@@ -243,6 +243,55 @@ def canon_area(text: str) -> str:
     return "unclassified"
 
 
+# A success report contradicted by an empty result. Deliberately NOT part of
+# AREA_CANON (AF-394).
+#
+# THE DEFECT. AREA_CANON is first-match-wins over the whole title, and a Mixpeek
+# title leads with its subsystem, so "Engine/batches (a batch reports COMPLETED,
+# 100%, failed_objects [] and writes ZERO documents)" is `engine`. The theme this
+# belongs to is "Instruments that lie", whose signal is
+# `ledger-cluster:instruments`, and that signal read QUIET on 2026-09-01 while
+# three fresh instances of the class sat in the same scan output.
+#
+# MEASURED, and it corrects the card that filed this: reordering AREA_CANON would
+# have fixed NOTHING. 16 open entries across both ledgers describe this shape and
+# only 3 of them contain any word from the instruments arm
+# (instrument|measur|probe|metric|observab|log). The failure is vocabulary, not
+# ordering. Those 16 are scattered over NINE clusters: api-contract, deploy-ci,
+# engine, ui, board-gates, cli, instruments.
+#
+# WHY THIS IS AN EXTRA LABEL AND NOT A REORDER OR A FULL MULTI-LABEL CANON. Both
+# alternatives were measured before being rejected. Reordering steals entries from
+# the subsystem clusters, which moves the trailing baselines the sweep compares
+# against. Letting every AREA_CANON arm apply independently is worse: the patterns
+# were written for first-match-wins and are far too loose to stand alone. Measured
+# over the same 1131 entries it gives 2.08 labels each, with `doc` matching every
+# entry that says "documents" (8 -> 156) and `index|cluster|pipeline` inflating
+# engine 134 -> 472. So this adds ONE precise membership and takes nothing away:
+# instruments 103 -> 116, every other cluster unchanged.
+GREEN_BUT_EMPTY = re.compile(
+    r"reports? (?:completed|success|green|ok)\b"
+    r"|completes? green|complet\w* green"
+    r"|(?:wrote|writes|written|produces?|produced) (?:zero|no) (?:documents|rows|results|files|bytes|objects)"
+    r"|zero (?:bytes|documents|rows|results|files|objects)"
+    r"|(?:reported|reports|says) (?:it )?(?:worked|succeeded|done)\b"
+    r"|silent (?:write )?loss"
+    r"|nothing (?:says so|can search)",
+    re.I,
+)
+
+
+def extra_areas(text: str) -> list:
+    """Cross-cutting memberships an entry carries BESIDES its subsystem area.
+
+    Returns at most one today. Kept as a list because the next cross-cutting
+    class (a gate with no honest exit, say) belongs here rather than in
+    AREA_CANON, for the same reason this one does: it is a property of the
+    FAILURE, and AREA_CANON answers a question about the SUBSYSTEM.
+    """
+    return ["instruments"] if GREEN_BUT_EMPTY.search(text or "") else []
+
+
 class Signal:
     """One measured signal. `measured` and `n_considered` are not optional.
 
@@ -539,25 +588,37 @@ def signal_ledger_clusters(now_ms):
         if rec["date"] and rec["date"] >= fresh_cut:
             per_area[area]["fresh_" + side].append(rec)
 
+    # `n` counts ENTRIES and increments once each; an entry that carries a
+    # cross-cutting membership as well as its subsystem one lands in two buckets
+    # (AF-394). So the buckets can sum to more than `n`, which is correct and is
+    # the whole point: "a batch reports COMPLETED and wrote zero" is genuinely an
+    # engine defect AND an instrument that lied.
     if a_txt is not None:
         for e in parse_amux_ledger(a_txt):
             if (e.get("status") or "open").lower() != "open":
                 continue
             n += 1
-            area = e.get("area") or canon_area(e.get("title", ""))
-            add("amux", canon_area(area), {
-                "title": e.get("title", "")[:120], "date": e.get("date", ""),
-                "card": e.get("card", ""), "session": e.get("session", ""),
-            })
+            title = e.get("title", "")
+            area = e.get("area") or canon_area(title)
+            rec = {"title": title[:120], "date": e.get("date", ""),
+                   "card": e.get("card", ""), "session": e.get("session", "")}
+            primary = canon_area(area)
+            add("amux", primary, rec)
+            for x in extra_areas(title):
+                if x != primary:
+                    add("amux", x, rec)
     if m_txt is not None:
         for e in parse_mixpeek_ledger(m_txt):
             if e["status"] != "open":
                 continue
             n += 1
-            add("mixpeek", canon_area(e["title"]), {
-                "title": e["title"][:120], "date": e["date"],
-                "card": "", "session": e.get("session", ""),
-            })
+            rec = {"title": e["title"][:120], "date": e["date"],
+                   "card": "", "session": e.get("session", "")}
+            primary = canon_area(e["title"])
+            add("mixpeek", primary, rec)
+            for x in extra_areas(e["title"]):
+                if x != primary:
+                    add("mixpeek", x, rec)
 
     out = []
     for area, sides in sorted(per_area.items(),

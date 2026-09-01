@@ -229,17 +229,37 @@ preflight this theme has been asking for, requested by Ethan in his own words.
 
 ## Instruments that lie: the single largest cluster in either ledger
 SCOPE: both
-STATUS: absorbed
+STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-08-30
-OCCURRENCES: 2
+LAST_SEEN: 2026-09-01
+OCCURRENCES: 3
 SIGNALS: ledger-cluster:instruments, rule-restatement:instrument-lies
 FIX_SITE: the `measured`/`n_considered` contract + `tests/diagnostic_contract.rs`
-CARDS: AF-320
+CARDS: AF-320, AF-394
 EVIDENCE: 41 of 83 amux ledger entries are an instrument that could not express
 its own failure. Re-measured 2026-08-30 across both repos: 99 open entries in
 this class, 19 amux / 80 Mixpeek. The contract is enforced for new amux
 diagnostic routes only, which is why this stays open on the Mixpeek side.
+2026-09-01: THIS THEME'S OWN SIGNAL WAS UNDERCOUNTING IT, which is the class
+happening to the instrument that measures the class. `ledger-cluster:instruments`
+read QUIET on the 11:05 scan while three fresh instances of the shape sat in the
+same output under `engine` and `api-contract`.
+Cause, and it corrects the card that filed it (AF-394): AREA_CANON is
+first-match-wins over a title that leads with its subsystem, but REORDERING would
+have fixed nothing. 16 open entries across both ledgers describe a success report
+contradicted by an empty result, and only 3 of them contain any word from the
+instruments arm at all. The failure was vocabulary, not ordering, and those 16
+were scattered over seven clusters.
+Fixed by an ADDITIONAL cross-cutting membership rather than a reorder or a full
+multi-label canon, both of which were measured before being rejected: reordering
+steals entries from the subsystem clusters and moves their trailing baselines, and
+letting every AREA_CANON arm apply independently gives 2.08 labels per entry, with
+`doc` matching every entry that says "documents" (8 -> 156). The shipped change
+moves exactly one cluster: instruments 103 -> 117, 17 of 18 others untouched, 1145
+labels over 1131 entries. The signal now fires at n=4 in a 1-day window.
+STATUS MOVED BACK TO open: this was `absorbed` on the strength of the amux
+diagnostic-route contract, and the Mixpeek side is where the class actually lives
+(80 of 99 last time, and 4 of 4 new entries today are Mixpeek).
 
 ## A fix ships, its tests pass, and it does nothing in production
 SCOPE: amux
