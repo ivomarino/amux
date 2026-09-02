@@ -3525,7 +3525,7 @@ FIX: Two halves, and only the first is shipped.
 
 ---
 
-## Five checks in one afternoon that ran, passed, and could not have failed
+## Six checks in one afternoon that ran, passed, and could not have failed
 AREA: instruments
 SEVERITY: slows
 STATUS: open
@@ -3550,11 +3550,26 @@ SYMPTOM: Not one bug. Five instances in a single afternoon, three mine and two
        existed for.
     5. (mixpeek-general) A test file with no marker, which CI would never have
        selected — it could not fail because it never ran.
-COST: individually small; two of the five would have shipped a no-op fix while the card
+    6. (mine, and the worst of the six) Verifying a 36-commit push for a peer who had
+       asked for consent, I ran `cargo test -p amux-server 2>&1 | tail -18` in the
+       background and read "[exited with code 0]" as the suite passing. IT IS TAIL'S
+       EXIT CODE. Without `pipefail` a pipeline reports the LAST command's status, so
+       that 0 was unconditional — cargo could have failed every test and it would still
+       have read 0. `tail -18` also discarded every result line but the last, so the
+       "17 passed" I was about to quote was one binary of many, out of ~1800 lib tests.
+       I caught it only because 17 looked too small, not because anything failed.
+COST: individually small except the sixth, which was about to authorize a 36-commit push
+  to origin on a fabricated green, for a peer who had explicitly asked whether my work
+  was safe to ship. Two of the other five would have shipped a no-op fix while the card
   closed as done with evidence attached. The compounding cost is worse: each of these
   produces a GREEN result that is then cited as proof. #1 and #3 were both about to be
   written into a card's evidence block as mutation-verified.
-FIX: rule 7 says "the way to know is to break it" and names the tool. The gap is WHEN.
+FIX: instance 6 has a mechanical fix the others do not, and it is worth stating on its
+  own: NEVER READ AN EXIT CODE THROUGH A PIPE. `cmd | tail` reports tail's status.
+  Either drop the pipe and write the log to a file, or `set -o pipefail` first. The
+  background-task harness reports "[exited with code N]" for the whole pipeline, which
+  is what made the wrong number look authoritative.
+  rule 7 says "the way to know is to break it" and names the tool. The gap is WHEN.
   All five were caught (or missed) at the moment the check was WRITTEN, not at the end,
   and four of the five were found only because something else forced a second look — a
   peer's report, a compiler warning, an unrelated mutation. The reflex that would have
