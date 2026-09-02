@@ -3483,3 +3483,42 @@ FIX: 80bff64b + this commit. `scripts/frustrations-archive.py` now checks, at th
   VERIFIED by two cells against a fixture: a resurrected title warns and names 2 prior
   copies; a novel title is SILENT and still archives. The control is the half that matters,
   since a detector that fired on every archive would be worth nothing.
+
+---
+
+## Reading the shared worktree to understand code returns a peer's draft, and the wrong decision leaves no artifact
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-02
+SESSION: amux-frustrations
+CARD: AF-336
+SYMPTOM: Reported by general-canvas-apps, self-traced by mixpeek-homepage-claude. A lane
+  changed a PUBLIC ARGUMENT'S SEMANTICS after reading a gate's invocation out of the
+  shared worktree, which held another lane's uncommitted draft of the same job. The
+  draft's line was broken. The committed line was correct and carried a comment, three
+  lines from the one they quoted, that would have stopped the change.
+  DISTINCT FROM THIS CARD'S OTHER ENTRY, which is the BUILD case: there, a peer's
+  in-flight edit reddens your test run, which is loud and self-correcting on a rerun.
+  Here the tree poisons a DECISION. Nobody pushes anything, the reader's commit is
+  entirely their own work and looks correct, and the wrongness lives in a conclusion
+  drawn from bytes that were nobody's committed truth.
+COST: One wrong public-API semantics change, caught only because its author went back and
+  traced their own reasoning. THE REAL COST IS THAT THERE IS NOTHING TO COUNT. The four
+  write-side races on this card each left a diff and all four were caught — three by the
+  victim running a receipt diff, one by the racing author. This class leaves no diff, no
+  repair commit and no receipt, so the observed rate of one is not a measurement, it is
+  the absence of an instrument. It also retires the strongest objection to AF-336: at
+  four catchable races the counter-argument was "the cost is repair commits and may be
+  cheaper than 125 worktrees", and a class with no artifact has no such bound.
+FIX: Two halves, and only the first is shipped.
+  DISCIPLINE, done: ~/.claude/CLAUDE.md's shared-checkout section covered a peer's edit
+  redding your BUILD and said nothing about a peer's draft poisoning your READING. It now
+  carries the distinction, the specimen, and the two commands — `git show
+  origin/main:<path>` for what everyone actually runs, `git show HEAD:<path>` for what
+  this checkout last committed — with general-canvas-apps' line kept because it is the
+  memorable form: a worktree read is a snapshot of nobody's truth.
+  ISOLATION, still needsyou on AF-336: per-lane worktrees make the read CORRECT rather
+  than merely well-advised. That is the difference between a rule every lane must
+  remember on every read and a property of the environment. A rule that must be
+  remembered is exactly what this file exists to stop relying on.
