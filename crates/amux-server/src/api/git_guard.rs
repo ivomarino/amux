@@ -418,6 +418,42 @@ pub(crate) enum PathFate {
     AtRisk,
 }
 
+/// AF-422: which closing line does this notice deserve?
+///
+/// "COMMITTED BY YOU" IS A DIFFERENT CLAIM FROM "NOT AT RISK", and the footer
+/// conflated them. `all_settled` is `n_at_risk == 0`, which `AbsorbedBy`,
+/// `LandedOnOrigin` and `NotTheirWork` all satisfy — and every one of those
+/// means committed by SOMEBODY ELSE, or not the reader's at all. So a set of
+/// purely-absorbed paths closed with "EVERY path above is already committed by
+/// you", asserting the reader's authorship from the same mtime evidence that
+/// produced the alarm this sentence was added to soften.
+///
+/// Reported by mixpeek-general 2026-09-02 on
+/// server/infra/gke/chart/templates/_helpers.tpl, whose history holds zero of
+/// their commits: "the heuristic added to soften the false alarm asserts
+/// authorship on the same mtime evidence that produced the false alarm, and
+/// inherits the same defect one level down."
+///
+/// Pure, because the wording is the product here and the branch it sits in is a
+/// 60-line async block nothing could reach — the same reason `victim_path_line`
+/// below was pulled out.
+pub(crate) fn victim_verdict(all_settled: bool, all_mine: bool) -> &'static str {
+    if all_settled && all_mine {
+        "\n\nEVERY path above is already committed by you, so this is almost certainly \
+         noise — the notice fires on EDIT RECORDS and cannot tell \"edited and committed\" \
+         from \"edited and staged\" on its own. Kept rather than suppressed because a \
+         false alarm costs you a glance and a missed one costs work."
+    } else if all_settled {
+        "\n\nNothing above is at risk, but they are NOT all yours — some were committed by \
+         another session, landed on origin, or carry no commit of yours at all, and each \
+         line above says which. The notice fires on EDIT RECORDS, and an edit record is not \
+         authorship on a shared checkout. Nothing here needs reconciling."
+    } else {
+        "\n\nAt least one path has no commit of yours since the edit — that is the one to \
+         reconcile."
+    }
+}
+
 /// The victim notice's per-path line, pure so the wording is testable
 /// (MG-1484). Returns (line, counts_as_at_risk). The distinction the incident
 /// demanded: an AtRisk path whose owner's record is a RESTORE carries no
@@ -3093,6 +3129,7 @@ pub async fn staged_guard_inner(
                 // committed" from "edited and still staged" — so it used to hand the
                 // recipient a `git log` to run every time. Now it runs it for them.
                 let mut lines: Vec<String> = Vec::new();
+                let mut fates: Vec<PathFate> = Vec::new();
                 let mut n_at_risk = 0usize;
                 for (pth, age, prov) in paths.iter().take(10) {
                     let fate = path_fate(&wd, pth, &owner, *age, prov).await;
@@ -3101,8 +3138,22 @@ pub async fn staged_guard_inner(
                         n_at_risk += 1;
                     }
                     lines.push(line);
+                    fates.push(fate);
                 }
                 let all_settled = n_at_risk == 0;
+                // AF-422: "COMMITTED BY YOU" IS A DIFFERENT CLAIM FROM "NOT AT
+                // RISK", and this footer conflated them. `all_settled` is
+                // `n_at_risk == 0`, which AbsorbedBy, LandedOnOrigin and
+                // NotTheirWork all satisfy — and every one of those means
+                // committed by SOMEBODY ELSE, or not yours at all. So a set of
+                // purely-absorbed paths produced "EVERY path above is already
+                // committed by you", asserting the reader's authorship from the
+                // same mtime evidence that produced the alarm it was written to
+                // soften. Reported by mixpeek-general on a file whose history
+                // holds zero of their commits.
+                //
+                // Only SettledByOwner supports the possessive.
+                let all_mine = fates.iter().all(|f| matches!(f, PathFate::SettledByOwner(_)));
                 // AF-130: the victim notice was delivered as a session message
                 // and NEVER logged, so `grep -c 'WORK ITSELF is at risk'`
                 // returned 0 across the whole retained window — nobody could
@@ -3126,15 +3177,7 @@ pub async fn staged_guard_inner(
                 }
                 let list = lines.join("\n");
                 let more = paths.len().saturating_sub(10);
-                let verdict = if all_settled {
-                    "\n\nEVERY path above is already committed by you, so this is almost certainly \
-                     noise — the notice fires on EDIT RECORDS and cannot tell \"edited and committed\" \
-                     from \"edited and staged\" on its own. Kept rather than suppressed because a \
-                     false alarm costs you a glance and a missed one costs work."
-                } else {
-                    "\n\nAt least one path has no commit of yours since the edit — that is the one to \
-                     reconcile."
-                };
+                let verdict = victim_verdict(all_settled, all_mine);
                 let text = format!(
                     "[amux staged-guard] Session `{}` is committing in {} and the staged set \
                      includes {} file(s) whose edit records are YOURS:\n{}{}\n\n\
@@ -3611,6 +3654,36 @@ mod tests {
         // at-risk case, and it must stay loud.
         std::fs::write(dir.path().join("grafted.txt"), "novel v3, uncommitted\n").unwrap();
         assert_eq!(path_fate(&d, "grafted.txt", "backend", 0, "firsthand").await, PathFate::AtRisk);
+    }
+
+    /// AF-422: the closing line must not claim authorship it cannot support.
+    #[test]
+    fn the_notice_only_says_committed_by_you_when_every_path_actually_is() {
+        // All SettledByOwner: the possessive is earned.
+        let mine = victim_verdict(true, true);
+        assert!(mine.contains("already committed by you"), "{mine}");
+
+        // THE REPORTED BUG: nothing at risk, but not all of it is theirs —
+        // absorbed under a peer, landed on origin, or never written by them.
+        let theirs = victim_verdict(true, false);
+        assert!(
+            !theirs.contains("committed by you"),
+            "must not claim authorship from an edit record: {theirs}"
+        );
+        assert!(theirs.contains("NOT all yours"), "say whose they are instead: {theirs}");
+        assert!(
+            theirs.contains("Nothing here needs reconciling"),
+            "still tell them there is no action, or the softening is lost: {theirs}"
+        );
+
+        // CONTROL: a genuinely at-risk path still gets the reconcile line, and
+        // `all_mine` must not be able to suppress it. Without this cell, wiring
+        // the possessive to `all_mine` alone would pass everything above.
+        for all_mine in [true, false] {
+            let risky = victim_verdict(false, all_mine);
+            assert!(risky.contains("that is the one to reconcile"), "{risky}");
+            assert!(!risky.contains("almost certainly noise"), "{risky}");
+        }
     }
 
     /// AF-420, mixpeek-general: the mirror told them their WORK was at risk about
