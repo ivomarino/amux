@@ -8372,7 +8372,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.774';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.775';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -24675,6 +24675,86 @@ function renderBoardFilters() {
   el.innerHTML = html;
 }
 
+// RIGHT-CLICK ACTIONS ON A BOARD ITEM (Ethan, 2026-09-02: "allow me to right
+// click board items and get a dropdown of actions").
+//
+// Every mutation here goes through `_gateConfirm` + `moveBoardItem`, which is
+// the SAME pair `boardColDrop` uses for a drag. That is the point rather than a
+// convenience: the board's gates (evidence on done, WIP, next-action on doing)
+// live in `_gateConfirm`, so a menu that PATCHed the status directly would be a
+// second, ungated way to move a card and would quietly undo AF-321. If a move
+// is refused here it is refused for the same stated reason as a drag.
+//
+// Bound on the shared `_issueRowHTML` as well as the kanban card, because that
+// renderer already exists so the List view and the peek Board tab cannot drift
+// from each other — the same argument its own comment makes.
+let _boardCtxId = null;
+function _boardCtxClose() {
+  const m = document.getElementById('board-ctx-menu');
+  if (m) m.remove();
+  _boardCtxId = null;
+}
+function _boardCtxMenu(e, id) {
+  e.preventDefault();
+  e.stopPropagation();
+  _boardCtxClose();
+  const item = (boardItems || []).find(i => i.id === id);
+  if (!item) return false;
+  _boardCtxId = id;
+  const cur = item.status || 'todo';
+  let h = '<div class="card-menu-item" onclick="event.stopPropagation();_boardCtxClose();openBoardDetail(\''
+    + escJs(id) + '\')"><span class="mi">&#x2197;</span> Open ' + esc(id) + '</div>';
+  h += '<div class="card-menu-sep"></div>';
+  (typeof boardStatuses !== 'undefined' ? boardStatuses : []).forEach(st => {
+    if (st.id === cur) return;
+    const sty = statusStyle(st.id);
+    h += '<div class="card-menu-item" onclick="event.stopPropagation();_boardCtxMove(\''
+      + escJs(id) + '\',\'' + escJs(st.id) + '\')">'
+      + '<span class="mi"><span class="board-status-dot" style="background:' + sty.dot + '"></span></span> '
+      + esc(st.label) + '</div>';
+  });
+  h += '<div class="card-menu-sep"></div>';
+  h += '<div class="card-menu-item" onclick="event.stopPropagation();_boardCtxCopy(\''
+    + escJs(id) + '\')"><span class="mi">&#x2398;</span> Copy ID</div>';
+  const m = document.createElement('div');
+  m.className = 'card-menu open';
+  m.id = 'board-ctx-menu';
+  m.innerHTML = h;
+  document.body.appendChild(m);
+  // Clamp INTO the viewport rather than off the bottom-right edge, which is
+  // where a right-click near the last column of a full board lands.
+  const r = m.getBoundingClientRect();
+  const x = Math.max(6, Math.min(e.clientX, window.innerWidth - r.width - 6));
+  const y = Math.max(6, Math.min(e.clientY, window.innerHeight - r.height - 6));
+  m.style.left = x + 'px';
+  m.style.top = y + 'px';
+  return false;
+}
+function _boardCtxMove(id, st) {
+  _boardCtxClose();
+  const item = (boardItems || []).find(i => i.id === id);
+  if (!item || (item.status || 'todo') === st) return;
+  _gateConfirm(item, st).then(ok => {
+    if (ok) moveBoardItem(id, st, undefined, ok);
+    else renderBoard();
+  });
+}
+function _boardCtxCopy(id) {
+  _boardCtxClose();
+  try {
+    navigator.clipboard.writeText(id);
+    showToast('Copied ' + id);
+  } catch (err) {
+    showToast('Could not copy: ' + err.message);
+  }
+}
+document.addEventListener('click', () => { if (_boardCtxId) _boardCtxClose(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && _boardCtxId) _boardCtxClose(); });
+// A right-click somewhere ELSE must not leave the old menu floating.
+document.addEventListener('contextmenu', (e) => {
+  if (_boardCtxId && !e.target.closest('.board-card, .peek-issue-item')) _boardCtxClose();
+});
+
 function boardDragStart(e, id) {
   _boardDragId = id;
   e.dataTransfer.effectAllowed = 'move';
@@ -24752,7 +24832,7 @@ function _issueRowHTML(item, opts) {
   const _rq = (typeof _peekIssuesQuery !== 'undefined' && _peekIssuesQuery)
     ? _peekIssuesQuery
     : (typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '');
-  return '<div class="peek-issue-item" style="min-height:44px;" onclick="openBoardDetail(\'' + esc(item.id) + '\')">' +
+  return '<div class="peek-issue-item" style="min-height:44px;" onclick="openBoardDetail(\'' + esc(item.id) + '\')" oncontextmenu="return _boardCtxMenu(event,\'' + escJs(item.id) + '\')">' +
     dot +
     '<span class="peek-issue-key">' + _hlSearch(esc(item.id), _rq) + '</span>' +
     // The PEEK query, not the global board query. This read boardSearchQuery,
@@ -24782,7 +24862,7 @@ function _renderBoardCard(item) {
     (typeof sessions !== 'undefined') && (sessions || []).some(s => s.name === item.session && s.status === 'active');
   // item.session, not the pre-rename item.worker — the dead field rendered
   // 'undefined is working on this right now' in the LIVE tooltip.
-  let h = '<div class="board-card' + (pinned ? ' board-card-pinned' : '') + (_liveNow ? ' board-card-live' : '') + '" data-id="' + item.id + '"' + (_liveNow ? ' title="' + esc(item.session) + ' is working on this right now"' : '') + ' onclick="openBoardDetail(\'' + item.id + '\')">';
+  let h = '<div class="board-card' + (pinned ? ' board-card-pinned' : '') + (_liveNow ? ' board-card-live' : '') + '" data-id="' + item.id + '"' + (_liveNow ? ' title="' + esc(item.session) + ' is working on this right now"' : '') + ' onclick="openBoardDetail(\'' + item.id + '\')" oncontextmenu="return _boardCtxMenu(event,\'' + escJs(item.id) + '\')">';
   h += '<div class="board-drag-handle" onclick="event.stopPropagation()" title="Drag to move"><svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><circle cx="3.5" cy="2.5" r="1.25"/><circle cx="8.5" cy="2.5" r="1.25"/><circle cx="3.5" cy="6" r="1.25"/><circle cx="8.5" cy="6" r="1.25"/><circle cx="3.5" cy="9.5" r="1.25"/><circle cx="8.5" cy="9.5" r="1.25"/></svg></div>';
   h += '<button class="board-pin-btn' + (pinned ? ' active' : '') + '" onclick="event.stopPropagation();_togglePin(\'' + item.id + '\')" title="' + (pinned ? 'Unpin' : 'Pin to top') + '">&#x1F4CC;</button>';
   const _bq = typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '';
