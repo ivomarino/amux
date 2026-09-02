@@ -56,6 +56,10 @@ pub fn routes() -> Router<AppState> {
         // Static /ready outranks /{id}. The read side of the dependency graph
         // (AMUX-3948) — READY is a query, never a stored status.
         .route("/ready", get(ready_frontier))
+        // Static /bulk-migrate outranks /{id}. Moving a whole column at once
+        // (AMUX-4044) — a single write transaction, because backlog alone
+        // holds 489 live cards and 489 sequential PATCHes is minutes of load.
+        .route("/bulk-migrate", axum::routing::post(bulk_migrate))
         // Static /needsyou outranks /{id}. The one owner view (AF-318).
         .route("/needsyou", get(needsyou_queue))
         // DELETE was never registered, so the SPA's own Delete button on a
@@ -144,7 +148,10 @@ async fn needsyou_queue(
         }
     };
     let now = crate::config::now_f64();
-    let mut scored: Vec<(f64, Value)> = rows
+    // One `today` for the whole pass: computing it per row could straddle
+    // midnight mid-sort and make two cards disagree about what "due today" is.
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let mut scored: Vec<(bool, f64, Value)> = rows
         .iter()
         .map(|r| {
             let age_days = ((now - r.created as f64) / 86_400.0).max(0.0);
@@ -152,6 +159,37 @@ async fn needsyou_queue(
             // radius + 1, so a card nobody depends on still ranks by age
             // instead of scoring zero and sinking below every card forever.
             let score = age_days * (radius + 1) as f64;
+            // AF-424: A PASSED DEADLINE OUTRANKS AN OLD CARD NOBODY DATED.
+            //
+            // Reported by gtm-engine (GE-769) and reproduced here. `due` is a
+            // signal the board HOLDS — a lane stated a date on purpose — and
+            // this ranking is justified in its own docstring as using "the only
+            // importance signal the board actually holds rather than infers".
+            // It was not using this one.
+            //
+            // The bias is structural, not incidental: stating a deadline
+            // correlates with being NEW, new means low `age_days`, and the
+            // formula rewards age. So dating a card pushed it DOWN. Measured
+            // live 2026-09-02: 119 of 404 rows carry a due date, their MEDIAN
+            // rank was 329 of 404, and 47 were due-today-or-overdue. AF-344,
+            // "scrub 646 leaked API-key occurrences", due that day, ranked 349.
+            //
+            // NO FREE PARAMETER, deliberately. A weight would make me decide how
+            // many days of age a deadline is worth, which is a judgement about
+            // someone else's queue. This is a yes/no instead: a card whose
+            // stated date has ARRIVED sorts above one whose has not, and within
+            // each group the existing score is unchanged. Nothing is reordered
+            // except across that one boundary, and turning it off is deleting
+            // this key.
+            //
+            // Dates are compared as ISO strings, which is what the column holds
+            // and what `is:overdue` in the dashboard already does.
+            let overdue = r
+                .due
+                .as_deref()
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .is_some_and(|d| d <= today.as_str());
             let mut v = list_body(r, true, false);
             if let Some(o) = v.as_object_mut() {
                 o.insert("age_days".into(), json!((age_days * 10.0).round() / 10.0));
@@ -163,19 +201,40 @@ async fn needsyou_queue(
                 // list is exactly who needs to tell them apart.
                 o.insert("has_typed_ask".into(), json!(r.ask_type.is_some()));
             }
-            (score, v)
+            if let Some(o) = v.as_object_mut() {
+                // Say it in the payload, so a reader can see WHY a card is where
+                // it is rather than inferring it from the order (rule 4).
+                o.insert("overdue".into(), json!(overdue));
+            }
+            (overdue, score, v)
         })
         .collect();
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    // Overdue first, then the existing score within each group. `true > false`,
+    // so the natural descending compare puts a passed deadline on top.
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0).then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
 
     let total = scored.len();
+    let n_overdue = scored.iter().filter(|(o, ..)| *o).count();
     let shown: Vec<Value> = if want_all {
-        scored.into_iter().map(|(_, v)| v).collect()
+        scored.into_iter().map(|(_, _, v)| v).collect()
     } else {
-        scored.into_iter().take(cap).map(|(_, v)| v).collect()
+        scored.into_iter().take(cap).map(|(_, _, v)| v).collect()
     };
     let hidden = total.saturating_sub(shown.len());
     let untyped = rows.iter().filter(|r| r.ask_type.is_none()).count();
+    // Counted from the store rather than from `rows`, which by construction
+    // holds only the active ones — a count derived from the filtered set could
+    // never be anything but zero, which is the check-that-cannot-fail shape.
+    let archived_excluded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM issues WHERE status='needsyou' \
+             AND NOT (COALESCE(archived,0)=0 AND deleted IS NULL)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(-1);
     Json(crate::api::measured::measured(
         json!({
             "queue": shown,
@@ -184,7 +243,22 @@ async fn needsyou_queue(
             "hidden": hidden,
             "cap": if want_all { Value::Null } else { json!(cap) },
             "untyped_legacy": untyped,
-            "ranked_by": "age_days * (blast_radius + 1), highest first",
+            // AF-424: NAME THE POPULATION THIS VIEW DOES NOT CONSIDER.
+            //
+            // `total` counts ACTIVE needsyou cards. A reader comparing it
+            // against a raw `/api/board?all=1` dump sees a much larger number
+            // and reasonably concludes the view is dropping live work — which
+            // is exactly what happened: gtm-engine measured 523 needsyou rows
+            // against this view's 404 and read the difference as 119 cards
+            // "outside it entirely". They are archived (121) and deleted (4),
+            // and excluding them is correct; an archived card is not
+            // outstanding owner-blocked work. But nothing here SAID so, and
+            // `hidden: 4` reads as the whole remainder when it is only the
+            // remainder past the cap.
+            "archived_excluded": archived_excluded,
+            "ranked_by": "overdue first (due <= today), then age_days * (blast_radius + 1), \
+                          highest first",
+            "overdue": n_overdue,
             "note": "THE owner view: the cards a human is actually blocking, capped so the \
                      list can be finished. `hidden` is the remainder, reachable with ?all=1 \
                      — the cap is a default, not a hiding place. `untyped_legacy` counts \
@@ -403,6 +477,186 @@ async fn ready_frontier(
         },
     });
     Json(crate::api::measured::measured(body, n_considered)).into_response()
+}
+
+/// (considered, moved, refused) carried out of the bulk-migrate write closure,
+/// which can only return a `WriteOutcome`. Per call, never a static: two
+/// concurrent migrations would clobber a global and each would report the
+/// other's numbers.
+type BulkOutcome = Arc<Mutex<Option<(usize, usize, Vec<Value>)>>>;
+
+/// A column's gate criteria, or `None` when it has none (AMUX-4044).
+///
+/// THREE THINGS MEAN "UNGATED" and they arrive as different values: no row, a
+/// NULL column, and a stored empty array. Collapsing them here is what lets the
+/// caller ask one question. An unparseable value is treated as GATED, because
+/// the safe reading of "I cannot tell" is not "go ahead and move 489 cards".
+fn gate_criteria(raw: &str) -> Option<Vec<String>> {
+    match serde_json::from_str::<Vec<String>>(raw) {
+        Ok(v) if v.is_empty() => None,
+        Ok(v) => Some(v),
+        // Unparseable: fail CLOSED.
+        Err(_) if raw.trim().is_empty() => None,
+        Err(_) => Some(vec![format!("unreadable gate: {raw}")]),
+    }
+}
+
+/// POST /api/board/bulk-migrate — move every live card out of one column.
+///
+/// Ethan, 2026-09-02: an ellipsis on a board column, "migrate all ... for
+/// example in backlog to discarded".
+///
+/// A GATED TARGET IS REFUSED OUTRIGHT, and that is the design rather than a
+/// limitation. `doing`, `review`, `done` and `verified` each carry a checklist
+/// a human is supposed to answer per card; one blanket acknowledgement across
+/// 489 backlog cards would assert all four of `verified`'s criteria about work
+/// nobody looked at, which is exactly the claim AF-321 exists to stop. The
+/// named use case, backlog to discarded, is ungated and unaffected.
+///
+/// `gate_ack` and `force` are deliberately NOT set below, so even if this
+/// somehow ran against a gated column every card would refuse individually
+/// rather than slip through. The upfront check is the honest error; the unset
+/// flags are the belt.
+///
+/// One transaction: a half-migrated column is a worse state than a refused
+/// one, and `advance` is the same transition primitive every other path uses,
+/// so a card that could not move for its own reason (archived, a stale CAS)
+/// is reported rather than silently skipped.
+async fn bulk_migrate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    let body = body.map(|Json(v)| v).unwrap_or(Value::Null);
+    let from = body.get("from").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let to = body.get("to").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    // Optional: restrict to one lane's board. Absent means the global column.
+    let lane = body
+        .get("session")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if from.is_empty() || to.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "from and to are required", "hint": "POST {\"from\":\"backlog\",\"to\":\"discarded\"}"}),
+        );
+    }
+    if from == to {
+        return err(StatusCode::BAD_REQUEST, json!({"error": "from and to are the same column"}));
+    }
+    let actor = actor_from_headers(&headers).1;
+
+    // THE GATE CHECK, once, up front, on a READ. Doing it inside the write
+    // closure meant smuggling the verdict out through a fake event; a column's
+    // gate is plain stored state and reading it is the honest way to ask.
+    let gate = state
+        .store
+        .read()
+        .ok()
+        .and_then(|conn| {
+            conn.query_row(
+                "SELECT gate FROM board_statuses WHERE id=?1",
+                rusqlite::params![to],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
+        })
+        .and_then(|g| gate_criteria(&g));
+    if let Some(criteria) = gate {
+        return err(
+            StatusCode::CONFLICT,
+            json!({
+                "error": format!("'{to}' has a gate, so it cannot be bulk-filled"),
+                "gate": criteria,
+                "why": "a gate is a per-card claim; one acknowledgement for a whole column \
+                        would assert it about cards nobody looked at",
+                "hint": "move these individually, or pick an ungated column",
+            }),
+        );
+    }
+
+    // PER-CALL, not a static: two concurrent migrations would clobber a global
+    // and each would report the other's numbers. Same handle shape the rename
+    // cascade uses to carry its step list out of the write closure.
+    let out: BulkOutcome = Default::default();
+    let out_c = out.clone();
+    let (f3, t3, lane3, actor3) = (from.clone(), to.clone(), lane.clone(), actor.clone());
+    let result = state
+        .store
+        .write_async(move |conn| {
+            let ids: Vec<String> = {
+                let (sql, params): (String, Vec<String>) = match &lane3 {
+                    Some(l) => (
+                        "SELECT id FROM issues WHERE status=?1 AND session=?2 \
+                         AND deleted IS NULL AND COALESCE(archived,0)=0 ORDER BY id"
+                            .into(),
+                        vec![f3.clone(), l.clone()],
+                    ),
+                    None => (
+                        "SELECT id FROM issues WHERE status=?1 \
+                         AND deleted IS NULL AND COALESCE(archived,0)=0 ORDER BY id"
+                            .into(),
+                        vec![f3.clone()],
+                    ),
+                };
+                let mut st = conn.prepare(&sql)?;
+                let rows = st.query_map(rusqlite::params_from_iter(params), |r| r.get::<_, String>(0))?;
+                rows.filter_map(Result::ok).collect()
+            };
+            let mut moved = 0usize;
+            let mut refused: Vec<Value> = Vec::new();
+            let mut events = Vec::new();
+            for id in &ids {
+                let opts = crate::db::advance::AdvanceOpts {
+                    expected_from: Some(f3.clone()),
+                    log_line: Some(format!("bulk-migrated {f3} -> {t3} by {actor3}")),
+                    ..Default::default()
+                };
+                match crate::db::advance::advance(conn, id, &t3, &actor3, &opts)? {
+                    Ok(o) => {
+                        moved += 1;
+                        events.extend(o.events);
+                    }
+                    Err(why) => refused.push(json!({"id": id, "why": format!("{why:?}")})),
+                }
+            }
+            conn.execute(
+                "INSERT INTO session_events (ts, session, type, data, source) VALUES (?1,?2,?3,?4,?5)",
+                rusqlite::params![
+                    crate::config::now_f64(),
+                    actor3,
+                    "board.bulk_migrated",
+                    json!({"from": f3, "to": t3, "session": lane3, "moved": moved,
+                           "refused": refused.len(), "considered": ids.len()})
+                    .to_string(),
+                    "board-api"
+                ],
+            )
+            .ok();
+            *out_c.lock().unwrap() = Some((ids.len(), moved, refused));
+            Ok(crate::db::WriteOutcome { applied: moved > 0, events })
+        })
+        .await;
+    match result {
+        Ok(_) => {
+            let (considered, moved, refused) =
+                out.lock().ok().and_then(|mut g| g.take()).unwrap_or((0, 0, Vec::new()));
+            Json(json!({
+                "ok": true, "from": from, "to": to, "session": lane,
+                "considered": considered, "moved": moved,
+                // Named, not just counted: a caller that moved 480 of 489 needs
+                // to know WHICH nine and why, or the number is a mystery.
+                "refused": refused,
+            }))
+            .into_response()
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
+    }
 }
 
 /// One lane's work frontier: what it could claim, and what is in the way.
@@ -7835,5 +8089,43 @@ mod slim_tests {
             "a capture a prior worker card already owns must not be re-folded"
         );
         assert_eq!(bs::get_issue(&conn, &cap.id).unwrap().unwrap().status, "doing");
+    }
+}
+
+#[cfg(test)]
+mod bulk_migrate_tests {
+    use super::*;
+
+    /// AMUX-4044. The safety property of bulk migrate is that a GATED column
+    /// cannot be filled in one click, so this is the cell that has to hold.
+    ///
+    /// Measured on the live board when this shipped: `doing`, `review`, `done`
+    /// and `verified` carry gates; `backlog`, `todo` and `discarded` do not.
+    /// One acknowledgement across 489 backlog cards would assert all four of
+    /// `verified`'s criteria about work nobody opened, which is the claim
+    /// AF-321 exists to refuse.
+    #[test]
+    fn a_gated_column_is_never_bulk_fillable_and_an_ungated_one_is() {
+        // The real shapes, all three of which mean ungated and arrive
+        // differently.
+        assert_eq!(gate_criteria("[]"), None, "an empty array is ungated");
+        assert_eq!(gate_criteria(""), None, "an empty string is ungated");
+        assert_eq!(gate_criteria("   "), None, "whitespace is ungated");
+
+        // The live `done` gate, verbatim.
+        let done = r#"["Implemented and merged","Tests / lint pass"]"#;
+        assert_eq!(
+            gate_criteria(done),
+            Some(vec!["Implemented and merged".into(), "Tests / lint pass".into()]),
+            "a real gate must be reported WITH its criteria, so the refusal can name them"
+        );
+
+        // FAIL CLOSED. "I cannot read this" must not become "go ahead": the
+        // cost of a wrong yes here is a whole column moved on a guess.
+        let unreadable = gate_criteria("{not json");
+        assert!(
+            unreadable.is_some(),
+            "an unparseable gate must be treated as GATED, not waved through: {unreadable:?}"
+        );
     }
 }

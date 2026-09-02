@@ -3976,3 +3976,79 @@ async fn a_refused_transition_names_the_fields_it_discarded() {
     assert_eq!(v["discarded"], json!([]), "empty, but PRESENT: {v}");
     assert!(v.get("discarded_note").is_none(), "no note when nothing was dropped: {v}");
 }
+
+/// AF-424: a card whose stated deadline has ARRIVED outranks an older card
+/// nobody dated.
+///
+/// Reported by gtm-engine (GE-769). The queue ranked by `age_days *
+/// (blast_radius + 1)`, and the bias was structural rather than incidental:
+/// stating a deadline correlates with being NEW, new means low age_days, and
+/// the formula rewards age — so dating a card pushed it DOWN. Measured live
+/// 2026-09-02: 119 of 404 rows carried a due date at MEDIAN rank 329 of 404,
+/// and 47 were due-today-or-overdue. "Scrub 646 leaked API-key occurrences",
+/// due that day, ranked 349.
+#[tokio::test]
+async fn the_needsyou_queue_ranks_a_passed_deadline_above_an_older_undated_card() {
+    let (app, _dir) = app();
+    let ask = json!({
+        "status": "needsyou", "ask_type": "decision",
+        "ask_question": "Should this move to the new cluster, or stay where it is?",
+        "ask_unblocks": "the migration can be scheduled either way",
+    });
+
+    // An OLD card nobody dated. Created first, so it is strictly older.
+    // NB: parking a card auto-stamps a near-future `due`, so this one is
+    // dated-but-not-arrived rather than truly undated — which is the same
+    // comparison and the commoner live shape (119 of 404 carry a date, mostly future).
+    let old = create(&app, json!({ "title": "older, date not yet arrived" })).await;
+    let old_id = old["id"].as_str().unwrap().to_string();
+    let (st, _, why) = send(&app, "PATCH", &format!("/api/board/{old_id}"), Some(ask.clone())).await;
+    assert_eq!(st, StatusCode::OK, "park refused: {why}");
+
+    // A NEWER card with a deadline that has already arrived.
+    let due = create(&app, json!({ "title": "new, due today" })).await;
+    let due_id = due["id"].as_str().unwrap().to_string();
+    let mut with_due = ask.as_object().unwrap().clone();
+    with_due.insert("due".into(), json!("2000-01-01")); // long past
+    let (st, _, _) =
+        send(&app, "PATCH", &format!("/api/board/{due_id}"), Some(Value::Object(with_due))).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (_, _, v) = send(&app, "GET", "/api/board/needsyou?all=1", None).await;
+    let q = v["queue"].as_array().unwrap();
+    let pos = |id: &str| q.iter().position(|r| r["id"] == json!(id)).expect("card in queue");
+    assert!(
+        pos(&due_id) < pos(&old_id),
+        "an ARRIVED deadline must outrank an older card whose date has not: {v}"
+    );
+    assert_eq!(v["queue"][pos(&due_id)]["overdue"], json!(true), "and say why: {v}");
+    assert_eq!(v["queue"][pos(&old_id)]["overdue"], json!(false));
+    assert_eq!(v["overdue"], json!(1), "the count is published: {v}");
+    assert!(
+        v["ranked_by"].as_str().unwrap().contains("overdue first"),
+        "the rule is stated, not silent: {v}"
+    );
+
+    // CONTROL 1: a FUTURE deadline is not urgency. Without this, "any due date
+    // wins" would pass — and 119 of 404 live cards carry one, mostly future.
+    let far = create(&app, json!({ "title": "dated, far future" })).await;
+    let far_id = far["id"].as_str().unwrap().to_string();
+    let mut future = ask.as_object().unwrap().clone();
+    future.insert("due".into(), json!("2099-12-31"));
+    let (st, _, _) =
+        send(&app, "PATCH", &format!("/api/board/{far_id}"), Some(Value::Object(future))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, _, v) = send(&app, "GET", "/api/board/needsyou?all=1", None).await;
+    let q = v["queue"].as_array().unwrap();
+    let pos = |id: &str| q.iter().position(|r| r["id"] == json!(id)).expect("card in queue");
+    assert!(
+        pos(&old_id) < pos(&far_id),
+        "a future deadline must NOT jump the queue; only an arrived one does: {v}"
+    );
+    assert_eq!(v["overdue"], json!(1), "still one overdue, not two: {v}");
+
+    // CONTROL 2: the view names the population it does NOT consider, so a
+    // reader comparing against a raw board dump cannot mistake archived cards
+    // for live work the view dropped. That misreading is what this card came in as.
+    assert!(v["archived_excluded"].is_number(), "excluded population is stated: {v}");
+}

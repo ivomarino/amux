@@ -2689,7 +2689,7 @@ A block with no named cause is unfalsifiable: nobody else can tell when it clear
       # still needs add-then-retitle, which is exactly the two-step that made
       # the mistake natural. `retitle` already had these flags; `add`, the verb
       # you reach first, had none and said so nowhere reachable.
-      local title="" desc="" itype="" _src=""
+      local title="" desc="" itype="" due="" _src=""
       local -a deps=()
       while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -2715,9 +2715,23 @@ types: $(_board_valid_types)"
           # split written into prose on both cards.
           --depends-on)  [[ -n "${2:-}" ]] || die "usage: amux board add --depends-on <ISSUE-ID>"
                          deps+=("$2"); shift 2 ;;
+          # AF-424, reported by gtm-engine. The board has had a `due` column all
+          # along and the CLI could not set it, so lanes encoded urgency in the
+          # TITLE instead — "[ETHAN - 2min]", "[ETHAN]" — which no ranking, sweep
+          # or filter can read. Measured 2026-09-02: 119 of 404 needsyou cards
+          # carried a date, every one of them set through the raw API or the
+          # dashboard. Same shape as AF-242 one flag over: capability present and
+          # honoured by the server, reaching nobody because the sanctioned tool
+          # could not express it.
+          --due)         [[ -n "${2:-}" ]] || die "usage: amux board add --due <YYYY-MM-DD>"
+                         [[ "$2" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
+                           || die "--due wants YYYY-MM-DD, got '$2'
+The board compares dates as strings, so any other shape sorts wrong and reads as
+never-due rather than failing loudly."
+                         due="$2"; shift 2 ;;
           --help|-h)     _board_add_usage; return 0 ;;
           --*)           _board_bad_flag add "$1" \
-                           "--stdin --file <p> --desc <text> --desc-stdin --desc-file <p> --type <t> --depends-on <ID> --help" ;;
+                           "--stdin --file <p> --desc <text> --desc-stdin --desc-file <p> --type <t> --depends-on <ID> --due <YYYY-MM-DD> --help" ;;
           *)             title="${title:+$title }$1"; _src=1; shift ;;
         esac
       done
@@ -2725,7 +2739,7 @@ types: $(_board_valid_types)"
       local body result
       local _deps_joined=""
       [[ ${#deps[@]} -gt 0 ]] && _deps_joined=$(printf '%s\n' "${deps[@]}")
-      body=$(T="$title" S="${AMUX_SESSION:-}" D="$desc" TY="$itype" DEP="$_deps_joined" python3 -c 'import json,os
+      body=$(T="$title" S="${AMUX_SESSION:-}" D="$desc" TY="$itype" DEP="$_deps_joined" DUE="$due" python3 -c 'import json,os
 b = {"title": os.environ["T"].strip(), "status": "todo", "session": os.environ["S"]}
 d = os.environ.get("D", "")
 if d.strip(): b["desc"] = d
@@ -2736,6 +2750,10 @@ if t: b["type"] = t
 # that only checks the flag WORKS (AF-242).
 dep = [x.strip() for x in os.environ.get("DEP", "").split("\n") if x.strip()]
 if dep: b["depends_on"] = dep
+# ABSENT when unset, for the same reason as depends_on: an empty string is a
+# statement to the server, and "no deadline" is not one.
+due = os.environ.get("DUE", "").strip()
+if due: b["due"] = due
 print(json.dumps(b))')
       result=$(_curl -sk -X POST \
         -H 'Content-Type: application/json' \
