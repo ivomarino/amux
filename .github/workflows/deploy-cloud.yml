@@ -360,6 +360,21 @@ jobs:
 
       - name: Deploy gateway.py + compose template + litestream config
         run: |
+          # AC-410: a gateway rsync OVERWRITES the host gateway.py from this
+          # origin checkout. When a fix was hand-deployed to the host AHEAD of
+          # origin (the legit emergency pattern when foreign commits block a push),
+          # this silently REVERTS it, and the revert left no signal — it cost a
+          # full cycle to notice by md5 (AC-409 materialized exactly this on
+          # 2026-09-02). Make it self-announcing: if the host's current gateway.py
+          # differs from the one we are about to ship, say so with both hashes, so
+          # a revert is visible in the deploy log instead of discovered later. Not
+          # a hard stop (a normal old-host->new-origin update also differs, and
+          # this job cannot tell that from a revert without the host file's git
+          # ancestry) — a loud line is the honest instrument here.
+          SHIP=$(md5sum cloud/gateway/gateway.py | cut -d' ' -f1)
+          if [ -n "${PRE_GW_PY:-}" ] && [ "$PRE_GW_PY" != "$SHIP" ]; then
+            echo "::warning title=gateway.py overwrite::host gateway.py ($PRE_GW_PY) differs from the version being deployed ($SHIP). If the host copy was a hand-deploy ahead of origin, this rsync REVERTS it (AC-410) — confirm origin carries the intended gateway.py."
+          fi
           rsync --inplace -e "ssh -i ~/.ssh/amux_cloud" cloud/gateway/gateway.py \
             "root@$CLOUD_HOST:/opt/amux-cloud/gateway/gateway.py"
           rsync -e "ssh -i ~/.ssh/amux_cloud" cloud/docker/docker-compose.template.yml \
