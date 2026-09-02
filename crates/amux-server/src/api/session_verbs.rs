@@ -1720,6 +1720,86 @@ pub const GENERATIONS_WARN_AT: u32 = 20;
 /// be EXECUTED by a test rather than paraphrased by one (ethos rule 7: a test
 /// that restates the list is green whichever columns the shipped path
 /// actually touches).
+/// What a RENAME must do with a table keyed by a session name (AMUX-4033).
+pub enum RenameDisposition {
+    /// The rows are the lane's own state and must follow it. Orphaning them
+    /// silently changes the worker's behaviour under a cosmetic rename.
+    Migrate,
+    /// An append-only record of what happened UNDER THAT NAME. Rewriting it
+    /// would falsify history, so it deliberately keeps the old name. The string
+    /// is why, because "not in the list" and "deliberately excluded" look
+    /// identical to the next reader.
+    KeepForAudit(&'static str),
+}
+
+/// EVERY table with a session-name column, and its disposition.
+///
+/// THE LIST USED TO BE THE BUG. The cascade carried two hand-maintained arrays,
+/// and a table added later simply never joined them — no error, no warning, the
+/// rows just stopped being addressable. Measured 2026-09-02 while renaming
+/// `leadership-coaching`: 12 of 21 session-keyed tables were uncovered,
+/// including `token_ledger` (the lane's whole cost history) and
+/// `telegram_mappings` (chat routing, so messages would address a dead name).
+///
+/// `tests/rename_covers_every_session_table.rs` enumerates the schema BUILT FROM
+/// MIGRATIONS and fails on any table missing here, so the next one cannot join
+/// that gap quietly — the same argument AF-328 made for the issues fixture.
+pub const SESSION_SCOPED_TABLES: &[(&str, RenameDisposition)] = &[
+    // -- the lane's own state: must follow the rename --
+    ("issues", RenameDisposition::Migrate),
+    ("schedules", RenameDisposition::Migrate),
+    ("session_gates", RenameDisposition::Migrate),
+    ("saved_messages", RenameDisposition::Migrate),
+    ("steering_queue", RenameDisposition::Migrate),
+    ("steering_history", RenameDisposition::Migrate),
+    ("share_tokens", RenameDisposition::Migrate),
+    ("cmd_history", RenameDisposition::Migrate),
+    ("token_ledger", RenameDisposition::Migrate),
+    ("tasks", RenameDisposition::Migrate),
+    ("task_windows", RenameDisposition::Migrate),
+    ("telegram_mappings", RenameDisposition::Migrate),
+    ("mdai_runs", RenameDisposition::Migrate),
+    ("board_drive_nudge_state", RenameDisposition::Migrate),
+    ("dictation_history", RenameDisposition::Migrate),
+    ("reclaim_quarantine", RenameDisposition::Migrate),
+    ("send_dedup", RenameDisposition::Migrate),
+    // -- history written under the old name: keeps it, on purpose --
+    (
+        "session_events",
+        RenameDisposition::KeepForAudit(
+            "the rename journal entry links the old and new name, so the audit \
+             trail stays readable across the rename",
+        ),
+    ),
+    (
+        "logs",
+        RenameDisposition::KeepForAudit("a log line records who emitted it at the time"),
+    ),
+    (
+        "guard_verdicts",
+        RenameDisposition::KeepForAudit(
+            "AF-127 outcome rows exist to measure a false-positive rate over time; \
+             rewriting the actor would re-attribute past verdicts",
+        ),
+    ),
+    (
+        "reclaim_scans",
+        RenameDisposition::KeepForAudit("a scan is a dated observation, not live state"),
+    ),
+];
+
+/// The `Migrate` tables a plain `SET session=?1 WHERE session=?2` handles —
+/// everything except the ones [`RENAME_MIGRATIONS`] already covers with custom
+/// SQL (those filter on `deleted IS NULL` or touch a second column).
+pub fn simple_rename_tables() -> Vec<&'static str> {
+    const CUSTOM: [&str; 4] = ["issues", "schedules", "session_gates", "saved_messages"];
+    SESSION_SCOPED_TABLES
+        .iter()
+        .filter(|(t, d)| matches!(d, RenameDisposition::Migrate) && !CUSTOM.contains(t))
+        .map(|(t, _)| *t)
+        .collect()
+}
+
 pub const RENAME_MIGRATIONS: [(&str, &str); 6] = [
     ("issues", "UPDATE issues SET session=?1 WHERE session=?2 AND deleted IS NULL"),
     // BEYOND PYTHON, and the reason AMUX-3749 exists: the cascade
@@ -15134,12 +15214,22 @@ async fn rename_session(state: &AppState, name: &str, raw_new: &str) -> Response
                     Err(_) => out.push(format!("db.{table}: table absent (fresh home)")),
                 }
             }
-            for table in ["steering_queue", "steering_history", "share_tokens", "cmd_history"] {
-                let n = conn.execute(
+            // FROM THE DECLARED LIST, not a second hand-maintained array
+            // (AMUX-4033). This used to name four tables inline while the
+            // schema had seventeen that a rename must carry; the missing ones
+            // were not excluded, they were forgotten, and nothing said so.
+            for table in simple_rename_tables() {
+                match conn.execute(
                     &format!("UPDATE {table} SET session=?1 WHERE session=?2"),
                     rusqlite::params![new_s, old_s],
-                )?;
-                out.push(format!("db.{table}: {n} row(s)"));
+                ) {
+                    Ok(n) => out.push(format!("db.{table}: {n} row(s)")),
+                    // A table can legitimately be absent on an older home that
+                    // has not run every migration. Reported, never skipped in
+                    // silence — the whole failure being fixed here is a
+                    // silent skip.
+                    Err(e) => out.push(format!("db.{table}: not migrated ({e})")),
+                }
             }
             // prefs session_reports is keyed by NAME inside a JSON blob —
             // Python orphans it and the renamed lane loses its self-reported
@@ -15179,7 +15269,13 @@ async fn rename_session(state: &AppState, name: &str, raw_new: &str) -> Response
         return fail(&steps, format!("db reference migration failed (transaction rolled back): {e}"));
     }
     steps.extend(counts.lock().unwrap().iter().cloned());
-    steps.push("db.session_events: audit rows keep the old name (deliberate — the rename journal entry links them)".into());
+    // Say WHICH tables kept the old name and WHY, rather than naming one of
+    // them and leaving the rest to look like an oversight.
+    for (t, d) in SESSION_SCOPED_TABLES {
+        if let RenameDisposition::KeepForAudit(why) = d {
+            steps.push(format!("db.{t}: keeps the old name — {why}"));
+        }
+    }
     // 9. Re-export AMUX_SESSION for future panes (py:76416) — best-effort;
     //    the RUNNING shell keeps its env until restart, same as Python.
     if is_running(&new_name).await {

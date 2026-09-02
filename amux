@@ -99,6 +99,33 @@ if [[ -z "${AMUX_SESSION:-}" ]]; then
   unset _mr43_tname
 fi
 
+# AMUX-4033: a STALE $AMUX_SESSION, which the empty check above cannot see.
+#
+# Renaming a running worker moves its env file and renames its tmux session,
+# then re-exports AMUX_SESSION into the tmux SESSION environment — which only
+# reaches processes started afterwards. The agent already running in that pane
+# keeps the OLD name for its entire life, so every call it makes attributes to
+# a session that no longer exists. Measured 2026-09-02, one minute after
+# renaming leadership-coaching -> leadership-coach: the lane's own hooks posted
+# `leadership-coaching` and took an unbroken run of HTTP 404s.
+#
+# The correction is deliberately NARROW: only when the claimed name has NO
+# session file AND the pane's own name HAS one. That is the renamed case and
+# the typo case (a lane once ran 4h15m as `amax-gtm`, 138 reports, every one a
+# 404), and it cannot hijack a deliberate cross-session claim, because there the
+# claimed session exists and this leaves it alone.
+if [[ -n "${AMUX_SESSION:-}" && ! -f "$CC_HOME/sessions/$AMUX_SESSION.env" ]]; then
+  _stale_tname="$(tmux display-message -p '#S' 2>/dev/null || true)"
+  if [[ "$_stale_tname" == amux-* ]]; then
+    _stale_true="${_stale_tname#amux-}"
+    if [[ "$_stale_true" != "$AMUX_SESSION" && -f "$CC_HOME/sessions/$_stale_true.env" ]]; then
+      export AMUX_SESSION_STALE="$AMUX_SESSION"
+      export AMUX_SESSION="$_stale_true"
+    fi
+  fi
+  unset _stale_tname _stale_true
+fi
+
 # ── Colors (disabled when not a tty or TERM is dumb) ────────────────────────
 if [[ -t 1 ]] && [[ "${TERM:-dumb}" != "dumb" ]]; then
   BOLD=$'\033[1m' DIM=$'\033[2m' RESET=$'\033[0m'

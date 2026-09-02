@@ -24,6 +24,36 @@ if [ -z "$AMUX_SESSION" ]; then
     amux-*) export AMUX_SESSION="${TNAME#amux-}"; DERIVED=1 ;;
   esac
 fi
+# AMUX-4033: a STALE $AMUX_SESSION, which the empty check above cannot see.
+#
+# Renaming a running worker moves its env file and renames its tmux session,
+# then re-exports AMUX_SESSION into the tmux SESSION environment — and that only
+# reaches panes started afterwards. The agent already running keeps the OLD name
+# for its entire life, so every report it sends names a session that no longer
+# exists. Measured 2026-09-02, one minute after leadership-coaching became
+# leadership-coach: `leadership-coaching source=prompt-hook http=404` and
+# `source=stop-hook http=404`, while tmux itself already read leadership-coach.
+# The worker looked renamed and was quietly reporting nothing.
+#
+# The correction is NARROW on purpose: only when the claimed name has NO session
+# file AND the pane's own name HAS one. That covers the rename and the typo this
+# file's own POST block describes (4h15m as `amax-gtm`, 138 reports, every one a
+# 404, zero 200s). It cannot capture a deliberate cross-session claim, because
+# there the claimed session exists and this leaves it alone.
+CORRECTED=0
+if [ -n "$AMUX_SESSION" ] && [ ! -f "$HOME/.amux/sessions/$AMUX_SESSION.env" ]; then
+  _TN=$(tmux display-message -p '#S' 2>/dev/null)
+  case "$_TN" in
+    amux-*)
+      _TRUE="${_TN#amux-}"
+      if [ "$_TRUE" != "$AMUX_SESSION" ] && [ -f "$HOME/.amux/sessions/$_TRUE.env" ]; then
+        STALE_FROM="$AMUX_SESSION"
+        export AMUX_SESSION="$_TRUE"
+        CORRECTED=1
+      fi
+      ;;
+  esac
+fi
 [ -n "$AMUX_SESSION" ] || exit 0
 # ISOLATED WORKERS (AMUX-3232). An isolated worker has AMUX_SESSION stripped at
 # spawn, so DERIVED=1 is the discriminator. But "derived" also covers a real lane
@@ -179,6 +209,10 @@ fi
 # so appending before the final brace is safe and avoids a second place this
 # script can break on stdin shape (MR-43).
 [ "$DERIVED" = "1" ] && BODY="${BODY%\}}, \"amux_session_derived\": true}"
+# Same surgery, same reason: a rename that silently de-attributed a lane should
+# be COUNTABLE in /api/logs/analyze, not something a human notices weeks later
+# by wondering why a worker stopped reporting (ethos rule 4).
+[ "$CORRECTED" = "1" ] && BODY="${BODY%\}}, \"amux_session_corrected_from\": \"$STALE_FROM\"}"
 # X-Amux-Session stamps the write server-side (AMUX-1768). report_post's own
 # comment names its absence as the standing residual: "the shipped hooks send no
 # header, so an UNSTAMPED write is still accepted". This IS the shipped hook.
