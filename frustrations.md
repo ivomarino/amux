@@ -3386,3 +3386,43 @@ FIX: Installed on this box (running copy backed up first, both syntax-checked, t
   the honest fix is a drift check that fires without being remembered. The SessionStart
   freshness hook already does exactly that for the four installed git hooks and does not
   know this file exists.
+
+---
+
+## A PATCH rejected for its status silently discards the desc sent in the same body
+AREA: silent-partial
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-09-02
+SESSION: amux-frustrations
+CARD: AF-413
+SYMPTOM: `PATCH /api/board/AF-410 {"desc": <4.2 KB>, "type": "code", "status": "doing"}`
+  answered `{"blocked": true, "error": "gate not acknowledged", ...}` with a full
+  `how_to_ack` block. The desc was discarded. Nothing in the 900-byte response mentions
+  it — every field describes the STATUS transition, and `desc` does not appear.
+  Re-measured deliberately on a throwaway card (AF-412, deleted), with a different
+  rejection reason to show it is the shape and not one gate:
+    PATCH {"desc": "CANARY-TEXT-SHOULD-IT-SURVIVE", "status": "doing"}
+    -> {"blocked": true, "error": "already holding doing"}
+    -> read back: status "todo", desc ''
+  Both rejection paths drop the whole body.
+COST: ~3 minutes and one silent loss of a 4.2 KB card body I had just composed. Cheap
+  here only because I read the card back out of habit. The failure is invisible to a
+  caller who does not: the write returns a 200-shaped JSON object, the error names a
+  DIFFERENT field than the one that was lost, and a card body is exactly the kind of
+  thing nobody re-reads after writing it. A script doing `{"desc":..., "status":...}`
+  in one call loses every desc for every card whose gate is unmet and reports nothing.
+FIX: Atomicity is defensible and I am not asking for a partial write. Say so in the
+  response: one `discarded` key listing the fields that were not applied because the
+  transition was refused (`"discarded": ["desc", "type"]`). The refusal already builds a
+  rich object; the caller cannot infer from `error: "gate not acknowledged"` that an
+  unrelated field went with it. Ethos rule 4 in its exact shape — the payload cannot
+  express what was and was not applied, so a wrong outcome is not detectable from what
+  the caller keeps.
+  THIS IS THE MIRROR OF AF-150, in the same AREA and worth counting with it. There, a
+  compound operation took its SUCCESS signal from the parts that worked while one part
+  silently did nothing. Here it takes its FAILURE signal from one part and silently
+  discards another. Same defect, opposite sign: the response describes one component of
+  a multi-part operation and is read as describing all of them. Three entries under
+  `AREA: silent-partial` is the argument that compound operations need a uniform
+  per-field outcome, not a per-operation verdict.
