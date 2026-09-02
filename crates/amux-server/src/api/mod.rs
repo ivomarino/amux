@@ -65,6 +65,7 @@ pub mod scope;
 pub mod search;
 pub mod self_update;
 pub mod session_verbs;
+pub mod telegram;
 pub mod board_themes;
 pub mod lookup;
 pub mod orchestrate;
@@ -236,6 +237,7 @@ pub fn router(state: AppState) -> Router {
         .merge(habits::routes())
         .merge(observability::routes())
         .merge(connectors::routes())
+        .nest("/api/telegram", telegram::routes())
         .merge(grants::routes())
         .merge(self_update::routes())
         .nest("/api/proxies", proxies::routes())

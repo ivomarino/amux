@@ -316,6 +316,16 @@ if [[ "$OS" == "Linux" ]] && command -v systemctl &>/dev/null; then
   envsubst < "$SCRIPT_DIR/scripts/amux-builder.timer.template" \
     > "$SYSTEMD_DIR/amux-builder.timer" || die "failed to create amux-builder.timer"
 
+  # Xvfb: the virtual display every playwright-mcp lane launches Chromium
+  # against. No variables to fill (fixed ExecStart), but still routed
+  # through the template convention for consistency and so a fresh install
+  # gets it automatically instead of Xvfb being a silent prerequisite nobody
+  # wrote down (FRONT-4, 2026-08-31 — it had NO supervision anywhere before
+  # this, not a unit, not a cron, nothing; "something restarts it" turned out
+  # to mean nothing did, reliably).
+  envsubst < "$SCRIPT_DIR/scripts/amux-xvfb.service.template" \
+    > "$SYSTEMD_DIR/amux-xvfb.service" || die "failed to create amux-xvfb.service"
+
   # playwright-mcp: a template unit (%i = "<lane>-<port>"), one instance per
   # browser-automation lane. envsubst only needs to fill $SCRIPT_DIR here —
   # the wrapper script (amux-playwright-mcp.sh) resolves %i into a port and
@@ -324,6 +334,14 @@ if [[ "$OS" == "Linux" ]] && command -v systemctl &>/dev/null; then
     > "$SYSTEMD_DIR/amux-playwright-mcp@.service" || die "failed to create amux-playwright-mcp@.service"
   chmod +x "$SCRIPT_DIR/scripts/amux-playwright-mcp.sh"
 
+  # worker-start: brings every registered lane back after a reboot, not just
+  # one hardcoded lane (AMUX-49, 2026-08-31) -- ExecStart points straight at
+  # the repo copy (ships on save, same convention as the playwright wrapper
+  # above), no separate ~/.local/bin copy to fall out of sync.
+  envsubst '$BIN_DIR $SCRIPT_DIR' < "$SCRIPT_DIR/scripts/amux-worker-start.service.template" \
+    > "$SYSTEMD_DIR/amux-worker-start.service" || die "failed to create amux-worker-start.service"
+  chmod +x "$SCRIPT_DIR/scripts/amux-start-worker.sh"
+
   # Reload systemd to recognize the new units.
   systemctl --user daemon-reload || die "systemctl daemon-reload failed"
 
@@ -331,14 +349,18 @@ if [[ "$OS" == "Linux" ]] && command -v systemctl &>/dev/null; then
   say "  $SYSTEMD_DIR/amux-server.service"
   say "  $SYSTEMD_DIR/amux-builder.service"
   say "  $SYSTEMD_DIR/amux-builder.timer"
+  say "  $SYSTEMD_DIR/amux-xvfb.service (virtual desktop: Xvfb + VNC + openbox, for headed browser automation and human viewing)"
   say "  $SYSTEMD_DIR/amux-playwright-mcp@.service (template — one instance per lane)"
+  say "  $SYSTEMD_DIR/amux-worker-start.service (starts every registered lane on boot)"
   echo ""
   say "Next: enable and start the services"
   echo "  ${DIM}systemctl --user enable amux-server${RESET}"
   echo "  ${DIM}systemctl --user enable amux-builder.timer${RESET}"
+  echo "  ${DIM}systemctl --user enable amux-worker-start${RESET}"
   echo "  ${DIM}systemctl --user start amux-server${RESET}"
   echo ""
   say "Playwright MCP lanes (edit ports/lanes to match your fleet):"
+  echo "  ${DIM}systemctl --user enable --now amux-xvfb${RESET}"
   echo "  ${DIM}for i in frontstage-8931 synthesia-8932 backstage-8933 amux-8934 infra-8935; do${RESET}"
   echo "  ${DIM}  systemctl --user enable --now amux-playwright-mcp@\$i.service${RESET}"
   echo "  ${DIM}done${RESET}"
