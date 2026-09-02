@@ -4656,7 +4656,21 @@ pub async fn patch_item(
                                         "why": "A card cannot be marked done without pointing at the artifact it produced: a URL, a repo file path, a commit sha, or a #PR/issue. This is a global constraint and gate_ack cannot satisfy it.",
                                         "how_to_fix": {
                                             "add_link": "PATCH /api/board/<id> with a desc containing the URL / file path / commit / #PR, then retry done.",
-                                            "or_evidence": "--evidence naming the artifact satisfies this gate too (a command, path, URL, sha or #PR). This card's evidence is empty or has nothing checkable in it.",
+                                            // A COMMAND IS NOT ACCEPTED HERE, and this string used to say it was (AF-406).
+                                            // Control-tested 2026-09-02 on a throwaway card, all three
+                                            // through `amux board done --evidence-stdin`:
+                                            //   a command (curl -sk "$AMUX_URL/api/logs/analyze?...") -> BLOCKED
+                                            //   a repo path (crates/.../request_log.rs)              -> ACCEPTED
+                                            //   a sha (ccefbcb6)                                     -> ACCEPTED
+                                            // So the detector works and the one shape this text
+                                            // advertised first was the one it rejects. That is a
+                                            // documented escape that fails when walked (ethos rule 6),
+                                            // shown to every lane that hits this gate -- 292 refusals
+                                            // across 27 lanes in the 24h before this was found.
+                                            // Whether a command SHOULD count as an artifact is a
+                                            // separate question and belongs to whoever owns the gate;
+                                            // this only stops the message promising it.
+                                            "or_evidence": "--evidence naming the artifact satisfies this gate too (a repo path, URL, sha or #PR). A bare command does NOT: it says how to reproduce the finding, not what the work created. This card's evidence is empty or has nothing checkable in it.",
                                             "no_artifact": "If the work genuinely produced none, say so: evidence starting `none: <reason>` (three words or more) is accepted and counted, not a bypass.",
                                             "override_for_this_worker": "set AMUX_DONE_LINK_REQUIRED=0 in this worker's (or its group's, or the global) scope env — Scope tab.",
                                             "force": "true (explicit bypass; logged)"
