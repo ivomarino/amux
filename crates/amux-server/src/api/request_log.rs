@@ -683,7 +683,7 @@ pub fn routes() -> Router<AppState> {
 /// Additive params (not sent by the SPA today, needed by the daily sweep —
 /// docs/rust-migration/log-sweep.md): `worker` (the per-worker subset),
 /// `since` + `until` (unix ts, a HALF-OPEN window `since < ts <= until`),
-/// `family`, `min_status`, `answered_by`. Additive response field:
+/// `family`, `min_status`, `max_status`, `answered_by`. Additive response field:
 /// `total_matched` — the pre-LIMIT count, so volume questions are
 /// answerable without paging (the page-vs-corpus trap).
 ///
@@ -770,6 +770,24 @@ async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String,
     }
     if let Some(ms) = q.get("min_status").and_then(|v| v.parse::<i64>().ok()) {
         clauses.push("status >= ?".into());
+        params.push(ms.into());
+    }
+    // `max_status`, the other half of a status BAND (AF-402).
+    //
+    // The sweep contract's step 4 says "keep status 401/403", and a reader who
+    // expresses that as `min_status=403&max_status=403` got a SUPERSET with no
+    // signal: on 2026-09-02 that returned 1448 rows, identical to `min_status=401`
+    // alone, and `max_status=403` by itself returned 82,639 of 82,640. An ignored
+    // filter is worse than an absent one, because the response looks like an
+    // answer. It cost this sweep a session breakdown of "403 rows" that was
+    // actually every error in the window, caught only because the count happened
+    // to equal a number seen a step earlier.
+    //
+    // Unknown params are silently dropped by design here, which is right for
+    // forward compatibility and is exactly what made this invisible. The fix is to
+    // make the param real rather than to start rejecting unknown ones.
+    if let Some(ms) = q.get("max_status").and_then(|v| v.parse::<i64>().ok()) {
+        clauses.push("status <= ?".into());
         params.push(ms.into());
     }
     if let Some(a) = q.get("answered_by").filter(|s| !s.is_empty()) {
@@ -3164,6 +3182,56 @@ mod tests {
         .await;
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["events"], json!([]), "no memory traffic seeded, so no rows");
+
+        // STATUS BAND: max_status must BOUND, not be silently dropped (AF-402).
+        //
+        // The sweep contract's step 4 says "keep status 401/403". A reader who
+        // wrote that as `min_status=403&max_status=403` used to get every error
+        // in the window back, because unknown params are dropped by design and
+        // an ignored filter returns a superset that LOOKS like an answer. On
+        // 2026-09-02 it returned 1448 rows, identical to `min_status=401` alone.
+        //
+        // The two seeded rows are both 200s, so the discrimination is asserted
+        // on the direction that can be seeded here: an upper bound that EXCLUDES
+        // must return nothing, and one that INCLUDES must return the rows. A
+        // dropped param passes the second and fails the first, which is why both
+        // are here rather than only the happy one.
+        let (_, body) = hit(
+            &api,
+            HttpRequest::builder().uri("/api/logs?max_status=199").body(Body::empty()).unwrap(),
+        )
+        .await;
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["events"],
+            json!([]),
+            "max_status=199 must EXCLUDE the seeded 200s; an ignored param returns them: {v}"
+        );
+        assert_eq!(v["total_matched"], 0, "total_matched must respect the bound too: {v}");
+
+        let (_, body) = hit(
+            &api,
+            HttpRequest::builder().uri("/api/logs?max_status=299").body(Body::empty()).unwrap(),
+        )
+        .await;
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            !v["events"].as_array().unwrap().is_empty(),
+            "max_status=299 must INCLUDE the seeded 200s, or the bound is inverted: {v}"
+        );
+
+        // And the band closes from both ends at once, which is the shape the
+        // contract actually asks for.
+        let (_, body) = hit(
+            &api,
+            HttpRequest::builder()
+                .uri("/api/logs?min_status=300&max_status=399")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["events"], json!([]), "a 3xx band must not match seeded 200s: {v}");
     }
 
     #[tokio::test]
