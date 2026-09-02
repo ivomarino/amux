@@ -487,10 +487,49 @@ pub(crate) async fn path_fate(
         // talks the victim out of checking while the pending commit would
         // revert their landed lines). Worktree-clean AND index-clean against
         // origin, or it stays AtRisk.
-        if git_out(dir, &["diff", "--quiet", "origin/main", "--", path]).await.is_some()
-            && git_out(dir, &["diff", "--quiet", "--cached", "origin/main", "--", path])
+        // AF-421: THE INDEX CONDITION ONLY BITES WHEN THE PATH IS STAGED.
+        //
+        // The index guard above is right about its hazard and wrong about its
+        // scope. It exists because the commit takes the STAGED blob, so an index
+        // holding a pre-graft copy would revert landed lines while the receipt
+        // talked the victim out of checking. That hazard needs the path to be IN
+        // the pending commit. For an UNSTAGED path the index simply mirrors
+        // local HEAD — nothing will be committed for it, and there is nothing to
+        // revert.
+        //
+        // And local HEAD is exactly what never advances on a graft-push
+        // checkout, which is the checkout class AMUX-3445 added this rescue FOR.
+        // So `index == origin/main` is structurally unsatisfiable there for
+        // every path the lane has not staged, and the rescue could not fire on
+        // the lanes it was written for.
+        //
+        // MEASURED on the mirror checkout, 2026-09-02, reported by
+        // mixpeek-general:
+        //     276  paths dirty vs local HEAD
+        //     181  worktree byte-identical to origin/main (landed)
+        //       5  reached LandedOnOrigin
+        //     176  landed, NOT STAGED AT ALL, reported "your WORK is at risk"
+        // Their specimen, customers/tubescience/archived/2026-07-07-iconik-sync-
+        // evidence.md: worktree and origin/main both bdf5759be7, index and local
+        // HEAD both d3c6f395b0. Cond1 passes, cond2 fails, and the file is one
+        // they had never opened.
+        //
+        // THE LOUD DIRECTION IS STILL THE DEFAULT. A staged path must still
+        // match origin on BOTH trees, so backend's amendment specimen — worktree
+        // == origin while the index held a pre-graft copy 44 lines behind —
+        // stays AtRisk exactly as before.
+        //
+        // `git diff --cached --quiet HEAD` exits nonzero when there IS a staged
+        // change, and `git_out` is None on nonzero exit, so `is_none()` reads as
+        // "this path is staged".
+        let path_is_staged =
+            git_out(dir, &["diff", "--cached", "--quiet", "HEAD", "--", path]).await.is_none();
+        let index_ok = !path_is_staged
+            || git_out(dir, &["diff", "--quiet", "--cached", "origin/main", "--", path])
                 .await
-                .is_some()
+                .is_some();
+        if git_out(dir, &["diff", "--quiet", "origin/main", "--", path]).await.is_some()
+            && index_ok
         {
             let sha = git_out(dir, &["log", "origin/main", "-1", "--format=%h", "--", path])
                 .await
@@ -3363,14 +3402,33 @@ mod tests {
         let graft = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout).unwrap().trim().to_string();
         git(&["update-ref", "refs/remotes/origin/main", &graft]);
         git(&["reset", "-q", "--hard", &base]);
+        // AF-421: THE TRAP ARM NOW STAGES, because backend's real case did.
+        //
+        // This arm used to rely on `reset --hard` leaving the index at v1 and
+        // call that "the pre-graft blob". It is — but it is there because
+        // NOTHING IS STAGED, not because anyone staged a stale copy, and those
+        // two are different states that `--cached vs origin` cannot separate.
+        // The amendment's own commit message (33b92a51) says which one backend
+        // measured: "worktree == origin while the STAGED blob sat 44 lines
+        // behind (a pre-graft copy) ... the commit takes the STAGED blob".
+        //
+        // The unstaged reading made this arm assert a hazard that no commit
+        // shape can produce. `git commit` omits an unstaged path; `git commit
+        // -a` stages the worktree, which IS origin's content; and graft-push
+        // builds a PRIVATE index (`GIT_INDEX_FILE`, `read-tree origin/main`)
+        // taking each named path's blob from the COMMIT via
+        // `git rev-parse "$SHA:$p"` — it never reads the shared index at all.
+        // Verified in mixpeek's scripts/graft-push.sh; the leg-13 comment there
+        // states the same property, which is why a peer's WIP cannot reach
+        // origin. Reported by mixpeek-general, whose checkout had 176 landed,
+        // unstaged paths reading "your WORK is at risk" against 5 receipts.
+        //
+        // So: stage a blob that differs from BOTH head and origin, which is
+        // backend's measured state, and the trap keeps biting exactly where the
+        // amendment intended.
+        std::fs::write(dir.path().join("grafted.txt"), "pre-graft copy, 44 lines behind\n").unwrap();
+        git(&["add", "grafted.txt"]);
         std::fs::write(dir.path().join("grafted.txt"), "landed v2\n").unwrap();
-        // backend's amendment, THE TRAP ARM: worktree == origin bytes but the
-        // INDEX still holds the pre-graft blob (reset --hard left it at v1).
-        // The commit takes the staged blob, so committing HERE would revert
-        // the landed lines — a receipt on this state talks the victim out of
-        // checking. Must stay AtRisk. (The first fix's own fixture sat in
-        // exactly this state and asserted the receipt, which is the proof the
-        // amendment was needed.)
         assert_eq!(
             path_fate(&d, "grafted.txt", "backend", 3600, "firsthand").await,
             PathFate::AtRisk,
@@ -3388,6 +3446,89 @@ mod tests {
         // at-risk case, and it must stay loud.
         std::fs::write(dir.path().join("grafted.txt"), "novel v3, uncommitted\n").unwrap();
         assert_eq!(path_fate(&d, "grafted.txt", "backend", 0, "firsthand").await, PathFate::AtRisk);
+    }
+
+    /// AF-421, rebuilt from the mirror checkout's real state (mixpeek-general,
+    /// 2026-09-02).
+    ///
+    /// A graft-push lane ships by pushing a dangling commit built from origin
+    /// bytes, so its local HEAD never advances. Every untouched file therefore
+    /// reads dirty-vs-HEAD forever, which is what AMUX-3445's `LandedOnOrigin`
+    /// rescue exists to forgive. But that rescue also required the INDEX to
+    /// match origin — and for a path the lane has not staged, the index mirrors
+    /// local HEAD, which is exactly the ref that never advances. So the rescue
+    /// was unsatisfiable on the checkout class it was written for.
+    ///
+    /// Measured there: 276 paths dirty vs HEAD, 181 byte-identical to
+    /// origin/main, 5 reaching LandedOnOrigin, 176 landed-and-unstaged reported
+    /// as "your WORK is at risk".
+    #[tokio::test]
+    async fn a_landed_unstaged_path_is_a_receipt_even_when_the_index_trails_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_string_lossy().to_string();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(&d).output().unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+
+        // Local HEAD holds the OLD bytes and stays there — the graft-push shape.
+        std::fs::write(dir.path().join("doc.md"), "old\n").unwrap();
+        git(&["add", "doc.md"]);
+        git(&["commit", "-q", "-m", "old"]);
+        // origin/main carries the LANDED bytes, ahead of local HEAD.
+        std::fs::write(dir.path().join("doc.md"), "landed\n").unwrap();
+        git(&["add", "doc.md"]);
+        git(&["commit", "-q", "-m", "landed"]);
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(&["reset", "-q", "--hard", "HEAD~1"]); // local HEAD back to `old`
+        // The worktree carries origin's bytes; the index is NOT touched, so it
+        // mirrors local HEAD. This is the untouched-file state, not a staged one.
+        std::fs::write(dir.path().join("doc.md"), "landed\n").unwrap();
+
+        // PREMISES, asserted so the arms below cannot be vacuously green.
+        assert!(
+            git_out(&d, &["diff", "HEAD", "--name-only", "--", "doc.md"])
+                .await
+                .map(|o| !o.trim().is_empty())
+                .unwrap_or(false),
+            "fixture must be dirty vs local HEAD, or AtRisk is never reached"
+        );
+        assert!(
+            git_out(&d, &["diff", "--quiet", "origin/main", "--", "doc.md"]).await.is_some(),
+            "fixture worktree must equal origin/main"
+        );
+        assert!(
+            git_out(&d, &["diff", "--quiet", "--cached", "origin/main", "--", "doc.md"])
+                .await
+                .is_none(),
+            "fixture INDEX must differ from origin — that is the whole defect"
+        );
+
+        match path_fate(&d, "doc.md", "peer", 0, "firsthand").await {
+            PathFate::LandedOnOrigin(sha) => assert!(!sha.is_empty(), "receipt carries origin's sha"),
+            other => panic!("landed and unstaged is a receipt, not an alarm: {other:?}"),
+        }
+
+        // CONTROL, and the one that keeps the loud direction default: STAGE a
+        // blob that differs from origin. Now the path IS in the pending commit
+        // and would revert the landed bytes, which is backend's amendment
+        // specimen. It must stay AtRisk.
+        std::fs::write(dir.path().join("doc.md"), "pre-graft copy\n").unwrap();
+        git(&["add", "doc.md"]);
+        std::fs::write(dir.path().join("doc.md"), "landed\n").unwrap();
+        assert_eq!(
+            path_fate(&d, "doc.md", "peer", 0, "firsthand").await,
+            PathFate::AtRisk,
+            "a STAGED blob differing from origin is the revert-in-waiting and stays loud"
+        );
+
+        // CONTROL 2: worktree differing from origin is still the genuine
+        // at-risk case, staged or not.
+        git(&["reset", "-q"]);
+        std::fs::write(dir.path().join("doc.md"), "novel local work\n").unwrap();
+        assert_eq!(path_fate(&d, "doc.md", "peer", 0, "firsthand").await, PathFate::AtRisk);
     }
 
     /// AMUX-3677, rebuilt from the notice's own text and the repo state that
