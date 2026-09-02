@@ -110,9 +110,9 @@ live and is currently faster on the Mixpeek side.
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-08-31
-OCCURRENCES: 2
-LAST_SEEN_NOTE: re-measured 2026-08-31
+LAST_SEEN: 2026-09-01
+OCCURRENCES: 3
+LAST_SEEN_NOTE: re-measured 2026-09-01, and it is GROWING
 SIGNALS: board-resting:*:needsyou
 FIX_SITE: board status gate; `needsyou` requires a typed `--ask`
 CARDS: AF-318
@@ -137,6 +137,12 @@ One datapoint from this lane on the other side of it: four cards in this lane's 
 question asked four times. Consolidating them to a single card is the per-lane
 version of what the gate does globally.
 
+Re-measured 2026-09-01: Mixpeek `needsyou` is 313 cards, median age 17.0 days,
+70% over a week old, oldest 60.9 days, and +93 against the 220 open seven days
+ago. It is not resting, it is GROWING at roughly 13 cards a day. The typed-ask
+schema reached that board (see above) and the gate still has not, so the queue
+keeps taking cards that ask nobody anything.
+
 ## Nudging is the dominant channel and the loop has no negative feedback
 SCOPE: both
 STATUS: open
@@ -160,24 +166,84 @@ a day is the argument that AF-319 is a mechanism fix, not a wording fix.
 
 ## Verification is something Ethan has to demand, every single time
 SCOPE: both
-STATUS: absorbed
+STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-08-30
-OCCURRENCES: 2
+LAST_SEEN: 2026-09-01
+OCCURRENCES: 3
 SIGNALS: rule-restatement:verification, rule-restatement:evidence
-FIX_SITE: VERIFY.md per repo + evidence required on `done` (shipped for amux)
-CARDS: AF-321
+FIX_SITE: NOT prose, and NOT a new mechanism. See AF-393: the push exists, the
+naming is enforced where a group asks for it, and the open question is whether the
+FLEET DEFAULT gate should ask for a peer at all.
+CARDS: AF-321, AF-393
 EVIDENCE: he re-dictated what verification means 7 times in 34 hours. The gate
 now refuses `done` without evidence in amux. Mixpeek has no equivalent gate, so
 watch whether the restatements migrate there. The class was still active on
 2026-08-30 with 4 hits, all Mixpeek-side.
+STATUS MOVED BACK TO open ON 2026-09-01, and that is the finding rather than a
+bookkeeping change. The theme was marked `absorbed` on 2026-08-30 because the
+prose and the amux evidence gate shipped. The next measurement is
+`rule-restatement:verification` n=16 against a 3.46/day baseline: FOUR AND A HALF
+TIMES it, the highest reading this file has recorded for any class, and it went up
+AFTER absorption. 10 of 16 Mixpeek, 3 amux, 3 other, so it is not one repo's gap.
+The file's own warning about `absorbed` ("nine of the ten themes existed as correct
+prose BEFORE they were measured, and the prose lost") is now measured on itself.
+WHAT THE EVIDENCE SAYS THE MECHANISM IS. Ethan names it himself in MSG-37657:
+"figure out why this wasn't automatically verified as part of the board gate". The
+gate is not the missing piece and adding prose is not either. Measured across the
+fleet the same day: 2260 cards are `verified`, so the gate is satisfiable at scale,
+and tubescience runs 95% verified across 619 of them. The distribution is bimodal,
+not low: amux-cloud 75%, amux-gtm 64%, amux-homepage 39%, amux-frustrations 16%,
+amux 3%, all under the SAME group gate. The lanes with huge `done` piles are the
+ones that never ASK a peer, and nothing in the system asks for them. Verification
+is pull-only; every hit above is Ethan doing the routing by hand.
+Confirmed from the inside on 2026-09-01: this lane sent two verification requests
+carrying the reproduce command, the expected output and a mutation to run. Six
+cards cleared in one round trip, by amux-cloud and amux-homepage, both of whom had
+spare capacity the whole time. The ask was the only missing step.
+
+CORRECTED SAME DAY, 2026-09-01, and the correction is the more useful finding.
+This theme's first version said "nothing routes a done card to a verifier". Wrong:
+`reviewer` is a real field with a real push behind it, `reviewer_notify` in
+board.rs and a reviewer nudge in board_drive.rs firing on `status == review AND
+reviewer == you`. Measured across the whole board:
+
+  done      2483 cards,  225 with a reviewer named   ( 9%)
+  verified  2271 cards,  233 with a reviewer named   (10%)
+  review      32 cards,    4 with a reviewer named   (12%)
+
+The mechanism is built, wired and unused. 2038 of 2271 cards reached `verified`
+without ever naming a reviewer, and only 32 cards are in `review` at all.
+So the defect is one layer over: the verified gate's own criterion is "Peer-reviewed
+by a DIFFERENT worker (NAME THEM)", and 90% name them only in free-text evidence.
+The board cannot answer "who verified this?" as data, which makes every
+verification ratio in this file uncheckable, including the ones above. That is
+ethos rule 4 inside the gate that exists to enforce evidence: the answer is
+required, supplied, and stored where nothing can read it.
+
+CORRECTED TWICE ON 2026-09-01, and the second correction retires the number in the
+first. The "90% of verified cards name no reviewer" figure above compared across
+gates that ask different things. The "name them" criterion exists only in the
+group:amux gate; the fleet default has no peer criterion at all. Read from three of
+today's unnamed cards: TG-3341 and MS-1266 resolve to ["Outcome confirmed to still
+hold"], SP-650 to [CI green, deployed to prod, confirmed working in prod, zero
+regressions]. None asks for a second party, so those lanes are not evading
+anything.
+So 90% measured compliance with a criterion 90% of those cards were never subject
+to: the instrument comparing across populations that are not comparable, committed
+by this sweep, in the file that exists to catch that class.
+WHAT SURVIVES, narrowly: the group:amux gate is enforced and works (amux-cloud's
+first verify today was REFUSED for a missing reviewer and all eight of today's
+verifications carry the field as data). And amux itself is inside group:amux at 3%
+verified over 351 done, so that backlog is a real compliance gap rather than a gate
+mismatch. The theme stays open on that, and on the 4.6x restatement rate, not on
+the 90%.
 
 ## Access and credential gaps surface mid-task, never before
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-08-31
-OCCURRENCES: 1
+LAST_SEEN: 2026-09-01
+OCCURRENCES: 2
 SIGNALS: rule-restatement:permissions, ledger-cluster:auth-secrets
 FIX_SITE: a preflight that names required credentials before a lane starts
 CARDS: AF-372
@@ -192,19 +258,46 @@ connector for gmail access and granola" (hoichoi, 11:00) arrives when the work i
 already underway, not before it. Carded as AF-372 rather than written as more
 prose, because two files already say it and the signal is at 6.5x anyway.
 
+Re-measured 2026-09-01: `rule-restatement:permissions` fired 4 times against a
+0.85/day baseline, 4.7x, spanning both repos (2 amux / 1 mixpeek / 1 other). Every
+specimen is mid-task again, and two of the four are the SAME session asking twice
+in 54 minutes (MSG-37628 07:34, MSG-37678 08:28), the second one asking for the
+list to be written into a README so a human can enable them up front. That is the
+preflight this theme has been asking for, requested by Ethan in his own words.
+
 ## Instruments that lie: the single largest cluster in either ledger
 SCOPE: both
-STATUS: absorbed
+STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-08-30
-OCCURRENCES: 2
+LAST_SEEN: 2026-09-01
+OCCURRENCES: 3
 SIGNALS: ledger-cluster:instruments, rule-restatement:instrument-lies
 FIX_SITE: the `measured`/`n_considered` contract + `tests/diagnostic_contract.rs`
-CARDS: AF-320
+CARDS: AF-320, AF-394
 EVIDENCE: 41 of 83 amux ledger entries are an instrument that could not express
 its own failure. Re-measured 2026-08-30 across both repos: 99 open entries in
 this class, 19 amux / 80 Mixpeek. The contract is enforced for new amux
 diagnostic routes only, which is why this stays open on the Mixpeek side.
+2026-09-01: THIS THEME'S OWN SIGNAL WAS UNDERCOUNTING IT, which is the class
+happening to the instrument that measures the class. `ledger-cluster:instruments`
+read QUIET on the 11:05 scan while three fresh instances of the shape sat in the
+same output under `engine` and `api-contract`.
+Cause, and it corrects the card that filed it (AF-394): AREA_CANON is
+first-match-wins over a title that leads with its subsystem, but REORDERING would
+have fixed nothing. 16 open entries across both ledgers describe a success report
+contradicted by an empty result, and only 3 of them contain any word from the
+instruments arm at all. The failure was vocabulary, not ordering, and those 16
+were scattered over seven clusters.
+Fixed by an ADDITIONAL cross-cutting membership rather than a reorder or a full
+multi-label canon, both of which were measured before being rejected: reordering
+steals entries from the subsystem clusters and moves their trailing baselines, and
+letting every AREA_CANON arm apply independently gives 2.08 labels per entry, with
+`doc` matching every entry that says "documents" (8 -> 156). The shipped change
+moves exactly one cluster: instruments 103 -> 117, 17 of 18 others untouched, 1145
+labels over 1131 entries. The signal now fires at n=4 in a 1-day window.
+STATUS MOVED BACK TO open: this was `absorbed` on the strength of the amux
+diagnostic-route contract, and the Mixpeek side is where the class actually lives
+(80 of 99 last time, and 4 of 4 new entries today are Mixpeek).
 
 ## A fix ships, its tests pass, and it does nothing in production
 SCOPE: amux

@@ -383,6 +383,15 @@ async fn async_main() {
     // pipe-pane reconciler (AMUX-2671). `pipe-pane` is attached in
     // start_session and nowhere else, so a pane that loses its writer stays
     // unlogged forever — indistinguishable from a lane that was never started.
+    // Owner-theme inference for the ranked inbox (AMUX-3998). One meta-model
+    // call per 6h at most, and it no-ops when the stored themes are still fresh
+    // so a restart does not buy one.
+    jobs::spawn_loop(
+        jobs::ids::EMAIL_THEMES,
+        Some(secs(api::email_intel::THEME_REFRESH_SECS)),
+        api::email_intel::theme_refresh_loop(),
+    );
+
     jobs::spawn_loop(
         jobs::ids::PIPE_RECONCILE,
         Some(secs(api::session_verbs::PIPE_RECONCILE_SECS)),

@@ -267,29 +267,36 @@ const MIGRATIONS: &[Migration] = &[
         name: "0048_issues_waiting_on",
         sql: include_str!("../../migrations/0048_issues_waiting_on.sql"),
     },
-    // Renumbered from 35-38 (collision with main's own 35-48, which had
-    // moved on well past where this branch forked) — the contributor-
-    // collision case this pattern has hit repeatedly on this repo; see
-    // versions_are_dense_and_match_their_filenames.
+    // Renumbered from 35-38, then AGAIN from 49-52 (second collision, same
+    // contributor-collision case this pattern has hit repeatedly on this
+    // repo — main's own 0049_email_annotations landed independently while
+    // this branch also claimed 49; see versions_are_dense_and_match_their_
+    // filenames). This branch's telegram migrations are the losing side
+    // both times, renumbered to the next free slots after main's 49.
     Migration {
         version: 49,
-        name: "0049_telegram",
-        sql: include_str!("../../migrations/0049_telegram.sql"),
+        name: "0049_email_annotations",
+        sql: include_str!("../../migrations/0049_email_annotations.sql"),
     },
     Migration {
         version: 50,
-        name: "0050_telegram_relay",
-        sql: include_str!("../../migrations/0050_telegram_relay.sql"),
+        name: "0050_telegram",
+        sql: include_str!("../../migrations/0050_telegram.sql"),
     },
     Migration {
         version: 51,
-        name: "0051_telegram_routed_session",
-        sql: include_str!("../../migrations/0051_telegram_routed_session.sql"),
+        name: "0051_telegram_relay",
+        sql: include_str!("../../migrations/0051_telegram_relay.sql"),
     },
     Migration {
         version: 52,
-        name: "0052_telegram_relay_dedup",
-        sql: include_str!("../../migrations/0052_telegram_relay_dedup.sql"),
+        name: "0052_telegram_routed_session",
+        sql: include_str!("../../migrations/0052_telegram_routed_session.sql"),
+    },
+    Migration {
+        version: 53,
+        name: "0053_telegram_relay_dedup",
+        sql: include_str!("../../migrations/0053_telegram_relay_dedup.sql"),
     },
 ];
 

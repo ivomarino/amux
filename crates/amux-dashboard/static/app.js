@@ -3970,10 +3970,41 @@ function toggleTabCustomizer() {
   if (_tabCustomizerOpen) {
     _renderTabCustomizerMenu();
     menu.style.display = '';
+    _capTabCustomizerHeight(menu);
     _tabCustBeacon(menu, 'global');
   } else {
     menu.style.display = 'none';
   }
+}
+
+// Keep the open menu inside the viewport (AC-403).
+//
+// The desktop rule had no max-height and no overflow, so 21 rows rendered 680px
+// tall from an anchor at y=342 and ran 222px past an 800px fold. BODY computes
+// to a clipper (overflow-x:clip pairs overflow-y down from visible), so the rows
+// past the fold are not merely below the scroll, they are CLIPPED: the menu's
+// boundingBox still looks correct, which is why every box assertion passed while
+// the last rows were invisible. The mobile bottom-sheet at <=600px got
+// `max-height: 60vh; overflow-y: auto` when it was written; the desktop rule
+// never did.
+//
+// MEASURED, NOT GUESSED AT, because a static cap cannot be right. 60vh from that
+// anchor is 480px and lands at 822, still 22px over — which is exactly the
+// overflow the e2e run reported, so the obvious CSS-only fix reproduces the bug
+// at a smaller size. The cap has to come from where the menu actually opens.
+//
+// Set as a custom property rather than an inline max-height so the media query's
+// bottom-sheet rule still wins on mobile, where the anchor is irrelevant.
+function _capTabCustomizerHeight(menu) {
+  try {
+    const top = menu.getBoundingClientRect().top;
+    // 12px of breathing room at the fold, and the iOS home indicator inset,
+    // which css-mobile.md requires for anything reaching a screen edge.
+    const inset = parseFloat(getComputedStyle(document.documentElement)
+      .getPropertyValue('--safe-bottom')) || 0;
+    const avail = Math.max(120, window.innerHeight - top - 12 - inset);
+    menu.style.setProperty('--tc-max-h', avail + 'px');
+  } catch (e) { /* a cap we cannot compute must not stop the menu opening */ }
 }
 
 function _renderTabCustomizerMenu() {
@@ -8262,7 +8293,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.761';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.769';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -11582,7 +11613,16 @@ async function _approvalsRefresh() {
     if (!r.ok) return;
     const d = await r.json();
     const pending = Array.isArray(d.pending) ? d.pending : [];
-    if (!pending.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
+    // PERMISSION GRANTS SHARE THIS BANNER (AMUX-3997). Ethan asked for the email
+    // approval flow to be leveraged for other ad-hoc permissions, and "leverage"
+    // has to include the SURFACE: a second banner elsewhere would mean a human
+    // has two places to look before knowing whether anything is waiting.
+    let grants = [];
+    try {
+      const gr = await fetch(API + '/api/grants', { headers: _authHeaders() });
+      if (gr.ok) { const gd = await gr.json(); grants = Array.isArray(gd.pending) ? gd.pending : []; }
+    } catch (e) { /* the email queue still renders if grants are unreachable */ }
+    if (!pending.length && !grants.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
     // COLLAPSIBLE (Ethan, 2026-08-25: "i should be able to collapse this").
     //
     // This is a full-width block at the top of a mobile-first dashboard, and it
@@ -11617,12 +11657,32 @@ async function _approvalsRefresh() {
       + 'title="' + (collapsed ? 'Show the drafts' : 'Collapse') + '">'
       + '<span style="display:inline-block;width:1em;transition:transform .12s;'
       + 'transform:rotate(' + (collapsed ? '-90' : '0') + 'deg);">&#x25BE;</span>'
-      + '<span>&#x2709;&#xFE0F; ' + pending.length + ' external email'
-      + (pending.length === 1 ? '' : 's') + ' held for your approval</span></div>';
+      + '<span>' + _apprHeadline(pending.length, grants.length) + '</span></div>';
     if (collapsed) {
       el.innerHTML = html + '</div>';
       el.style.display = 'block';
       return;
+    }
+    for (const g of grants) {
+      const gp = g.payload || {};
+      const gmins = Math.max(1, Math.round((g.expires_in_s || 0) / 60));
+      html += '<details open style="margin:4px 0;text-align:left;">'
+        + '<summary style="cursor:pointer;display:flex;align-items:center;gap:10px;min-height:34px;">'
+        + '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'
+        + '&#x1F511; <b>' + esc(g.requested_by || '?') + '</b> wants to message <b>'
+        + esc(gp.target || '?') + '</b> across a group boundary</span>'
+        + '<span style="opacity:0.7;font-size:0.76rem;">expires in ' + gmins + 'm</span>'
+        + '<button onclick="event.preventDefault();_grantApprove(\'' + esc(g.id) + '\',this)" '
+        + 'style="background:#16a34a;color:#fff;border:none;border-radius:6px;'
+        + 'padding:8px 14px;font-size:0.8rem;cursor:pointer;min-height:34px;">Allow once</button>'
+        + '<button onclick="event.preventDefault();_grantReject(\'' + esc(g.id) + '\',this)" '
+        + 'style="background:transparent;color:#fff;border:1px solid rgba(255,255,255,0.45);'
+        + 'border-radius:6px;padding:8px 14px;font-size:0.8rem;cursor:pointer;'
+        + 'min-height:34px;min-width:44px;">Deny</button>'
+        + '</summary>'
+        + '<div style="white-space:pre-wrap;word-break:break-word;background:rgba(0,0,0,0.25);'
+        + 'border-radius:6px;padding:8px 10px;margin:6px 0;font-size:0.8rem;max-height:220px;overflow:auto;">'
+        + esc(gp.preview || '(no message preview)') + '</div></details>';
     }
     for (const p of pending) {
       const pv = p.preview || {};
@@ -11655,11 +11715,47 @@ async function _approvalsRefresh() {
         + (pv.cc ? 'cc: ' + esc(pv.cc) + '\n' : '')
         + esc(pv.body || '') + '</div></details>';
     }
-    html += '<div style="opacity:0.65;font-size:0.74rem;margin-top:4px;">Nothing sends without Approve. Discard drops a draft now and records who dropped it; unapproved drafts also expire on their own.</div></div>';
+    html += '<div style="opacity:0.65;font-size:0.74rem;margin-top:4px;">'
+      + (grants.length ? 'Allow once releases exactly ONE message to that worker, then the wall is back. ' : '')
+      + 'Nothing sends without Approve. Discard drops a draft now and records who dropped it; unapproved drafts also expire on their own.</div></div>';
     el.innerHTML = html;
     el.style.display = 'block';
   } catch (e) {}
 }
+// Says what is waiting WITHOUT flattening two different asks into one noun. An
+// email draft and a permission grant need different decisions from the reader.
+function _apprHeadline(emails, grants) {
+  const parts = [];
+  if (grants) parts.push('\u{1F511} ' + grants + ' permission request' + (grants === 1 ? '' : 's'));
+  if (emails) parts.push('\u2709\uFE0F ' + emails + ' external email' + (emails === 1 ? '' : 's'));
+  return parts.join(' \u00B7 ') + ' held for your approval';
+}
+
+async function _grantApprove(id, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Allowing…'; }
+  try {
+    // NO auth-session header on purpose: the server reads its absence as "this
+    // is the human". Sending one here would make the dashboard look like a
+    // worker approving its own grant, which is exactly what the gate refuses.
+    const r = await fetch(API + '/api/grants/' + encodeURIComponent(id) + '/approve', { method: 'POST' });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.error) { showToast(d.error || 'approve failed'); if (btn) { btn.disabled = false; btn.textContent = 'Allow once'; } return; }
+    showToast(d.note || 'Allowed once');
+  } catch (e) { showToast('approve failed: ' + String(e)); }
+  _approvalsRefresh();
+}
+
+async function _grantReject(id, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Denying…'; }
+  try {
+    const r = await fetch(API + '/api/grants/' + encodeURIComponent(id) + '/reject', { method: 'POST' });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.error) { showToast(d.error || 'deny failed'); if (btn) { btn.disabled = false; btn.textContent = 'Deny'; } return; }
+    showToast('Denied');
+  } catch (e) { showToast('deny failed: ' + String(e)); }
+  _approvalsRefresh();
+}
+
 function _apprToggle() {
   const now = localStorage.getItem('amuxApprCollapsed') === '1' ? '0' : '1';
   localStorage.setItem('amuxApprCollapsed', now);
@@ -16894,6 +16990,244 @@ async function _connDelete(id) {
   } catch (e) { showToast('delete failed: ' + String(e)); }
 }
 
+let _emailAccount = null;
+let _emailFolder = 'inbox';
+
+async function _emailLoad() {
+  const host = document.getElementById('email-list');
+  if (!host) return;
+  // Accounts come from the SAME place the Connectors tab reads, so a mailbox
+  // cannot appear here and be missing there.
+  let accounts = [];
+  try {
+    const r = await fetch(API + '/api/gmail/accounts', { headers: _authHeaders() });
+    const d = await r.json();
+    accounts = Array.isArray(d.accounts) ? d.accounts : [];
+    _emailRenderSubtabs(accounts, d.health || {});
+  } catch (e) { /* fall through: the list below will say it found nothing */ }
+  if (!accounts.length) {
+    host.innerHTML = '<div class="conn-empty">No connected email accounts. Connect one in the Connectors tab.</div>';
+    return;
+  }
+  if (!_emailAccount || accounts.indexOf(_emailAccount) < 0) _emailAccount = accounts[0];
+  _emailRenderSubtabs(accounts, {});
+  host.innerHTML = '<div class="conn-empty">Loading ' + esc(_emailAccount) + '…</div>';
+  try {
+    const r = await fetch(API + '/api/email/ranked?count=60&folder=' + encodeURIComponent(_emailFolder)
+      + '&account=' + encodeURIComponent(_emailAccount), { headers: _authHeaders() });
+    const d = await r.json();
+    if (!r.ok || d.error) {
+      // Name WHICH half failed. `stage` distinguishes a mailbox problem from a
+      // ranking problem, and sending a reader to the themes for an IMAP error
+      // is the wrong door.
+      host.innerHTML = '<div class="conn-empty">Could not load '
+        + esc(_emailAccount) + (d.stage ? ' (' + esc(d.stage) + ')' : '') + ': '
+        + esc(String(d.error || r.status)) + '</div>';
+      return;
+    }
+    _emailRenderFolders();
+    _emailRenderThemes(d.ranking || {});
+    _emailRenderList(d.messages || []);
+  } catch (e) {
+    host.innerHTML = '<div class="conn-empty">Failed to load: ' + esc(String(e)) + '</div>';
+  }
+}
+
+function _emailRenderSubtabs(accounts, health) {
+  const el = document.getElementById('email-subtabs');
+  if (!el) return;
+  el.innerHTML = accounts.map(a => {
+    const on = a === _emailAccount;
+    const bad = health[a] && health[a] !== 'ok';
+    return '<button class="conn-scope-btn" onclick="_emailPick(\'' + esc(a) + '\')" '
+      + 'style="min-height:34px;' + (on ? 'background:var(--accent,#2563eb);color:#fff;' : '') + '">'
+      + esc(a) + (bad ? ' ⚠️' : '') + '</button>';
+  }).join('');
+}
+
+function _emailPick(a) { _emailAccount = a; _emailLoad(); }
+function _emailFolderPick(f) { _emailFolder = f; _emailLoad(); }
+
+function _emailRenderFolders() {
+  const el = document.getElementById('email-folders');
+  if (!el) return;
+  // Inbox is the UNFILED set, not "everything" — a list that keeps showing mail
+  // you already filed is one you stop reading.
+  el.innerHTML = [['inbox','Inbox'],['approved','Approved'],['rejected','Rejected']].map(([k,label]) => {
+    const on = k === _emailFolder;
+    return '<button class="conn-scope-btn" onclick="_emailFolderPick(\'' + k + '\')" '
+      + 'style="min-height:34px;' + (on ? 'background:var(--accent,#2563eb);color:#fff;' : '') + '">'
+      + label + '</button>';
+  }).join('');
+}
+
+// The inference's provenance, stated rather than implied. An all-zero ranking
+// with measured:false is a probe that never ran; with measured:true it is a
+// genuine "none of this is about anything you asked for".
+function _emailRenderThemes(r) {
+  const el = document.getElementById('email-themes');
+  if (!el) return;
+  if (!r.measured) {
+    el.innerHTML = '<b>Not ranked yet.</b> ' + esc(r.why_unmeasured || 'the inference has not run')
+      + ' — scores below are all 0 because nothing has been learned, not because nothing matters.';
+    return;
+  }
+  const when = r.computed_at ? new Date(r.computed_at * 1000).toLocaleString() : 'unknown';
+  el.innerHTML = 'Ranking on <b>' + (r.themes || 0) + ' learned theme'
+    + ((r.themes === 1) ? '' : 's') + '</b>, inferred from <b>' + (r.n_considered || 0)
+    + '</b> of your messages via <code>' + esc(r.model || '?') + '</code> at ' + esc(when) + '.';
+}
+
+// ---- inbox rendering -------------------------------------------------------
+//
+// These follow MAIL-CLIENT conventions rather than the scored-list shape this
+// started as. The first version put five always-visible buttons under every row,
+// which is a control panel, not an inbox: it tripled row height, buried the
+// subject, and made the list unscannable — the one thing an inbox is for.
+//
+// What the conventions actually are, and why each is here:
+//   * SENDER first and fixed-width, so the eye scans one column, not ragged text
+//   * SUBJECT bold + snippet dimmed on ONE line, the Gmail/Mail/Outlook shape
+//   * TIME right-aligned, relative (time today, month-day this year, else date)
+//   * UNREAD is bold — the oldest convention in mail, and `read` was already in
+//     the payload and ignored
+//   * ACTIONS ON HOVER, not always on. A row at rest shows content; the controls
+//     appear when you are pointing at the thing they act on
+//   * CLICK THE ROW TO OPEN IT, because that is what every mail client does
+
+function _emailSender(from) {
+  const f = String(from || '');
+  const m = f.match(/^\s*"?([^"<]+?)"?\s*<(.+)>\s*$/);
+  if (m) return { name: m[1].trim(), addr: m[2].trim() };
+  return { name: f.replace(/[<>]/g, '').trim(), addr: f.replace(/[<>]/g, '').trim() };
+}
+
+// Relative like a mail client: a time for today, a date for this year, a full
+// date beyond it. An absolute timestamp on every row is noise you have to read.
+function _emailWhen(d) {
+  const t = Date.parse(d || '');
+  if (!t || isNaN(t)) return '';
+  const dt = new Date(t), now = new Date();
+  if (dt.toDateString() === now.toDateString()) {
+    return dt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  }
+  if (dt.getFullYear() === now.getFullYear()) {
+    return dt.toLocaleDateString([], { month: 'short', day: 'numeric' });
+  }
+  return dt.toLocaleDateString([], { year: '2-digit', month: 'numeric', day: 'numeric' });
+}
+
+// One line, tags stripped, whitespace collapsed. A raw body carries invisible
+// padding characters that render as a long blank gap in the preview.
+function _emailSnippet(body) {
+  // DECODE ENTITIES FIRST. A mail body is HTML, so an apostrophe arrives as
+  // &#39; and rendered verbatim it reads "We weren&#39;t able to charge your
+  // card" — seen live in the Stripe row. Decoding via a detached textarea is the
+  // standard trick and is safe here because the result is re-escaped by esc()
+  // before it reaches the DOM; it is never assigned as innerHTML.
+  const ta = document.createElement('textarea');
+  ta.innerHTML = String(body || '').replace(/<[^>]*>/g, ' ');
+  return String(ta.value)
+    .replace(/[͏​-‍⁠﻿­]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 160);
+}
+
+function _emailRenderList(msgs) {
+  const host = document.getElementById('email-list');
+  if (!host) return;
+  if (!msgs.length) {
+    host.innerHTML = '<div class="conn-empty">Nothing here.</div>';
+    return;
+  }
+  let html = '';
+  for (const m of msgs) {
+    const s = _emailSender(m.from);
+    const unread = m.read === false;
+    const score = Number(m.score || 0);
+    const hits = Array.isArray(m.matched_themes) ? m.matched_themes : [];
+    const arg = _emailArg(m);
+    const id = 'em-' + (m.gmail_id || Math.random().toString(36).slice(2));
+    html += '<div class="mail-row' + (unread ? ' unread' : '') + (m.flagged ? ' flagged' : '') + '"'
+      + ' onclick="_emailToggleBody(\'' + id + '\')">'
+      // Star is the flag, in the position every client puts it.
+      + '<button class="mail-star" title="Flag" onclick="event.stopPropagation();_emailAnnotate('
+      + arg + ',{flagged:' + (m.flagged ? 'false' : 'true') + '})">' + (m.flagged ? '★' : '☆') + '</button>'
+      + '<div class="mail-from" title="' + esc(s.addr) + '">' + esc(s.name || s.addr) + '</div>'
+      + '<div class="mail-mid">'
+      + '<span class="mail-subj">' + esc(m.subject || '(no subject)') + '</span>'
+      + '<span class="mail-snip"> — ' + esc(_emailSnippet(m.body)) + '</span>'
+      + (hits.length ? '<span class="mail-themes">' + hits.map(h => '<span class="conn-cat">'
+          + esc(h) + '</span>').join('') + '</span>' : '')
+      + '</div>'
+      // The score is why this row is HERE, so it sits with the metadata, small.
+      + '<div class="mail-score" title="' + (hits.length ? 'matched: ' + esc(hits.join(', ')) : 'no theme matched')
+      + (Number(m.rank_delta || 0) !== 0 ? ' · base ' + Number(m.base_score || 0).toFixed(0)
+          + ', your nudge ' + (Number(m.rank_delta) > 0 ? '+' : '') + Number(m.rank_delta).toFixed(0) : '')
+      + '">' + (score > 0 ? score.toFixed(0) : '') + '</div>'
+      + '<div class="mail-when">' + esc(_emailWhen(m.date)) + '</div>'
+      // AT REST this is hidden and the time shows; on hover they swap. Same slot,
+      // so the row never reflows and the list does not jump under the cursor.
+      + '<div class="mail-actions" onclick="event.stopPropagation()">'
+      + '<button title="Keep" onclick="_emailAnnotate(' + arg + ',{verdict:\''
+        + (m.verdict === 'approved' ? '' : 'approved') + '\'})">✓</button>'
+      + '<button title="Reject" onclick="_emailAnnotate(' + arg + ',{verdict:\''
+        + (m.verdict === 'rejected' ? '' : 'rejected') + '\'})">✕</button>'
+      + '<button title="Rank higher" onclick="_emailAnnotate(' + arg + ',{rank_delta:'
+        + (Number(m.rank_delta || 0) + 5) + '})">▲</button>'
+      + '<button title="Rank lower" onclick="_emailAnnotate(' + arg + ',{rank_delta:'
+        + (Number(m.rank_delta || 0) - 5) + '})">▼</button>'
+      + '</div>'
+      + '</div>'
+      + '<div class="mail-body" id="' + id + '" hidden>' + esc(String(m.body || '').slice(0, 4000)) + '</div>';
+  }
+  host.innerHTML = html;
+}
+
+function _emailToggleBody(id) {
+  const el = document.getElementById(id);
+  if (el) el.hidden = !el.hidden;
+}
+
+function _emailArg(m) {
+  // The message's IDENTITY plus what the ranker was SHOWING. Both travel to the
+  // server: the verdict alone teaches nothing once the themes are recomputed.
+  return JSON.stringify({
+    message_id: m.message_id || m.id || '',
+    from: m.from || '', subject: m.subject || '',
+    score: Number(m.base_score || m.score || 0),
+    matched_themes: Array.isArray(m.matched_themes) ? m.matched_themes : [],
+  }).replace(/"/g, '&quot;');
+}
+
+async function _emailAnnotate(ctx, patch) {
+  try {
+    const body = Object.assign({ account: _emailAccount }, ctx, patch);
+    const r = await fetch(API + '/api/email/annotate', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, _authHeaders()),
+      body: JSON.stringify(body),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.error) { showToast(d.error || 'could not save'); return; }
+  } catch (e) { showToast('failed: ' + String(e)); return; }
+  _emailLoad();
+}
+
+async function _emailThemesRefresh(btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Learning…'; }
+  try {
+    const r = await fetch(API + '/api/email/themes/refresh', { method: 'POST', headers: _authHeaders() });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.error) { showToast(d.error || 'could not re-learn'); }
+    else if (!d.measured) { showToast('Not enough of your messages yet to infer themes'); }
+    else { showToast('Learned ' + d.themes + ' themes from ' + d.n_considered + ' messages'); }
+  } catch (e) { showToast('failed: ' + String(e)); }
+  if (btn) { btn.disabled = false; btn.textContent = 'Re-learn priorities'; }
+  _emailLoad();
+}
+
 async function _connectorsTabLoad() {
   const host = document.getElementById('connectors-list');
   if (!host) return;
@@ -20510,16 +20844,31 @@ function switchView(view) {
   // Persist the tab to localStorage so it survives iOS evicting the backgrounded
   // PWA (which wipes sessionStorage but keeps localStorage) — restored on load.
   try { localStorage.setItem('amux_ui_view', JSON.stringify({ v: view, ts: Date.now() })); } catch(e) {}
-  const _svIds = ['session', 'board', 'groups', 'calendar', 'scheduler', 'files', 'mdai', 'proxies', 'logs', 'messages', 'skills', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph', 'connectors'];
-  const _svNames = ['sessions', 'board', 'groups', 'calendar', 'scheduler', 'files', 'mdai', 'proxies', 'logs', 'messages', 'skills', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph', 'connectors'];
-  // MUST stay index-aligned with _svIds/_svNames above (20 entries). It once had
-  // 18 for 19 ids, so 'graph' ran off the end and took the '' fallback by accident.
-  const _svDisplay = ['', '', '', 'flex', '', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', '', 'flex', 'flex', 'flex'];
-  for (let i = 0; i < _svIds.length; i++) {
-    const ve = document.getElementById(_svIds[i] + '-view');
-    if (ve) ve.style.display = view === _svNames[i] ? (_svDisplay[i] || '') : 'none';
-    const te = document.getElementById('tab-' + _svNames[i]);
-    if (te) te.classList.toggle('active', view === _svNames[i]);
+  // ONE ROW PER VIEW: [domIdPrefix, tabName, display]. This was three PARALLEL
+  // ARRAYS that had to stay index-aligned, and the alignment had already failed
+  // once — the old comment recorded 18 display entries for 19 ids, so 'graph'
+  // ran off the end and took the '' fallback by accident.
+  //
+  // It failed again adding 'email' (AMUX-3998): the tab and the view existed,
+  // the click fired, and the body stayed blank because the name was in none of
+  // the three lists. A structure where forgetting one of three edits produces a
+  // silently blank screen is the bug, not the omission. Triples cannot
+  // misalign — a new view is one row or it is absent, never half-present.
+  const _svViews = [
+    ['session', 'sessions', ''], ['board', 'board', ''], ['groups', 'groups', ''],
+    ['calendar', 'calendar', 'flex'], ['scheduler', 'scheduler', ''],
+    ['files', 'files', 'flex'], ['mdai', 'mdai', 'flex'], ['proxies', 'proxies', 'flex'],
+    ['logs', 'logs', 'flex'], ['messages', 'messages', 'flex'], ['skills', 'skills', 'flex'],
+    ['sql', 'sql', 'flex'], ['map', 'map', 'flex'], ['metrics', 'metrics', 'flex'],
+    ['cost', 'cost', 'flex'], ['torrents', 'torrents', 'flex'], ['terminal', 'terminal', ''],
+    ['browser', 'browser', 'flex'], ['graph', 'graph', 'flex'],
+    ['email', 'email', 'flex'], ['connectors', 'connectors', 'flex'],
+  ];
+  for (const [domId, name, display] of _svViews) {
+    const ve = document.getElementById(domId + '-view');
+    if (ve) ve.style.display = view === name ? (display || '') : 'none';
+    const te = document.getElementById('tab-' + name);
+    if (te) te.classList.toggle('active', view === name);
   }
   if (view === 'groups') { _renderGroupsTab(); fetchBoard().then(() => _renderGroupsTab()); }
   if (view === 'calendar') { fetchBoard().then(() => { _fcInit(); }); }
@@ -20543,6 +20892,7 @@ function switchView(view) {
   if (view === 'messages') _messagesLoad(true, '');
   if (view === 'files') { loadFiles(_filesPath); _filesRenderBookmarks(); }
   if (view === 'mdai') _mdaiTabLoad();
+  if (view === 'email') _emailLoad();
   if (view === 'connectors') _connectorsTabLoad();
   if (view === 'proxies') { loadProxies(); _startProxiesTimer(); } else { _stopProxiesTimer(); }
   if (view !== 'files') {
@@ -33520,7 +33870,18 @@ function _gmailFmtDate(ts) {
 }
 
 // ── Notifications ────────────────────────────────────────────────────────────
-async function _emailLoad() {
+// ORPHANED (AMUX-3998). This is the entry point of an older Gmail client that
+// is UNREACHABLE: every DOM id it renders into — gmail-messages-list,
+// gmail-sidebar, gmail-thread-view, gmail-accounts-list, the compose fields —
+// is absent from index.html, so no markup has ever existed for it.
+//
+// Renamed rather than deleted: it is somebody's work and it may be the basis of
+// a fuller client later. But it could not keep the name, because function
+// declarations HOIST — this later definition silently replaced the live one
+// above and every call site would have run this body instead.
+// `no_two_top_level_functions_in_app_js_share_a_name` caught it, which is the
+// ethos rule 7 check ("every name you DEFINE must not already") earning its keep.
+async function _gmailLegacyLoad_UNREACHABLE() {
   // Load connected accounts, then render inbox
   const r = await fetch(API + '/api/gmail/accounts').catch(() => null);
   if (!r || !r.ok) { _gmailRenderEmpty('Could not connect to server'); return; }

@@ -114,6 +114,33 @@ both fields fails `tests/diagnostic_contract.rs`.
 
 Raw logs: `~/.amux/logs/server-rs.log`
 
+## Reading CI: use the App token, and CHECK that you got it
+
+`gh` here defaults to the user identity (`esteininger`, id 15973166) on a **5000/hr**
+budget shared by every amux lane. A GitHub App is already provisioned on this box
+and sits on its own larger budget:
+
+```bash
+eval "$(~/.amux/github-app/get-token.sh)"
+gh api rate_limit --jq '.resources.core | "limit=\(.limit) remaining=\(.remaining)"'
+```
+
+**The limit number is the check, and it costs nothing** because `rate_limit` is not
+itself counted. `limit=5000` means you are on the shared user budget; anything
+higher means you got the App. Measured 2026-09-01: bare `gh` reported
+`limit=5000 remaining=4999`, the App `limit=8700 remaining=8625`.
+
+Run the check, do not assume the eval worked. `get-token.sh`'s own docstring records
+why: if the script exits non-zero the `eval` sets nothing, `gh` falls back to user
+auth, and you are back on the contended budget with no sign that anything happened.
+
+**Do not poll `gh` in a loop.** Secondary limits are per-account and trigger on
+request RATE, so one lane's 30s `until` loop 403s every other lane, on every
+endpoint, including a plain repo read. On 2026-09-01 two lanes lost CI visibility
+for hours that way, and `gh api rate_limit` reported `used: 0, remaining: 5000`
+throughout, because the counter it reads is not the counter being enforced. Use
+ScheduleWakeup, or one delay sized to the job. (AF-396)
+
 ## Deploy
 
 **Before `git push origin main`:**

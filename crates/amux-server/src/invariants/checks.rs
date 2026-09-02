@@ -478,6 +478,22 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     ("_amux_invariant_result", "ts", false),
     ("_amux_media_jobs", "created_at", false), // UNVERIFIED: no rows yet; seconds is the convention every sibling follows
     ("_amux_media_jobs", "updated_at", false), // UNVERIFIED: no rows yet; seconds is the convention every sibling follows
+    // AMUX-3974's two tables. Both are EMPTY, so there is nothing to measure and
+    // the convention argument above would be the only thing available. It is not
+    // needed here: every write to these columns is derivable from source and all
+    // five are `chrono::Utc::now().timestamp()`, which is SECONDS.
+    //
+    //   api/board.rs:6792         `let now = ...timestamp()`, feeding both the
+    //                             insert at 6794 and update_state at 6850
+    //   db/artifact_store.rs:90   takes that same `now` as its parameter
+    //   api/verify.rs:145         `created_at: ...timestamp()`
+    //
+    // Zero occurrences of `timestamp_millis` in either store or in verify.rs. So
+    // this is read off the writers rather than off the column names, which is
+    // the distinction the guard exists to force.
+    ("_amux_task_artifacts", "created_at", false),
+    ("_amux_task_artifacts", "updated_at", false),
+    ("_amux_verifications", "created_at", false),
     ("_amux_request_log", "ts", false),
     // AF-175's boot column: which process wrote the row. Same unit as `ts` by
     // construction — it is `heartbeat::boot_at()`, the same clock — and the

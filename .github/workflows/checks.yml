@@ -224,6 +224,13 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-staged-guard-render.sh
+          # AF-391: the co-edit warning is mtime-derived and says so, and on a
+          # shared checkout that makes the busiest lane the default suspect. It
+          # now downgrades when the claim is uncorroborated AND nothing is in
+          # dispute. Cells (b)(c)(d) are the load-bearing half: real uncommitted
+          # content, a two-sided transcript claim, and a check that could not
+          # run must all still print in full.
+          ./scripts/test-staged-guard-coedit.sh
           ./scripts/test-commit-stamp.sh
           ./scripts/test-mass-delete-gate.sh
           ./scripts/test-observed-edits-walk.sh

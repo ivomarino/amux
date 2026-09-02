@@ -1329,6 +1329,10 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // begin/callback, live Test, and the DWD token mint (AMUX-3362). `list` is
     // GET; credentials/auth/test/token are POST; callback is the GET landing.
     // POST declares a connector at runtime, DELETE forgets one (AMUX-3993).
+    // Owner-approved ad-hoc permission grants (AMUX-3997).
+    RouteEntry { path: "/api/grants", methods: &["GET"] },
+    RouteEntry { path: "/api/grants/{id}/approve", methods: &["POST"] },
+    RouteEntry { path: "/api/grants/{id}/reject", methods: &["POST"] },
     RouteEntry { path: "/api/connectors", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/connectors/{id}", methods: &["DELETE"] },
     RouteEntry { path: "/api/connectors/accounts", methods: &["GET"] },
