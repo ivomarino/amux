@@ -3477,3 +3477,68 @@ FIX: manually re-ran install.sh's own install_hook_from_head sequence for both
   real options (a systemd timer polling install.sh's hook block the way
   amux-builder.timer polls the Rust build, or the invariant self-healing since
   it already computes the right bytes) — a design choice, not made here.
+
+## A multi-part prompt became unrelated leaves and the message reported only the first leaf
+AREA: scheduler
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-1
+SYMPTOM: MSG-39225 captured as ATE-1, then the worker hand-created ATE-2 and
+  ATE-3 without an epic, structured dependency edge, or priority. The scheduler
+  selected ATE-3 before ATE-2, hit the WIP gate, and repaired the ordering only
+  after the refusal. The Messages chip stayed attached to ATE-1, which had been
+  reshaped as one leaf and reached done while the rest of the command remained open.
+COST: A supposedly automatic command required manual plan reconstruction; the
+  source message gave a false completion signal and work ran in the wrong order.
+FIX: e139be2d adds one attributed, idempotent decomposition transaction. The
+  capture remains the message-linked epic; children require p0-p3 priority,
+  earlier-step dependencies, concrete next actions and a common owner. The drive
+  loop completes the epic when all children are terminal.
+
+## Board create visibly selected an owner and groups, then the server discarded both
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: AMUX-4047
+SYMPTOM: Creating a card in the dashboard with worker amux-testing-e2e and groups
+  selected produced `Not saved: server ignored groups, worker`; AMUX-4047 and
+  AMUX-4048 landed as duplicate, unowned backlog cards with no tags.
+COST: Two junk cards were created during one browser audit, and neither could be
+  driven by the worker the UI showed as selected.
+FIX: e139be2d makes both optimistic state and POST/PATCH payloads use the server's
+  real `session` and `tags` fields, with a static regression check at the wire boundary.
+
+## Opening a fresh board card showed older status, owner and history than the board itself
+AREA: board
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-3
+SYMPTOM: The board list showed ATE-3 done, but its detail view showed To Do or In
+  Progress, owner none, `No status posted yet`, and empty History while Lineage
+  showed 29 events. The detail GET arrived, but hydration refreshed only desc/log.
+COST: The audit had to cross-check list, detail and lineage for every transition;
+  any single surface supported the wrong conclusion.
+FIX: e139be2d refreshes every authoritative detail field when the user has not
+  edited it, and renders one linked view of epic, children, dependencies, source
+  messages, work summary and artifacts.
+
+## Task artifacts existed outside the task's attributed action history
+AREA: attribution
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-2
+SYMPTOM: The structured artifact API existed, but workers had no board CLI verb
+  for it and registering an artifact did not add an attributed action to the task log.
+COST: Files, URLs, commits and screenshots fell back to prose; the task could not
+  answer who attached an asset or expose it as a direct link in detail.
+FIX: e139be2d adds `amux board artifact`, validates artifact kind/state, appends an
+  attributed task-history event, emits a greppable registration log, and returns
+  artifacts in the authoritative task detail response.
