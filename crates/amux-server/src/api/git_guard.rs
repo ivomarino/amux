@@ -270,6 +270,67 @@ async fn git_out(dir: &str, args: &[&str]) -> Option<String> {
 /// Deliberately the NEWEST commit and not merely "any commit of theirs": if a
 /// peer has committed this path since, the owner's bytes may have been changed
 /// or reverted by that commit, and only the owner can judge it.
+/// Has this session EVER written this path, by commit trailer? (AF-420, porting
+/// MC-1561 from the local hook.)
+///
+/// The mirror notice tells a lane their WORK may be lost under someone else's
+/// commit. That claim needs the lane to have authored something here, and the
+/// only input behind it is an edit record — which on a shared cwd records
+/// whoever was ACTIVE, not whoever WROTE. mixpeek-general received the full
+/// alarm about a tubescience iconik daily tick they had never opened.
+///
+/// The exact answer is already on every commit, and the local hook has asked it
+/// since MC-1561 (`_never_wrote`). This is the same question, server-side.
+///
+/// THREE ANSWERS, and the middle one is why this returns Option<bool>.
+/// `Some(true)` means the path has trailer-attributed history and none of it is
+/// theirs. `Some(false)` means some of it is. `None` means the question could
+/// not be asked — no history, or history carrying no trailers at all — and that
+/// must NOT read as "they never wrote it", or every repo that does not use
+/// trailers would silently suppress every notice.
+async fn owner_never_wrote(dir: &str, path: &str, owner: &str) -> Option<bool> {
+    if owner.trim().is_empty() {
+        return None;
+    }
+    // HEAD ALONE IS THE WRONG HISTORY, and the existing AMUX-3445 fixture caught
+    // this before it shipped. `git log` defaults to HEAD, and on a graft-push
+    // checkout a lane's own commits live ONLY on origin/main — local HEAD never
+    // advances. Asking HEAD-only therefore reports the lane as a non-writer of a
+    // path they landed themselves, which is the same defect AF-421 had one
+    // function away: a HEAD-relative question on a checkout whose HEAD is
+    // permanently behind.
+    //
+    // Both refs, falling back to HEAD alone when there is no origin/main (a
+    // fresh clone, a test fixture, the cloud image). `git_out` is None on
+    // nonzero exit, so the fallback is what runs when the ref is missing.
+    let out = match git_out(
+        dir,
+        &["log", "-n", "200", "--format=%(trailers:key=Amux-Session,valueonly,separator=,)",
+          "HEAD", "origin/main", "--", path],
+    )
+    .await
+    {
+        Some(o) => o,
+        None => {
+            git_out(
+                dir,
+                &["log", "-n", "200",
+                  "--format=%(trailers:key=Amux-Session,valueonly,separator=,)", "--", path],
+            )
+            .await?
+        }
+    };
+    let attributed: Vec<&str> =
+        out.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if attributed.is_empty() {
+        return None; // no history, or none of it carries a trailer
+    }
+    let wrote = attributed
+        .iter()
+        .any(|l| l.split(',').map(str::trim).any(|w| w == owner));
+    Some(!wrote)
+}
+
 async fn owner_owns_newest_commit(dir: &str, path: &str, owner: &str) -> Option<String> {
     let out = git_out(
         dir,
@@ -342,6 +403,15 @@ pub(crate) enum PathFate {
     /// byte-identical no-ops). Nothing identical to origin can be absorbed or
     /// reverted; carries origin's newest sha on the path for the receipt.
     LandedOnOrigin(String),
+    /// AF-420: the path is genuinely dirty, but this lane has NEVER written it —
+    /// the path carries trailer-attributed history and none of it is theirs. The
+    /// edit record behind the notice is activity in a shared cwd, not authorship,
+    /// so there is no work of theirs to lose. Carries the sessions that HAVE
+    /// written it, because "not yours" is only actionable beside "theirs".
+    ///
+    /// DOWNGRADE, NOT SUPPRESSION. The file is still named and the dirt is still
+    /// real; what goes is the claim that the reader's reasoning is at stake.
+    NotTheirWork(Vec<String>),
     /// The path differs from HEAD and the owner has no commit for it: the work
     /// is genuinely uncommitted and a sweep would take it. This is the state
     /// the AC-355 block exists to prevent.
@@ -382,6 +452,26 @@ pub(crate) fn victim_path_line(pth: &str, fate: &PathFate, provenance: &str) -> 
             ),
             false,
         ),
+        // AF-420: named, not accused. The dirt is real and the file is still
+        // printed; what is dropped is the claim that THEIR reasoning is at
+        // stake, which is the sentence that makes a careful lane stop and
+        // verify. `counts_as_at_risk` is false — this must not inflate the
+        // count the notice leads with.
+        PathFate::NotTheirWork(writers) => {
+            let who = if writers.is_empty() {
+                String::new()
+            } else {
+                format!(" (written here by {})", writers.join(", "))
+            };
+            (
+                format!(
+                    "  {pth}  — dirty, but you have no commit to this path{who}; the record \
+                     behind this notice is activity in a shared checkout, not authorship, so \
+                     none of your work is in it (MC-1561)"
+                ),
+                false,
+            )
+        }
         PathFate::AtRisk if provenance == "restore" => (
             format!(
                 "  {pth}  — your only recorded touch here is a RESTORE from a committed ref \
@@ -537,6 +627,32 @@ pub(crate) async fn path_fate(
                 .trim()
                 .to_string();
             return PathFate::LandedOnOrigin(sha);
+        }
+        // AF-420: before claiming their WORK is at risk, ask whether they have
+        // ever written this path. `Some(true)` means the path HAS
+        // trailer-attributed history and none of it is theirs — a reader, not an
+        // author. `None` (no history, or none carrying trailers) falls through
+        // to AtRisk, because "could not ask" must never read as "never wrote".
+        if let Some(true) = owner_never_wrote(dir, path, owner).await {
+            let writers = git_out(
+                dir,
+                &["log", "-n", "50", "--format=%(trailers:key=Amux-Session,valueonly,separator=,)", "--", path],
+            )
+            .await
+            .map(|o| {
+                let mut v: Vec<String> = o
+                    .lines()
+                    .flat_map(|l| l.split(','))
+                    .map(|w| w.trim().to_string())
+                    .filter(|w| !w.is_empty())
+                    .collect();
+                v.sort();
+                v.dedup();
+                v.truncate(3);
+                v
+            })
+            .unwrap_or_default();
+            return PathFate::NotTheirWork(writers);
         }
         return PathFate::AtRisk;
     }
@@ -3446,6 +3562,103 @@ mod tests {
         // at-risk case, and it must stay loud.
         std::fs::write(dir.path().join("grafted.txt"), "novel v3, uncommitted\n").unwrap();
         assert_eq!(path_fate(&d, "grafted.txt", "backend", 0, "firsthand").await, PathFate::AtRisk);
+    }
+
+    /// AF-420, mixpeek-general: the mirror told them their WORK was at risk about
+    /// a tubescience iconik daily tick they had never opened. The local hook has
+    /// asked "has this session ever written this path" since MC-1561; the mirror
+    /// never learned it.
+    #[tokio::test]
+    async fn a_path_this_lane_never_wrote_is_not_their_work_to_lose() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_string_lossy().to_string();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(&d).output().unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+
+        // The path's whole history belongs to tubescience.
+        std::fs::write(dir.path().join("tick.md"), "iconik tick v1\n").unwrap();
+        git(&["add", "tick.md"]);
+        git(&["commit", "-q", "-m", "tick\n\nAmux-Session: tubescience"]);
+        // Someone is mid-edit, so the path is genuinely dirty and NOT on origin.
+        std::fs::write(dir.path().join("tick.md"), "iconik tick v1\nedit\n").unwrap();
+
+        // PREMISE: dirty, or AtRisk is never reached and this is vacuous.
+        assert!(
+            git_out(&d, &["diff", "HEAD", "--name-only", "--", "tick.md"])
+                .await
+                .map(|o| !o.trim().is_empty())
+                .unwrap_or(false),
+            "fixture must be dirty"
+        );
+
+        match path_fate(&d, "tick.md", "mixpeek-general", 0, "firsthand").await {
+            PathFate::NotTheirWork(writers) => {
+                assert!(writers.contains(&"tubescience".to_string()), "name the real writers: {writers:?}");
+            }
+            other => panic!("a lane that never wrote this path has no work to lose: {other:?}"),
+        }
+
+        // CONTROL 1 — the lane that DID write it still gets the full warning.
+        // Without this the fix would have deleted the signal, not sharpened it.
+        assert_eq!(
+            path_fate(&d, "tick.md", "tubescience", 0, "firsthand").await,
+            PathFate::AtRisk,
+            "the actual author's work IS at risk and must stay loud"
+        );
+
+        // CONTROL 3 — A LANE WHOSE ONLY COMMITS ARE ON ORIGIN still counts as a
+        // writer. `git log` defaults to HEAD, and on a graft-push checkout local
+        // HEAD never advances, so a HEAD-only question reports the lane as a
+        // non-writer of a path they landed themselves. The AMUX-3445 fixture
+        // caught this before it shipped; this cell keeps it caught.
+        let dir3 = tempfile::tempdir().unwrap();
+        let d3 = dir3.path().to_string_lossy().to_string();
+        let git3 = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(&d3).output().unwrap()
+        };
+        git3(&["init", "-q"]);
+        git3(&["config", "user.email", "t@t"]);
+        git3(&["config", "user.name", "t"]);
+        std::fs::write(dir3.path().join("g.md"), "v1\n").unwrap();
+        git3(&["add", "g.md"]);
+        git3(&["commit", "-q", "-m", "base\n\nAmux-Session: someone-else"]);
+        let base3 = String::from_utf8(git3(&["rev-parse", "HEAD"]).stdout).unwrap().trim().to_string();
+        std::fs::write(dir3.path().join("g.md"), "v2\n").unwrap();
+        git3(&["add", "g.md"]);
+        git3(&["commit", "-q", "-m", "landed\n\nAmux-Session: grafter"]);
+        git3(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git3(&["reset", "-q", "--hard", &base3]); // local HEAD back behind origin
+        std::fs::write(dir3.path().join("g.md"), "v2 plus local edit\n").unwrap();
+        assert_eq!(
+            path_fate(&d3, "g.md", "grafter", 0, "firsthand").await,
+            PathFate::AtRisk,
+            "grafter's only commit is on origin, and they are still a writer here"
+        );
+
+        // CONTROL 2 — NO TRAILERS ANYWHERE is "cannot ask", not "never wrote".
+        // A repo that does not use trailers must not silently suppress every
+        // notice; that is the three-answers rule MC-1561 is built on.
+        let dir2 = tempfile::tempdir().unwrap();
+        let d2 = dir2.path().to_string_lossy().to_string();
+        let git2 = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(&d2).output().unwrap()
+        };
+        git2(&["init", "-q"]);
+        git2(&["config", "user.email", "t@t"]);
+        git2(&["config", "user.name", "t"]);
+        std::fs::write(dir2.path().join("plain.md"), "v1\n").unwrap();
+        git2(&["add", "plain.md"]);
+        git2(&["commit", "-q", "-m", "no trailer here"]);
+        std::fs::write(dir2.path().join("plain.md"), "v1\nedit\n").unwrap();
+        assert_eq!(
+            path_fate(&d2, "plain.md", "anyone", 0, "firsthand").await,
+            PathFate::AtRisk,
+            "untrailered history means the question could not be asked, so stay loud"
+        );
     }
 
     /// AF-421, rebuilt from the mirror checkout's real state (mixpeek-general,
