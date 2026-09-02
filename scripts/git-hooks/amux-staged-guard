@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# guard-features: AMUX-2946 AF-342
+# guard-features: AMUX-2946 AF-342 AF-414
 # (Drift token for install-hooks.sh — see append-only-push-guard's header for
 #  the mechanism. A vendored copy lacking a canonical token reads STALE.)
 # ============================================================================
@@ -50,7 +50,7 @@ import json, os, ssl, subprocess, sys, time, urllib.error, urllib.request
 # `^`-anchored, because an unanchored match now finds the comment line first
 # (checked: it returned empty, which would have made `grep -L` match nothing and
 # report a clean fleet).
-GUARD_VERSION = 11
+GUARD_VERSION = 12
 
 
 def amux_base_url():
@@ -475,8 +475,26 @@ def _render_split_risk(d, w):
     without first reading a claim about ownership.
     """
     for _sr in d.get("split_risk") or []:
-        w("\namux staged-guard: SPLIT COMMIT WARNING — %s's work is being cut in half:\n"
-          % _sr.get("owner", "?"))
+        # AF-414: the possessive header is an OWNERSHIP ASSERTION, and the server
+        # now says whether it can support one. `authored` is true only when the
+        # peer has transcript-backed content on BOTH sides of the split; an
+        # mtime-only record gets the same warning without the claim.
+        #
+        # This docstring already said the check is "a warning about a BUILD, not
+        # an assertion that the staged bytes are somebody else's" while the first
+        # line printed asserted exactly that. Measured 2026-09-02: it announced
+        # "amux's work is being cut in half" over a 368-insertion diff that was
+        # entirely the committer's own.
+        #
+        # Old servers send no `authored` key. `.get("authored", True)` keeps
+        # their behaviour unchanged rather than silently downgrading every
+        # warning against a server that cannot answer the question.
+        if _sr.get("authored", True):
+            w("\namux staged-guard: SPLIT COMMIT WARNING — %s's work is being cut in half:\n"
+              % _sr.get("owner", "?"))
+        else:
+            w("\namux staged-guard: SPLIT COMMIT WARNING — this commit leaves related "
+              "dirty files behind:\n")
         w("  in this commit:  %s\n" % ", ".join(_sr.get("staged") or []))
         w("  left behind, dirty and NOT committed:\n")
         for _p in _sr.get("left_dirty") or []:

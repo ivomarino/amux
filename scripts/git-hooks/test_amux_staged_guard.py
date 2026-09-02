@@ -134,6 +134,47 @@ def main():
         if out:
             failures.append(f"split_risk must print NOTHING for {empty!r}, got {out!r}")
 
+    # AF-414: an MTIME-ONLY record must not carry the possessive header. The
+    # server sends `authored: false` when it cannot support an ownership claim;
+    # the row still prints, because the BUILD hazard is real whoever owns the
+    # bytes, and only "X's work is being cut in half" goes.
+    out = []
+    mod._render_split_risk({
+        "split_risk": [{
+            "owner": "amux",
+            "authored": False,
+            "staged": ["crates/amux-server/src/api/board.rs"],
+            "left_dirty": ["/repo/crates/amux-server/src/db/board_store.rs"],
+            "why": "the only record linking these paths to 'amux' is an mtime",
+        }]
+    }, out.append)
+    txt = "".join(out)
+    if "'s work is being cut in half" in txt:
+        failures.append(f"authored=false must drop the possessive header, got: {txt!r}")
+    for needle, what in [
+        ("SPLIT COMMIT WARNING", "the warning still fires — downgrade, not suppression"),
+        ("board.rs", "the staged file is still named"),
+        ("board_store.rs", "the file left behind is still named"),
+        ("mtime", "the server's sentence still reaches the reader"),
+    ]:
+        if needle not in txt:
+            failures.append(f"authored=false render dropped {what} ({needle!r}): {txt!r}")
+
+    # CONTROL: an OLD SERVER sends no `authored` key at all. It must keep the
+    # possessive rather than be silently downgraded by a client that assumes the
+    # worst — a missing field is "cannot answer", not "answer is no".
+    out = []
+    mod._render_split_risk({
+        "split_risk": [{
+            "owner": "amux",
+            "staged": ["a.rs"],
+            "left_dirty": ["/repo/b.rs"],
+            "why": "why",
+        }]
+    }, out.append)
+    if "amux's work is being cut in half" not in "".join(out):
+        failures.append(f"a server sending no `authored` must keep the old wording: {out!r}")
+
     # AF-365: the BLOCKED remedy must offer the non-destructive exit FIRST.
     #
     # On a shared index `git restore --staged <their path>` mutates state that

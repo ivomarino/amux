@@ -2228,11 +2228,40 @@ fn split_risk(paths: &[(String, String)], inp: &GuardInputs, v: &mut Verdict) {
             continue;
         }
         left.sort();
-        v.split_risk.push(json!({
-            "owner": owner,
-            "staged": staged_rels,
-            "left_dirty": left,
-            "why": format!(
+        // AF-414: IS THIS OWNERSHIP CLAIM AUTHORSHIP, OR AN MTIME?
+        //
+        // `inp.theirs` is satisfied by an MTIME. `apply_observed` inserts into
+        // `theirs_firsthand` at firsthand rank deliberately, so on a shared
+        // checkout a peer's Bash window catches nearly every actively-edited
+        // path. `peer_authored_content` is the discriminator this file already
+        // built for exactly this distinction, and its docstring records that
+        // AF-342 shipped reading `theirs`, stayed INERT FOR A FULL RELEASE for
+        // this reason, and has a test refusing a mutation that puts `theirs`
+        // back. split_risk was never migrated.
+        //
+        // MEASURED ON ITSELF, 2026-09-02. Committing a frustrations.md entry,
+        // this warning announced "amux's work is being cut in half" and named
+        // invariants/checks.rs and invariants/monitor.rs as "THEIR files". Both
+        // were mine: 368 insertions, 0 deletions, every added item written
+        // minutes earlier in that session. The prescribed remedy, "confirm with
+        // them", would have sent me to a peer about my own code.
+        //
+        // BOTH SIDES, because the hazard is a symbol split ACROSS them. Their
+        // authored content in the staged half with only an mtime on the left
+        // half is not a split of their work, and neither is the reverse.
+        let staged_authored = paths
+            .iter()
+            .any(|(rel, ap)| staged_rels.contains(&rel) && peer_authored_content(inp, ap));
+        let left_authored = left.iter().any(|p| peer_authored_content(inp, p));
+        let authored = staged_authored && left_authored;
+        // DOWNGRADE, NEVER SUPPRESS. The BUILD hazard is real whoever owns the
+        // bytes — those files genuinely are dirty and genuinely not in this
+        // commit — so the warning stays and only the possessive goes. That is
+        // also what the hook's own renderer docstring has always said this is:
+        // "a warning about a BUILD, not an assertion that the staged bytes are
+        // somebody else's".
+        let why = if authored {
+            format!(
                 "you are committing {} — which '{owner}' co-edited — while {} of THEIR files \
                  are dirty and NOT in this commit. A symbol added on one side may be missing \
                  from the other, so this commit can fail to build even though your tree \
@@ -2242,7 +2271,27 @@ fn split_risk(paths: &[(String, String)], inp: &GuardInputs, v: &mut Verdict) {
                  yours (`git add -p`), or confirm with them.",
                 staged_rels.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
                 left.len()
-            ),
+            )
+        } else {
+            format!(
+                "you are committing {} while {} other file(s) below are dirty and NOT in this \
+                 commit. A symbol added on one side may be missing from the other, so this \
+                 commit can fail to build even though your tree compiles: nothing here builds \
+                 the COMMIT, only the TREE. The only record linking these paths to '{owner}' \
+                 is an mtime, which on a shared checkout is routinely an echo of YOUR OWN \
+                 write caught in their Bash window — so this names the files and stops there \
+                 rather than calling them that lane's work. Check the paths; do not go ask \
+                 '{owner}' on the strength of this line.",
+                staged_rels.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+                left.len()
+            )
+        };
+        v.split_risk.push(json!({
+            "owner": owner,
+            "authored": authored,
+            "staged": staged_rels,
+            "left_dirty": left,
+            "why": why,
         }));
     }
 }
@@ -3872,6 +3921,22 @@ mod tests {
         let mut g = GuardInputs::default();
         g.theirs.insert(format!("/repo/{path}"), (owner.into(), ts));
         g.theirs_firsthand.insert(format!("/repo/{path}"));
+        // AF-414: the helper is named for AUTHORSHIP, so it must set the set that
+        // MEANS authorship. It set only `theirs`/`theirs_firsthand`, both of
+        // which a bare mtime satisfies — so every split_risk cell was really
+        // exercising the mtime case while reading as if it proved the authored
+        // one. `peer_touched` below is the mtime case, named honestly.
+        g.theirs_transcript.insert(format!("/repo/{path}"));
+        g
+    }
+
+    /// A peer RECORD with no authored content: an mtime their Bash window
+    /// caught. Differs from `peer_wrote` on exactly the field that decides
+    /// whether an ownership claim is supportable.
+    fn peer_touched(path: &str, owner: &str, ts: f64) -> GuardInputs {
+        let mut g = GuardInputs::default();
+        g.theirs.insert(format!("/repo/{path}"), (owner.into(), ts));
+        g.theirs_firsthand.insert(format!("/repo/{path}"));
         g
     }
 
@@ -3963,6 +4028,73 @@ mod tests {
         assert!(
             classify(&staged, 200.0, 3600.0, &other).split_risk.is_empty(),
             "only the co-editor's OWN dirty files can split their own symbol"
+        );
+    }
+
+    /// AF-414, from the specimen this warning produced about ME.
+    ///
+    /// Committing a frustrations.md entry, split_risk announced "amux's work is
+    /// being cut in half" and named two files as "THEIR files". Both were mine:
+    /// 368 insertions, 0 deletions, written minutes earlier. The prescribed
+    /// remedy, "confirm with them", would have sent me to a peer about my own
+    /// code. The claim came from `inp.theirs`, which a bare mtime satisfies.
+    #[test]
+    fn an_mtime_only_record_names_the_files_without_claiming_they_are_the_peers() {
+        // MTIME ONLY on both sides: a record exists, no authored content does.
+        let mut g = peer_touched("crates/amux-server/src/api/board.rs", "amux", 100.0);
+        g.theirs.insert("/repo/crates/amux-server/src/db/board_store.rs".into(), ("amux".into(), 100.0));
+        g.theirs_firsthand.insert("/repo/crates/amux-server/src/db/board_store.rs".into());
+        g.dirty.insert("/repo/crates/amux-server/src/db/board_store.rs".into());
+        g.mine_firsthand.insert("/repo/crates/amux-server/src/api/board.rs".into());
+
+        let staged = [pair("crates/amux-server/src/api/board.rs")];
+        let v = classify(&staged, 200.0, 3600.0, &g);
+
+        // DOWNGRADE, NEVER SUPPRESS: the build hazard is real whoever owns the
+        // bytes, so the row must still be here and still name the file.
+        assert_eq!(v.split_risk.len(), 1, "the BUILD warning must survive: {:?}", v.split_risk);
+        let r = &v.split_risk[0];
+        assert_eq!(r["authored"], json!(false), "{r}");
+        assert!(
+            r["left_dirty"].as_array().unwrap()[0].as_str().unwrap().ends_with("db/board_store.rs"),
+            "still names the file left behind: {r}"
+        );
+        let why = r["why"].as_str().unwrap();
+        assert!(why.contains("fail to build"), "the hazard still stated: {why}");
+        // ...and the possessive is gone, with the remedy that sends you to a peer.
+        assert!(!why.contains("THEIR files"), "no ownership assertion from an mtime: {why}");
+        assert!(!why.contains("confirm with them"), "do not send them to a peer: {why}");
+        assert!(why.contains("mtime"), "say what the record actually is: {why}");
+        assert!(
+            !why.contains('?'),
+            "STATE A FACT, never ask the committer a question (the rule the authored arm keeps): {why}"
+        );
+
+        // CONTROL, and the half that keeps this honest: with TRANSCRIPT evidence
+        // on both sides the claim is supportable and the full wording returns.
+        // Without this cell, deleting the possessive unconditionally would pass.
+        let mut a = peer_wrote("crates/amux-server/src/api/board.rs", "amux", 100.0);
+        a.theirs.insert("/repo/crates/amux-server/src/db/board_store.rs".into(), ("amux".into(), 100.0));
+        a.theirs_firsthand.insert("/repo/crates/amux-server/src/db/board_store.rs".into());
+        a.theirs_transcript.insert("/repo/crates/amux-server/src/db/board_store.rs".into());
+        a.dirty.insert("/repo/crates/amux-server/src/db/board_store.rs".into());
+        a.mine_firsthand.insert("/repo/crates/amux-server/src/api/board.rs".into());
+        let v2 = classify(&staged, 200.0, 3600.0, &a);
+        assert_eq!(v2.split_risk[0]["authored"], json!(true));
+        assert!(v2.split_risk[0]["why"].as_str().unwrap().contains("THEIR files"));
+
+        // CONTROL 2: transcript on ONE side only is not a split of their work.
+        // The hazard is a symbol split ACROSS the two halves, so one authored
+        // side plus one mtime side must stay downgraded.
+        let mut half = peer_wrote("crates/amux-server/src/api/board.rs", "amux", 100.0);
+        half.theirs.insert("/repo/crates/amux-server/src/db/board_store.rs".into(), ("amux".into(), 100.0));
+        half.theirs_firsthand.insert("/repo/crates/amux-server/src/db/board_store.rs".into());
+        half.dirty.insert("/repo/crates/amux-server/src/db/board_store.rs".into());
+        half.mine_firsthand.insert("/repo/crates/amux-server/src/api/board.rs".into());
+        assert_eq!(
+            classify(&staged, 200.0, 3600.0, &half).split_risk[0]["authored"],
+            json!(false),
+            "authored needs BOTH sides; one is not a split of their work"
         );
     }
 
