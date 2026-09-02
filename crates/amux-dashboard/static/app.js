@@ -8372,7 +8372,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.771';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.772';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -9965,8 +9965,23 @@ async function _peekLoadEarlier() {
     } else {
       const text = await r.text();
       const remaining = parseInt(r.headers.get('X-Log-Remaining') || '0', 10);
-      // New chunk is OLDER than everything loaded — it goes on top.
-      _peekEarlier.chunks.unshift('<span class="pe-chunk">' + esc(text) + '</span>');
+      // THROUGH THE SAME PIPELINE AS THE LIVE VIEW (AMUX-4021). This was
+      // `esc(text)`, which is raw escaped text with none of the peek render
+      // stages — and `_peekHtml`'s own comment warns about exactly that: "the
+      // four call sites each spelled the chain out, so adding a stage meant
+      // finding all of them". This was a fifth call site that never got them.
+      //
+      // The symptom was not subtle. A worker log is full of box-drawing runs
+      // and long unbroken lines; without `wrapBoxBlocks` they inherit the
+      // container's pre-wrap + break-word and wrap at EVERY CHARACTER, so
+      // loading earlier output rendered a 2-3 character wide column of
+      // gibberish instead of a log. `wrapBoxBlocks` gives each box run its own
+      // `.peek-box` with white-space:pre and its own horizontal scroller, which
+      // is what keeps tables, diffs and framed output aligned; `_fitRules`
+      // stops a 220-column pane rule forcing a scroller; `_linkifyPaths` and
+      // `highlightPrompts` make the earlier text behave like the live text it
+      // is continuous with.
+      _peekEarlier.chunks.unshift('<span class="pe-chunk">' + _peekHtml(text) + '</span>');
       _peekEarlier.loadedKb += _PEEK_LOG_CHUNK_KB;
       _peekEarlier.done = remaining <= 0;
     }
