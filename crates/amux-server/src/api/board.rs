@@ -77,10 +77,17 @@ pub fn routes() -> Router<AppState> {
         // SPA catch-all (405) and the CLI (pre-fix) exited 0 with the card
         // untouched — AMUX-2140 one layer down. Same mechanism auto-pickup uses.
         .route("/{id}/claim", post(claim_item))
+        // One write for the whole model-judged plan: the capture becomes the
+        // epic that the originating message already points at, and every child
+        // is created with its owner, priority and dependency edges intact.
+        .route("/{id}/decompose", post(decompose_item))
         .route("/{id}/capsule", get(capsule))
         .route("/{id}/verifications", get(list_verifications))
         .route("/{id}/artifacts", get(list_artifacts).post(create_artifact))
-        .route("/{id}/artifacts/{aid}", axum::routing::patch(patch_artifact).delete(delete_artifact))
+        .route(
+            "/{id}/artifacts/{aid}",
+            axum::routing::patch(patch_artifact).delete(delete_artifact),
+        )
 }
 
 /// GET /api/board/needsyou — THE owner view, capped (AF-318).
@@ -2895,21 +2902,340 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
     let key = id.clone();
     let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = store.read()?;
-        Ok(bs::get_issue(&conn, &key)?)
+        let Some(row) = bs::get_issue(&conn, &key)? else {
+            return Ok(None);
+        };
+        let mut child_ids = Vec::new();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM issues WHERE epic=?1 AND deleted IS NULL ORDER BY created, id",
+        )?;
+        child_ids.extend(
+            stmt.query_map(rusqlite::params![row.id], |r| r.get::<_, String>(0))?
+                .flatten(),
+        );
+        let children = child_ids
+            .iter()
+            .filter_map(|child| bs::get_issue(&conn, child).ok().flatten())
+            .map(|child| {
+                json!({
+                    "id": child.id,
+                    "title": child.title,
+                    "status": child.status,
+                    "session": child.session,
+                    "type": child.item_type,
+                    "depends_on": child.depends_on,
+                    "priority": child.tags.iter().find(|t| t.starts_with('p')),
+                    "evidence": child.evidence,
+                    "last_result": child.last_result,
+                    "next_action": child.next_action,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        // A child inherits the source message of its epic for display, while
+        // cmd_history.card_id itself remains attached to the root epic. That
+        // keeps the Messages chip stable from prompt through completion.
+        let message_root = row.epic.as_deref().unwrap_or(&row.id);
+        let mut messages = Vec::new();
+        let mut msg_stmt = conn.prepare(
+            "SELECT id,text,type,session,ts,origin,card_id FROM cmd_history \
+             WHERE card_id=?1 ORDER BY ts DESC LIMIT 20",
+        )?;
+        messages.extend(
+            msg_stmt
+                .query_map(rusqlite::params![message_root], |r| {
+                    Ok(json!({
+                        "id": r.get::<_, i64>(0)?,
+                        "text": r.get::<_, String>(1)?,
+                        "type": r.get::<_, String>(2)?,
+                        "session": r.get::<_, String>(3)?,
+                        "ts": r.get::<_, i64>(4)?,
+                        "origin": r.get::<_, String>(5)?,
+                        "card_id": r.get::<_, Option<String>>(6)?,
+                    }))
+                })?
+                .flatten(),
+        );
+        let artifacts = crate::db::artifact_store::list_for_task(&conn, &row.id)?
+            .into_iter()
+            .map(|a| artifact_value(&a))
+            .collect::<Vec<_>>();
+        Ok(Some((row, children, messages, artifacts)))
     })
     .await;
     match joined {
-        Ok(Ok(Some(row))) => {
+        Ok(Ok(Some((row, children, messages, artifacts)))) => {
             // Weak ETag for read-modify-write callers (AMUX-1711 parity).
             let mut headers = HeaderMap::new();
             if let Ok(v) = format!("W/\"{}-{}\"", row.id, row.rev).parse() {
                 headers.insert("etag", v);
             }
-            (StatusCode::OK, headers, Json(detail_body(&row))).into_response()
+            let mut body = detail_body(&row);
+            body["children"] = json!(children);
+            body["messages"] = json!(messages);
+            body["artifacts"] = json!(artifacts);
+            (StatusCode::OK, headers, Json(body)).into_response()
         }
         Ok(Ok(None)) => not_found(&id),
         Ok(Err(e)) => internal(e),
         Err(e) => internal(e),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DecomposeTask {
+    title: String,
+    #[serde(default, alias = "desc")]
+    description: String,
+    #[serde(default = "default_decompose_type", rename = "type")]
+    item_type: String,
+    priority: u8,
+    #[serde(default)]
+    depends_on: Vec<usize>,
+    next_action: String,
+}
+
+fn default_decompose_type() -> String {
+    "code".into()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DecomposeBody {
+    tasks: Vec<DecomposeTask>,
+}
+
+fn validate_decomposition(tasks: &[DecomposeTask]) -> Result<(), String> {
+    if !(2..=50).contains(&tasks.len()) {
+        return Err("decomposition requires 2 to 50 child tasks".into());
+    }
+    for (idx, task) in tasks.iter().enumerate() {
+        let n = idx + 1;
+        if task.title.trim().is_empty() {
+            return Err(format!("task {n} has an empty title"));
+        }
+        if !bs::KNOWN_TYPES.contains(&task.item_type.as_str()) || task.item_type == "epic" {
+            return Err(format!(
+                "task {n} has invalid leaf type {:?}",
+                task.item_type
+            ));
+        }
+        if task.priority > 3 {
+            return Err(format!("task {n} priority must be 0 (highest) through 3"));
+        }
+        if bs::continuation_verdict(&task.next_action) != bs::ContinuationVerdict::Ok {
+            return Err(format!(
+                "task {n} needs a concrete next_action of at least three words"
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for dep in &task.depends_on {
+            if *dep == 0 || *dep >= n {
+                return Err(format!(
+                    "task {n} dependency {dep} must name an earlier task by 1-based index"
+                ));
+            }
+            if !seen.insert(*dep) {
+                return Err(format!("task {n} repeats dependency {dep}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// POST /api/board/{id}/decompose — atomically turn a capture shell into an
+/// epic and create its ordered, attributed child plan.
+async fn decompose_item(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<DecomposeBody>,
+) -> Response {
+    if let Err(why) = validate_decomposition(&body.tasks) {
+        return err(StatusCode::BAD_REQUEST, json!({"error": why, "item": id}));
+    }
+    let (_, actor) = actor_from_headers(&headers);
+    if actor == "api-anonymous" {
+        return err(
+            StatusCode::UNAUTHORIZED,
+            json!({"error":"decomposition requires X-Amux-Worker or X-Amux-Session attribution"}),
+        );
+    }
+
+    enum Out {
+        Missing,
+        NotCapture,
+        WrongOwner(String),
+        Already(IssueRow, Vec<IssueRow>),
+        Created(IssueRow, Vec<IssueRow>),
+    }
+    let tasks = body.tasks;
+    let id_w = id.clone();
+    let actor_w = actor.clone();
+    let slot: Arc<Mutex<Option<Out>>> = Arc::new(Mutex::new(None));
+    let slot_w = slot.clone();
+    let write = state
+        .store
+        .write_async(move |conn| {
+            let Some(mut parent) = bs::get_issue(conn, &id_w)? else {
+                return finish(&slot_w, Out::Missing, no_write());
+            };
+            let child_ids = {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM issues WHERE epic=?1 AND deleted IS NULL ORDER BY created,id",
+                )?;
+                let ids = stmt
+                    .query_map(rusqlite::params![id_w], |r| r.get::<_, String>(0))?
+                    .flatten()
+                    .collect::<Vec<_>>();
+                ids
+            };
+            if parent.item_type == "epic" && !child_ids.is_empty() {
+                let children = child_ids
+                    .iter()
+                    .filter_map(|child| bs::get_issue(conn, child).ok().flatten())
+                    .collect();
+                return finish(&slot_w, Out::Already(parent, children), no_write());
+            }
+            if parent.source.as_deref() != Some("capture")
+                && !parent.desc.trim_start().starts_with("**Prompt:**")
+            {
+                return finish(&slot_w, Out::NotCapture, no_write());
+            }
+            if parent
+                .session
+                .as_deref()
+                .is_some_and(|owner| owner != actor_w)
+            {
+                return finish(
+                    &slot_w,
+                    Out::WrongOwner(parent.session.clone().unwrap_or_default()),
+                    no_write(),
+                );
+            }
+
+            let now = now_secs();
+            let stamp = chrono::Local::now().format("%H:%M").to_string();
+            parent.item_type = "epic".into();
+            parent.updated = now;
+            parent.rev += 1;
+            parent.version += 1;
+            parent.log = Some(bs::append_log(
+                parent.log.as_deref(),
+                &stamp,
+                &format!(
+                    "decomposed by {actor_w} into {} ordered child task(s)",
+                    tasks.len()
+                ),
+            ));
+            bs::save_patched(conn, &mut parent)?;
+            let mut events = vec![ev_snap(&parent, MutationKind::Updated)];
+            let mut children: Vec<IssueRow> = Vec::with_capacity(tasks.len());
+            for (idx, task) in tasks.iter().enumerate() {
+                let deps = task
+                    .depends_on
+                    .iter()
+                    .map(|n| children[*n - 1].id.clone())
+                    .collect::<Vec<_>>();
+                let new = bs::NewIssue {
+                    title: task.title.trim().to_string(),
+                    desc: task.description.trim().to_string(),
+                    status: if deps.is_empty() {
+                        "todo".into()
+                    } else {
+                        "backlog".into()
+                    },
+                    session: parent.session.clone().or_else(|| Some(actor_w.clone())),
+                    item_type: task.item_type.clone(),
+                    creator: actor_w.clone(),
+                    owner_type: "agent".into(),
+                    due: None,
+                    due_time: None,
+                    reviewer: None,
+                    shepherd: None,
+                    gate: Vec::new(),
+                    depends_on: deps,
+                    tags: vec![format!("p{}", task.priority)],
+                    ask_type: None,
+                    ask_question: None,
+                    ask_unblocks: None,
+                    source: Some("decomposition".into()),
+                };
+                let mut child = bs::create_issue(conn, &new, now)?;
+                child.epic = Some(parent.id.clone());
+                child.next_action = Some(task.next_action.trim().to_string());
+                child.log = Some(bs::append_log(
+                    child.log.as_deref(),
+                    &stamp,
+                    &format!(
+                        "created by {actor_w} from epic {} as plan step {} (priority p{})",
+                        parent.id,
+                        idx + 1,
+                        task.priority
+                    ),
+                ));
+                child.updated = now;
+                child.rev += 1;
+                child.version += 1;
+                bs::save_patched(conn, &mut child)?;
+                events.push(ev_snap(&child, MutationKind::Created));
+                children.push(child);
+            }
+            finish(
+                &slot_w,
+                Out::Created(parent, children),
+                WriteOutcome {
+                    applied: true,
+                    events,
+                },
+            )
+        })
+        .await;
+    if let Err(e) = write {
+        return internal(e);
+    }
+    let outcome = slot.lock().expect("outcome slot poisoned").take();
+    match outcome {
+        Some(Out::Missing) => not_found(&id),
+        Some(Out::NotCapture) => err(
+            StatusCode::CONFLICT,
+            json!({"error":"only an auto-captured prompt can be decomposed atomically", "item":id}),
+        ),
+        Some(Out::WrongOwner(owner)) => err(
+            StatusCode::FORBIDDEN,
+            json!({"error":"capture belongs to another worker", "item":id, "owner":owner, "caller":actor}),
+        ),
+        Some(Out::Already(parent, children)) => Json(json!({
+            "ok": true,
+            "id": parent.id,
+            "status": parent.status,
+            "epic": detail_body(&parent),
+            "tasks": children.iter().map(detail_body).collect::<Vec<_>>(),
+            "idempotent": true,
+        }))
+        .into_response(),
+        Some(Out::Created(parent, children)) => {
+            tracing::info!(
+                target: "amux::board",
+                epic = %parent.id,
+                worker = %actor,
+                children = children.len(),
+                dependency_edges = children.iter().map(|c| c.depends_on.len()).sum::<usize>(),
+                priorities = %children.iter().filter_map(|c| c.tags.iter().find(|t| t.starts_with('p'))).cloned().collect::<Vec<_>>().join(","),
+                "board capture decomposed atomically"
+            );
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "ok": true,
+                    "id": parent.id,
+                    "status": parent.status,
+                    "epic": detail_body(&parent),
+                    "tasks": children.iter().map(detail_body).collect::<Vec<_>>(),
+                })),
+            )
+                .into_response()
+        }
+        None => internal("decompose produced no outcome"),
     }
 }
 
@@ -6752,11 +7078,21 @@ async fn list_verifications(
 // Artifact CRUD (Phase 3a): per-task artifact registry.
 // ---------------------------------------------------------------------------
 
+fn artifact_value(r: &crate::db::artifact_store::ArtifactRow) -> Value {
+    json!({
+        "id": r.id,
+        "task_id": r.task_id,
+        "kind": r.kind,
+        "ref": r.ref_value,
+        "state": r.state,
+        "description": r.description,
+        "created_at": r.created_at,
+        "updated_at": r.updated_at,
+    })
+}
+
 /// GET /api/board/{id}/artifacts
-async fn list_artifacts(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Response {
+async fn list_artifacts(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let conn = match state.store.read() {
         Ok(c) => c,
         Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
@@ -6768,18 +7104,7 @@ async fn list_artifacts(
         Ok(r) => r,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    let items: Vec<Value> = rows.iter().map(|r| {
-        json!({
-            "id": r.id,
-            "task_id": r.task_id,
-            "kind": r.kind,
-            "ref": r.ref_value,
-            "state": r.state,
-            "description": r.description,
-            "created_at": r.created_at,
-            "updated_at": r.updated_at,
-        })
-    }).collect();
+    let items: Vec<Value> = rows.iter().map(artifact_value).collect();
     (StatusCode::OK, Json(json!(items))).into_response()
 }
 
@@ -6787,6 +7112,7 @@ async fn list_artifacts(
 async fn create_artifact(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
     let kind = match body.get("kind").and_then(|v| v.as_str()) {
@@ -6803,36 +7129,88 @@ async fn create_artifact(
     };
     let state_val = body.get("state").and_then(|v| v.as_str()).unwrap_or("created").to_string();
     let desc = body.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
+    if !crate::db::artifact_store::KNOWN_KINDS.contains(&kind.as_str()) {
+        return (StatusCode::BAD_REQUEST, Json(json!({
+            "error": "unknown artifact kind",
+            "kind": kind,
+            "valid_kinds": crate::db::artifact_store::KNOWN_KINDS,
+        }))).into_response();
+    }
+    if !crate::db::artifact_store::ARTIFACT_STATES.contains(&state_val.as_str()) {
+        return (StatusCode::BAD_REQUEST, Json(json!({
+            "error": "unknown artifact state",
+            "state": state_val,
+            "valid_states": crate::db::artifact_store::ARTIFACT_STATES,
+        }))).into_response();
+    }
+    let (_, actor) = actor_from_headers(&headers);
     let now = chrono::Utc::now().timestamp();
     let aid = format!("ART-{}", ulid::Ulid::new().to_string().to_lowercase());
     let row = crate::db::artifact_store::ArtifactRow {
         id: aid.clone(),
         task_id: id.clone(),
-        kind,
-        ref_value,
-        state: state_val,
+        kind: kind.clone(),
+        ref_value: ref_value.clone(),
+        state: state_val.clone(),
         description: desc,
         created_at: now,
         updated_at: now,
     };
     let aid_out = aid.clone();
+    let actor_w = actor.clone();
+    let kind_w = row.kind.clone();
+    let state_w = row.state.clone();
+    let ref_w = row.ref_value.clone();
+    let task_id_w = id.clone();
     let write = state.store.write_async(move |conn| {
-        if bs::get_issue(conn, &id).ok().flatten().is_none() {
+        let Some(mut task) = bs::get_issue(conn, &task_id_w)? else {
             return Err(rusqlite::Error::QueryReturnedNoRows);
-        }
+        };
         crate::db::artifact_store::insert(conn, &row)?;
+        let stamp = chrono::Local::now().format("%H:%M").to_string();
+        task.log = Some(bs::append_log(
+            task.log.as_deref(),
+            &stamp,
+            &format!("artifact ({actor_w}): {kind_w}/{state_w} {ref_w}"),
+        ));
+        task.updated = now;
+        task.rev += 1;
+        task.version += 1;
+        bs::save_patched(conn, &mut task)?;
         Ok(crate::db::WriteOutcome {
             applied: true,
-            events: vec![crate::db::PendingEvent {
-                entity_type: amux_core::revision::EntityType::Other("artifact".into()),
-                entity_id: aid.clone(),
-                mutation: amux_core::revision::MutationKind::Created,
-                payload: None,
-            }],
+            events: vec![
+                crate::db::PendingEvent {
+                    entity_type: amux_core::revision::EntityType::Other("artifact".into()),
+                    entity_id: aid.clone(),
+                    mutation: amux_core::revision::MutationKind::Created,
+                    payload: None,
+                },
+                ev_snap(&task, MutationKind::Updated),
+            ],
         })
     }).await;
     match write {
-        Ok(_) => (StatusCode::CREATED, Json(json!({"id": aid_out}))).into_response(),
+        Ok(_) => {
+            tracing::info!(
+                target: "amux::board",
+                task = %id,
+                artifact = %aid_out,
+                worker = %actor,
+                kind = %kind,
+                state = %state_val,
+                reference = %ref_value,
+                "board task artifact registered"
+            );
+            (StatusCode::CREATED, Json(json!({
+                "id": aid_out,
+                "task_id": id,
+                "kind": kind,
+                "ref": ref_value,
+                "state": state_val,
+                "actor": actor,
+            }))).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

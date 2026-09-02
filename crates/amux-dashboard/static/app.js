@@ -8372,7 +8372,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.772';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.773';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -25842,6 +25842,105 @@ function _boardDraftsPersist() {
 // known to have one — see the guard in the save handler (AMUX-2840).
 let _bdHydrated = false;
 
+function _bdConfigureGo(item) {
+  const goBtn = document.getElementById('bd-goto-session');
+  if (!goBtn) return;
+  const sess = item.session || '';
+  goBtn.style.display = sess ? '' : 'none';
+  goBtn.onclick = (e) => {
+    e.stopPropagation();
+    try { closeBoardDetail(); } catch (err) {}
+    openPeek(sess, { query: item.id });
+  };
+}
+
+function _bdArtifactRef(a) {
+  const ref = String((a && a.ref) || '');
+  if (/^https?:\/\//i.test(ref)) {
+    return '<a href="' + esc(ref) + '" target="_blank" rel="noopener noreferrer">' + esc(ref) + '</a>';
+  }
+  if (/^(?:\/|\.\.?\/)/.test(ref)) {
+    return '<span class="file-link" onclick="event.stopPropagation();openFilePreview(\''
+      + escJs(ref) + '\')">' + esc(ref) + '</span>';
+  }
+  return '<code>' + esc(ref) + '</code>';
+}
+
+// One renderer for cached open and authoritative hydration. Keeping relation
+// rendering here prevents the list card and GET detail from growing separate
+// definitions of the task's epic, source message, summary and assets.
+function _bdRenderMeta(item) {
+  const meta = document.getElementById('bd-meta');
+  if (!meta || !item) return;
+  const parts = [];
+  if (item.type) parts.push('Type ' + esc(item.type));
+  if (item.creator) parts.push('From ' + esc(item.creator));
+  if (item.created) parts.push('Created ' + timeAgo(item.created));
+  if (item.updated && item.updated !== item.created) parts.push('Updated ' + timeAgo(item.updated));
+  if (item.reviewer) parts.push('Reviewer ' + esc(item.reviewer));
+  if (item.source_ref) {
+    const lv = item.last_verified_at;
+    const ageH = lv ? Math.round((Date.now()/1000 - lv) / 3600) : null;
+    const stale = !lv || ageH > 24;
+    parts.push('Derived from ' + esc(String(item.source_ref).slice(0,60))
+      + (lv ? (' · source re-checked ' + ageH + 'h ago') : ' · never re-verified')
+      + (stale ? ' <span style="color:var(--red);font-weight:600;">STALE — re-check the source before acting</span>' : ''));
+  }
+  let html = parts.map(p => '<div class="board-detail-meta-row">' + p + '</div>').join('');
+  if (item.epic) {
+    html += '<div class="board-detail-meta-row"><b>Epic</b> <span class="task-id-chip" onclick="_openIssue(\''
+      + escJs(item.epic) + '\')">' + esc(item.epic) + '</span></div>';
+  }
+  const deps = Array.isArray(item.depends_on) ? item.depends_on : [];
+  if (deps.length) html += '<div class="board-detail-meta-row"><b>Blocked by</b> ' + deps.map(d =>
+    '<span class="task-id-chip" onclick="_openIssue(\'' + escJs(d) + '\')">' + esc(d) + '</span>').join(' ') + '</div>';
+
+  const summary = [
+    ['Next action', item.next_action],
+    ['Last result', item.last_result],
+    ['Unresolved', item.unresolved],
+    ['Evidence', item.evidence]
+  ].filter(x => x[1]);
+  if (summary.length) {
+    html += '<div class="board-detail-meta-row"><b>Work summary</b></div>'
+      + summary.map(x => '<div class="board-detail-meta-row"><span style="color:var(--dim)">'
+        + esc(x[0]) + ':</span> ' + _linkifyUrls(_linkifyCardIds(esc(String(x[1])))) + '</div>').join('');
+  }
+
+  const children = Array.isArray(item.children) ? item.children : [];
+  if (children.length) {
+    html += '<div class="board-detail-meta-row"><b>Child tasks (' + children.length + ')</b></div>'
+      + children.map(c => {
+        const sty = statusStyle(c.status || 'todo');
+        const pri = c.priority ? ' · ' + esc(c.priority) : '';
+        return '<div class="board-detail-meta-row" style="display:flex;gap:6px;align-items:center;">'
+          + '<span class="task-id-chip" onclick="_openIssue(\'' + escJs(c.id) + '\')">' + esc(c.id) + '</span>'
+          + '<span class="status-badge" style="background:' + sty.bg + ';color:' + sty.color + '">' + esc(c.status || 'todo') + '</span>'
+          + '<span>' + esc(c.title || '') + pri + '</span></div>';
+      }).join('');
+  }
+
+  const messages = Array.isArray(item.messages) ? item.messages : [];
+  if (messages.length) {
+    html += '<div class="board-detail-meta-row"><b>Source message' + (messages.length === 1 ? '' : 's') + '</b></div>'
+      + messages.map(m => {
+        const ts = Number(m.ts || 0); const sec = ts > 100000000000 ? Math.floor(ts / 1000) : ts;
+        return '<div class="board-detail-meta-row"><span class="task-id-chip">MSG-' + esc(String(m.id)) + '</span> '
+          + (m.session ? esc(m.session) + ' · ' : '') + (sec ? timeAgo(sec) + ' · ' : '')
+          + esc(String(m.text || '').slice(0,220)) + '</div>';
+      }).join('');
+  }
+
+  const artifacts = Array.isArray(item.artifacts) ? item.artifacts : [];
+  if (artifacts.length) {
+    html += '<div class="board-detail-meta-row"><b>Artifacts (' + artifacts.length + ')</b></div>'
+      + artifacts.map(a => '<div class="board-detail-meta-row">' + _bdArtifactRef(a)
+        + ' <span style="color:var(--dim)">· ' + esc(a.kind || 'artifact') + ' · ' + esc(a.state || 'created') + '</span>'
+        + (a.description ? '<div style="color:var(--dim)">' + esc(a.description) + '</div>' : '') + '</div>').join('');
+  }
+  meta.innerHTML = html;
+}
+
 /// Fetch the authoritative card and fill desc/log, WITHOUT clobbering anything
 /// the user has typed.
 ///
@@ -25857,22 +25956,37 @@ async function _bdHydrate(id) {
     const full = await r.json();
     if (!full || full.id !== id || boardDetailId !== id) return;  // modal moved on
     const idx = boardItems.findIndex(i => i.id === id);
+    const cached = idx >= 0 ? { ...boardItems[idx] } : {};
     if (idx >= 0) boardItems[idx] = Object.assign({}, boardItems[idx], full);
-    if (_boardDrafts[id]) { _bdHydrated = true; return; }  // user's draft wins
-    const d = document.getElementById('bd-desc');
-    // Only fill if the user has not started typing into it.
-    if (d && (d.value === '' || d.value === (full.desc || ''))) d.value = full.desc || '';
-    const l = document.getElementById('bd-log');
-    if (l && full.log !== undefined) l.textContent = full.log || '';
-    // RE-RENDER THE HISTORY TAB with the hydrated record. It was rendered at
-    // open time from the LIST item, and under slim that item carries no `log`
-    // — so the tab would show an empty history and a 0 count for every card,
-    // which reads as "nothing ever happened here" rather than as still
-    // loading. Same class as the blank desc, one surface over.
-    if (boardDetailId === id) {
       const merged = idx >= 0 ? boardItems[idx] : full;
       _bdRenderHistory(merged);
       if (typeof _bdRenderStatusBanner === 'function') _bdRenderStatusBanner(merged);
+    _bdRenderMeta(merged);
+    if (_boardDrafts[id]) { _bdHydrated = true; return; }  // user's draft wins
+    const title = document.getElementById('bd-title');
+    if (title && title.value === (cached.title || '')) {
+      title.value = full.title || '';
+      title.style.height = 'auto'; title.style.height = title.scrollHeight + 'px';
+    }
+    const d = document.getElementById('bd-desc');
+    // Only fill if the user has not started typing into it.
+    if (d && d.value === (cached.desc || '')) d.value = full.desc || '';
+    if (boardDetailStatus === (cached.status || 'todo')) {
+      boardDetailStatus = full.status || 'todo';
+      _renderDetailStatusBtns();
+    }
+    const sess = document.getElementById('bd-session');
+    if (sess && sess.value === (cached.session || '')) _populateSessionSelect('bd-session', full.session || '');
+    _bdConfigureGo(full);
+    const due = document.getElementById('bd-due');
+    if (due && due.value === (cached.due || '')) { due.value = full.due || ''; try { _dpSyncLabel(due); } catch (e) {} }
+    const dueTime = document.getElementById('bd-due-time');
+    if (dueTime && dueTime.value === (cached.due_time || '')) dueTime.value = full.due_time || '';
+    const gate = document.getElementById('bd-gate');
+    const oldGate = (Array.isArray(cached.gate) ? cached.gate : []).join('\n');
+    if (gate && gate.value === oldGate) gate.value = (Array.isArray(full.gate) ? full.gate : []).join('\n');
+    if (JSON.stringify(_tagState['bd'] || []) === JSON.stringify(cached.tags || [])) {
+      _tagState['bd'] = [...(full.tags || [])]; _beTagRenderChips('bd'); _beTagInputUpdate('bd');
     }
     _bdHydrated = true;
   } catch (e) { /* leave unhydrated; the save guard covers it */ }
@@ -25906,19 +26020,7 @@ function openBoardDetail(id) {
   const keyEl = document.getElementById('bd-key');
   if (keyEl) keyEl.textContent = item.id || '';
   _populateSessionSelect('bd-session', draft ? draft.session : (item.session || ''));
-  // One-tap jump from a card to the owning session's live progress
-  // (Ethan 07:19): opens the peek on the terminal, prefilled to search for
-  // this card id so the jump lands where the session last touched it.
-  const goBtn = document.getElementById('bd-goto-session');
-  if (goBtn) {
-    const _sess = (draft ? draft.session : item.session) || '';
-    goBtn.style.display = _sess ? '' : 'none';
-    goBtn.onclick = (e) => {
-      e.stopPropagation();
-      try { closeBoardDetail(); } catch (err) {}
-      openPeek(_sess, { query: item.id });
-    };
-  }
+  _bdConfigureGo({ ...item, session: draft ? draft.session : item.session });
   const dueEl = document.getElementById('bd-due');
   if (dueEl) { dueEl.value = draft ? (draft.due || '') : (item.due || ''); try { _dpSyncLabel(dueEl); } catch (e) {} }
   const dueTimeEl = document.getElementById('bd-due-time');
@@ -25929,26 +26031,7 @@ function openBoardDetail(id) {
   _tagState['bd'] = [...(item.tags || [])];
   _beTagRenderChips('bd');
   _beTagInputUpdate('bd');
-  const meta = document.getElementById('bd-meta');
-  const parts = [];
-  if (item.type) parts.push('Type ' + esc(item.type));
-  if (item.creator) parts.push('From ' + esc(item.creator));
-  if (item.created) parts.push('Created ' + timeAgo(item.created));
-  if (item.updated && item.updated !== item.created) parts.push('Updated ' + timeAgo(item.updated));
-  if (item.reviewer) parts.push('Reviewer ' + esc(item.reviewer));
-  if (item.source_ref) {
-    const lv = item.last_verified_at;
-    const ageH = lv ? Math.round((Date.now()/1000 - lv) / 3600) : null;
-    const stale = !lv || ageH > 24;
-    parts.push('Derived from ' + esc(String(item.source_ref).slice(0,60))
-      + (lv ? (' · source re-checked ' + ageH + 'h ago') : ' · never re-verified')
-      + (stale ? ' <span style="color:var(--red);font-weight:600;">STALE — re-check the source before acting</span>' : ''));
-  }
-  const deps = Array.isArray(item.depends_on) ? item.depends_on : [];
-  let depHtml = '';
-  if (deps.length) depHtml = '<div class="board-detail-meta-row">Blocked by ' + deps.map(d =>
-    '<span class="task-id-chip" onclick="_openIssue(\'' + escJs(d) + '\')" style="cursor:pointer;">' + esc(d) + '</span>').join(' ') + '</div>';
-  meta.innerHTML = parts.map(p => '<div class="board-detail-meta-row">' + p + '</div>').join('') + depHtml;
+  _bdRenderMeta(item);
   document.getElementById('bd-save-status').textContent = '';
   document.getElementById('board-detail-overlay').classList.add('active');
   setTimeout(() => document.getElementById('bd-title').focus(), 100);
@@ -26348,7 +26431,7 @@ async function boardDetailSave() {
   document.getElementById('bd-save-status').textContent = 'Saving...';
   const dueInput = document.getElementById('bd-due');
   const dueTimeInput = document.getElementById('bd-due-time');
-  const changes = { title, desc, status: boardDetailStatus, due: dueInput ? dueInput.value : '', due_time: dueTimeInput ? dueTimeInput.value : '', groups: [..._tagState['bd']], gate };
+  const changes = { title, desc, status: boardDetailStatus, due: dueInput ? dueInput.value : '', due_time: dueTimeInput ? dueTimeInput.value : '', tags: [..._tagState['bd']], gate };
   if (worker !== undefined) changes.session = worker;
   // The server enforces status gates: forward acknowledgement from _gateConfirm.
   if (_gateAck) { changes.gate_ack = true; if (Array.isArray(_gateAck)) changes.gate_checked = _gateAck; }
@@ -26387,13 +26470,13 @@ async function addBoardItem(title, desc, status, worker, groups, due, ownerType,
   gate = gate || [];
   const tempId = Math.random().toString(16).slice(2, 8);
   const now = Math.floor(Date.now() / 1000);
-  const tempItem = { id: tempId, title, desc, status, worker: worker || '', groups: groups || [], due: due || '', due_time: dueTime || '', gate: gate, creator: _getDeviceName(), owner_type: ownerType, created: now, updated: now, _pending: true };
+  const tempItem = { id: tempId, title, desc, status, session: worker || '', tags: groups || [], due: due || '', due_time: dueTime || '', gate: gate, creator: _getDeviceName(), owner_type: ownerType, created: now, updated: now, _pending: true };
   boardItems.push(tempItem);
   saveBoardCache();
   renderBoard();
   const r = await apiCall(API + '/api/board', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ title, desc, status, worker: worker || '', groups: groups || [], due: due || '', due_time: dueTime || '', gate: gate, creator: _getDeviceName(), owner_type: ownerType })
+    body: JSON.stringify({ title, desc, status, session: worker || '', tags: groups || [], due: due || '', due_time: dueTime || '', gate: gate, creator: _getDeviceName(), owner_type: ownerType })
   });
   if (r) {
     const item = await r.json();
