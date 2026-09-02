@@ -194,13 +194,15 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // path INIT-1's KillMode=process already covers (an OOM kill of the
     // pane, a manual kill, a crash).
     out.extend(registered_lanes_running_check().await);
+
+    tm.mark(&out, "5c. every registered, non-archived lane actually has");
     // -- 5d. did any pane's WHOLE systemd scope just get OOM-killed, not just
     // a process inside it? (AMUX-70) — the log signal for the incident that
     // filed this: a local cargo run OOM-killed took the whole interactive
     // session down with it.
     out.extend(pane_scope_oom_kill_check().await);
 
-    tm.mark(&out, "5c. every registered, non-archived lane actually has");
+    tm.mark(&out, "5d. did any pane's WHOLE systemd scope just get OOM-k");
     // -- 6. shared-checkout git guard: does the RUNNING hook match its committed
     // source? (AMUX-3033). AF-132: the committed side is read from HEAD at CHECK
     // time — these scripts deploy on COMMIT (install), not on binary rebuild, so
