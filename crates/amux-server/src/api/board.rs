@@ -3087,6 +3087,47 @@ fn chars_truncate_log(s: &str, n: usize) -> String {
     format!("{}…", s.chars().take(n).collect::<String>())
 }
 
+/// AF-413: which fields did a REFUSAL throw away?
+///
+/// A PATCH is atomic: when the status transition is refused, the whole body is
+/// discarded. That is the defensible choice and this does not change it. What
+/// was missing is that the refusal never SAID so — the response is a rich object
+/// (`blocked`, `error`, `gate`, `how_to_ack`, `why_blocked`) and every field in
+/// it describes the STATUS, so a caller cannot learn from it that an unrelated
+/// field went with it.
+///
+/// Measured three times in one session on 2026-09-02, on three different
+/// rejection reasons ("gate not acknowledged", "already holding doing", "done
+/// requires evidence of what was run"), one of which silently dropped a 4.2 KB
+/// card body that had just been composed. It is only cheap when the caller reads
+/// the card back out of habit; a script sending `{desc, status}` in one call
+/// loses every desc for every card whose gate is unmet and is told nothing.
+///
+/// `status` is excluded because the body already names it (`attempted_status`)
+/// and reporting it as discarded would bury the surprising fields in the
+/// unsurprising one.
+///
+/// UNKNOWN KEYS ARE NOT DISCARDED. A key outside `PATCH_WRITABLE` would not have
+/// been applied by a SUCCESSFUL patch either, so calling it a casualty of the
+/// refusal is a wrong answer, not a cautious one — it would send a caller
+/// hunting for work the refusal never destroyed. Those are `ignored_fields`, a
+/// different claim, reported on the paths that can compute it.
+///
+/// `desc_append` IS included despite being a control key rather than a writable
+/// one: it is the one control key that carries CONTENT, and it is the sanctioned
+/// way to add to a card somebody else is also writing. Dropping an append
+/// silently is the same loss as dropping a desc.
+fn discarded_by_refusal(map: &serde_json::Map<String, Value>) -> Vec<String> {
+    let mut out: Vec<String> = map
+        .keys()
+        .filter(|k| k.as_str() != "status")
+        .filter(|k| PATCH_WRITABLE.contains(&k.as_str()) || k.as_str() == "desc_append")
+        .cloned()
+        .collect();
+    out.sort();
+    out
+}
+
 const PATCH_WRITABLE: [&str; 32] = [
     "title", "desc", "status", "session", "type", "depends_on", "tags", "reviewer", "shepherd",
     "epic", // AMUX-2992: assign/clear the epic a card rolls up under
@@ -3135,6 +3176,73 @@ const PATCH_WRITABLE: [&str; 32] = [
 /// `desc_append` modifies how `desc` is written rather than naming a column,
 /// so it is control, not writable — but it MUST be listed, or it lands in
 /// `ignored_fields` and the append silently does nothing (AC-323).
+#[cfg(test)]
+mod af413_discarded_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn keys(v: serde_json::Value) -> Vec<String> {
+        discarded_by_refusal(v.as_object().unwrap())
+    }
+
+    /// THE SPECIMEN. A 4.2 KB desc sent alongside a status that was gated.
+    #[test]
+    fn a_desc_sent_with_a_refused_status_is_named() {
+        assert_eq!(keys(json!({"desc": "4.2 KB of card body", "status": "doing"})), ["desc"]);
+    }
+
+    /// The other two rejection reasons hit the same day carried `type` too.
+    #[test]
+    fn every_writable_field_in_the_body_is_named_sorted() {
+        assert_eq!(
+            keys(json!({"status": "done", "desc": "x", "type": "code", "title": "t"})),
+            ["desc", "title", "type"]
+        );
+    }
+
+    /// `status` is excluded: the body already names it as `attempted_status`,
+    /// and listing it would bury the surprising fields in the unsurprising one.
+    #[test]
+    fn status_alone_discards_nothing_surprising() {
+        assert!(keys(json!({"status": "doing"})).is_empty());
+    }
+
+    /// CONTROL, and the one that keeps this honest. An unknown key would not
+    /// have been applied by a SUCCESSFUL patch either, so naming it as a
+    /// casualty of the refusal would send the caller hunting for work that was
+    /// never destroyed. Without this cell, "list every key" would pass every
+    /// other cell here.
+    #[test]
+    fn an_unknown_key_is_not_a_casualty_of_the_refusal() {
+        assert!(keys(json!({"status": "doing", "nonsense_field": 1})).is_empty());
+        assert_eq!(keys(json!({"status": "doing", "nonsense_field": 1, "desc": "x"})), ["desc"]);
+    }
+
+    /// Control keys steer the operation and carry no content, so they are not
+    /// losses. The exception is the next cell.
+    #[test]
+    fn steering_control_keys_are_not_losses() {
+        assert!(keys(json!({"status": "doing", "gate_ack": true, "expect_rev": 3,
+                            "force": true, "reason": "why"})).is_empty());
+    }
+
+    /// ...except `desc_append`, the one control key that carries CONTENT. It is
+    /// the sanctioned way to add to a card someone else is also writing, so
+    /// dropping an append silently is the same loss as dropping a desc.
+    #[test]
+    fn desc_append_is_content_and_is_reported_though_it_is_a_control_key() {
+        assert!(!PATCH_WRITABLE.contains(&"desc_append"), "premise: it is NOT a writable key");
+        assert!(PATCH_CONTROL.contains(&"desc_append"), "premise: it IS a control key");
+        assert_eq!(keys(json!({"status": "done", "desc_append": "a peer note"})), ["desc_append"]);
+    }
+
+    /// An empty body discards nothing, and must not panic.
+    #[test]
+    fn an_empty_body_names_nothing() {
+        assert!(keys(json!({})).is_empty());
+    }
+}
+
 const PATCH_CONTROL: [&str; 9] = [
     "expect_rev",
     "gate_ack",
@@ -3593,6 +3701,12 @@ pub async fn patch_item(
             json!({ "error": "body must be a JSON object" }),
         );
     };
+    // AF-413: computed HERE, before `map` moves into the write closure, because
+    // the refusal that needs it is built inside that closure and answered after
+    // it. Cheap (a key scan) and unconditional: a value only read on the refusal
+    // path is not worth a branch, and making it conditional would put the field
+    // behind the same reasoning that left it missing in the first place.
+    let discarded_on_refusal = discarded_by_refusal(&map);
     let (actor, actor_name) = actor_from_headers(&headers);
     // ATTRIBUTION IS REQUIRED FOR FORCE (ts-gke 2026-08-03; Python parity
     // amux-server.py ~70111). Fires on `force` ITSELF, never `eff_gate &&
@@ -5915,7 +6029,27 @@ pub async fn patch_item(
     match outcome {
         None => internal("patch produced no outcome"),
         Some(PatchOut::NotFound) => not_found(&id),
-        Some(PatchOut::Refused(status, body)) => err(status, body),
+        Some(PatchOut::Refused(status, mut body)) => {
+            // AF-413: say what the refusal threw away, at the ONE place every
+            // refusal converges. There are 16 sites that build a refusal body;
+            // decorating each would cover today's and miss the next one, which
+            // is the rule-1 shape this card is an instance of.
+            //
+            // ALWAYS EMITTED, INCLUDING EMPTY. `discarded: []` means "nothing
+            // beyond the status was lost"; the key's ABSENCE would mean a server
+            // that does not compute this at all, and a caller cannot tell those
+            // apart if it is omitted when empty (ethos rule 4).
+            let dropped = discarded_on_refusal;
+            if !dropped.is_empty() {
+                body["discarded_note"] = json!(format!(
+                    "the transition was refused, so the WHOLE body was discarded — \
+                     {} was NOT applied and must be re-sent, separately from the status",
+                    dropped.join(", ")
+                ));
+            }
+            body["discarded"] = json!(dropped);
+            err(status, body)
+        }
         Some(PatchOut::Noop { mut body, ignored, all_ignored }) => {
             body["applied"] = json!(false);
             if !ignored.is_empty() {

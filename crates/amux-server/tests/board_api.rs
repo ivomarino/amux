@@ -3900,3 +3900,79 @@ async fn a_card_records_where_it_came_from_and_the_api_publishes_it() {
         "a row with no source must publish null, not invent one: {aged}"
     );
 }
+
+/// AF-413: a refusal must SAY what it threw away, and the caller must be able to
+/// tell "nothing else was lost" from "this server does not report losses".
+///
+/// The PATCH is atomic and stays that way — this asserts the reporting, not a
+/// partial write. Measured three times in one session on 2026-09-02 across three
+/// rejection reasons, one of which silently dropped a 4.2 KB card body.
+#[tokio::test]
+async fn a_refused_transition_names_the_fields_it_discarded() {
+    let (app, _dir) = app();
+    let card = create(
+        &app,
+        json!({ "title": "gated", "status": "doing", "desc": "artifact: crates/amux-server/src/api/board.rs" }),
+    )
+    .await;
+    let id = card["id"].as_str().unwrap().to_string();
+
+    // A desc riding along with a gated status: the specimen.
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "done", "evidence": EV, "desc": "CANARY-BODY", "title": "renamed" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert_eq!(v["error"], json!("gate not acknowledged"));
+    assert_eq!(
+        v["discarded"],
+        json!(["desc", "evidence", "title"]),
+        "the refusal must name the content fields it dropped: {v}"
+    );
+    assert!(
+        v["discarded_note"].as_str().unwrap_or("").contains("NOT applied"),
+        "a bare array is cryptic; say what happened: {v}"
+    );
+
+    // AND THE WRITE REALLY DID NOT HAPPEN — otherwise this test would pass just
+    // as well against a server that applied the desc and reported it discarded.
+    let (_, _, detail) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(detail["title"], json!("gated"), "title must be unchanged: {detail}");
+    assert!(
+        !detail["desc"].as_str().unwrap_or("").contains("CANARY-BODY"),
+        "desc must be unchanged: {detail}"
+    );
+
+    // THE FLEET'S COMMONEST LOSS, and the reason this matters beyond a card
+    // body. `amux board done <ID> --evidence-stdin` sends {status, evidence}.
+    // `evidence` is a writable field, so a gate refusal discards the evidence
+    // the caller just composed — which is what happened twice on 2026-09-02,
+    // on AF-410 and AF-416, each time re-sent by hand with --checked.
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "done", "evidence": EV })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert_eq!(v["discarded"], json!(["evidence"]), "{v}");
+
+    // CONTROL: a body with NOTHING but the status discards nothing surprising,
+    // and the key is STILL present. Its absence would mean "this server does not
+    // compute losses", which a caller cannot distinguish from "nothing was lost"
+    // if it were omitted when empty (ethos rule 4).
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "done" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert_eq!(v["discarded"], json!([]), "empty, but PRESENT: {v}");
+    assert!(v.get("discarded_note").is_none(), "no note when nothing was dropped: {v}");
+}
