@@ -380,17 +380,40 @@ pub(crate) async fn send_message(
     text: &str,
     parse_mode: Option<&str>,
 ) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    // AMUX-85/86 (2026-09-02): the previous bare `reqwest::Client::new()` had
+    // no timeout and no retry on a raw connection failure. Observed live:
+    // 84% of sends failing with "sendMessage request: error sending request"
+    // (a network-level failure, not a Telegram-side rejection -- that branch
+    // is handled separately below) at a suspiciously tight, consistent
+    // ~12.1s (p50 12111ms / p95 12169ms across 25 samples in one hour) --
+    // an ambient OS/network timeout this code was never bounding or retrying
+    // itself. An explicit timeout plus one retry on a transient send failure
+    // matches the resilience shape email.rs's api() already has for its own
+    // external calls; this call site had none.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("building telegram http client: {e}"))?;
     let mut body = serde_json::json!({ "chat_id": chat_id, "text": text });
     if let Some(mode) = parse_mode {
         body["parse_mode"] = serde_json::Value::String(mode.to_string());
     }
-    let resp = client
-        .post(format!("{}/sendMessage", api_base(token)))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("sendMessage request: {e}"))?;
+    let resp = match client.post(format!("{}/sendMessage", api_base(token))).json(&body).send().await
+    {
+        Ok(r) => r,
+        Err(first_err) => {
+            tracing::warn!(
+                "telegram_poll: sendMessage request failed ({first_err}), retrying once after 500ms"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            client
+                .post(format!("{}/sendMessage", api_base(token)))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("sendMessage request (after 1 retry): {e}"))?
+        }
+    };
     let status = resp.status();
     if status.is_success() {
         return Ok(());
