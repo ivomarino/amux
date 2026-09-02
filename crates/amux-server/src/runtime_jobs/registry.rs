@@ -574,6 +574,58 @@ fn reg() -> &'static Mutex<BTreeMap<String, Job>> {
     R.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+/// MANUAL TRIGGERS (AMUX-4046). Ethan: "make it so i can manually run a system
+/// schedule right then and there so that i can test it."
+///
+/// A separate map rather than a field on `Job`, for one reason that matters:
+/// `Job` lives behind a `std::sync::Mutex`, and the tick loop has to AWAIT the
+/// trigger. Handing the loop an `Arc<Notify>` cloned out of the map keeps the
+/// std lock strictly synchronous and never held across an await point.
+///
+/// `Notify::notify_one` stores a permit when nobody is waiting, so a trigger
+/// fired while the job is mid-tick is not lost — the next wait returns
+/// immediately. That is the behaviour you want from a "run it now" button: the
+/// press always produces a run, even if it lands during one.
+fn triggers() -> &'static Mutex<BTreeMap<String, std::sync::Arc<tokio::sync::Notify>>> {
+    static T: OnceLock<Mutex<BTreeMap<String, std::sync::Arc<tokio::sync::Notify>>>> =
+        OnceLock::new();
+    T.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// The trigger handle for `id`, created on first use so a job and its trigger
+/// cannot get out of step.
+pub fn trigger_handle(id: &str) -> std::sync::Arc<tokio::sync::Notify> {
+    let mut g = match triggers().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    g.entry(id.to_string()).or_default().clone()
+}
+
+/// Ask a job to tick NOW. `false` means there is nothing to ask: the id is not
+/// registered, or it is a `loop` job that owns its own sleep and never consults
+/// a trigger. Returning false rather than silently succeeding is the point —
+/// a run button that reports success while nothing runs is the failure this
+/// whole module exists to prevent.
+pub fn trigger(id: &str) -> bool {
+    if !is_triggerable(id) {
+        return false;
+    }
+    trigger_handle(id).notify_one();
+    true
+}
+
+/// Can this job be asked to tick? Only `periodic` jobs consult a trigger, and
+/// only if their loop was actually spawned (fleet isolation registers a job
+/// inert-but-visible, and an inert job must not claim it can run).
+pub fn is_triggerable(id: &str) -> bool {
+    let g = match reg().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    g.get(id).map(|j| j.kind == "periodic" && j.disabled.is_none()).unwrap_or(false)
+}
+
 /// Record a job at its spawn. Called by [`super::spawn_periodic_every`] and by
 /// [`spawn_loop`] / [`adopt`]; nothing else should call it, because a
 /// registration that is not a spawn is exactly the parallel list this module
@@ -1016,6 +1068,65 @@ fn pref_json(state: &AppState, d: &Doc) -> Option<Value> {
 
 /// `GET /api/system-jobs` — every internal background job, its last tick, and
 /// a status that can say STALLED.
+/// POST /api/system-jobs/{id}/run — tick a background job NOW (AMUX-4046).
+///
+/// Ethan: "make it so i can manually run a system schedule right then and there
+/// so that i can test it." The section this serves is amux's own plumbing,
+/// which is deliberately not editable — no edit, no delete, because it is
+/// machinery the user cannot own. Running one is a different act: it changes
+/// nothing about the job, it just stops you waiting up to an hour to find out
+/// whether a change works.
+///
+/// REFUSES RATHER THAN LYING when it cannot deliver. A `loop` job owns its own
+/// sleep and never consults a trigger, so asking it to run would do nothing at
+/// all; a 409 saying so is worth more than a 200 that looks like it worked.
+/// That is this view's founding rule applied to its newest button — three loops
+/// were dead for hours because a job with nothing to do and a job that is not
+/// running produced identical evidence.
+pub async fn run_system_job(
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let known = {
+        let g = match reg().lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        g.get(&id).map(|j| (j.kind, j.disabled.clone()))
+    };
+    let Some((kind, disabled)) = known else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(json!({"error": format!("no system job '{id}'")})),
+        )
+            .into_response();
+    };
+    if let Some(why) = disabled {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(json!({
+                "error": format!("'{id}' is disabled and its loop never spawned"),
+                "disabled_by": why,
+                "hint": "clear the switch above, then run it",
+            })),
+        )
+            .into_response();
+    }
+    if !trigger(&id) {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(json!({
+                "error": format!("'{id}' cannot be run on demand"),
+                "kind": kind,
+                "why": "this job owns its own sleep loop rather than ticking through the \
+                        shared periodic driver, so there is nothing to signal",
+            })),
+        )
+            .into_response();
+    }
+    axum::Json(json!({"ok": true, "id": id, "queued": true})).into_response()
+}
+
 pub async fn system_jobs(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> axum::response::Response {
@@ -1076,6 +1187,14 @@ pub async fn system_jobs(
             "purpose": d.map(|d| d.purpose),
             "documented": d.is_some(),
             "kind": l.map(|x| x.kind),
+            // CAN THIS BE RUN ON DEMAND (AMUX-4046)? Published rather than
+            // inferred client-side, because the answer depends on HOW the job
+            // was spawned: `periodic` jobs wait on a trigger in the shared
+            // loop, while `loop` jobs own their own sleep and never consult
+            // one. A UI that guessed would offer a button that silently does
+            // nothing, which is the exact failure this whole view exists to
+            // prevent (a dead job and a quiet one must not look alike).
+            "triggerable": is_triggerable(&id),
             "interval_s": f.interval_s,
             "stale_after_s": f.interval_s.map(stall_after_s),
             "spawned": f.spawned,
@@ -1122,7 +1241,9 @@ pub async fn system_jobs(
 }
 
 pub fn routes() -> axum::Router<AppState> {
-    axum::Router::new().route("/api/system-jobs", axum::routing::get(system_jobs))
+    axum::Router::new()
+        .route("/api/system-jobs", axum::routing::get(system_jobs))
+        .route("/api/system-jobs/{id}/run", axum::routing::post(run_system_job))
 }
 
 #[cfg(test)]

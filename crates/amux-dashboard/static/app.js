@@ -8428,7 +8428,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.777';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.778';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -23129,6 +23129,50 @@ const _SYSJOB_STATUS = {
   not_spawned: { cls: 'bad',   label: 'NOT RUNNING', hint: 'nothing started this job — the failure that cost hours' },
 };
 
+// RUN NOW for a system job (Ethan, 2026-09-02: "system schedulers need a run
+// now btn").
+//
+// This section is deliberately not editable — no edit, no delete, because it is
+// amux's own machinery and the user cannot own it. Running one is a different
+// act: it changes nothing about the job, it only saves waiting up to an hour to
+// find out whether a change works.
+//
+// `triggerable` comes from the SERVER, not a guess here. A `loop` job owns its
+// own sleep and never consults a trigger, so a button on it would do nothing at
+// all — and a control that silently does nothing is the exact failure this view
+// was built to prevent, where a dead job and a quiet one looked alike.
+function _sysJobRunBtn(j) {
+  if (!j.triggerable) {
+    const why = j.status === 'disabled'
+      ? 'This job is disabled, so its loop never started.'
+      : 'This job runs its own sleep loop rather than the shared periodic driver, '
+        + 'so there is nothing to signal.';
+    return '<button class="sysjob-run" disabled title="Cannot be run on demand. ' + esc(why)
+      + '">Run now</button>';
+  }
+  return '<button class="sysjob-run" onclick="event.stopPropagation();_runSystemJob(\''
+    + escJs(j.id) + '\',this)" title="Tick this job now instead of waiting for its interval">'
+    + 'Run now</button>';
+}
+async function _runSystemJob(id, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Running…'; }
+  try {
+    const r = await fetch(API + '/api/system-jobs/' + encodeURIComponent(id) + '/run',
+                          { method: 'POST', headers: _authHeaders() });
+    const d = await r.json();
+    if (!r.ok) { showToast(id + ': ' + (d.error || ('HTTP ' + r.status))); return; }
+    // "queued", not "ran": the trigger wakes the loop, and the tick happens on
+    // the job's own task. Claiming it finished would be a guess — the row's own
+    // last-tick age is what actually reports the run, a second or two later.
+    showToast(id + ' triggered — watch its last-tick age');
+    setTimeout(async () => { await fetchSystemJobs(); renderSystemJobs(); }, 1500);
+  } catch (e) {
+    showToast(id + ': ' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Run now'; }
+  }
+}
+
 function renderSystemJobs() {
   const el = document.getElementById('system-jobs-list');
   if (!el) return;
@@ -23178,7 +23222,7 @@ function renderSystemJobs() {
         <span class="sysjob-dot ${st.cls}"></span>
         <span class="sysjob-name">${esc(j.name || j.id)}</span>
         <code class="sysjob-id">${esc(j.id)}</code>
-        <span class="sysjob-status ${st.cls}" title="${esc(st.hint)}">${st.label}</span>
+        ${_sysJobRunBtn(j)}<span class="sysjob-status ${st.cls}" title="${esc(st.hint)}">${st.label}</span>
       </div>
       ${j.purpose ? `<div class="sysjob-purpose">${esc(j.purpose)}</div>`
                   : `<div class="sysjob-purpose dim">Undocumented job — it is running, but no one has written down what it does.</div>`}
@@ -24759,14 +24803,19 @@ function _colMenuClose() {
   const m = document.getElementById('board-col-menu');
   if (m) m.remove();
 }
-function _colMenu(e, st) {
+function _colMenu(e, st, lane) {
   e.preventDefault();
   e.stopPropagation();
   _colMenuClose();
   const from = boardStatuses.find(x => x.id === st);
-  const n = _colCardCount(st);
+  lane = lane || '';
+  const n = _colCardCount(st, lane);
+  // NAME THE SCOPE. "Migrate all" on a worker board means that worker's cards;
+  // on the global board it means every lane's. The header says which, because
+  // the two differ by two orders of magnitude and the menu looks identical.
   let h = '<div class="card-menu-item" style="cursor:default;opacity:0.75;">'
     + esc((from && from.label) || st) + ' &middot; ' + n + ' card' + (n === 1 ? '' : 's')
+    + (lane ? ' in ' + esc(lane) : ' (all workers)')
     + '</div><div class="card-menu-sep"></div>';
   boardStatuses.forEach(t => {
     if (t.id === st) return;
@@ -24778,7 +24827,7 @@ function _colMenu(e, st) {
         + 'individually.">&#128274; Migrate all to ' + esc(t.label) + '</div>';
     } else {
       h += '<div class="card-menu-item" onclick="event.stopPropagation();_colMigrateAll(\''
-        + escJs(st) + '\',\'' + escJs(t.id) + '\')">&#8594; Migrate all to '
+        + escJs(st) + '\',\'' + escJs(t.id) + '\',\'' + escJs(lane) + '\')">&#8594; Migrate all to '
         + esc(t.label) + '</div>';
     }
   });
@@ -24794,26 +24843,30 @@ function _colMenu(e, st) {
 }
 // The SAME canon `deleteBoardStatus` counts with, so the number in the dialog
 // matches the number on the column header you just clicked.
-function _colCardCount(st) {
+function _colCardCount(st, lane) {
   return (typeof boardItems !== 'undefined' ? boardItems : [])
-    .filter(i => !i.archived && !i.deleted && _statusCanon(i.status) === st).length;
+    .filter(i => !i.archived && !i.deleted && _statusCanon(i.status) === st
+                 && (!lane || i.session === lane)).length;
 }
-async function _colMigrateAll(from, to) {
+async function _colMigrateAll(from, to, lane) {
   _colMenuClose();
-  const n = _colCardCount(from);
+  lane = lane || '';
+  const n = _colCardCount(from, lane);
   const fl = (boardStatuses.find(x => x.id === from) || {}).label || from;
   const tl = (boardStatuses.find(x => x.id === to) || {}).label || to;
   if (!n) { showToast('"' + fl + '" has no cards to migrate'); return; }
   // SAY HOW MANY, and say it is not undoable in one action — the same rule
   // AMUX-2491 set for the column delete dialog. The count is the decision.
-  if (!confirm('Migrate all ' + n + ' card' + (n === 1 ? '' : 's') + ' from "' + fl
-      + '" to "' + tl + '"?\n\nEach move is recorded on the card, but there is no single '
-      + 'undo — reversing this means migrating them back.')) return;
+  if (!confirm('Migrate all ' + n + ' card' + (n === 1 ? '' : 's')
+      + (lane ? ' belonging to ' + lane : ' across ALL workers')
+      + ' from "' + fl + '" to "' + tl + '"?\n\nEach move is recorded on the card, but there '
+      + 'is no single undo; reversing this means migrating them back.')) return;
   try {
     const r = await fetch(API + '/api/board/bulk-migrate', {
       method: 'POST',
       headers: Object.assign({ 'Content-Type': 'application/json' }, _authHeaders()),
-      body: JSON.stringify({ from: from, to: to }),
+      body: JSON.stringify(lane ? { from: from, to: to, session: lane }
+                                 : { from: from, to: to }),
     });
     const d = await r.json();
     if (!r.ok) { showToast('Migrate refused: ' + (d.error || ('HTTP ' + r.status))); return; }
@@ -25223,9 +25276,6 @@ function _renderBoardColumnsInto(host, items, scope) {
     if (isGlobal && !stObj.stray) {
       const _hasGate = Array.isArray(stObj.gate) && stObj.gate.length;
       html += '<button class="col-gate-btn' + (_hasGate ? ' has-gate' : '') + '" onclick="event.stopPropagation();editStatusGate(\'' + st + '\')" title="Edit gate checklist for this column">&#9745;&#xFE0E; Gate</button>';
-      // MIGRATE-ALL lives here, beside Gate and delete, because it is the same
-      // class of control: it acts on the COLUMN, not on a card (AMUX-4044).
-      html += '<button class="col-more-btn" onclick="event.stopPropagation();_colMenu(event,\'' + st + '\')" title="Column actions">&#x22EF;</button>';
       if (!builtIn.has(st)) {
         // TRASH, NOT ✕ (AMUX-2491): the delete affordance must not look like
         // the app's 43 consequence-free dismiss ✕s — the glyph carries the
@@ -25236,6 +25286,19 @@ function _renderBoardColumnsInto(host, items, scope) {
     if (!isGlobal && scope.session && !stObj.stray) {
       const _sgHas = sessionGates[scope.session] && Array.isArray(sessionGates[scope.session][st]) && sessionGates[scope.session][st].length;
       html += '<button class="col-gate-btn' + (_sgHas ? ' has-gate' : '') + '" onclick="event.stopPropagation();editSessionGate(\'' + escJs(scope.session) + '\',\'' + st + '\')" title="Edit this worker&#39;s gate for ' + esc(stObj.label) + '">&#9745;&#xFE0E; Gate</button>';
+    }
+    // MIGRATE-ALL, on BOTH boards (Ethan: "the board elipse needs to be on the
+    // worker board page"). It sits beside Gate because it is the same class of
+    // control: it acts on the COLUMN, not on a card (AMUX-4044).
+    //
+    // The lane is passed through on a worker board, so "migrate all" there
+    // means THAT WORKER'S cards in the column and not the fleet's. Getting this
+    // wrong would be the worst possible bug in this feature: a click on one
+    // worker's board silently moving 489 cards belonging to 46 other lanes.
+    if (!stObj.stray) {
+      const _mLane = (!isGlobal && scope.session) ? scope.session : '';
+      html += '<button class="col-more-btn" onclick="event.stopPropagation();_colMenu(event,\''
+        + st + '\',\'' + escJs(_mLane) + '\')" title="Column actions">&#x22EF;</button>';
     }
     html += '</span></div>';
     if (isGlobal) {

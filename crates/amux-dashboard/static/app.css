@@ -3732,6 +3732,21 @@
   @media (max-width: 600px) {
     .col-more-btn { min-width: 44px; min-height: 44px; }
   }
+  /* Run-now on a system job (AMUX-4046). Quiet by default: this section is a
+     health view first, and the button must not compete with the status word
+     that says whether the job is alive. The disabled state stays visible
+     rather than hidden, so "cannot be run on demand" reads as a deliberate
+     refusal instead of a missing feature. */
+  .sysjob-run {
+    background: none; border: 1px solid var(--border); border-radius: 5px;
+    color: var(--dim); cursor: pointer; font-size: 0.7rem; padding: 2px 8px;
+    margin-right: 8px; line-height: 1.4; white-space: nowrap;
+    transition: color 0.15s, border-color 0.15s;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .sysjob-run:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+  .sysjob-run:disabled { opacity: 0.35; cursor: not-allowed; }
+  @media (max-width: 600px) { .sysjob-run { min-height: 44px; padding: 2px 12px; } }
   .col-del-btn {
     background: none; border: none; color: var(--dim); cursor: pointer; font-size: 0.75rem;
     padding: 0 2px; line-height: 1; opacity: 0.5; transition: opacity 0.15s, color 0.15s;

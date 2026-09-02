@@ -227,8 +227,30 @@ where
         // with a rapid-fire catch-up volley (the spin-catcher lesson — a
         // detector/maintainer must not amplify the load it exists to manage).
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // MANUAL TRIGGER (AMUX-4046). Ethan: "make it so i can manually run a
+        // system schedule right then and there so that i can test it."
+        //
+        // ONE seam for all 31 jobs. Because this is the only constructor of a
+        // PeriodicTask, selecting the trigger HERE makes every periodic job
+        // runnable on demand — including ones written years from now by
+        // someone who never reads this. The same argument the registration
+        // above already makes for visibility.
+        //
+        // The handle is cloned once, outside the loop: `notified()` must be
+        // created from a live `Notify`, and re-fetching it per iteration would
+        // race a trigger fired between the drop and the next lookup.
+        let trigger = registry::trigger_handle(&job_id);
         loop {
-            tick.tick().await;
+            tokio::select! {
+                _ = tick.tick() => {}
+                () = trigger.notified() => {
+                    // Say it was a person, not the clock. A tick that ran
+                    // because someone pressed a button and one that ran on
+                    // schedule are different facts, and a reader debugging a
+                    // job needs to tell them apart.
+                    tracing::info!(job = %job_id, "manual run requested");
+                }
+            }
             registry::tick_start(&job_id);
             f().await;
             registry::tick_end(&job_id);

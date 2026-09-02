@@ -485,20 +485,39 @@ async fn ready_frontier(
 /// other's numbers.
 type BulkOutcome = Arc<Mutex<Option<(usize, usize, Vec<Value>)>>>;
 
-/// A column's gate criteria, or `None` when it has none (AMUX-4044).
+/// Did EVERY card refuse for the same gate? (AMUX-4044)
 ///
-/// THREE THINGS MEAN "UNGATED" and they arrive as different values: no row, a
-/// NULL column, and a stored empty array. Collapsing them here is what lets the
-/// caller ask one question. An unparseable value is treated as GATED, because
-/// the safe reading of "I cannot tell" is not "go ahead and move 489 cards".
-fn gate_criteria(raw: &str) -> Option<Vec<String>> {
-    match serde_json::from_str::<Vec<String>>(raw) {
-        Ok(v) if v.is_empty() => None,
-        Ok(v) => Some(v),
-        // Unparseable: fail CLOSED.
-        Err(_) if raw.trim().is_empty() => None,
-        Err(_) => Some(vec![format!("unreadable gate: {raw}")]),
+/// THERE IS NO COLUMN-LEVEL GATE TO PRE-CHECK, and finding that out is the
+/// whole story of this function. The first draft queried a `board_statuses`
+/// table that does not exist, swallowed the error, read "ungated" and let a
+/// `todo -> done` request through. Pointing it at the real `statuses` table
+/// did not fix it either: a fresh schema has no gate stored on `done` at all,
+/// while the live refusals reported `source: "typed"`. Gates resolve through
+/// `effective_gate_trail`, which is per CARD — it reads the card's session and
+/// its lane's groups — so "is this column gated" has no single answer to look
+/// up. A pre-check could only ever have been a guess that disagreed with the
+/// authority.
+///
+/// So the authority decides, per card, and this reads the result. When every
+/// considered card refused with the SAME gate, the honest response is a 409
+/// naming it, not a 200 saying "moved 0" and leaving the caller to infer why.
+/// Measured live before this existed: `todo -> done` returned HTTP 200 with
+/// `considered: 147, moved: 0` and 147 identical `GateBlocked` refusals.
+fn unanimous_gate(considered: usize, moved: usize, refused: &[Value]) -> Option<String> {
+    if considered == 0 || moved > 0 || refused.len() != considered {
+        return None;
     }
+    let first = refused.first()?.get("why")?.as_str()?.to_string();
+    if !first.starts_with("GateBlocked") {
+        return None;
+    }
+    // Every one, not just the first: a column where SOME cards are gated and
+    // others failed for their own reasons is a mixed result, and flattening
+    // that into one gate message would hide the rest.
+    refused
+        .iter()
+        .all(|r| r.get("why").and_then(Value::as_str) == Some(first.as_str()))
+        .then_some(first)
 }
 
 /// POST /api/board/bulk-migrate — move every live card out of one column.
@@ -551,34 +570,6 @@ async fn bulk_migrate(
     // THE GATE CHECK, once, up front, on a READ. Doing it inside the write
     // closure meant smuggling the verdict out through a fake event; a column's
     // gate is plain stored state and reading it is the honest way to ask.
-    let gate = state
-        .store
-        .read()
-        .ok()
-        .and_then(|conn| {
-            conn.query_row(
-                "SELECT gate FROM board_statuses WHERE id=?1",
-                rusqlite::params![to],
-                |r| r.get::<_, Option<String>>(0),
-            )
-            .optional()
-            .ok()
-            .flatten()
-            .flatten()
-        })
-        .and_then(|g| gate_criteria(&g));
-    if let Some(criteria) = gate {
-        return err(
-            StatusCode::CONFLICT,
-            json!({
-                "error": format!("'{to}' has a gate, so it cannot be bulk-filled"),
-                "gate": criteria,
-                "why": "a gate is a per-card claim; one acknowledgement for a whole column \
-                        would assert it about cards nobody looked at",
-                "hint": "move these individually, or pick an ungated column",
-            }),
-        );
-    }
 
     // PER-CALL, not a static: two concurrent migrations would clobber a global
     // and each would report the other's numbers. Same handle shape the rename
@@ -646,6 +637,19 @@ async fn bulk_migrate(
         Ok(_) => {
             let (considered, moved, refused) =
                 out.lock().ok().and_then(|mut g| g.take()).unwrap_or((0, 0, Vec::new()));
+            if let Some(why) = unanimous_gate(considered, moved, &refused) {
+                return err(
+                    StatusCode::CONFLICT,
+                    json!({
+                        "error": format!("every card in '{from}' refused the move to '{to}'"),
+                        "gate": why,
+                        "why": "a gate is a per-card claim; one acknowledgement for a whole \
+                                column would assert it about cards nobody looked at",
+                        "hint": "move these individually, or pick an ungated column",
+                        "considered": considered,
+                    }),
+                );
+            }
             Json(json!({
                 "ok": true, "from": from, "to": to, "session": lane,
                 "considered": considered, "moved": moved,
@@ -8104,28 +8108,46 @@ mod bulk_migrate_tests {
     /// One acknowledgement across 489 backlog cards would assert all four of
     /// `verified`'s criteria about work nobody opened, which is the claim
     /// AF-321 exists to refuse.
+    /// AMUX-4044. The response must say WHY a whole column refused.
+    ///
+    /// Built from the live specimen: `todo -> done` returned HTTP 200 with
+    /// `considered: 147, moved: 0` and 147 identical
+    /// `GateBlocked{criteria:["Implemented and merged","Tests / lint pass"]}`
+    /// refusals. Every card was correctly stopped by `advance` — the belt held
+    /// — but the caller got a success with a zero in it and had to infer the
+    /// reason from an array.
     #[test]
-    fn a_gated_column_is_never_bulk_fillable_and_an_ungated_one_is() {
-        // The real shapes, all three of which mean ungated and arrive
-        // differently.
-        assert_eq!(gate_criteria("[]"), None, "an empty array is ungated");
-        assert_eq!(gate_criteria(""), None, "an empty string is ungated");
-        assert_eq!(gate_criteria("   "), None, "whitespace is ungated");
+    fn a_column_that_unanimously_refuses_a_gate_is_reported_as_a_gate() {
+        let gb = |id: &str| {
+            json!({"id": id, "why": "GateBlocked { criteria: [\"Implemented and merged\"] }"})
+        };
 
-        // The live `done` gate, verbatim.
-        let done = r#"["Implemented and merged","Tests / lint pass"]"#;
-        assert_eq!(
-            gate_criteria(done),
-            Some(vec!["Implemented and merged".into(), "Tests / lint pass".into()]),
-            "a real gate must be reported WITH its criteria, so the refusal can name them"
-        );
-
-        // FAIL CLOSED. "I cannot read this" must not become "go ahead": the
-        // cost of a wrong yes here is a whole column moved on a guess.
-        let unreadable = gate_criteria("{not json");
+        // THE SPECIMEN, shrunk: every considered card refused the same gate.
+        let all = vec![gb("A-1"), gb("A-2"), gb("A-3")];
         assert!(
-            unreadable.is_some(),
-            "an unparseable gate must be treated as GATED, not waved through: {unreadable:?}"
+            unanimous_gate(3, 0, &all).is_some(),
+            "a column where every card refused one gate must be reported as gated"
         );
+
+        // PARTIAL SUCCESS IS NOT A GATE. If anything moved, the operation did
+        // what it said and the refusals are per-card business.
+        assert_eq!(unanimous_gate(3, 1, &all[..2]), None, "a partial move is not a gate refusal");
+
+        // MIXED REASONS MUST NOT FLATTEN. One gate message over a column whose
+        // cards failed for different reasons hides everything but the first.
+        let mixed = vec![gb("A-1"), json!({"id": "A-2", "why": "Stale { actual: \"doing\" }"})];
+        assert_eq!(
+            unanimous_gate(2, 0, &mixed),
+            None,
+            "different refusals are a mixed result, not one gate"
+        );
+
+        // A non-gate unanimous refusal is also not a gate.
+        let stale = vec![json!({"id": "A-1", "why": "Stale { actual: \"doing\" }"})];
+        assert_eq!(unanimous_gate(1, 0, &stale), None, "only GateBlocked reads as a gate");
+
+        // Nothing considered is nothing to report.
+        assert_eq!(unanimous_gate(0, 0, &[]), None, "an empty column is not a gate refusal");
     }
+
 }
