@@ -18,8 +18,9 @@
   body.light .overlay-body {
     background: #1c2128 !important; color: #cdd9e5 !important;
   }
-  body.light .peek-copy-btn {
-    background: rgba(28,33,40,0.85); border-color: rgba(255,255,255,0.2); color: #cdd9e5;
+  body.light .peek-copy-btn,
+  body.light .peek-agent-nav button {
+    background: #1c2128; border-color: rgba(255,255,255,0.2); color: #cdd9e5;
   }
   /* Connection status — hardcoded neon colors are invisible on white */
   body.light .conn-status.online  { color: #1a7f37; background: rgba(26,127,55,0.1); }
@@ -768,6 +769,10 @@
     margin-bottom: 8px; flex-shrink: 0;
   }
   .overlay-header h2 { font-size: 1.1rem; }
+  /* Reserve the control strip so output does not start underneath it. Scoped
+     to #peek-body: .overlay-body is shared with overlays that have no such
+     controls, and padding them would be a gap with nothing in it. */
+  #peek-body { padding-top: 40px; }
   .overlay-body {
     flex: 1; min-height: 0; overflow-x: hidden; overflow-y: auto;
     background: #010409; border-radius: 8px;
@@ -810,10 +815,25 @@
      220-col lane: 4196 vs 1416 at 1440px desktop (2780px unreachable without
      panning) and 4196 vs 366 at 390px phone — ~9% of each line visible on the
      platform amux optimises for first. */
+  /* THE CONTROL STRIP MUST NOT BLEED (AMUX-4050). Ethan's phone screenshot:
+     `crates/amux-` of a panicked-at path was unreadable because these controls
+     float over #peek-body (position:absolute; inset:0) at 0.85 alpha, so the
+     terminal text showed THROUGH them and neither the text nor the button was
+     legible. Two changes, and both are needed:
+
+       1. Opaque. At 0.85 the text behind is still visible and the result is
+          mush. A sticky control that hides what is under it is honest; one
+          that half-hides it is not readable either way.
+       2. #peek-body reserves the strip (padding-top below), so at rest the
+          first line of output starts BELOW the buttons rather than under them.
+
+     The pane auto-scrolls to the bottom, so the occluded zone is the top,
+     which is exactly where someone scrolled up to read old output is looking.
+     That is the case in the screenshot. */
   .peek-copy-btn {
     position: absolute; top: 6px; right: 6px; z-index: 10;
     height: 28px; border-radius: 6px; padding: 0 8px;
-    border: 1px solid rgba(255,255,255,0.15); background: rgba(13,17,23,0.85);
+    border: 1px solid rgba(255,255,255,0.15); background: #0d1117;
     color: var(--dim); font-size: 0.75rem; cursor: pointer;
     display: flex; align-items: center; gap: 4px;
     -webkit-tap-highlight-color: transparent; transition: all 0.15s;
@@ -826,7 +846,7 @@
   }
   .peek-agent-nav button {
     height: 28px; min-width: 32px; border-radius: 6px; padding: 0 6px;
-    border: 1px solid rgba(255,255,255,0.15); background: rgba(13,17,23,0.85);
+    border: 1px solid rgba(255,255,255,0.15); background: #0d1117;
     color: var(--dim); font-size: 0.78rem; cursor: pointer;
     -webkit-tap-highlight-color: transparent; transition: all 0.15s;
   }
