@@ -1091,11 +1091,17 @@ mod report_hook_wiring_tests {
         let wired = serde_json::json!({"hooks": {
             "Stop": [{"hooks": [{"type": "command",
                 "command": "bash \"$HOME/.amux/hook-report.sh\" idle stop-hook"}]}],
+            "UserPromptSubmit": [{"hooks": [{"type": "command",
+                "command": "bash \"$HOME/.amux/hook-report.sh\" active prompt-hook"}]}],
             "PostToolUse": [{"matcher": ".*", "hooks": [{"type": "command",
-                "command": "bash \"$HOME/.amux/hook-report.sh\" active tool-hook"}]}]
+                "command": "bash \"$HOME/.amux/hook-report.sh\" active tool-hook"}]}],
+            "SubagentStart": [{"hooks": [{"type": "command",
+                "command": "bash \"$HOME/.amux/hook-report.sh\" subagent-start subagent-start-hook"}]}],
+            "SubagentStop": [{"hooks": [{"type": "command",
+                "command": "bash \"$HOME/.amux/hook-report.sh\" subagent-stop subagent-stop-hook"}]}]
         }});
         let got = extract_report_hooks(&wired);
-        assert_eq!(got.len(), 2, "both report hooks must be selected");
+        assert_eq!(got.len(), 5, "all five report hooks must be selected");
         assert_eq!(
             got.iter().find(|e| e.event == "PostToolUse").unwrap().matcher.as_deref(),
             Some(".*"),

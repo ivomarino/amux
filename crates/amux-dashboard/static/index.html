@@ -1896,6 +1896,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <textarea id="bd-title" class="board-detail-title-input" placeholder="Untitled" autocomplete="off" autocorrect="on" spellcheck="true" rows="1" oninput="this.style.height='auto';this.style.height=this.scrollHeight+'px'"></textarea>
     <div id="bd-status-banner" class="bd-status-banner" style="display:none;"></div>
     <div class="board-detail-status-row" id="bd-status-row"></div>
+    <div class="board-detail-meta" id="bd-meta"></div>
     <div class="board-detail-row" id="bd-session-row">
       <span style="font-size:0.78rem;color:var(--dim);">Worker:</span>
       <select id="bd-session" class="board-detail-session-select"></select>
@@ -1920,22 +1921,19 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </div>
     </div>
     <div class="board-detail-row" style="align-items:flex-start;">
-      <span style="font-size:0.78rem;color:var(--dim);padding-top:7px;">Gate:</span>
+      <span style="font-size:0.78rem;color:var(--dim);padding-top:7px;">Gate override:</span>
       <div style="flex:1;">
         <textarea id="bd-gate" class="board-detail-desc-input" style="min-height:56px;resize:vertical;" placeholder="Gate override — one criterion per line. Leave blank to use the status's default gate."></textarea>
       </div>
     </div>
     <div class="board-detail-tabs">
       <button class="board-detail-tab" id="bd-tab-edit" onclick="boardDetailTab('edit')">Edit</button>
-      <button class="board-detail-tab active" id="bd-tab-preview" onclick="boardDetailTab('preview')">Preview</button>
-      <button class="board-detail-tab" id="bd-tab-history" onclick="boardDetailTab('history')">History<span id="bd-hist-n" class="bd-hist-n"></span></button>
-      <button class="board-detail-tab" id="bd-tab-lineage" onclick="boardDetailTab('lineage')">Lineage</button>
+      <button class="board-detail-tab active" id="bd-tab-preview" onclick="boardDetailTab('preview')">Details</button>
+      <button class="board-detail-tab" id="bd-tab-history" onclick="boardDetailTab('history')">Activity<span id="bd-hist-n" class="bd-hist-n"></span></button>
     </div>
     <textarea id="bd-desc" class="board-detail-desc-input" placeholder="Add notes, description, or context... (supports Markdown)"></textarea>
     <div id="bd-log" class="board-detail-log" style="display:none"></div>
-    <div id="bd-lineage" class="board-detail-lineage" style="display:none"></div>
     <div id="bd-preview" class="board-detail-preview md-content" style="display:none;"></div>
-    <div class="board-detail-meta" id="bd-meta"></div>
   </div>
   <div class="board-detail-footer">
     <span id="bd-save-status" style="font-size:0.78rem;color:var(--dim);"></span>

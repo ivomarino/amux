@@ -3542,3 +3542,99 @@ COST: Files, URLs, commits and screenshots fell back to prose; the task could no
 FIX: e139be2d adds `amux board artifact`, validates artifact kind/state, appends an
   attributed task-history event, emits a greppable registration log, and returns
   artifacts in the authoritative task detail response.
+
+## Cross-group worker permission looked saved, then silently reset
+AREA: settings
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: none
+SYMPTOM: Enabling "Allow workers to message beyond groups" in Settings immediately
+  returned the switch to off. The global offline outbox synthesized an HTTP 202
+  for `/api/config/cross-group`; the settings caller accepted that queued response
+  as durable server state, and its error path did not restore the prior value.
+COST: Operators were shown permission state that was never persisted, so workers
+  could not reliably use the intended routing policy after a refresh or outage.
+FIX: The cross-group route is no longer queueable. The toggle now rejects locally
+  synthesized responses, reads the setting back after PUT, and visibly rolls back
+  on transport failure or a mismatched server value. A browser-contract test covers
+  the real response, queued response, read-back mismatch, and failure cases.
+
+## Claude subagent work was invisible to live worker status
+AREA: status
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: none
+SYMPTOM: Two real Claude subagents created files while the embedded terminal showed
+  `2 agents`, but the Workers card remained idle for the entire 31-second window.
+  The installed hook set had prompt/tool/stop events only; it omitted
+  `SubagentStart` and `SubagentStop`. A later main-agent report also replaced the
+  full report object, erasing any subagent count, while subagent updates neither
+  invalidated the sessions cache nor emitted the normal session SSE event.
+COST: The status surface contradicted the actual terminal precisely during delegated
+  work, and could remain stale until an unrelated refresh.
+FIX: Installation now idempotently merges all five Claude lifecycle hooks while
+  preserving unrelated settings. Subagent reports keep a floored live count,
+  preserve that count across main-agent updates, invalidate the cache, and emit the
+  ordinary session update event. Hook, invariant, cache and SSE regressions cover it.
+
+## Codex could read idle while working, then working after completion
+AREA: status
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-10
+SYMPTOM: During a real Codex gpt-5.5 run the embedded terminal visibly said Working
+  while the Workers card said idle and 41 minutes old. After the completed turn had
+  returned to an idle prompt, the card said working. Tmux activity time is not a
+  trustworthy lifecycle clock for Codex's alternate-screen UI, and pane churn after
+  completion can outvote the visible prompt.
+COST: Supervisors could start duplicate work during an active turn or wait forever
+  on work that had already completed, including turns that created real subagents.
+FIX: For Codex-family workers, status now reads the structured rollout lifecycle
+  (`task_started`/`task_complete`, plus equivalent turn events), ignores signals from
+  before the current session start, and uses those boundaries to override stale tmux
+  activity without overriding an explicit waiting prompt.
+
+## Task detail hid the gates, sources, relationships and produced assets needed to audit it
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-5
+SYMPTOM: A completed card exposed Edit, an empty Preview, History and Lineage, but
+  not one coherent audit view. The empty gate override did not show the effective
+  column gates; source messages and task relationships were scattered; created files
+  appeared only in prose; and opening an empty group field dumped a fleet-wide list
+  of detector/autofix suggestions unrelated to the task.
+COST: A reviewer could not establish from the card what command created it, which
+  epic/dependencies governed it, which gates it passed, what every worker action was,
+  or open the files and URLs it produced.
+FIX: The task API now returns resolved structured and inferred asset links plus the
+  effective gate trail. The card's Details view groups facts, exact source-message
+  links, epic/parent/child/dependency relationships, gates, work summary, multiple
+  clickable assets, and recent actions with a link to the full activity list.
+  Empty group input no longer invents suggestions; dead Preview/Lineage surface area
+  is removed from the detail UI, and displayed `MSG-N` links perform exact ID lookup.
+
+## Claude completion notifications could precede the subagent's actual completion
+AREA: provider-integration
+SEVERITY: slows
+STATUS: open (provider-side notification defect; amux lifecycle handling is fixed)
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: none
+SYMPTOM: Claude produced an initial subagent completion notification while that agent
+  still reported waiting and its requested file did not exist; a second notification
+  arrived only after the file was actually written.
+COST: Treating notification prose as lifecycle truth would have marked delegated work
+  complete early.
+FIX: Amux does not infer lifecycle from Claude's notification text. The status fix
+  consumes the provider's explicit subagent start/stop hooks and keeps notification
+  content as display-only evidence. The provider-side duplicate/early notification
+  remains outside this repository.

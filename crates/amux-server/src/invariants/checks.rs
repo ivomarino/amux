@@ -1916,11 +1916,11 @@ pub struct ReportHookEntry {
 /// ethos rule 7, certified by its own incident report.
 ///
 /// INVARIANT: every report hook configured in settings.json actually INVOKES
-/// `hook-report.sh`, and (the documented second trap, AMUX-2538) a tool event's
-/// entry carries a matcher that is a valid REGEX — `"*"` is not one, and an
-/// entry without one is silently ignored. Both failure modes leave a
-/// settings.json that reads as correct and a hook that never runs or runs
-/// impoverished.
+/// `hook-report.sh`; all five lifecycle edges are present with the right mode;
+/// and (the documented second trap, AMUX-2538) a tool event's entry carries a
+/// matcher that is a valid REGEX — `"*"` is not one, and an entry without one is
+/// silently ignored. A Stop-only config used to pass this check while prompt
+/// activation and subagent counts were completely unwired.
 ///
 /// Selection is by "does this command mention the report script or the report
 /// ENDPOINT", so a fork is INSIDE the denominator rather than filtered out of
@@ -1944,6 +1944,13 @@ pub fn report_hooks_wired(entries: Result<Vec<ReportHookEntry>, String>) -> Vec<
     }
     let mut broken: Vec<String> = Vec::new();
     let mut rows: Vec<serde_json::Value> = Vec::new();
+    let required = [
+        ("UserPromptSubmit", "active prompt-hook"),
+        ("PostToolUse", "active tool-hook"),
+        ("Stop", "idle stop-hook"),
+        ("SubagentStart", "subagent-start subagent-start-hook"),
+        ("SubagentStop", "subagent-stop subagent-stop-hook"),
+    ];
     for e in &entries {
         let wired = e.command.contains("hook-report.sh");
         // A tool event without a valid regex matcher is INERT — it parses, it
@@ -1951,6 +1958,8 @@ pub fn report_hooks_wired(entries: Result<Vec<ReportHookEntry>, String>) -> Vec<
         let tool_event = matches!(e.event.as_str(), "PreToolUse" | "PostToolUse");
         let matcher_ok = !tool_event
             || e.matcher.as_deref().is_some_and(|m| regex::Regex::new(m).is_ok());
+        let expected_mode = required.iter().find(|(event, _)| *event == e.event);
+        let mode_ok = expected_mode.is_some_and(|(_, args)| e.command.contains(args));
         if !wired {
             broken.push(format!(
                 "{}: does not invoke hook-report.sh (an inline reimplementation — this is the \
@@ -1967,13 +1976,26 @@ pub fn report_hooks_wired(entries: Result<Vec<ReportHookEntry>, String>) -> Vec<
                 ),
             });
         }
+        if !mode_ok {
+            broken.push(match expected_mode {
+                Some((_, args)) => format!(
+                    "{}: hook-report.sh is invoked with the wrong mode (expected {args:?})",
+                    e.event
+                ),
+                None => format!(
+                    "{}: amux report command is on a non-canonical lifecycle event",
+                    e.event
+                ),
+            });
+        }
         let mut row = json!({
             "event": e.event,
             "invokes_hook_report": wired,
             "matcher_ok": matcher_ok,
+            "mode_ok": mode_ok,
             "matcher": e.matcher,
         });
-        if !wired || !matcher_ok {
+        if !wired || !matcher_ok || !mode_ok {
             // Only for FAILING rows, and only a head: enough to identify the
             // fork, without dumping a user's settings file into an API response.
             let head: String = e.command.chars().take(120).collect();
@@ -1981,13 +2003,27 @@ pub fn report_hooks_wired(entries: Result<Vec<ReportHookEntry>, String>) -> Vec<
         }
         rows.push(row);
     }
+    for (event, args) in required {
+        let covered = entries.iter().any(|e| {
+            e.event == event
+                && e.command.contains("hook-report.sh")
+                && e.command.contains(args)
+                && (event != "PostToolUse"
+                    || e.matcher.as_deref().is_some_and(|m| regex::Regex::new(m).is_ok()))
+        });
+        if !covered {
+            broken.push(format!(
+                "{event}: missing canonical hook (expected hook-report.sh {args})"
+            ));
+        }
+    }
     let evidence = json!({ "entries": rows });
     if broken.is_empty() {
         vec![InvariantResult::pass(ID).evidence(evidence)]
     } else {
         vec![InvariantResult::fail(
             ID,
-            "every report hook in ~/.claude/settings.json invokes ~/.amux/hook-report.sh, \
+            "all five lifecycle hooks invoke ~/.amux/hook-report.sh with canonical modes, \
              and tool events carry a valid regex matcher",
             broken.join("; "),
         )
@@ -4103,9 +4139,27 @@ mod negative_controls {
         const INLINE: &str = r#"curl -sk -m 3 -X POST -H 'Content-Type: application/json' -d "{\"state\":\"idle\",\"source\":\"stop-hook\"}" "$AMUX_URL/api/sessions/$AMUX_SESSION/report""#;
 
         let healthy = report_hooks_wired(Ok(vec![
-            ent("Stop", GOOD, None),
-            ent("UserPromptSubmit", GOOD, None),
-            ent("PostToolUse", GOOD, Some(".*")),
+            ent("Stop", r#"bash "$HOME/.amux/hook-report.sh" idle stop-hook"#, None),
+            ent(
+                "UserPromptSubmit",
+                r#"bash "$HOME/.amux/hook-report.sh" active prompt-hook"#,
+                None,
+            ),
+            ent(
+                "PostToolUse",
+                r#"bash "$HOME/.amux/hook-report.sh" active tool-hook"#,
+                Some(".*"),
+            ),
+            ent(
+                "SubagentStart",
+                r#"bash "$HOME/.amux/hook-report.sh" subagent-start subagent-start-hook"#,
+                None,
+            ),
+            ent(
+                "SubagentStop",
+                r#"bash "$HOME/.amux/hook-report.sh" subagent-stop subagent-stop-hook"#,
+                None,
+            ),
         ]));
         assert_eq!(healthy[0].status, Status::Pass, "correct wiring must pass: {healthy:?}");
 
@@ -4137,10 +4191,12 @@ mod negative_controls {
         let no_matcher = report_hooks_wired(Ok(vec![ent("PostToolUse", GOOD, None)]));
         assert_eq!(no_matcher[0].status, Status::Fail, "tool event needs a matcher: {no_matcher:?}");
 
-        // A LIFECYCLE event legitimately has none — the check must not invent a
-        // failure there, or it fires forever on a correct config and gets muted.
+        // A lifecycle event legitimately has no matcher, but one event cannot
+        // stand in for the other four. This was the vacuous PASS in the live
+        // incident: Stop was correct while activation/subagents were unwired.
         let lifecycle = report_hooks_wired(Ok(vec![ent("Stop", GOOD, None)]));
-        assert_eq!(lifecycle[0].status, Status::Pass, "Stop takes no matcher: {lifecycle:?}");
+        assert_eq!(lifecycle[0].status, Status::Fail, "Stop-only must fail: {lifecycle:?}");
+        assert!(lifecycle[0].observed.contains("SubagentStart"));
 
         // Absence and unreadability are Unknown, never a false pass.
         assert_eq!(report_hooks_wired(Ok(vec![]))[0].status, Status::Unknown);

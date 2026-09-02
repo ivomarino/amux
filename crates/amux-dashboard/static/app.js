@@ -312,32 +312,55 @@ let _yoloDefault = false;
 // No X-Amux-Session header: the server refuses this write from a worker origin,
 // because a session that could set it would be granting itself and every peer a
 // standing cross-group channel.
+async function readCrossGroupDefault() {
+  const r = await fetch(API + '/api/config/cross-group', { headers: _authHeaders() });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok || d.error) throw new Error(d.error || 'could not read saved setting');
+  return d;
+}
+
 async function toggleCrossGroupDefault(checked) {
   const note = document.getElementById('crossgroup-default-note');
+  const cb = document.getElementById('crossgroup-default-checkbox');
+  const rollback = () => { if (cb) cb.checked = !checked; };
   try {
     const r = await fetch(API + '/api/config/cross-group', {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: _authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ allow: checked ? '*' : '' }),
     });
     const d = await r.json().catch(() => ({}));
-    if (!r.ok || d.error) {
+    // This setting is a capability grant. A synthetic offline-outbox 202 says
+    // only "saved in this browser", not "persisted in amux.env". Treating it
+    // as success made the switch look saved until the next GET reset it.
+    if (_isLocallyQueued(r) || !r.ok || d.error) {
       showToast(d.error || 'could not save');
-      const cb = document.getElementById('crossgroup-default-checkbox');
-      if (cb) cb.checked = !checked;      // put the switch back
+      rollback();
       return;
     }
+    // Read after write. The response echoes the intended value; only a fresh
+    // GET proves the global env layer now resolves to it. Keep the visible
+    // switch only when the authoritative reader agrees.
+    const saved = await readCrossGroupDefault();
+    if (!!saved.enabled !== !!checked) {
+      rollback();
+      showToast('setting was not persisted; please try again');
+      return;
+    }
+    if (cb) cb.checked = !!saved.enabled;
     showToast(d.message || (checked ? 'Cross-group messaging on' : 'Cross-group messaging off'));
-    if (note && d.gate_enforcing === false) {
+    if (note && saved.gate_enforcing === false) {
       note.textContent = 'Note: AMUX_GROUP_SEND_ENFORCE is off, so all cross-group sends pass regardless of this switch.';
     }
-  } catch (e) { showToast('failed: ' + String(e)); }
+  } catch (e) {
+    rollback();
+    showToast('failed: ' + String(e));
+  }
 }
 
 (async function initCrossGroupDefault() {
   try {
-    const r = await fetch(API + '/api/config/cross-group', { headers: _authHeaders() });
-    const d = await r.json();
+    const d = await readCrossGroupDefault();
     const cb = document.getElementById('crossgroup-default-checkbox');
     if (cb) cb.checked = !!d.enabled;
     // SAY IT OUT LOUD when the gate is not enforcing at all. Otherwise an
@@ -2237,7 +2260,7 @@ const _origFetch = window.fetch.bind(window);
 // deploy has its fetch fail, get queued, and report success. Ethan saw the two
 // halves separately — "mdai files are stuck at running", and a banner reading
 // `Syncing 0/1 · POST /api/files/mdai/run` that never cleared.
-const _OUTBOX_SKIP = /\/api\/(client-debug|speedtest|tts|lookup|sql|suggest-branch|terminal\/|upload|fs\/upload|sessions\/login\/|tunnel\/|push\/test|browser|files\/mdai\/run)/;
+const _OUTBOX_SKIP = /\/api\/(client-debug|speedtest|tts|lookup|sql|suggest-branch|terminal\/|upload|fs\/upload|sessions\/login\/|tunnel\/|push\/test|browser|files\/mdai\/run|config\/cross-group)/;
 const _OUTBOX_METHODS = { POST: 1, PATCH: 1, PUT: 1, DELETE: 1 };
 function _outboxQueueable(url, init) {
   if (!url || typeof url !== 'string') return false;
@@ -8372,7 +8395,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.773';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.774';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -23688,11 +23711,16 @@ function _tagSuggestions(prefix, q) {
 
 function _beTagInputUpdate(prefix) {
   const inp = document.getElementById(prefix + '-tag-input');
-  const q = inp ? inp.value.toLowerCase() : '';
-  _themesRefresh(prefix);   // once per TTL; re-renders itself when it lands
-  const suggestions = _tagSuggestions(prefix, q);
   const el = document.getElementById(prefix + '-tag-suggestions');
   if (!el) return;
+  const q = inp ? inp.value.trim().toLowerCase() : '';
+  // Groups are card metadata, not a recommended taxonomy. An empty input used
+  // to dump twelve fleet-wide suggestions into every card and visually bury
+  // its source message, epic, gate and output. Suggestions are autocomplete:
+  // they exist only after the user asks by typing.
+  if (!q) { el.innerHTML = ''; return; }
+  _themesRefresh(prefix);   // once per TTL; re-renders itself when it lands
+  const suggestions = _tagSuggestions(prefix, q);
   // Data attributes + a delegated listener, NOT an inline onclick.
   //
   // The inline version was silently dead. `JSON.stringify(t)` emits DOUBLE
@@ -25856,14 +25884,30 @@ function _bdConfigureGo(item) {
 
 function _bdArtifactRef(a) {
   const ref = String((a && a.ref) || '');
-  if (/^https?:\/\//i.test(ref)) {
-    return '<a href="' + esc(ref) + '" target="_blank" rel="noopener noreferrer">' + esc(ref) + '</a>';
+  const target = String((a && a.resolved_ref) || ref);
+  if (/^https?:\/\//i.test(target)) {
+    return '<a href="' + esc(target) + '" target="_blank" rel="noopener noreferrer">' + esc(ref) + '</a>';
   }
-  if (/^(?:\/|\.\.?\/)/.test(ref)) {
+  if (/^(?:\/|\.\.?\/)/.test(target) || /(?:^|\/)\S+\.[a-z0-9]{1,12}$/i.test(ref)) {
     return '<span class="file-link" onclick="event.stopPropagation();openFilePreview(\''
-      + escJs(ref) + '\')">' + esc(ref) + '</span>';
+      + escJs(target) + '\')" title="Open ' + esc(target) + '">' + esc(ref) + '</span>';
   }
   return '<code>' + esc(ref) + '</code>';
+}
+
+function _bdOpenMessage(id) {
+  const displayId = 'MSG-' + String(id || '').replace(/^MSG-/i, '');
+  closeBoardDetail();
+  _msgsKind = 'all';
+  _msgsDeepQ = displayId;
+  _msgsGroup = '';
+  _msgsCounts = null;
+  const search = document.getElementById('msgs-search');
+  if (search) search.value = displayId;
+  const worker = document.getElementById('msgs-session-filter');
+  if (worker) worker.value = '';
+  if (typeof _msgSetMode === 'function') _msgSetMode('messages');
+  switchView('messages');
 }
 
 // One renderer for cached open and authoritative hydration. Keeping relation
@@ -25886,30 +25930,33 @@ function _bdRenderMeta(item) {
       + (lv ? (' · source re-checked ' + ageH + 'h ago') : ' · never re-verified')
       + (stale ? ' <span style="color:var(--red);font-weight:600;">STALE — re-check the source before acting</span>' : ''));
   }
-  let html = parts.map(p => '<div class="board-detail-meta-row">' + p + '</div>').join('');
+  let html = parts.length ? '<div class="bd-card-facts">'
+    + parts.map(p => '<span>' + p + '</span>').join('') + '</div>' : '';
+
+  const messages = Array.isArray(item.messages) ? item.messages : [];
+  if (messages.length) {
+    html += '<section class="bd-card-section"><h4>Source message' + (messages.length === 1 ? '' : 's') + '</h4>'
+      + messages.map(m => {
+        const ts = Number(m.ts || 0); const sec = ts > 100000000000 ? Math.floor(ts / 1000) : ts;
+        return '<div class="board-detail-meta-row"><button class="task-id-chip bd-link-chip" onclick="_bdOpenMessage('
+          + Number(m.id || 0) + ')" title="Open this exact message in Messages">MSG-' + esc(String(m.id)) + '</button> '
+          + '<span>' + (m.session ? esc(m.session) + ' · ' : '') + (sec ? timeAgo(sec) + ' · ' : '')
+          + esc(String(m.text || '').slice(0,220)) + '</span></div>';
+      }).join('') + '</section>';
+  }
+
+  let relationHtml = '';
   if (item.epic) {
-    html += '<div class="board-detail-meta-row"><b>Epic</b> <span class="task-id-chip" onclick="_openIssue(\''
+    relationHtml += '<div class="board-detail-meta-row"><b>Epic</b> <span class="task-id-chip" onclick="_openIssue(\''
       + escJs(item.epic) + '\')">' + esc(item.epic) + '</span></div>';
   }
   const deps = Array.isArray(item.depends_on) ? item.depends_on : [];
-  if (deps.length) html += '<div class="board-detail-meta-row"><b>Blocked by</b> ' + deps.map(d =>
+  if (deps.length) relationHtml += '<div class="board-detail-meta-row"><b>Blocked by</b> ' + deps.map(d =>
     '<span class="task-id-chip" onclick="_openIssue(\'' + escJs(d) + '\')">' + esc(d) + '</span>').join(' ') + '</div>';
-
-  const summary = [
-    ['Next action', item.next_action],
-    ['Last result', item.last_result],
-    ['Unresolved', item.unresolved],
-    ['Evidence', item.evidence]
-  ].filter(x => x[1]);
-  if (summary.length) {
-    html += '<div class="board-detail-meta-row"><b>Work summary</b></div>'
-      + summary.map(x => '<div class="board-detail-meta-row"><span style="color:var(--dim)">'
-        + esc(x[0]) + ':</span> ' + _linkifyUrls(_linkifyCardIds(esc(String(x[1])))) + '</div>').join('');
-  }
 
   const children = Array.isArray(item.children) ? item.children : [];
   if (children.length) {
-    html += '<div class="board-detail-meta-row"><b>Child tasks (' + children.length + ')</b></div>'
+    relationHtml += '<div class="board-detail-meta-row"><b>Child tasks (' + children.length + ')</b></div>'
       + children.map(c => {
         const sty = statusStyle(c.status || 'todo');
         const pri = c.priority ? ' · ' + esc(c.priority) : '';
@@ -25919,24 +25966,58 @@ function _bdRenderMeta(item) {
           + '<span>' + esc(c.title || '') + pri + '</span></div>';
       }).join('');
   }
+  if (relationHtml) html += '<section class="bd-card-section"><h4>Task relationships</h4>' + relationHtml + '</section>';
 
-  const messages = Array.isArray(item.messages) ? item.messages : [];
-  if (messages.length) {
-    html += '<div class="board-detail-meta-row"><b>Source message' + (messages.length === 1 ? '' : 's') + '</b></div>'
-      + messages.map(m => {
-        const ts = Number(m.ts || 0); const sec = ts > 100000000000 ? Math.floor(ts / 1000) : ts;
-        return '<div class="board-detail-meta-row"><span class="task-id-chip">MSG-' + esc(String(m.id)) + '</span> '
-          + (m.session ? esc(m.session) + ' · ' : '') + (sec ? timeAgo(sec) + ' · ' : '')
-          + esc(String(m.text || '').slice(0,220)) + '</div>';
-      }).join('');
+  const gates = (Array.isArray(item.gate_requirements) ? item.gate_requirements : [])
+    .filter(g => Array.isArray(g.criteria) && g.criteria.length);
+  if (gates.length) {
+    html += '<section class="bd-card-section"><h4>Column gate requirements</h4>'
+      + gates.map(g => {
+        const src = String(g.source || 'type') + (g.scope ? ' · ' + String(g.scope) : '');
+        return '<div class="bd-gate"><div class="bd-gate-head"><span class="status-badge">'
+          + esc(String(g.status || '')) + '</span><span>' + esc(src) + '</span></div><ul>'
+          + g.criteria.map(c => '<li>' + esc(String(c)) + '</li>').join('') + '</ul></div>';
+      }).join('') + '</section>';
   }
 
-  const artifacts = Array.isArray(item.artifacts) ? item.artifacts : [];
+  const summary = [
+    ['Next action', item.next_action],
+    ['Last result', item.last_result],
+    ['Unresolved', item.unresolved],
+    ['Evidence', item.evidence]
+  ].filter(x => x[1]);
+  if (summary.length) {
+    html += '<section class="bd-card-section"><h4>Work summary</h4>'
+      + summary.map(x => '<div class="board-detail-meta-row"><span style="color:var(--dim)">'
+        + esc(x[0]) + ':</span> ' + _linkifyUrls(_linkifyCardIds(esc(String(x[1])))) + '</div>').join('')
+      + '</section>';
+  }
+
+  const artifacts = [];
+  const artifactSeen = new Set();
+  (Array.isArray(item.artifacts) ? item.artifacts : [])
+    .concat(Array.isArray(item.asset_links) ? item.asset_links : [])
+    .forEach(a => {
+      const key = String((a && a.ref) || '');
+      if (key && !artifactSeen.has(key)) { artifactSeen.add(key); artifacts.push(a); }
+    });
   if (artifacts.length) {
-    html += '<div class="board-detail-meta-row"><b>Artifacts (' + artifacts.length + ')</b></div>'
+    html += '<section class="bd-card-section"><h4>Produced assets (' + artifacts.length + ')</h4>'
       + artifacts.map(a => '<div class="board-detail-meta-row">' + _bdArtifactRef(a)
-        + ' <span style="color:var(--dim)">· ' + esc(a.kind || 'artifact') + ' · ' + esc(a.state || 'created') + '</span>'
+        + ' <span style="color:var(--dim)">· ' + esc(a.kind || a.source || 'artifact')
+        + (a.state ? ' · ' + esc(a.state) : '') + '</span>'
         + (a.description ? '<div style="color:var(--dim)">' + esc(a.description) + '</div>' : '') + '</div>').join('');
+    html += '</section>';
+  }
+
+  const activity = _bdParseHistory(item.log || '');
+  if (activity.length) {
+    html += '<section class="bd-card-section"><h4>Recent worker activity</h4>'
+      + activity.slice(-5).reverse().map(e => '<div class="board-detail-meta-row"><span class="bd-hist-ic" style="color:'
+        + (_BD_KIND_COL[e.kind] || 'var(--dim)') + '">' + (_BD_KIND_ICON[e.kind] || '\u00B7') + '</span><span>'
+        + _linkifyUrls(_linkifyCardIds(esc(e.body))) + '</span>'
+        + (e.ts ? '<span class="bd-hist-ts">' + esc(e.ts) + '</span>' : '') + '</div>').join('')
+      + '<button class="bd-activity-all" onclick="boardDetailTab(\'history\')">View all ' + activity.length + ' actions</button></section>';
   }
   meta.innerHTML = html;
 }
@@ -25958,9 +26039,9 @@ async function _bdHydrate(id) {
     const idx = boardItems.findIndex(i => i.id === id);
     const cached = idx >= 0 ? { ...boardItems[idx] } : {};
     if (idx >= 0) boardItems[idx] = Object.assign({}, boardItems[idx], full);
-      const merged = idx >= 0 ? boardItems[idx] : full;
-      _bdRenderHistory(merged);
-      if (typeof _bdRenderStatusBanner === 'function') _bdRenderStatusBanner(merged);
+    const merged = idx >= 0 ? boardItems[idx] : full;
+    _bdRenderHistory(merged);
+    if (typeof _bdRenderStatusBanner === 'function') _bdRenderStatusBanner(merged);
     _bdRenderMeta(merged);
     if (_boardDrafts[id]) { _bdHydrated = true; return; }  // user's draft wins
     const title = document.getElementById('bd-title');
@@ -26103,21 +26184,11 @@ function boardDetailTab(tab) {
   const editBtn = document.getElementById('bd-tab-edit');
   const previewBtn = document.getElementById('bd-tab-preview');
   const histBtn = document.getElementById('bd-tab-history');
-  const linBtn = document.getElementById('bd-tab-lineage');
   const desc = document.getElementById('bd-desc');
   const preview = document.getElementById('bd-preview');
   const log = document.getElementById('bd-log');
-  const lin = document.getElementById('bd-lineage');
   if (!editBtn || !previewBtn || !desc || !preview) return;
-  [editBtn, previewBtn, histBtn, linBtn].forEach(bt => bt && bt.classList.remove('active'));
-  if (lin) lin.style.display = 'none';
-  if (tab === 'lineage') {
-    if (linBtn) linBtn.classList.add('active');
-    desc.style.display = 'none'; preview.style.display = 'none';
-    if (log) log.style.display = 'none';
-    if (lin) { lin.style.display = ''; _bdRenderLineage(boardDetailId); }
-    return;
-  }
+  [editBtn, previewBtn, histBtn].forEach(bt => bt && bt.classList.remove('active'));
   if (tab === 'history') {
     if (histBtn) histBtn.classList.add('active');
     desc.style.display = 'none'; preview.style.display = 'none';
@@ -26130,7 +26201,9 @@ function boardDetailTab(tab) {
     previewBtn.classList.add('active');
     desc.style.display = 'none';
     preview.style.display = '';
-    preview.innerHTML = renderMarkdown(desc.value);
+    preview.innerHTML = desc.value.trim()
+      ? renderMarkdown(desc.value)
+      : '<div class="bd-notes-empty">No additional notes. The source message, relationships, gates, work summary, assets, and recent activity are above.</div>';
   } else {
     editBtn.classList.add('active');
     previewBtn.classList.remove('active');
@@ -33475,7 +33548,9 @@ function _messagesRender() {
   // is 500 rows OF THAT KIND rather than 500 mixed rows filtered down to a
   // handful — the same crowding that showed 48 human messages out of 6547.
   if (_msgsKind !== 'all') rows = rows.filter(m => _msgKind(m) === _msgsKind);
-  if (q) rows = rows.filter(m => (m.text || '').toLowerCase().includes(q) || (m.session || '').toLowerCase().includes(q));
+  if (q) rows = rows.filter(m => (m.text || '').toLowerCase().includes(q)
+    || (m.session || '').toLowerCase().includes(q)
+    || ('msg-' + String(m.id || '')).toLowerCase() === q);
   // Selection toolbar (AMUX-2318). Only rendered when something is selected,
   // so the default view is unchanged - a persistent bar for a rare action is
   // clutter, and this list is read far more often than it is acted on.

@@ -264,3 +264,42 @@ fn board_detail_hydration_refreshes_authoritative_state_and_relations() {
         );
     }
 }
+
+#[test]
+fn board_detail_leads_with_actionable_task_context() {
+    let html = asset("index.html");
+    let meta = html.find("id=\"bd-meta\"").expect("task context container");
+    let tabs = html.find("class=\"board-detail-tabs\"").expect("detail tabs");
+    assert!(meta < tabs, "source, epic, gates and assets must appear before notes tabs");
+    assert!(html.contains(">Details</button>"));
+    assert!(html.contains(">Activity<span id=\"bd-hist-n\""));
+    assert!(
+        !html.contains("id=\"bd-tab-lineage\""),
+        "database lineage is not the task card's primary content"
+    );
+
+    let app = asset("app.js");
+    for needle in [
+        "item.gate_requirements",
+        "item.asset_links",
+        "a.resolved_ref",
+        "Produced assets (",
+        "Source message",
+        "_bdOpenMessage(",
+        "View all ",
+    ] {
+        assert!(app.contains(needle), "card detail omitted `{needle}`");
+    }
+}
+
+#[test]
+fn group_suggestions_are_autocomplete_not_an_unprompted_wall() {
+    let app = asset("app.js");
+    let start = app
+        .find("function _beTagInputUpdate(prefix)")
+        .expect("tag autocomplete exists");
+    let body = &app[start..start + 900.min(app.len() - start)];
+    let empty = body.find("if (!q) { el.innerHTML = ''; return; }").expect("empty-query guard");
+    let suggest = body.find("_tagSuggestions(prefix, q)").expect("typed suggestions remain");
+    assert!(empty < suggest, "the empty query must stop before fleet groups are suggested");
+}

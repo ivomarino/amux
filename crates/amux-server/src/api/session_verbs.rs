@@ -2273,6 +2273,54 @@ pub(crate) fn codex_rollout_path(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// The latest structured Codex turn boundary recorded in a rollout file.
+///
+/// Codex does not expose Claude-style start/stop hooks, but its rollout is an
+/// append-only event stream with the same semantics: `task_started` opens a
+/// turn and `task_complete` closes it. This is stronger evidence than tmux's
+/// `window_activity`, which does not advance for Codex's alternate-screen TUI
+/// on some tmux builds (the live `amux-testing-e2e` specimen stayed `idle` for
+/// an entire multi-minute turn while the pane visibly said `Working`).
+#[derive(Clone, Debug)]
+pub(crate) struct CodexTurnSignal {
+    pub state: String,
+    pub ts: f64,
+}
+
+fn codex_turn_signal_from_events(lines: &[Value]) -> Option<CodexTurnSignal> {
+    let mut latest = None;
+    for event in lines {
+        let top = event.get("type").and_then(Value::as_str).unwrap_or("");
+        let nested = event.pointer("/payload/type").and_then(Value::as_str).unwrap_or("");
+        let state = match (top, nested) {
+            ("turn.started", _) | ("event_msg", "task_started") => "active",
+            ("turn.completed", _) | ("event_msg", "task_complete") => "idle",
+            _ => continue,
+        };
+        let ts = event.get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.timestamp_millis() as f64 / 1000.0)?;
+        latest = Some(CodexTurnSignal { state: state.into(), ts });
+    }
+    latest
+}
+
+/// Resolve one Codex/ollama worker's latest structured turn state.
+///
+/// A bounded tail keeps the fleet poll cheap. Turn-complete is always the
+/// final lifecycle event of an idle rollout; while a very long live turn can
+/// push its start outside the tail, its continuing event writes still leave
+/// the pane/activity fallback available rather than inventing an idle claim.
+pub(crate) fn codex_rollout_turn_signal(name: &str) -> Option<CodexTurnSignal> {
+    let provider = provider_of(&parse_env(name));
+    if !matches!(provider.as_str(), "codex" | "ollama") {
+        return None;
+    }
+    let path = codex_rollout_path(name)?;
+    codex_turn_signal_from_events(&iter_jsonl_tail(&path, 32_000_000))
+}
+
 /// A codex/ollama worker's transcript as the uniform [`TranscriptEvent`] model
 /// (AMUX-3201 slice 1). Reads a bounded tail of the rollout so a long session
 /// stays cheap, parses it via the shared `opencode::events` projection, and
@@ -14362,6 +14410,9 @@ async fn subagent_event_post(state: &AppState, name: &str, ev: &str) -> Response
                 .unwrap_or_else(|| json!({}));
             let prev = reports[&name_s]["subagents"]["count"].as_i64().unwrap_or(0);
             let next = (prev + delta).max(0);
+            if next == prev {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            }
             if !reports[&name_s].is_object() {
                 reports[&name_s] = json!({});
             }
@@ -14371,7 +14422,19 @@ async fn subagent_event_post(state: &AppState, name: &str, ev: &str) -> Response
                  ON CONFLICT(key) DO UPDATE SET value=?1",
                 [reports.to_string()],
             )?;
-            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            // Clear BEFORE returning the event: the store broadcasts only after
+            // this transaction commits, so the SSE-driven GET cannot race ahead
+            // of cache invalidation and render the old count for another 2s.
+            crate::api::sessions_legacy::invalidate_sessions_cache();
+            Ok(crate::db::WriteOutcome {
+                applied: true,
+                events: vec![crate::db::PendingEvent {
+                    entity_type: amux_core::revision::EntityType::Session,
+                    entity_id: name_s.clone(),
+                    mutation: amux_core::revision::MutationKind::Updated,
+                    payload: None,
+                }],
+            })
         })
         .await;
     match reply {
@@ -14434,7 +14497,7 @@ pub(crate) async fn report_post(state: &AppState, name: &str, headers: &HeaderMa
     }
     // SELF-REPORTED CONVERSATION ID (AMUX-2936). Handled here, above the
     // subagent early-return, so EVERY report shape carries it — a lane that only
-    // ever fires PreToolUse:Task would otherwise never heal.
+    // ever fires SubagentStart would otherwise never heal.
     //
     // Three spellings accepted because three producers exist: `conv_id` (amux's
     // own callers), `session_id` (Claude Code's hook payload field verbatim, so
@@ -14469,7 +14532,7 @@ pub(crate) async fn report_post(state: &AppState, name: &str, headers: &HeaderMa
     // the durable exit for the mtime-window instruments cluster (AMUX-2646/2904/
     // 2959/2952/3022/3030/3047). A subagent transcript's mtime cannot tell
     // "finished 30s ago" from "thinking, will write in 90s"; a start/stop event
-    // pair can. `{"subagent":"start"}` (PreToolUse:Task) increments, `"stop"`
+    // pair can. `{"subagent":"start"}` (SubagentStart) increments, `"stop"`
     // (SubagentStop) decrements. Handled BEFORE the main-state parse below so it
     // never touches state/model/tokens — it is orthogonal to the main turn.
     // Attribution (the origin==name check above) applies here too: a subagent
@@ -14587,20 +14650,33 @@ pub(crate) async fn report_post(state: &AppState, name: &str, headers: &HeaderMa
             // ABSENT != EMPTY above): the model does not change per tool call.
             let prev_model = reports[&name_s]["model"].clone();
             let prev_tokens = reports[&name_s]["tokens"].clone();
+            // Main-turn reports and subagent lifecycle reports share this one
+            // object. Replacing it without carrying `subagents` erased the live
+            // count on every prompt/tool/stop event, so the card could flip idle
+            // while children were still running.
+            let prev_subagents = reports[&name_s]["subagents"].clone();
             // Did the STATUS actually change? Only then is an SSE push worth it.
             let status_changed = prev_state != st2;
             let new_state = st2.clone();
-            reports[&name_s] = json!({
+            let mut next_report = json!({
                 "model": model_opt.clone().map(Value::from).unwrap_or(prev_model),
                 "tokens": tokens_opt.clone().unwrap_or(prev_tokens),
                 "state": st2, "detail": detail, "source": src2,
                 "origin": origin2, "ts": now_f64(),
             });
+            if !prev_subagents.is_null() {
+                next_report["subagents"] = prev_subagents;
+            }
+            reports[&name_s] = next_report;
             conn.execute(
                 "INSERT INTO prefs(key, value) VALUES('session_reports', ?1) \
                  ON CONFLICT(key) DO UPDATE SET value=?1",
                 [reports.to_string()],
             )?;
+            // See subagent_event_post: invalidate inside the writer, before its
+            // committed Session event is broadcast, so the reactive GET sees
+            // this exact state rather than the preceding cache entry.
+            crate::api::sessions_legacy::invalidate_sessions_cache();
             // SNAPPY STATUS (Ethan, 2026-08-16). A self-report is the fast, exact
             // signal for active/idle/needs-input (the D1 exit), but this write used
             // events:vec![], so a hook state change pushed NO SSE and the dashboard
@@ -18672,6 +18748,35 @@ mod tests {
         assert!(!at_resume_picker("Enter to select"));
     }
 
+    #[test]
+    fn codex_rollout_boundaries_are_a_structured_live_state() {
+        let events = vec![
+            json!({
+                "timestamp": "2026-09-02T21:36:17.348Z",
+                "type": "event_msg",
+                "payload": {"type": "task_started"}
+            }),
+            json!({"timestamp": "2026-09-02T21:36:18Z", "type": "response_item"}),
+        ];
+        let active = codex_turn_signal_from_events(&events).unwrap();
+        assert_eq!(active.state, "active");
+        assert!(active.ts > 1_700_000_000.0);
+
+        let mut completed = events;
+        completed.push(json!({
+            "timestamp": "2026-09-02T21:40:00Z",
+            "type": "event_msg",
+            "payload": {"type": "task_complete"}
+        }));
+        assert_eq!(codex_turn_signal_from_events(&completed).unwrap().state, "idle");
+
+        let exec_json = vec![json!({
+            "timestamp": "2026-09-02T21:41:00Z",
+            "type": "turn.started"
+        })];
+        assert_eq!(codex_turn_signal_from_events(&exec_json).unwrap().state, "active");
+    }
+
     /// Codex's trust-directory picker, byte shape captured live 2026-08-11
     /// (AMUX-2913): selector cursor is `›` (U+203A), not Claude's `❯`, so a
     /// lane blocked on it read `idle` — needs-input invisible, the AMUX-2834
@@ -19671,7 +19776,7 @@ mod tests {
 
         // 6. A SUBAGENT-ONLY report still heals. It returns early, before the
         //    state parse, so adoption had to be hoisted above that branch — a
-        //    lane whose only hook is PreToolUse:Task would otherwise stay blind
+        //    lane whose only hook is SubagentStart would otherwise stay blind
         //    forever.
         const CONV3: &str = "5f6e7d8c-9b0a-4123-8456-789abcdef012";
         std::fs::write(env_path("subby"), "CC_DIR=\"/tmp\"\n").unwrap();
@@ -20066,6 +20171,7 @@ mod steer_boundary_tests {
         let (state, _d) = tstate();
         // A prior main-state report must survive the subagent events untouched.
         set_report(&state, "probe", "active").await;
+        let mut events = state.store.subscribe();
 
         let read = |state: &AppState| -> Value {
             state
@@ -20081,6 +20187,13 @@ mod steer_boundary_tests {
         };
 
         subagent_event_post(&state, "probe", "start").await;
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("subagent start must push a real-time session event")
+            .expect("event channel open");
+        assert_eq!(event.entity_type, amux_core::revision::EntityType::Session);
+        assert_eq!(event.entity_id, "probe");
+        assert_eq!(event.mutation, amux_core::revision::MutationKind::Updated);
         subagent_event_post(&state, "probe", "start").await;
         let v = read(&state);
         assert_eq!(v["probe"]["subagents"]["count"].as_i64(), Some(2), "two starts -> 2");
@@ -20088,6 +20201,22 @@ mod steer_boundary_tests {
             v["probe"]["state"].as_str(),
             Some("active"),
             "subagent events must not touch the main state"
+        );
+
+        // THE LIVE FAILURE: any main report used to replace this whole object,
+        // deleting `subagents` while both children were still running.
+        let headers = HeaderMap::new();
+        report_post(
+            &state,
+            "probe",
+            &headers,
+            &json!({"state": "active", "source": "prompt-hook"}),
+        )
+        .await;
+        assert_eq!(
+            read(&state)["probe"]["subagents"]["count"].as_i64(),
+            Some(2),
+            "main-turn reports must preserve the live subagent count"
         );
 
         subagent_event_post(&state, "probe", "stop").await;
