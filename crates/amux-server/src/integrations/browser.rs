@@ -542,6 +542,46 @@ fn running_state_path(home: &Path) -> PathBuf {
     home.join("browser-running.json")
 }
 
+fn last_exit_path(home: &Path) -> PathBuf {
+    home.join("browser-last-exit.json")
+}
+
+/// Record why the browser is gone, in memory AND on disk (AF-378).
+///
+/// `LAST_EXIT` alone is in-memory, and its own note says a server restart clears
+/// it. That is a worse limitation than it reads, because of WHICH restart clears
+/// it. The commonest death is "killed alongside a server restart", and the adopt
+/// path below records that correctly in the NEW process, so the record does
+/// survive the restart that caused the death. What kills it is the NEXT restart,
+/// unrelated and usually minutes later: this box rebuilds and swaps the server on
+/// every commit, so the explanation evaporates long before anyone asks.
+///
+/// Reported by tubescience 2026-08-31: two browsers on two ports, each dying
+/// within minutes, and all they saw was ConnectionRefusedError on the CDP socket
+/// mid-suite. `status()` would have explained it; a process watching a socket does
+/// not call `status()`, and by the time it did the record was gone.
+///
+/// Best-effort on purpose. A failure to WRITE the explanation must never fail the
+/// path that is already handling a death.
+pub(crate) fn record_last_exit(home: &Path, v: serde_json::Value) {
+    *LAST_EXIT.lock().expect("last-exit poisoned") = Some(v.clone());
+    let _ = std::fs::write(last_exit_path(home), v.to_string());
+}
+
+/// The persisted record, for when this process has none of its own.
+///
+/// Tagged `from_disk` so a reader can tell a record THIS server observed from one
+/// it inherited. Without that the two read identically, which is the distinction
+/// the in-memory note was careful about in the first place.
+pub(crate) fn persisted_last_exit(home: &Path) -> Option<serde_json::Value> {
+    let raw = std::fs::read_to_string(last_exit_path(home)).ok()?;
+    let mut v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    if let Some(o) = v.as_object_mut() {
+        o.insert("from_disk".into(), serde_json::json!(true));
+    }
+    Some(v)
+}
+
 /// The running-file, as a MAP keyed by profile (AMUX-3828).
 ///
 /// One file holding every browser, rather than one file per profile: profile
@@ -662,7 +702,7 @@ async fn adopt_one(home: &Path, v: &serde_json::Value) -> bool {
              no server was watching, most likely killed alongside a server restart; \
              recording last_exit and clearing the file"
         );
-        *LAST_EXIT.lock().expect("last-exit poisoned") = Some(serde_json::json!({
+        record_last_exit(home, serde_json::json!({
             "ts": chrono::Utc::now().timestamp(),
             "reason": "found dead on adopt (died while the server was down or restarting)",
             "profile": profile,
@@ -4012,5 +4052,62 @@ mod spki_pin_tests {
         assert!(amux_cert_spki_b64(&dir).is_none(), "absent key -> no pin");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod last_exit_persistence_tests {
+    use super::*;
+
+    /// AF-378: the exit record survives the restart that erases the in-memory one.
+    ///
+    /// WHY THIS IS NOT PARANOIA. The commonest browser death is "killed alongside
+    /// a server restart". The adopt path records that correctly in the NEW
+    /// process, so the record does survive the restart that caused the death.
+    /// What erases it is the NEXT restart, unrelated and usually minutes later,
+    /// because this box swaps the server binary on every commit. Reported live by
+    /// tubescience: two browsers dying minutes apart, and all they saw was
+    /// ConnectionRefusedError on the CDP socket, with `last_exit: null` by the
+    /// time anyone looked.
+    #[test]
+    fn a_recorded_exit_outlives_the_process_that_recorded_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path();
+
+        // CONTROL FIRST, and it is load-bearing: with nothing recorded the reader
+        // must answer None. A function that returned Some(_) unconditionally
+        // would pass the assertion below and mean nothing.
+        assert!(
+            persisted_last_exit(home).is_none(),
+            "an empty home must report no persisted exit, not an invented one"
+        );
+
+        record_last_exit(
+            home,
+            serde_json::json!({ "reason": "found dead on adopt", "pid": 4242, "profile": "default" }),
+        );
+
+        // Reading it back is the whole point: this stands in for a LATER server
+        // process, which has an empty LAST_EXIT and must still be able to say why.
+        let got = persisted_last_exit(home).expect("the record must survive on disk");
+        assert_eq!(got["reason"], serde_json::json!("found dead on adopt"));
+        assert_eq!(got["pid"], serde_json::json!(4242));
+
+        // TAGGED, so a record this server OBSERVED stays distinguishable from one
+        // it INHERITED. Without the tag the two read identically, which is the
+        // exact distinction the in-memory note was careful about.
+        assert_eq!(
+            got["from_disk"],
+            serde_json::json!(true),
+            "an inherited record must say so: {got}"
+        );
+
+        // And the in-memory copy is still set, so the fast path is unchanged.
+        let mem = LAST_EXIT.lock().expect("last-exit poisoned").clone();
+        assert!(mem.is_some(), "record_last_exit must still set the in-memory copy");
+        assert!(
+            mem.expect("checked")["from_disk"].is_null(),
+            "the in-memory copy must NOT claim it came from disk"
+        );
     }
 }

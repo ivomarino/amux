@@ -383,6 +383,15 @@ async fn async_main() {
     // pipe-pane reconciler (AMUX-2671). `pipe-pane` is attached in
     // start_session and nowhere else, so a pane that loses its writer stays
     // unlogged forever — indistinguishable from a lane that was never started.
+    // Owner-theme inference for the ranked inbox (AMUX-3998). One meta-model
+    // call per 6h at most, and it no-ops when the stored themes are still fresh
+    // so a restart does not buy one.
+    jobs::spawn_loop(
+        jobs::ids::EMAIL_THEMES,
+        Some(secs(api::email_intel::THEME_REFRESH_SECS)),
+        api::email_intel::theme_refresh_loop(),
+    );
+
     jobs::spawn_loop(
         jobs::ids::PIPE_RECONCILE,
         Some(secs(api::session_verbs::PIPE_RECONCILE_SECS)),
@@ -464,6 +473,13 @@ async fn async_main() {
     drop(runtime_jobs::disk_watch::spawn(state.clone()));
     drop(runtime_jobs::queue_disposition::spawn(state.clone()));
     drop(runtime_jobs::tailnet_watch::spawn());
+    // Telegram long-poll (idles with no error when TELEGRAM_BOT_TOKEN is
+    // unset — see runtime_jobs::telegram_poll's module doc for why polling,
+    // not a webhook).
+    drop(runtime_jobs::telegram_poll::spawn(state.clone()));
+    // Auto-relay: send session replies back to Telegram when linked sessions respond
+    // to Telegram-routed messages. Works for all workers without per-session configuration.
+    drop(runtime_jobs::telegram_relay::spawn(state.clone()));
     // Compaction-generation watch (AMUX-3742): the reason "amux claude performs
     // worse than raw claude" was invisible for months is that nothing counted
     // how many times a lane's conversation had been summarized away.

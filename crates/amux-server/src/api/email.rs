@@ -60,6 +60,9 @@ pub fn routes_with(ctx: Arc<EmailCtx>) -> Router<AppState> {
         .route("/approve/{id}", post(approve))
         .route("/reject/{id}", post(reject))
         .route("/approvals", get(list_approvals))
+        // AMUX-3998: the ranked inbox + owner themes, nested here so they get the
+        // same EmailCtx rather than opening a second client.
+        .merge(super::email_intel::nested_routes())
         .layer(Extension(ctx))
 }
 

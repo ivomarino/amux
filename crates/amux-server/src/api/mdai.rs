@@ -133,7 +133,28 @@ const MAX_FOLDER_BYTES: usize = 256 * 1024;
 
 /// How long a single node's model call may take before the run fails loudly
 /// rather than hanging the request.
-const MODEL_TIMEOUT_S: u64 = 150;
+///
+/// RAISED 150 -> 240 on 2026-09-01 from measured traffic, not from a guess. The
+/// log sweep found FOUR of seven real runs in 24h failing 504 with
+/// `model timeout: claude did not answer within 150s`, a 57% failure rate on a
+/// user-facing feature, while the family's p95 sat at 194s and its max at 298s.
+///
+/// The cap was not separating fast runs from slow ones. A run that SUCCEEDED took
+/// 192.3s, longer than two that were killed, because this budget is PER NODE and
+/// whether you survive depends on how the work splits across the DAG rather than
+/// on how long it takes in total. Two of the four kills are exactly 150.0s, which
+/// is the cap and not the workload.
+///
+/// Observed successful runs: 82.8s, 111.7s, 192.3s. 240 covers all of them with
+/// margin and keeps 120s of headroom under the client's 600s backstop, where the
+/// invariant below only demands 480. It is deliberately NOT 300: that satisfies
+/// the assert exactly and leaves the client no room to receive the answer, which
+/// is the spirit of AF-141 even though the arithmetic passes.
+///
+/// This raises a threshold rather than masking a defect: the runs are model calls
+/// over large sources and 82-192s is what that costs. The old number described a
+/// workload we no longer have.
+const MODEL_TIMEOUT_S: u64 = 240;
 /// A `fetch:` node's HTTP timeout. Much shorter than the model timeout: an API
 /// that has not answered in 30s is not going to, and a node that hangs here
 /// stalls every downstream node in the DAG.
@@ -897,7 +918,7 @@ impl ModelClient for ApiModel {
 
 /// Picks the best available model client: [`ApiModel`] if `ANTHROPIC_API_KEY` is
 /// set (direct HTTP, no process boot), else [`CliModel`] (CLI subprocess).
-fn best_model() -> Box<dyn ModelClient> {
+pub(crate) fn best_model() -> Box<dyn ModelClient> {
     if let Some(api) = ApiModel::from_env() {
         tracing::info!("mdai: using direct Anthropic API (ANTHROPIC_API_KEY set)");
         Box::new(api)

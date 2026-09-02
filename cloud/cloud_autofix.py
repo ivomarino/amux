@@ -210,19 +210,30 @@ def escalate_board(summary, detail):
                 existing = it.get("id"); break
         if existing:
             # Refresh title + append a dated line; keep the human's context intact.
-            subprocess.run(["curl", "-sk", "-X", "PATCH", "-H", "Content-Type: application/json",
-                            "-H", "X-Amux-Session:%s" % os.environ.get("AMUX_SESSION", "cloud-autofix"),
-                            "-d", json.dumps({"title": title,
-                                              "desc_append": "\n\n[autofix re-observed %d] %s" % (int(time.time()), detail)}),
-                            "%s/api/board/%s" % (base, existing)], capture_output=True, text=True, timeout=15)
+            out = subprocess.run(["curl", "-sk", "-X", "PATCH", "-H", "Content-Type: application/json",
+                                  "-H", "X-Amux-Session:%s" % os.environ.get("AMUX_SESSION", "cloud-autofix"),
+                                  "-d", json.dumps({"title": title,
+                                                    "desc_append": "\n\n[autofix re-observed %d] %s" % (int(time.time()), detail)}),
+                                  "%s/api/board/%s" % (base, existing)], capture_output=True, text=True, timeout=15).stdout
         else:
-            subprocess.run(["curl", "-sk", "-X", "POST", "-H", "Content-Type: application/json",
-                            "-H", "X-Amux-Session:%s" % os.environ.get("AMUX_SESSION", "cloud-autofix"),
-                            "-d", json.dumps({"title": title, "desc": detail,
-                                              "status": "needsyou", "session": "amux-cloud"}),
-                            "%s/api/board" % base], capture_output=True, text=True, timeout=15)
-    except Exception:
-        pass
+            # status "todo", not "needsyou": the board refuses an untyped needsyou
+            # (needsyou_requires_ask_type) and this caller has no typed human ask —
+            # the condition is work for whoever owns it, not a question for Ethan.
+            # The 09-01 FROZEN escalation was silently refused on exactly this.
+            out = subprocess.run(["curl", "-sk", "-X", "POST", "-H", "Content-Type: application/json",
+                                  "-H", "X-Amux-Session:%s" % os.environ.get("AMUX_SESSION", "cloud-autofix"),
+                                  "-d", json.dumps({"title": title, "desc": detail,
+                                                    "status": "todo", "session": "amux-cloud"}),
+                                  "%s/api/board" % base], capture_output=True, text=True, timeout=15).stdout
+        # Read the answer, never assume it (ethos rule 4: a card id beside
+        # "escalated"). A gate refusal is a 200-shaped JSON with ok:false/error.
+        resp = json.loads(out) if out.strip() else {}
+        if resp.get("ok") is False or resp.get("error"):
+            trace("escalate_board", "BOARD WRITE REFUSED: %s" % (resp.get("code") or resp.get("error") or "?")[:80], False)
+        else:
+            trace("escalate_board", "card %s" % (resp.get("id") or existing or "?"), True)
+    except Exception as e:
+        trace("escalate_board", "BOARD WRITE FAILED: %s" % str(e)[:80], False)
 
 
 def escalate(summary, detail):

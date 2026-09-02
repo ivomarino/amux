@@ -96,6 +96,7 @@ pub mod ids {
     pub const EVENT_PROCESSORS: &str = "event-processors";
     pub const SCAN: &str = "terminal-scan";
     pub const BOOTSTRAP: &str = "session-bootstrap";
+    pub const EMAIL_THEMES: &str = "email-themes";
     pub const COMMIT_NUDGE: &str = "commit-nudge";
     pub const COMMIT_MENTION_NOTES: &str = "commit-mention-notes";
     pub const SELF_ADOPT: &str = "self-adoption";
@@ -112,6 +113,8 @@ pub mod ids {
     pub const STORAGE: &str = "storage";
     pub const HEARTBEAT: &str = "heartbeat";
     pub const TAILNET_WATCH: &str = "tailnet-watch";
+    pub const TELEGRAM_POLL: &str = "telegram-poll";
+    pub const TELEGRAM_RELAY: &str = "telegram-relay";
     pub const QUEUE_DISPOSITION: &str = "queue-disposition";
     pub const MAC_HEALTH: &str = "mac-health";
 }
@@ -132,6 +135,7 @@ pub const ALL_IDS: &[&str] = &[
     ids::EVENT_PROCESSORS,
     ids::SCAN,
     ids::BOOTSTRAP,
+    ids::EMAIL_THEMES,
     ids::COMMIT_NUDGE,
     ids::COMMIT_MENTION_NOTES,
     ids::SELF_ADOPT,
@@ -144,6 +148,8 @@ pub const ALL_IDS: &[&str] = &[
     ids::STORAGE,
     ids::HEARTBEAT,
     ids::TAILNET_WATCH,
+    ids::TELEGRAM_POLL,
+    ids::TELEGRAM_RELAY,
     ids::QUEUE_DISPOSITION,
     ids::MAC_HEALTH,
 ];
@@ -210,6 +216,14 @@ pub const CATALOG: &[Doc] = &[
         }],
         pref: None,
         detail: None,
+    },
+    Doc {
+        id: ids::EMAIL_THEMES,
+        name: "Email theme inference",
+        purpose: "Recomputes the owner's email themes from human message history for the ranked inbox; one meta-model call per 6h at most, and a pass skips when the stored themes are still fresh so a restart does not buy a call.",
+        env: NO_ENV,
+        pref: None,
+        detail: Some("/api/email/themes"),
     },
     Doc {
         id: ids::STEER_DELIVER,
@@ -474,6 +488,30 @@ pub const CATALOG: &[Doc] = &[
         env: NO_ENV,
         pref: None,
         detail: None,
+    },
+    Doc {
+        id: ids::TELEGRAM_POLL,
+        name: "Telegram poll",
+        purpose: "Long-polls the Telegram bot API for messages and routes them into linked amux sessions; idles (no token) rather than erroring when TELEGRAM_BOT_TOKEN is unset.",
+        env: &[EnvControl {
+            var: "TELEGRAM_BOT_TOKEN",
+            effect: "unset = loop idles, checking every 5 minutes; set = polls continuously",
+            off: Some(""),
+        }],
+        pref: None,
+        detail: Some("/api/telegram/status"),
+    },
+    Doc {
+        id: ids::TELEGRAM_RELAY,
+        name: "Telegram relay",
+        purpose: "Auto-relays session replies back to Telegram when a session responds to a Telegram-routed message; works for all sessions without per-session configuration.",
+        env: &[EnvControl {
+            var: "TELEGRAM_BOT_TOKEN",
+            effect: "unset = relay idles; set = relays enabled",
+            off: Some(""),
+        }],
+        pref: None,
+        detail: Some("/api/telegram/status"),
     },
     Doc {
         id: ids::MAC_HEALTH,

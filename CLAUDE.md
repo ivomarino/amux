@@ -58,6 +58,13 @@ Verify a hook by what it WROTE, not by the settings file.
 - **Client JS: bump `APP_VER` (app.js) + `CACHE` (sw.js) together.**
 - Syntax gates: `cargo check --workspace`. Before push: `cargo clippy --workspace --all-targets -- -D warnings`.
   Tests: `scripts/test-contended.sh -p amux-server` (same args as `cargo test`, same exit status).
+- **Prefer offloading any of the above to remote hardware (see the remote-build convention below)
+  over running them in an interactive pane at all.** If a local run is genuinely unavoidable, run
+  it through `scripts/safe-cargo.sh <cargo args>` instead of bare `cargo` — every process in an
+  interactive amux pane shares one systemd scope, and an OOM-killed `cargo`/`clippy` process
+  inside that scope takes the WHOLE PANE down with it, not just the build (confirmed via
+  journalctl, AMUX-70/frustrations.md 2026-09-01). The wrapper runs cargo in its own sibling
+  scope so an OOM kill there can't cascade into the session.
   **A red suite here is not automatically a regression.** This box builds and tests amux
   continuously, so the auto-builder can rewrite the shared binary while your tests spawn it,
   and the ETXTBSY family surfaces as failures in modules you never touched (AMUX-3853: 8
@@ -106,6 +113,33 @@ which is 41 of 83 frustration entries (AF-320). A new diagnostic route without
 both fields fails `tests/diagnostic_contract.rs`.
 
 Raw logs: `~/.amux/logs/server-rs.log`
+
+## Reading CI: use the App token, and CHECK that you got it
+
+`gh` here defaults to the user identity (`esteininger`, id 15973166) on a **5000/hr**
+budget shared by every amux lane. A GitHub App is already provisioned on this box
+and sits on its own larger budget:
+
+```bash
+eval "$(~/.amux/github-app/get-token.sh)"
+gh api rate_limit --jq '.resources.core | "limit=\(.limit) remaining=\(.remaining)"'
+```
+
+**The limit number is the check, and it costs nothing** because `rate_limit` is not
+itself counted. `limit=5000` means you are on the shared user budget; anything
+higher means you got the App. Measured 2026-09-01: bare `gh` reported
+`limit=5000 remaining=4999`, the App `limit=8700 remaining=8625`.
+
+Run the check, do not assume the eval worked. `get-token.sh`'s own docstring records
+why: if the script exits non-zero the `eval` sets nothing, `gh` falls back to user
+auth, and you are back on the contended budget with no sign that anything happened.
+
+**Do not poll `gh` in a loop.** Secondary limits are per-account and trigger on
+request RATE, so one lane's 30s `until` loop 403s every other lane, on every
+endpoint, including a plain repo read. On 2026-09-01 two lanes lost CI visibility
+for hours that way, and `gh api rate_limit` reported `used: 0, remaining: 5000`
+throughout, because the counter it reads is not the counter being enforced. Use
+ScheduleWakeup, or one delay sized to the job. (AF-396)
 
 ## Deploy
 
@@ -188,13 +222,30 @@ what was silently auto-respawning the server during an earlier redeploy in
 that same session (mistaken for a mystery supervisor at the time). Only the
 BUILDER unit was the actual gap. `scripts/amux-builder.service.template` +
 `.timer.template` are now installed on this box too (generated to
-`~/.config/systemd/user/`, `daemon-reload`'d) but deliberately left
-**disabled** — enabling it makes every future commit auto-rebuild AND
-auto-restart the live server, which is a materially bigger deal now that
-amux is in active daily use and a restart kills every live Claude session
-(see Deploy section below). That's a decision for whoever's driving at the
-time, not a default to flip silently. `systemctl --user enable --now
-amux-builder.timer` when ready.
+`~/.config/systemd/user/`, `daemon-reload`'d) and — as of 2026-08-31 —
+`amux-builder.timer` is **enabled and live**, polling every 60s.
+
+**Correction 2026-08-31, superseding the original "leave it disabled" note
+below**: this paragraph used to warn that enabling the timer meant "a
+restart kills every live Claude session" and left the decision to whoever
+was driving. That warning is now stale. Root cause (INIT-1, closed
+2026-08-30, see `frustrations.md`): `amux.service` used to run with
+systemd's default `KillMode=mixed`, and the tmux server hosting every
+worker session lives in that unit's own cgroup (spawned by
+`ExecStartPre`, and cgroup membership is sticky across tmux's own
+self-daemonization) — so ANY restart of `amux.service`, reboot or an
+ordinary auto-builder deploy, SIGKILLed the whole cgroup, tmux and every
+live Claude session included. The fix, already shipped and verified
+**loaded** (`systemctl --user show amux.service -p KillMode` → `process`,
+confirmed live 2026-08-31, not just present in the unit file): `amux.service`
+now sets `KillMode=process`, so systemd only signals its own tracked main
+PID on stop/restart and leaves every other process in the cgroup — tmux
+server, every pane, every Claude process — untouched. A commit-triggered
+auto-restart no longer kills any session, so the timer is safe to run
+enabled, which is now this box's actual state.
+
+This does NOT cover a real reboot, which is a different failure path with
+its own still-open gap — see the reboot findings a few paragraphs below.
 
 **Playwright MCP servers had NO supervision at all** until 2026-08-28 (found
 during the same reboot test — the 5 lanes came back for everything

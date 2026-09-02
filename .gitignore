@@ -65,3 +65,15 @@ crates/amux-dashboard/eslint.globals.generated.json
 
 secrets/amux-secrets.yaml
 secrets/*.yaml
+
+# Manual build artifact from the live-binary-swap deploy workflow — never
+# belongs in the repo (was accidentally committed once, 37MB, see 055121f4).
+amux-server.new
+
+# Per-checkout internal notes (hostnames, SSH usernames) — explicitly never
+# meant to leave this machine. Was accidentally committed and pushed to a
+# public fork once (055121f4); scrubbed from history 2026-08-30. This line
+# is what actually stops it recurring — the first two attempts to add it
+# never got staged, so double-check `git show HEAD:.gitignore` after editing
+# this file, not just the working tree, before trusting it's committed.
+CLAUDE.local.md
