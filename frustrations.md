@@ -3614,10 +3614,24 @@ FIX: `.claude/rules/frustrations.md` already documents this class exactly — "L
   way, having read that rule earlier the same day. That is the tell that the rule is in
   the wrong place: it asks a human to remember a lookup before writing, and the moment
   the lookup matters is the moment a message ARRIVES.
+  CORRECTION, same day, after walking the sanctioned path end to end: THE DOCUMENTED
+  FALLBACK ALSO FAILS, and the advice printed at the first refusal sends you to a
+  mechanism that fails for the same reason. All four channels, in order, all refused:
+      amux send amux              -> "not a peer or relay target"
+      card in their queue         -> blocked by THEIR OWN WIP limit ("close_these_first")
+      amux board progress <card>  -> "progress noted, but OWNER NOT NOTIFIED: target is
+                                     an isolated (raw-agent) worker: amux automation is
+                                     not delivered into it"
+      only the owner, from the dashboard
+  The cross-group send refusal explicitly recommends the board handoff ("use the board on
+  a card owned by <them>: `amux board progress <CARD>` notifies the owner at their next
+  turn"), and neither refusal mentions the other. A lane following the guidance exactly
+  ends up where it started, having written the message twice.
   The cheap mechanism is at delivery, not in prose: when an isolated worker's message is
   delivered to a peer, say so in the delivery envelope — one clause, "this sender cannot
-  receive replies; answer via the board" — the same way the cross-group refusal already
-  names the board handoff path. The information is on the record being rendered.
+  receive replies; only the owner can reach them" — and stop naming the board path for
+  isolated targets, since it does not work for them. The `isolated` flag is on the record
+  being rendered in both places.
   Related: AF-352 is the entry for entries whose authors can never sign off, which is
   the same asymmetry costing something different.
 ## Runtime hook copies drift from HEAD silently — install.sh has no supervision
