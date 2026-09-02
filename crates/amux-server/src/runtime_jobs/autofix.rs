@@ -188,6 +188,24 @@ const LONG_BY_DESIGN: &[(&str, f64)] = &[
     // design bound (40s), which is the threshold-below-baseline defect the
     // card's own closing line names.
     ("/api/browser/navigate", 40_000.0),
+    // POST /api/browser/start (AMUX-97). The wait is a real Chrome launch: the
+    // handler polls CDP's HTTP port for up to 30s before giving up
+    // (integrations/browser.rs `start`, `deadline = now + 30s`), and that
+    // window is deliberately wide rather than the old 12s — the comment right
+    // above it says why: "a real logged-in profile on a busy machine (a
+    // 50-lane fleet) routinely takes longer than the old 12s to open the
+    // debugging port". So the endpoint's own designed bound is 30s, not the
+    // 10s floor this detector applies to every route.
+    //
+    // AMUX-97's own filing was a single 10.3s call, its only sample in 7 days
+    // (n=1, no baseline to compare against), arriving while this box's
+    // 1-minute load was 1.96x on 4 cores (compiling/testing amux
+    // concurrently, per the card's own host_load_at_worst) — comfortably
+    // inside the 30s launch budget the code already documents, not a hang.
+    // 30s, matching the deadline directly rather than padding it: this route
+    // (unlike navigate) has nothing running AFTER the CDP wait that a wider
+    // budget would need to cover.
+    ("/api/browser/start", 30_000.0),
     // GET /api/email/inbox (AMUX-3519, third filing in one day on the same
     // residual): a count=480 metadata fetch is quota-bound at ~12-15s — the
     // 8-wide concurrency sits deliberately under Gmail's 250 units/s budget
@@ -11413,6 +11431,66 @@ mod tests {
             f2.iter()
                 .any(|x| x.signature.contains("/api/browser/navigate")),
             "past its own timeouts, a navigate is a hang and must file: {f2:?}"
+        );
+    }
+
+    /// AMUX-97. `POST /api/browser/start` polls Chrome's CDP port for up to
+    /// 30s before giving up (integrations/browser.rs `start`), deliberately
+    /// widened past the old 12s for a real logged-in profile on a busy
+    /// machine — so a launch inside that window is the design, not a fault.
+    ///
+    /// PIN THE LOOKUP, NOT JUST THE TABLE (same reasoning as the archive
+    /// budget cell above): a constant nothing consults would be exactly as
+    /// green whether or not the detector can actually reach it.
+    #[tokio::test]
+    async fn a_browser_start_is_judged_against_its_own_cdp_wait() {
+        let (st, _d) = state();
+        let now = unix_now();
+        // The filing itself: one 10.3s launch, comfortably inside the 30s CDP
+        // wait — this is what AMUX-97 actually measured.
+        log_row(
+            &st,
+            Row {
+                ts: now - 500.0,
+                method: "POST",
+                path: "/api/browser/start",
+                family: "/api/browser",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 10_308.0,
+            },
+        );
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        assert!(
+            !f.iter()
+                .any(|x| x.signature.contains("/api/browser/start")),
+            "a launch inside its own 30s CDP-wait bound is designed behaviour: {f:?}"
+        );
+
+        // PAST the budget: the CDP wait failed to bound it, which is a real
+        // hang and must still file.
+        let (st2, _d2) = state();
+        log_row(
+            &st2,
+            Row {
+                ts: now - 500.0,
+                method: "POST",
+                path: "/api/browser/start",
+                family: "/api/browser",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 31_000.0,
+            },
+        );
+        let (f2, _) = detect_latency(&st2.store.read().unwrap(), now);
+        assert!(
+            f2.iter()
+                .any(|x| x.signature.contains("/api/browser/start")),
+            "past its own CDP-wait timeout, a start is a hang and must file: {f2:?}"
         );
     }
 
