@@ -428,6 +428,32 @@ if [ -n "${hooks_dir:-}" ] && [ -d "$REPO/scripts/git-hooks" ]; then
       stale_names="${stale_names} ${name}"
     fi
   done
+  # THE FIFTH GUARD, which no installer covered and which this axis could not see
+  # (AF-409). ~/.claude/settings.json invokes `python3
+  # ~/.amux/hooks/git-shared-guard.py` as a PreToolUse hook, outside any checkout,
+  # so the loop above — which compares against `git rev-parse --git-path hooks` —
+  # is structurally blind to it.
+  #
+  # It cost three days. Measured 2026-09-02: the running copy was 148 lines behind
+  # and byte-identical to a58a53cf, while the repo carried e782b68a's fix for a
+  # command-substitution BYPASS (AMUX-3932). Run through both copies directly,
+  # `echo "$(git add -A)"` was ALLOWED by the running one and blocked by the repo
+  # one. That is the command AF-316 exists to refuse, on a tree 125 lanes share.
+  #
+  # THREE STATES, and the third is why this is not a one-liner. An ABSENT
+  # destination means "not an amux host", which is not drift and must not be
+  # reported as any. install-hooks.sh now installs and verifies this file too, so
+  # this line is the half that fires without anyone remembering to run it.
+  _pgd="${AMUX_SHARED_GUARD_DEST:-$HOME/.amux/hooks/git-shared-guard.py}"
+  _pgs="$REPO/scripts/git-hooks/git-shared-guard.py"
+  if [ -f "$_pgs" ] && [ -f "$_pgd" ] && ! cmp -s "$_pgs" "$_pgd"; then
+    out+="  - the PreToolUse shared-checkout guard differs from this checkout"$'\n'
+    out+="    running: ${_pgd}"$'\n'
+    out+=$'    it has NO git-hook installer of its own and is not in the list above;\n'
+    out+=$'    a repo edit reaches nobody until someone installs it (AF-409)\n'
+    out+=$'    ./scripts/install-hooks.sh   installs and verifies it now\n'
+  fi
+
   if [ -n "$stale_hooks" ]; then
     out+="  - installed git hooks differ from this checkout: ${stale_hooks}"$'
 '

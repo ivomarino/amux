@@ -270,6 +270,29 @@ install -m 0755 "$ROOT/scripts/git-hooks/pre-push" "$HOOKS/pre-push"
 install -m 0755 "$ROOT/scripts/git-hooks/append-only-push-guard" "$HOOKS/append-only-push-guard"
 install -m 0755 "$ROOT/scripts/git-hooks/post-commit" "$HOOKS/post-commit"
 
+# THE FIFTH GUARD, which is not a git hook and had no installer at all (AF-409).
+#
+# ~/.claude/settings.json invokes `python3 ~/.amux/hooks/git-shared-guard.py` as a
+# PreToolUse hook, a path OUTSIDE any checkout. Everything above installs into
+# .git/hooks; nothing installed this one, so a repo edit reached nobody until a
+# human copied it by hand.
+#
+# Measured 2026-09-02: the running copy was 148 lines behind and byte-identical to
+# a58a53cf, while the repo copy carried e782b68a's fix for a command-substitution
+# BYPASS (AMUX-3932). Both forms were run through both copies directly:
+#   echo "$(git add -A)"             old: ALLOWED   new: blocked
+#   python3 <<EOF ... $(git add -A)  old: ALLOWED   new: blocked
+# `git add -A` on a shared checkout is the command AF-316 exists to refuse, and for
+# three days it was one layer of quoting away from succeeding.
+#
+# Installed only when the destination directory already exists: this script runs in
+# checkouts that are not amux hosts, and creating ~/.amux there would be inventing
+# state on somebody else's machine.
+SHARED_GUARD_DEST="${AMUX_SHARED_GUARD_DEST:-$HOME/.amux/hooks/git-shared-guard.py}"
+if [ -d "$(dirname "$SHARED_GUARD_DEST")" ]; then
+  install -m 0755 "$ROOT/scripts/git-hooks/git-shared-guard.py" "$SHARED_GUARD_DEST"
+fi
+
 # Verify rather than announce (ethos #7): compare what landed against its source,
 # so a stale installed copy cannot hide behind a success message. That drift was
 # real and security-relevant — the AC-239 secret patterns (Clerk, R2, Slack,
@@ -285,6 +308,22 @@ for h in pre-commit amux-staged-guard prepare-commit-msg pre-push post-commit ap
     fail=1
   fi
 done
+
+# The PreToolUse guard gets the same treatment, and it is the one that needed it:
+# the six above at least had an installer that someone could forget to run, and
+# this had none to forget. Reported as SKIP rather than ok when the destination is
+# absent, because "not an amux host" and "installed correctly" are different facts
+# and a silent pass would merge them (AF-409).
+if [ -d "$(dirname "$SHARED_GUARD_DEST")" ]; then
+  if cmp -s "$ROOT/scripts/git-hooks/git-shared-guard.py" "$SHARED_GUARD_DEST"; then
+    echo "  ok   $SHARED_GUARD_DEST matches scripts/git-hooks/git-shared-guard.py"
+  else
+    echo "  FAIL $SHARED_GUARD_DEST differs from scripts/git-hooks/git-shared-guard.py" >&2
+    fail=1
+  fi
+else
+  echo "  SKIP $SHARED_GUARD_DEST — no ~/.amux/hooks on this machine (not an amux host)"
+fi
 
 # The shim is the whole chain: an installed guard that pre-commit never calls is
 # a file, not a guard. Check the LINK, not just the two files — this is exactly
