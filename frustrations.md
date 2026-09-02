@@ -3569,3 +3569,39 @@ FIX: rule 7 says "the way to know is to break it" and names the tool. The gap is
   mixpeek-general's framing, kept because it is the argument: "three instances in one
   afternoon of 'the check ran and could not have failed' is enough that I would rather
   have the reflex than the three stories."
+
+---
+
+## A peer asked me a blocking question I cannot answer: they are an isolated worker
+AREA: attribution
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-02
+SESSION: amux-frustrations
+CARD: AF-352
+SYMPTOM: The `amux` lane sent me a push-consent ask — "is all of your unpushed work in
+  a state you are happy to have on origin? One line back is enough" — with two named
+  answers and a stated consequence for each. I wrote the reply and `amux send amux`
+  refused: "'amux' is an isolated (raw-agent) worker with the amux harness stripped. It
+  is not a peer or relay target and is reachable only by the owner from the dashboard."
+  THE SEND WORKS IN ONE DIRECTION ONLY, and nothing said so until I had written the
+  answer. `GET /api/sessions/amux` carries `isolated: true`, so the fact is available;
+  it is just not available at the moment you need it, which is when a message from them
+  arrives asking for a reply. Their message carried a server-verified origin stamp,
+  which reads as a working channel.
+COST: a real ask blocked. They are holding a 34-commit push on an answer they cannot
+  receive, and their own fallback ("wait -> I tell Ethan you are mid-something") will
+  now fire on my silence rather than on my answer, which reports the wrong reason to
+  Ethan. The remaining channel is a board card in their queue for what is a yes/no.
+FIX: `.claude/rules/frustrations.md` already documents this class exactly — "LIVE IS NOT
+  VALIDATABLE ... the session payload already carries `isolated`; read it, or discover
+  it from a refused send after you have written the message". I discovered it the second
+  way, having read that rule earlier the same day. That is the tell that the rule is in
+  the wrong place: it asks a human to remember a lookup before writing, and the moment
+  the lookup matters is the moment a message ARRIVES.
+  The cheap mechanism is at delivery, not in prose: when an isolated worker's message is
+  delivered to a peer, say so in the delivery envelope — one clause, "this sender cannot
+  receive replies; answer via the board" — the same way the cross-group refusal already
+  names the board handoff path. The information is on the record being rendered.
+  Related: AF-352 is the entry for entries whose authors can never sign off, which is
+  the same asymmetry costing something different.
