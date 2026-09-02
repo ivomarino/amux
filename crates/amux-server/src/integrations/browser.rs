@@ -1202,7 +1202,14 @@ pub async fn start(
     // user_data_dir", because that is what corrupts. A browser on a DIFFERENT
     // profile is a legitimate neighbour and is left alone.
     if RUNNING.lock().expect("browser registry poisoned").contains_key(profile) {
-        let _ = stop_profile(home, profile).await;
+        // NAME THE DISPLACER AND SAY IT WAS A DISPLACEMENT (AF-378 follow-up).
+        // `started_by` is the resolved attribution of whoever asked for THIS
+        // start; it was already in hand here and was being dropped, so every
+        // browser replaced by a peer's start recorded `by: null`. The reason is
+        // "displaced by a new start" rather than "stopped" because nobody asked
+        // to stop it: naming the starter as the stopper would be a wrong
+        // attribution, which is the failure this record exists to prevent.
+        let _ = stop_profile_as_reason(home, profile, started_by, "displaced by a new start").await;
     }
 
     if is_amux_owned(home, &target.user_data_dir) {
@@ -1481,19 +1488,68 @@ pub async fn stop_as(home: &Path, stopped_by: &str) -> StopReport {
 }
 
 /// [`stop_as`] for one named profile.
+/// The `last_exit` record, as a pure value so it can be asserted on.
+///
+/// Extracted because the behaviour worth pinning lives in two fields and the
+/// function that writes them early-returns when nothing is running, so there is
+/// no seam to test through. `by` is NULL rather than "" on purpose: an empty
+/// string and an unnamed actor read identically to a consumer, and telling them
+/// apart is the whole point of the record (AMUX-3063).
+fn exit_record(
+    reason: &str,
+    stopped_by: &str,
+    profile: &str,
+    pid: u32,
+    started_by: &str,
+    ts: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "ts": ts,
+        "reason": reason,
+        "by": if stopped_by.is_empty() { serde_json::Value::Null } else { serde_json::json!(stopped_by) },
+        "profile": profile,
+        "pid": pid,
+        "started_by": started_by,
+    })
+}
+
 pub async fn stop_profile_as(home: &Path, profile: &str, stopped_by: &str) -> StopReport {
+    stop_profile_as_reason(home, profile, stopped_by, "stopped").await
+}
+
+/// Stop, naming BOTH the actor and WHY (AF-378 follow-up).
+///
+/// `stop_profile_as` hardcoded `reason: "stopped"`, which is right for a `/stop`
+/// and wrong for the internal stop inside `start()`: there nobody asked for a
+/// stop, a peer asked for a START and the running browser was displaced to make
+/// room. Recording that as "stopped by <the new starter>" would name them as the
+/// stopper, which is a subtly wrong attribution of exactly the kind this record
+/// exists to prevent.
+///
+/// Found by reading a VALUE rather than a field's presence. amux-homepage
+/// verified AF-378 by checking `last_exit` was populated, and the value they
+/// pasted back was `{by: None, reason: stopped, started_by: mixpeek-cicd}` — the
+/// record survived, and the one field the card is about was null. The path that
+/// produced it was `start()` calling the actor-less `stop_profile`, while the
+/// actor sat in its own `started_by` parameter the whole time.
+pub async fn stop_profile_as_reason(
+    home: &Path,
+    profile: &str,
+    stopped_by: &str,
+    reason: &str,
+) -> StopReport {
     let running = RUNNING.lock().expect("browser registry poisoned").remove(profile);
     let Some(mut running) = running else {
         return StopReport { stopped: false, profile: None, clean_exit: None, locks_cleaned: vec![] };
     };
-    *LAST_EXIT.lock().expect("last-exit poisoned") = Some(serde_json::json!({
-        "ts": chrono::Utc::now().timestamp(),
-        "reason": "stopped",
-        "by": if stopped_by.is_empty() { serde_json::Value::Null } else { serde_json::json!(stopped_by) },
-        "profile": running.profile,
-        "pid": running.pid,
-        "started_by": running.started_by,
-    }));
+    *LAST_EXIT.lock().expect("last-exit poisoned") = Some(exit_record(
+        reason,
+        stopped_by,
+        &running.profile,
+        running.pid,
+        &running.started_by,
+        chrono::Utc::now().timestamp(),
+    ));
 
     // std/tokio only offer SIGKILL; /bin/kill sends the TERM we need.
     let _ = tokio::process::Command::new("kill")
@@ -4069,6 +4125,70 @@ mod last_exit_persistence_tests {
     /// tubescience: two browsers dying minutes apart, and all they saw was
     /// ConnectionRefusedError on the CDP socket, with `last_exit: null` by the
     /// time anyone looked.
+    /// The CALL SITE, not just the record shape (AF-161's rule).
+    ///
+    /// The test below pins what `exit_record` produces. It passed unchanged when
+    /// the displacement call site was mutated back to the actor-less
+    /// `stop_profile`, which is a check pinning the wrong layer: exactly as green
+    /// as one pinning the right layer, and worth nothing. This reads the source
+    /// and fails if `start()` goes back to dropping the actor.
+    ///
+    /// A source scan is the weaker kind of probe, so it is bounded to the one
+    /// window that matters and asserts the positive rather than the absence.
+    #[test]
+    fn starts_displacement_stop_names_the_actor_in_the_source() {
+        let src = include_str!("browser.rs");
+        let at = src
+            .find("// ONE BROWSER PER PROFILE, and only this profile (AMUX-3828)")
+            .expect("the displacement block's anchor comment must exist");
+        let window = &src[at..src.len().min(at + 1400)];
+        assert!(
+            window.contains("stop_profile_as_reason(home, profile, started_by,"),
+            "start()'s displacement stop must pass the actor; window was:\n{window}"
+        );
+        assert!(
+            !window.contains("stop_profile(home, profile)"),
+            "start() must not use the actor-less stop, which records by: null"
+        );
+    }
+
+    /// A DISPLACED browser names who displaced it, and does not call them the
+    /// stopper (AF-378 follow-up).
+    ///
+    /// Found by reading a value rather than a field's presence: amux-homepage
+    /// verified AF-378 by checking last_exit was populated, and the value they
+    /// pasted back was `{by: None, reason: stopped, started_by: mixpeek-cicd}`.
+    /// The record survived a restart, which is what AF-378 shipped, and the one
+    /// field the card is about was null. The path was `start()` calling the
+    /// actor-less `stop_profile` while the actor sat in its own `started_by`
+    /// parameter.
+    ///
+    /// Both halves are asserted because passing the actor alone would be a WRONG
+    /// attribution: nobody asked to stop that browser, somebody asked to start a
+    /// new one, and "stopped by X" reads as X having stopped it.
+    #[test]
+    fn a_displaced_browser_names_the_displacer_and_says_it_was_displaced() {
+        let v = super::exit_record(
+            "displaced by a new start", "lane-b", "default", 4242, "lane-a", 1000,
+        );
+        assert_eq!(v["by"], serde_json::json!("lane-b"), "the displacer must be named: {v}");
+        assert_eq!(v["started_by"], serde_json::json!("lane-a"), "the displaced owner must survive: {v}");
+        assert_eq!(
+            v["reason"], serde_json::json!("displaced by a new start"),
+            "a displacement must not be recorded as a plain stop: {v}"
+        );
+
+        // A REAL stop still reads as one, so this did not just rename everything.
+        let stopped = super::exit_record("stopped", "activity-reaper", "default", 1, "lane-a", 1000);
+        assert_eq!(stopped["reason"], serde_json::json!("stopped"));
+        assert_eq!(stopped["by"], serde_json::json!("activity-reaper"));
+
+        // AND AN UNNAMED ACTOR IS STILL NULL, NOT "". The two read identically to
+        // a consumer and telling them apart is what the record is for (AMUX-3063).
+        let anon = super::exit_record("stopped", "", "default", 1, "lane-a", 1000);
+        assert!(anon["by"].is_null(), "an unnamed actor must be null, not empty: {anon}");
+    }
+
     #[test]
     fn a_recorded_exit_outlives_the_process_that_recorded_it() {
         let dir = tempfile::tempdir().expect("tempdir");
