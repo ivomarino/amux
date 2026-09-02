@@ -4055,3 +4055,56 @@ prescription.
 Verified in the INVOKED copy (~/.amux/hooks/git-shared-guard.py, the path
 ~/.claude/settings.json runs), not only in the repo, because the two are not kept
 in sync — see AF-409, filed while checking this.
+
+## A shared CARGO_TARGET_DIR is mandated, and concurrent builds in it evict each other's artifacts
+VALIDATED: amux-frustrations | Diagnosed and largely fixed. The entry's own FIX said "nobody has established
+WHICH of the three is happening — the diagnosis is missing, not the remedy". It
+is now established, and it is none of the three.
+
+MECHANISM: the builder's disk guard rm -rf'd the ENTIRE shared target dir at the
+25GB fleet floor, with no peer-build gate. From ~/.amux/logs/rust-auto-build.log,
+all 23 shared-dir clears in the log, no truncation:
+    2026-08-15  11   <- this entry's incident date, which reports 3 failures
+    2026-08-16   9
+    2026-08-24   2
+    2026-08-30   1
+Log line: "DISK LOW: 22GB free (< 25GB). Clearing the 162GB shared target dir;
+next build is cold." A lane's in-flight cargo check/test had its whole dependency
+tree removed underneath it — exactly the vanished serde_core rmeta and the 42
+errors in nix.
+
+The builder's own AMUX-2927 comment predicted this in writing and was never
+connected to this entry: its lock serialises BUILDER vs BUILDER and does nothing
+for BUILDER vs LANE.
+
+THE THREE OPTIONS, resolved:
+ (c) cargo GC — RULED OUT. -Z gc is unstable, this is stable cargo 1.97.1,
+     RUSTC_BOOTSTRAP unset, no [unstable] stanza in .cargo/config.toml and
+     ~/.cargo/config.toml does not exist. A positive would have been an enabled
+     gc flag; the probe could have produced one and found none.
+ (b) give the auto-builder its own target dir — MISAIMED. It only builds
+     --release, into release/. Its debug cleanup arm was added 2026-08-29
+     (881ff614), 14 days AFTER this incident.
+ (a) leave it — overtaken.
+
+FIXED BY 79abbb09 (2026-08-20, AEAB-35), filed against a different card: the
+fleet floor was split from the build's own cache threshold, so the shared dir is
+sacrificed only below 8GB and the idle e2e dir goes first. 20 clears in the two
+days before it, 3 in the thirteen days after.
+
+RESIDUE CARRIED FORWARD, not left silent: the builder now has two rm -rf arms and
+only the debug-size one carries AF-303's peer-build gate. The disk-low arm has
+none. Almost certainly correct (ENOSPC outranks a peer build, by AF-303's own
+reasoning) but undocumented at that site. Filed as AF-415 rather than kept open
+here, because this entry's text is about evictions at the 25GB threshold and
+those are gone.
+AREA: build
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-15
+SESSION: amux-frustrations
+CARD: AMUX-2936
+SYMPTOM: `error: extern location for serde_core does not exist: ~/.amux/rust-build-target/debug/deps/libserde_core-0d2476c6ed9be3cc.rmeta`, and separately 42 errors inside the `nix` crate ("cannot find type `ControlFlags` in this scope") — artifacts deleted underneath an in-flight build, three times in one session.
+  CLAUDE.md requires ONE shared build dir (~/.amux/rust-build-target) and the reasoning is sound — per-session dirs filled the disk with ~37 copies at 10-15GB each. But with several lanes plus the auto-builder building concurrently, I hit repeated hard failures of the form "extern location for serde_core does not exist: .../libserde_core-<hash>.rmeta" and 42 errors inside the `nix` crate, i.e. artifacts deleted underneath an in-flight build. Not a lock contention wait, which is what the CLAUDE.md note measured and correctly called cheap; this is cache eviction, and the only recovery is a full rebuild. Hit it three times in one session, roughly 4 minutes of rebuild each.
+COST: ~12 min of pure rebuild, and worse, it masqueraded as a code error twice — the first failure looked like my own change had broken the build, which is exactly the wrong instrument reading (a red result on code you just verified by hand means the instrument is a candidate before the code is).
+FIX: Not fixed; needs a decision, not a workaround. Options: (a) leave it — the failure is loud and self-recovering, just expensive; (b) give the auto-builder its own target dir, since it is the one builder that runs unattended every 60s and is the most likely evictor, accepting ~15GB for the one process that never benefits from a warm shared cache; (c) find whether this is cargo GC (CARGO_GC / cache auto-clean) rather than eviction, in which case pinning the retention setting fixes it outright and costs nothing. (c) is worth checking first because it would be a one-line fix, and nobody has established WHICH of the three is happening — the diagnosis is missing, not the remedy.
