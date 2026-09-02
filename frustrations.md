@@ -1406,47 +1406,6 @@ FIX: Open, and it is a design call rather than a patch — carded as AEAB-40 and
   conflict structurally impossible, with the work being the greps in the rules, CLAUDE.md
   and `scripts/frustrations_audit.py`. Interim recipe, which worked three times today: take
   origin's file, append your entries VERBATIM, never let git interleave, then run the audit.
-## The shared-checkout amend guard pins HEAD, not the staged set, so a correctly-pinned amend still absorbed a peer's work
-AREA: git
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-20
-SESSION: amux-frustrations
-CARD: AF-106
-SYMPTOM: I ran `git commit --amend` to replace a placeholder commit message. The guard
-  refused the unpinned form and told me exactly what to do:
-    "BLOCKED ... git commit --amend without verified HEAD pin ... re-run pinned:
-     AMUX_AMEND_EXPECT=<that-sha> git commit --amend"
-  I did precisely that, with the sha I had just read off `git log -1`. It was allowed,
-  and it swept 139 lines of another session's in-flight work into a commit carrying MY
-  message: amux's AMUX-3110 dead-letter implementation (session_verbs.rs +132) plus
-  their untracked migrations/0024_steering_dead_letter.sql, under
-  "fix(instruments): /api/debug/downtime could not distinguish an empty history from a
-  broken query (AF-99)".
-  `--amend` with no pathspec commits the whole STAGED set, and a peer had staged theirs
-  in the seconds between my two commands.
-COST: ~20 minutes of disclosure, coordination and verification across two sessions, and a
-  permanently mislabelled commit — amux chose to leave f70fc51 as-is and add a provenance
-  note (3e77b20) rather than rewrite shared HEAD to fix a label. Cheap this time ONLY
-  because the peer was reachable and answered in five minutes; their own reply names the
-  real hazard, that they were about to conclude their work was uncommitted and re-commit
-  it. The near-miss is a duplicated 132-line change, or a `git checkout` over it.
-FIX: The guard verifies that the COMMIT BEING REWRITTEN is yours and says nothing about
-  whether the CONTENT BEING ABSORBED is. Pinning AMUX_AMEND_EXPECT protected the wrong
-  operand, and it protected it while telling me I was now safe — which is worse than no
-  guard, because I stopped thinking about the staged set at exactly the moment it started
-  mattering.
-  Durable shape, and it needs no new machinery (amux's suggestion, and I agree): the
-  amend path should warn — or refuse without an explicit ack — when the staged set
-  contains paths whose last editor, by the staged-guard's OWN attribution, is another
-  session. That is the identical ownership question the staged-guard already answers at
-  commit time; this is the same predicate at a second door, which is AMUX-2325's lesson
-  about a constraint whose sanctioned escape is unwalkable from the audited path.
-  Cheap interim, entirely on the caller: `git commit --amend -- <your paths>`. A
-  pathspec makes amend behave like the scoped commit the guard already pushes people
-  toward everywhere else, and nothing in the guard's message mentions it.
-
----
 ## SIX answer-shaped wrong results in one night, and in every one the tell was a MISSING ACCOMPANIMENT rather than the answer
 AREA: instruments
 SEVERITY: slows
@@ -3390,7 +3349,40 @@ COST: Two wrong lane statuses reported by Ethan in one afternoon, in opposite
   reported one — the answer was none, and the first fix would have been green and
   completely inert, which is the same defect a second time.
 FIX: Producer wired in `scripts/hooks/hook-report.sh` (`subagent:start` / `subagent:stop`)
-  and in settings.json as `PreToolUse[Task|Agent]` + `SubagentStop`; count made
+  and in settings.json as `PreToolUse[^(Task|Agent)$]` + `SubagentStop`; count made
   authoritative in both directions; `hooks.report_hooks_wired` extended with an
   absent-event-class arm so the next dead producer fails a check instead of reading
   as a deliberate trade-off.
+
+## A guard with two copies and no installer ran three days behind, allowing the bypass its newer copy refuses
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-frustrations (found it), amux (wrote the fix that was sitting inert)
+CARD: AF-409
+SYMPTOM: `~/.claude/settings.json` invokes `python3 ~/.amux/hooks/git-shared-guard.py`,
+  a path OUTSIDE the repo. The repo versions and reviews
+  `scripts/git-hooks/git-shared-guard.py`. Nothing copies one to the other:
+  `scripts/install-hooks.sh` installs pre-commit, pre-push, prepare-commit-msg and
+  amux-staged-guard, and not this one. Measured 2026-09-02: 148 differing lines. The
+  running copy was byte-identical to a58a53cf (08-30 06:38); the repo copy carried
+  e782b68a (08-30 21:02), "command substitution inside a quoted argument bypassed the
+  shared-checkout guard (AMUX-3932)".
+COST: A BYPASS FIX INERT FOR THREE DAYS, proven with a control rather than asserted by
+  running both forms through each copy directly:
+    echo "$(git add -A)"             OLD: allowed   NEW: BLOCKED
+    python3 <<EOF ... $(git add -A)  OLD: allowed   NEW: BLOCKED
+  The old copy is the one that was running. `git add -A` in a shared checkout is the
+  command AF-316 exists to refuse, and for three days it was one layer of quoting away
+  from succeeding on a tree 125 lanes share. Nobody is known to have used it; the cost
+  is the exposure, not a measured incident.
+FIX: Installed on this box (running copy backed up first, both syntax-checked, the old
+  one confirmed a strict ANCESTOR at a58a53cf so nothing unique was lost). That is the
+  instance. The CLASS is unfixed and is AF-409: this is the second hook found running
+  behind its repo copy in three days, after AF-375, and the two failed differently —
+  AF-375's hook HAS an installer nobody ran, this one has none to run. The generalisable
+  half is that a file's deploy semantics are invisible at the point of editing it, so
+  the honest fix is a drift check that fires without being remembered. The SessionStart
+  freshness hook already does exactly that for the four installed git hooks and does not
+  know this file exists.

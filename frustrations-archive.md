@@ -3975,3 +3975,83 @@ states it is in. That is the measured/n_considered contract applied to the exact
 failure this entry names. The detector is also demonstrably running rather than
 merely present: it made three latency decisions in that tick, including a
 long-by-design exemption for /api/email/inbox with the numbers attached.
+
+## The shared-checkout amend guard pins HEAD, not the staged set, so a correctly-pinned amend still absorbed a peer's work
+VALIDATED: amux-frustrations | VALIDATED by the ORIGINATING session (amux-frustrations). SELF-SIGNOFF, labelled as
+one. Verified in the hook that RUNS, not the one the repo versions, because those
+two turned out to differ.
+
+The entry's mechanism: a correctly-pinned `--amend` was allowed and swept 139 lines
+of a peer's staged work, because the pin protects the COMMIT being rewritten and
+says nothing about the STAGED SET being absorbed.
+
+Now, in ~/.amux/hooks/git-shared-guard.py, a valid pin does not end the check:
+
+  if m and head.startswith(m.group(1)):
+      # AF-106 durable half (AMUX-3407): the pin proves the COMMIT BEING
+      # REWRITTEN is yours; the check below proves the STAGED SET being
+      # absorbed is too. ... the pin was satisfied and protected the wrong operand.
+      return _amend_staged_check(scrubbed, run_dir)
+
+`_amend_staged_check` posts to /api/git/staged-guard and `_amend_staged_decision`
+refuses when any staged path was last edited by a different session, naming them and
+prescribing `git commit --amend -- <your paths>`. That is the entry's own
+prescription, and it is the second door on the same question the pre-commit guard
+already answers.
+
+FOUND WHILE CHECKING THIS, filed as AF-409 rather than folded in here: the invoked
+copy and the repo copy are not synced by anything, and the invoked one was 148 lines
+behind, missing a command-substitution BYPASS fix (e782b68a / AMUX-3932) for three
+days. Both copies carry the AF-106 fix, so this entry closes either way — but I
+would not have known that without checking the right file, and the AF-375 lesson is
+the only reason I did.
+AREA: git
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-20
+SESSION: amux-frustrations
+CARD: AF-106
+SYMPTOM: I ran `git commit --amend` to replace a placeholder commit message. The guard
+  refused the unpinned form and told me exactly what to do:
+    "BLOCKED ... git commit --amend without verified HEAD pin ... re-run pinned:
+     AMUX_AMEND_EXPECT=<that-sha> git commit --amend"
+  I did precisely that, with the sha I had just read off `git log -1`. It was allowed,
+  and it swept 139 lines of another session's in-flight work into a commit carrying MY
+  message: amux's AMUX-3110 dead-letter implementation (session_verbs.rs +132) plus
+  their untracked migrations/0024_steering_dead_letter.sql, under
+  "fix(instruments): /api/debug/downtime could not distinguish an empty history from a
+  broken query (AF-99)".
+  `--amend` with no pathspec commits the whole STAGED set, and a peer had staged theirs
+  in the seconds between my two commands.
+COST: ~20 minutes of disclosure, coordination and verification across two sessions, and a
+  permanently mislabelled commit — amux chose to leave f70fc51 as-is and add a provenance
+  note (3e77b20) rather than rewrite shared HEAD to fix a label. Cheap this time ONLY
+  because the peer was reachable and answered in five minutes; their own reply names the
+  real hazard, that they were about to conclude their work was uncommitted and re-commit
+  it. The near-miss is a duplicated 132-line change, or a `git checkout` over it.
+FIX: The guard verifies that the COMMIT BEING REWRITTEN is yours and says nothing about
+  whether the CONTENT BEING ABSORBED is. Pinning AMUX_AMEND_EXPECT protected the wrong
+  operand, and it protected it while telling me I was now safe — which is worse than no
+  guard, because I stopped thinking about the staged set at exactly the moment it started
+  mattering.
+  Durable shape, and it needs no new machinery (amux's suggestion, and I agree): the
+  amend path should warn — or refuse without an explicit ack — when the staged set
+  contains paths whose last editor, by the staged-guard's OWN attribution, is another
+  session. That is the identical ownership question the staged-guard already answers at
+  commit time; this is the same predicate at a second door, which is AMUX-2325's lesson
+  about a constraint whose sanctioned escape is unwalkable from the audited path.
+  Cheap interim, entirely on the caller: `git commit --amend -- <your paths>`. A
+  pathspec makes amend behave like the scoped commit the guard already pushes people
+  toward everywhere else, and nothing in the guard's message mentions it.
+
+---
+FIXED, verified 2026-09-02 in the hook that actually runs. A VALID pin no longer
+ends the check: git-shared-guard.py proceeds to `_amend_staged_check`, which asks
+the same server endpoint the pre-commit guard uses and refuses on foreign staged
+paths. The code names this entry at that branch: "the pin proves the COMMIT BEING
+REWRITTEN is yours; the check below proves the STAGED SET being absorbed is too ...
+the pin was satisfied and protected the wrong operand". That is this entry's own
+prescription.
+Verified in the INVOKED copy (~/.amux/hooks/git-shared-guard.py, the path
+~/.claude/settings.json runs), not only in the repo, because the two are not kept
+in sync — see AF-409, filed while checking this.
