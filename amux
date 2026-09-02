@@ -2417,6 +2417,71 @@ Usage: amux board epic $id <EPIC-ID> | none"
       echo "$result" | _board_outcome "$id" "" "$_note"
       return $?
       ;;
+    decompose)
+      # The multi-card exit from a capture shell is deliberately ONE request.
+      # Creating children with repeated `board add` calls made dependency,
+      # priority, ownership and epic linking optional at every step, and left
+      # half a plan behind whenever one call failed.
+      local id="${1:-}"
+      _board_id_guard "decompose" "$id"
+      [[ -n "$id" ]] || die "Usage: amux board decompose <CAPTURE-ID> --stdin | --file <plan.json>
+The plan is JSON: {\"tasks\":[{\"title\":\"...\",\"description\":\"...\",\"type\":\"code\",\"priority\":0,\"depends_on\":[],\"next_action\":\"Implement ...\"}, ...]}
+depends_on contains 1-based indexes of earlier tasks. Priority is p0 (highest) through p3."
+      shift
+      local plan=""
+      case "${1:-}" in
+        --stdin|-) plan=$(cat); shift ;;
+        --file) [[ -n "${2:-}" && -r "${2:-}" ]] || die "amux board decompose: readable --file required"
+                plan=$(cat "$2"); shift 2 ;;
+        --help|-h) die "Usage: amux board decompose <CAPTURE-ID> --stdin | --file <plan.json>" ;;
+        *) die "amux board decompose: pass the plan with --stdin or --file" ;;
+      esac
+      [[ -n "$plan" ]] || die "amux board decompose: the plan is empty"
+      [[ $# -eq 0 ]] || _board_bad_flag decompose "$1" "--stdin --file <plan.json>"
+      local result
+      result=$(_curl -sk -X POST -H 'Content-Type: application/json' \
+        -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
+        -d "$plan" "$AMUX_API/api/board/$id/decompose")
+      echo "$result" | _board_outcome "$id" "" "decomposed atomically"
+      return $?
+      ;;
+    artifact)
+      # The API has had a structured artifact registry since migration 0046,
+      # but workers had no attributed CLI path to write it. A registry nobody
+      # can reach from the pickup instruction degrades back into prose.
+      local id="${1:-}" ref="${2:-}" kind="implementation" state="created" description=""
+      _board_id_guard "artifact" "$id"
+      [[ -n "$id" ]] || die "Usage: amux board artifact <ISSUE-ID> <file|URL|commit|PR> [--kind K] [--state S] [--description TEXT]"
+      shift
+      if [[ "${1:-}" == "--stdin" || "${1:-}" == "-" ]]; then
+        ref=$(cat); shift
+      elif [[ "${1:-}" == "--file" ]]; then
+        [[ -n "${2:-}" && -r "${2:-}" ]] || die "amux board artifact: readable --file required"
+        ref=$(cat "$2"); shift 2
+      else
+        ref="${1:-}"; [[ $# -gt 0 ]] && shift
+      fi
+      [[ -n "$ref" ]] || die "amux board artifact: artifact reference required"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --kind) [[ -n "${2:-}" ]] || die "amux board artifact: --kind needs a value"; kind="$2"; shift 2 ;;
+          --state) [[ -n "${2:-}" ]] || die "amux board artifact: --state needs a value"; state="$2"; shift 2 ;;
+          --description) [[ -n "${2:-}" ]] || die "amux board artifact: --description needs text"; description="$2"; shift 2 ;;
+          --*) _board_bad_flag artifact "$1" "--kind <kind> --state <state> --description <text>" ;;
+          *) die "amux board artifact: unexpected argument '$1'" ;;
+        esac
+      done
+      local body result
+      body=$(R="$ref" K="$kind" S="$state" D="$description" python3 -c 'import json,os
+b={"ref":os.environ["R"],"kind":os.environ["K"],"state":os.environ["S"]}
+if os.environ.get("D"): b["description"]=os.environ["D"]
+print(json.dumps(b))')
+      result=$(_curl -sk -X POST -H 'Content-Type: application/json' \
+        -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
+        -d "$body" "$AMUX_API/api/board/$id/artifacts")
+      echo "$result" | _board_outcome "$id" "" "artifact registered"
+      return $?
+      ;;
     archive|unarchive)
       # AMUX-2492. `archived` had no per-card setter anywhere — only the age-archive
       # sweep and a per-session bulk update could touch it, so an automated action had
@@ -3213,6 +3278,11 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
   amux board status <ID> <status>  Set any status
   amux board type <ID> <type>      Correct a card's type (the gate is DERIVED from it)
   amux board epic <ID> <EPIC-ID>   Roll a card up under an epic ('none' detaches)
+  amux board decompose <ID> --stdin Atomically turn a captured prompt into an epic
+                                   plus ordered child tasks with dependencies,
+                                   p0-p3 priorities and concrete next actions.
+  amux board artifact <ID> <ref>   Register a file, URL, commit, PR, screenshot or
+                                   verification asset on the task.
   amux board reviewer <ID> <W>     Name the peer a card in review is handed to
   amux board block <ID> --on <why> Block a card WITHOUT changing its status, so its
                                    lifecycle position survives. --on is required:

@@ -3620,3 +3620,100 @@ FIX: `.claude/rules/frustrations.md` already documents this class exactly — "L
   names the board handoff path. The information is on the record being rendered.
   Related: AF-352 is the entry for entries whose authors can never sign off, which is
   the same asymmetry costing something different.
+## Runtime hook copies drift from HEAD silently — install.sh has no supervision
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux
+CARD: AMUX-99
+SYMPTOM: GET /api/health/invariants showed hooks.report_hook_matches_committed
+  and hooks.shared_guard_matches_committed both failing — runtime hook sha
+  differs from the sha baked into the running binary. ~/.amux/hooks/
+  git-shared-guard.py and ~/.amux/hook-report.sh were both installed 2026-08-30
+  20:48 and never reinstalled since, while their source kept getting real
+  commits — most notably e782b68a (AMUX-3932), a genuine guard-BYPASS fix
+  ("command substitution inside a quoted argument bypassed the shared-checkout
+  guard"). That fix passed every CI gate and sat in git history, never live on
+  this box, because nothing re-runs install.sh's hook-install step
+  automatically. AMUX-28/AMUX-29 already covered this exact invariant pair and
+  are marked done with no evidence recorded on either — the drift came back
+  because the underlying gap (install.sh only runs manually, unlike the Rust
+  binary auto-builder / amux-builder.timer) was never closed the first time.
+COST: a real security-relevant fix (a shared-checkout guard bypass) sat
+  undeployed for days on a box running unsupervised agents against a shared
+  checkout, with the health invariant correctly flagging it the whole time and
+  nothing consuming that signal. Discovered only because this session was
+  sweeping GET /api/health/invariants for other reasons.
+FIX: manually re-ran install.sh's own install_hook_from_head sequence for both
+  files (git show HEAD:<rel> + chmod +x + sha256 sidecar). Confirmed live:
+  invariant failures dropped from 6 to 4, both hooks.* entries cleared.
+  NOT fixed: the durable gap. AMUX-99 is the recurrence card and names the two
+  real options (a systemd timer polling install.sh's hook block the way
+  amux-builder.timer polls the Rust build, or the invariant self-healing since
+  it already computes the right bytes) — a design choice, not made here.
+
+## A multi-part prompt became unrelated leaves and the message reported only the first leaf
+AREA: scheduler
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-1
+SYMPTOM: MSG-39225 captured as ATE-1, then the worker hand-created ATE-2 and
+  ATE-3 without an epic, structured dependency edge, or priority. The scheduler
+  selected ATE-3 before ATE-2, hit the WIP gate, and repaired the ordering only
+  after the refusal. The Messages chip stayed attached to ATE-1, which had been
+  reshaped as one leaf and reached done while the rest of the command remained open.
+COST: A supposedly automatic command required manual plan reconstruction; the
+  source message gave a false completion signal and work ran in the wrong order.
+FIX: e139be2d adds one attributed, idempotent decomposition transaction. The
+  capture remains the message-linked epic; children require p0-p3 priority,
+  earlier-step dependencies, concrete next actions and a common owner. The drive
+  loop completes the epic when all children are terminal.
+
+## Board create visibly selected an owner and groups, then the server discarded both
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: AMUX-4047
+SYMPTOM: Creating a card in the dashboard with worker amux-testing-e2e and groups
+  selected produced `Not saved: server ignored groups, worker`; AMUX-4047 and
+  AMUX-4048 landed as duplicate, unowned backlog cards with no tags.
+COST: Two junk cards were created during one browser audit, and neither could be
+  driven by the worker the UI showed as selected.
+FIX: e139be2d makes both optimistic state and POST/PATCH payloads use the server's
+  real `session` and `tags` fields, with a static regression check at the wire boundary.
+
+## Opening a fresh board card showed older status, owner and history than the board itself
+AREA: board
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-3
+SYMPTOM: The board list showed ATE-3 done, but its detail view showed To Do or In
+  Progress, owner none, `No status posted yet`, and empty History while Lineage
+  showed 29 events. The detail GET arrived, but hydration refreshed only desc/log.
+COST: The audit had to cross-check list, detail and lineage for every transition;
+  any single surface supported the wrong conclusion.
+FIX: e139be2d refreshes every authoritative detail field when the user has not
+  edited it, and renders one linked view of epic, children, dependencies, source
+  messages, work summary and artifacts.
+
+## Task artifacts existed outside the task's attributed action history
+AREA: attribution
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-2
+SYMPTOM: The structured artifact API existed, but workers had no board CLI verb
+  for it and registering an artifact did not add an attributed action to the task log.
+COST: Files, URLs, commits and screenshots fell back to prose; the task could not
+  answer who attached an asset or expose it as a direct link in detail.
+FIX: e139be2d adds `amux board artifact`, validates artifact kind/state, appends an
+  attributed task-history event, emits a greppable registration log, and returns
+  artifacts in the authoritative task detail response.

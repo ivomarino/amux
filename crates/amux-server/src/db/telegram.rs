@@ -38,6 +38,14 @@ pub struct TelegramMapping {
     /// neither failure mode, since it only changes when the text to send
     /// actually does.
     pub last_relayed_hash: Option<String>,
+    /// What Telegram called this chat at link time: "private", "group", or
+    /// "supergroup" (migration 0054). Drives two group-only rules: only an
+    /// `@lane`-addressed message is delivered (every other group message is
+    /// silently ignored — the noise the group feature was blocked on), and
+    /// `/link` in a group requires the target session already have a
+    /// PRIVATE mapping (see `has_private_link`) — proves whoever links a
+    /// group already controls a private line to that session first.
+    pub chat_type: String,
 }
 
 impl TelegramMapping {
@@ -50,6 +58,10 @@ impl TelegramMapping {
     pub fn routed_session(&self) -> &str {
         self.last_routed_session.as_deref().unwrap_or(&self.session)
     }
+
+    pub fn is_group(&self) -> bool {
+        self.chat_type == "group" || self.chat_type == "supergroup"
+    }
 }
 
 fn row_to_mapping(r: &rusqlite::Row<'_>) -> rusqlite::Result<TelegramMapping> {
@@ -61,11 +73,12 @@ fn row_to_mapping(r: &rusqlite::Row<'_>) -> rusqlite::Result<TelegramMapping> {
         last_message_at: r.get(4)?,
         last_routed_session: r.get(5)?,
         last_relayed_hash: r.get(6)?,
+        chat_type: r.get(7)?,
     })
 }
 
 const COLS: &str = "chat_id, session, telegram_username, linked_at, last_message_at, \
-                     last_routed_session, last_relayed_hash";
+                     last_routed_session, last_relayed_hash, chat_type";
 
 pub fn list(conn: &Connection) -> rusqlite::Result<Vec<TelegramMapping>> {
     let mut stmt =
@@ -103,17 +116,36 @@ pub fn upsert(
     chat_id: i64,
     session: &str,
     telegram_username: Option<&str>,
+    chat_type: &str,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO telegram_mappings (chat_id, session, telegram_username, linked_at)
-         VALUES (?1, ?2, ?3, datetime('now'))
+        "INSERT INTO telegram_mappings (chat_id, session, telegram_username, linked_at, chat_type)
+         VALUES (?1, ?2, ?3, datetime('now'), ?4)
          ON CONFLICT(chat_id) DO UPDATE SET
            session = excluded.session,
            telegram_username = COALESCE(excluded.telegram_username, telegram_mappings.telegram_username),
-           linked_at = datetime('now')",
-        params![chat_id, session, telegram_username],
+           linked_at = datetime('now'),
+           chat_type = excluded.chat_type",
+        params![chat_id, session, telegram_username, chat_type],
     )?;
     Ok(())
+}
+
+/// Does this session already have a PRIVATE-chat mapping? The eligibility
+/// gate for linking a GROUP to it (Ethan, 2026-09-02) — a group link is only
+/// accepted for a session that already has a private one, so pointing a
+/// group at a session first requires controlling a private line to it.
+/// Deliberately independent of `by_session` (which returns the newest
+/// mapping regardless of type, for the outbound-send MVP limitation
+/// documented on it) — this asks "does ANY private row exist", not "is the
+/// newest row private".
+pub fn has_private_link(conn: &Connection, session: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM telegram_mappings WHERE session = ?1 AND chat_type = 'private')",
+        params![session],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n != 0)
 }
 
 /// Stamp which session THIS inbound message actually routed into (migration
@@ -199,4 +231,77 @@ pub fn mark_relay_error(conn: &Connection, chat_id: i64, error: &str) -> rusqlit
         params![error, chat_id],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conn() -> Connection {
+        let mut c = Connection::open_in_memory().unwrap();
+        crate::db::migrate::apply_all(&mut c).unwrap();
+        c
+    }
+
+    #[test]
+    fn upsert_defaults_and_records_chat_type() {
+        let c = conn();
+        upsert(&c, 111, "amux", Some("ivo"), "private").unwrap();
+        let m = by_chat(&c, 111).unwrap().unwrap();
+        assert_eq!(m.chat_type, "private");
+        assert!(!m.is_group());
+
+        upsert(&c, 222, "amux", None, "supergroup").unwrap();
+        let g = by_chat(&c, 222).unwrap().unwrap();
+        assert_eq!(g.chat_type, "supergroup");
+        assert!(g.is_group());
+    }
+
+    /// AMUX group-linking gate: a session with NO private link has
+    /// `has_private_link` false — this is what `link_chat` refuses a group
+    /// link over.
+    #[test]
+    fn has_private_link_false_until_a_private_row_exists() {
+        let c = conn();
+        assert!(!has_private_link(&c, "amux").unwrap());
+
+        upsert(&c, 111, "amux", None, "private").unwrap();
+        assert!(has_private_link(&c, "amux").unwrap());
+    }
+
+    /// A GROUP row alone must not satisfy the gate — the whole point is that
+    /// a private link has to exist FIRST, so `has_private_link` cannot be
+    /// satisfied by the group row it is meant to gate.
+    #[test]
+    fn has_private_link_ignores_group_rows() {
+        let c = conn();
+        upsert(&c, 222, "amux", None, "group").unwrap();
+        assert!(!has_private_link(&c, "amux").unwrap());
+    }
+
+    /// Re-`/link`ing a chat (same chat_id, different session) must not
+    /// silently change its recorded chat_type — the ON CONFLICT arm updates
+    /// `session` unconditionally but `chat_type` should track whatever the
+    /// CALLER passes this time, since a real chat's type cannot change
+    /// between calls (Telegram tells us on every message) and this is the
+    /// same "re-link repoints, doesn't half-update" contract the existing
+    /// session/telegram_username fields already have.
+    #[test]
+    fn relinking_updates_chat_type_too() {
+        let c = conn();
+        upsert(&c, 111, "amux", None, "private").unwrap();
+        upsert(&c, 111, "amux", None, "private").unwrap(); // idempotent re-link
+        let m = by_chat(&c, 111).unwrap().unwrap();
+        assert_eq!(m.chat_type, "private");
+    }
+
+    #[test]
+    fn a_session_can_have_both_a_private_and_a_group_link() {
+        let c = conn();
+        upsert(&c, 111, "amux", None, "private").unwrap();
+        upsert(&c, 222, "amux", None, "supergroup").unwrap();
+        let mut types: Vec<String> = list(&c).unwrap().into_iter().map(|m| m.chat_type).collect();
+        types.sort();
+        assert_eq!(types, vec!["private".to_string(), "supergroup".to_string()]);
+    }
 }

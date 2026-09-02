@@ -216,3 +216,51 @@ fn the_auto_compact_copy_states_the_threshold_the_server_actually_uses() {
         "copy still names 50% while the constant is {pct}: {line}"
     );
 }
+
+#[test]
+fn board_create_uses_the_server_field_names() {
+    let app = asset("app.js");
+    let start = app
+        .find("async function addBoardItem(")
+        .expect("addBoardItem exists");
+    let tail = &app[start..];
+    let end = tail.find("\n}\n").expect("addBoardItem closes") + 3;
+    let body = &tail[..end];
+    assert!(
+        body.contains("session: worker || ''"),
+        "board create must send `session`: {body}"
+    );
+    assert!(
+        body.contains("tags: groups || []"),
+        "board create must send `tags`: {body}"
+    );
+    assert!(
+        !body.contains("worker: worker || ''") && !body.contains("groups: groups || []"),
+        "`worker`/`groups` are UI names, not POST /api/board fields; the server reports them ignored"
+    );
+}
+
+#[test]
+fn board_detail_hydration_refreshes_authoritative_state_and_relations() {
+    let app = asset("app.js");
+    let start = app
+        .find("async function _bdHydrate(")
+        .expect("_bdHydrate exists");
+    let tail = &app[start..];
+    let end = tail
+        .find("\n}\n\nfunction openBoardDetail")
+        .expect("_bdHydrate closes");
+    let body = &tail[..end];
+    for needle in [
+        "boardDetailStatus = full.status",
+        "_populateSessionSelect('bd-session', full.session",
+        "_bdRenderMeta(merged)",
+        "full.due_time",
+        "full.tags",
+    ] {
+        assert!(
+            body.contains(needle),
+            "hydration still leaves `{needle}` stale"
+        );
+    }
+}

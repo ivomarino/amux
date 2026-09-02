@@ -79,7 +79,9 @@ use serde_json::{json, Value};
 
 use crate::api::AppState;
 use crate::db::board_store as bs;
+use crate::db::PendingEvent;
 use amux_core::board::TaskStatus;
+use amux_core::revision::{EntityType, MutationKind};
 
 /// Sweep cadence. Python's level sweep ran every 300s behind an idle EDGE that
 /// fired immediately; with no edge, 300s would mean a lane finishing a turn
@@ -636,6 +638,10 @@ pub struct DriveReport {
     /// (ethos rule 4 — a count that can read zero must publish whether the
     /// measurement ran).
     pub revisit_due_total: usize,
+    /// Epic capture roots completed this tick because every linked child is in
+    /// a terminal state. Without this, the original Messages chip remains
+    /// permanently non-terminal after all of the actual work has finished.
+    pub completed_epics: usize,
     pub lanes: Vec<LaneTrace>,
 }
 
@@ -1928,6 +1934,172 @@ async fn promote_ready_backlog(state: &AppState) -> (usize, usize) {
         }
     }
     (promoted, held_on_trigger)
+}
+
+fn child_terminal_for_epic(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "done" | "verified" | "discarded" | "quarantined"
+    )
+}
+
+fn epic_completion_candidates(conn: &Connection) -> Vec<(String, Vec<(String, String)>)> {
+    let epic_ids = conn
+        .prepare(
+            "SELECT id FROM issues WHERE type='epic' AND deleted IS NULL \
+             AND COALESCE(archived,0)=0 AND status NOT IN ('done','verified','discarded','quarantined') \
+             ORDER BY created,id",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .map(|rows| rows.flatten().collect::<Vec<_>>())
+        })
+        .unwrap_or_default();
+    epic_ids
+        .into_iter()
+        .filter_map(|epic| {
+            let children = conn
+                .prepare(
+                    "SELECT id,status FROM issues WHERE epic=?1 AND deleted IS NULL \
+                     AND COALESCE(archived,0)=0 ORDER BY created,id",
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map(rusqlite::params![epic], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })
+                    .map(|rows| rows.flatten().collect::<Vec<_>>())
+                })
+                .unwrap_or_default();
+            (!children.is_empty()
+                && children
+                    .iter()
+                    .all(|(_, status)| child_terminal_for_epic(status)))
+            .then_some((epic, children))
+        })
+        .collect()
+}
+
+/// Close every prompt-root epic whose children are all terminal. The parent is
+/// the id stored on the original message, so completing it is what makes the
+/// message's task chip report the state of the whole command rather than the
+/// state of whichever leaf happened to be created first.
+async fn complete_finished_epics(state: &AppState) -> usize {
+    let candidates = match state.store.read() {
+        Ok(conn) => epic_completion_candidates(&conn),
+        Err(_) => return 0,
+    };
+    let mut completed = 0;
+    for (epic, observed_children) in candidates {
+        let epic_w = epic.clone();
+        let reply = state
+            .store
+            .write_async(move |conn| {
+                let current = epic_completion_candidates(conn)
+                    .into_iter()
+                    .find(|(id, _)| id == &epic_w);
+                let Some((_, children)) = current else {
+                    return Ok(crate::db::WriteOutcome {
+                        applied: false,
+                        events: vec![],
+                    });
+                };
+                let Some(mut parent) = bs::get_issue(conn, &epic_w)? else {
+                    return Ok(crate::db::WriteOutcome {
+                        applied: false,
+                        events: vec![],
+                    });
+                };
+                let summary = children
+                    .iter()
+                    .map(|(id, status)| format!("{id}={status}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let now = chrono::Utc::now().timestamp();
+                let stamp = chrono::Local::now().format("%H:%M").to_string();
+                parent.evidence = Some(format!("all epic children terminal: {summary}"));
+                parent.last_result = Some(format!("Completed child plan: {summary}"));
+                parent.next_action = None;
+                parent.updated = now;
+                parent.rev += 1;
+                parent.version += 1;
+                parent.log = Some(bs::append_log(
+                    parent.log.as_deref(),
+                    &stamp,
+                    &format!("all child tasks terminal ({summary}); completing epic"),
+                ));
+                bs::save_patched(conn, &mut parent)?;
+                let mut events = vec![PendingEvent {
+                    entity_type: EntityType::Task,
+                    entity_id: parent.id.clone(),
+                    mutation: MutationKind::Updated,
+                    payload: Some(parent.snapshot()),
+                }];
+                let opts = crate::db::advance::AdvanceOpts {
+                    expected_from: Some(parent.status.clone()),
+                    gate_ack: true,
+                    skip_continuation: true,
+                    log_line: Some("status: epic -> done (all children terminal)".into()),
+                    ..Default::default()
+                };
+                match crate::db::advance::advance(conn, &parent.id, "done", "board_drive", &opts)? {
+                    Ok(out) => {
+                        events.extend(out.events);
+                        Ok(crate::db::WriteOutcome {
+                            applied: true,
+                            events,
+                        })
+                    }
+                    Err(_) => Ok(crate::db::WriteOutcome {
+                        applied: false,
+                        events: vec![],
+                    }),
+                }
+            })
+            .await;
+        if matches!(reply, Ok(r) if r.applied) {
+            completed += 1;
+            let children = observed_children
+                .iter()
+                .map(|(id, status)| format!("{id}={status}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            tracing::info!(
+                target: "amux::board_drive",
+                %epic,
+                %children,
+                "board_drive: completed epic — every linked child is terminal"
+            );
+        }
+    }
+    completed
+}
+
+#[cfg(test)]
+mod epic_completion_unit_tests {
+    use super::*;
+
+    #[test]
+    fn epic_completes_only_after_every_child_is_terminal() {
+        let conn = crate::db::migrate::test_memdb();
+        conn.execute_batch(
+            "INSERT INTO issues (id,title,status,type,created,updated,owner_type) \
+             VALUES ('E-1','root','doing','epic',1,1,'agent');
+             INSERT INTO issues (id,title,status,type,epic,created,updated,owner_type) \
+             VALUES ('C-1','one','done','code','E-1',2,2,'agent');
+             INSERT INTO issues (id,title,status,type,epic,created,updated,owner_type) \
+             VALUES ('C-2','two','todo','code','E-1',3,3,'agent');
+             INSERT INTO issues (id,title,status,type,created,updated,owner_type) \
+             VALUES ('E-EMPTY','empty','doing','epic',4,4,'agent');",
+        )
+        .unwrap();
+        assert!(epic_completion_candidates(&conn).is_empty());
+        conn.execute("UPDATE issues SET status='verified' WHERE id='C-2'", [])
+            .unwrap();
+        let got = epic_completion_candidates(&conn);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "E-1");
+        assert_eq!(got[0].1.len(), 2);
+    }
 }
 
 /// The revisit-date arm: promote `backlog` cards whose own due date arrived,
@@ -3382,6 +3554,13 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
         quoted_card_text(&row.title, &row.id),
         qnote
     );
+    prompt.push_str(&format!(
+        "\n\n[worker contract] Post material actions with `amux board status-update {} \
+         --stdin`. Register every file, URL, commit, PR, screenshot or test asset with \
+         `amux board artifact {} <ref>`. Finish this card, then keep driving ready \
+         todo/backlog work until no non-terminal task remains actionable.",
+        row.id, row.id
+    ));
     let full = format!("{}\n{}", row.desc, row.log.clone().unwrap_or_default());
     let full = full.trim();
     let cap = pickup_excerpt_chars();
@@ -3775,8 +3954,9 @@ pub fn select_advance_with(
             "[amux] {card_id} is a capture shell ({why}). Not blocking pickup, but not actionable either.\n\n\
              Not work? `amux board discard {card_id} --outcome-stdin`\n\
              One task? `amux board retitle {card_id} \"<title>\" --desc-stdin`\n\
-             Several? `amux board type {card_id} epic`, `amux board add \"<unit>\"`, \
-             `amux board epic <NEW-ID> {card_id}`"
+             Several? Produce the ordered JSON plan and run \
+             `amux board decompose {card_id} --stdin`. That single write preserves this \
+             message link and requires each child's dependencies, p0-p3 priority, and next action."
         );
         return Advance::Nudge {
             target: session.to_string(),
@@ -4331,6 +4511,9 @@ pub async fn drive_tick<F: Fleet>(state: &AppState, fleet: &F) -> DriveReport {
         started_at: now_f64(),
         ..Default::default()
     };
+    // Complete root epics before dispatch so the Messages chip and the board
+    // agree that a command is finished as soon as all of its leaves are.
+    report.completed_epics = complete_finished_epics(state).await;
     // DRIVE TO VERIFIED, BEFORE DISPATCH. A card parked in `backlog` on a
     // `depends_on` dependency re-activates to `todo` the moment every dependency
     // reaches a terminal status, so a "do B after A" command completes instead
@@ -7888,8 +8071,15 @@ mod tests {
         // behaviour — and the sibling test one screen down had already learned
         // it: "a wording rewrite must be free; an exit losing its command must
         // not be" (AMUX-3707).
-        for cmd in ["amux board discard", "amux board retitle", "amux board type"] {
-            assert!(text.contains(cmd), "the ask must still reach its exit `{cmd}`: {text}");
+        for cmd in [
+            "amux board discard",
+            "amux board retitle",
+            "amux board decompose",
+        ] {
+            assert!(
+                text.contains(cmd),
+                "the ask must still reach its exit `{cmd}`: {text}"
+            );
         }
     }
 
@@ -8654,7 +8844,11 @@ mod tests {
                 // while the epic exit it was guarding named no command at all,
                 // because `amux board epic` did not exist (AMUX-3707). A wording
                 // rewrite must be free; an exit losing its command must not be.
-                for cmd in ["amux board discard", "amux board type", "amux board epic"] {
+                for cmd in [
+                    "amux board discard",
+                    "amux board retitle",
+                    "amux board decompose",
+                ] {
                     assert!(
                         text.contains(cmd),
                         "the decompose ask must reach its exit with `{cmd}`: {text}"

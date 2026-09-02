@@ -176,6 +176,138 @@ async fn create_list_detail_lifecycle() {
     assert_eq!(v["creator"], json!("orch"));
 }
 
+#[tokio::test]
+async fn capture_decomposition_is_atomic_ordered_and_keeps_the_message_on_the_epic() {
+    let (app, store, _dir) = app_with_store();
+    store
+        .write(|conn| {
+            conn.execute(
+                "INSERT INTO issues \
+                 (id,title,desc,status,session,type,creator,owner_type,source,created,updated) \
+                 VALUES ('ATE-1','Captured request','**Prompt:** build and verify it', \
+                         'doing','amux-testing-e2e','code','amux','agent','capture',1,1)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO cmd_history (id,text,type,session,ts,origin,card_id) \
+                 VALUES (39225,'build and verify it','user','amux-testing-e2e',1000,'browser','ATE-1')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO issue_counters (prefix,next_n) VALUES ('ATE',2)",
+                [],
+            )?;
+            Ok(amux_server::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .unwrap();
+
+    let plan = json!({"tasks":[
+        {"title":"Implement the change","description":"Build the requested behavior.",
+         "type":"code","priority":0,"depends_on":[],"next_action":"Implement the requested behavior"},
+        {"title":"Verify the change","description":"Exercise the complete flow.",
+         "type":"investigation","priority":1,"depends_on":[1],"next_action":"Run the end to end verification"},
+        {"title":"Document the result","description":"Record the verified outcome.",
+         "type":"doc","priority":2,"depends_on":[2],"next_action":"Write the final result summary"}
+    ]});
+    let (st, _, made) = send_with(
+        &app,
+        "POST",
+        "/api/board/ATE-1/decompose",
+        Some(plan.clone()),
+        &[("X-Amux-Worker", "amux-testing-e2e")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{made}");
+    assert_eq!(made["epic"]["type"], json!("epic"));
+    let tasks = made["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 3);
+    assert_eq!(tasks[0]["status"], json!("todo"));
+    assert_eq!(tasks[1]["status"], json!("backlog"));
+    assert_eq!(tasks[1]["depends_on"], json!([tasks[0]["id"].clone()]));
+    assert_eq!(tasks[2]["depends_on"], json!([tasks[1]["id"].clone()]));
+    assert_eq!(tasks[0]["tags"], json!(["p0"]));
+    assert_eq!(tasks[1]["epic"], json!("ATE-1"));
+    assert_eq!(tasks[0]["session"], json!("amux-testing-e2e"));
+
+    let (st, _, detail) = send(&app, "GET", "/api/board/ATE-1", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(detail["children"].as_array().unwrap().len(), 3);
+    assert_eq!(detail["messages"][0]["id"], json!(39225));
+    assert_eq!(detail["messages"][0]["card_id"], json!("ATE-1"));
+
+    let first_id = tasks[0]["id"].as_str().unwrap();
+    let (st, _, artifact) = send(
+        &app,
+        "POST",
+        &format!("/api/board/{first_id}/artifacts"),
+        Some(json!({"kind":"implementation","ref":"/tmp/result.md","state":"created"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{artifact}");
+    let (_, _, child_detail) = send(&app, "GET", &format!("/api/board/{first_id}"), None).await;
+    assert_eq!(child_detail["epic"], json!("ATE-1"));
+    assert_eq!(child_detail["messages"][0]["id"], json!(39225));
+    assert_eq!(child_detail["artifacts"][0]["ref"], json!("/tmp/result.md"));
+    assert!(
+        child_detail["log"].as_str().unwrap().contains("artifact (api-anonymous): implementation/created /tmp/result.md"),
+        "artifact registration must be part of the task action history: {child_detail}"
+    );
+
+    // A retry is idempotent: it reports the existing plan instead of minting
+    // a second set of leaves after a client loses the first response.
+    let (st, _, retried) = send_with(
+        &app,
+        "POST",
+        "/api/board/ATE-1/decompose",
+        Some(plan),
+        &[("X-Amux-Worker", "amux-testing-e2e")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(retried["idempotent"], json!(true));
+    assert_eq!(retried["tasks"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn invalid_decomposition_creates_no_partial_children() {
+    let (app, store, _dir) = app_with_store();
+    store
+        .write(|conn| {
+            conn.execute(
+                "INSERT INTO issues \
+                 (id,title,desc,status,session,type,creator,owner_type,source,created,updated) \
+                 VALUES ('ATE-9','Captured request','**Prompt:** bad plan','doing','lane', \
+                         'code','amux','agent','capture',1,1)",
+                [],
+            )?;
+            Ok(amux_server::db::WriteOutcome {
+                applied: true,
+                events: vec![],
+            })
+        })
+        .unwrap();
+    let (st, _, body) = send_with(
+        &app,
+        "POST",
+        "/api/board/ATE-9/decompose",
+        Some(json!({"tasks":[
+            {"title":"First","priority":0,"depends_on":[],"next_action":"Implement the first step"},
+            {"title":"Second","priority":1,"depends_on":[2],"next_action":"Implement the second step"}
+        ]})),
+        &[("X-Amux-Worker", "lane")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    let children: i64 = store
+        .read()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM issues WHERE epic='ATE-9'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(children, 0);
+}
+
 // ---- List payload shapes: slim by default, prose on request --------------
 //
 // History, because this contract moved TWICE and each move was deliberate.
