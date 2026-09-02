@@ -1339,6 +1339,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // scanned only api/mod.rs's own .route() calls.
     RouteEntry { path: "/api/board/contract", methods: &["GET"] },
     RouteEntry { path: "/api/board/ready", methods: &["GET"] },
+    RouteEntry { path: "/api/board/bulk-migrate", methods: &["POST"] },
     RouteEntry { path: "/api/board/needsyou", methods: &["GET"] },
     RouteEntry { path: "/api/schedules/{id}/skip", methods: &["POST"] },
     RouteEntry { path: "/api/search", methods: &["GET"] },

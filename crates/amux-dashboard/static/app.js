@@ -8428,7 +8428,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.776';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.777';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -24744,6 +24744,93 @@ function renderBoardFilters() {
 // Bound on the shared `_issueRowHTML` as well as the kanban card, because that
 // renderer already exists so the List view and the peek Board tab cannot drift
 // from each other — the same argument its own comment makes.
+// COLUMN ACTIONS (Ethan, 2026-09-02: "add a button on board view at a column
+// make an ellipse button and in that ellipse migrate all then a seperate
+// column, with a confirmation").
+//
+// Only UNGATED targets are offered. `doing`, `review`, `done` and `verified`
+// each carry a checklist a human answers per card; one click that moved 489
+// backlog cards into `verified` would assert all four of its criteria about
+// work nobody opened, which is the claim AF-321 exists to refuse. Gated columns
+// are still LISTED, disabled, with the reason — leaving them out entirely would
+// read as a missing feature rather than a deliberate refusal, and the server
+// enforces the same rule anyway (409, not a silent no-op).
+function _colMenuClose() {
+  const m = document.getElementById('board-col-menu');
+  if (m) m.remove();
+}
+function _colMenu(e, st) {
+  e.preventDefault();
+  e.stopPropagation();
+  _colMenuClose();
+  const from = boardStatuses.find(x => x.id === st);
+  const n = _colCardCount(st);
+  let h = '<div class="card-menu-item" style="cursor:default;opacity:0.75;">'
+    + esc((from && from.label) || st) + ' &middot; ' + n + ' card' + (n === 1 ? '' : 's')
+    + '</div><div class="card-menu-sep"></div>';
+  boardStatuses.forEach(t => {
+    if (t.id === st) return;
+    const gated = Array.isArray(t.gate) && t.gate.length;
+    if (gated) {
+      h += '<div class="card-menu-item" style="cursor:not-allowed;opacity:0.45;" '
+        + 'title="' + esc(t.label) + ' has a ' + t.gate.length + '-item gate. A gate is a '
+        + 'per-card claim, so it cannot be answered once for a whole column. Move these '
+        + 'individually.">&#128274; Migrate all to ' + esc(t.label) + '</div>';
+    } else {
+      h += '<div class="card-menu-item" onclick="event.stopPropagation();_colMigrateAll(\''
+        + escJs(st) + '\',\'' + escJs(t.id) + '\')">&#8594; Migrate all to '
+        + esc(t.label) + '</div>';
+    }
+  });
+  const m = document.createElement('div');
+  m.className = 'card-menu open';
+  m.id = 'board-col-menu';
+  m.innerHTML = h;
+  document.body.appendChild(m);
+  const r = m.getBoundingClientRect();
+  m.style.left = Math.max(6, Math.min(e.clientX, window.innerWidth - r.width - 6)) + 'px';
+  m.style.top = Math.max(6, Math.min(e.clientY, window.innerHeight - r.height - 6)) + 'px';
+  return false;
+}
+// The SAME canon `deleteBoardStatus` counts with, so the number in the dialog
+// matches the number on the column header you just clicked.
+function _colCardCount(st) {
+  return (typeof boardItems !== 'undefined' ? boardItems : [])
+    .filter(i => !i.archived && !i.deleted && _statusCanon(i.status) === st).length;
+}
+async function _colMigrateAll(from, to) {
+  _colMenuClose();
+  const n = _colCardCount(from);
+  const fl = (boardStatuses.find(x => x.id === from) || {}).label || from;
+  const tl = (boardStatuses.find(x => x.id === to) || {}).label || to;
+  if (!n) { showToast('"' + fl + '" has no cards to migrate'); return; }
+  // SAY HOW MANY, and say it is not undoable in one action — the same rule
+  // AMUX-2491 set for the column delete dialog. The count is the decision.
+  if (!confirm('Migrate all ' + n + ' card' + (n === 1 ? '' : 's') + ' from "' + fl
+      + '" to "' + tl + '"?\n\nEach move is recorded on the card, but there is no single '
+      + 'undo — reversing this means migrating them back.')) return;
+  try {
+    const r = await fetch(API + '/api/board/bulk-migrate', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, _authHeaders()),
+      body: JSON.stringify({ from: from, to: to }),
+    });
+    const d = await r.json();
+    if (!r.ok) { showToast('Migrate refused: ' + (d.error || ('HTTP ' + r.status))); return; }
+    // REPORT THE REFUSALS, not just the successes. "moved 480" over a column of
+    // 489 leaves nine cards unexplained, and the caller cannot tell which.
+    const ref = (d.refused || []).length;
+    showToast('Moved ' + d.moved + ' of ' + d.considered + ' to "' + tl + '"'
+      + (ref ? ' — ' + ref + ' refused (see console)' : ''));
+    if (ref) console.warn('[bulk-migrate] refused:', d.refused);
+    await fetchBoard();
+    renderBoard();
+  } catch (e) {
+    showToast('Migrate failed: ' + e.message);
+  }
+}
+document.addEventListener('click', () => _colMenuClose());
+
 let _boardCtxId = null;
 function _boardCtxClose() {
   const m = document.getElementById('board-ctx-menu');
@@ -25136,6 +25223,9 @@ function _renderBoardColumnsInto(host, items, scope) {
     if (isGlobal && !stObj.stray) {
       const _hasGate = Array.isArray(stObj.gate) && stObj.gate.length;
       html += '<button class="col-gate-btn' + (_hasGate ? ' has-gate' : '') + '" onclick="event.stopPropagation();editStatusGate(\'' + st + '\')" title="Edit gate checklist for this column">&#9745;&#xFE0E; Gate</button>';
+      // MIGRATE-ALL lives here, beside Gate and delete, because it is the same
+      // class of control: it acts on the COLUMN, not on a card (AMUX-4044).
+      html += '<button class="col-more-btn" onclick="event.stopPropagation();_colMenu(event,\'' + st + '\')" title="Column actions">&#x22EF;</button>';
       if (!builtIn.has(st)) {
         // TRASH, NOT ✕ (AMUX-2491): the delete affordance must not look like
         // the app's 43 consequence-free dismiss ✕s — the glyph carries the
