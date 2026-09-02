@@ -502,18 +502,16 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     // exclude or admit the wrong rows. Verified against 174 live rows: 0 with
     // boot_at > ts, and the magnitude is 1.78e9 (seconds), not 1.78e12.
     ("_amux_request_log", "boot_at", false),
-    // AMUX-3947's task-artifacts table (migration 0046). SECONDS, measured
-    // from the write site: api/board.rs's create-artifact handler stamps
-    // `chrono::Utc::now().timestamp()` into both columns. Filed as
-    // AMUX-81/AMUX-72/AMUX-73 — the migration and this declaration landed in
-    // different commits, same shape as every other entry below with that
-    // exact same explanation.
-    ("_amux_task_artifacts", "created_at", false),
-    ("_amux_task_artifacts", "updated_at", false),
-    // AMUX-3947's verification-runs table (migration 0044). SECONDS, measured
-    // from api/verify.rs's write site: `chrono::Utc::now().timestamp()`.
-    // Filed as AMUX-81/AMUX-74, same shape.
-    ("_amux_verifications", "created_at", false),
+    // _amux_task_artifacts.{created_at,updated_at} and
+    // _amux_verifications.created_at (AMUX-3947, migrations 0044/0046; filed
+    // as AMUX-81/AMUX-72/AMUX-73/AMUX-74 — the migrations and this
+    // declaration landed in different commits) are declared just above,
+    // right after the "AMUX-3974's two tables" comment -- a merge brought in
+    // two independent additions of the same three columns, caught by this
+    // test's own duplicate check (caught by CI on this merge, 2026-09-02).
+    // Consolidated to the one
+    // declaration; the file:line writer citations there are the fuller of
+    // the two explanations.
     // AF-319's nudge feedback state. SECONDS: written from `now_f64()` in
     // `drive_lane`, the same clock every other board_drive timestamp uses.
     // Declared the hour it shipped, because this invariant caught it — the
