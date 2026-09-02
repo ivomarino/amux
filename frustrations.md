@@ -3414,3 +3414,50 @@ FIX: Atomicity is defensible and I am not asking for a partial write. Say so in 
   a multi-part operation and is read as describing all of them. Three entries under
   `AREA: silent-partial` is the argument that compound operations need a uniform
   per-field outcome, not a per-operation verdict.
+
+---
+
+## An archived entry came back through a merge, read as open, and got re-diagnosed from scratch
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-frustrations
+CARD: AF-417
+SYMPTOM: I picked "A shared CARGO_TARGET_DIR is mandated..." out of the ledger as `STATUS:
+  open`, spent ~40 minutes diagnosing it from the builder log and git history, and reached
+  the disk-guard `rm -rf` with no in-flight check. Correct. It was also already archived on
+  2026-08-29 (53cafb92) with a VALIDATED line by the same session recording the SAME
+  conclusion, including cargo GC already ruled out on the same grounds. I only found out
+  because the archive then held two copies of the title and I went looking.
+  THE MECHANISM IS THE FILE, NOT THE READER. An archive move is a DELETION from
+  frustrations.md, and this file is merged across divergent branches. Counting copies at
+  each commit shows it oscillate: 53cafb92 correctly removed it; 7dbab8f6, a human "sync
+  frustrations.md to fork's current copy before push", put it back; merges 4216504b and
+  09dd5024 from feature/telegram-connector carried it onto main. A resurrected entry is
+  BYTE-IDENTICAL to a never-retired one — it reads open, its own FIX text still says the
+  work is undone, and the sign-off lives in a different file nobody greps before starting.
+  `git log -S` did not find the reintroduction either; only counting copies per commit did,
+  because the pickaxe follows one line of history and the resurrection came across a merge.
+COST: ~40 minutes re-deriving a retired conclusion, and it nearly cost more: I wrote the
+  result onto the wrong card (the entry's `CARD: AMUX-2936` is itself a mis-link — that card
+  is about the staged-file absorption window) and presented it as a new finding before
+  catching it. Two independent derivations agreeing is reassuring about the ANSWER and says
+  nothing good about the process. The general cost is worse than the minutes: every entry in
+  this ledger is a claim that work is outstanding, and a resurrected one is a false claim
+  that no reader can distinguish from a true one.
+FIX: 80bff64b + this commit. `scripts/frustrations-archive.py` now checks, at the moment it
+  writes, whether the title is ALREADY in frustrations-archive.md, and if so prints the
+  count of prior copies, the reason resurrection happens, and the grep that surfaces the
+  earlier VALIDATED line.
+  A WARNING, NOT A REFUSAL, deliberately. A friction can genuinely recur and be honestly
+  re-logged and re-retired under one title; refusing would be a gate with no truthful path
+  for that case (ethos rule 3). So it archives and says what it noticed.
+  `.claude/rules/frustrations.md` already warns about the mirror direction — do not
+  re-append something that merely LOOKS lost, grep the archive first, creative-dna measured
+  15 of 15 "lost" entries as archive moves. That rule asks a human to remember. This is the
+  same check run by the tool that has both files open anyway, which is rule 1: the guidance
+  existed and did not reach the moment it was needed.
+  VERIFIED by two cells against a fixture: a resurrected title warns and names 2 prior
+  copies; a novel title is SILENT and still archives. The control is the half that matters,
+  since a detector that fired on every archive would be worth nothing.

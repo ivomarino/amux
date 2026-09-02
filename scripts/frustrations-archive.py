@@ -307,6 +307,52 @@ def main():
     if not ARCHIVE.exists():
         ARCHIVE.write_text(ARCHIVE_HEADER)
     arch = ARCHIVE.read_text().rstrip("\n")
+
+    # AF-417: IS THIS TITLE ALREADY ARCHIVED?
+    #
+    # An archive move is a DELETION from frustrations.md, and this file is
+    # merged across divergent branches. So any merge from a side that predates
+    # the archive RESURRECTS the entry, at STATUS: open, with no trace that it
+    # was ever retired. Nothing downstream can tell a resurrected entry from a
+    # new one: it reads open, its text still says the work is undone, and the
+    # archive is a separate file nobody greps before starting.
+    #
+    # MEASURED. "A shared CARGO_TARGET_DIR is mandated..." was archived
+    # 2026-08-29 in 53cafb92, which correctly removed it from the ledger. A
+    # human sync commit (7dbab8f6, "sync frustrations.md to fork's current
+    # copy") put it back, and two merges from feature/telegram-connector
+    # (4216504b, 09dd5024) carried it onto main. On 2026-09-02 it was picked up
+    # as open and re-diagnosed from scratch -- ~40 minutes reaching, correctly,
+    # the SAME conclusion the 2026-08-29 VALIDATED line already recorded: the
+    # builder's disk-pressure `rm -rf` with no in-flight check, cargo GC ruled
+    # out. Two independent derivations agreeing is reassuring about the answer
+    # and says nothing good about the process.
+    #
+    # `.claude/rules/frustrations.md` already warns about this in the other
+    # direction -- do not re-append something that merely LOOKS lost, grep the
+    # archive first, creative-dna measured 15 of 15 "lost" entries as archive
+    # moves. That rule asks a human to remember. This is the same check, run by
+    # the tool that has both files open anyway.
+    #
+    # A WARNING, NOT A REFUSAL. A genuine recurrence is legitimate: a friction
+    # can return, and its entry may honestly be re-logged and re-retired under
+    # the same title. Refusing would be a gate with no truthful path (ethos rule
+    # 3) for that case. So it archives, and says loudly what it just noticed --
+    # the reader can see the prior sign-off and decide whether they have
+    # re-derived it or genuinely re-hit it.
+    prior = [l for l in arch.splitlines() if l.strip() == body[0].strip()]
+    if prior:
+        sys.stderr.write(
+            f"\nWARNING: this title is ALREADY in {ARCHIVE.name} "
+            f"({len(prior)} prior copy/copies).\n"
+            "  An archive move is a deletion, and this file merges across branches, so an\n"
+            "  entry retired once can be resurrected by a merge from a side that predates\n"
+            "  the archive -- resurfacing at STATUS: open with its prior sign-off invisible.\n"
+            "  Before trusting the work you just did: read the earlier VALIDATED line.\n"
+            f"  grep -n -A3 {body[0].strip()[:48]!r} {ARCHIVE.name}\n"
+            "  If it already answers this entry, you re-derived a retired conclusion and\n"
+            "  the finding is the resurrection, not the diagnosis (AF-417).\n\n")
+
     ARCHIVE.write_text(arch + "\n\n" + "\n".join(stamped) + "\n")
 
     # Carry BEFORE the ledger write, so a crash between the two leaves the entry
