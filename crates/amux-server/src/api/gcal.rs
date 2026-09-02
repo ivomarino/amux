@@ -1,13 +1,31 @@
-//! Google Calendar API endpoints (Phase 3)
+//! Google Calendar API endpoints.
 //!
-//! Multi-account Google Calendar sync via existing OAuth grants
-//! in ~/.amux/connectors/google/<email>.json. Unified iCal feed
-//! across every connected account.
+//! Deliberately narrow: read + create, no local mirror. Reuses the existing
+//! per-account Gmail OAuth grants in ~/.amux/connectors/google/<email>.json
+//! (same as gmail_auth.rs) rather than minting a second credential flow.
+//!
+//! Scoped down from an earlier, wider draft that pulled+STORED every event
+//! locally (a second `calendar_events` table) on a periodic sync job, and
+//! published a second `/api/gcal/unified.ics` feed alongside amux's existing
+//! one-way `/api/calendar.ics` (source of truth: amux; Google/Apple
+//! subscribe to it). That shape meant Google became a read/write peer that
+//! could delete events amux itself created — a real ownership question, not
+//! a review nitpick. This version sidesteps it entirely: `list_events` is a
+//! LIVE READ-THROUGH (calls Google's API on every request, stores nothing),
+//! and `create_event` is a thin, stateless write-through (calls Google's API
+//! directly). Neither ever writes an event into amux's own DB, so there is
+//! nothing to reconcile, nothing for a sync job to prune, and no second
+//! calendar competing with the existing one.
+//!
+//! Cost of that: no local cache means every `GET /events` is a live round
+//! trip to Google (typically 1-3 calendars, well under the account's own
+//! rate limit for a dashboard-refresh cadence) rather than a DB read. Worth
+//! it for the ownership property; revisit only if latency becomes a real
+//! complaint, not preemptively.
 
 use axum::{
     extract::{Query, State},
     http::StatusCode,
-    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
@@ -20,11 +38,6 @@ pub fn routes() -> Router<AppState> {
         .route("/accounts", get(list_accounts))
         .route("/events", get(list_events))
         .route("/events", post(create_event))
-        .route("/events/{event_id}", axum::routing::put(update_event))
-        .route("/events/{event_id}", axum::routing::delete(delete_event))
-        .route("/status", get(sync_status))
-        .route("/sync", post(trigger_sync))
-        .route("/unified.ics", get(unified_ical))
 }
 
 #[derive(Serialize)]
@@ -38,18 +51,10 @@ pub struct EventsResponse {
     total: usize,
 }
 
-#[derive(Serialize)]
-pub struct SyncStatusResponse {
-    account_id: String,
-    status: String,
-    event_count: i32,
-    last_sync: Option<String>,
-    /// From `calendar_sync_metadata` (populated at boot by calendar_init) —
-    /// who this sync belongs to and why, if that was ever set. `None` when
-    /// there's no metadata row for the account yet, not on any query error;
-    /// a missing owner/purpose is not worth failing the whole status call.
-    owner: Option<String>,
-    purpose: Option<String>,
+#[derive(Deserialize)]
+pub struct EventsQuery {
+    /// Filter to one connected account; omit for every connected account.
+    account_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -69,28 +74,8 @@ pub struct CreateEventResponse {
     message: String,
 }
 
-#[derive(Deserialize)]
-pub struct UpdateEventRequest {
-    title: Option<String>,
-    description: Option<String>,
-    start_time: Option<String>,
-    end_time: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct SyncRequest {
-    account_id: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct SyncResponse {
-    synced: Vec<String>,
-    failed: Vec<(String, String)>,
-    total_events: i32,
-}
-
 /// GET /api/gcal/accounts
-/// List all configured Google Calendar accounts with sync status
+/// List connected Google Calendar accounts (which OAuth grants exist).
 pub async fn list_accounts(
     State(state): State<AppState>,
 ) -> Result<Json<AccountResponse>, (StatusCode, String)> {
@@ -106,35 +91,58 @@ pub async fn list_accounts(
 }
 
 /// GET /api/gcal/events
-/// List synced Google Calendar events
-#[derive(Deserialize)]
-pub struct EventsQuery {
-    account_id: Option<String>,
-}
-
+/// Live read-through: fetches events directly from Google's Calendar API
+/// for the given account (or every connected account if none is given).
+/// Nothing here is stored in amux's own DB -- see this file's own header.
 pub async fn list_events(
     State(state): State<AppState>,
     Query(q): Query<EventsQuery>,
 ) -> Result<Json<EventsResponse>, (StatusCode, String)> {
-    let conn = state
-        .store
-        .read()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let accounts = {
+        let conn = state
+            .store
+            .read()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let events = if let Some(account_id) = q.account_id {
-        calendar::get_events_for_account(&conn, &account_id, None, None)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    } else {
-        calendar::get_all_events(&conn)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        match &q.account_id {
+            Some(id) => vec![calendar::get_account(&conn, id)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                .ok_or_else(|| (StatusCode::NOT_FOUND, "Account not found".to_string()))?],
+            None => calendar::get_accounts(&conn)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+        }
     };
 
+    let mut events = Vec::new();
+    for account in &accounts {
+        let oauth_token =
+            match crate::integrations::gcal_sync::load_refresh_token(&account.id, &account.email) {
+                Ok(t) => t,
+                // One account's missing/expired grant shouldn't 401 the
+                // whole multi-account list -- skip it, the caller still
+                // gets every account that DOES have a usable token.
+                Err(e) => {
+                    tracing::warn!(account = %account.id, error = %e, "gcal list_events: skipping account, no usable OAuth token");
+                    continue;
+                }
+            };
+
+        match crate::integrations::gcal_sync::fetch_calendar_events(&oauth_token, &account.id).await {
+            Ok(mut acc_events) => events.append(&mut acc_events),
+            Err(e) => {
+                tracing::warn!(account = %account.id, error = %e, "gcal list_events: fetch failed for account");
+            }
+        }
+    }
+
+    events.sort_by(|a, b| a.start_time.cmp(&b.start_time));
     let total = events.len();
     Ok(Json(EventsResponse { events, total }))
 }
 
 /// POST /api/gcal/events
-/// Create a new Google Calendar event with optional attendees/invites
+/// Create a new Google Calendar event with optional attendees/invites.
+/// Writes straight through to Google's API; amux stores nothing about it.
 pub async fn create_event(
     State(state): State<AppState>,
     Json(req): Json<CreateEventRequest>,
@@ -171,268 +179,4 @@ pub async fn create_event(
         event_id: event_id.clone(),
         message: format!("Event created successfully. ID: {}", event_id),
     }))
-}
-
-/// PUT /api/gcal/events/:event_id
-/// Update an existing Google Calendar event
-pub async fn update_event(
-    State(state): State<AppState>,
-    axum::extract::Path(event_id): axum::extract::Path<String>,
-    Json(req): Json<UpdateEventRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let conn = state
-        .store
-        .read()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let events = calendar::get_all_events(&conn)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let event = events
-        .iter()
-        .find(|e| e.id.contains(&event_id))
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "Event not found".to_string()))?;
-
-    let account = calendar::get_account(&conn, &event.account_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "Account not found".to_string()))?;
-
-    // Load OAuth token for this account
-    let oauth_token = crate::integrations::gcal_sync::load_refresh_token(&account.id, &account.email)
-        .map_err(|e| (StatusCode::UNAUTHORIZED, format!("Failed to load OAuth token: {}", e)))?;
-
-    crate::integrations::gcal_sync::update_calendar_event(
-        &oauth_token,
-        &event.calendar_id,
-        &event.event_id,
-        req.title.as_deref(),
-        req.description.as_deref(),
-        req.start_time.as_deref(),
-        req.end_time.as_deref(),
-    )
-    .await
-    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-
-    Ok(Json(serde_json::json!({
-        "message": "Event updated successfully",
-        "event_id": event_id
-    })))
-}
-
-/// DELETE /api/gcal/events/:event_id
-/// Delete a Google Calendar event
-pub async fn delete_event(
-    State(state): State<AppState>,
-    axum::extract::Path(event_id): axum::extract::Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let conn = state
-        .store
-        .read()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let events = calendar::get_all_events(&conn)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let event = events
-        .iter()
-        .find(|e| e.id.contains(&event_id))
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "Event not found".to_string()))?;
-
-    let account = calendar::get_account(&conn, &event.account_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "Account not found".to_string()))?;
-
-    // Load OAuth token for this account
-    let oauth_token = crate::integrations::gcal_sync::load_refresh_token(&account.id, &account.email)
-        .map_err(|e| (StatusCode::UNAUTHORIZED, format!("Failed to load OAuth token: {}", e)))?;
-
-    crate::integrations::gcal_sync::delete_calendar_event(
-        &oauth_token,
-        &event.calendar_id,
-        &event.event_id,
-    )
-    .await
-    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-
-    Ok(Json(serde_json::json!({
-        "message": "Event deleted successfully",
-        "event_id": event_id
-    })))
-}
-
-/// GET /api/gcal/status
-/// Get current sync status for all accounts
-pub async fn sync_status(
-    State(state): State<AppState>,
-) -> Result<Json<Vec<SyncStatusResponse>>, (StatusCode, String)> {
-    let conn = state
-        .store
-        .read()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let accounts = calendar::get_accounts(&conn)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let mut responses = Vec::with_capacity(accounts.len());
-    for acc in accounts {
-        // Best-effort: a metadata query failure or missing row degrades to
-        // owner/purpose: None rather than failing the whole status list —
-        // sync_status/event_count/last_sync (the fields this endpoint
-        // existed for) come from `acc` regardless of this lookup.
-        let (owner, purpose) = calendar::get_sync_metadata(&conn, &acc.id)
-            .ok()
-            .flatten()
-            .map(|m| (Some(m.owner), Some(m.purpose)))
-            .unwrap_or((None, None));
-        responses.push(SyncStatusResponse {
-            account_id: acc.id.clone(),
-            status: acc.sync_status.clone(),
-            event_count: acc.event_count,
-            last_sync: acc.synced_at.clone(),
-            owner,
-            purpose,
-        });
-    }
-
-    Ok(Json(responses))
-}
-
-/// POST /api/gcal/sync
-/// Trigger manual sync of calendar events from Google Calendar API
-/// Requires auth token
-pub async fn trigger_sync(
-    State(state): State<AppState>,
-    body: Option<Json<SyncRequest>>,
-) -> Result<Json<SyncResponse>, (StatusCode, String)> {
-    // Verify auth token (optional for now, will implement full auth later)
-    if state.auth_token.is_none() {
-        return Err((StatusCode::UNAUTHORIZED, "auth required".to_string()));
-    }
-
-    let accounts = {
-        let conn = state
-            .store
-            .read()
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        calendar::get_accounts(&conn)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    };
-
-    let filter_id = body.as_ref().and_then(|b| b.account_id.clone());
-
-    let mut synced = Vec::new();
-    let mut failed = Vec::new();
-
-    for account in &accounts {
-        if let Some(ref id) = filter_id {
-            if account.id != *id {
-                continue;
-            }
-        }
-
-        // Runs the same fetch-from-Google + store-in-SQLite logic as the
-        // 15-minute background job (crate::runtime_jobs::gcal_sync_job) —
-        // this used to be a stub that only echoed back event_count already
-        // in the DB, so a manual sync never actually talked to Google.
-        match crate::runtime_jobs::gcal_sync_job::sync_account(&state.store, &account.id, &account.email).await {
-            Ok(()) => synced.push(account.id.clone()),
-            Err(e) => failed.push((account.id.clone(), e.to_string())),
-        }
-    }
-
-    let total_events = {
-        let conn = state
-            .store
-            .read()
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        calendar::get_accounts(&conn)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .iter()
-            .map(|a| a.event_count)
-            .sum()
-    };
-
-    Ok(Json(SyncResponse {
-        synced,
-        failed,
-        total_events,
-    }))
-}
-
-/// GET /api/gcal/unified.ics
-/// Unified iCal feed from all Google Calendar accounts (Phase 4)
-/// Bearer token gated for future access control
-pub async fn unified_ical(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
-    let conn = match state.store.read() {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
-
-    let events = match calendar::get_all_events(&conn) {
-        Ok(e) => e,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
-
-    let mut ical = String::new();
-    ical.push_str("BEGIN:VCALENDAR\r\n");
-    ical.push_str("VERSION:2.0\r\n");
-    ical.push_str("PRODID:-//amux//Google Calendar sync//EN\r\n");
-    ical.push_str("CALSCALE:GREGORIAN\r\n");
-    ical.push_str("METHOD:PUBLISH\r\n");
-    ical.push_str("X-WR-CALNAME:amux - Google Calendars (unified)\r\n");
-    ical.push_str("X-WR-CALDESC:Unified feed from all connected Google accounts\r\n");
-    ical.push_str("REFRESH-INTERVAL;VALUE=DURATION:PT15M\r\n");
-    ical.push_str("X-PUBLISHED-TTL:PT15M\r\n");
-
-    for event in events {
-        ical.push_str("BEGIN:VEVENT\r\n");
-        ical.push_str(&format!("UID:{}@amux.local\r\n", event.id));
-        ical.push_str(&format!(
-            "DTSTAMP:{}\r\n",
-            chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
-        ));
-        ical.push_str(&format!(
-            "SUMMARY:{}\r\n",
-            event.title.replace(['\n', '\r'], " ")
-        ));
-
-        if let Some(desc) = event.description {
-            ical.push_str(&format!(
-                "DESCRIPTION:{}\r\n",
-                desc.replace(['\n', '\r'], " ")
-            ));
-        }
-
-        if let Some(start) = event.start_time {
-            ical.push_str(&format!("DTSTART:{}\r\n", start));
-        }
-        if let Some(end) = event.end_time {
-            ical.push_str(&format!("DTEND:{}\r\n", end));
-        }
-
-        if let Some(location) = event.location {
-            ical.push_str(&format!(
-                "LOCATION:{}\r\n",
-                location.replace(['\n', '\r'], " ")
-            ));
-        }
-
-        ical.push_str(&format!("STATUS:{}\r\n", event.status.to_uppercase()));
-        ical.push_str("TRANSP:OPAQUE\r\n");
-        ical.push_str("END:VEVENT\r\n");
-    }
-
-    ical.push_str("END:VCALENDAR\r\n");
-
-    (
-        StatusCode::OK,
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/calendar; charset=utf-8",
-        )],
-        ical,
-    )
-        .into_response()
 }

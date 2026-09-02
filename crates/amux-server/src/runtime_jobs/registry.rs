@@ -101,7 +101,6 @@ pub mod ids {
     pub const SELF_ADOPT: &str = "self-adoption";
     pub const TUNNEL: &str = "tunnel-relay";
     pub const BROWSER_REAPER: &str = "browser-idle-reaper";
-    pub const GCAL_SYNC: &str = "gcal-sync";
     // The PeriodicTask ids below are NOT referenced by any spawn site — they
     // register themselves through `spawn_periodic_every` under the name their
     // own module passes. They are listed here only so CATALOG rows and tests
@@ -138,7 +137,6 @@ pub const ALL_IDS: &[&str] = &[
     ids::SELF_ADOPT,
     ids::TUNNEL,
     ids::BROWSER_REAPER,
-    ids::GCAL_SYNC,
     ids::AUTOFIX,
     ids::BOARD_DRIVE,
     ids::GHOST_RESCUE,
@@ -212,14 +210,6 @@ pub const CATALOG: &[Doc] = &[
         }],
         pref: None,
         detail: None,
-    },
-    Doc {
-        id: ids::GCAL_SYNC,
-        name: "Google Calendar sync",
-        purpose: "Fetches events for every connected Google account every 15 minutes; without it, calendar data only updates via a manual POST /api/gcal/sync.",
-        env: NO_ENV,
-        pref: None,
-        detail: Some("/api/gcal/status"),
     },
     Doc {
         id: ids::STEER_DELIVER,

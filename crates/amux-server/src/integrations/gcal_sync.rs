@@ -246,87 +246,6 @@ pub async fn create_calendar_event(
     Ok(event_id)
 }
 
-/// Update an existing Google Calendar event
-pub async fn update_calendar_event(
-    refresh_token: &str,
-    calendar_id: &str,
-    event_id: &str,
-    title: Option<&str>,
-    description: Option<&str>,
-    start_time: Option<&str>,
-    end_time: Option<&str>,
-) -> anyhow::Result<()> {
-    let access_token = get_access_token(refresh_token).await?;
-
-    let client = reqwest::Client::new();
-
-    // First, get the existing event
-    let url = calendar_events_url(calendar_id, Some(event_id))?;
-
-    let response = client
-        .get(url.clone())
-        .header("Authorization", format!("Bearer {}", access_token))
-        .send()
-        .await?;
-
-    let mut event: serde_json::Value = response.json().await?;
-
-    // Update fields
-    if let Some(t) = title {
-        event["summary"] = serde_json::json!(t);
-    }
-    if let Some(d) = description {
-        event["description"] = serde_json::json!(d);
-    }
-    if let Some(st) = start_time {
-        event["start"]["dateTime"] = serde_json::json!(st);
-    }
-    if let Some(et) = end_time {
-        event["end"]["dateTime"] = serde_json::json!(et);
-    }
-
-    // Send update
-    let update_response = client
-        .put(url)
-        .header("Authorization", format!("Bearer {}", access_token))
-        .json(&event)
-        .send()
-        .await?;
-
-    if !update_response.status().is_success() {
-        let error_text = update_response.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!("Failed to update event: {}", error_text));
-    }
-
-    Ok(())
-}
-
-/// Delete a Google Calendar event
-pub async fn delete_calendar_event(
-    refresh_token: &str,
-    calendar_id: &str,
-    event_id: &str,
-) -> anyhow::Result<()> {
-    let access_token = get_access_token(refresh_token).await?;
-
-    let client = reqwest::Client::new();
-    let mut url = calendar_events_url(calendar_id, Some(event_id))?;
-    url.query_pairs_mut().append_pair("sendNotifications", "true");
-
-    let response = client
-        .delete(url)
-        .header("Authorization", format!("Bearer {}", access_token))
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        let error_text = response.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!("Failed to delete event: {}", error_text));
-    }
-
-    Ok(())
-}
-
 /// Fetch calendar events from Google Calendar API
 /// `account_id` is amux's own account identifier ("account-1", matching
 /// `calendar_accounts.id`) — NOT the Google email. It used to be missing
@@ -444,12 +363,7 @@ async fn fetch_calendar_list(access_token: &str) -> anyhow::Result<Vec<String>> 
     Ok(calendar_ids)
 }
 
-/// How far back/forward each sync fetches. `runtime_jobs::gcal_sync_job`
-/// reuses this to decide which local rows are actually in scope for pruning
-/// (a local row outside this window was never re-fetched this cycle, so its
-/// absence from the response says nothing about whether it still exists on
-/// Google — only a row inside the window that Google didn't return is safe
-/// to treat as deleted).
+/// How far back/forward `GET /api/gcal/events` looks on each live call.
 pub const SYNC_WINDOW_DAYS: i64 = 90;
 
 /// Fetch events from a specific calendar

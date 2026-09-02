@@ -91,7 +91,10 @@ pub fn initialize_accounts(conn: &mut Connection, config: &CalendarConfig) -> Re
             }
         };
 
-        // Insert or update account
+        // Insert or update account. Status goes straight to "ok" -- there is
+        // no sync job to advance it out of "pending" any more (this module
+        // only records that a usable OAuth token was found; see gcal.rs's
+        // own header for why there's no local event mirror to sync at all).
         tx.execute(
             "INSERT OR REPLACE INTO calendar_accounts
              (id, email, display_name, is_primary, oauth_refresh_token, sync_status)
@@ -102,25 +105,10 @@ pub fn initialize_accounts(conn: &mut Connection, config: &CalendarConfig) -> Re
                 account.display_name.as_deref(),
                 account.is_primary as i32,
                 oauth_token,
-                "pending",
+                "ok",
             ],
         )
         .map_err(|e| anyhow!("Failed to insert calendar account {}: {}", account.id, e))?;
-
-        // Insert sync metadata
-        tx.execute(
-            "INSERT OR REPLACE INTO calendar_sync_metadata
-             (account_id, is_enabled, sync_frequency_minutes, sync_window_days)
-             VALUES (?, 1, 15, ?)",
-            rusqlite::params![&account.id, account.sync_window_days],
-        )
-        .map_err(|e| {
-            anyhow!(
-                "Failed to insert sync metadata for {}: {}",
-                account.id,
-                e
-            )
-        })?;
 
         tracing::info!(
             "Initialized calendar account: {} ({})",

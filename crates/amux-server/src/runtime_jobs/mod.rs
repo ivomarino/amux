@@ -55,7 +55,6 @@ pub mod commit_nudge;
 pub mod context_health;
 pub mod status_history;
 pub mod disk_watch;
-pub mod gcal_sync_job;
 pub mod ghost_rescue;
 pub mod heartbeat;
 pub mod mac_health;

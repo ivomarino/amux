@@ -1206,13 +1206,11 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/email/approvals", methods: &["GET"] },
     RouteEntry { path: "/api/cal-events", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/cal-events/{id}", methods: &["PATCH", "DELETE"] },
-    // Google Calendar sync (api/gcal.rs) — distinct family from /api/cal-events above.
+    // Google Calendar (api/gcal.rs) — distinct family from /api/cal-events
+    // above. Read + create only, no local mirror; see that file's own
+    // header for why there's no status/sync/unified.ics surface here.
     RouteEntry { path: "/api/gcal/accounts", methods: &["GET"] },
     RouteEntry { path: "/api/gcal/events", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/gcal/events/{event_id}", methods: &["PUT", "DELETE"] },
-    RouteEntry { path: "/api/gcal/status", methods: &["GET"] },
-    RouteEntry { path: "/api/gcal/sync", methods: &["POST"] },
-    RouteEntry { path: "/api/gcal/unified.ics", methods: &["GET"] },
     // -- sessions (legacy list + native per-name verbs) / identity / scope
     RouteEntry { path: "/api/sessions", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/sessions-git", methods: &["GET"] },
