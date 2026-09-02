@@ -3444,3 +3444,36 @@ FIX: e6b80033. The arm now names the files that block the merge and gives each a
   where the obvious command stops working. `drop_paths_identical_to_origin()`
   already computed this comparison for the idle nudge; the surface every lane
   reads at SessionStart did not (ethos rule 1).
+
+## Runtime hook copies drift from HEAD silently — install.sh has no supervision
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux
+CARD: AMUX-99
+SYMPTOM: GET /api/health/invariants showed hooks.report_hook_matches_committed
+  and hooks.shared_guard_matches_committed both failing — runtime hook sha
+  differs from the sha baked into the running binary. ~/.amux/hooks/
+  git-shared-guard.py and ~/.amux/hook-report.sh were both installed 2026-08-30
+  20:48 and never reinstalled since, while their source kept getting real
+  commits — most notably e782b68a (AMUX-3932), a genuine guard-BYPASS fix
+  ("command substitution inside a quoted argument bypassed the shared-checkout
+  guard"). That fix passed every CI gate and sat in git history, never live on
+  this box, because nothing re-runs install.sh's hook-install step
+  automatically. AMUX-28/AMUX-29 already covered this exact invariant pair and
+  are marked done with no evidence recorded on either — the drift came back
+  because the underlying gap (install.sh only runs manually, unlike the Rust
+  binary auto-builder / amux-builder.timer) was never closed the first time.
+COST: a real security-relevant fix (a shared-checkout guard bypass) sat
+  undeployed for days on a box running unsupervised agents against a shared
+  checkout, with the health invariant correctly flagging it the whole time and
+  nothing consuming that signal. Discovered only because this session was
+  sweeping GET /api/health/invariants for other reasons.
+FIX: manually re-ran install.sh's own install_hook_from_head sequence for both
+  files (git show HEAD:<rel> + chmod +x + sha256 sidecar). Confirmed live:
+  invariant failures dropped from 6 to 4, both hooks.* entries cleared.
+  NOT fixed: the durable gap. AMUX-99 is the recurrence card and names the two
+  real options (a systemd timer polling install.sh's hook block the way
+  amux-builder.timer polls the Rust build, or the invariant self-healing since
+  it already computes the right bytes) — a design choice, not made here.
