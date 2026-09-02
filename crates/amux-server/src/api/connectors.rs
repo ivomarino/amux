@@ -202,6 +202,20 @@ const REGISTRY: &[Provider] = &[
         test_url: "https://slack.com/api/auth.test",
     },
     Provider {
+        id: "telegram",
+        label: "Telegram",
+        category: "Chat",
+        auth: Auth::ApiKey { key_env: "TELEGRAM_BOT_TOKEN" },
+        // No OAuth, no server URL to configure — one bot token, and the
+        // `runtime_jobs::telegram_poll` long-poll loop (no public endpoint
+        // needed, unlike a webhook) picks it up on the next server restart.
+        // Chats link themselves to a session by sending `/link <session>` to
+        // the bot; `/api/telegram/mappings` is the operator-side view.
+        setup_note: "Message @BotFather on Telegram, /newbot, paste the token it gives you. No webhook/public URL needed — amux polls. After saving, restart the server so the poll loop picks up the token, then send /link <session> to the bot from Telegram.",
+        docs: "https://core.telegram.org/bots#how-do-i-create-a-bot",
+        test_url: "",
+    },
+    Provider {
         id: "mattermost",
         label: "Mattermost",
         category: "Chat",
@@ -1872,6 +1886,39 @@ async fn test_connection(Path(id): Path<String>) -> Response {
                 .into_response()
         }
     };
+    // Telegram's Bot API puts the token IN THE URL PATH (`/bot<token>/getMe`),
+    // not an Authorization header — the one connector here where `bearer`
+    // isn't a header value, so it can't share the generic GET below (an empty
+    // `test_url` there would hit `client.get("")`, a malformed-URL error that
+    // reads as "could not reach the provider" — true of the request, false of
+    // the actual cause).
+    if id == "telegram" {
+        let started = std::time::Instant::now();
+        let resp = client.get(format!("https://api.telegram.org/bot{bearer}/getMe")).send().await;
+        let ms = started.elapsed().as_millis();
+        return match resp {
+            Ok(r) => {
+                let code = r.status().as_u16();
+                let body: Value = r.json().await.unwrap_or_default();
+                let ok = body.get("ok").and_then(Value::as_bool) == Some(true);
+                tracing::info!("connector_test: telegram -> {code} ({ok}) in {ms}ms");
+                Json(json!({
+                    "ok": ok,
+                    "status": if ok { "connected" } else { "error" },
+                    "http_status": code,
+                    "elapsed_ms": ms,
+                    "detail": if ok {
+                        format!("live: bot @{} in {ms}ms", body.get("result").and_then(|r| r.get("username")).and_then(Value::as_str).unwrap_or("?"))
+                    } else {
+                        format!("Telegram rejected the token: {body}")
+                    },
+                }))
+                .into_response()
+            }
+            Err(e) => Json(json!({"ok": false, "status": "error", "detail": format!("could not reach Telegram: {e}")}))
+                .into_response(),
+        };
+    }
     let started = std::time::Instant::now();
     let resp = client
         .get(&url)

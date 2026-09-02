@@ -1,4 +1,18 @@
 #!/bin/bash
+# Ensure cargo/rustup's PATH is present even when the invoking shell (a git
+# GUI, a fresh non-interactive commit, or apparently even an ordinary
+# interactive `git commit` in some environments) didn't export it — same
+# "setdefault, don't override" discipline CARGO_TARGET_DIR below already
+# uses. Found 2026-08-31: a Rust-touching commit hit "clippy not installed
+# - falling back to cargo check" immediately followed by "cargo: command
+# not found", i.e. BOTH the clippy branch and its own cargo-check fallback
+# were unresolvable in the hook's environment even though the same shell
+# resolved `cargo` fine when run directly — silently downgrading the Rust
+# gate from "lints enforced" all the way to "commit refused", never to
+# "actually ran". `[ -f ... ]` guard so a box without rustup's installer
+# (a from-scratch cargo install, a system package) is unaffected.
+[ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
+
 # amux-staged-guard  (see the block below for why this call is HERE now)
 g="$(dirname -- "$0")/amux-staged-guard"
 # SELF-HEAL RATHER THAN WARN (AMUX-2663). The guard BLOCKS a commit that touches
@@ -499,7 +513,11 @@ elif echo "$STAGED" | grep -qE '^(crates/.*\.rs|Cargo\.(toml|lock))$'; then
     # So: still refuse, always — a red workspace is a red workspace. But
     # PARTITION the offenders, because the next action is completely different
     # and the committer cannot work it out from clippy's output alone.
-    if ! _clippy_out=$(cargo clippy --workspace --all-targets --quiet -- -D warnings 2>&1); then
+    # AMUX-70: run through safe-cargo.sh (its own systemd scope), not bare
+    # cargo — a workspace-wide clippy run OOM-killed inside THIS hook's own
+    # process tree takes the whole interactive pane down with it, hook and
+    # all, exactly the incident this wrapper exists to prevent.
+    if ! _clippy_out=$(scripts/safe-cargo.sh clippy --workspace --all-targets --quiet -- -D warnings 2>&1); then
       printf '%s\n' "$_clippy_out" >&2
       # NEVER let the blame analysis change the verdict: it runs after the raw
       # output, its failure is swallowed, and the exit is unconditional. A
@@ -527,7 +545,8 @@ elif echo "$STAGED" | grep -qE '^(crates/.*\.rs|Cargo\.(toml|lock))$'; then
     #
     # lint-blame parses `--> file:line` spans, which rustc emits in the same
     # form clippy does, so an E0063 partitions exactly like a lint denial.
-    if ! _check_out=$(cargo check --workspace --all-targets --quiet 2>&1); then
+    # AMUX-70: same reasoning as the clippy branch above — safe-cargo.sh, not bare cargo.
+    if ! _check_out=$(scripts/safe-cargo.sh check --workspace --all-targets --quiet 2>&1); then
       printf '%s\n' "$_check_out" >&2
       # SAME PATH AS THE CLIPPY BRANCH, via the shared helper. This branch's own
       # comment says it matters MORE there, since the failure reaching it is a
