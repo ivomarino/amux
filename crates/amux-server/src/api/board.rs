@@ -397,6 +397,7 @@ async fn ready_frontier(
                 "holding": f.holding},
         "excluded": {
             "blocked_by_deps": f.blocked_by_deps,
+            "blocked_by_parked_dep": f.blocked_by_parked_dep,
             "missing_continuation": f.missing_continuation,
             "continuation_gate_on": f.gate_on,
         },
@@ -419,6 +420,10 @@ pub(crate) struct LaneFrontier {
     pub wip_available: usize,
     pub holding: Vec<String>,
     pub blocked_by_deps: usize,
+    /// Of `blocked_by_deps`, the ones whose blocker CANNOT clear on its own:
+    /// parked in `backlog`/`needsyou`, discarded, or resolving to no card.
+    /// These are deadlocked, not waiting.
+    pub blocked_by_parked_dep: usize,
     pub missing_continuation: usize,
     pub gate_on: bool,
     pub n_considered: usize,
@@ -465,6 +470,7 @@ pub(crate) fn lane_frontier(
 
     let gate_on = bs::continuation_required(Some(lane));
     let (mut blocked_by_deps, mut missing_continuation) = (0usize, 0usize);
+    let mut blocked_by_parked_dep = 0usize;
     let mut ready: Vec<Value> = Vec::new();
     let now = crate::config::now_f64();
 
@@ -474,6 +480,26 @@ pub(crate) fn lane_frontier(
         let blockers = crate::runtime_jobs::board_drive::deps_blocking(conn, &row);
         if !blockers.is_empty() {
             blocked_by_deps += 1;
+            // WAITING AND DEADLOCKED ARE DIFFERENT ANSWERS (AMUX-4040), and one
+            // number could not tell them apart. A dependency that is `doing` or
+            // `todo` will clear on its own; one that is parked in `backlog` /
+            // `needsyou`, or that resolves to no card at all, will not clear
+            // ever, and the lane waiting on it is stuck rather than patient.
+            //
+            // rtsp-connection read `blocked_by_deps: 12` over 13 todo cards. The
+            // whole queue hung off ONE parked card, and nothing in the payload
+            // said which kind of blocked it was, so the honest reading was
+            // "busy waiting" when the truth was "will never move".
+            //
+            // Counted per CARD, not per edge: a card is deadlocked if ANY
+            // blocker cannot clear, because it only takes one.
+            if blockers.iter().any(|b| {
+                bs::get_issue(conn, b).ok().flatten().is_none_or(|d| {
+                    matches!(d.status.as_str(), "backlog" | "needsyou" | "discarded")
+                })
+            }) {
+                blocked_by_parked_dep += 1;
+            }
             continue;
         }
         match frontier_exclusion(&row, gate_on) {
@@ -510,6 +536,7 @@ pub(crate) fn lane_frontier(
         wip_available: available,
         holding,
         blocked_by_deps,
+        blocked_by_parked_dep,
         missing_continuation,
         gate_on,
         n_considered,

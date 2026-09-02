@@ -1466,6 +1466,60 @@ fn self_owned_backlog_blockers(conn: &Connection, dep_ids: &[String], session: &
         .collect()
 }
 
+/// The dependency promotion that must NOT wait for a free WIP slot (AMUX-4040).
+///
+/// PROMOTING A DEPENDENCY IS NOT DISPATCHING WORK. It moves a self-owned
+/// `backlog` blocker to `todo` and claims nothing, so it consumes no WIP slot
+/// and changes no dispatch decision — it only makes the lane's queue tell the
+/// truth about what is workable.
+///
+/// It used to live only INSIDE the candidate loop, which runs after the WIP
+/// guard returns. So a lane at its cap could never prepare its own queue: the
+/// moment the cap freed, its todo cards were still blocked, pickup found
+/// nothing, and the lane went idle holding a full backlog.
+///
+/// Ethan, 2026-09-02, rtsp-connection: "it has tons of todo and backlog it
+/// should've kept going". 13 todo cards, every one blocked, `ready: []`,
+/// `blocked_by_deps: 12`. The whole queue hung off ONE edge — RC-67 depends on
+/// RC-66, which sits in `backlog` and is owned by that same lane, which is
+/// exactly the self-resolvable case this promotion exists for. RC-80 held the
+/// single WIP slot, so the promotion never ran, and 12 cards chained behind
+/// RC-67 stayed unreachable.
+///
+/// The shape is AMUX-2128's, one guard further out: a refusal that RETURNS
+/// stalls the whole lane. That fix moved the per-card refusals inside the loop;
+/// this one moves the queue repair ahead of the guard that skips the loop.
+fn promote_blocked_self_owned_deps(conn: &Connection, session: &str, now: f64) -> Option<Pickup> {
+    let fresh_cut = (now as i64) - pickup_freshness_s();
+    let reclaim_cut = now - reclaim_cooldown_s();
+    let ids: Vec<String> = conn
+        .prepare(&format!(
+            "SELECT i.id FROM issues i WHERE {DISPATCHABLE_WHERE} ORDER BY COALESCE(i.created,0) ASC"
+        ))
+        .and_then(|mut st| {
+            st.query_map(rusqlite::params![session, fresh_cut, reclaim_cut], |r| {
+                r.get::<_, String>(0)
+            })
+            .map(|rows| rows.filter_map(Result::ok).collect())
+        })
+        .unwrap_or_default();
+    for id in &ids {
+        let Ok(Some(row)) = bs::get_issue(conn, id) else { continue };
+        let blocking = deps_blocking(conn, &row);
+        if blocking.is_empty() {
+            continue;
+        }
+        // The SAME condition the in-loop path uses: every blocker is this
+        // lane's own backlog card. Anything else is somebody else's to move and
+        // must stay a nudge, not a silent promotion.
+        let self_owned = self_owned_backlog_blockers(conn, &blocking, session);
+        if !self_owned.is_empty() && self_owned.len() == blocking.len() {
+            return Some(Pickup::PromoteDeps { blocked_card: id.clone(), promoted: self_owned });
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Drive to verified — re-activate a card parked on a dependency once it clears
 // ---------------------------------------------------------------------------
@@ -2219,6 +2273,12 @@ pub fn select_pickup_with(
         })
         .unwrap_or_default();
     if holding.len() as i64 >= cap {
+        // AT THE CAP IS NOT A REASON TO LEAVE THE QUEUE BROKEN (AMUX-4040).
+        // This promotion claims nothing and takes no slot; skipping it is what
+        // let rtsp-connection hold 13 todo cards it could never advance.
+        if let Some(p) = promote_blocked_self_owned_deps(conn, session, now) {
+            return p;
+        }
         return Pickup::None {
             reason: "wip-cap",
             detail: format!("holding {}/{} in doing: {}", holding.len(), cap, holding.join(", ")),
@@ -7274,6 +7334,65 @@ mod tests {
             "both claims still emit task.claimed — the new type is ADDITIONAL, not a \
              replacement, or every existing consumer of the claim ledger silently loses a row"
         );
+    }
+
+    /// AMUX-4040. A lane AT THE CAP must still repair its own queue.
+    ///
+    /// Ethan, 2026-09-02, rtsp-connection: "it has tons of todo and backlog it
+    /// should've kept going". 13 todo cards, `ready: []`, every one blocked, and
+    /// the entire queue hung off a single edge — RC-67 depends on RC-66, a
+    /// `backlog` card owned by that same lane, which is exactly the
+    /// self-resolvable case `PromoteDeps` exists for. RC-80 held the one WIP
+    /// slot, so the promotion pass (which lives inside the candidate loop) was
+    /// never reached, and the lane went idle over a full queue it could not
+    /// advance.
+    ///
+    /// Promoting a dep CLAIMS NOTHING and takes no slot, so being at the cap is
+    /// not a reason to leave the queue broken. The control below is the half
+    /// that keeps this a repair rather than a hole: with nothing promotable, a
+    /// capped lane must still be told `wip-cap` and handed no work.
+    #[test]
+    fn a_capped_lane_still_promotes_its_own_blocked_dependency() {
+        let conn = board_db();
+        // The cap is full, exactly as rtsp-connection's was.
+        add_card(&conn, "RC-80", "lane", "doing", "holding the slot", "SCOPE: x");
+        // ...and the head of the chain is blocked by this lane's OWN backlog card.
+        add_card(&conn, "RC-66", "lane", "backlog", "the parked blocker", "SCOPE: x");
+        add_card(&conn, "RC-67", "lane", "todo", "blocked head", "SCOPE: x\n- [ ] y");
+        conn.execute(
+            "UPDATE issues SET depends_on=?1 WHERE id='RC-67'",
+            rusqlite::params!["[\"RC-66\"]"],
+        )
+        .expect("set dep");
+
+        match select_pickup_with(&conn, "lane", now_f64(), false) {
+            Pickup::PromoteDeps { blocked_card, promoted } => {
+                assert_eq!(blocked_card, "RC-67");
+                assert_eq!(promoted, vec!["RC-66"]);
+            }
+            other => panic!(
+                "a capped lane must still unblock its own queue; \
+                 leaving it blocked is what kept rtsp-connection idle over 13 todos: {other:?}"
+            ),
+        }
+    }
+
+    /// THE CONTROL. Same capped lane, nothing promotable: the cap must still be
+    /// reported and no work handed out, or the fix above has turned the WIP
+    /// guard into a hole.
+    #[test]
+    fn a_capped_lane_with_nothing_promotable_still_reports_the_cap() {
+        let conn = board_db();
+        add_card(&conn, "D-1", "lane", "doing", "holding the slot", "SCOPE: x");
+        // Blocked by ANOTHER lane's card — not this lane's to promote.
+        add_card(&conn, "X-9", "other", "backlog", "someone else's blocker", "SCOPE: x");
+        add_card(&conn, "T-2", "lane", "todo", "blocked by a peer", "SCOPE: x\n- [ ] y");
+        conn.execute("UPDATE issues SET depends_on=?1 WHERE id='T-2'", rusqlite::params!["[\"X-9\"]"])
+            .expect("set dep");
+        match select_pickup_with(&conn, "lane", now_f64(), false) {
+            Pickup::None { reason, .. } => assert_eq!(reason, "wip-cap"),
+            other => panic!("another lane's backlog card is not ours to promote: {other:?}"),
+        }
     }
 
     #[test]
