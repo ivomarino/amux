@@ -382,6 +382,53 @@ async fn ready_frontier(
         .into_response();
     };
 
+    let f = lane_frontier(&conn, &lane, limit);
+    let n_considered = f.n_considered;
+    let body = json!({
+        "session": lane,
+        // Cards that pass every computable precondition, oldest first. Capacity
+        // is reported BESIDE this rather than emptying it: "nothing is ready" and
+        // "you are at the cap holding something" are different answers and a
+        // caller that wants to know what is next while finishing a card deserves
+        // the real list.
+        "ready": f.ready,
+        "claimable_now": f.claimable_now,
+        "wip": {"doing": f.holding.len(), "cap": f.wip_cap, "available": f.wip_available,
+                "holding": f.holding},
+        "excluded": {
+            "blocked_by_deps": f.blocked_by_deps,
+            "missing_continuation": f.missing_continuation,
+            "continuation_gate_on": f.gate_on,
+        },
+    });
+    Json(crate::api::measured::measured(body, n_considered)).into_response()
+}
+
+/// One lane's work frontier: what it could claim, and what is in the way.
+///
+/// EXTRACTED SO THERE IS ONE EVALUATOR (AMUX-4029). `/api/board/ready` was the
+/// only caller and the only place this reasoning existed, so anything else that
+/// wanted to know whether a lane had claimable work either re-derived it or did
+/// without. `board.lane_idle_with_ready_work` is the second caller, and the
+/// point of sharing the function rather than the shape is that a detector which
+/// disagreed with the endpoint would be reporting a stall the endpoint denies.
+pub(crate) struct LaneFrontier {
+    pub ready: Vec<Value>,
+    pub claimable_now: usize,
+    pub wip_cap: usize,
+    pub wip_available: usize,
+    pub holding: Vec<String>,
+    pub blocked_by_deps: usize,
+    pub missing_continuation: usize,
+    pub gate_on: bool,
+    pub n_considered: usize,
+}
+
+pub(crate) fn lane_frontier(
+    conn: &rusqlite::Connection,
+    lane: &str,
+    limit: usize,
+) -> LaneFrontier {
     // CAPACITY, from the same predicate the `doing` gate refuses on: same status,
     // same type exclusions, same archived/deleted filter. A frontier that
     // disagreed with the gate would offer cards the gate then refuses, which is
@@ -416,15 +463,15 @@ async fn ready_frontier(
         .unwrap_or_default();
     let n_considered = ids.len();
 
-    let gate_on = bs::continuation_required(Some(&lane));
+    let gate_on = bs::continuation_required(Some(lane));
     let (mut blocked_by_deps, mut missing_continuation) = (0usize, 0usize);
     let mut ready: Vec<Value> = Vec::new();
     let now = crate::config::now_f64();
 
     for id in &ids {
-        let Ok(Some(row)) = bs::get_issue(&conn, id) else { continue };
+        let Ok(Some(row)) = bs::get_issue(conn, id) else { continue };
         // THE SHARED PREDICATE, not a second spelling of it (AMUX-3814).
-        let blockers = crate::runtime_jobs::board_drive::deps_blocking(&conn, &row);
+        let blockers = crate::runtime_jobs::board_drive::deps_blocking(conn, &row);
         if !blockers.is_empty() {
             blocked_by_deps += 1;
             continue;
@@ -456,23 +503,17 @@ async fn ready_frontier(
     }
     ready.truncate(limit);
 
-    let body = json!({
-        "session": lane,
-        // Cards that pass every computable precondition, oldest first. Capacity
-        // is reported BESIDE this rather than emptying it: "nothing is ready" and
-        // "you are at the cap holding something" are different answers and a
-        // caller that wants to know what is next while finishing a card deserves
-        // the real list.
-        "ready": ready,
-        "claimable_now": available.min(ready.len()),
-        "wip": {"doing": holding.len(), "cap": cap, "available": available, "holding": holding},
-        "excluded": {
-            "blocked_by_deps": blocked_by_deps,
-            "missing_continuation": missing_continuation,
-            "continuation_gate_on": gate_on,
-        },
-    });
-    Json(crate::api::measured::measured(body, n_considered)).into_response()
+    LaneFrontier {
+        claimable_now: available.min(ready.len()),
+        ready,
+        wip_cap: cap,
+        wip_available: available,
+        holding,
+        blocked_by_deps,
+        missing_continuation,
+        gate_on,
+        n_considered,
+    }
 }
 
 /// GET /api/board/contract — the gate table, types, and CLI syntax.

@@ -2790,6 +2790,62 @@ function _agentsChip(s) {
 }
 
 // ═══════ RENDERING ═══════
+// EXECUTION IDLE AND WORK IDLE ARE DIFFERENT QUESTIONS (AMUX-4029).
+//
+// Ethan, 2026-09-02: "byo-ray is idle despite having todo and backlog". The
+// header badge is derived from terminal and model activity, and the board's
+// column counts are card counts. Neither answers "could this lane pick anything
+// up", so a lane at its WIP cap and a lane with genuinely nothing to do render
+// identically — byo-ray showed IDLE over 5 todo cards, 3 of them ready, none
+// claimable because BR-51 held a cap of 1.
+//
+// Read from /api/board/ready, which is the endpoint the CLI already uses and
+// which shares `lane_frontier` with the dispatcher's own predicate, so this
+// badge cannot claim a stall the dispatcher denies. Fetched ONLY for the open
+// peek and cached, because the frontier is per-lane DB work and /api/sessions
+// is already the slowest thing here (AMUX-3864) — putting it in that payload
+// would cost 127 lanes' queries to answer a question about one.
+let _workFrontier = {};
+let _workFrontierBusy = {};
+function _workFrontierFor(name) {
+  const c = _workFrontier[name];
+  if (c && Date.now() - c.ts < 20000) return c;
+  if (!_workFrontierBusy[name]) {
+    _workFrontierBusy[name] = true;
+    fetch(API + '/api/board/ready?session=' + encodeURIComponent(name), { headers: _authHeaders() })
+      .then(r => r.json())
+      .then(d => {
+        _workFrontier[name] = {
+          ready: (d.ready || []).length,
+          claimable: d.claimable_now,
+          holding: (d.wip || {}).holding || [],
+          // `measured` decides whether this may render at all: an unmeasured
+          // frontier reads as 0 ready and would quietly mean "nothing to do".
+          measured: d.measured !== false,
+          ts: Date.now(),
+        };
+        if (peekSession === name) updatePeekStatus();
+      })
+      .catch(() => {})
+      .finally(() => { _workFrontierBusy[name] = false; });
+  }
+  return c || null;
+}
+// The badge, or '' when the lane is not stalled. Same conjunction as the
+// server-side invariant `board.lane_idle_with_ready_work`: idle AND ready AND
+// nothing claimable. A busy lane holding its one card is working correctly and
+// must not be labelled.
+function _stalledChip(s) {
+  if (!s.running || s.status !== 'idle') return '';
+  const w = _workFrontierFor(s.name);
+  if (!w || !w.measured || !(w.ready > 0) || w.claimable !== 0) return '';
+  const held = w.holding.length ? w.holding.join(', ') : 'nothing';
+  return '<span class="status-badge rate-limited" style="margin-left:6px;" title="'
+    + w.ready + ' card(s) ready, 0 claimable. The WIP cap is held by ' + esc(held)
+    + '. This lane is not out of work, it cannot claim the work it has.">stalled &middot; '
+    + w.ready + ' ready</span>';
+}
+
 function updatePeekStatus() {
   const el = document.getElementById('peek-session-status');
   if (!el || !peekSession) { if (el) el.innerHTML = ''; return; }
@@ -2812,7 +2868,7 @@ function updatePeekStatus() {
   else if (s.status === 'waiting') badge = '<span class="status-badge waiting"' + _waitingTitle(s) + '>' + _waitingLabel(s) + '</span>';
   else if (s.status === 'rate_limited') badge = '<span class="status-badge rate-limited">rate limited</span>';
   else if (s.status === 'api_error') badge = `<span class="status-badge rate-limited" title="API Error ${esc(s.api_error_code || '5xx')} — server-side and retryable. Send &quot;continue&quot;.">API ${esc(s.api_error_code || '5xx')}</span>`;
-  else if (s.status === 'idle')    badge = '<span class="status-badge idle">idle</span>';
+  else if (s.status === 'idle')    badge = '<span class="status-badge idle">idle</span>' + _stalledChip(s);
   else if (!s.running)             badge = '<span class="status-badge" style="background:rgba(255,255,255,0.06);color:var(--dim);border:1px solid var(--border);">stopped</span>';
   if (s.rate_limited_until) {
     const _lbl = s.rate_limit_weekly ? 'Weekly limit until' : 'Rate-limited until';
@@ -8372,7 +8428,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.775';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.776';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").

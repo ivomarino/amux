@@ -1891,6 +1891,89 @@ pub fn reports_are_attributed(total: i64, unattributed: i64) -> Vec<InvariantRes
 // 6b. Are the report hooks WIRED to that script at all? (AMUX-2936)
 // ---------------------------------------------------------------------------
 
+/// One lane's WORK state beside its EXECUTION state (AMUX-4029).
+pub struct LaneWork {
+    pub name: String,
+    /// The derived execution status: is the process doing anything.
+    pub status: String,
+    /// Cards that pass every computable precondition.
+    pub ready: usize,
+    /// How many of those it could actually claim right now.
+    pub claimable_now: usize,
+    /// The `doing` cards consuming its WIP cap.
+    pub holding: Vec<String>,
+    /// Of `holding`, the ones with no `next_action` — a card that cannot say
+    /// what it is waiting for is the shape that sits there.
+    pub held_without_next_action: Vec<String>,
+}
+
+/// A LANE THAT IS IDLE WHILE HOLDING WORK IT CANNOT CLAIM IS STALLED, and that
+/// is a system failure rather than ordinary idle.
+///
+/// EXECUTION IDLE AND WORK IDLE ARE DIFFERENT QUESTIONS and nothing joined them.
+/// The header badge is derived from terminal and model activity; the column
+/// counts are card counts. Neither answers "is there anything this lane could
+/// pick up", so a lane at its WIP cap and a lane with genuinely nothing to do
+/// render identically, and the difference is invisible until a human opens the
+/// board and counts.
+///
+/// Ethan, 2026-09-02: "byo-ray is idle despite having todo and backlog". It was
+/// holding BR-51 in `doing` against a WIP cap of 1, with BR-117, BR-120 and
+/// BR-122 all ready and none claimable. Measured across the fleet the same
+/// minute: 6 of 51 running lanes had ready work they could not claim, and the
+/// discriminator matters — 4 of the 6 were ACTIVE, which is a lane correctly
+/// working its one card and must not be flagged. Only the 2 idle ones are
+/// stalled, and both held a card with no `next_action`.
+///
+/// So the predicate is the conjunction, not any one term: idle AND ready > 0
+/// AND claimable_now == 0. Flagging `ready > 0 && claimable == 0` alone would
+/// fire on every healthy busy lane and be muted within a day.
+pub fn lane_idle_with_ready_work(lanes: &[LaneWork]) -> Vec<InvariantResult> {
+    const ID: &str = "board.lane_idle_with_ready_work";
+    if lanes.is_empty() {
+        // The same reasoning as `status.agrees_with_pane`: no visible fleet is
+        // indistinguishable from a failed enumeration, and that has shipped here
+        // before. Never a pass.
+        return vec![InvariantResult::unknown(ID, "no running lanes visible to examine")];
+    }
+    let mut out = Vec::new();
+    for l in lanes {
+        let stalled = l.status == "idle" && l.ready > 0 && l.claimable_now == 0;
+        if !stalled {
+            out.push(InvariantResult::pass(ID).entity(&l.name));
+            continue;
+        }
+        // NAME WHAT IS IN THE WAY, not just that something is. "0 claimable" sends
+        // the reader to the board to work out why; the held card's id sends them
+        // to the one row that has to move.
+        let held = if l.holding.is_empty() {
+            "nothing is holding the cap, so the block is upstream of WIP".to_string()
+        } else {
+            let stale = if l.held_without_next_action.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " ({} of them declare no next_action, so nothing says what they wait for)",
+                    l.held_without_next_action.len()
+                )
+            };
+            format!("held by {}{}", l.holding.join(", "), stale)
+        };
+        out.push(
+            InvariantResult::fail(
+                ID,
+                "a lane with ready work is either working it or can claim it".to_string(),
+                format!(
+                    "{} is execution-idle with {} ready card(s) and 0 claimable: {}",
+                    l.name, l.ready, held
+                ),
+            )
+            .entity(&l.name),
+        );
+    }
+    out
+}
+
 /// One report-hook entry as configured in `~/.claude/settings.json`.
 #[derive(Debug)]
 pub struct ReportHookEntry {
@@ -4143,6 +4226,61 @@ mod negative_controls {
     /// — an inline curl posting `{state,source}` — not from a convenient
     /// fixture, because the convenient fixture is convenient precisely by
     /// lacking the property that made the incident.
+    /// AMUX-4029, built from the live fleet reading on 2026-09-02 rather than a
+    /// convenient fixture. Six of 51 running lanes had ready work they could not
+    /// claim; four were ACTIVE and two were IDLE. The four are the reason this
+    /// check is a conjunction: flag `ready > 0 && claimable == 0` on its own and
+    /// it fires on every healthy lane that is correctly working its one card,
+    /// which is how a check earns being muted.
+    #[test]
+    fn only_an_idle_lane_with_unclaimable_ready_work_is_stalled() {
+        let lane = |name: &str, status: &str, ready: usize, claimable: usize| LaneWork {
+            name: name.into(),
+            status: status.into(),
+            ready,
+            claimable_now: claimable,
+            holding: vec!["BR-51".into()],
+            held_without_next_action: vec!["BR-51".into()],
+        };
+
+        // THE SPECIMEN. Ethan: "byo-ray is idle despite having todo and backlog".
+        let got = lane_idle_with_ready_work(&[lane("byo-ray", "idle", 3, 0)]);
+        assert_eq!(got[0].status, Status::Fail, "the reported specimen must fail: {got:?}");
+        assert!(
+            got[0].observed.contains("BR-51"),
+            "the failure must NAME what is in the way, not just that something is: {}",
+            got[0].observed
+        );
+        assert!(
+            got[0].observed.contains("next_action"),
+            "...and that the held card declares none: {}",
+            got[0].observed
+        );
+
+        // THE FOUR THAT MUST NOT FIRE. Same board shape, lane is working.
+        for st in ["active", "waiting"] {
+            let got = lane_idle_with_ready_work(&[lane("backend", st, 9, 0)]);
+            assert_eq!(
+                got[0].status,
+                Status::Pass,
+                "a {st} lane working its one card is not stalled: {got:?}"
+            );
+        }
+
+        // An idle lane with nothing ready is ordinary idle, not a failure.
+        let got = lane_idle_with_ready_work(&[lane("quiet", "idle", 0, 0)]);
+        assert_eq!(got[0].status, Status::Pass, "idle with no ready work is fine: {got:?}");
+
+        // An idle lane that CAN claim is the dispatcher's problem, not this
+        // check's: it has capacity and ready work, so nothing is in the way.
+        let got = lane_idle_with_ready_work(&[lane("free", "idle", 3, 3)]);
+        assert_eq!(got[0].status, Status::Pass, "claimable work is not a stall: {got:?}");
+
+        // Absence is Unknown, never a false pass — a failed enumeration and an
+        // empty fleet look identical, and that has shipped here before.
+        assert_eq!(lane_idle_with_ready_work(&[])[0].status, Status::Unknown);
+    }
+
     #[test]
     fn report_hook_wiring_faults_are_detected() {
         const GOOD: &str = r#"bash "$HOME/.amux/hook-report.sh" idle stop-hook"#;

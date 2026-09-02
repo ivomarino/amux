@@ -178,6 +178,14 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // -- 4. status truth: does the card agree with the pane?
     out.extend(status_pane_check(state));
 
+    // -- 4b. WORK truth: is an idle lane idle because there is nothing to do,
+    // or because it cannot claim what it has? (AMUX-4029) The status check
+    // above asks whether the lane is RUNNING anything. Neither it nor the
+    // board's column counts ask whether the lane COULD run something, which is
+    // how byo-ray sat idle over 5 todo cards with nobody the wiser.
+    out.extend(lane_work_check(state));
+
+    tm.mark(&out, "4b. work truth");
     tm.mark(&out, "4. status truth");
     // -- 5. is the report control plane up? (2026-08-13 fleet-wide outage)
     out.extend(self_reports_check(state));
@@ -870,6 +878,75 @@ fn arrival_follows_boot_check(state: &AppState) -> Vec<InvariantResult> {
         }
         Err(e) => vec![InvariantResult::unknown(ID, format!("request log unreadable: {e}"))],
     }
+}
+
+/// AMUX-4029: a lane that is execution-idle while holding ready work it cannot
+/// claim is STALLED.
+///
+/// Reads the SAME `lane_frontier` the `/api/board/ready` endpoint serves, and
+/// the SAME `derive_status` the header badge shows, so this cannot report a
+/// stall either of them denies. That sharing is the whole design: the reason
+/// nothing caught byo-ray is that the two facts lived in different places and
+/// no code held both at once.
+fn lane_work_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "board.lane_idle_with_ready_work";
+    let Ok(conn) = state.store.read() else {
+        return vec![InvariantResult::unknown(ID, "store unreadable")];
+    };
+    let mut signals = crate::api::sessions_legacy::FleetSignals::load(&conn);
+    if signals.running.is_empty() {
+        return vec![InvariantResult::unknown(ID, "no running tmux sessions visible")];
+    }
+    // Capture panes anyway, even though the enumeration below does not come from
+    // them: `derive_status` consults the pane to contradict a stale report, so
+    // without this an ACTIVE lane whose report went stale derives as idle and, if
+    // it also holds unclaimable ready work, gets reported as a false stall. Only
+    // recently-painted lanes are captured, which is precisely the set where pane
+    // evidence changes the answer; an idle lane has none and falls back to its
+    // own report, which is the right source for it.
+    signals.capture_panes();
+    // NOT `probed_lanes()`, which is what `status_pane_check` beside this uses.
+    // That enumeration is `panes.keys()`, and `capture_panes` only captures
+    // lanes that painted inside the contradiction window — "typically a handful
+    // of a 60-lane fleet (measured: 4 of 63)", per its own doc. An IDLE lane has
+    // by definition not painted, so this check would have skipped exactly the
+    // lanes it exists to find and reported a clean pass over every one of them.
+    //
+    // Enumerate the RUNNING tmux sessions instead. `derive_status` needs no pane
+    // (it falls back to the lane's self-report), which is the whole reason the
+    // idle side is answerable at all.
+    let names: Vec<String> = signals
+        .running
+        .iter()
+        .filter_map(|t| t.strip_prefix("amux-").map(str::to_string))
+        .filter(|n| signals.agent_running(&format!("amux-{n}")))
+        .collect();
+    let mut lanes = Vec::with_capacity(names.len());
+    for name in names {
+        let f = crate::api::board::lane_frontier(&conn, &name, 50);
+        // A held card that cannot say what it is waiting for is the shape that
+        // sits: both stalled lanes measured on 2026-09-02 held exactly one.
+        let held_without_next_action: Vec<String> = f
+            .holding
+            .iter()
+            .filter(|id| {
+                crate::db::board_store::get_issue(&conn, id)
+                    .ok()
+                    .flatten()
+                    .is_none_or(|r| r.next_action.as_deref().unwrap_or("").trim().is_empty())
+            })
+            .cloned()
+            .collect();
+        lanes.push(checks::LaneWork {
+            status: signals.derive_status(&name, true),
+            ready: f.ready.len(),
+            claimable_now: f.claimable_now,
+            holding: f.holding,
+            held_without_next_action,
+            name,
+        });
+    }
+    checks::lane_idle_with_ready_work(&lanes)
 }
 
 fn status_pane_check(state: &AppState) -> Vec<InvariantResult> {
