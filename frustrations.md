@@ -3380,7 +3380,7 @@ FIX: Installed on this box (running copy backed up first, both syntax-checked, t
 ## A PATCH rejected for its status silently discards the desc sent in the same body
 AREA: silent-partial
 SEVERITY: annoys
-STATUS: open
+STATUS: fixed
 DATE: 2026-09-02
 SESSION: amux-frustrations
 CARD: AF-413
@@ -3415,6 +3415,20 @@ FIX: Atomicity is defensible and I am not asking for a partial write. Say so in 
   `AREA: silent-partial` is the argument that compound operations need a uniform
   per-field outcome, not a per-operation verdict.
 
+  SHIPPED 87699f3c. The refusal now carries `discarded` (always present, including
+  empty — an absent key would mean a server that does not compute this, which a caller
+  cannot distinguish from "nothing was lost") plus a `discarded_note` when non-empty.
+  Decorated at the ONE arm every refusal converges on, PatchOut::Refused, rather than at
+  the 16 sites that build a refusal body: covering those would fix today's and miss the
+  next one, which is this bug's own shape.
+  BIGGER THAN THE CARD BODY THAT PROMPTED IT. `evidence` is a writable field, so
+  `amux board done --evidence-stdin` loses the evidence on any gate refusal. That is the
+  fleet's commonest PATCH, and it hit me twice more the same day on AF-410 and AF-416.
+  One path already knew: the evidence gate's own how_to_fix advises "writable on its own,
+  so record it first and the transition cannot discard it" — a hand-written workaround for
+  the general defect, now unnecessary rather than load-bearing.
+  Mutation-verified: removing the decoration fails the HTTP wiring test; making the key
+  conditional on non-empty fails the control cell.
 ---
 
 ## An archived entry came back through a merge, read as open, and got re-diagnosed from scratch
