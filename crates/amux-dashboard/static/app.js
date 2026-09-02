@@ -305,6 +305,51 @@ async function toggleAutofix(checked) {
 // dropping the server-resolved --model (passing `flags` at create would replace
 // it). Default OFF: skipping permission prompts is opt-in, per worker or globally.
 let _yoloDefault = false;
+// FLEET-WIDE cross-group default (AMUX-4018). Writes the GLOBAL env layer, which
+// `cross_group_send_ok` resolves at worker > group > global — so a per-worker
+// setting still wins and this is genuinely a default rather than an override.
+//
+// No X-Amux-Session header: the server refuses this write from a worker origin,
+// because a session that could set it would be granting itself and every peer a
+// standing cross-group channel.
+async function toggleCrossGroupDefault(checked) {
+  const note = document.getElementById('crossgroup-default-note');
+  try {
+    const r = await fetch(API + '/api/config/cross-group', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ allow: checked ? '*' : '' }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.error) {
+      showToast(d.error || 'could not save');
+      const cb = document.getElementById('crossgroup-default-checkbox');
+      if (cb) cb.checked = !checked;      // put the switch back
+      return;
+    }
+    showToast(d.message || (checked ? 'Cross-group messaging on' : 'Cross-group messaging off'));
+    if (note && d.gate_enforcing === false) {
+      note.textContent = 'Note: AMUX_GROUP_SEND_ENFORCE is off, so all cross-group sends pass regardless of this switch.';
+    }
+  } catch (e) { showToast('failed: ' + String(e)); }
+}
+
+(async function initCrossGroupDefault() {
+  try {
+    const r = await fetch(API + '/api/config/cross-group', { headers: _authHeaders() });
+    const d = await r.json();
+    const cb = document.getElementById('crossgroup-default-checkbox');
+    if (cb) cb.checked = !!d.enabled;
+    // SAY IT OUT LOUD when the gate is not enforcing at all. Otherwise an
+    // operator reads an OFF switch as a closed door that is not there.
+    const note = document.getElementById('crossgroup-default-note');
+    if (note && d.gate_enforcing === false) {
+      note.textContent = 'AMUX_GROUP_SEND_ENFORCE is off, so ALL cross-group sends pass regardless of this switch.';
+      note.style.color = '#b8860b';
+    }
+  } catch (e) {}
+})();
+
 async function toggleYoloDefault(checked) {
   _yoloDefault = !!checked;
   await fetch('/api/prefs', {
@@ -3170,6 +3215,7 @@ function render() {
                (AMUX-2559, "I cant add a worker to a group"). The label is the
                vocab; the field is the contract. */ ''}
           <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','tags','${escJs(s.tags.join(", "))}')"><span class="mi">&#x1F3F7;</span> Groups</div>
+          <div class="card-menu-item" onclick="event.stopPropagation();toggleSpansGroups('${s.name}')" title="Let this worker message workers in OTHER groups with no per-message approval. Writes CC_SEND_ALLOW on this worker; a group or global layer can also grant it from the Scope tab."><span class="mi">${s.spans_groups?'&#x2611;':'&#x2610;'}</span> Spans groups${_spansLabel(s)}</div>
           <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','dir','${esc(s.dir)}')"><span class="mi">&#x1F4C1;</span> Directory</div>
           ${s.running ? `<div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();doRestart('${s.name}')"><span class="mi">&#x21BB;</span> Restart</div>` : ''}
           ${s.running ? `<div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();doStop('${s.name}')"><span class="mi">&#x23F9;</span> Stop</div>` : ''}
@@ -5332,6 +5378,39 @@ async function togglePin(session) {
 // harness (AMUX_SESSION/URL env, self-report hooks, --mcp-config) and hides the
 // worker from peers at the NEXT spawn, so the toast says restart to apply. Paint
 // the flip immediately like togglePin, then let fetchSessions be the truth.
+// Says WHERE the allowance comes from, because the resolved value and the
+// worker's own value are different facts. A lane granted by a group layer shows
+// a ticked box it cannot untick here, and saying "(inherited)" is the difference
+// between a confusing control and an honest one.
+function _spansLabel(s) {
+  if (!s.spans_groups) return '';
+  const v = s.spans_groups_value || '';
+  const scope = v === '*' ? 'all' : v;
+  return s.spans_groups_own ? ': ' + esc(scope) : ': ' + esc(scope) + ' (inherited)';
+}
+
+async function toggleSpansGroups(session) {
+  closeAllMenus();
+  const s = sessions.find(x => x.name === session);
+  const was = s ? !!s.spans_groups : false;
+  // Turning OFF only clears this worker's own value. If a group or global layer
+  // granted it, the server says so in its reply rather than reporting success
+  // for a change the next send would disprove.
+  if (was && s && !s.spans_groups_own) {
+    showToast('Granted by a group or global layer — turn it off in the Scope tab');
+    return;
+  }
+  const next = !was;
+  if (s) { s.spans_groups = next; lastSessionsJSON = ''; render(); }
+  const r = await apiCall(API + '/api/sessions/' + session + '/config', {
+    method: 'PATCH', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ spans_groups: next })
+  });
+  if (!r && s) { s.spans_groups = was; lastSessionsJSON = ''; render(); }
+  else if (r) { showToast(r.message || (next ? 'Spans groups on' : 'Spans groups off')); }
+  await fetchSessions();
+}
+
 async function toggleIsolated(session) {
   closeAllMenus();
   const s = sessions.find(x => x.name === session);
@@ -8293,7 +8372,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.770';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.772';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -9886,8 +9965,23 @@ async function _peekLoadEarlier() {
     } else {
       const text = await r.text();
       const remaining = parseInt(r.headers.get('X-Log-Remaining') || '0', 10);
-      // New chunk is OLDER than everything loaded — it goes on top.
-      _peekEarlier.chunks.unshift('<span class="pe-chunk">' + esc(text) + '</span>');
+      // THROUGH THE SAME PIPELINE AS THE LIVE VIEW (AMUX-4021). This was
+      // `esc(text)`, which is raw escaped text with none of the peek render
+      // stages — and `_peekHtml`'s own comment warns about exactly that: "the
+      // four call sites each spelled the chain out, so adding a stage meant
+      // finding all of them". This was a fifth call site that never got them.
+      //
+      // The symptom was not subtle. A worker log is full of box-drawing runs
+      // and long unbroken lines; without `wrapBoxBlocks` they inherit the
+      // container's pre-wrap + break-word and wrap at EVERY CHARACTER, so
+      // loading earlier output rendered a 2-3 character wide column of
+      // gibberish instead of a log. `wrapBoxBlocks` gives each box run its own
+      // `.peek-box` with white-space:pre and its own horizontal scroller, which
+      // is what keeps tables, diffs and framed output aligned; `_fitRules`
+      // stops a 220-column pane rule forcing a scroller; `_linkifyPaths` and
+      // `highlightPrompts` make the earlier text behave like the live text it
+      // is continuous with.
+      _peekEarlier.chunks.unshift('<span class="pe-chunk">' + _peekHtml(text) + '</span>');
       _peekEarlier.loadedKb += _PEEK_LOG_CHUNK_KB;
       _peekEarlier.done = remaining <= 0;
     }

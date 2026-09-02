@@ -490,6 +490,51 @@ def _render_split_risk(d, w):
         w("  %s\n" % _sr.get("why", ""))
 
 
+def _never_wrote(path, session):
+    """Has this session EVER written this path, by commit trailer? (MC-1561)
+
+    Edit records cannot tell a READER from a WRITER. mixpeek-cicd was named three
+    times in one session as the co-editor of files it had never written, because
+    it had parsed one of them dozens of times building a coverage baseline,
+    extracted it into archives, and diffed it across nine commits. All of that is
+    activity in a shared cwd and none of it is authorship. That is the class
+    ~/Dev/mixpeek/CLAUDE.md already names: an owner derived from mtime reports
+    whoever was ACTIVE, not whoever WROTE.
+
+    The exact answer is already on every commit. Measured by mixpeek-cicd on
+    server/shared/ops/ownership_registry.yaml: 9 commits touching it that day, 9
+    carrying an Amux-Session trailer, 0 naming them, actual writers 7
+    mixpeek-observability and 2 mixpeek-funnel.
+
+    THREE ANSWERS, and the middle one is the one that matters. `True` means the
+    path has trailer-attributed history and none of it is theirs. `False` means it
+    is. `None` means the question could not be asked -- no history, or history
+    with no trailers at all -- and that must NOT read as "they never wrote it",
+    or every repo that does not use trailers would silently suppress every notice.
+    """
+    if not path or not session:
+        return None
+    try:
+        out = subprocess.run(
+            ["git", "log", "-n", "200",
+             "--format=%(trailers:key=Amux-Session,valueonly,separator=,)", "--", path],
+            capture_output=True, text=True, timeout=8)
+        if out.returncode != 0:
+            return None
+        lines = [l.strip() for l in (out.stdout or "").splitlines()]
+        if not lines:
+            return None                      # no history for this path
+        attributed = [l for l in lines if l]
+        if not attributed:
+            return None                      # history, but nothing carries a trailer
+        for l in attributed:
+            if session in [x.strip() for x in l.split(",")]:
+                return False                 # they have written it
+        return True
+    except Exception:
+        return None
+
+
 def _nothing_in_dispute(path):
     """Are this path's on-disk bytes already inside a commit? (AF-391)
 
@@ -755,12 +800,27 @@ def main():
         if _mtime_claim:
             _settled, _where = _nothing_in_dispute(f.get("path") or "")
             if _settled:
-                _quiet = _where
+                _quiet = "its on-disk bytes are already in %s, so no uncommitted work " \
+                         "exists in it to absorb (AF-391)" % _where
+        # SECOND, INDEPENDENT CORROBORATION (MC-1561). AF-391 asks whether anything
+        # is in DISPUTE; this asks whether the named session is even a WRITER of
+        # this path. They are different questions and the second catches what the
+        # first cannot: a hot shared file has uncommitted content, so AF-391's
+        # check correctly declines to downgrade, while the lane being named has
+        # never written a line of it.
+        #
+        # Not gated on `_mtime_claim`. If the named session has trailer-attributed
+        # history on this path and none of it is theirs, naming them is wrong
+        # however the claim was derived.
+        if not _quiet:
+            _nw = _never_wrote(f.get("path") or "", (f.get("owner") or "").strip())
+            if _nw:
+                _quiet = "%s has no commit to this path carrying their Amux-Session " \
+                         "trailer, so the record is activity in a shared cwd rather " \
+                         "than authorship (MC-1561)" % (f.get("owner") or "that session")
         if _quiet:
-            w("amux staged-guard: NOTE — %s carries an mtime-derived co-edit claim, "
-              "NOT corroborated: its on-disk bytes are already in %s, so no uncommitted "
-              "work exists in it to absorb. Not asking you to check anything (AF-391).\n"
-              % (f.get("path"), _quiet))
+            w("amux staged-guard: NOTE — %s carries an UNCORROBORATED co-edit claim: %s. "
+              "Not asking you to check anything.\n" % (f.get("path"), _quiet))
             continue
         # RECIPE CORRECTED (AC-303). This printed `git diff -U0` + `git apply
         # --cached`, and that pairing produced FOUR unbuildable commits on

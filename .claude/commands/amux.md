@@ -300,17 +300,21 @@ that it now works.
 
 ## Telegram
 
-> **NOT LIVE ON THIS SERVER YET.** Telegram is still open PR #170 as of
-> 2026-09-01, and none of the routes below are in the running route table:
-> `/api/telegram/status`, `/api/telegram/send`, `/api/telegram/mappings`,
-> `/api/connectors/telegram/credentials` all answer 404 today. Verified against
-> `GET /api/debug/routes` (318 routes) rather than assumed.
+> **MERGED UPSTREAM, NOT LIVE ON THIS SERVER YET.** PR #170 merged to
+> origin/main on 2026-09-02 as `4526787a`. It is still not running here, and the
+> distinction matters because this checkout builds its own HEAD: local main is 66
+> commits behind origin, so the binary serving this box does not contain the
+> connector.
 >
-> This section belongs with the three in "Not yet deployed" above and escaped
-> that list; the note there even cites the "Gmail/Telegram pattern" as though
-> Telegram had shipped. Read everything below as the shape it WILL have, and
-> promote it into a real section when #170 lands rather than deleting this
-> banner, exactly as that section instructs.
+> Verified rather than assumed, the same way the previous version of this banner
+> was: `GET /api/debug/routes` returns 319 routes and ZERO of them are telegram,
+> `/api/telegram/status` answers 404, and `/api/health` reports commit
+> 3fe9a8cff99a, which predates the merge.
+>
+> So read everything below as the shape it HAS upstream and WILL have here. This
+> banner comes off when the routes appear in `/api/debug/routes` on this server,
+> not when the PR closed. Promote the section then, rather than deleting the
+> banner, exactly as the "Not yet deployed" section instructs.
 
 Bot connector — **inbound** via long-polling
 (`runtime_jobs::telegram_poll`; `GET /api/telegram/status` reports

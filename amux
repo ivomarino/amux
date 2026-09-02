@@ -3234,6 +3234,11 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
   amux board import gh:owner/repo#N [--workspace W] [--project P]
                                    Import GH issue as board task(s)
   amux board progress <ID> <msg>   Add progress note (posts to GH if linked)
+                                   APPENDS. Use this, or the API's desc_append
+                                   BODY field, to add to a card a peer is also
+                                   writing: a whole-desc PATCH is last-write-wins
+                                   and leaves no diff to inspect (MG-1599).
+                                   desc_append is a body field, not a sub-path.
 EOF
       return $_rc
       ;;

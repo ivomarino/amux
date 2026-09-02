@@ -281,6 +281,40 @@ def check_envs(retries=1):
     return last
 
 
+def restart_stopped_workers(env_result):
+    """Restart plan-declared workers a recreate left stopped (AC-407).
+
+    A container recreate — deploy `recreate=yes`, a per-workspace admin recreate,
+    or a host reboot — stops every tmux session, and the rust server does not
+    restore them (it has no AMUX_AUTOSTART_SESSIONS). Until the server grows that,
+    the persona suite is the only thing that notices, and it only WARNs. This
+    restarts exactly the DECLARED workers that are present-but-stopped, which
+    restores the env's OWN configured set rather than imposing one (ethos rule 8:
+    a declared persona a recreate knocked down is continuity, not a new decision),
+    over the container's internal API via SSH. Returns [(worker, http_code)].
+
+    Verified by hand 2026-09-01 on capital-express (org_37aa…, recreated 17:14 by a
+    non-deploy op): POST /api/sessions/<name>/start -> 202, workers returned to idle."""
+    org = env_result.get("org_id")
+    stopped = [p["name"] for p in env_result.get("personas", [])
+               if p.get("present") and not p.get("running")]
+    if not org or not stopped:
+        return []
+    c = "amux-user-%s" % org
+    done = []
+    for name in stopped:
+        # Internal rust port is 8822 in every container (compose maps <ext>:8822).
+        out = ssh(
+            "import subprocess;"
+            "print(subprocess.run(['docker','exec',%r,'bash','-lc',"
+            "'curl -sk -o /dev/null -w \"%%{http_code}\" -X POST "
+            "https://localhost:8822/api/sessions/%s/start'],"
+            "capture_output=True,text=True,timeout=30).stdout.strip())" % (c, name),
+            timeout=45)
+        done.append((name, (out or "").strip()[:12]))
+    return done
+
+
 def check_deploy_freshness():
     """Is the cloud image behind origin/main, and WHY (AC-344). The auto-deploy
     (deploy-cloud.yml) is gated on green rust CI via workflow_run, so when main CI
@@ -501,6 +535,18 @@ def main():
                 _bad = ["%s (%s)" % (r0.get("env"), "; ".join(r0.get("reasons") or []))
                         for r0 in _env.get("results", []) if r0.get("status") == "FAIL"]
                 env_problem = ("%d customer env FAILURE(s)" % _failed, " | ".join(_bad)[:600])
+            # SELF-HEAL: a recreate left declared workers stopped (AC-407). Restart
+            # them here rather than only WARNing, so a per-workspace recreate no
+            # longer needs a hand on the box. Runs unless --no-fix; a no-op when
+            # every declared worker is already running.
+            if not no_fix:
+                for r0 in _env.get("results", []):
+                    restarted = restart_stopped_workers(r0)
+                    if restarted:
+                        ok_ct = sum(1 for _, code in restarted if code in ("200", "202"))
+                        trace("restart_workers", "%s: %s" % (
+                            r0.get("stem"), ", ".join("%s->%s" % (n, c) for n, c in restarted)),
+                            ok_ct == len(restarted))
         # Orphaned (DB-less) running containers — a deploy resurrection self-announces here.
         result["orphans"] = check_orphans()
         _orph = result["orphans"].get("orphans") or []

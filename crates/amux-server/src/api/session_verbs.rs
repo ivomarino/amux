@@ -11027,6 +11027,9 @@ pub async fn steer_deliver_loop(state: AppState) {
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        // Fleet-wide cross-group default (AMUX-4018). GET is open; PUT is
+        // owner-only, enforced in the handler.
+        .route("/api/config/cross-group", axum::routing::get(get_cross_group_config).put(put_cross_group_config))
         .route("/api/sessions/{name}", any(session_root_handler))
         // A WARN nobody can query is the same gap one layer out: this is
         // where a sweep or an autofix loop asks "did anything get delivered
@@ -12821,11 +12824,24 @@ fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, Strin
     if !og.is_disjoint(&tg) {
         return Ok("same-group");
     }
-    let env_t = parse_env(target);
-    if matches!(
-        env_t.get("CC_RECEIVE_ANY").map(|v| v.trim().trim_matches('"').to_lowercase()).as_deref(),
-        Some("1") | Some("true") | Some("yes")
-    ) {
+    // RESOLVED WORKER > GROUP > GLOBAL, not read from the worker file alone
+    // (AMUX-4015). Both switches below are POLICY — a standing order about who
+    // may talk to whom — and AMUX-2930 already established that policy read
+    // through `parse_env` is the ethos-rule-1 shape: `/api/scope` advertises
+    // `env` at all three levels and the Scope tab writes all three, so a
+    // group-level or global `CC_SEND_ALLOW` saved cleanly and changed nothing,
+    // because this gate only ever consulted `sessions/<worker>.env`.
+    //
+    // Using the same resolver `continuation_required` uses means a setting means
+    // the same thing to this gate as it does inside the lane's own shell.
+    let home = crate::config::amux_home();
+    let truthy = |v: Option<String>| {
+        matches!(
+            v.map(|x| x.trim().trim_matches('"').to_lowercase()).as_deref(),
+            Some("1") | Some("true") | Some("yes")
+        )
+    };
+    if truthy(scoped_setting_in(&home, target, "CC_RECEIVE_ANY")) {
         return Ok("receiver-open");
     }
     // REPLY EXEMPTION. Ethan's objection was to a lane BROADCASTING across groups
@@ -12841,8 +12857,7 @@ fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, Strin
     if recently_contacted_by(target, origin) {
         return Ok("reply-to-inbound");
     }
-    let allow: Vec<String> = parse_env(origin)
-        .get("CC_SEND_ALLOW")
+    let allow: Vec<String> = scoped_setting_in(&home, origin, "CC_SEND_ALLOW")
         .map(|v| v.split(',').map(|t| t.trim().trim_matches('"').to_lowercase()).filter(|t| !t.is_empty()).collect())
         .unwrap_or_default();
     if allow.iter().any(|a| a == "*") || allow.iter().any(|a| tg.contains(a)) {
@@ -12853,9 +12868,14 @@ fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, Strin
     };
     Err(format!(
         "cross-group send refused: {origin} [{}] -> {target} [{}]. Worker-to-worker \
-         messaging is intra-group unless explicitly configured. To allow it: set \
-         CC_SEND_ALLOW on {origin} (comma-separated groups, or *), or CC_RECEIVE_ANY=1 \
-         on {target} if it is a fleet-wide routing target. A human send is never \
+         messaging is intra-group unless explicitly configured. To allow it \
+         STANDING (no per-message approval): set CC_SEND_ALLOW on {origin} \
+         (comma-separated groups, or *), or CC_RECEIVE_ANY=1 on {target} if it is a \
+         fleet-wide routing target. BOTH RESOLVE worker > group > global, so the \
+         Scope tab can set them for this one worker, for its whole group, or \
+         fleet-wide, and a worker-level value overrides a group or global one \
+         (AMUX-4015). For a ONE-OFF instead, this refusal mints a grant the owner \
+         approves from the dashboard. A human send is never \
          restricted — this applies only to sends carrying a worker origin. For a \
          cross-group HANDOFF, use the board on a card owned by {target}: \
          `amux board progress <CARD> --stdin` notifies the owner at their next turn, \
@@ -12863,6 +12883,87 @@ fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, Strin
          bare desc PATCH records without notifying).",
         fmt(&og), fmt(&tg)
     ))
+}
+
+/// GET /api/config/cross-group — the FLEET-WIDE default for cross-group sends.
+///
+/// Reports the resolved global value plus whether the gate is enforcing at all,
+/// because those are different facts and only one of them is a policy choice:
+/// `AMUX_GROUP_SEND_ENFORCE=0` switches the whole gate OFF, which also disables
+/// the isolated-target protection and stops emitting the refusal events. A
+/// global allowance leaves the gate running and simply grants every lane, so
+/// isolation still holds and every crossing is still auditable. The UI offers
+/// the second; this endpoint reports both so an operator can see when the first
+/// one is what is really in effect.
+async fn get_cross_group_config() -> Response {
+    let home = crate::config::amux_home();
+    let global = crate::config::parse_env_file(&home.join("amux.env"))
+        .get("CC_SEND_ALLOW")
+        .map(|v| v.trim().trim_matches('"').to_string())
+        .unwrap_or_default();
+    let enforcing = std::env::var("AMUX_GROUP_SEND_ENFORCE")
+        .map(|v| !matches!(v.trim(), "0" | "false" | "no"))
+        .unwrap_or(true);
+    j200(json!({
+        "default_allow": global,
+        "enabled": !global.is_empty(),
+        // Named separately and never folded into `enabled`: a reader who turns
+        // the toggle off while enforcement is disabled would otherwise believe
+        // they had closed a door that is not there.
+        "gate_enforcing": enforcing,
+        "note": if enforcing {
+            "the gate is active; this default grants every worker a standing allowance"
+        } else {
+            "AMUX_GROUP_SEND_ENFORCE is off, so ALL cross-group sends pass regardless of this setting"
+        },
+    }))
+}
+
+/// PUT /api/config/cross-group — set the fleet-wide default.
+///
+/// OWNER ONLY, the same rule `/api/scope` applies to its global layer: a session
+/// that could write this could grant ITSELF and every peer a standing
+/// cross-group channel, which is the escalation the scope policy exists to stop.
+/// A request carrying no worker origin is the dashboard.
+async fn put_cross_group_config(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    if ["x-amux-session", "x-amux-worker"].iter().any(|h| {
+        headers.get(*h).and_then(|v| v.to_str().ok()).is_some_and(|s| !s.trim().is_empty())
+    }) {
+        return jresp(StatusCode::FORBIDDEN, json!({
+            "error": "a worker may not set the fleet-wide cross-group default",
+            "why": "this grants EVERY lane a standing allowance, so a session writing it \
+                    would be granting itself and its peers new capability. Same rule \
+                    /api/scope applies to the global layer.",
+            "how": "set it from the dashboard, or per worker via PATCH /api/sessions/{name}/config",
+        }));
+    }
+    let b = body.map(|Json(v)| v).unwrap_or(Value::Null);
+    let allow = b.get("allow").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let home = crate::config::amux_home();
+    let f = home.join("amux.env");
+    let mut cfg = EnvFile::load(&f);
+    cfg.set("CC_SEND_ALLOW", &allow);
+    if cfg.write(&f).is_err() {
+        return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write amux.env"}));
+    }
+    tracing::warn!(
+        default_allow = %allow,
+        "config: FLEET-WIDE cross-group default changed (global CC_SEND_ALLOW)"
+    );
+    j200(json!({
+        "ok": true,
+        "default_allow": allow,
+        "enabled": !allow.is_empty(),
+        // A worker-level value still overrides this, so the honest message says
+        // "default" rather than implying it settles every lane.
+        "message": if allow.is_empty() {
+            "cross-group sends are refused by default again; per-worker allowances still apply"
+        } else if allow == "*" {
+            "every worker may now send to any group by default, no approval needed"
+        } else {
+            "workers may now send to the listed groups by default"
+        },
+    }))
 }
 
 /// The message id a send answers with (Ethan 2026-08-11: "we should have all
@@ -15912,6 +16013,62 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
         }));
     }
 
+    // SPANS GROUPS (AMUX-4016): the per-worker standing allowance, written as
+    // the env key `CC_SEND_ALLOW` — the environment primitive the gate already
+    // reads, not a new store.
+    //
+    // Two shapes on purpose:
+    //   `spans_groups: true`      -> "*", may reach any group
+    //   `send_allow: "gtm,canvas"` -> exactly those groups
+    // A bare toggle covers the common case; the string covers "these, not all",
+    // which a checkbox cannot express and which is the honest default for a
+    // permission.
+    //
+    // WRITES THE WORKER LAYER ONLY. Group and global layers are the Scope tab's
+    // to set, and silently writing one from a per-worker menu would change every
+    // lane in that group from a control labelled with one worker's name.
+    if body.get("spans_groups").is_some() || body.get("send_allow").is_some() {
+        let value = if let Some(sv) = body.get("send_allow").and_then(Value::as_str) {
+            sv.trim().to_string()
+        } else if py_truthy(body.get("spans_groups").unwrap_or(&Value::Null)) {
+            "*".to_string()
+        } else {
+            String::new()
+        };
+        cfg.set("CC_SEND_ALLOW", &value);
+        if cfg.write(&f).is_err() {
+            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+        }
+        // Resolved AFTER the write, so the answer is what the gate will actually
+        // enforce rather than what was just typed — a group or global layer can
+        // still grant this lane even when its own value is now empty, and
+        // reporting "off" there would be a lie the next send disproves.
+        let effective = scoped_setting_in(&crate::config::amux_home(), name, "CC_SEND_ALLOW")
+            .unwrap_or_default();
+        let effective = effective.trim().trim_matches('"').to_string();
+        tracing::info!(
+            session = %name, send_allow = %value, effective = %effective,
+            "config: cross-group standing allowance set (CC_SEND_ALLOW)"
+        );
+        return j200(json!({
+            "ok": true,
+            "spans_groups": !effective.is_empty(),
+            "send_allow": value,
+            "effective": effective,
+            // Applies to the NEXT send, not at spawn: the gate resolves this on
+            // every send rather than caching it at launch, so no restart.
+            "message": if effective.is_empty() {
+                "cross-group sends refused again for this worker".to_string()
+            } else if value.is_empty() {
+                format!("worker value cleared, but a group or global layer still grants: {effective}")
+            } else if effective == "*" {
+                "this worker may now send to any group, no approval needed".to_string()
+            } else {
+                format!("this worker may now send to: {effective}")
+            },
+        }));
+    }
+
     // Branch (py:76679).
     if let Some(bv) = body.get("branch") {
         cfg.set("CC_BRANCH", bv.as_str().unwrap_or("").trim());
@@ -16513,6 +16670,82 @@ mod tests {
     /// Ethan, 2026-08-11: worker-to-worker messaging is intra-group unless
     /// explicitly configured. The escapes must be CONFIG — a body flag any
     /// caller could set would make the rule advisory.
+    /// CONFIGURE A WORKER (OR A WHOLE GROUP) TO SPAN GROUPS, WITHOUT A
+    /// PER-MESSAGE APPROVAL (AMUX-4015).
+    ///
+    /// `CC_SEND_ALLOW` and `CC_RECEIVE_ANY` were read through `parse_env`, which
+    /// reads `sessions/<worker>.env` and nothing else. `/api/scope` has always
+    /// advertised `env` at global/group/worker and the Scope tab writes all
+    /// three, so setting either switch at the GROUP or GLOBAL layer saved a file
+    /// this gate never opened: it appeared to work and changed nothing. That is
+    /// AMUX-2930's shape, still live for these two keys.
+    ///
+    /// These cells pin the three layers. Without the fix the first two fail and
+    /// the third passes, which is exactly how the bug hid.
+    #[test]
+    fn a_standing_cross_group_allowance_resolves_at_worker_group_and_global() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        let groups = dir.path().join("env");
+        std::fs::create_dir_all(&sessions).expect("mkdir");
+        std::fs::create_dir_all(&groups).expect("mkdir");
+        let w = |n: &str, body: &str| {
+            std::fs::write(sessions.join(format!("{n}.env")), body).expect("write")
+        };
+
+        w("roamer", "CC_TAGS=\"customers\"\n");
+        w("target", "CC_TAGS=\"gtm\"\n");
+        // Baseline: no configuration anywhere, so it is refused.
+        assert!(cross_group_send_ok("roamer", "target").is_err(), "premise: refused unconfigured");
+
+        // GROUP LAYER on the SENDER's group. This is the "configure it once for
+        // the group" case, and before the fix it did nothing at all.
+        std::fs::write(groups.join("customers.env"), "CC_SEND_ALLOW=\"gtm\"\n").expect("write");
+        assert_eq!(
+            cross_group_send_ok("roamer", "target").expect("group layer must grant"),
+            "sender-allowlist"
+        );
+
+        // GLOBAL LAYER on the RECEIVER. A fleet-wide routing target, declared
+        // once rather than per worker.
+        std::fs::remove_file(groups.join("customers.env")).expect("rm");
+        assert!(cross_group_send_ok("roamer", "target").is_err(), "control: grant withdrawn");
+        std::fs::write(dir.path().join("amux.env"), "CC_RECEIVE_ANY=1\n").expect("write");
+        assert_eq!(
+            cross_group_send_ok("roamer", "target").expect("global layer must grant"),
+            "receiver-open"
+        );
+
+        // WORKER LAYER still wins, so a global standing order can be turned OFF
+        // for one lane. Without this, "configure workers individually" would only
+        // ever mean "add", never "except this one".
+        std::fs::remove_file(dir.path().join("amux.env")).expect("rm");
+        w("roamer", "CC_TAGS=\"customers\"\nCC_SEND_ALLOW=\"*\"\n");
+        assert_eq!(
+            cross_group_send_ok("roamer", "target").expect("worker layer must grant"),
+            "sender-allowlist"
+        );
+    }
+
+    /// An ISOLATED target stays unreachable no matter how the SENDER is
+    /// configured. Isolation is a fact about what the TARGET can receive — a raw
+    /// agent has the harness stripped — so a sender-side allowance must not
+    /// override it, or a standing order would deliver into a lane that cannot
+    /// process the message. Named here because it is the one case a reader will
+    /// expect `CC_SEND_ALLOW="*"` to cover, and it deliberately does not.
+    #[test]
+    fn a_sender_allowance_does_not_override_the_targets_isolation() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("mkdir");
+        std::fs::write(sessions.join("roamer.env"), "CC_TAGS=\"a\"\nCC_SEND_ALLOW=\"*\"\n").unwrap();
+        std::fs::write(sessions.join("raw.env"), "CC_TAGS=\"b\"\nCC_ISOLATED=1\n").unwrap();
+        let err = cross_group_send_ok("roamer", "raw").expect_err("isolation must hold");
+        assert!(err.contains("isolated"), "and must say why: {err}");
+    }
+
     #[test]
     fn cross_group_sends_are_refused_unless_configured() {
         let dir = tempfile::tempdir().expect("tmp");
