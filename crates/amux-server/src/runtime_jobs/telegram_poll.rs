@@ -23,7 +23,25 @@
 //!   sends — attribution travels with the text, not out-of-band).
 //! - Any other text from an UNLINKED chat: a one-line nudge back to
 //!   `/link <session>`, never silently dropped (ethos rule 3: the honest
-//!   refusal beats the quiet nothing).
+//!   refusal beats the quiet nothing) — UNLESS the chat is a group, in which
+//!   case it stays silent (see below).
+//!
+//! # Groups (migration 0054)
+//!
+//! Telegram hands a `chat_id` to a group exactly like a private chat, so the
+//! flow above technically already worked for one — with no gate and no
+//! filtering, meaning `/link` in an arbitrary group would forward every
+//! message from every member. Two rules on top, both group-only:
+//!
+//! - `/link` in a group only succeeds if the target session ALREADY has a
+//!   private link (`db::telegram::has_private_link`) — proves whoever links
+//!   the group already controls a private line to that session first.
+//! - Once linked, only a message that `@session-name`-mentions a known lane
+//!   is delivered; every other message in the group (an unlinked group's
+//!   messages too) is silently ignored — no reply, no nudge. A group's
+//!   ordinary chatter between humans is not a mistake to correct, and an
+//!   unlinked-nudge reply would also advertise the chat_id's reachability to
+//!   the whole group before the eligibility gate is even relevant.
 //!
 //! # Outbound (session -> Telegram)
 //!
@@ -70,6 +88,12 @@ pub struct Report {
     pub last_error: Option<String>,
     pub messages_routed: u64,
     pub messages_unlinked: u64,
+    /// Messages in a linked GROUP chat that were silently ignored because
+    /// they did not @mention a known lane (migration 0054). Silent to the
+    /// sender is the point — a group's ordinary chatter must not bounce a
+    /// reply — but silent to a sweep would be exactly the failure mode
+    /// AF-38/the two-fix rule exists to prevent, so it counts here instead.
+    pub messages_group_ignored: u64,
 }
 
 static REPORT: OnceLock<Mutex<Report>> = OnceLock::new();
@@ -94,6 +118,10 @@ fn record_routed() {
 
 fn record_unlinked() {
     report_slot().lock().expect("telegram report lock poisoned").messages_unlinked += 1;
+}
+
+fn record_group_ignored() {
+    report_slot().lock().expect("telegram report lock poisoned").messages_group_ignored += 1;
 }
 
 /// The loop. Never returns — matches every other `spawn_loop` job (gcal-sync,
@@ -180,6 +208,13 @@ async fn handle_update(state: &AppState, update: &Value) {
     let Some(chat_id) = msg.get("chat").and_then(|c| c.get("id")).and_then(Value::as_i64) else {
         return;
     };
+    // "private" | "group" | "supergroup" | "channel" — Telegram sends this on
+    // every message, so there is never a moment where the type is unknown.
+    // Default "private" only covers a malformed/missing field, never a real
+    // group (which always carries its own type), so it cannot be used to
+    // sneak a group past the eligibility gate below.
+    let chat_type = msg.get("chat").and_then(|c| c.get("type")).and_then(Value::as_str).unwrap_or("private");
+    let is_group = chat_type == "group" || chat_type == "supergroup";
     let text = msg.get("text").and_then(Value::as_str).unwrap_or("").trim().to_string();
     let username = msg
         .get("from")
@@ -191,7 +226,7 @@ async fn handle_update(state: &AppState, update: &Value) {
     }
 
     if let Some(session) = text.strip_prefix("/link ").map(str::trim) {
-        link_chat(state, chat_id, session, username.as_deref()).await;
+        link_chat(state, chat_id, session, username.as_deref(), chat_type).await;
         return;
     }
 
@@ -200,6 +235,17 @@ async fn handle_update(state: &AppState, update: &Value) {
         tg_db::by_chat(&conn, chat_id).ok().flatten()
     };
     let Some(mapping) = mapping else {
+        // A linked GROUP is common ground (everyone in it can see this), but
+        // an UNLINKED group replying "not linked, send /link" to every
+        // stray message from every member would be its own noise problem —
+        // and worse, it would advertise that this chat_id is reachable at
+        // all to anyone in the group, before the eligibility gate below is
+        // even relevant. Stay silent in an unlinked group; the private-chat
+        // nudge is unchanged (a 1:1 chat has exactly one person to nudge).
+        if is_group {
+            record_group_ignored();
+            return;
+        }
         record_unlinked();
         send_reply(chat_id, "Not linked to any amux session yet. Send `/link <session-name>` first.").await;
         return;
@@ -225,6 +271,21 @@ async fn handle_update(state: &AppState, update: &Value) {
             // Valid lane mention found
             let remaining = if parts.len() > 1 { parts[1] } else { "" };
             (mention.to_string(), remaining.to_string())
+        } else if mapping.is_group() {
+            // A GROUP typo gets no fallback delivery and no reply — unlike
+            // the private-chat arm below, guessing "deliver to the default
+            // anyway" here means every mistyped @mention from anyone in the
+            // group forwards their message to a session they may not have
+            // meant to address at all, which is exactly the noise the
+            // mention-only rule exists to prevent. Still WARN (sweep-
+            // catchable) so a real typo pattern is findable without being a
+            // per-message reply in a chat full of humans.
+            tracing::warn!(
+                "telegram_poll: unknown lane mention '@{}' from GROUP chat {}, message ignored (not forwarded)",
+                mention, chat_id
+            );
+            record_group_ignored();
+            return;
         } else {
             // Invalid mention: still deliver the whole text to the default
             // session (never silently dropped — ethos rule 3), but a typo'd
@@ -249,6 +310,13 @@ async fn handle_update(state: &AppState, update: &Value) {
             send_reply(chat_id, &reply).await;
             (mapping.session.clone(), text.to_string())
         }
+    } else if mapping.is_group() {
+        // GROUP, no @mention at all: a linked group must not forward every
+        // message from every member, only ones deliberately addressed to a
+        // lane. Silent, not a reply: a group's ordinary chatter is not a
+        // mistake to correct.
+        record_group_ignored();
+        return;
     } else {
         (mapping.session.clone(), text.to_string())
     };
@@ -288,7 +356,7 @@ async fn handle_update(state: &AppState, update: &Value) {
     }
 }
 
-async fn link_chat(state: &AppState, chat_id: i64, session: &str, username: Option<&str>) {
+async fn link_chat(state: &AppState, chat_id: i64, session: &str, username: Option<&str>, chat_type: &str) {
     if session.is_empty() {
         send_reply(chat_id, "Usage: /link <session-name>").await;
         return;
@@ -302,17 +370,52 @@ async fn link_chat(state: &AppState, chat_id: i64, session: &str, username: Opti
         .await;
         return;
     }
+    let is_group = chat_type == "group" || chat_type == "supergroup";
+    if is_group {
+        // Eligibility gate (Ethan, 2026-09-02): a group may only link to a
+        // session that already has a private link — proves whoever is
+        // linking the group already controls a private line to that
+        // session, before it becomes reachable from everyone else in the
+        // group. Checked here, not just at the API layer, because this is
+        // the path an actual Telegram user actually reaches.
+        let already_private = match state.store.read() {
+            Ok(conn) => tg_db::has_private_link(&conn, session).unwrap_or(false),
+            Err(_) => false,
+        };
+        if !already_private {
+            send_reply(
+                chat_id,
+                &format!(
+                    "'{session}' has no private link yet — message the bot directly and \
+                     send `/link {session}` there first, then this group link is allowed."
+                ),
+            )
+            .await;
+            return;
+        }
+    }
     let session_owned = session.to_string();
     let username_owned = username.map(str::to_string);
+    let chat_type_owned = chat_type.to_string();
     let stored = state
         .store
         .write_async(move |conn| {
-            tg_db::upsert(conn, chat_id, &session_owned, username_owned.as_deref())?;
+            tg_db::upsert(conn, chat_id, &session_owned, username_owned.as_deref(), &chat_type_owned)?;
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         })
         .await
         .map_err(|e| e.to_string());
     match stored {
+        Ok(_) if is_group => {
+            send_reply(
+                chat_id,
+                &format!(
+                    "Linked. Only messages here that start with @{session} go to it — \
+                     everything else in this group is ignored."
+                ),
+            )
+            .await
+        }
         Ok(_) => send_reply(chat_id, &format!("Linked. Messages here now go to '{session}'.")).await,
         Err(e) => {
             tracing::warn!("telegram_poll: link write failed for chat {chat_id}: {e}");

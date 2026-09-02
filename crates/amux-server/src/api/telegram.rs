@@ -66,10 +66,22 @@ async fn list_mappings(State(state): State<AppState>) -> Response {
     }
 }
 
+fn default_chat_type() -> String {
+    "private".to_string()
+}
+
 #[derive(Deserialize)]
 struct CreateMappingReq {
     chat_id: i64,
     session: String,
+    /// Optional — defaults to "private". This is the admin/API path
+    /// (`/link` from the chat itself always knows the real type from
+    /// Telegram's own update payload), so an operator manually pre-linking a
+    /// group chat_id must say so explicitly; silently defaulting a manual
+    /// link to "group" would be guessing at the one thing the group-linking
+    /// eligibility gate exists to not guess about.
+    #[serde(default = "default_chat_type")]
+    chat_type: String,
 }
 
 /// Manual mapping creation — mirrors what `/link <session>` does from the
@@ -87,18 +99,42 @@ async fn create_mapping(State(state): State<AppState>, Json(body): Json<CreateMa
             json!({ "error": "no such session", "session": body.session, "known": known }),
         );
     }
+    let is_group = body.chat_type == "group" || body.chat_type == "supergroup";
+    if is_group {
+        // Same eligibility gate as /link in a group chat (Ethan, 2026-09-02):
+        // enforced HERE too, not just in telegram_poll's Telegram-side
+        // handler — a security-relevant invariant with a bypass on one of
+        // its two entry paths is not the invariant, it is that invariant
+        // minus whichever path skipped it.
+        let already_private = match state.store.read() {
+            Ok(conn) => tg_db::has_private_link(&conn, &body.session).unwrap_or(false),
+            Err(_) => false,
+        };
+        if !already_private {
+            return err(
+                StatusCode::CONFLICT,
+                json!({
+                    "error": format!(
+                        "session '{}' has no existing private Telegram link — link it privately first, then a group link is allowed",
+                        body.session
+                    ),
+                }),
+            );
+        }
+    }
     let chat_id = body.chat_id;
     let session = body.session.clone();
+    let chat_type = body.chat_type.clone();
     let result = state
         .store
         .write_async(move |conn| {
-            tg_db::upsert(conn, chat_id, &session, None)?;
+            tg_db::upsert(conn, chat_id, &session, None, &chat_type)?;
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         })
         .await
         .map_err(|e| e.to_string());
     match result {
-        Ok(_) => (StatusCode::OK, Json(json!({ "chat_id": body.chat_id, "session": body.session }))).into_response(),
+        Ok(_) => (StatusCode::OK, Json(json!({ "chat_id": body.chat_id, "session": body.session, "chat_type": body.chat_type }))).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
     }
 }
