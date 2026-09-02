@@ -1466,6 +1466,62 @@ fn self_owned_backlog_blockers(conn: &Connection, dep_ids: &[String], session: &
         .collect()
 }
 
+/// An abandoned `doing` card holding a lane's only WIP slot (AMUX-4042).
+///
+/// THIS IS THE ONE PLACE amux CHANGES A CARD'S STATUS WITHOUT THE OWNER, and
+/// Ethan chose it deliberately on 2026-09-02 over escalating to `needsyou`, so
+/// the guards are the argument for why it is safe.
+///
+/// The stall it ends: byo-ray held BR-51 in `doing` for 42 hours with no
+/// `next_action` while 5 todo cards sat unclaimable behind it. The drive had
+/// already done everything it is designed to do — it detected the stall and
+/// nudged three times — and then stopped, correctly, because "repeating the
+/// prompt is not the fix". After that there was no next move at all.
+///
+/// NOT MG-1388's case, which is the incident that made this module
+/// surface-don't-mutate: there, auto-promotion re-activated a card five times
+/// against its owner's EXPLICIT re-park. A park is a decision; an abandoned
+/// claim is the absence of one. Returning a card the lane stopped working is
+/// not overriding a choice, and `todo` is where it already was.
+///
+/// Four guards, each load-bearing:
+///  1. The caller has already established the lane is at a TURN BOUNDARY —
+///     `drive_lane` skips `mid-turn` before pickup ever runs — so this can
+///     never take a card from a lane that is working it.
+///  2. The card has been UNTOUCHED for `doing_reclaim_s`, so a card being
+///     actively edited is not eligible however long it has been open.
+///  3. The lane must have work it could actually claim, or reclaiming buys
+///     nothing and only churns the board.
+///  4. `needs:you` and dormant types are excluded upstream by the same query
+///     that decides what holds WIP, so a card parked ON A HUMAN is never taken.
+fn reclaim_stale_doing(
+    conn: &Connection,
+    now: f64,
+    holding: &[String],
+    eligible: i64,
+) -> Option<Pickup> {
+    // GUARD 3: nothing to unblock means nothing to gain.
+    if eligible <= 0 {
+        return None;
+    }
+    let cutoff = doing_reclaim_s();
+    for id in holding {
+        let Ok(Some(row)) = bs::get_issue(conn, id) else { continue };
+        // GUARD 2: `updated` moves on any edit — a note, a status log line, a
+        // next_action. Untouched is the honest reading of abandoned.
+        let idle_s = now - row.updated as f64;
+        if idle_s < cutoff {
+            continue;
+        }
+        return Some(Pickup::ReclaimStale {
+            card: id.clone(),
+            held_h: idle_s / 3600.0,
+            blocking: eligible.max(0) as usize,
+        });
+    }
+    None
+}
+
 /// The dependency promotion that must NOT wait for a free WIP slot (AMUX-4040).
 ///
 /// PROMOTING A DEPENDENCY IS NOT DISPATCHING WORK. It moves a self-owned
@@ -2096,8 +2152,22 @@ pub enum Pickup {
     /// `blocked_card` is the todo that was waiting; `promoted` are the backlog
     /// ids that were promoted. The lane receives no nudge — it just gets work.
     PromoteDeps { blocked_card: String, promoted: Vec<String> },
+    /// An ABANDONED `doing` card, returned to `todo` so it stops holding the
+    /// lane's WIP slot (AMUX-4042). `held_h` is how long it went untouched.
+    ReclaimStale { card: String, held_h: f64, blocking: usize },
     /// Nothing to do, with the reason and the detail for the trace.
     None { reason: &'static str, detail: String },
+}
+
+/// How long a `doing` card may go UNTOUCHED before a lane that is idle at a
+/// turn boundary has it taken back (AMUX-4042). Generous by default: the point
+/// is abandonment, not slowness.
+pub(crate) fn doing_reclaim_s() -> f64 {
+    std::env::var("AMUX_DOING_RECLAIM_S")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(6.0 * 3600.0)
 }
 
 /// Age-weighted pickup scoring (AMUX-3779). Default ON; `AMUX_PICKUP_SCORING=0`
@@ -2277,6 +2347,15 @@ pub fn select_pickup_with(
         // This promotion claims nothing and takes no slot; skipping it is what
         // let rtsp-connection hold 13 todo cards it could never advance.
         if let Some(p) = promote_blocked_self_owned_deps(conn, session, now) {
+            return p;
+        }
+        // AMUX-4042: and if the slot is held by a card nobody has touched, take
+        // it back. Ordered AFTER the promotion on purpose — promoting is
+        // reversible and touches only a parked card, so it gets first refusal;
+        // reclaiming moves someone's claimed card and is the last resort.
+        if let Some(p) =
+            reclaim_stale_doing(conn, now, &holding, eligible_todo_count(conn, session, now))
+        {
             return p;
         }
         return Pickup::None {
@@ -4537,6 +4616,68 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                     lane,
                     "promote-deps-err",
                     format!("write failed promoting deps of {blocked_card}: {e}"),
+                )
+                .with_counts(eligible, open),
+            }
+        }
+        Pickup::ReclaimStale { card, held_h, blocking } => {
+            // AMUX-4042. `expected_from: doing` makes this a CAS: if the lane
+            // touched the card between select and write, the advance does not
+            // apply and we say so rather than silently taking it anyway.
+            let card_c = card.clone();
+            let line = format!(
+                "auto-reclaimed: untouched {held_h:.1}h while the lane sat idle at a turn \
+                 boundary, holding the WIP slot against {blocking} claimable card(s)"
+            );
+            let result = state
+                .store
+                .write_async(move |conn| {
+                    let opts = crate::db::advance::AdvanceOpts {
+                        expected_from: Some("doing".into()),
+                        skip_continuation: true,
+                        log_line: Some(line.clone()),
+                        ..Default::default()
+                    };
+                    let outcome =
+                        crate::db::advance::advance(conn, &card_c, "todo", "board_drive", &opts)?;
+                    Ok(crate::db::WriteOutcome {
+                        applied: outcome.is_ok(),
+                        events: outcome.map(|o| o.events).unwrap_or_default(),
+                    })
+                })
+                .await;
+            match result {
+                Ok(o) if o.applied => {
+                    // The audit trail for the one mutation amux makes on the
+                    // owner's behalf. It has to be findable later by someone
+                    // asking "who moved my card".
+                    crate::api::session_verbs::emit_event(
+                        state,
+                        lane,
+                        "pickup.reclaimed_stale",
+                        Some(json!({"issue": card, "held_h": held_h, "blocking": blocking})),
+                        None,
+                        "board-drive",
+                    )
+                    .await;
+                    LaneTrace::acted(
+                        lane,
+                        "reclaim-stale",
+                        &card,
+                        format!("{card} untouched {held_h:.1}h -> todo; {blocking} card(s) unblocked"),
+                    )
+                    .with_counts(eligible, open)
+                }
+                Ok(_) => LaneTrace::skip(
+                    lane,
+                    "reclaim-raced",
+                    format!("{card} moved before the reclaim landed"),
+                )
+                .with_counts(eligible, open),
+                Err(e) => LaneTrace::skip(
+                    lane,
+                    "reclaim-err",
+                    format!("write failed reclaiming {card}: {e}"),
                 )
                 .with_counts(eligible, open),
             }
@@ -7393,6 +7534,83 @@ mod tests {
             Pickup::None { reason, .. } => assert_eq!(reason, "wip-cap"),
             other => panic!("another lane's backlog card is not ours to promote: {other:?}"),
         }
+    }
+
+    /// AMUX-4042. Ethan chose auto-reclaim over escalation for the case the
+    /// drive had already given up on: byo-ray held BR-51 in `doing` for 42h
+    /// with no `next_action` while 5 todos sat unclaimable, and the trace read
+    /// "advance: budget-spent (all 1 candidate(s) have spent their 3-nudge 24h
+    /// budget — repeating the prompt is not the fix)". The system was right
+    /// that nudging was exhausted and had no next move.
+    ///
+    /// Each cell below is one guard, because the whole safety argument for
+    /// amux moving somebody's card rests on them holding.
+    #[test]
+    fn an_abandoned_doing_card_is_reclaimed_but_only_under_every_guard() {
+        let stale = now_f64() - 8.0 * 3600.0; // past the 6h default
+        let setup = |touched: f64, with_todo: bool| {
+            let conn = board_db();
+            add_card(&conn, "BR-51", "lane", "doing", "abandoned", "SCOPE: x");
+            conn.execute("UPDATE issues SET updated=?1 WHERE id='BR-51'", rusqlite::params![touched as i64])
+                .expect("age the card");
+            if with_todo {
+                add_card(&conn, "BR-3", "lane", "todo", "waiting behind it", "SCOPE: x\n- [ ] y");
+            }
+            conn
+        };
+
+        // THE SPECIMEN: untouched past the window, with work waiting behind it.
+        match select_pickup_with(&setup(stale, true), "lane", now_f64(), false) {
+            Pickup::ReclaimStale { card, held_h, blocking } => {
+                assert_eq!(card, "BR-51");
+                assert!(held_h >= 6.0, "held_h must report the real idle time: {held_h}");
+                assert_eq!(blocking, 1, "and how much work it was holding up");
+            }
+            other => panic!("an abandoned card holding the only slot must be reclaimed: {other:?}"),
+        }
+
+        // GUARD 2: a card touched recently is being worked, however long it has
+        // been open. This is what stops the reclaim from racing a live lane.
+        match select_pickup_with(&setup(now_f64() - 60.0, true), "lane", now_f64(), false) {
+            Pickup::None { reason, .. } => assert_eq!(reason, "wip-cap"),
+            other => panic!("a card touched a minute ago is not abandoned: {other:?}"),
+        }
+
+        // GUARD 3: with nothing to unblock, reclaiming only churns the board.
+        match select_pickup_with(&setup(stale, false), "lane", now_f64(), false) {
+            Pickup::None { reason, .. } => assert_eq!(reason, "wip-cap"),
+            other => panic!("no claimable work means no reason to take the card: {other:?}"),
+        }
+    }
+
+    /// GUARD 4, and the one that keeps this from touching a human's card: a
+    /// `doing` card tagged `needs:you` is parked ON A PERSON. The same query
+    /// that decides what holds WIP excludes it, so it is never a reclaim
+    /// candidate — and because it does not hold WIP, the lane is not capped by
+    /// it either.
+    #[test]
+    fn a_needs_you_card_is_never_reclaimed() {
+        let conn = board_db();
+        add_card(&conn, "H-1", "lane", "doing", "waiting on a human", "SCOPE: x");
+        conn.execute(
+            "UPDATE issues SET updated=?1 WHERE id='H-1'",
+            rusqlite::params![(now_f64() - 48.0 * 3600.0) as i64],
+        )
+        .expect("age it");
+        conn.execute(
+            "INSERT INTO issue_tags (issue_id, tag) VALUES ('H-1','needs:you')",
+            [],
+        )
+        .expect("tag it");
+        add_card(&conn, "T-9", "lane", "todo", "behind it", "SCOPE: x\n- [ ] y");
+        // Any other outcome is fine — the card does not hold WIP, so the lane is
+        // free to be handed T-9. The one thing that must never happen is the
+        // reclaim.
+        let got = select_pickup_with(&conn, "lane", now_f64(), false);
+        assert!(
+            !matches!(got, Pickup::ReclaimStale { .. }),
+            "a card parked on a human must never be auto-reclaimed: {got:?}"
+        );
     }
 
     #[test]
