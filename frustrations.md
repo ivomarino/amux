@@ -3421,12 +3421,20 @@ FIX: Atomicity is defensible and I am not asking for a partial write. Say so in 
   Decorated at the ONE arm every refusal converges on, PatchOut::Refused, rather than at
   the 16 sites that build a refusal body: covering those would fix today's and miss the
   next one, which is this bug's own shape.
-  BIGGER THAN THE CARD BODY THAT PROMPTED IT. `evidence` is a writable field, so
-  `amux board done --evidence-stdin` loses the evidence on any gate refusal. That is the
-  fleet's commonest PATCH, and it hit me twice more the same day on AF-410 and AF-416.
-  One path already knew: the evidence gate's own how_to_fix advises "writable on its own,
-  so record it first and the transition cannot discard it" — a hand-written workaround for
-  the general defect, now unnecessary rather than load-bearing.
+  BIGGER THAN THE CARD BODY THAT PROMPTED IT, though not in the way I first wrote.
+  CORRECTED same day: I claimed `amux board done --evidence-stdin` loses its evidence on a
+  gate refusal. It does NOT — the CLI writes evidence as its own PATCH before the
+  transition, and says why at the site ("409 rolls back the evidence too... do not fold
+  this into the status body"). My own fix disproved my claim: the refusal I hit closing
+  AF-411 came back `discarded: []`, not `["evidence"]`.
+  What is true is the API level: `PATCH {status, evidence}` discards the evidence, proven
+  by the HTTP test and live. Anyone calling the API directly loses it.
+  AND THE CORRECTED FORM IS THE STRONGER ARGUMENT. The CLI does not avoid this defect, it
+  CARRIES A HAND-BUILT WORKAROUND FOR IT at four separate sites (amux:1761, :1779, :1825,
+  :2272), each added after someone was bitten on a different field — evidence, the typed
+  ask, the outcome, and a fourth. The comment at :1761 says so: "AC-323's shape, now on a
+  fourth field". Four independent discoveries of one silent behaviour, each paid for
+  separately and patched locally in the client. The fifth field's author now gets told.
   Mutation-verified: removing the decoration fails the HTTP wiring test; making the key
   conditional on non-empty fails the control cell.
 ---
