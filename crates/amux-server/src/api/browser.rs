@@ -944,12 +944,28 @@ async fn status() -> Response {
     // clears it — absent means "no exit recorded by this process", not "no
     // exit happened"; the field's note says so rather than letting the two
     // read identically.
-    let last_exit = chrome::LAST_EXIT.lock().expect("last-exit poisoned").clone();
+    // AF-378: fall back to the PERSISTED record when this process has none.
+    //
+    // The in-memory one is correct and short-lived. The commonest death is
+    // "killed alongside a server restart", which the adopt path records in the
+    // NEW process, so the record survives the restart that caused the death and
+    // is then erased by the NEXT one. On this box the builder swaps the server on
+    // every commit, so the explanation usually evaporates before anyone asks.
+    // Reported by tubescience: two browsers dying minutes apart, and all they saw
+    // was ConnectionRefusedError on the CDP socket.
+    //
+    // The disk copy is tagged `from_disk` by `persisted_last_exit`, so a record
+    // THIS server observed stays distinguishable from one it inherited.
+    let last_exit = chrome::LAST_EXIT
+        .lock()
+        .expect("last-exit poisoned")
+        .clone()
+        .or_else(|| chrome::persisted_last_exit(&chrome::amux_home()));
     let Some((profile, cdp_port, started_at, started_by)) = snapshot else {
         return Json(json!({
             "running": false,
             "last_exit": last_exit,
-            "last_exit_note": "in-memory: a server restart clears it; null means no exit recorded by THIS server process",
+            "last_exit_note": "in-memory first, then the persisted copy (tagged from_disk); null means no exit has been recorded at all",
             // THE COUNTERS BELONG HERE TOO (AMUX-3886 follow-up). Both used to
             // appear only in the running branch, so they vanished in exactly
             // the state they describe: a browser that died leaves `running:

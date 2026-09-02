@@ -170,7 +170,19 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
      (AMUX-3510). Global strip so a pending approval is visible on every tab;
      the approve POST comes from this browser (no worker origin), which is
      exactly what the gate defines as the human context. -->
-<div id="email-approvals-banner" style="display:none;background:#7c2d12;border-bottom:1px solid #f97316;color:#ffedd5;padding:8px 16px;font-size:0.84rem;z-index:200;position:relative;"></div>
+<!-- z-index 90 is DELIBERATE and must stay under 100 (AF-390). This is an
+     in-flow strip at the top of the document; .overlay (peek) is fixed at
+     z-index 100 and #board-detail-overlay at 150, both in the root stacking
+     context, so at 200 this painted OVER them. It occupies the same screen
+     band as the overlay, and once the strip grew past the overlay tab bar it
+     swallowed clicks on #peek-tab-customize: measured with elementFromPoint,
+     banner 246px, button at y=145, hit = a banner DIV. 10 golden e2e
+     scenarios red. AMUX-3997 is what made it grow, by putting grants in the
+     same strip as email approvals.
+     "Visible on every tab" still holds; an overlay is not a tab. If it must
+     show OVER an overlay, raising this is the wrong fix -- the overlays have
+     to start BELOW the banner instead of under it. -->
+<div id="email-approvals-banner" style="display:none;background:#7c2d12;border-bottom:1px solid #f97316;color:#ffedd5;padding:8px 16px;font-size:0.84rem;z-index:90;position:relative;"></div>
 <div id="chrome-tabs-bar" class="chrome-tabs-bar"></div>
 <div id="chrome-tab-frames" class="chrome-tab-frames"></div>
 <div class="header-row">
@@ -527,6 +539,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <button id="tab-files" onclick="switchView('files')"><span class="tab-ico">🗂</span><span class="tab-lbl">Files</span></button>
   <button id="tab-mdai" onclick="switchView('mdai')"><span class="tab-ico">&#x2726;</span><span class="tab-lbl">MDAI</span></button>
   <button id="tab-proxies" onclick="switchView('proxies')"><span class="tab-ico">⇄</span><span class="tab-lbl">Proxies</span></button>
+  <button id="tab-email" onclick="switchView('email')"><span class="tab-ico">📥</span><span class="tab-lbl">Email</span></button>
   <button id="tab-connectors" onclick="switchView('connectors')"><span class="tab-ico">🔌</span><span class="tab-lbl">Connectors</span></button>
   <button id="tab-logs" onclick="switchView('logs')"><span class="tab-ico">≡</span><span class="tab-lbl">Logs</span></button>
   <button id="tab-grid" onclick="enterGridMode()"><span class="tab-ico">▣</span><span class="tab-lbl">Workspace</span></button>
@@ -893,6 +906,27 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   </div>
 </div>
 
+<div id="email-view" style="display:none;flex-direction:column;flex:1;min-height:0;overflow-y:auto;">
+  <div style="padding:12px 16px;">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+      <div style="font-size:1.05rem;font-weight:700;">Email</div>
+      <button class="btn" onclick="_emailLoad()">Refresh</button>
+      <button class="btn" onclick="_emailThemesRefresh(this)" title="Re-infer what matters to you from your recent messages to amux">Re-learn priorities</button>
+    </div>
+    <div style="font-size:0.75rem;color:var(--dim);line-height:1.5;margin:6px 0 10px;">
+      Ranked by what amux infers you care about, learned from the messages you send it and
+      recomputed periodically with the <b>Meta-task model</b> from Settings. Scoring itself is
+      arithmetic over those themes, so opening this costs nothing.
+    </div>
+    <!-- The inference's own provenance, beside the list rather than implied by
+         it: an all-zero ranking means something different when the themes have
+         never been computed. -->
+    <div id="email-themes" class="conn-origin"></div>
+    <div id="email-subtabs" style="display:flex;gap:6px;flex-wrap:wrap;margin:8px 0;"></div>
+    <div id="email-folders" style="display:flex;gap:6px;flex-wrap:wrap;margin:0 0 10px;"></div>
+    <div id="email-list"></div>
+  </div>
+</div>
 <div id="connectors-view" style="display:none;flex-direction:column;flex:1;min-height:0;overflow-y:auto;">
   <div style="max-width:760px;width:100%;margin:0 auto;padding:16px 16px 40px;">
     <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:6px;">

@@ -24,6 +24,8 @@ pub mod file_viewer;
 pub mod files;
 pub mod fs;
 pub mod git_guard;
+pub mod email_intel;
+pub mod grants;
 pub mod gmail_auth;
 pub mod google_sa;
 pub mod groups;
@@ -241,6 +243,7 @@ pub fn router(state: AppState) -> Router {
         .merge(connectors::routes())
         .merge(secrets::routes())
         .merge(github_connector::routes())
+        .merge(grants::routes())
         .merge(self_update::routes())
         .nest("/api/proxies", proxies::routes())
         // AMUX-2888: the client controls the SPA and CLI already call. Status

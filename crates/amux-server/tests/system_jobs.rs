@@ -48,6 +48,15 @@ const ALLOWED_BARE_SPAWNS: &[(&str, &str)] = &[
          under ids::TUNNEL via registry::adopt inside tunnel::start. Registering this shot \
          would put a job on /api/system-jobs that exits immediately by design (AMUX-2888)",
     ),
+    (
+        "reconcile_on_startup",
+        "one-shot startup reconciliation moved off the bind path so the listener answers \
+         immediately instead of connection-refusing for ~88s (AMUX-3969b). It runs once, \
+         flips the `reconciled` flag /health serves, and exits; the long-lived ORCH_RUNTIME \
+         loop it hands off to registers itself via jobs::spawn_loop inside the same block. \
+         A death mid-shot is visible as `reconciled: false` on /health, so registering the \
+         shot would only add a job that exits immediately by design (same as AMUX-2888)",
+    ),
     ];
 
 /// Every `tokio::spawn(` in `src` that is not on the allow-list, returned with

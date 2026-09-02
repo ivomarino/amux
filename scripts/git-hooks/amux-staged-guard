@@ -490,6 +490,49 @@ def _render_split_risk(d, w):
         w("  %s\n" % _sr.get("why", ""))
 
 
+def _nothing_in_dispute(path):
+    """Are this path's on-disk bytes already inside a commit? (AF-391)
+
+    THE CLAIM THIS CORROBORATES. The co-edit warning below says a peer may have
+    uncommitted work in a file you are about to commit whole. When the worktree
+    bytes already equal a committed blob for the same path, there IS no
+    uncommitted work in it, so the warning is protecting nothing regardless of
+    who the attribution names. That holds whoever edited it, which is what makes
+    it stronger than the attribution it downgrades. Same reasoning as
+    `_content_is_committed` in ~/.amux/hooks/git-shared-guard.py (AMUX-3859) --
+    that guard has had this check since August and it reaches exactly one of its
+    two consumers, so the co-edit notice never got it.
+
+    WHY IT WAS WORTH ADDING. mixpeek-general, 2026-09-01: the guard named them
+    as the editor of server/.gcloudignore-ci, a file they had never opened, and
+    warned mixpeek-cicd symmetrically. They cleared it with four checks, the
+    first of which was this one: worktree identical to origin, no uncommitted
+    content at all. The guard says out loud that its claim is mtime-derived, and
+    on a shared checkout that makes the BUSIEST lane the default suspect for any
+    file whose mtime moves -- which is backwards, since that lane can least
+    afford the interruption and its own edits are elsewhere.
+
+    THREE ANSWERS, NOT TWO. `None` means the check could not run, and it must not
+    read as "there is content in dispute" nor as "there is not". A silent False
+    on a timeout is the failure this file records elsewhere (AMUX-3859's own
+    docstring makes the same point).
+    """
+    try:
+        wt = subprocess.run(["git", "hash-object", "--", path],
+                            capture_output=True, text=True, timeout=5)
+        blob = (wt.stdout or "").strip()
+        if wt.returncode != 0 or not blob:
+            return None, "could not hash the worktree copy"
+        for ref in ("HEAD", "origin/main"):
+            r = subprocess.run(["git", "rev-parse", "%s:%s" % (ref, path)],
+                               capture_output=True, text=True, timeout=5)
+            if r.returncode == 0 and (r.stdout or "").strip() == blob:
+                return True, ref
+        return False, None
+    except Exception:
+        return None, "the check errored"
+
+
 def main():
     sess = os.environ.get("AMUX_SESSION", "")
     derived = False
@@ -689,6 +732,36 @@ def main():
         # right now. That is the FACT — someone has uncommitted work in a file
         # you are about to commit whole.
         _level = "WARNING" if f.get("has_unstaged_changes") else "NOTE"
+        # AF-391: DOWNGRADE, never suppress, when the attribution is mtime-derived
+        # AND nothing is in dispute. Two conditions, both required.
+        #
+        # `_mtime_claim` is true only when the server itself says one side's
+        # evidence is inferred: an ambiguous mtime echo (`co_signal`), or the two
+        # provenances disagreeing with one being "observed". A transcript-backed
+        # co-edit on both sides is never downgraded, because that claim is not the
+        # weak one.
+        #
+        # DOWNGRADE AND NOT SUPPRESS is the whole design. The file is still named
+        # on one line, so nothing the reader could have acted on disappears; what
+        # goes is the eight lines of remedy for a dispute that does not exist. A
+        # warning this guard itself labels unreliable cost two sessions a
+        # verification each, and the honest way to spend less is to say less, not
+        # to say nothing.
+        _mtime_claim = bool(f.get("co_signal")) or (
+            f.get("mine_provenance") and f.get("their_provenance")
+            and f.get("mine_provenance") != f.get("their_provenance")
+            and "observed" in (f.get("mine_provenance"), f.get("their_provenance")))
+        _quiet = None
+        if _mtime_claim:
+            _settled, _where = _nothing_in_dispute(f.get("path") or "")
+            if _settled:
+                _quiet = _where
+        if _quiet:
+            w("amux staged-guard: NOTE — %s carries an mtime-derived co-edit claim, "
+              "NOT corroborated: its on-disk bytes are already in %s, so no uncommitted "
+              "work exists in it to absorb. Not asking you to check anything (AF-391).\n"
+              % (f.get("path"), _quiet))
+            continue
         # RECIPE CORRECTED (AC-303). This printed `git diff -U0` + `git apply
         # --cached`, and that pairing produced FOUR unbuildable commits on
         # 2026-08-08 — all the same shape, a `try:` in main() whose body came

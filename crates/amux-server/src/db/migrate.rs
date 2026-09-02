@@ -267,13 +267,19 @@ const MIGRATIONS: &[Migration] = &[
         name: "0048_issues_waiting_on",
         sql: include_str!("../../migrations/0048_issues_waiting_on.sql"),
     },
-    // Renumbered from 0033/0035 during rebases onto main (last: 2026-09-01):
-    // main's own migrations claimed those slots first, so this PR's
-    // secret_metadata migration keeps moving to the next free version.
     Migration {
         version: 49,
-        name: "0049_secret_metadata",
-        sql: include_str!("../../migrations/0049_secret_metadata.sql"),
+        name: "0049_email_annotations",
+        sql: include_str!("../../migrations/0049_email_annotations.sql"),
+    },
+    // Renumbered from 0033/0035/0049 across successive rebases onto main
+    // (last: 2026-09-02): main's own migrations kept claiming those slots
+    // first, so this PR's secret_metadata migration keeps moving to the
+    // next free version.
+    Migration {
+        version: 50,
+        name: "0050_secret_metadata",
+        sql: include_str!("../../migrations/0050_secret_metadata.sql"),
     },
 ];
 
