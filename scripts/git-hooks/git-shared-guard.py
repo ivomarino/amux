@@ -911,27 +911,61 @@ def _discard_verdict(cmd, scrubbed, run_dir):
             % (len(safe), ", ".join(h.get("path", "?") for h in safe[:5])))
     if not hits:
         return None
-    # NAME THE BLANK OWNER AS BLANK. `.get("owner", "?")` only defaults a MISSING
-    # key, so an owner that is present and empty rendered as nothing at all and
-    # the refusal claimed "another session" it could not name. A reader who goes
-    # looking for that peer and finds none stops, correctly, and is stuck.
-    who = ", ".join(sorted({(f.get("owner") or "").strip() or "an edit record with no session attached"
-                            for f in hits}))
+    # AF-423: "(unknown)" IS A PLACEHOLDER, NOT A SESSION NAME.
+    #
+    # The server sends `owner: "(unknown)"` on the shared branch when there is no
+    # peer record at all, and it sends `peer: false` beside it to say so. The
+    # staged-guard has branched on that since AF-24, in its own words: rendering
+    # the placeholder as a co-editor "asserts a co-editor who does not exist —
+    # the real fact is that YOU edited it and it has uncommitted changes". This
+    # guard never learned it, so its refusal read "(recently edited by
+    # (unknown))" and, worse, closed with "or ask (unknown) first".
+    #
+    # Measured 2026-09-02: it named a phantom co-editor on git_guard.rs whose
+    # every hunk was the committer's own, written minutes earlier.
+    #
+    # THE SAME BUG WAS ALREADY HALF-FIXED HERE and the fix made the tail
+    # nonsense: an empty owner rendered as "an edit record with no session
+    # attached", which is right in the first slot and absurd in "or ask <that>
+    # first". Both slots now come off one decision.
+    def _is_named_peer(h):
+        owner = (h.get("owner") or "").strip()
+        if owner in ("", "(unknown)"):
+            return False
+        # OLD SERVERS SEND NO `peer` KEY. Absent means "cannot answer", not
+        # "answer is no" — treating it as no would silently drop a real peer's
+        # name from every refusal against an older server. A real-looking name
+        # with no flag is taken at face value, exactly as before.
+        return bool(h["peer"]) if "peer" in h else True
+
+    named = sorted({(h.get("owner") or "").strip() for h in hits if _is_named_peer(h)})
     what = ", ".join(f.get("path", "?") for f in hits[:5])
-    # Distinct wording: "also edited" is a different fact from "is theirs", and a
-    # guard that says the wrong one gets argued with instead of obeyed.
-    lead = ("discarding UNCOMMITTED work that belongs to another session"
-            if foreign else
-            "discarding a file ANOTHER SESSION HAS ALSO EDITED")
-    return (lead + " — "
-            f"{what} (recently edited by {who}). Naming a path does NOT make this "
-            "yours in a shared checkout: in a single-file repo that one path holds "
-            "every session's edits, and editing it too is not a claim to destroy "
-            "their half. Unlike a bad commit or push, this is "
-            "UNRECOVERABLE — no object, no reflog entry. Make it recoverable "
-            "instead: `git stash push -- <paths>` keeps the content, or revert only "
-            "your own hunks (`git diff` then a sliced `git apply -R`), or ask "
-            f"{who} first")
+    # THE BLOCK IS UNCHANGED EITHER WAY. It is about recoverability — `git
+    # checkout --` leaves no object and no reflog entry — and that does not
+    # depend on who edited the file. Only the attribution is in question here.
+    tail = ("Unlike a bad commit or push, this is UNRECOVERABLE — no object, no "
+            "reflog entry. Make it recoverable instead: `git stash push -- <paths>` "
+            "keeps the content, or revert only your own hunks (`git diff` then a "
+            "sliced `git apply -R`)")
+    if named:
+        who = ", ".join(named)
+        # Distinct wording: "also edited" is a different fact from "is theirs",
+        # and a guard that says the wrong one gets argued with instead of obeyed.
+        lead = ("discarding UNCOMMITTED work that belongs to another session"
+                if foreign else
+                "discarding a file ANOTHER SESSION HAS ALSO EDITED")
+        return (lead + " — "
+                f"{what} (recently edited by {who}). Naming a path does NOT make this "
+                "yours in a shared checkout: in a single-file repo that one path holds "
+                "every session's edits, and editing it too is not a claim to destroy "
+                "their half. " + tail + f", or ask {who} first")
+    # No nameable peer: say what IS known and stop. No accusation, and no
+    # remedy that tells the reader to go ask somebody who does not exist.
+    return ("discarding UNCOMMITTED CHANGES — "
+            f"{what} has uncommitted content and NO other session's edit record names "
+            "it, so nothing here says a peer wrote any of it. That does not make the "
+            "discard safe: the changes are still unsaved, and on a shared checkout "
+            "they may be yours, a peer's with no record, or both. " + tail)
 
 
 def _has_cotenants(run_dir):
