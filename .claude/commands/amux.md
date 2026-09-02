@@ -300,22 +300,6 @@ that it now works.
 
 ## Telegram
 
-> **MERGED UPSTREAM, NOT LIVE ON THIS SERVER YET.** PR #170 merged to
-> origin/main on 2026-09-02 as `4526787a`. It is still not running here, and the
-> distinction matters because this checkout builds its own HEAD: local main is 66
-> commits behind origin, so the binary serving this box does not contain the
-> connector.
->
-> Verified rather than assumed, the same way the previous version of this banner
-> was: `GET /api/debug/routes` returns 319 routes and ZERO of them are telegram,
-> `/api/telegram/status` answers 404, and `/api/health` reports commit
-> 3fe9a8cff99a, which predates the merge.
->
-> So read everything below as the shape it HAS upstream and WILL have here. This
-> banner comes off when the routes appear in `/api/debug/routes` on this server,
-> not when the PR closed. Promote the section then, rather than deleting the
-> banner, exactly as the "Not yet deployed" section instructs.
-
 Bot connector — **inbound** via long-polling
 (`runtime_jobs::telegram_poll`; `GET /api/telegram/status` reports
 last-poll time/error and routing counts), **outbound** via
