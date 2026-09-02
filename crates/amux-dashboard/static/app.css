@@ -4089,6 +4089,7 @@
     resize: none; overflow: hidden; word-wrap: break-word;
   }
   .board-detail-title-input::placeholder { color: var(--dim); }
+  .board-detail-title-input[readonly] { cursor: default; }
   .board-detail-row { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
   .board-detail-status-row { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
   .board-detail-status-btn {

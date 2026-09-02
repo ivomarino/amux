@@ -1890,25 +1890,31 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <button class="btn" onclick="closeBoardDetail()">&#x2190; Back</button>
       <span id="bd-key" class="board-detail-key" onclick="_bdCopyLink()" title="Copy link to this card"></span>
     </div>
-    <button class="btn" onclick="boardDetailDelete()" style="color:var(--red);border-color:rgba(248,81,73,0.3);">Delete</button>
+    <button id="bd-delete" class="btn" onclick="boardDetailDelete()" style="display:none;color:var(--red);border-color:rgba(248,81,73,0.3);">Delete</button>
   </div>
   <div class="board-detail-body">
     <textarea id="bd-title" class="board-detail-title-input" placeholder="Untitled" autocomplete="off" autocorrect="on" spellcheck="true" rows="1" oninput="this.style.height='auto';this.style.height=this.scrollHeight+'px'"></textarea>
     <div id="bd-status-banner" class="bd-status-banner" style="display:none;"></div>
     <div class="board-detail-status-row" id="bd-status-row"></div>
+    <div class="board-detail-tabs">
+      <button class="board-detail-tab active" id="bd-tab-preview" onclick="boardDetailTab('preview')">Details</button>
+      <button class="board-detail-tab" id="bd-tab-history" onclick="boardDetailTab('history')">Worker actions<span id="bd-hist-n" class="bd-hist-n"></span></button>
+      <button class="board-detail-tab" id="bd-tab-edit" onclick="boardDetailTab('edit')">Edit</button>
+    </div>
     <div class="board-detail-meta" id="bd-meta"></div>
-    <div class="board-detail-row" id="bd-session-row">
+    <div id="bd-edit-fields" style="display:none;">
+      <div class="board-detail-row" id="bd-session-row">
       <span style="font-size:0.78rem;color:var(--dim);">Worker:</span>
       <select id="bd-session" class="board-detail-session-select"></select>
         <button id="bd-goto-session" class="btn" style="display:none;flex:0 0 auto;min-height:44px;font-size:0.78rem;" title="Open this worker's live progress, searched to this card">&#x2192; worker</button>
 
-    </div>
-    <div class="board-detail-row">
+      </div>
+      <div class="board-detail-row">
       <span style="font-size:0.78rem;color:var(--dim);">Due:</span>
       <input type="date" id="bd-due" class="board-detail-session-select amux-dp" style="flex:1;cursor:pointer;">
       <input type="time" id="bd-due-time" class="board-detail-session-select" style="width:110px;cursor:pointer;" title="Time (optional — leave blank for all-day)">
-    </div>
-    <div class="board-detail-row" style="align-items:flex-start;">
+      </div>
+      <div class="board-detail-row" style="align-items:flex-start;">
       <span style="font-size:0.78rem;color:var(--dim);padding-top:7px;">Groups:</span>
       <div style="flex:1;">
         <div class="be-tag-wrap" id="bd-tag-wrap" onclick="document.getElementById('bd-tag-input').focus()">
@@ -1919,23 +1925,19 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         </div>
         <div id="bd-tag-suggestions" class="be-tag-suggestions"></div>
       </div>
-    </div>
-    <div class="board-detail-row" style="align-items:flex-start;">
+      </div>
+      <div class="board-detail-row" style="align-items:flex-start;">
       <span style="font-size:0.78rem;color:var(--dim);padding-top:7px;">Gate override:</span>
       <div style="flex:1;">
         <textarea id="bd-gate" class="board-detail-desc-input" style="min-height:56px;resize:vertical;" placeholder="Gate override — one criterion per line. Leave blank to use the status's default gate."></textarea>
       </div>
-    </div>
-    <div class="board-detail-tabs">
-      <button class="board-detail-tab" id="bd-tab-edit" onclick="boardDetailTab('edit')">Edit</button>
-      <button class="board-detail-tab active" id="bd-tab-preview" onclick="boardDetailTab('preview')">Details</button>
-      <button class="board-detail-tab" id="bd-tab-history" onclick="boardDetailTab('history')">Activity<span id="bd-hist-n" class="bd-hist-n"></span></button>
+      </div>
     </div>
     <textarea id="bd-desc" class="board-detail-desc-input" placeholder="Add notes, description, or context... (supports Markdown)"></textarea>
     <div id="bd-log" class="board-detail-log" style="display:none"></div>
     <div id="bd-preview" class="board-detail-preview md-content" style="display:none;"></div>
   </div>
-  <div class="board-detail-footer">
+  <div id="bd-edit-footer" class="board-detail-footer" style="display:none;">
     <span id="bd-save-status" style="font-size:0.78rem;color:var(--dim);"></span>
     <button class="btn primary" onclick="boardDetailSave()">Save</button>
   </div>

@@ -8395,7 +8395,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.774';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.776';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -23054,6 +23054,7 @@ const _SYSJOB_STATUS = {
   disabled:    { cls: 'idle',  label: 'off',      hint: 'switched off by configuration' },
   stalled:     { cls: 'bad',   label: 'STALLED',  hint: 'last tick is far older than this job’s interval' },
   hung:        { cls: 'bad',   label: 'HUNG',     hint: 'a tick started and never finished' },
+  slow:        { cls: 'bad',   label: 'SLOW',     hint: 'the last completed tick exceeded this job’s liveness budget' },
   dead:        { cls: 'bad',   label: 'DEAD',     hint: 'the task exited — it panicked or was aborted' },
   not_spawned: { cls: 'bad',   label: 'NOT RUNNING', hint: 'nothing started this job — the failure that cost hours' },
 };
@@ -23068,7 +23069,7 @@ function renderSystemJobs() {
     return;
   }
   const jobs = _systemJobs.jobs.slice();
-  const bad = jobs.filter(j => ['stalled', 'hung', 'dead', 'not_spawned'].includes(j.status));
+  const bad = jobs.filter(j => ['stalled', 'hung', 'slow', 'dead', 'not_spawned'].includes(j.status));
   if (head) {
     head.innerHTML = bad.length
       ? `<span class="sysjob-alarm">${bad.length} need${bad.length === 1 ? 's' : ''} attention</span>`
@@ -23076,7 +23077,7 @@ function renderSystemJobs() {
   }
   // Broken first — the whole point of the section is that a dead loop is not
   // something you have to scroll for.
-  const rank = j => (['stalled','hung','dead','not_spawned'].includes(j.status) ? 0
+  const rank = j => (['stalled','hung','slow','dead','not_spawned'].includes(j.status) ? 0
                    : j.status === 'alive' ? 1 : j.status === 'disabled' ? 3 : 2);
   jobs.sort((a, b) => rank(a) - rank(b) || String(a.name).localeCompare(String(b.name)));
 
@@ -23100,7 +23101,7 @@ function renderSystemJobs() {
     const tick = j.last_tick_at
       ? `<span title="last tick">✓ ${_sysAge(j.last_tick_age_s)} ago</span>`
       : (j.spawned ? `<span title="no tick recorded yet">no tick yet</span>` : '');
-    const budget = (j.stale_after_s != null && ['stalled','hung'].includes(j.status))
+    const budget = (j.stale_after_s != null && ['stalled','hung','slow'].includes(j.status))
       ? `<span class="sysjob-budget">budget ${_sysAge(j.stale_after_s)}</span>` : '';
     return `<div class="sysjob ${st.cls}">
       <div class="sysjob-top">
@@ -25983,8 +25984,7 @@ function _bdRenderMeta(item) {
   const summary = [
     ['Next action', item.next_action],
     ['Last result', item.last_result],
-    ['Unresolved', item.unresolved],
-    ['Evidence', item.evidence]
+    ['Unresolved', item.unresolved]
   ].filter(x => x[1]);
   if (summary.length) {
     html += '<section class="bd-card-section"><h4>Work summary</h4>'
@@ -26010,14 +26010,15 @@ function _bdRenderMeta(item) {
     html += '</section>';
   }
 
-  const activity = _bdParseHistory(item.log || '');
+  const activity = _bdWorkerActivity(item);
   if (activity.length) {
-    html += '<section class="bd-card-section"><h4>Recent worker activity</h4>'
-      + activity.slice(-5).reverse().map(e => '<div class="board-detail-meta-row"><span class="bd-hist-ic" style="color:'
+    html += '<section class="bd-card-section"><h4>Worker actions</h4>'
+      + activity.slice(-8).reverse().map(e => '<div class="board-detail-meta-row"><span class="bd-hist-ic" style="color:'
         + (_BD_KIND_COL[e.kind] || 'var(--dim)') + '">' + (_BD_KIND_ICON[e.kind] || '\u00B7') + '</span><span>'
         + _linkifyUrls(_linkifyCardIds(esc(e.body))) + '</span>'
         + (e.ts ? '<span class="bd-hist-ts">' + esc(e.ts) + '</span>' : '') + '</div>').join('')
-      + '<button class="bd-activity-all" onclick="boardDetailTab(\'history\')">View all ' + activity.length + ' actions</button></section>';
+      + (activity.length > 8 ? '<button class="bd-activity-all" onclick="boardDetailTab(\'history\')">View all '
+        + activity.length + ' worker actions</button>' : '') + '</section>';
   }
   meta.innerHTML = html;
 }
@@ -26115,7 +26116,6 @@ function openBoardDetail(id) {
   _bdRenderMeta(item);
   document.getElementById('bd-save-status').textContent = '';
   document.getElementById('board-detail-overlay').classList.add('active');
-  setTimeout(() => document.getElementById('bd-title').focus(), 100);
 }
 
 // ── Improved detail: status banner, typed History, permalink (AMUX-2178) ───
@@ -26136,6 +26136,20 @@ function _bdParseHistory(log) {
     return { ts, body, kind };
   });
 }
+function _bdWorkerActivity(item) {
+  return _bdParseHistory((item && item.log) || '').filter(e => {
+    const body = String(e.body || '').trim();
+    // The complete mutation/audit trail remains on the server. This card view
+    // is the worker record, so suppress storage plumbing that buried every
+    // useful action in the old History screenshot.
+    if (/^authz:/i.test(body)) return false;
+    if (/^[^:]+:\s*(?:backlog|todo|doing|review|done|verified|discarded)\s*->/i.test(body)) return false;
+    if (/gate satisfied via|gate_checked/i.test(body)) return false;
+    if (/^[^:]+:\s*(?:desc\s+[+-]\d+\s+chars|evidence|last_result|next_action|unresolved)$/i.test(body)) return false;
+    if (/^capture:\s/i.test(body)) return false;
+    return true;
+  });
+}
 const _BD_KIND_ICON = { status:'\uD83D\uDCCD', transition:'\u2192', commit:'\u2318', claim:'\u270B',
   request:'\uD83D\uDCAC', decision:'\u2713', warn:'\u26A0', note:'\u00B7' };
 const _BD_KIND_COL = { status:'var(--accent)', transition:'var(--fg)', commit:'var(--green)',
@@ -26143,7 +26157,7 @@ const _BD_KIND_COL = { status:'var(--accent)', transition:'var(--fg)', commit:'v
 function _bdRenderHistory(item) {
   const el = document.getElementById('bd-log');
   const nb = document.getElementById('bd-hist-n');
-  const evs = _bdParseHistory(item.log);
+  const evs = _bdWorkerActivity(item);
   if (nb) nb.textContent = evs.length ? ' ' + evs.length : '';
   if (!el) return;
   el.innerHTML = evs.length
@@ -26153,7 +26167,7 @@ function _bdRenderHistory(item) {
         + '<div class="bd-hist-b"><span class="bd-hist-txt">' + _linkifyUrls(_linkifyCardIds(esc(e.body))) + '</span>'
         + (e.ts ? '<span class="bd-hist-ts">' + esc(e.ts) + '</span>' : '') + '</div></div>').join('')
       + '</div>'
-    : '<div style="color:var(--dim);font-size:0.85rem;padding:18px;text-align:center;">No activity recorded yet.</div>';
+    : '<div style="color:var(--dim);font-size:0.85rem;padding:18px;text-align:center;">No worker actions recorded yet.</div>';
 }
 function _bdRenderStatusBanner(item) {
   const el = document.getElementById('bd-status-banner');
@@ -26167,7 +26181,7 @@ function _bdRenderStatusBanner(item) {
       + (last.ts ? ' \u00B7 ' + esc(last.ts) : '') + '</div>'
       + '<div class="bd-sb-text">' + _linkifyUrls(_linkifyCardIds(esc(last.body.replace(/^STATUS\s*\([^)]*\):\s*/i, '')))) + '</div>'
       + (sess ? '<button class="btn" style="margin-top:8px;font-size:0.74rem;min-height:36px;" onclick="_askCardStatus(\'' + escJs(item.id) + '\',\'' + escJs(sess) + '\')">\uD83D\uDD04 Refresh from ' + esc(sess) + '</button>' : '');
-  } else if (sess) {
+  } else if (sess && !/^(done|verified|discarded)$/i.test(String(item.status || ''))) {
     el.style.display = '';
     el.innerHTML = '<div class="bd-sb-empty">No status posted yet.'
       + ' <button class="btn" style="font-size:0.74rem;min-height:36px;margin-left:6px;" onclick="_askCardStatus(\'' + escJs(item.id) + '\',\'' + escJs(sess) + '\')">\uD83D\uDCAC Ask ' + esc(sess) + '</button></div>';
@@ -26187,8 +26201,19 @@ function boardDetailTab(tab) {
   const desc = document.getElementById('bd-desc');
   const preview = document.getElementById('bd-preview');
   const log = document.getElementById('bd-log');
+  const meta = document.getElementById('bd-meta');
+  const editFields = document.getElementById('bd-edit-fields');
+  const editFooter = document.getElementById('bd-edit-footer');
+  const deleteBtn = document.getElementById('bd-delete');
+  const title = document.getElementById('bd-title');
   if (!editBtn || !previewBtn || !desc || !preview) return;
   [editBtn, previewBtn, histBtn].forEach(bt => bt && bt.classList.remove('active'));
+  const editing = tab === 'edit';
+  if (editFields) editFields.style.display = editing ? '' : 'none';
+  if (editFooter) editFooter.style.display = editing ? '' : 'none';
+  if (deleteBtn) deleteBtn.style.display = editing ? '' : 'none';
+  if (title) title.readOnly = !editing;
+  if (meta) meta.style.display = tab === 'preview' ? '' : 'none';
   if (tab === 'history') {
     if (histBtn) histBtn.classList.add('active');
     desc.style.display = 'none'; preview.style.display = 'none';
@@ -26201,9 +26226,7 @@ function boardDetailTab(tab) {
     previewBtn.classList.add('active');
     desc.style.display = 'none';
     preview.style.display = '';
-    preview.innerHTML = desc.value.trim()
-      ? renderMarkdown(desc.value)
-      : '<div class="bd-notes-empty">No additional notes. The source message, relationships, gates, work summary, assets, and recent activity are above.</div>';
+    preview.innerHTML = desc.value.trim() ? renderMarkdown(desc.value) : '';
   } else {
     editBtn.classList.add('active');
     previewBtn.classList.remove('active');

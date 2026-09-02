@@ -3638,3 +3638,103 @@ FIX: Amux does not infer lifecycle from Claude's notification text. The status f
   consumes the provider's explicit subagent start/stop hooks and keeps notification
   content as display-only evidence. The provider-side duplicate/early notification
   remains outside this repository.
+
+## Informational questions could consume board ids and WIP slots
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: none
+SYMPTOM: Prompt capture had a narrow exception for status and `why` questions,
+  while ordinary answer-only prompts such as "what is the difference between todo
+  and backlog?" could still be treated as code work. Direct, queued and orchestrator
+  delivery did not all consult the same non-task predicate.
+COST: Conversation-only questions could create cards with no durable deliverable,
+  occupy WIP, enter decomposition/drive, and make the source message look like
+  unfinished work after the answer had already been given.
+FIX: A shared deterministic informational-intent boundary now keeps question-word,
+  plain yes/no/advice, and explicit answer-only prompts in Messages. Imperative
+  follow-ups and operational checks such as "does this build?" remain cardable.
+  Direct, queued, orchestrated and invariant-reader paths all consume the same
+  predicate; tests pin the message-without-card outcome and false-positive controls.
+
+## Periodic process cleanup described rustc zombies but never implemented that sweep
+AREA: runtime
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: none
+SYMPTOM: The registered 30-minute `mac-health` job reaped orphaned Ray workers
+  and Playwright Chrome roots, but its own module contract also promised orphaned
+  debug rustc cleanup and had no corresponding code. True process-table zombies
+  were neither counted nor distinguished from still-running orphans.
+COST: Interrupted builds could leave parentless compilers consuming CPU and memory,
+  while dead children could accumulate PID-table entries with no periodic signal
+  to their amux parent and no observable machine-health count.
+FIX: The existing registered job now takes a state-bearing process snapshot, sends
+  SIGTERM only to aged pid-1 rustc processes proven to target `target/debug`, and
+  detects true `Z` processes. Because a zombie child is already dead, it calls
+  non-blocking `waitpid` only for aged children of this exact server process and
+  merely reports foreign-parent zombies. Every count is included in the periodic
+  tick log; fixtures pin ownership, age, malformed input, debug/release and
+  living-parent negative controls. The System Jobs catalog exposes every grace.
+
+## Scheduler health showed a dead Telegram relay beside an undocumented live duplicate
+AREA: scheduler
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: none
+SYMPTOM: The live System Jobs section reported catalogued `telegram-relay` as
+  `not_spawned` while a separate undocumented `telegram_relay` row ticked every
+  30 seconds. Five other stable periodic jobs also rendered as "Undocumented job".
+COST: The health surface raised a false red alarm for a working relay and could
+  not explain accountability, context, disk, status-history, or token-ledger jobs;
+  operators could not distinguish a missing spawn from a spelling drift.
+FIX: Every stable periodic job now uses a registry id constant at its spawn site
+  and has a catalog contract. Telegram relay uses the same hyphenated constant as
+  its catalog row, so a future name drift is a compile/test failure rather than a
+  second live job identity.
+
+## Repeated schedule failures never became one repair incident
+AREA: scheduler
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: none
+SYMPTOM: The live Granola transcript schedule accumulated six consecutive
+  traceback runs, but scheduler health remained green because the firing loop
+  itself still ticked. A `delivered` run also had no closed-loop check that its
+  command appeared in Messages.
+COST: Recurring failures stayed as rows a human had to notice and correlate; a
+  delivery log could claim success while the worker-facing message ledger lacked
+  the artifact that proves it.
+FIX: Autofix now groups consecutive error notes into stable patterns and files one
+  durable incident after three failures; refused/queued/success outcomes break the
+  streak. Confirmed deliveries carry a clickable `[SCHED-N]` origin and are checked
+  against Messages after a grace period. The System Jobs predicate also feeds
+  autofix directly, including stalled, dead, hung, missing, and over-budget ticks.
+
+## Time-only capture dedup discarded distinct commands before a model saw them
+AREA: harness
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: none
+SYMPTOM: The direct send path treated every cardable prompt within 45 seconds of
+  another capture as a retry, even when the text and task were different. The
+  orchestrator variant discarded every new command whenever any agent card was open.
+COST: Follow-up work vanished before the underlying model could relate, merge,
+  prioritize, or decompose it—the harness made a capability decision in a boolean
+  shim and then gave the model no opportunity to recover.
+FIX: The direct path now dedupes only an exact recent prompt already linked to a
+  card; the durable orchestrator path relies on its existing message-id command
+  idempotency rather than adding a second text heuristic. Distinct rapid commands
+  always enter the work ledger, including while another card is open, so the worker
+  model can decide their correct relationship and ordered plan. Tests pin transport
+  retry and distinct/repeated durable-message outcomes.

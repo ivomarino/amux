@@ -270,9 +270,15 @@ fn board_detail_leads_with_actionable_task_context() {
     let html = asset("index.html");
     let meta = html.find("id=\"bd-meta\"").expect("task context container");
     let tabs = html.find("class=\"board-detail-tabs\"").expect("detail tabs");
-    assert!(meta < tabs, "source, epic, gates and assets must appear before notes tabs");
+    let edit = html.find("id=\"bd-edit-fields\"").expect("edit-only fields");
+    assert!(
+        tabs < meta && meta < edit,
+        "Details must lead with source, epic, gates and assets before edit-only controls"
+    );
     assert!(html.contains(">Details</button>"));
-    assert!(html.contains(">Activity<span id=\"bd-hist-n\""));
+    assert!(html.contains(">Worker actions<span id=\"bd-hist-n\""));
+    assert!(html.contains("id=\"bd-edit-fields\" style=\"display:none;\""));
+    assert!(html.contains("id=\"bd-edit-footer\"") && html.contains("id=\"bd-delete\""));
     assert!(
         !html.contains("id=\"bd-tab-lineage\""),
         "database lineage is not the task card's primary content"
@@ -286,10 +292,17 @@ fn board_detail_leads_with_actionable_task_context() {
         "Produced assets (",
         "Source message",
         "_bdOpenMessage(",
-        "View all ",
+        "_bdWorkerActivity(",
+        "Worker actions",
     ] {
         assert!(app.contains(needle), "card detail omitted `{needle}`");
     }
+    let summary = app.find("const summary = [").expect("work summary");
+    let assets = app[summary..].find("const artifacts = []").expect("asset section") + summary;
+    assert!(
+        !app[summary..assets].contains("['Evidence', item.evidence]"),
+        "raw shell evidence must not dominate the default card"
+    );
 }
 
 #[test]

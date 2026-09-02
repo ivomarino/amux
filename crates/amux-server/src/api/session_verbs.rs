@@ -3315,8 +3315,8 @@ impl Delivery {
 // point: there is no longer a spelling of "record this" that quietly asserts
 // direct delivery.
 
-/// A scheduled command that was DELIVERED (py parity: origin = the schedule's
-/// title, so a peek shows scheduled commands distinctly from a human's). Only
+/// A scheduled command that was DELIVERED (origin includes the exact schedule
+/// id, so the row is clickable and can be joined back to its run). Only
 /// called once delivery is confirmed — recording history for a command that
 /// never landed is how the Messages tab starts disagreeing with the run log.
 pub(crate) async fn cmd_hist_record_schedule(
@@ -3398,9 +3398,8 @@ const DUP_DELIVERY_WINDOW_MS: i64 = 120_000;
 
 /// Mint a ledger card for a HUMAN prompt delivered via the send path and return
 /// its row, or None when the prompt is steering/control (`title_from_prompt`
-/// None: `[no-board]`, control words, bare slash commands, <12 chars) or the
-/// worker already holds an open agent card (the prompt is steering work in
-/// flight, not a new task).
+/// None: `[no-board]`, control words, bare slash commands, <12 chars) or an
+/// identical prompt was just retried.
 ///
 /// WHY THIS EXISTS (AMUX-3071): the Python server's `_autotask_from_command`
 /// carded every human command and stamped `cmd_history.card_id`. That path was
@@ -3504,10 +3503,10 @@ fn mint_capture_card(
     // already declines. Surface it (two-fixes rule): grep
     // "ledger: status-query not carded" to audit the detector, so a wrong
     // suppression of a REAL task is findable in the logs rather than silent.
-    if amux_core::board::is_status_query(body) {
+    if amux_core::board::is_informational_query(body) {
         tracing::info!(
             session = %session_name,
-            "ledger: status-query not carded (recorded in cmd_history only) — AMUX-3330"
+            "ledger: informational prompt not carded (recorded in cmd_history only) — AMUX-3330"
         );
         return Ok(None);
     }
@@ -3519,11 +3518,11 @@ fn mint_capture_card(
     // arrive via the delivered path, not here). Manual work cards also counted, so
     // being mid-work on ANY card blanked the ledger entirely.
     //
-    // Narrowed to the guard's real purpose: don't double-card a RAPID re-send of
-    // one thought (the user pastes a spec across two sends). Skip ONLY when THIS
-    // mechanism minted a capture card (`desc` starts with the `**Prompt:**`
-    // marker) for this session within the window; a distinct task seconds+ later
-    // still cards, and a manual work card never blocks a capture. Captures mint
+    // Narrowed to the guard's real purpose: don't double-card an IDENTICAL retry.
+    // The former time-only test swallowed every distinct command sent within 45s,
+    // preventing the model from ever seeing or decomposing that work. Equality is
+    // checked against the exact captured description; a distinct follow-up cards
+    // immediately, and a manual work card never blocks a capture. Captures mint
     // `doing` (never re-dispatched), so an extra card cannot re-run work — the
     // AMUX-2613 double-run the old dedup was conflated with stays fixed by the
     // `doing` mint, not by this skip.
@@ -3532,11 +3531,12 @@ fn mint_capture_card(
         .and_then(|v| v.parse().ok())
         .unwrap_or(45);
     let cutoff = (now_ms / 1000) - window_s;
+    let desc_body: String = body.chars().take(300).collect();
+    let captured_desc = format!("**Prompt:** {desc_body}");
     let recent_capture: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM issues WHERE session = ?1 AND deleted IS NULL \
-         AND owner_type = 'agent' AND creator = 'amux' AND status = 'doing' \
-         AND substr(desc, 1, 11) = '**Prompt:**' AND created > ?2",
-        rusqlite::params![session_name, cutoff],
+        "SELECT COUNT(*) FROM cmd_history WHERE session=?1 AND type='user' \
+         AND text=?2 AND card_id IS NOT NULL AND ts>?3",
+        rusqlite::params![session_name, body, cutoff * 1000],
         |r| r.get(0),
     )?;
     if recent_capture > 0 {
@@ -3545,17 +3545,16 @@ fn mint_capture_card(
         tracing::info!(
             session = %session_name,
             window_s,
-            "ledger: capture deduped — a capture card was minted <{window_s}s ago (rapid re-send guard)"
+            "ledger: identical capture retry deduped within {window_s}s"
         );
         return Ok(None);
     }
     let needs_self = amux_core::board::title_needs_self_description(&title);
-    let desc_body: String = body.chars().take(300).collect();
     let mut row = crate::db::board_store::create_issue(
         conn,
         &crate::db::board_store::NewIssue {
             title,
-            desc: format!("**Prompt:** {desc_body}"),
+            desc: captured_desc,
             // `doing`, NOT `todo`: an owned `todo` ledger card is Runnable to the
             // planner and its prompt was re-dispatched, double-running every
             // direct prompt (AMUX-2613). `doing` + agent owner is Assigned, never
@@ -3689,6 +3688,7 @@ pub(crate) async fn cmd_hist_record_full(
             "message.duplicate",
             Some(json!({
                 "prior_id": prior_id, "age_s": age_s, "type": ctype,
+                "origin": origin.clone(),
                 "chars": text.chars().count(),
                 "preview": chars_truncate(&text, 120),
             })),
@@ -10123,6 +10123,7 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         if guard.is_empty()
             && sender.is_empty()
             && amux_core::board::title_from_prompt(&text).is_some()
+            && !amux_core::board::is_informational_query(&text)
         {
             let (sess3, text3) = (session.clone(), text.clone());
             let now_ms = (now_f64() * 1000.0) as i64;
@@ -10133,11 +10134,17 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                 .store
                 .write_async(move |conn| {
                     // Already carded (enqueue-time direct mint)? Never double-card.
+                    let retry_cutoff_ms = now_ms
+                        - std::env::var("AMUX_CAPTURE_DEDUP_WINDOW_S")
+                            .ok()
+                            .and_then(|v| v.parse::<i64>().ok())
+                            .unwrap_or(45)
+                            * 1000;
                     let already: i64 = conn
                         .query_row(
                             "SELECT COUNT(*) FROM cmd_history \
-                             WHERE session = ?1 AND text = ?2 AND card_id IS NOT NULL",
-                            rusqlite::params![sess3, text3],
+                             WHERE session = ?1 AND text = ?2 AND card_id IS NOT NULL AND ts>?3",
+                            rusqlite::params![sess3, text3, retry_cutoff_ms],
                             |r| r.get(0),
                         )
                         .unwrap_or(0);
@@ -18088,8 +18095,9 @@ mod tests {
         assert_eq!(sess, "lane-cap");
         assert_eq!(status, "doing", "capture mints in doing, not todo (AMUX-2613)");
 
-        // 2. A SECOND prompt to a lane that now holds an open card is STEERING,
-        //    not a new task: no card, card_id stays NULL, still exactly one card.
+        // 2. A distinct SECOND prompt is still work even while a card is open.
+        //    The model gets both durable commands and decides whether to relate,
+        //    merge, order, or decompose them; the harness must not erase one.
         cmd_hist_record_full(
             &st, "lane-cap", "Also make the tabs keyboard-navigable please",
             "user", "", false, DeliveryMeta::direct(),
@@ -18097,8 +18105,8 @@ mod tests {
         .await;
         assert!(
             q("SELECT card_id FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1", "lane-cap")
-                .is_none(),
-            "a lane with an open card is steered, not re-carded"
+                .is_some(),
+            "distinct work is carded even while another card is open"
         );
         let n: i64 = st
             .store
@@ -18106,7 +18114,7 @@ mod tests {
             .unwrap()
             .query_row("SELECT COUNT(*) FROM issues WHERE session='lane-cap'", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n, 1, "exactly one card for the lane");
+        assert_eq!(n, 2, "each distinct durable command reaches the work ledger");
 
         // 3. [no-board] (skip_board=true) mints nothing.
         cmd_hist_record_full(
@@ -18172,6 +18180,41 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM cmd_history WHERE session='lane-sq'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(msgs, 1, "the prompt is still recorded in cmd_history (Messages ledger)");
+    }
+
+    #[tokio::test]
+    async fn an_informational_question_records_in_messages_without_a_board_card() {
+        let (st, _dir) = state();
+        cmd_hist_record_full(
+            &st,
+            "lane-info",
+            "What is the difference between todo and backlog? Please answer only; do not change anything.",
+            "user",
+            "",
+            false,
+            DeliveryMeta::direct(),
+        )
+        .await;
+        let (card_id, messages): (Option<String>, i64) = st
+            .store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT card_id, (SELECT COUNT(*) FROM cmd_history WHERE session='lane-info') \
+                 FROM cmd_history WHERE session='lane-info' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(card_id.is_none(), "answer-only question must not mint a work card");
+        assert_eq!(messages, 1, "the question still belongs in Messages");
+        let cards: i64 = st
+            .store
+            .read()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM issues WHERE session='lane-info'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cards, 0);
     }
 
     // The stale-pickup guard (AMUX-3052) reads the card id out of the prompt
@@ -19911,10 +19954,11 @@ mod steer_boundary_tests {
 
     /// AMUX-3147: a new user prompt must card even while the session holds an open
     /// MANUAL card — that was the "none of these have board items" bug, the old
-    /// dedup skipping on ANY open agent card. Only a RAPID re-send within the
-    /// window is deduped; a distinct task past the window cards again.
+    /// dedup skipping on ANY open agent card. Only an IDENTICAL retry within the
+    /// window is deduped; a distinct task cards immediately so the model can
+    /// decide whether it is a sibling, dependency, or follow-up.
     #[tokio::test]
-    async fn capture_cards_new_tasks_past_a_manual_card_but_dedups_a_rapid_resend() {
+    async fn capture_cards_distinct_rapid_tasks_but_dedups_an_identical_retry() {
         use crate::db::board_store::{create_issue, NewIssue};
         let (state, _tmp) = tstate();
         let now_ms = 1_700_000_000_000i64;
@@ -19950,12 +19994,25 @@ mod steer_boundary_tests {
                 // The open manual card must NOT block a new user task.
                 let first = super::mint_capture_card(conn, "s", "build the connectors tab", now_ms)?;
                 assert!(first.is_some(), "a new task must card even with an open manual card");
-                // A rapid re-send within the window IS deduped.
+                // In production the recorder atomically attaches the minted id
+                // to this exact cmd_history row; the retry predicate reads that
+                // durable link rather than comparing truncated card prose.
+                conn.execute(
+                    "INSERT INTO cmd_history(text,type,session,ts,origin,card_id) VALUES(?1,'user','s',?2,'test',?3)",
+                    rusqlite::params![
+                        "build the connectors tab",
+                        now_ms,
+                        first.as_ref().unwrap().id
+                    ],
+                )?;
+                // An identical transport retry within the window IS deduped.
+                let retry = super::mint_capture_card(conn, "s", "build the connectors tab", now_ms + 1_000)?;
+                assert!(retry.is_none(), "an identical retry within the window must dedup");
+                // A different task two seconds later is not a retry. The old
+                // time-only shim silently swallowed it before any model could
+                // classify or decompose it.
                 let rapid = super::mint_capture_card(conn, "s", "also wire slack", now_ms + 2_000)?;
-                assert!(rapid.is_none(), "a rapid re-send within the window must dedup");
-                // A distinct task past the window cards again.
-                let later = super::mint_capture_card(conn, "s", "now add gmail", now_ms + 60_000)?;
-                assert!(later.is_some(), "a distinct task past the dedup window must card");
+                assert!(rapid.is_some(), "a distinct rapid task must card immediately");
                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
             })
             .await

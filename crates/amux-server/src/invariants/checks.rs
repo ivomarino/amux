@@ -2048,9 +2048,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// `title_from_prompt(text).is_some()` — computed in the monitor, so this
 /// invariant's denominator can never disagree with what the mint would have
 /// carded (the ethos view/predicate rule: copy the filter from the code that
-/// acts, never re-derive a plausible-looking one). `span_s` is the wall-clock
-/// spread of those cardable prompts, used to exclude a legitimate rapid re-send
-/// that the mint's dedup window is SUPPOSED to collapse to one card.
+/// acts, never re-derive a plausible-looking one). Exact distinct text—not time
+/// proximity—separates a transport retry from another command.
 #[derive(Debug, Clone)]
 pub struct SessionPromptStats {
     pub session: String,
@@ -2058,6 +2057,8 @@ pub struct SessionPromptStats {
     pub cardable: i64,
     /// Of those, how many actually have a linked capture card.
     pub carded: i64,
+    /// Exact distinct cardable prompt bodies in the window.
+    pub distinct_cardable: i64,
     /// Seconds between the earliest and latest cardable prompt.
     pub span_s: i64,
 }
@@ -2073,19 +2074,15 @@ pub struct SessionPromptStats {
 /// its own detector in a comment, but nothing READ that rate (ethos rule 4: a
 /// signal in a store the reader never opens is the same as no signal).
 ///
-/// INVARIANT: a session that received `min_cardable`+ cardable user prompts,
-/// spread over MORE than the dedup window (so each was an independent task, not
-/// one thought re-sent), must have minted at least one capture card. Zero cards
-/// across several spaced tasks is not legitimate dedup — it is the pipeline
-/// silently dropping the board leg.
+/// INVARIANT: a session that received `min_cardable`+ DISTINCT cardable user
+/// prompts must have minted at least one capture card. Exact repeats may be
+/// transport retries; time proximity alone is not evidence that two different
+/// commands are one thought, and deleting them would work against the model.
 ///
 /// The gates are load-bearing and each excludes a real false positive:
-/// - `cardable >= min_cardable`: one `[no-board]` or control prompt (title None)
+/// - `distinct_cardable >= min_cardable`: one `[no-board]` or control prompt (title None)
 ///   is already excluded from `cardable`; requiring several more excludes a lane
 ///   that legitimately sent only uncardable text.
-/// - `span_s > dedup_window_s`: a burst inside the dedup window SHOULD collapse
-///   to one card, so firing on it would flag correct behaviour — the exact
-///   "filter that matches everything" trap.
 /// - `carded == 0`: one card proves the pipeline works for this lane; a low
 ///   ratio is a separate, quieter concern, not this outage.
 #[cfg(test)]
@@ -2112,17 +2109,18 @@ mod capture_isolation_tests {
             session: session.to_string(),
             cardable: 3,
             carded: 0,
+            distinct_cardable: 3,
             span_s: 933,
         };
         // The specimen's exact numbers, for a lane the monitor DID pass through.
-        let rs = user_prompts_produce_cards(&[s("a-real-lane")], 3, 45);
+        let rs = user_prompts_produce_cards(&[s("a-real-lane")], 3);
         assert_eq!(rs[0].status, Status::Fail, "a genuine dropped board leg must still fire");
         assert!(rs[0].observed.contains("0 carded"), "{}", rs[0].observed);
 
         // CONTROL: an isolated lane is filtered UPSTREAM, so this function never
         // sees it. Passing an empty slice is what that looks like here, and it
         // must PASS rather than produce a spurious entity-less failure.
-        let rs = user_prompts_produce_cards(&[], 3, 45);
+        let rs = user_prompts_produce_cards(&[], 3);
         assert!(rs.iter().all(|r| r.status == Status::Pass), "no stats is not a failure: {rs:?}");
     }
 }
@@ -2130,25 +2128,25 @@ mod capture_isolation_tests {
 pub fn user_prompts_produce_cards(
     stats: &[SessionPromptStats],
     min_cardable: i64,
-    dedup_window_s: i64,
 ) -> Vec<InvariantResult> {
     const ID: &str = "pipeline.user_prompts_card";
     let mut out = Vec::new();
     for s in stats {
-        if s.cardable >= min_cardable && s.span_s > dedup_window_s && s.carded == 0 {
+        if s.distinct_cardable >= min_cardable && s.carded == 0 {
             out.push(
                 InvariantResult::fail(
                     ID,
                     "a delivered cardable user prompt mints a capture card",
                     format!(
-                        "{} cardable user prompt(s) over {}s, 0 carded — board leg silently dropped",
-                        s.cardable, s.span_s
+                        "{} distinct cardable user prompt(s) ({} total) over {}s, 0 carded — board leg silently dropped",
+                        s.distinct_cardable, s.cardable, s.span_s
                     ),
                 )
                 .entity(&s.session)
                 .evidence(serde_json::json!({
                     "session": s.session,
                     "cardable_user_prompts": s.cardable,
+                    "distinct_cardable_user_prompts": s.distinct_cardable,
                     "carded": s.carded,
                     "span_s": s.span_s,
                     "class": "capture-pipeline-dropped",
@@ -3214,26 +3212,26 @@ mod negative_controls {
         assert!(f.observed.contains("hooks=true"), "must name the lied capability: {}", f.observed);
     }
 
-    /// AMUX-3148: the exact live signature — several spaced cardable prompts, zero
-    /// cards — must FAIL, and a healthy lane, a low-volume lane, and a rapid
-    /// re-send burst must all PASS. A check that fired on the burst would be
-    /// flagging the dedup working as designed.
+    /// AMUX-3148: several distinct cardable prompts with zero cards must FAIL;
+    /// healthy, low-volume, and exact-retry-only lanes must PASS. A fast burst
+    /// of different commands is still work—the model, not a timer, relates it.
     #[test]
     fn detects_a_lane_whose_prompts_never_reach_the_board() {
-        let window = 45; // the mint's dedup window
         let stats = vec![
             // amux's real shape: 22 prompts over hours, 0 cards.
-            SessionPromptStats { session: "amux".into(), cardable: 12, carded: 0, span_s: 7200 },
+            SessionPromptStats { session: "amux".into(), cardable: 12, carded: 0, distinct_cardable: 12, span_s: 7200 },
             // healthy: cards its prompts.
-            SessionPromptStats { session: "amux-homepage".into(), cardable: 3, carded: 3, span_s: 1800 },
+            SessionPromptStats { session: "amux-homepage".into(), cardable: 3, carded: 3, distinct_cardable: 3, span_s: 1800 },
             // one card is enough to prove the pipeline works for the lane.
-            SessionPromptStats { session: "tubescience".into(), cardable: 6, carded: 2, span_s: 3600 },
+            SessionPromptStats { session: "tubescience".into(), cardable: 6, carded: 2, distinct_cardable: 6, span_s: 3600 },
             // low volume: below the floor, not judged as an outage.
-            SessionPromptStats { session: "quiet".into(), cardable: 2, carded: 0, span_s: 600 },
-            // a rapid re-send burst INSIDE the window: 0 cards is CORRECT (dedup).
-            SessionPromptStats { session: "burst".into(), cardable: 4, carded: 0, span_s: 30 },
+            SessionPromptStats { session: "quiet".into(), cardable: 2, carded: 0, distinct_cardable: 2, span_s: 600 },
+            // Four exact retries are one distinct body: 0 cards stays below the incident floor.
+            SessionPromptStats { session: "retry-only".into(), cardable: 4, carded: 0, distinct_cardable: 1, span_s: 30 },
+            // Four different commands sent just as fast are not discarded by a timer.
+            SessionPromptStats { session: "rapid-distinct".into(), cardable: 4, carded: 0, distinct_cardable: 4, span_s: 30 },
         ];
-        let rs = user_prompts_produce_cards(&stats, 3, window);
+        let rs = user_prompts_produce_cards(&stats, 3);
         let failed: Vec<&str> = rs
             .iter()
             .filter(|r| r.status == Status::Fail)
@@ -3241,8 +3239,8 @@ mod negative_controls {
             .collect();
         assert_eq!(
             failed,
-            vec!["amux"],
-            "only the spaced-prompts-zero-cards lane fails; healthy/low-volume/burst all pass"
+            vec!["amux", "rapid-distinct"],
+            "distinct prompts fail at any cadence; healthy/low-volume/exact-retry-only lanes pass"
         );
     }
 
