@@ -196,6 +196,23 @@ const LONG_BY_DESIGN: &[(&str, f64)] = &[
     // (the per-call reqwest timeout is 30s), so an outlier past the budget
     // still means what an outlier should: something hung, not something big.
     ("/api/email/inbox", 30_000.0),
+    // GET /api/gmail/inbox (AMUX-83, third filing on the same residual —
+    // AMUX-66/79/82 before it). A DIFFERENT route from /api/email/inbox
+    // above (a separate function, list_messages, serving the SPA's own
+    // /api/gmail/* family) but as of AMUX-66 the SAME underlying shape:
+    // batched/bounded-concurrency metadata fetch through the identical
+    // api() 429/503 backoff (AMUX-3495) this file's own comment three
+    // lines up describes. Before AMUX-66's fix this route was genuinely,
+    // unconditionally slow (a real N-sequential-round-trips bug, not
+    // design) — it never needed this entry because there was nothing
+    // "by design" about it. Now that the code bug is fixed, its residual
+    // latency is Gmail's own quota backoff, the same story, so it gets
+    // the same budget: worst measured post-fix is 14978ms (AMUX-66's own
+    // investigation), and every occurrence since is an isolated call
+    // surrounded by sub-second siblings, never a sustained pattern —
+    // exactly what a design-bounded quota wait looks like from outside.
+    // 30s matches /api/email/inbox's own reasoning (2x worst measured).
+    ("/api/gmail/inbox", 30_000.0),
     // GET /api/email/search (AMUX-3690). THE ARGUMENT IS NOT "it is also slow",
     // it is that this route and the one above are the SAME CODE: both call
     // `email::inbox_messages`, so both inherit its 8-wide concurrency, its
@@ -11452,6 +11469,57 @@ mod tests {
             f2.iter().any(|x| x.signature.contains("/api/email/search")),
             "past 30s the per-call transport timeout should already have fired, so this is a \
              hang and must still file: {f2:?}"
+        );
+    }
+
+    /// AMUX-83: /api/gmail/inbox (list_messages) is a DIFFERENT function from
+    /// /api/email/inbox above (inbox_messages) — a separate implementation,
+    /// not literally the same code — but as of the AMUX-66 fix it shares the
+    /// same quota-bound residual through the identical api() 429/503 backoff,
+    /// so it needs the same budget for the same reason, pinned separately
+    /// because "shares an implementation" would overstate the relationship.
+    #[tokio::test]
+    async fn gmail_inbox_shares_the_email_inbox_budget_without_sharing_its_code() {
+        let (st, _d) = state();
+        let now = unix_now();
+        log_row(
+            &st,
+            Row {
+                ts: now - 300.0,
+                method: "GET",
+                path: "/api/gmail/inbox",
+                family: "/api/gmail",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 14_978.0, // AMUX-66's own worst measured, post-fix
+            },
+        );
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        assert!(
+            !f.iter().any(|x| x.signature.contains("/api/gmail/inbox")),
+            "inside its 30s design budget, a quota-bound gmail/inbox call must not file: {f:?}"
+        );
+
+        log_row(
+            &st,
+            Row {
+                ts: now - 100.0,
+                method: "GET",
+                path: "/api/gmail/inbox",
+                family: "/api/gmail",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 45_000.0,
+            },
+        );
+        let (f2, _) = detect_latency(&st.store.read().unwrap(), now + 1.0);
+        assert!(
+            f2.iter().any(|x| x.signature.contains("/api/gmail/inbox")),
+            "past the 30s budget this is a hang, not a design duration, and must still file: {f2:?}"
         );
     }
 

@@ -721,14 +721,33 @@ pub async fn callback(
 
 pub async fn accounts(Extension(ctx): Extension<Arc<GmailAuthCtx>>) -> Response {
     let accts = connected_accounts_in(&ctx.home);
+    // Bounded-concurrency health probes (AMUX-84): the previous serial
+    // for-loop did N sequential real Google `getProfile` round trips on
+    // every cache miss (account_health's TTL is 300s) -- the same N+1-shaped
+    // bug AMUX-66 already fixed for /gmail/inbox's batch_metadata. Worst
+    // measured: 24.3s across 3 connected accounts. buffered(8) matches that
+    // fix's own concurrency cap and, being `buffered` (not `buffer_unordered`),
+    // preserves `accts`' own order in the results -- same output shape as the
+    // serial loop, just not serially awaited.
+    use futures::stream::{self, StreamExt};
+    let results: Vec<(String, String)> = stream::iter(accts.iter().cloned().map(|a| {
+        let ctx = ctx.clone();
+        async move {
+            let state = account_health(&ctx, &a).await;
+            (a, state)
+        }
+    }))
+    .buffered(8)
+    .collect()
+    .await;
+
     let mut health: Map<String, Value> = Map::new();
     let mut needs_reauth: Vec<String> = Vec::new();
-    for a in &accts {
-        let state = account_health(&ctx, a).await;
+    for (a, state) in results {
         if state == "needs_reauth" {
             needs_reauth.push(a.clone());
         }
-        health.insert(a.clone(), json!(state));
+        health.insert(a, json!(state));
     }
     // SURFACE THE FAIL-OPEN WRITES (amux-cloud's review of AMUX-3839). The
     // callback stamps a token it could not identity-check; without this the

@@ -66,6 +66,8 @@ pub mod registry;
 pub mod scheduler;
 pub mod storage;
 pub mod tailnet_watch;
+pub mod telegram_poll;
+pub mod telegram_relay;
 pub mod tunnel;
 pub mod token_ledger;
 

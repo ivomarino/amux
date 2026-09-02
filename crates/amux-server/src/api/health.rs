@@ -194,24 +194,57 @@ pub fn disk_health() -> DiskHealth {
     // statvfs is POSIX and present on both macOS and Linux, so unlike mem_health
     // this needs no cfg split at all.
     let free_total = statvfs_free_total(&crate::config::amux_home());
+    let (critical_gb, warn_gb) = disk_thresholds();
     match free_total {
         Some((free_gb, total_gb)) => DiskHealth {
             free_gb: Some(free_gb),
             total_gb: Some(total_gb),
-            state: disk_state(Some(free_gb)),
+            state: disk_state_with_thresholds(Some(free_gb), critical_gb, warn_gb),
         },
         // "unknown" and "ok" must never collapse: an unreadable disk is not a
         // healthy one, and reporting it as ok is how a silent probe gets trusted.
-        None => DiskHealth { free_gb: None, total_gb: None, state: disk_state(None) },
+        None => DiskHealth { free_gb: None, total_gb: None, state: disk_state_with_thresholds(None, critical_gb, warn_gb) },
     }
 }
 
-/// The threshold decision, split out so it is testable without a disk — the
-/// shipped path calls exactly this.
+const DISK_CRITICAL_GB_DEFAULT: f64 = 25.0;
+const DISK_WARN_GB_DEFAULT: f64 = 75.0;
+
+/// Per-host override for the absolute-GB thresholds below (`server.env`:
+/// `AMUX_DISK_CRITICAL_GB` / `AMUX_DISK_WARN_GB`), found 2026-08-30. The
+/// 25/75 GB defaults were calibrated against a real incident on a large
+/// (multi-hundred-GB) fleet host — see `disk_health`'s doc — and stay the
+/// default for every host unset. They ALSO make the "ok" band structurally
+/// unreachable on a deliberately small host (a 35 GB dev container: 100%
+/// free is still under 75 GB), which reads as permanently critical
+/// regardless of actual disk pressure. Overriding here does not undo the
+/// reasoning against a PERCENTAGE threshold (still wrong — see
+/// `disk_health`'s doc, a 1.8TB-at-91%-used host would still false-positive
+/// forever on percent); it recalibrates the SAME absolute-GB mechanism for a
+/// host whose real risk (one abandoned cargo target tree costs 10-15GB —
+/// confirmed live on this exact box the same day this was found) is smaller
+/// in scale, not different in kind.
+fn disk_thresholds() -> (f64, f64) {
+    let get = |key: &str, default: f64| {
+        std::env::var(key).ok().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(default)
+    };
+    (get("AMUX_DISK_CRITICAL_GB", DISK_CRITICAL_GB_DEFAULT), get("AMUX_DISK_WARN_GB", DISK_WARN_GB_DEFAULT))
+}
+
+/// The threshold decision at amux's fleet-wide DEFAULTS, split out so it is
+/// testable without a disk — the shipped path with no override calls exactly
+/// this. Every incident-regression test below pins these exact numbers;
+/// `disk_state_with_thresholds` is the same logic parameterized for
+/// `disk_thresholds`'s override, so a host-specific `server.env` value never
+/// has to touch this function or its tests.
 pub(crate) fn disk_state(free_gb: Option<f64>) -> &'static str {
+    disk_state_with_thresholds(free_gb, DISK_CRITICAL_GB_DEFAULT, DISK_WARN_GB_DEFAULT)
+}
+
+pub(crate) fn disk_state_with_thresholds(free_gb: Option<f64>, critical_gb: f64, warn_gb: f64) -> &'static str {
     match free_gb {
-        Some(g) if g < 25.0 => "critical",
-        Some(g) if g < 75.0 => "warn",
+        Some(g) if g < critical_gb => "critical",
+        Some(g) if g < warn_gb => "warn",
         Some(_) => "ok",
         None => "unknown",
     }
@@ -815,6 +848,35 @@ mod disk_tests {
         assert_eq!(disk_state(Some(25.0)), "warn");
         assert_eq!(disk_state(Some(74.99)), "warn");
         assert_eq!(disk_state(Some(75.0)), "ok");
+    }
+
+    /// Found 2026-08-30: a 35 GB host can never reach "ok" against the
+    /// fleet-wide defaults (25/75 GB) since 100% free is still under 75 GB.
+    /// `disk_state` itself must stay pinned to the defaults — this is what
+    /// the parameterized form under `disk_thresholds`'s override exists for.
+    #[test]
+    fn a_small_host_can_reach_ok_with_scaled_down_thresholds() {
+        // Same 19 GB free that read "critical" against the fleet defaults on
+        // a 35 GB disk (this exact box, this exact day) reads "ok" once the
+        // thresholds are recalibrated for its real size.
+        assert_eq!(disk_state(Some(19.0)), "critical", "unscaled default still fires, correctly");
+        assert_eq!(disk_state_with_thresholds(Some(19.0), 5.0, 10.0), "ok");
+        assert_eq!(disk_state_with_thresholds(Some(7.0), 5.0, 10.0), "warn");
+        assert_eq!(disk_state_with_thresholds(Some(3.0), 5.0, 10.0), "critical");
+    }
+
+    /// `disk_state_with_thresholds` at the DEFAULT thresholds must behave
+    /// identically to `disk_state` — same function, not a fork that could
+    /// drift from the incident-pinned regression tests above.
+    #[test]
+    fn parameterized_form_matches_disk_state_at_defaults() {
+        for g in [0.741, 13.0, 24.99, 25.0, 60.0, 74.99, 75.0, 144.0, 170.0] {
+            assert_eq!(
+                disk_state_with_thresholds(Some(g), DISK_CRITICAL_GB_DEFAULT, DISK_WARN_GB_DEFAULT),
+                disk_state(Some(g)),
+                "diverged at {g} GB"
+            );
+        }
     }
 
     /// The statvfs read must actually work. A reader that compiles everywhere
