@@ -1092,10 +1092,23 @@ mod report_hook_wiring_tests {
             "Stop": [{"hooks": [{"type": "command",
                 "command": "bash \"$HOME/.amux/hook-report.sh\" idle stop-hook"}]}],
             "PostToolUse": [{"matcher": ".*", "hooks": [{"type": "command",
-                "command": "bash \"$HOME/.amux/hook-report.sh\" active tool-hook"}]}]
+                "command": "bash \"$HOME/.amux/hook-report.sh\" active tool-hook"}]}],
+            // AMUX-4024: the subagent lifecycle pair is part of the wired shape
+            // now, and putting it HERE also pins the extractor — `SubagentStop`
+            // is a lifecycle event it had never been shown before, and a pair
+            // the extractor silently dropped would look exactly like a pair
+            // nobody configured.
+            "PreToolUse": [{"matcher": "^(Task|Agent)$", "hooks": [{"type": "command",
+                "command": "bash \"$HOME/.amux/hook-report.sh\" subagent:start pretooluse-agent"}]}],
+            "SubagentStop": [{"hooks": [{"type": "command",
+                "command": "bash \"$HOME/.amux/hook-report.sh\" subagent:stop subagent-stop"}]}]
         }});
         let got = extract_report_hooks(&wired);
-        assert_eq!(got.len(), 2, "both report hooks must be selected");
+        assert_eq!(got.len(), 4, "every report hook must be selected, lifecycle pair included");
+        assert!(
+            got.iter().any(|e| e.event == "SubagentStop"),
+            "the extractor must select SubagentStop: {got:?}"
+        );
         assert_eq!(
             got.iter().find(|e| e.event == "PostToolUse").unwrap().matcher.as_deref(),
             Some(".*"),

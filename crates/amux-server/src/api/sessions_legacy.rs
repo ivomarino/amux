@@ -1131,12 +1131,42 @@ impl FleetSignals {
         // wired here yet: it needs a leak-safe reset that does not zero a live
         // run_in_background agent (which outlives the main turn, AMUX-2904).
         // Tracked as the follow-up on AMUX-3048.
-        let reported_live = self.reported_subagent_count(name).is_some_and(|c| c > 0);
-        reported_live
-            || self
+        //
+        // AMUX-4024: THE COUNT IS NOW AUTHORITATIVE IN BOTH DIRECTIONS, because
+        // it finally exists. The paragraph above deferred the "off" direction
+        // for a good reason and a wrong one. The good reason: zeroing on a
+        // stale signal would kill a live `run_in_background` agent, which
+        // outlives the main turn (AMUX-2904). The wrong one: it assumed the
+        // count was being reported and only the rule was missing. It was not
+        // being reported by anybody — `subagents_live` was null for 125 of 125
+        // lanes on 2026-09-02, because no hook ever POSTed a lifecycle event
+        // (now fixed in `scripts/hooks/hook-report.sh`). So this OR was not a
+        // conservative choice between two signals; it was the mtime window
+        // alone, wearing a second name.
+        //
+        // With real start/stop events the deferral's own condition is met: a
+        // background agent's `stop` fires when IT finishes, not when the main
+        // turn does, so a count that is still positive is exactly the live
+        // background agent the comment was protecting. Preferring the count
+        // where we have one ends AMUX-3047's up-to-four-minute false WORKING —
+        // Ethan, 2026-09-02, mvs-pitr: header WORKING with an AGENTS badge over
+        // an empty composer, decided_by `contradiction_subagents_working`, on
+        // nothing but a warm transcript from agents that had already finished.
+        //
+        // `None` still means the mtime window, unchanged, and that is the whole
+        // blast radius for a lane amux cannot hook: gemini and codex send no
+        // events, have no `subagents` key, and read exactly as they did before.
+        // A LOST `stop` is the residual and it is one-directional (a lane stuck
+        // WORKING, never a lane stuck idle); `subagents_live` is published in
+        // the sessions payload and in every status-history row so the leak is
+        // countable rather than mysterious.
+        match self.reported_subagent_count(name) {
+            Some(c) => c > 0,
+            None => self
                 .subagent_activity
                 .get(name)
-                .is_some_and(|m| self.now - m < window)
+                .is_some_and(|m| self.now - m < window),
+        }
     }
 
     /// The raw event-driven live-subagent count a lane last reported (AMUX-3048),
@@ -1386,6 +1416,22 @@ impl FleetSignals {
                 "contradiction_window_s": self.contradiction_window(),
             }),
         );
+        // THE SUBAGENT COUNT, WHERE THE READERS ALREADY LOOK (AMUX-4024).
+        // `status_history.rs` has recorded `explain.subagents_live` in every row
+        // since it shipped, on the same "carry the EVIDENCE, not only the
+        // verdict" argument as the report and pane blocks beside it — and this
+        // key was never inserted here, so every stored row carried null. The
+        // field is now the deciding evidence for
+        // `contradiction_subagents_reported_live`, and it is the one place a
+        // LEAKED count (a lost SubagentStop pinning a lane WORKING) would be
+        // visible after the fact. `null` is a real answer and a different one
+        // from `0`: it means this lane reports no lifecycle events at all and is
+        // being judged on the mtime window instead.
+        ex.insert(
+            "subagents_live".into(),
+            self.reported_subagent_count(name).map(|c| json!(c)).unwrap_or(serde_json::Value::Null),
+        );
+        ex.insert("subagents_working".into(), json!(self.subagents_working(name)));
         // No transition: prefer the PANE over the activity timestamp when the
         // pane is admissible. A timestamp says something painted; the pane
         // says what. `detect_claude_status` returning "" is the documented
@@ -1566,9 +1612,45 @@ impl FleetSignals {
         // -> the flip still fires), and once a real idle report ages past the
         // window a still-writing subagent flips it active as the bounded late
         // correction the window was always documented to cost.
-        if status == "idle" && idle_gate_open && self.subagents_working(name) {
+        //
+        // AMUX-4024: A REPORTED LIVE COUNT DOES NOT WAIT FOR THAT GATE. Read the
+        // justification above one more time — "a stopped main turn means its
+        // FOREGROUND subagents have necessarily finished". True, and it is the
+        // whole argument, and BACKGROUND agents are the case it does not cover:
+        // they outlive the main turn by construction (AMUX-2904), so the stop
+        // hook fires, the report is fresh, and the gate holds the correction
+        // shut for a full minute while the lane sits there working.
+        //
+        // Ethan, 2026-08-30, tubescience: header IDLE over a pane reading
+        // "Waiting for 1 background agent to finish". Its status-explain history
+        // flapped idle -> active -> idle on a ~30s cycle, every idle row
+        // `decided_by: report`, because each new report restarted the window.
+        //
+        // The gate exists because an MTIME can be stale — it cannot tell
+        // "finished 30s ago" from "thinking, will write in 90s", so a fresh
+        // self-report is the better evidence and should win. An event-driven
+        // count has no such defect: it moves only when a subagent actually
+        // starts or stops, so a positive count is a statement about NOW, and
+        // there is nothing for the window to protect against. Gate the mtime,
+        // trust the count.
+        //
+        // Deliberately NOT the pane-churn leg, which stays gated: content churn
+        // is also what a human typing at the composer produces
+        // (`churn_without_a_spinner_does_not_falsify_a_fresh_idle_claim`), and
+        // flipping a lane to WORKING because someone is typing into it is the
+        // error the other half of this card is about. A subagent count cannot be
+        // typed.
+        let subagents_reported_live = self.reported_subagent_count(name).is_some_and(|c| c > 0);
+        if status == "idle" && (idle_gate_open || subagents_reported_live) && self.subagents_working(name)
+        {
             status = "active".into();
-            decided = "contradiction_subagents_working";
+            // Named apart from the aged path, same reason the pane rules are:
+            // one rests on a timestamp inside a window, the other on an event.
+            decided = if idle_gate_open {
+                "contradiction_subagents_working"
+            } else {
+                "contradiction_subagents_reported_live"
+            };
         }
         // API-ERROR (5xx / Overloaded) is its own status (Ethan 2026-08-18).
         // Claude Code ENDS the turn on a 529 and returns to the prompt, so its
@@ -4158,6 +4240,72 @@ Claude usage limit reached. Your limit will reset at 3pm.
         assert_eq!(ex["idle_contradiction_gate_open"], json!(false), "the 60s gate is still shut: {ex}");
         assert_eq!(ex["fresh_idle_contradicted"], json!(true), "{ex}");
         assert!(ex["churn_since_claim"].as_u64().unwrap() >= 2, "{ex}");
+    }
+
+    /// AMUX-4024, THE FALSE IDLE. A lane blocked on a BACKGROUND agent, with a
+    /// fresh stop-hook `idle` — which is not a contradiction but the expected
+    /// pair, because yielding to a background agent ends the main turn and
+    /// fires the stop hook while the agent keeps running.
+    ///
+    /// Ethan, 2026-08-30: tubescience read IDLE with its pane on "Waiting for 1
+    /// background agent to finish". The pane is deliberately IDLE_WITH_AGENTS
+    /// here — no spinner, nothing for a string rule to find, which is what such
+    /// a lane actually looks like once the main loop stops generating. The
+    /// reported count is the only evidence, and it must not have to wait out
+    /// the 60s window.
+    #[test]
+    fn a_reported_live_subagent_beats_a_fresh_idle_claim() {
+        let lane = "t4024-bg";
+        let mut s = fresh_idle_lane(lane, 9.0);
+        s.panes.insert(lane.into(), IDLE_WITH_AGENTS.into());
+        s.reports[lane]["subagents"] = json!({"count": 1, "ts": s.now - 3.0});
+        let (status, ex) = s.derive_status_explain(lane, true);
+        assert_eq!(status, "active", "a lane waiting on a background agent is not idle: {ex}");
+        assert_eq!(ex["decided_by"], json!("contradiction_subagents_reported_live"), "{ex}");
+        assert_eq!(ex["idle_contradiction_gate_open"], json!(false), "the 60s gate is still shut: {ex}");
+        assert_eq!(ex["subagents_live"], json!(1), "the count is the evidence: {ex}");
+    }
+
+    /// AMUX-4024, THE FALSE WORKING — the same card's other direction, and the
+    /// reason the count has to be authoritative rather than OR'd.
+    ///
+    /// Ethan, 2026-09-02: mvs-pitr showed WORKING and an AGENTS badge over an
+    /// empty composer. Its agents had finished; their transcripts were merely
+    /// still inside the 240s mtime window, and `decided_by` was
+    /// `contradiction_subagents_working` on nothing else. A lane that REPORTS
+    /// zero live subagents is telling us the window is stale, so the window
+    /// must lose.
+    #[test]
+    fn a_reported_zero_count_beats_a_warm_subagent_mtime() {
+        let mut s = signals();
+        let lane = "t4024-finished";
+        s.activity.insert(format!("amux-{lane}"), (s.now - 1.0) as i64);
+        s.running.insert(format!("amux-{lane}"));
+        s.reports = json!({lane: {"state": "idle", "ts": s.now - 1076.0, "source": "stop-hook"}});
+        // A transcript written 20s ago — well inside the 240s window, and on its
+        // own enough to pin the lane WORKING for four minutes.
+        s.subagent_activity.insert(lane.into(), s.now - 20.0);
+        assert!(s.subagents_working(lane), "control: the warm mtime alone reads as working");
+
+        s.reports[lane]["subagents"] = json!({"count": 0, "ts": s.now - 5.0});
+        assert!(!s.subagents_working(lane), "a reported zero must override the warm mtime");
+        let (status, ex) = s.derive_status_explain(lane, true);
+        assert_eq!(status, "idle", "finished agents must not pin a lane WORKING: {ex}");
+        assert_eq!(ex["subagents_live"], json!(0), "{ex}");
+    }
+
+    /// The blast radius of making the count authoritative, stated as a test: a
+    /// lane that reports NO count at all (gemini, codex, any hookless runtime)
+    /// is pure mtime exactly as before. Without this, "authoritative" could
+    /// quietly mean "lanes we cannot hook always read idle".
+    #[test]
+    fn a_lane_that_reports_no_count_still_uses_the_mtime_window() {
+        let mut s = signals();
+        let lane = "t4024-hookless";
+        s.reports = json!({lane: {"state": "idle", "ts": s.now - 1076.0, "source": "stop-hook"}});
+        s.subagent_activity.insert(lane.into(), s.now - 90.0);
+        assert_eq!(s.reported_subagent_count(lane), None, "fixture: this lane reports no count");
+        assert!(s.subagents_working(lane), "a hookless lane must still read its mtime window");
     }
 
     /// THE RACE THE WINDOW EXISTS FOR, WHICH MUST KEEP WINNING. The live

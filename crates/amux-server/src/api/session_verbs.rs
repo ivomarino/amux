@@ -14337,13 +14337,61 @@ pub(crate) fn context_pct_remaining(used: u64, window: u64) -> u8 {
 /// ONLY the `subagents` sub-key, preserving state/model/tokens — a subagent
 /// starting or stopping says nothing about the main turn's state.
 async fn subagent_event_post(state: &AppState, name: &str, ev: &str) -> Response {
+    // `reset` is not a delta — it is the LEAK BOUND (AMUX-4024), and it is the
+    // "leak-safe reset" AMUX-3048's deferral said the count-authoritative "off"
+    // direction needed before it could ship.
+    //
+    // A lost SubagentStop (a lane killed mid-agent, a crashed subagent) pins the
+    // count positive, and since the count now outranks the mtime window that
+    // used to bound this at 240s, a leak would read WORKING forever — and
+    // survive a restart, because a state report carries the count forward.
+    //
+    // SESSION START is the one moment a zero is provably correct rather than a
+    // guess: a background agent belongs to the process that spawned it, so a
+    // NEW session has none by construction. That is exactly the property the
+    // deferral demanded — this cannot zero a live `run_in_background` agent,
+    // because a live one implies the session it belongs to is still the old one.
+    // The caller is responsible for not sending this on a compact, which does
+    // not restart the process (see `scripts/hooks/hook-report.sh`).
+    if ev == "reset" {
+        let name_s = name.to_string();
+        let reply = state
+            .store
+            .write_async(move |conn| {
+                ensure_fleet_tables(conn)?;
+                let mut reports: Value = conn
+                    .query_row("SELECT value FROM prefs WHERE key='session_reports'", [], |r| {
+                        r.get::<_, String>(0)
+                    })
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_else(|| json!({}));
+                if !reports[&name_s].is_object() {
+                    reports[&name_s] = json!({});
+                }
+                reports[&name_s]["subagents"] = json!({"count": 0, "ts": now_f64()});
+                conn.execute(
+                    "INSERT INTO prefs(key, value) VALUES('session_reports', ?1) \
+                     ON CONFLICT(key) DO UPDATE SET value=?1",
+                    [reports.to_string()],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await;
+        return match reply {
+            Ok(_) => j200(json!({"ok": true, "session": name, "subagent": "reset"})),
+            Err(e) => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
+        };
+    }
     let delta: i64 = match ev {
         "start" => 1,
         "stop" | "done" => -1,
         other => {
             return jresp(
                 StatusCode::BAD_REQUEST,
-                json!({"error": format!("subagent must be 'start' or 'stop' (got '{other}')")}),
+                json!({"error": format!(
+                    "subagent must be 'start', 'stop' or 'reset' (got '{other}')"
+                )}),
             );
         }
     };
@@ -14587,6 +14635,22 @@ pub(crate) async fn report_post(state: &AppState, name: &str, headers: &HeaderMa
             // ABSENT != EMPTY above): the model does not change per tool call.
             let prev_model = reports[&name_s]["model"].clone();
             let prev_tokens = reports[&name_s]["tokens"].clone();
+            // AND `subagents` (AMUX-4024) — the same carry-forward, for the same
+            // reason, and it was the one field missing from this list. This
+            // assignment REPLACES the lane's whole object, so every state report
+            // deleted the live-subagent count: a Stop, a UserPromptSubmit, or any
+            // tool-hook heartbeat. A subagent that started would have its count
+            // erased by the lane's very next tool call, seconds later.
+            //
+            // Measured while verifying the new producer: of 127 lanes, only 3
+            // still had a `subagents` key at all, every one of them reading 0,
+            // and lanes observed reporting a count minutes earlier had none —
+            // which reads exactly like "the start event never fires" and is not
+            // that. A count of 0 and a count that was deleted are the same null
+            // to every reader, which is why this survived AMUX-3048's own tests:
+            // they exercise `subagent_event_post` alone, and nothing wrote a
+            // state report in between.
+            let prev_subagents = reports[&name_s]["subagents"].clone();
             // Did the STATUS actually change? Only then is an SSE push worth it.
             let status_changed = prev_state != st2;
             let new_state = st2.clone();
@@ -14595,6 +14659,7 @@ pub(crate) async fn report_post(state: &AppState, name: &str, headers: &HeaderMa
                 "tokens": tokens_opt.clone().unwrap_or(prev_tokens),
                 "state": st2, "detail": detail, "source": src2,
                 "origin": origin2, "ts": now_f64(),
+                "subagents": prev_subagents,
             });
             conn.execute(
                 "INSERT INTO prefs(key, value) VALUES('session_reports', ?1) \
@@ -20102,6 +20167,76 @@ mod steer_boundary_tests {
             Some(0),
             "count floors at 0 on excess stops"
         );
+
+        // AMUX-4024: A STATE REPORT MUST NOT DELETE THE COUNT.
+        //
+        // Every assertion above drives `subagent_event_post` back to back with
+        // nothing else writing in between, which is the one sequence a live lane
+        // never produces: it interleaves state reports constantly, a tool-hook
+        // on every tool call and a Stop on every turn end. `report_post`
+        // REPLACES the lane's whole object and carried only `model` and `tokens`
+        // forward, so the count was deleted seconds after it was set.
+        //
+        // Driven through `report_post` — the SHIPPED handler, with the headers
+        // its attribution check reads — and not through the `set_report`
+        // fixture, which writes the blob directly and would have "passed" this
+        // by never exercising the replacement at all. That distinction is the
+        // whole cell: the bug lives in the carry-forward list, and only the real
+        // handler has one.
+        //
+        // Measured live before the fix: 3 of 127 lanes still had a `subagents`
+        // key, all reading 0, while lanes that had reported a count minutes
+        // earlier had none at all.
+        let mut h = HeaderMap::new();
+        h.insert("X-Amux-Session", "probe".parse().unwrap());
+        report_post(&state, "probe", &h, &json!({"subagent": "start"})).await;
+        assert_eq!(
+            read(&state)["probe"]["subagents"]["count"].as_i64(),
+            Some(1),
+            "the shipped handler must route a subagent event to the count"
+        );
+        report_post(&state, "probe", &h, &json!({"state": "idle", "source": "stop-hook"})).await;
+        let after = read(&state);
+        assert_eq!(
+            after["probe"]["subagents"]["count"].as_i64(),
+            Some(1),
+            "a state report must CARRY the live count, not delete it: {after}"
+        );
+        assert_eq!(
+            after["probe"]["state"].as_str(),
+            Some("idle"),
+            "...while still applying the state it was sent for: {after}"
+        );
+
+        // THE LEAK BOUND (AMUX-4024). Making the count authoritative removed the
+        // 240s mtime ceiling that used to bound a lost SubagentStop, and the
+        // carry-forward above means a leaked count now survives restarts too. A
+        // SessionStart reset is the bound, and it is the one zero that is
+        // provably right rather than a guess.
+        report_post(&state, "probe", &h, &json!({"subagent": "start"})).await;
+        report_post(&state, "probe", &h, &json!({"subagent": "start"})).await;
+        // 3, not 2: the block above left one live count standing, which is the
+        // point — reset must clear a count it did not create, not just undo the
+        // two starts on the line above it.
+        assert_eq!(read(&state)["probe"]["subagents"]["count"].as_i64(), Some(3), "1 carried + 2 starts");
+        report_post(&state, "probe", &h, &json!({"subagent": "reset"})).await;
+        let r = read(&state);
+        assert_eq!(
+            r["probe"]["subagents"]["count"].as_i64(),
+            Some(0),
+            "a session start must clear a leaked count: {r}"
+        );
+        assert_eq!(
+            r["probe"]["state"].as_str(),
+            Some("idle"),
+            "...without touching the main state, like every other subagent event: {r}"
+        );
+
+        // An unknown event is still refused rather than silently counted, and the
+        // error NAMES the accepted set — `reset` included, or the hook author
+        // reads a message that forbids the thing the hook is being asked to send.
+        let bad = report_post(&state, "probe", &h, &json!({"subagent": "sideways"})).await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST, "an unknown subagent event must 400");
     }
 
     /// Fail-closed is the whole safety property: an unknown lane must not be

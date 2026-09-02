@@ -1892,6 +1892,7 @@ pub fn reports_are_attributed(total: i64, unattributed: i64) -> Vec<InvariantRes
 // ---------------------------------------------------------------------------
 
 /// One report-hook entry as configured in `~/.claude/settings.json`.
+#[derive(Debug)]
 pub struct ReportHookEntry {
     /// `Stop` | `UserPromptSubmit` | `PostToolUse` | ...
     pub event: String,
@@ -1981,7 +1982,52 @@ pub fn report_hooks_wired(entries: Result<Vec<ReportHookEntry>, String>) -> Vec<
         }
         rows.push(row);
     }
-    let evidence = json!({ "entries": rows });
+    // AMUX-4024: AN EVENT CLASS THAT IS ENTIRELY ABSENT. Everything above walks
+    // the entries that EXIST and asks whether each is wired correctly, which is
+    // structurally unable to notice a hook nobody ever added — the loop has no
+    // row to fail on. That is the shape of the incident this clause is for.
+    //
+    // `subagent_event_post` has accepted start/stop since AMUX-3048, the count
+    // has a store, a consumer in `FleetSignals::subagents_working` and its own
+    // unit test, and NOTHING EVER POSTED ONE: `subagents_live` was null for 125
+    // of 125 lanes when measured on 2026-09-02. With no events the status
+    // derivation silently falls back to a transcript mtime, which cannot tell
+    // "thinking, will write in 90s" from "finished 30s ago" — so lanes read
+    // WORKING for up to four minutes after their agents landed, and read IDLE
+    // while blocked on a background agent. Both directions were reported by
+    // Ethan on the same afternoon.
+    //
+    // This is a Fail rather than an Unknown ONLY when other amux hooks are
+    // present, which the early return above has already established: a box with
+    // amux hooks configured but no lifecycle events is a box where the count
+    // will be null and nothing else says so.
+    for (needle, event, why) in [
+        (
+            "subagent:start",
+            "PreToolUse (matcher ^(Task|Agent)$)",
+            "nothing increments the live-subagent count, so a lane blocked on a background \
+             agent reads IDLE until its transcript happens to be written",
+        ),
+        (
+            "subagent:stop",
+            "SubagentStop",
+            "nothing decrements the live-subagent count, so a finished agent leaves the lane \
+             reading WORKING until the count is reset",
+        ),
+    ] {
+        if !entries.iter().any(|e| e.command.contains(needle)) {
+            broken.push(format!(
+                "{event}: no hook posts {needle:?} — {why}"
+            ));
+        }
+    }
+    let evidence = json!({
+        "entries": rows,
+        "subagent_lifecycle_wired": {
+            "start": entries.iter().any(|e| e.command.contains("subagent:start")),
+            "stop": entries.iter().any(|e| e.command.contains("subagent:stop")),
+        },
+    });
     if broken.is_empty() {
         vec![InvariantResult::pass(ID).evidence(evidence)]
     } else {
@@ -4101,19 +4147,31 @@ mod negative_controls {
     fn report_hook_wiring_faults_are_detected() {
         const GOOD: &str = r#"bash "$HOME/.amux/hook-report.sh" idle stop-hook"#;
         const INLINE: &str = r#"curl -sk -m 3 -X POST -H 'Content-Type: application/json' -d "{\"state\":\"idle\",\"source\":\"stop-hook\"}" "$AMUX_URL/api/sessions/$AMUX_SESSION/report""#;
+        // AMUX-4024: the subagent lifecycle pair is now part of "fully wired",
+        // so every fixture that asserts Pass has to carry it. Kept as separate
+        // constants so the negative control below is the SAME config minus one
+        // entry, and the assertion cannot pass for an unrelated reason.
+        const SUB_START: &str = r#"bash "$HOME/.amux/hook-report.sh" subagent:start pretooluse-agent"#;
+        const SUB_STOP: &str = r#"bash "$HOME/.amux/hook-report.sh" subagent:stop subagent-stop"#;
+        let lifecycle_pair =
+            || vec![ent("PreToolUse", SUB_START, Some("^(Task|Agent)$")), ent("SubagentStop", SUB_STOP, None)];
+        let with_pair = |mut v: Vec<ReportHookEntry>| {
+            v.extend(lifecycle_pair());
+            v
+        };
 
-        let healthy = report_hooks_wired(Ok(vec![
+        let healthy = report_hooks_wired(Ok(with_pair(vec![
             ent("Stop", GOOD, None),
             ent("UserPromptSubmit", GOOD, None),
             ent("PostToolUse", GOOD, Some(".*")),
-        ]));
+        ])));
         assert_eq!(healthy[0].status, Status::Pass, "correct wiring must pass: {healthy:?}");
 
-        let the_incident = report_hooks_wired(Ok(vec![
+        let the_incident = report_hooks_wired(Ok(with_pair(vec![
             ent("Stop", INLINE, None),
             ent("UserPromptSubmit", INLINE, None),
             ent("PostToolUse", INLINE, Some(".*")),
-        ]));
+        ])));
         assert_eq!(
             the_incident[0].status,
             Status::Fail,
@@ -4130,17 +4188,42 @@ mod negative_controls {
         // AMUX-2538's trap: correctly wired, still inert. `"*"` is not a regex,
         // and a tool event with no matcher is ignored outright.
         let bad_matcher =
-            report_hooks_wired(Ok(vec![ent("PostToolUse", GOOD, Some("*"))]));
+            report_hooks_wired(Ok(with_pair(vec![ent("PostToolUse", GOOD, Some("*"))])));
         assert_eq!(bad_matcher[0].status, Status::Fail, "\"*\" is not a regex: {bad_matcher:?}");
         assert!(bad_matcher[0].observed.contains("inert"), "{}", bad_matcher[0].observed);
 
-        let no_matcher = report_hooks_wired(Ok(vec![ent("PostToolUse", GOOD, None)]));
+        let no_matcher = report_hooks_wired(Ok(with_pair(vec![ent("PostToolUse", GOOD, None)])));
         assert_eq!(no_matcher[0].status, Status::Fail, "tool event needs a matcher: {no_matcher:?}");
 
         // A LIFECYCLE event legitimately has none — the check must not invent a
         // failure there, or it fires forever on a correct config and gets muted.
-        let lifecycle = report_hooks_wired(Ok(vec![ent("Stop", GOOD, None)]));
+        let lifecycle = report_hooks_wired(Ok(with_pair(vec![ent("Stop", GOOD, None)])));
         assert_eq!(lifecycle[0].status, Status::Pass, "Stop takes no matcher: {lifecycle:?}");
+
+        // AMUX-4024: A HOOK NOBODY EVER ADDED. Every assertion above walks
+        // entries that EXIST, so none of them can fail on an absent event class
+        // — which is how a lifecycle count with a store, a consumer and a unit
+        // test sat at null for 125 of 125 lanes. Each arm drops exactly ONE
+        // entry from the healthy config above, so a Fail here can only be the
+        // missing hook.
+        for (missing, rest) in [
+            ("subagent:start", vec![ent("SubagentStop", SUB_STOP, None)]),
+            ("subagent:stop", vec![ent("PreToolUse", SUB_START, Some("^(Task|Agent)$"))]),
+        ] {
+            let mut v = vec![ent("Stop", GOOD, None)];
+            v.extend(rest);
+            let got = report_hooks_wired(Ok(v));
+            assert_eq!(
+                got[0].status,
+                Status::Fail,
+                "a missing {missing:?} hook leaves the subagent count dead and must fail: {got:?}"
+            );
+            assert!(
+                got[0].observed.contains(missing),
+                "the failure must NAME the missing hook: {}",
+                got[0].observed
+            );
+        }
 
         // Absence and unreadability are Unknown, never a false pass.
         assert_eq!(report_hooks_wired(Ok(vec![]))[0].status, Status::Unknown);

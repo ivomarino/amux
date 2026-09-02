@@ -8372,7 +8372,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.773';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.774';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -11530,6 +11530,44 @@ function _atAttach(inp) {
   inp.addEventListener('blur', () => setTimeout(() => dd.classList.remove('open'), 200));
 }
 
+// The status of each lane, in the @-mention list (Ethan, 2026-09-02: "i want
+// these to say the status of each when i @ it").
+//
+// The row used to carry a bare filled/hollow dot, which answers "is the process
+// up" and not the question you are actually asking at an @ — whether the lane
+// you are about to address can take the message now. A running lane at a
+// permission prompt and a running lane mid-turn drew the identical dot.
+//
+// Reuses `_sessStatusKey` and the `.status-badge` classes rather than a second
+// vocabulary, so this list cannot drift from the cards, the peek header or the
+// filter facets — they all resolve the same `s.status` through the same
+// helpers. `waiting` keeps `_waitingLabel`'s specific reason ("permission
+// prompt") because that is the state where knowing WHY decides whether you
+// should be sending anything at all.
+function _atStatusBadge(s) {
+  const k = _sessStatusKey(s);
+  if (k === 'stopped') {
+    return '<span class="status-badge" style="background:rgba(255,255,255,0.06);' +
+      'color:var(--dim);border:1px solid var(--border);margin-right:6px;">stopped</span>';
+  }
+  const b = (cls, txt, extra) =>
+    `<span class="status-badge ${cls}" style="margin-right:6px;"${extra || ''}>${txt}</span>`;
+  if (k === 'working') return b('active', 'working') + _atAgentsChip(s);
+  if (k === 'waiting') return b('waiting', esc(_waitingLabel(s)), _waitingTitle(s));
+  if (k === 'rate_limited') return b('rate-limited', 'rate limited');
+  if (k === 'api_error') return b('rate-limited', 'API ' + esc(s.api_error_code || '5xx'));
+  return b('idle', 'idle');
+}
+// Same chip as the peek header, minus the left margin that assumes a badge
+// precedes it. Whether a lane has live background agents is the difference
+// between "idle, say what you like" and "mid-delegation" (AMUX-4024).
+function _atAgentsChip(s) {
+  return s.agents_working
+    ? '<span class="status-badge active" style="margin-right:6px;" ' +
+      'title="Background agents are live">\u2699 agents</span>'
+    : '';
+}
+
 // Populate dropdown with @session matches; returns true if @ mode active.
 // Empty @ lists ALL sessions (running first); a query fuzzy-matches + ranks.
 function _atRender(inp, el, pickCall) {
@@ -11549,7 +11587,7 @@ function _atRender(inp, el, pickCall) {
       : esc(r.s.name);
     return `<div class="ac-item at-item" onmousedown="${pickCall}(${i})">` +
       `<span class="at-at">@</span>${name}` +
-      `<span class="ac-desc">${r.s.running ? '● ' : '○ '}open channel &rarr;</span></div>`;
+      `<span class="ac-desc">${_atStatusBadge(r.s)}open channel &rarr;</span></div>`;
   }).join('');
   el._atItems = ranked.map(r => r.s);
   el.classList.add('open');
