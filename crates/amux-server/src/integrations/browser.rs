@@ -1725,7 +1725,18 @@ impl CdpClient {
                 .and_then(Value::as_str)
                 .or_else(|| ex.get("text").and_then(Value::as_str))
                 .unwrap_or("page threw");
-            anyhow::bail!("eval: {desc}");
+            // Carried as a TYPE (AMUX-98), same technique as CdpTimeout right
+            // below: a caller-supplied selector that is not valid CSS (e.g.
+            // Playwright-style `text=...` syntax reaching a native
+            // `document.querySelector`) throws HERE, inside the page — the
+            // caller's mistake, not amux's. Every OTHER caller of `eval()`
+            // (click_selector, the "wait" selector probe, ...) used to
+            // propagate this as a bare anyhow error indistinguishable from a
+            // real transport failure, so the API boundary answered 502 for a
+            // malformed selector — "amux is broken" for what was actually a
+            // well-formed refusal. Message text is UNCHANGED ("eval: {desc}"),
+            // only the type changed, so this is not a wire-format break.
+            return Err(anyhow::Error::new(PageException(desc.to_string())));
         }
         Ok(r.pointer("/result/value").cloned().unwrap_or(Value::Null))
     }
@@ -1778,6 +1789,34 @@ impl std::fmt::Display for CdpTimeout {
 }
 
 impl std::error::Error for CdpTimeout {}
+
+/// A page-side exception from `Runtime.evaluate` (AMUX-98) — the SCRIPT
+/// threw, most commonly because a caller-supplied selector interpolated
+/// into a `document.querySelector(...)` call is not valid CSS (e.g. a
+/// Playwright-style `text=...` selector, which native `querySelector` does
+/// not understand and rejects with a `SyntaxError`). This is the caller's
+/// mistake, same class as the NOELEMENT/NOTVISIBLE/STALE sentinels
+/// `click_outcome` already maps to 400 — it just arrives as an exception
+/// instead of a benign string return, because the malformed selector fails
+/// before the click JS's own logic ever runs.
+///
+/// Carried as a TYPE, same technique as [`CdpTimeout`] right above (and for
+/// the identical reason, AMUX-3672): the API boundary decides the status
+/// code from the error's TYPE, never by matching its message text, so a
+/// future rewording can't silently flip a 400 into a 502.
+#[derive(Debug)]
+pub struct PageException(pub String);
+
+impl std::fmt::Display for PageException {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Unchanged wording ("eval: {desc}") from the old bail!() this
+        // replaced — callers and tests that match on the message see no
+        // difference; only the type is now inspectable.
+        write!(f, "eval: {}", self.0)
+    }
+}
+
+impl std::error::Error for PageException {}
 
 impl From<anyhow::Error> for DriverError {
     fn from(e: anyhow::Error) -> Self {
