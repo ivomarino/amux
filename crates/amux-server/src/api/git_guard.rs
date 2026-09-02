@@ -470,6 +470,53 @@ pub(crate) fn victim_path_line(pth: &str, fate: &PathFate, provenance: &str) -> 
         // point at the card, do not send anyone hunting for lost work.
         // Reporting this as at-risk is what cries wolf on every absorption
         // that went fine.
+        // AF-422: THE ABSORPTION ARM NEVER INHERITED THE PROVENANCE BRANCH the
+        // at-risk arms below have had since AMUX-3778 and MG-1484.
+        //
+        // "your CODE is safe, record the REASONING on the card" presumes the
+        // reader HAD reasoning here. That holds when their claim is a recorded
+        // write; it does not when the claim is a cwd mtime or a restore, and
+        // then the sentence sends them to document work that never existed.
+        //
+        // Reported by mixpeek-general 2026-09-02, who received BOTH forms from
+        // this emitter within an hour: the at-risk arm on one file correctly
+        // said "your claim here is OBSERVED (a file mtime moved during one of
+        // your Bash commands), not a recorded edit", and the absorption arm on
+        // server/infra/gke/chart/templates/_helpers.tpl said "absorbed into
+        // 3cb19fde1b under byo-ray" and nothing else. Their case was
+        // `mine_provenance == "observed"`. The value was reaching the mirror;
+        // this arm was not reading it.
+        //
+        // WHY THE OBVIOUS FIX IS WRONG, recorded so nobody re-derives it:
+        // gating this on `owner_never_wrote` (AF-420's check, which the report
+        // originally asked for) deletes the signal. Real absorption means the
+        // victim's UNCOMMITTED work was swept into someone else's commit, so
+        // they legitimately have no commit on the path — the check returns true
+        // for exactly the case this arm exists to report. Commit history cannot
+        // separate the two; provenance can, because a real absorption is
+        // transcript-backed and an mtime echo is not.
+        //
+        // Still not at-risk (`false`) in every arm: absorption is not lost work,
+        // and that was never the defect. Only the claim about whose reasoning is
+        // stranded changes.
+        PathFate::AbsorbedBy(sha, who) if provenance == "restore" => (
+            format!(
+                "  {pth}  — absorbed into {sha} under `{who}`. Your only recorded touch here \
+                 is a RESTORE from a committed ref (no authored content of yours; MG-1484), \
+                 so there is no reasoning of yours to record"
+            ),
+            false,
+        ),
+        PathFate::AbsorbedBy(sha, who) if provenance == "observed" => (
+            format!(
+                "  {pth}  — absorbed into {sha} under `{who}`; your CODE is safe. NOTE: your \
+                 claim here is OBSERVED (a file mtime moved during one of your Bash commands), \
+                 not a recorded edit — on a shared checkout a peer writing under your cwd looks \
+                 identical from here. Check whether you actually wrote this before recording \
+                 reasoning for it"
+            ),
+            false,
+        ),
         PathFate::AbsorbedBy(sha, who) => (
             format!(
                 "  {pth}  — absorbed into {sha} under `{who}`; your CODE is safe, \
@@ -3654,6 +3701,51 @@ mod tests {
         // at-risk case, and it must stay loud.
         std::fs::write(dir.path().join("grafted.txt"), "novel v3, uncommitted\n").unwrap();
         assert_eq!(path_fate(&d, "grafted.txt", "backend", 0, "firsthand").await, PathFate::AtRisk);
+    }
+
+    /// AF-422: the ABSORPTION arm reads provenance, like the at-risk arms have
+    /// since AMUX-3778.
+    ///
+    /// mixpeek-general received both forms from this emitter within an hour:
+    /// the at-risk arm correctly noted "your claim here is OBSERVED ... not a
+    /// recorded edit", and the absorption arm on
+    /// server/infra/gke/chart/templates/_helpers.tpl said only "absorbed into
+    /// 3cb19fde1b under byo-ray; your CODE is safe, record the REASONING on the
+    /// card". Their claim was `observed`. There was no reasoning to record.
+    #[test]
+    fn absorption_does_not_ask_you_to_record_reasoning_you_never_wrote() {
+        let fate = PathFate::AbsorbedBy("3cb19fd".into(), "byo-ray".into());
+
+        // THE SPECIMEN: an mtime claim. Still absorbed, still not at risk, but
+        // it must not send the reader to document work they may not have done.
+        let (line, at_risk) = victim_path_line("_helpers.tpl", &fate, "observed");
+        assert!(!at_risk, "absorption is not lost work, in any arm: {line}");
+        assert!(line.contains("absorbed into 3cb19fd"), "still says what happened: {line}");
+        assert!(
+            !line.contains("record the REASONING"),
+            "an mtime claim must not presume reasoning: {line}"
+        );
+        assert!(line.contains("OBSERVED"), "say what the claim actually is: {line}");
+
+        // A RESTORE carries no authored content at all (MG-1484), so it is even
+        // more certain there is nothing to record.
+        let (line, at_risk) = victim_path_line("_helpers.tpl", &fate, "restore");
+        assert!(!at_risk);
+        assert!(line.contains("RESTORE"), "{line}");
+        assert!(!line.contains("record the REASONING"), "{line}");
+
+        // CONTROL, and the reason this is a fix rather than a mute: a
+        // TRANSCRIPT-backed claim is a real absorption — the reader did write
+        // bytes and a peer committed them — and it must still say so. This is
+        // also why AF-420's `owner_never_wrote` is the WRONG gate here: a real
+        // absorption has no commit of theirs either, by definition.
+        let (line, at_risk) = victim_path_line("_helpers.tpl", &fate, "firsthand");
+        assert!(!at_risk);
+        assert!(
+            line.contains("record the REASONING on the card"),
+            "a real absorption still strands reasoning and must say so: {line}"
+        );
+        assert!(!line.contains("OBSERVED"), "{line}");
     }
 
     /// AF-422: the closing line must not claim authorship it cannot support.
