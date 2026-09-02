@@ -327,8 +327,30 @@ fn lookup_start_origin(store: &crate::db::SharedStore, started_at: i64) -> Start
     let Ok(conn) = store.read() else {
         return StartOrigin::NotLooked;
     };
+    // AF-419: ONLY ROWS THAT WERE THEMSELVES UNATTRIBUTED CAN BE THIS HOLDER'S.
+    //
+    // This function is called for an UNATTRIBUTED holder and nowhere else (the
+    // call site gates on `r_owner.trim().is_empty()`). A holder is unattributed
+    // exactly when its start carried no session — neither a body/query `session`
+    // nor an `X-Amux-Session` header, since `explicit_session` reads both. The
+    // log stores the raw header, so that start's row MUST have an empty
+    // `amux_session`. A row carrying a session therefore cannot be the one that
+    // began this holder, whatever its timestamp.
+    //
+    // Without this clause the nearest-row rule can hand an unattributed holder
+    // the ip and user-agent of a DIFFERENT lane's start, and the refusal then
+    // describes the wrong caller with full confidence — the wrong-but-confident
+    // attribution class of AF-411, AF-179 and AMUX-3954. Measured live: 115 of
+    // 265 all-time start rows are unattributed, and 5 windows exist where an
+    // attributed start falls within 120s after an unattributed one (e.g.
+    // 2026-08-29 09:08:10 unattributed, ai-video-editor 20.0s later).
+    //
+    // NOT PROVEN TO HAVE FIRED. `started_at` is not in the log, so I can show
+    // the windows exist and not that a wrong answer was produced. The clause is
+    // worth it anyway because it makes the wrong answer UNREACHABLE rather than
+    // unlikely, and it costs one predicate.
     let row = conn.query_row(
-        "SELECT COALESCE(client_ip,''), COALESCE(user_agent,'')          FROM _amux_request_log          WHERE path = '/api/browser/start' AND method = 'POST'            AND ts <= ?1 AND ts >= ?1 - 120          ORDER BY ts DESC LIMIT 1",
+        "SELECT COALESCE(client_ip,''), COALESCE(user_agent,'')          FROM _amux_request_log          WHERE path = '/api/browser/start' AND method = 'POST'            AND COALESCE(amux_session,'') = ''            AND ts <= ?1 AND ts >= ?1 - 120          ORDER BY ts DESC LIMIT 1",
         [started_at as f64],
         |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
     );
@@ -339,6 +361,88 @@ fn lookup_start_origin(store: &crate::db::SharedStore, started_at: i64) -> Start
         // A BROKEN LOOKUP IS NOT AN ABSENT ROW. Reporting "no origin" here would
         // let a schema change or a locked db read as evidence about the holder.
         Err(_) => StartOrigin::NotLooked,
+    }
+}
+
+#[cfg(test)]
+mod af419_start_origin_tests {
+    use super::*;
+
+    fn store_with(rows: &[(f64, &str, &str, &str)]) -> crate::db::SharedStore {
+        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let store = std::sync::Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
+        let owned: Vec<(f64, String, String, String)> = rows
+            .iter()
+            .map(|(t, i, u, s)| (*t, (*i).to_string(), (*u).to_string(), (*s).to_string()))
+            .collect();
+        store
+            .write(move |conn| {
+                for (ts, ip, ua, sess) in &owned {
+                    conn.execute(
+                        "INSERT INTO _amux_request_log \
+                         (ts, method, path, family, status, latency_ms, client_ip, user_agent, amux_session, answered_by) \
+                         VALUES (?1,'POST','/api/browser/start','/api/browser',200,1.0,?2,?3,?4,'native')",
+                        rusqlite::params![ts, ip, ua, sess],
+                    )?;
+                }
+                Ok(crate::db::WriteOutcome { applied: false, events: vec![] })
+            })
+            .unwrap();
+        store
+    }
+
+    /// THE CARD'S NAMED CHECK. Two starts inside one 120s window from different
+    /// callers: an UNATTRIBUTED one, then an ATTRIBUTED one that is NEARER to
+    /// the holder's started_at. The holder is unattributed, so only the first
+    /// can be its start — and the nearest-row rule alone would pick the second.
+    #[test]
+    fn an_unattributed_holder_is_never_described_by_an_attributed_start() {
+        let s = store_with(&[
+            (1000.0, "100.66.26.84", "Mozilla/5.0 (Macintosh)", ""),
+            (1050.0, "127.0.0.1", "curl/8.7.1", "ai-video-editor"),
+        ]);
+        match lookup_start_origin(&s, 1060) {
+            StartOrigin::Found { ip, ua } => {
+                assert_eq!(ip, "100.66.26.84", "must be the UNATTRIBUTED row, not the nearer one");
+                assert!(ua.contains("Mozilla"), "got {ua}");
+            }
+            other => panic!("expected the unattributed row, got {}", other.label()),
+        }
+    }
+
+    /// CONTROL, and the one that makes this honest: with ONLY an attributed row
+    /// in the window there is no candidate at all, and the answer must be
+    /// NotFound rather than a confident description of the wrong caller.
+    /// Without this cell, "return the oldest row" would pass the test above.
+    #[test]
+    fn only_attributed_rows_in_the_window_means_no_candidate() {
+        let s = store_with(&[(1050.0, "127.0.0.1", "curl/8.7.1", "ai-video-editor")]);
+        assert!(
+            matches!(lookup_start_origin(&s, 1060), StartOrigin::NotFound),
+            "an attributed row cannot describe an unattributed holder"
+        );
+    }
+
+    /// CONTROL: the ordinary case still works — nearest unattributed row wins
+    /// among several, so the fix narrows the candidates without inverting them.
+    #[test]
+    fn among_unattributed_rows_the_nearest_still_wins() {
+        let s = store_with(&[
+            (1000.0, "10.0.0.1", "old-client", ""),
+            (1055.0, "10.0.0.2", "new-client", ""),
+        ]);
+        match lookup_start_origin(&s, 1060) {
+            StartOrigin::Found { ip, .. } => assert_eq!(ip, "10.0.0.2"),
+            other => panic!("expected the nearer row, got {}", other.label()),
+        }
+    }
+
+    /// CONTROL: the 120s window is still enforced — an unattributed row older
+    /// than the window must not be adopted just because it is the only one.
+    #[test]
+    fn the_window_still_bounds_the_search() {
+        let s = store_with(&[(900.0, "10.0.0.1", "too-old", "")]);
+        assert!(matches!(lookup_start_origin(&s, 1060), StartOrigin::NotFound));
     }
 }
 
