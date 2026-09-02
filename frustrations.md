@@ -273,33 +273,6 @@ NOTE: what makes this instructive rather than just a bug is that the function ha
   ethos rule-1 note that a view must share the predicate of the mechanism it describes;
   here the guard describes "did this lane work?" with a predicate that means "does this
   lane own cards?".
-## The reviewer-identity check fires on done->verified, blocking the peer amux routed the verification to
-AREA: gates
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-08
-SESSION: amux-frustrations
-CARD: AF-20
-SYMPTOM: Working the VERIFY queue amux dispatched to me ("You are the independent check"),
-  done -> verified was refused twice with "review sign-off required from the reviewer ...
-  the review->done ack must come from that session". The attempted edge is done->verified,
-  not review->done. On AMUX-2385 it is unsatisfiable by construction: the card went
-  doing -> done directly (log: `status: doing -> done (by amux/session)`), so the named
-  reviewer never acked a review and has no pending ack to give.
-COST: Two forced bypasses in one afternoon (AMUX-2334, AMUX-2385) on cards I had fully
-  measured. Both logged and attributed, so nothing is hidden — but the alternative was
-  leaving a completed verification unrecorded, and a gate that trains its most careful users
-  to reach for --force is inverting its own purpose.
-FIX: Scope the identity check to the transition it is about. It exists so an author cannot
-  self-ack their own review — that is review->done. done->verified is a different edge with
-  a different role and already has its own peer criterion. Failing that, accept ANY different
-  worker in the group, which is what the gate text already asks for. At minimum fix the
-  message: naming the wrong transition sends the reader hunting an ack that cannot exist.
-NOTE: ethos rule 6 — the published contract and the enforced one disagree. The `verified`
-  gate lists four criteria; criterion 2 is "Peer-reviewed by a DIFFERENT worker in group
-  `amux` (name them)", which I satisfied and named. The refusal comes from a check the gate
-  text never mentions. A card can therefore pass every criterion it publishes and still be
-  refused, which is the state that makes --force feel like the honest move.
 ## The co-edit notice asserts a git fact that was true at emission and false by delivery
 AREA: notices
 SEVERITY: annoys
@@ -2400,41 +2373,6 @@ NOTE: Two things worth more than the bug. First, I diagnosed it WRONG twice — 
   discarding still loops, so AMUX-3594 was closed `done` instead — the re-arm hook fires only on
   the discard transition. Nothing in the card, the gate or the idle nudge can tell you that, and
   the nudge's own option 5 recommends the action that restarts the loop.
-
-## A graft-push checkout read as DIVERGED on every path, withholding the safe restore
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-24
-SESSION: mixpeek-frustrations (reported), amux (fixed)
-CARD: AMUX-3599
-SYMPTOM: The idle commit-nudge filed dirty append-only files as DIVERGED — "commits in BOTH
-  directions, neither single-arm remedy is safe" — on a checkout where the local commits were a
-  REPLAY of content already upstream. DIVERGED forbids both remedies, so the reader is left with
-  a union-merge they do not need and the safe `git checkout origin/main -- <file>` is withheld.
-  The classifier asked `git log origin/main..HEAD -- <path>`, which counts commits BY SHA, and a
-  commit already upstream under a different sha sits in that range permanently. On a graft-push
-  checkout that is EVERY path.
-COST: The wrong verdict on the exact file class the nudge singles out by name — the append-only
-  ledgers, where the union-merge directive is printed. A reader following it does more work than
-  needed and, worse, learns that the nudge's verdicts are unreliable on their checkout, which is
-  the expensive direction: the next DIVERGED that IS real gets read as more of the same. Nobody
-  lost data; the reported cost is a wrong prescription plus the turn spent establishing it.
-FIX: d55b7a63 — content set-difference instead of sha arithmetic, since sha identity is what a
-  replay destroys. The remedy overwrites the WORKTREE, so restore-safety is exactly "does the
-  worktree hold lines origin does not"; zero means nothing here can be lost. One-sided by design:
-  it only ever downgrades diverged->stale, only on a readable pair AND an empty difference, so
-  any error leaves DIVERGED standing.
-NOTE: This is the SECOND defect in this cell in four days and they point opposite ways. The cell
-  was ADDED on 2026-08-20 because the two-bucket classifier filed a genuinely-diverged path STALE
-  and the prescribed restore disarmed a data-loss push guard. This entry is the same cell now
-  over-firing. Both are the same underlying error — reading commit identity as content identity —
-  and it produced a false negative first, then a false positive, which is why "be more careful
-  with the direction test" would not have caught either. The durable form is that a classifier
-  prescribing a DESTRUCTIVE remedy has to be gated on what the remedy actually destroys, not on
-  a proxy for it. Also worth recording: the fix logs the downgrade, because STALE-because-
-  downgraded and STALE-outright were otherwise byte-identical in the log, which is the one-output-
-  two-states shape on the arm that prescribes the destructive remedy.
 
 ## A migration's COST is invisible to the TEST SUITE: four fixture rows make a table scan and an index scan identical
 AREA: instruments
