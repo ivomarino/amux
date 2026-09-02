@@ -1862,6 +1862,15 @@ FIX: none shipped; git_guard.rs and the hooks are amux's, routed to them, and th
   Kept separate deliberately: amux's append-only-push-guard WAS genuinely stale today and is
   now reinstalled and verified. That was real. `hook_outdated` did not and could not report
   it. Two different things that both say "hook" and "outdated".
+RE-CHECKED 2026-09-02, STILL LIVE, so nobody has to re-derive it. A hand-rolled
+POST to /api/git/staged-guard with a valid `dir` and no `guard_version` still
+returns `hook_outdated: true`. The mechanism is unchanged: git_guard.rs:2341 sets
+it from `hook_is_outdated(guard_version, ...)`, i.e. from the request body.
+Worth stating what is NOT wrong, since that is where a reader loses time: the
+field reports exactly what the module header says it reports ("the caller sent no
+guard_version, so it is a pre-rust hook"). The friction is that the NAME says
+staleness and the value says something else, and the caller has no way to learn
+that from the response. That is unchanged too.
 
 
 ## Every checkout's git hooks are 18 days stale, and amux has been saying so into a log for 11
@@ -2101,34 +2110,6 @@ FIX: the index is the shared resource nobody is arbitrating. Either (a) take a l
   Separately and cheaply: prepare-commit-msg must stamp the session of the process
   actually running git, and the staged-guard must warn in BOTH directions — "your
   staged files may ride out under someone else's commit" is the half it cannot say.
-
----
-## A detector went fully inert and its own debug surface called it "baseline has 0 samples"
-AREA: instruments
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-23
-SESSION: amux-frustrations
-CARD: AF-178
-SYMPTOM: Reviewing AF-175 I found the latency regression detector had stopped working on the
-  running build. The only trace anywhere was in GET /api/debug/autofix:
-    {"detector":"latency","signature":"latency|p95|/api/board",
-     "reason":"baseline has 0 samples (<30) - no trailing norm to compare against yet"}
-  /api/board has 46,825 rows in the baseline period and /api/sessions has 122,848. They are the
-  two busiest families in the system. An upstream filter was excluding 99.75% of rows (213,397
-  of 213,935) and the suppression reported that as an absence of data. The same sentence is
-  emitted for a genuinely quiet endpoint, so a live detector outage is byte-identical to a new
-  install with no traffic yet.
-COST: The regression shape was dead on main and would have stayed dead silently. I only found
-  it because I was reviewing that specific commit; no sweep, no alarm and no invariant could
-  have surfaced it. Checked from two angles before saying so: /api/debug/invariants returns 461
-  invariants and the only autofix-adjacent one is board.autofix_cards_are_dispatchable, and in
-  the source base.len() is compared in exactly one place, the min_samples gate that produces
-  the suppression. Detector health is not checked anywhere.
-FIX: Carry the pre-filter row count into the suppression so "0 of 46,825 rows, all filtered"
-  cannot be confused with "0 rows in the period", and add an invariant that fails when a family
-  with enough rows in the period has an empty baseline. Both values are already in hand at the
-  point of suppression. Detail and acceptance on AF-178.
 
 ---
 ## The staged guard named me as co-editor of a file I never opened
@@ -3382,3 +3363,34 @@ FIX: e6b80033. The arm now names the files that block the merge and gives each a
   where the obvious command stops working. `drop_paths_identical_to_origin()`
   already computed this comparison for the idle nudge; the surface every lane
   reads at SessionStart did not (ethos rule 1).
+
+## A status signal with a store, a consumer and a unit test, and no producer anywhere
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux
+CARD: AMUX-4024
+SYMPTOM: `subagents_live` was null for 125 of 125 lanes. AMUX-3048 shipped
+  `subagent_event_post` (start/stop), a `{count, ts}` store, a reader in
+  `FleetSignals::subagents_working`, an explain field, a status-history column and a
+  passing unit test. No hook ever POSTed an event, so every one of those read null
+  forever. The code comment deferring the count-authoritative "off" direction reads as
+  a careful trade-off between two live signals; there was only ever one, because the
+  other was never sent. Two more details compound it: the deferral names the producer
+  as "PreToolUse:Task" and the tool is called `Agent` in current Claude Code, so the
+  hook would have been inert even if someone had wired the documented name; and
+  `hooks.report_hooks_wired` walks the entries that EXIST, so it structurally cannot
+  fail on an event class nobody added.
+COST: Two wrong lane statuses reported by Ethan in one afternoon, in opposite
+  directions, both landing on the mtime fallback nobody knew was load-bearing:
+  tubescience read IDLE while blocked on a background agent, mvs-pitr read WORKING
+  with an AGENTS badge over an empty composer. About 40 minutes of this session spent
+  designing a fix keyed on the reported count before checking whether any lane
+  reported one — the answer was none, and the first fix would have been green and
+  completely inert, which is the same defect a second time.
+FIX: Producer wired in `scripts/hooks/hook-report.sh` (`subagent:start` / `subagent:stop`)
+  and in settings.json as `PreToolUse[Task|Agent]` + `SubagentStop`; count made
+  authoritative in both directions; `hooks.report_hooks_wired` extended with an
+  absent-event-class arm so the next dead producer fails a check instead of reading
+  as a deliberate trade-off.

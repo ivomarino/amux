@@ -3902,3 +3902,76 @@ recalling that something shipped. Probe card, type investigation:
   the string "review sign-off" / "review->done ack" appears NOWHERE in it
 So the identity check no longer fires on this edge. It is scoped to the transition
 it is about, which is the FIX line's own prescription. Probe deleted after.
+
+## A detector went fully inert and its own debug surface called it "baseline has 0 samples"
+VALIDATED: amux-frustrations | VALIDATED by the ORIGINATING session (amux-frustrations). SELF-SIGNOFF, labelled as
+one. Closed on POSITIVE evidence, which this entry specifically requires: its claim
+is that a dead detector and a quiet one are byte-identical, so "the error string is
+gone" is not a test. I checked that first and deliberately did not stop there.
+
+GET /api/debug/autofix: loop_running true, tick 120s, last tick 95s old, 18
+suppressed decisions, 3 of them latency. The one that closes this entry:
+
+  {"detector": "latency",
+   "reason": "blindness check ran: 0 of 75 families lost every row to filtering
+              (295970 rows considered, 0 excluded). A zero here is a measurement;
+              silence would not be.",
+   "signature": "latency|input-collapsed..."}
+
+The entry's mechanism was an upstream filter excluding 213,397 of 213,935 rows while
+the suppression reported it as an absence of data. That filter is now measured every
+tick, with its denominator, and the payload states which of the two states it is in
+rather than leaving them identical. The sentence "A zero here is a measurement;
+silence would not be" is the contract this entry argued for, in the detector it
+argued about.
+
+The detector is running, not merely listed: three latency decisions in that tick,
+including a long-by-design exemption for /api/email/inbox carrying its own numbers
+(3 requests past the 10s floor, worst 15.8s, 30s budget).
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-23
+SESSION: amux-frustrations
+CARD: AF-178
+SYMPTOM: Reviewing AF-175 I found the latency regression detector had stopped working on the
+  running build. The only trace anywhere was in GET /api/debug/autofix:
+    {"detector":"latency","signature":"latency|p95|/api/board",
+     "reason":"baseline has 0 samples (<30) - no trailing norm to compare against yet"}
+  /api/board has 46,825 rows in the baseline period and /api/sessions has 122,848. They are the
+  two busiest families in the system. An upstream filter was excluding 99.75% of rows (213,397
+  of 213,935) and the suppression reported that as an absence of data. The same sentence is
+  emitted for a genuinely quiet endpoint, so a live detector outage is byte-identical to a new
+  install with no traffic yet.
+COST: The regression shape was dead on main and would have stayed dead silently. I only found
+  it because I was reviewing that specific commit; no sweep, no alarm and no invariant could
+  have surfaced it. Checked from two angles before saying so: /api/debug/invariants returns 461
+  invariants and the only autofix-adjacent one is board.autofix_cards_are_dispatchable, and in
+  the source base.len() is compared in exactly one place, the min_samples gate that produces
+  the suppression. Detector health is not checked anywhere.
+FIX: Carry the pre-filter row count into the suppression so "0 of 46,825 rows, all filtered"
+  cannot be confused with "0 rows in the period", and add an invariant that fails when a family
+  with enough rows in the period has an empty baseline. Both values are already in hand at the
+  point of suppression. Detail and acceptance on AF-178.
+
+---
+FIXED, verified 2026-09-02 with POSITIVE evidence rather than the absence of the
+error string. The entry's whole point is that a dead detector and a quiet one read
+identically, so "the message is gone" would have been the wrong test.
+
+GET /api/debug/autofix, last tick 95s ago on a 120s loop, loop_running true, 18
+suppressed decisions of which 3 are latency. One of them is this entry's fix,
+verbatim:
+
+  {"detector": "latency",
+   "reason": "blindness check ran: 0 of 75 families lost every row to filtering
+              (295970 rows considered, 0 excluded). A zero here is a measurement;
+              silence would not be.",
+   "signature": "latency|input-collapsed..."}
+
+So the upstream filter that was excluding 99.75% of rows is now MEASURED per tick
+and reported with its denominator, and the payload says out loud which of the two
+states it is in. That is the measured/n_considered contract applied to the exact
+failure this entry names. The detector is also demonstrably running rather than
+merely present: it made three latency decisions in that tick, including a
+long-by-design exemption for /api/email/inbox with the numbers attached.
