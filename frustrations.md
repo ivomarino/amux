@@ -3522,3 +3522,50 @@ FIX: Two halves, and only the first is shipped.
   than merely well-advised. That is the difference between a rule every lane must
   remember on every read and a property of the environment. A rule that must be
   remembered is exactly what this file exists to stop relying on.
+
+---
+
+## Five checks in one afternoon that ran, passed, and could not have failed
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-02
+SESSION: amux-frustrations
+CARD: AF-422
+SYMPTOM: Not one bug. Five instances in a single afternoon, three mine and two
+  reported by mixpeek-general, of a check that EXECUTED, reported success, and was
+  structurally incapable of failing. Ethos rule 7 already names this class and points
+  at scripts/mutate.sh; what this entry adds is that naming it was not enough to make
+  anyone RUN it, including the person who had just written the rule's own examples.
+    1. (mine, AF-422) A footer fix sat unextracted in a 60-line async block. The
+       mutation restoring the exact bug PASSED THE ENTIRE SUITE. Pulling it into a
+       pure function is the only reason it is a fix rather than a claim.
+    2. (mine, AF-422) Two new match arms placed BELOW the generic arm they were meant
+       to precede. Unreachable, would have shipped inert, every test green. Caught by
+       the compiler, not by me and not by any test.
+    3. (mine, AF-419) Every placeholder cell also set `peer: false`, so the flag alone
+       decided them and the string check under test was never load-bearing. Removing
+       it passed 6 of 6.
+    4. (mixpeek-general) A live self-test leg that could not observe the defect it
+       existed for.
+    5. (mixpeek-general) A test file with no marker, which CI would never have
+       selected — it could not fail because it never ran.
+COST: individually small; two of the five would have shipped a no-op fix while the card
+  closed as done with evidence attached. The compounding cost is worse: each of these
+  produces a GREEN result that is then cited as proof. #1 and #3 were both about to be
+  written into a card's evidence block as mutation-verified.
+FIX: rule 7 says "the way to know is to break it" and names the tool. The gap is WHEN.
+  All five were caught (or missed) at the moment the check was WRITTEN, not at the end,
+  and four of the five were found only because something else forced a second look — a
+  peer's report, a compiler warning, an unrelated mutation. The reflex that would have
+  caught all five is one line: RUN THE MUTATION BEFORE BELIEVING THE TEST, at the
+  moment you write it, not before you claim it.
+  Deliberately NOT proposing new prose in ethos.md. Rule 7 is already correct and
+  already names the tool; a sixth sentence restating it is the shape docs/friction-
+  themes.md warns about, where prose that is not enforceable joins the problem. This is
+  logged as a CLUSTER so the count argues for a mechanism — a `mutate.sh` invocation
+  that takes a test name and reports which mutations it survives would make the reflex
+  cheap enough to be automatic, which is the only thing that has ever worked here.
+  mixpeek-general's framing, kept because it is the argument: "three instances in one
+  afternoon of 'the check ran and could not have failed' is enough that I would rather
+  have the reflex than the three stories."
