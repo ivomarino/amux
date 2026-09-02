@@ -81,6 +81,45 @@ if printf '%s\n' "$out3" | grep -qE "DISK LOW"; then
   bad "(d) with free space above the floor nothing may be cleared" "$out3"
 else ok; fi
 
+# --- (g) AF-415: the disk-low arm clears EVEN WITH A PEER BUILD IN FLIGHT --
+#     The neighbouring debug-SIZE arm defers while any rustc/cargo runs
+#     (AF-303). This one deliberately does not, because below the sacrifice
+#     floor ENOSPC breaks every lane anyway — so a peer build dies either way,
+#     and the difference is whether it dies diagnosably or with a full disk.
+#
+#     That asymmetry reads as an oversight, and the obvious "fix" is to add the
+#     same gate here. This cell is what makes that a deliberate choice somebody
+#     has to argue with rather than one they can quietly reverse: if a peer gate
+#     is ever added to the low-disk arm, this fails and says why.
+#     ASSERT THE EFFECT, NOT THE LOG LINE. The first version of this cell
+#     grepped for "SHARED target dir" — and the echo runs BEFORE the rm, so a
+#     peer gate inserted between them left the line intact and the cell passed
+#     while the clear was skipped. Verified by mutation: adding
+#     `[ -n "$AMUX_BUILD_PEER_PIDS_OVERRIDE" ] && continue` before the rm scored
+#     23 passed. So this runs WITHOUT the dry-run seam, against throwaway dirs
+#     under $TMP, and asks the filesystem.
+H4="$TMP/peerbuilding"; mkdir -p "$H4/.amux/rust-build-target" "$H4/.amux/rust-build-target-e2e-head"
+HOME="$H4" AMUX_RS_BUILD_LOG="$H4/build.log" AMUX_BUILD_MIN_FREE_GB=999999 \
+  AMUX_BUILD_SACRIFICE_CACHE_BELOW_GB=999999 \
+  AMUX_BUILD_PEER_PIDS_OVERRIDE="4242 4243" \
+  AMUX_RS_DISK_CLEAR_ONLY=1 bash "$SCRIPT" >/dev/null 2>&1
+out4=$(cat "$H4/build.log" 2>/dev/null)
+if [ ! -d "$H4/.amux/rust-build-target" ]; then ok
+else bad "(g) the low-disk arm must still CLEAR with peers building — below the sacrifice floor ENOSPC breaks them anyway (AF-415)" "$out4"; fi
+# PRECONDITION, so (g) cannot pass because the script never reached the arm:
+# the low-disk branch must actually have run.
+if printf '%s\n' "$out4" | grep -q "DISK LOW"; then ok
+else bad "(g) precondition: the low-disk branch must have been reached at all" "$out4"; fi
+
+# --- (h) AF-415: and it must say WHOSE build goes cold ---------------------
+#     The line used to read as if the cost landed on the process doing the
+#     clearing. It lands on every lane, and it was 11 firings of the 25GB-era
+#     version of this arm that produced AMUX-2936's three mid-build failures
+#     (diagnosis on AF-416). A log line that understates its blast radius is
+#     how the same clear gets re-tuned by someone who thinks it is cheap.
+if printf '%s\n' "$out" | grep -q "EVERY lane's next build goes cold"; then ok
+else bad "(h) the low-disk clear must name whose build it costs — every lane's, not just this one" "$out"; fi
+
 # --- (f) the free-space figure must actually PARSE -------------------------
 #     This is why (a)-(c) failed on their first CI run, and they failed only
 #     INCIDENTALLY: the script used `df -g`, which is BSD-only, so GNU coreutils

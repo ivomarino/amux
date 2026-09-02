@@ -345,7 +345,28 @@ fi
       fi
       CAND_GB=$(du -sk "$cand" 2>/dev/null | awk '{print int($1/1048576)}')
       if [ "$cand" = "$HOME/.amux/rust-build-target" ]; then
-        echo "== DISK LOW: ${FREE_GB}GB free (< ${AMUX_BUILD_SACRIFICE_CACHE_BELOW_GB:-8}GB). Clearing the ${CAND_GB:-?}GB SHARED target dir — this build goes cold."
+        # AF-415: THIS ARM HAS NO PEER-BUILD GATE, AND THAT IS DELIBERATE.
+        #
+        # The debug-SIZE arm above defers while any rustc/cargo is running
+        # (AF-303, the vanished-rlib class). This one does not, and the
+        # asymmetry is easy to read as an oversight, so: AF-303's own reasoning
+        # covers it. "When disk IS low the override is automatic and needs no
+        # counter, because ENOSPC breaks every lane including the ones being
+        # protected." A peer build dies either way below this threshold; the
+        # difference is whether it dies with a diagnosable error or with the
+        # disk full.
+        #
+        # Do NOT add a peer check here without changing that argument. The
+        # ordering already does the cheap part — the idle e2e dir is cleared
+        # first, and the shared one only survives to this line when that was not
+        # enough.
+        #
+        # WHOSE BUILD GOES COLD: every lane's, not this builder's. That is worth
+        # saying in the log because the sentence used to read as if the cost
+        # landed on the process doing the clearing, and it was 11 firings of the
+        # 25GB-era version of this arm that produced the three mid-build failures
+        # in AMUX-2936 (see AF-416 for the full diagnosis).
+        echo "== DISK LOW: ${FREE_GB}GB free (< ${AMUX_BUILD_SACRIFICE_CACHE_BELOW_GB:-8}GB). Clearing the ${CAND_GB:-?}GB SHARED target dir — EVERY lane's next build goes cold, not just this one. No peer-build gate here on purpose: below this floor ENOSPC breaks them anyway (AF-415)."
       else
         echo "== DISK LOW: ${FREE_GB}GB free. Clearing the ${CAND_GB:-?}GB idle e2e target dir first (this build does not need it)."
       fi
