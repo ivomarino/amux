@@ -66,6 +66,42 @@ def main():
     if mod.GUARD_VERSION <= 8:
         failures.append(f"GUARD_VERSION is {mod.GUARD_VERSION} — bump it, every install checks this")
 
+    # AF-410: THE DOCUMENTED EXTRACTION MUST RETURN THE VALUE THE INTERPRETER
+    # LOADS. This file's header carries an inventory command built on `grep -m1`
+    # over this constant, and the header itself records that an UNANCHORED match
+    # once found a comment line first. That was fixed by anchoring and verified
+    # by hand — "checked: it returned empty" — which is a one-time observation,
+    # not a check that can fail. It is now a check that can fail.
+    #
+    # The failure this pins is live RIGHT NOW in another checkout. Mixpeek's
+    # vendored copy carries the pre-fix comment naming `GUARD_VERSION = 8` as a
+    # literal while its own constant is 9, so the obvious extraction returns 8.
+    # ts-gke hit exactly that on 2026-09-02 and reported the file as v8. The
+    # direction happened to be harmless there (too LOW still reads as stale), but
+    # a comment quoting a HIGHER number would make every stale copy read as
+    # current — a staleness check that passes forever, which is the bug this
+    # whole card is about.
+    import re as _re
+    _src = open(HOOK).read()
+    _anchored = _re.search(r"^GUARD_VERSION *= *(\d+)", _src, _re.M)
+    if not _anchored:
+        failures.append("no anchored `GUARD_VERSION = N` line — the inventory grep finds nothing")
+    elif int(_anchored.group(1)) != mod.GUARD_VERSION:
+        failures.append(
+            f"the anchored extraction reads {_anchored.group(1)} but the module loads "
+            f"{mod.GUARD_VERSION} — the documented inventory command lies")
+    # And no line ABOVE the assignment may look like one, or a first-match read
+    # (anchored or not) lands on the decoy instead.
+    _lines = _src.splitlines()
+    _assign_at = next((i for i, l in enumerate(_lines)
+                       if _re.match(r"^GUARD_VERSION *= *\d+", l)), len(_lines))
+    for _i, _l in enumerate(_lines[:_assign_at]):
+        if _re.search(r"GUARD_VERSION *= *\d+", _l):
+            failures.append(
+                f"line {_i + 1} quotes a literal `GUARD_VERSION = N` above the real "
+                f"assignment on line {_assign_at + 1}; an unanchored `grep -m1` returns it "
+                f"instead: {_l.strip()!r}. Derive the number in prose, do not repeat it.")
+
     # AF-190: the server emits `split_risk`; this asserts a HOOK actually prints
     # it. A field nobody renders reaches nobody, and nothing about reading the
     # server code would say so — that gap is ethos rule 1, and it is why the

@@ -5015,3 +5015,260 @@ mod disposition_tests {
         assert_eq!(nonterminal_has_disposition(&cards)[0].status, Status::Fail);
     }
 }
+
+// ---------------------------------------------------------------------------
+// 6c. Does the CURRENT staged-guard reach every checkout? (AF-410)
+// ---------------------------------------------------------------------------
+
+/// One checkout's observed staged-guard, rolled up from `guard_verdicts`.
+#[derive(Debug, Clone)]
+pub struct GuardCheckout {
+    /// Worktree top-level the hook reported running in.
+    pub dir: String,
+    /// Highest `GUARD_VERSION` that checkout has reported in the window.
+    pub version: i64,
+    /// Firings on that version.
+    pub runs: i64,
+    /// Distinct lanes served by it.
+    pub lanes: i64,
+}
+
+/// AF-410: a corroboration that never reaches a checkout is not a corroboration.
+///
+/// REPORTED BY ts-gke, 2026-09-02. The staged-guard named a peer as co-editor of
+/// a file ts-gke had just written, and named ts-gke on the mirror case, twice in
+/// one hour. Their structural read is the valuable part and it is right: the
+/// guard pairs whoever was ACTIVE with whoever was WRITING, so on a shared
+/// checkout the lane running greps and test sweeps across the tree is the default
+/// suspect for any file whose mtime moves — precisely the lane least likely to
+/// have written it. False positives concentrate on careful readers.
+///
+/// THE FIRST-ORDER CAUSE WAS NOT THE ALGORITHM. Both corroborations built for
+/// exactly that case were ABSENT from the copy that fired: `_never_wrote`
+/// (MC-1561 — the named session has no commit to this path carrying their
+/// trailer) and `_nothing_in_dispute` (AF-391). The live Mixpeek guard was 766
+/// lines at `GUARD_VERSION` 9; the amux source was 1111 at 11. `.githooks/` is a
+/// VENDORED, TRACKED copy no installer writes.
+///
+/// MEASURED, 14 days of `guard_verdicts`: Mixpeek 689 firings across 31 lanes on
+/// version 9 while amux ran 11. Top of that list is `mixpeek-cicd` at 231 —
+/// MC-1561 is mixpeek-cicd's OWN card, so the lane that reported the
+/// reader-vs-writer bug was served a guard without its fix 231 times. Ethos rule
+/// 1 in its exact shape: the capability existed and did not reach.
+///
+/// WHY NOTHING ALARMED. The server has had this data all along — the hook POSTs
+/// `guard_version` on every run and it is stored per `dir`. But the staleness
+/// test is `hook_is_outdated(v, has_op) = v < 2 && !has_op` (api/git_guard.rs), a
+/// floor set when 2 was current, so all 689 version-9 firings read as fine. A
+/// constant floor cannot express "9 when the fleet is at 11".
+///
+/// THE FLOOR HERE IS THE FLEET MAXIMUM, NOT A CONSTANT. That is the whole design:
+/// every future version bump covers itself with no edit here, so this check
+/// cannot rot into the thing it replaced.
+///
+/// TWO CASES THAT MUST NOT READ AS HEALTH, both rule 4:
+/// - **No versioned checkout reported.** `Unknown`, never `Pass`. Version 0 is
+///   `git-shared-guard.py`, a different client that legitimately sends no
+///   version; a checkout that only ever reports 0 has not been measured for this,
+///   and calling it current would be a wrong answer rather than a missing one.
+/// - **Exactly one checkout reported.** Uniformity across a set of one is
+///   vacuous: the check structurally cannot fail, so a `Pass` would be a green
+///   that means nothing (rule 7). It reports `Unknown` and says which.
+pub fn guard_reaches_every_checkout(checkouts: &[GuardCheckout]) -> Vec<InvariantResult> {
+    const ID: &str = "hooks.guard_reaches_every_checkout";
+    let versioned: Vec<&GuardCheckout> = checkouts.iter().filter(|c| c.version >= 1).collect();
+    if versioned.is_empty() {
+        return vec![InvariantResult::unknown(
+            ID,
+            "no checkout reported a versioned staged-guard in the window — version 0 is \
+             git-shared-guard.py, a different client that sends none, so there is nothing \
+             here to compare (not measured; not a clean bill)",
+        )
+        .evidence(json!({"measured": false, "n_considered": 0,
+                         "why_unmeasured": "no guard_verdicts row carried guard_version >= 1"}))];
+    }
+    let newest = versioned.iter().map(|c| c.version).max().unwrap_or(0);
+    if versioned.len() < 2 {
+        return vec![InvariantResult::unknown(
+            ID,
+            format!(
+                "only one checkout ({}) reported a versioned staged-guard, at {newest} — \
+                 uniformity across a set of one cannot fail, so a pass here would carry no \
+                 information",
+                versioned[0].dir
+            ),
+        )
+        .evidence(json!({"measured": false, "n_considered": 1, "newest_version": newest,
+                         "why_unmeasured": "a single checkout makes the comparison vacuous"}))];
+    }
+    let mut lagging: Vec<&GuardCheckout> =
+        versioned.iter().copied().filter(|c| c.version < newest).collect();
+    lagging.sort_by_key(|c| (-c.runs, c.dir.clone()));
+    if lagging.is_empty() {
+        return vec![InvariantResult::pass(ID).evidence(json!({
+            "measured": true,
+            "n_considered": versioned.len(),
+            "newest_version": newest,
+            "checkouts": versioned.iter().map(|c| json!({
+                "dir": c.dir, "version": c.version, "runs": c.runs, "lanes": c.lanes
+            })).collect::<Vec<_>>(),
+        }))];
+    }
+    lagging
+        .iter()
+        .map(|c| {
+            InvariantResult::fail(
+                ID,
+                format!("every checkout runs staged-guard {newest}, the newest the fleet reports"),
+                format!(
+                    "{} runs GUARD_VERSION {} ({} behind): {} firings across {} lanes were \
+                     served it. Every fix landed between {} and {} is absent there — a \
+                     corroboration that does not reach a checkout does not exist for the \
+                     lanes in it. Graft the current source into that checkout's hook path \
+                     (its copy may be vendored and tracked, in which case no installer \
+                     writes it and the owning lane has to commit it).",
+                    c.dir,
+                    c.version,
+                    newest - c.version,
+                    c.runs,
+                    c.lanes,
+                    c.version,
+                    newest,
+                ),
+            )
+            // One incident per checkout, not one flapping fleet-wide incident.
+            .entity(c.dir.clone())
+            .evidence(json!({
+                "measured": true,
+                "n_considered": versioned.len(),
+                "dir": c.dir,
+                "version": c.version,
+                "newest_version": newest,
+                "versions_behind": newest - c.version,
+                "runs": c.runs,
+                "lanes": c.lanes,
+                "source": "scripts/git-hooks/amux-staged-guard",
+            }))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod guard_reach_tests {
+    use super::*;
+
+    fn co(dir: &str, version: i64, runs: i64, lanes: i64) -> GuardCheckout {
+        GuardCheckout { dir: dir.to_string(), version, runs, lanes }
+    }
+
+    fn ev(r: &InvariantResult) -> &serde_json::Value {
+        &r.evidence
+    }
+
+    #[test]
+    fn no_versioned_checkout_is_unknown_not_pass() {
+        let out = guard_reaches_every_checkout(&[]);
+        assert_eq!(out[0].status, Status::Unknown);
+        assert_eq!(ev(&out[0])["measured"], json!(false));
+        assert_eq!(ev(&out[0])["n_considered"], json!(0));
+    }
+
+    /// Version 0 is git-shared-guard.py, a DIFFERENT client that legitimately
+    /// sends no version. A checkout that only ever reports 0 has not been
+    /// measured for this; calling it maximally stale would be a wrong answer.
+    #[test]
+    fn version_zero_alone_is_unmeasured_not_maximally_stale() {
+        let out = guard_reaches_every_checkout(&[co("/a", 0, 300, 30), co("/b", 0, 5, 1)]);
+        assert_eq!(out[0].status, Status::Unknown);
+        assert_eq!(ev(&out[0])["measured"], json!(false));
+    }
+
+    /// A version-0 row sitting BESIDE real ones must not drag the floor down or
+    /// appear as a lagging checkout of its own.
+    #[test]
+    fn version_zero_beside_versioned_checkouts_is_excluded_from_both_sides() {
+        let out = guard_reaches_every_checkout(&[
+            co("/shared-guard-only", 0, 338, 33),
+            co("/a", 11, 10, 2),
+            co("/b", 11, 10, 2),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].status, Status::Pass);
+        assert_eq!(ev(&out[0])["n_considered"], json!(2), "the version-0 dir is not considered");
+        for r in &out {
+            assert!(!r.observed.contains("shared-guard-only"), "not named as lagging: {r:?}");
+        }
+    }
+
+    /// Rule 7 turned on the check's own output: with one checkout the comparison
+    /// structurally cannot fail, so a Pass would be a green that means nothing.
+    #[test]
+    fn a_single_checkout_cannot_fail_so_it_reports_unknown() {
+        let out = guard_reaches_every_checkout(&[co("/only", 11, 900, 40)]);
+        assert_eq!(out[0].status, Status::Unknown);
+        assert_eq!(ev(&out[0])["measured"], json!(false));
+        assert_eq!(ev(&out[0])["n_considered"], json!(1));
+        assert!(out[0].observed.contains("vacuous") || out[0].observed.contains("cannot fail"));
+    }
+
+    #[test]
+    fn uniform_checkouts_pass_and_say_how_many_were_compared() {
+        let out = guard_reaches_every_checkout(&[co("/a", 11, 100, 5), co("/b", 11, 20, 2)]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].status, Status::Pass);
+        assert_eq!(ev(&out[0])["measured"], json!(true));
+        assert_eq!(ev(&out[0])["n_considered"], json!(2));
+        assert_eq!(ev(&out[0])["newest_version"], json!(11));
+    }
+
+    /// THE SPECIMEN, from guard_verdicts over the 14 days to 2026-09-02.
+    #[test]
+    fn the_af410_specimen_names_mixpeek_two_versions_behind() {
+        let out = guard_reaches_every_checkout(&[
+            co("/Users/ethan/Dev/mixpeek", 9, 689, 31),
+            co("/Users/ethan/Dev/amux", 11, 165, 8),
+        ]);
+        assert_eq!(out.len(), 1, "one incident, for the one lagging checkout");
+        assert_eq!(out[0].status, Status::Fail);
+        assert_eq!(out[0].entity_key, "/Users/ethan/Dev/mixpeek");
+        assert_eq!(ev(&out[0])["versions_behind"], json!(2));
+        assert_eq!(ev(&out[0])["runs"], json!(689));
+        assert_eq!(ev(&out[0])["lanes"], json!(31));
+        // The blast radius belongs in the message, not only the evidence blob:
+        // "9 days stale" is not actionable, "689 firings across 31 lanes" is.
+        assert!(out[0].observed.contains("689"), "{}", out[0].observed);
+        assert!(out[0].observed.contains("31 lanes"), "{}", out[0].observed);
+    }
+
+    /// Two lagging checkouts are two incidents, keyed by dir — not one
+    /// fleet-wide incident that flaps as they are fixed one at a time.
+    #[test]
+    fn each_lagging_checkout_is_its_own_incident() {
+        let out = guard_reaches_every_checkout(&[
+            co("/Users/ethan/Dev/mixpeek", 9, 689, 31),
+            co("/Users/ethan/Dev/amux-GTM", 10, 1, 1),
+            co("/Users/ethan/Dev/amux", 11, 165, 8),
+        ]);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|r| r.status == Status::Fail));
+        let keys: Vec<&str> = out.iter().map(|r| r.entity_key.as_str()).collect();
+        assert!(keys.contains(&"/Users/ethan/Dev/mixpeek"));
+        assert!(keys.contains(&"/Users/ethan/Dev/amux-GTM"));
+        // Busiest first: the checkout serving 689 firings outranks the one serving 1.
+        assert_eq!(out[0].entity_key, "/Users/ethan/Dev/mixpeek");
+    }
+
+    /// The floor must MOVE. This is the property that stops this check rotting
+    /// into `guard_version < 2`, the constant it replaces: bump every checkout
+    /// past today's newest and it still passes, with no edit here.
+    #[test]
+    fn the_floor_is_the_fleet_maximum_not_a_constant() {
+        let out = guard_reaches_every_checkout(&[co("/a", 40, 10, 1), co("/b", 40, 10, 1)]);
+        assert_eq!(out[0].status, Status::Pass);
+        assert_eq!(ev(&out[0])["newest_version"], json!(40));
+        // ... and one behind at that height still fails.
+        let out = guard_reaches_every_checkout(&[co("/a", 39, 10, 1), co("/b", 40, 10, 1)]);
+        assert_eq!(out[0].status, Status::Fail);
+        assert_eq!(ev(&out[0])["versions_behind"], json!(1));
+    }
+}
