@@ -8695,7 +8695,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.794';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.795';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -26707,9 +26707,23 @@ async function _bdHydrate(id) {
   } catch (e) { /* leave unhydrated; the save guard covers it */ }
 }
 
-function openBoardDetail(id) {
-  const item = boardItems.find(i => i.id === id);
-  if (!item) return;
+async function openBoardDetail(id) {
+  let item = boardItems.find(i => i.id === id);
+  if (!item) {
+    // Message history, lineage, and deep links can point at an older terminal
+    // card that is intentionally absent from the board's capped working set.
+    // Resolve that ID authoritatively instead of turning a valid clickable
+    // link into a silent navigation to an unrelated board overview.
+    try {
+      const fetched = await apiCall(API + '/api/board/' + encodeURIComponent(id));
+      if (!fetched || !fetched.id) throw new Error('Task not found');
+      item = fetched;
+      boardItems.push(fetched);
+    } catch (e) {
+      showToast('Could not open ' + id + ': ' + (e.message || e), true);
+      return;
+    }
+  }
   boardDetailId = id;
   // Render instantly from cache, then correct it from the server. Blocking the
   // modal on a fetch would make every card open feel slow for a field most
