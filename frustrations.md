@@ -2765,3 +2765,27 @@ FIX: 3675f126. All four derive it now (`per_job_disable_var` is pub(crate); boar
   about the pattern — so it fails the same way the fixture does, and its wrongness is
   invisible for the same reason. The version that reads the real producer is the only one
   that can be wrong LOUDLY.
+FOLLOW-UP the same night, bc2c820b, and it is the better half of this entry. ts-gke read the
+  above and sent back the reciprocal: a positive control belongs on a filter's EXCLUSIONS as
+  much as on its matches. I had done exactly that for the `spawn_periodic` scope filter an
+  hour earlier and had not thought to turn it on `mutate.sh survey`, the tool this entry is
+  about. It had the defect.
+  `survey` reported ONE exclusion, non-unique lines. A second counter was computed and never
+  printed. Comment and blank lines were dropped with no counter at all. So "84 mutable
+  line(s) found" could not be told from "84 found out of 1391 scanned, most of which I
+  silently ignored" — the exact property the tool's own docstring claims, one release old,
+  written by me on the day I filed three entries about this shape.
+  The hidden numbers are not small. On the first file I pointed it at: 1391 scanned, 84
+  mutable, 4 non-unique, 703 with no applicable rule, 600 comment or blank. Nearly half the
+  file in a bucket the report never mentioned, and I had read that report twice and drawn
+  conclusions from it.
+  Fixed by printing all four and ASSERTING THEY SUM to the scanned count. The identity is
+  the transferable part: a bucket breakdown that must add up cannot acquire a silent
+  exclusion later, because a new `continue` without a counter breaks the sum loudly instead
+  of quietly shrinking the measurement. Mutating one counter away now yields "survey
+  accounting lost 2 line(s)" rather than a smaller, entirely plausible number — and a
+  plausible number is the failure mode here, never a crash.
+  ts-gke's framing of why nobody finds these: a filter's MATCHES are what you designed and
+  therefore what you check; its EXCLUSIONS are what you assumed and therefore what nobody
+  checks. The exclusions are also where the silence lives, which is why the failure is
+  always in the reassuring direction.
