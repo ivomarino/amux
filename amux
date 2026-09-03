@@ -3258,13 +3258,49 @@ for tag in item.get('tags',[]):
       # second layer: a tag in a store the reader never opens. So read them
       # here and print one line, in the place the reader is already looking.
       local _hdr; _hdr=$(mktemp)
+      # MARK THE ARCHIVED ROWS (AF-461). `archived` is a boolean FLAG, not a
+      # status, so a card can be archived AND `backlog` at once — and then it is
+      # listed as ordinary work while every closing verb refuses it with
+      # `archived_task_immutable`. Measured 2026-09-03: 119 of 800 rows in the
+      # default board carry archived:1 with a non-terminal status and
+      # closed_at:None, several of them `needsyou` and so in the OWNER's digest.
+      #
+      # gtm-engine lost 26 days on GE-564 to this and only learned it was
+      # unclosable by trying to close it; the listing that offered it said
+      # nothing. I hit the same refusal on AF-224 the same day and read it as
+      # normal. The remedy line exists (`restore it first`) and reaches you only
+      # after you have already done the work of deciding the card is done.
+      #
+      # The symbol table below USED to carry an 'archived' entry keyed by status,
+      # which could never fire for exactly the flag-vs-status reason above: a
+      # dead branch that made the renderer look like it handled this. Keyed off
+      # the flag now, where it can actually fire.
       _curl -sk -D "$_hdr" "$AMUX_API/api/board?$_lsq" | python3 -c "
 import sys,json
 items=json.load(sys.stdin)
+n_arch = 0
 for i in sorted(items, key=lambda x: x.get('updated',0), reverse=True):
-    status_sym = {'done':'✓','verified':'✅','doing':'▶','todo':'○','backlog':'·','discarded':'✗','review':'◎','archived':'⌁'}.get(i['status'],'?')
+    status_sym = {'done':'✓','verified':'✅','doing':'▶','todo':'○','backlog':'·','discarded':'✗','review':'◎'}.get(i['status'],'?')
     tags = ' '.join(f'[{t}]' for t in i.get('tags',[])) if i.get('tags') else ''
-    print(f\"{status_sym} {i['id']:12s} {i['title'][:50]:50s} [{i['status']}] {tags}\")
+    arch = ''
+    if i.get('archived'):
+        status_sym = '⌁'
+        # ONLY the non-terminal ones are the defect. An archived card that is
+        # already done/verified/discarded is archived correctly and nobody wants
+        # to close it; flagging those too would put the warning on 849 rows when
+        # 119 are wrong, and a marker that fires on everything is read as
+        # decoration (ethos rule 5). The pathological state is precisely
+        # archived + a status that still asks someone to act.
+        if i['status'] not in ('done','verified','discarded'):
+            n_arch += 1
+            arch = ' ARCHIVED-cannot-close'
+        else:
+            arch = ' archived'
+    print(f\"{status_sym} {i['id']:12s} {i['title'][:50]:50s} [{i['status']}]{arch} {tags}\")
+if n_arch:
+    print(f\"⌁ {n_arch} row(s) above are ARCHIVED but carry a LIVE status, so they read as\")
+    print(\"  work and every closing verb refuses them (archived_task_immutable). To close:\")
+    print(\"    amux board unarchive <ID>   # then done/discard as usual\")
 "
       # One line, only when rows were actually dropped.
       if grep -qi '^x-amux-truncated: 1' "$_hdr" 2>/dev/null; then
