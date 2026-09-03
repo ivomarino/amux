@@ -148,6 +148,12 @@ fn is_session_blocked(name: &str) -> bool {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EnvFile {
     pairs: Vec<(String, String)>,
+    dirty: Vec<(String, Option<String>)>,
+}
+
+fn env_write_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 /// A temp path unique to THIS CALL, for the write-then-rename dance (AF-104).
@@ -187,10 +193,10 @@ impl EnvFile {
         self.pairs.iter().map(|(k, _)| k.clone()).collect()
     }
 
-    fn load(path: &Path) -> Self {
+    pub(crate) fn load(path: &Path) -> Self {
         let mut pairs = Vec::new();
         let Ok(text) = std::fs::read_to_string(path) else {
-            return Self { pairs };
+            return Self { pairs, dirty: Vec::new() };
         };
         for line in text.lines() {
             let line = line.trim();
@@ -214,7 +220,7 @@ impl EnvFile {
                 None => pairs.push((k.to_string(), v.to_string())),
             }
         }
-        Self { pairs }
+        Self { pairs, dirty: Vec::new() }
     }
 
     pub(crate) fn get(&self, key: &str) -> Option<&str> {
@@ -223,18 +229,34 @@ impl EnvFile {
     fn get_or<'a>(&'a self, key: &str, default: &'a str) -> &'a str {
         self.get(key).unwrap_or(default)
     }
-    fn set(&mut self, key: &str, value: &str) {
+    pub(crate) fn set(&mut self, key: &str, value: &str) {
         match self.pairs.iter_mut().find(|(k, _)| k == key) {
             Some((_, v)) => *v = value.to_string(),
             None => self.pairs.push((key.to_string(), value.to_string())),
         }
+        self.dirty.retain(|(k, _)| k != key);
+        self.dirty.push((key.to_string(), Some(value.to_string())));
     }
-    fn remove(&mut self, key: &str) {
+    pub(crate) fn remove(&mut self, key: &str) {
         self.pairs.retain(|(k, _)| k != key);
+        self.dirty.retain(|(k, _)| k != key);
+        self.dirty.push((key.to_string(), None));
     }
 
     /// Python `_write_env` (py:4252): `# updated:` header + K="V", atomic 0600.
-    fn write(&self, path: &Path) -> std::io::Result<()> {
+    pub(crate) fn write(&self, path: &Path) -> std::io::Result<()> {
+        let _guard = env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut latest = if self.dirty.is_empty() { self.clone() } else { Self::load(path) };
+        for (key, value) in &self.dirty {
+            match value {
+                Some(value) => latest.set(key, value),
+                None => latest.remove(key),
+            }
+        }
+        latest.write_unlocked(path)
+    }
+
+    fn write_unlocked(&self, path: &Path) -> std::io::Result<()> {
         use std::io::Write as _;
         let mut out = format!("# updated: {}\n", chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.6f"));
         for (k, v) in &self.pairs {
@@ -253,6 +275,59 @@ impl EnvFile {
             }
             f.write_all(out.as_bytes())?;
             f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)
+    }
+
+    pub(crate) fn replace_text(path: &Path, text: &str) -> std::io::Result<()> {
+        let _guard = env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
+        use std::io::Write as _;
+        if let Some(dir) = path.parent() { std::fs::create_dir_all(dir)?; }
+        let tmp = unique_tmp_path(path);
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; f.set_permissions(std::fs::Permissions::from_mode(0o600))?; }
+            f.write_all(text.as_bytes())?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Merge key deltas into the legacy unquoted `KEY=value` representation.
+    /// Scope configuration historically writes this shape, while worker env
+    /// files use [`Self::write`]'s quoted/header form. Both paths share the
+    /// same lock and reload under it, so concurrent UI saves cannot resurrect
+    /// a stale copy of another setting merely because their serialization
+    /// formats differ.
+    pub(crate) fn merge_plain(
+        path: &Path,
+        updates: &[(String, Option<String>)],
+    ) -> std::io::Result<()> {
+        let _guard = env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut current: std::collections::BTreeMap<String, String> =
+            crate::config::parse_env_file(path).into_iter().collect();
+        for (key, value) in updates {
+            match value {
+                Some(value) => {
+                    current.insert(key.clone(), value.clone());
+                }
+                None => {
+                    current.remove(key);
+                }
+            }
+        }
+        let text: String = current.iter().map(|(key, value)| format!("{key}={value}\n")).collect();
+        use std::io::Write as _;
+        if let Some(dir) = path.parent() { std::fs::create_dir_all(dir)?; }
+        let tmp = unique_tmp_path(path);
+        {
+            let mut file = std::fs::File::create(&tmp)?;
+            #[cfg(unix)] {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
         }
         std::fs::rename(&tmp, path)
     }
@@ -3324,7 +3399,9 @@ pub(crate) async fn emit_event_store(store: &crate::db::SharedStore, session: &s
 
 /// The secret-redaction pass Python applies before any chat text lands in a
 /// DB row (py:8676 _cmd_hist_record / py:8655 steer history — AMUX-2525).
-/// Same pattern family as the pipe-pane redactor (py:21478).
+/// Same pattern family as the delivery/history redactor (py:21478). Terminal
+/// output itself is intentionally preserved; this helper protects copied text
+/// that is about to enter a shared record.
 pub(crate) fn redact_secrets(text: &str) -> String {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
@@ -3535,10 +3612,19 @@ pub(crate) fn redact_prompt_secrets(s: &str) -> String {
     out = tok
         .replace_all(&out, |c: &regex::Captures| {
             let m = &c[0];
+            // Absolute/relative filesystem paths and lowercase kebab-case
+            // filenames are not credentials. The previous "any punctuation"
+            // rule treated `/Users/.../video-moderation-launch-9x16` as a
+            // token, replacing the useful part of every produced-asset link
+            // with `[REDACTED]`. Known token prefixes were already handled
+            // above; a path must retain its identity to remain auditable.
+            if m.starts_with('/') || m.starts_with("./") || m.starts_with("../") {
+                return m.to_string();
+            }
             let has_upper = m.bytes().any(|b| b.is_ascii_uppercase());
             let has_lower = m.bytes().any(|b| b.is_ascii_lowercase());
-            let has_punct = m.bytes().any(|b| matches!(b, b'+' | b'/' | b'=' | b'-'));
-            if (has_upper && has_lower) || has_punct {
+            let has_b64_punct = m.bytes().any(|b| matches!(b, b'+' | b'/' | b'='));
+            if (has_upper && has_lower) || has_b64_punct {
                 "[REDACTED]".to_string()
             } else {
                 m.to_string() // pure-hex / single-case run (git sha, hex hash): leave it
@@ -6343,8 +6429,7 @@ fn tmux_rows() -> String {
     std::env::var("AMUX_TMUX_ROWS").ok().filter(|v| v.parse::<u32>().is_ok()).unwrap_or_else(|| "50".into())
 }
 
-/// The `pipe-pane` writer program (py:21478 `_log_pipe_command` was
-/// redaction-only; AMUX-2628 rewrote it).
+/// The `pipe-pane` writer program (AMUX-2628).
 ///
 /// **Why this is not `for line in sys.stdin.buffer`.** That is what shipped,
 /// and it froze every log on the fleet for over an hour with `pane_pipe=1`
@@ -6376,11 +6461,6 @@ fn tmux_rows() -> String {
 fn log_pipe_command(log_path: &Path) -> String {
     const PROG: &str = r#"import os,re,select,sys,time
 LOG=sys.argv[1]; MAXB=int(sys.argv[2]); RAW=sys.argv[3]=='1'; FLUSH=int(sys.argv[4])/1000.0
-SEC=re.compile(rb'((?:mxp|usr|ret)_sk)_[A-Za-z0-9_-]+|([A-Z_][A-Z0-9_]*(?:PASSWORD|PASSWD|PWD|SECRET|TOKEN|API_KEY|ACCESS_KEY|PRIVATE_KEY|CLIENT_SECRET|CREDENTIAL|_KEY)[A-Z0-9_]*=)[^\s\r\n]+|(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]+|sk-ant-[A-Za-z0-9_-]+|sk-proj-[A-Za-z0-9_-]+|sk[_-][A-Za-z0-9]{32,}|AIza[0-9A-Za-z_-]{30,}|(?:phx|phc)_[A-Za-z0-9]+',re.I)
-def repl(m):
-    if m.group(1): return m.group(1)+b'_REDACTED'
-    if m.group(2): return m.group(2)+b'REDACTED'
-    return b'SECRET_REDACTED'
 CSI=re.compile(rb'\x1b\[[0-9;?]*([a-zA-Z])')
 def csi(m):
     f=m.group(1)
@@ -6405,7 +6485,7 @@ def rot():
 prev=None
 def emit(seg,redraw):
     global prev
-    s=SEC.sub(repl,seg)
+    s=seg
     if RAW:
         try: fh.write(s+b'\n')
         except OSError: return
@@ -6424,7 +6504,7 @@ if RAW:
     while True:
         c=os.read(0,65536)
         if not c: break
-        try: fh.write(SEC.sub(repl,c))
+        try: fh.write(c)
         except OSError: break
         rot()
     sys.exit(0)
@@ -6475,7 +6555,7 @@ fn log_rotate_bytes() -> u64 {
 }
 
 /// `AMUX_LOG_RAW=1` keeps the verbatim byte stream (colour, cursor escapes)
-/// instead of readable text. Secrets are still redacted in both modes.
+/// instead of readable text. Worker output is never content-redacted.
 fn log_raw_capture() -> bool {
     matches!(std::env::var("AMUX_LOG_RAW").unwrap_or_default().trim(), "1" | "true" | "yes")
 }
@@ -8548,18 +8628,6 @@ async fn peek_response(name: &str, lines: i64, live_only: bool, no_trim: bool) -
     }
     let fallback = if output.is_empty() { "(no output)".to_string() } else { output };
     json!({"name": name, "output": collapse_blank_runs(&fallback)})
-}
-
-/// Defense in depth for the browser terminal. The pipe writer redacts before
-/// bytes reach the log, but old logs and a live pane can predate that writer.
-/// Every text-bearing peek field crosses this final boundary before JSON leaves
-/// the server.
-fn redact_peek_payload(value: &mut Value) {
-    let Some(obj) = value.as_object_mut() else { return };
-    for key in ["history", "live", "output"] {
-        let Some(text) = obj.get(key).and_then(Value::as_str) else { continue };
-        obj.insert(key.into(), json!(redact_prompt_secrets(&redact_secrets(text))));
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -10820,12 +10888,28 @@ pub async fn steer_deliver_for_session(state: &AppState, session: &str) -> bool 
 // silently unlogged 29 of 60 panes.
 //
 // The writer comes from log_pipe_command() and is never hand-rolled, because
-// that function is where REDACTION lives (sk-ant-, ANTHROPIC_API_KEY=, ghp_,
-// AIza..., sk-proj-, POSTHOG_KEY). Re-arming a pane with a bare `cat` works and
-// redacts nothing — I did exactly that by hand while diagnosing this and had to
-// detach it. "Re-arming is safe" is true of the tmux VERB, not of an arbitrary
-// command handed to it.
+// that function owns the readable/raw capture contract, CR/LF handling,
+// rotation, and flush behavior. "Re-arming is safe" is true of the tmux VERB,
+// not of an arbitrary command handed to it.
 // ---------------------------------------------------------------------------
+
+fn pipe_writer_fingerprint() -> String {
+    // Stable FNV-1a over the complete generated command. Unlike a hand-maintained
+    // version number this changes whenever the embedded writer OR one of its
+    // effective runtime knobs changes, so a deployment cannot leave old writer
+    // children running indefinitely behind pane_pipe=1.
+    let command = log_pipe_command(Path::new("__amux_log_path__"));
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in command.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn pipe_writer_marker_path() -> PathBuf {
+    logs_dir().join(".pipe-writer-version")
+}
 
 /// Should this pane be re-armed? Pure, so the discriminator is testable without
 /// a tmux server — and so the NEGATIVE case is pinned as tightly as the
@@ -10835,8 +10919,8 @@ pub async fn steer_deliver_for_session(state: &AppState, session: &str) -> bool 
 /// those would spray shell noise into per-worker logs for lanes that have no
 /// worker; 10 of the 11 unpiped panes measured were exactly that (disposable
 /// smprobe*/zz-* test lanes) and only ONE was a live agent.
-fn should_rearm_pipe(pane_pipe: i64, children: usize) -> bool {
-    pane_pipe == 0 && children > 0
+fn should_rearm_pipe(pane_pipe: i64, children: usize, writer_changed: bool) -> bool {
+    children > 0 && (pane_pipe == 0 || writer_changed)
 }
 
 /// One reconciliation pass. Returns how many panes were re-armed — a count, so
@@ -10850,8 +10934,17 @@ pub async fn pipe_reconcile_tick() -> usize {
     else {
         return 0; // tmux unreachable: not a reconciliation, and not a pass
     };
+    if !out.status.success() {
+        return 0;
+    }
+    let fingerprint = pipe_writer_fingerprint();
+    let marker_path = pipe_writer_marker_path();
+    let writer_changed = std::fs::read_to_string(&marker_path)
+        .map(|value| value.trim() != fingerprint)
+        .unwrap_or(true);
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     let mut rearmed = 0usize;
+    let mut failed = false;
     for line in text.lines() {
         let mut f = line.split_whitespace();
         let (Some(sess), Some(pipe), Some(pid)) = (f.next(), f.next(), f.next()) else {
@@ -10866,15 +10959,29 @@ pub async fn pipe_reconcile_tick() -> usize {
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
             .unwrap_or(0);
-        if !should_rearm_pipe(pipe, children) {
+        if !should_rearm_pipe(pipe, children, writer_changed) {
             continue;
         }
         let lp = log_path(name);
         let cmd = log_pipe_command(&lp);
         let pt = pane_target(sess);
-        let _ = tmux(&["pipe-pane", "-t", &pt, &cmd]).await;
-        rearmed += 1;
-        tracing::warn!(session = %name, children, "re-armed a lost pipe-pane");
+        match tmux(&["pipe-pane", "-t", &pt, &cmd]).await {
+            Some(result) if result.status.success() => {
+                rearmed += 1;
+                tracing::warn!(session = %name, children, writer_changed, "re-armed pipe-pane");
+            }
+            _ => {
+                failed = true;
+                tracing::error!(session = %name, children, writer_changed, "failed to re-arm pipe-pane");
+            }
+        }
+    }
+    // Mark the fleet current only after every eligible pane accepted the new
+    // writer. A partial failure deliberately retries the migration next tick.
+    if writer_changed && !failed {
+        if let Err(error) = EnvFile::replace_text(&marker_path, &format!("{fingerprint}\n")) {
+            tracing::error!(error = %error, "failed to persist pipe-writer version");
+        }
     }
     rearmed
 }
@@ -14160,7 +14267,6 @@ pub(crate) async fn peek_verb(name: &str, qs: &[(String, String)]) -> Response {
     // short-output, empty…) and a key added to one of them is a key the
     // reader cannot rely on. One injection site covers every shape.
     let mut resp = peek_response(name, lines, live_only, no_trim).await;
-    redact_peek_payload(&mut resp);
     if let (Some((cols, rows)), Some(obj)) =
         (tmux_pane_geometry(name).await, resp.as_object_mut())
     {
@@ -14927,6 +15033,8 @@ pub(crate) async fn report_post(state: &AppState, name: &str, headers: &HeaderMa
                 let st_clone = state.clone();
                 let name_clone = name.to_string();
                 tokio::spawn(async move {
+                    steer_deliver_for_session(&st_clone, &name_clone).await;
+                    let _ = crate::runtime_jobs::board_drive::drive_session(&st_clone, &name_clone).await;
                     steer_deliver_for_session(&st_clone, &name_clone).await;
                 });
             }
@@ -16814,6 +16922,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn concurrent_key_updates_merge_instead_of_resetting_other_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("amux.env");
+        std::fs::write(&path, "BASE=kept\n").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8).map(|i| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut env = super::EnvFile::load(&path);
+                env.set(&format!("SETTING_{i}"), "1");
+                barrier.wait();
+                env.write(&path).unwrap();
+            })
+        }).collect();
+        for handle in handles { handle.join().unwrap(); }
+        let final_env = super::EnvFile::load(&path);
+        assert_eq!(final_env.get("BASE"), Some("kept"));
+        for i in 0..8 {
+            assert_eq!(final_env.get(&format!("SETTING_{i}")), Some("1"));
+        }
+    }
+
 
     // ---- AF-96: /api/debug/logs verdict, now testable ------------------------
     //
@@ -17015,6 +17147,11 @@ mod tests {
         // Ordinary prose is untouched.
         let clean = "fix the login bug in auth.rs and rerun the tests";
         assert_eq!(r(clean), clean, "prose must not be redacted");
+        let assets = "~/tubescience-video-moderation-launch.mp4\n/Users/ethan/work/video-moderation-launch-9x16.mp4";
+        assert_eq!(
+            r(assets), assets,
+            "produced asset paths must retain their identity and link target"
+        );
         // A 40-hex git sha survives (single-case, no punct, < 44 chars).
         let sha = "revert a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2 please";
         assert_eq!(r(sha), sha, "git sha must survive: {}", r(sha));
@@ -17391,10 +17528,11 @@ mod tests {
         assert!(!got.contains(&0x1b), "ANSI escapes must be stripped by default");
     }
 
-    /// Redaction is the writer's original job and must survive the rewrite,
-    /// including for a secret that arrives with only CR terminators.
+    /// Worker output is evidence. Preserve it byte-for-byte at the content
+    /// layer, including strings that resemble credentials; access control owns
+    /// who may see the terminal, not irreversible mutation of its output.
     #[test]
-    fn secrets_are_redacted_in_cr_terminated_output() {
+    fn credential_shaped_text_is_not_redacted_from_worker_output() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("s.log");
         let got = run_pipe_writer(
@@ -17402,10 +17540,10 @@ mod tests {
             &log,
         );
         let text = String::from_utf8_lossy(&got);
-        assert!(!text.contains("hunter2"), "api key leaked: {text}");
-        assert!(!text.contains("DEADBEEF"), "anthropic key leaked: {text}");
-        assert!(!text.contains("abcdefghijklmnopqrstuvwxyz01"), "github token leaked: {text}");
-        assert!(text.contains("REDACTED"), "expected a redaction marker: {text}");
+        assert!(text.contains("hunter2hunter2"), "env-shaped output changed: {text}");
+        assert!(text.contains("DEADBEEF"), "token-shaped output changed: {text}");
+        assert!(text.contains("abcdefghijklmnopqrstuvwxyz01"), "prefixed output changed: {text}");
+        assert!(!text.contains("REDACTED"), "worker output must not be redacted: {text}");
     }
 
     /// Cursor MOVEMENT becomes whitespace rather than being deleted. Deleting
@@ -19386,19 +19524,6 @@ mod tests {
         assert!(prompt.contains("source message") && prompt.contains("dependencies"), "{prompt}");
         assert!(!prompt.contains(".amux/logs"), "{prompt}");
         assert!(!prompt.contains("terminal history"), "{prompt}");
-    }
-
-    #[test]
-    fn peek_payload_redacts_live_and_saved_secret_shapes() {
-        let key = format!("AMUX_QA_{}", "PASSWORD");
-        let raw = format!("{key}=fake-login-value");
-        let mut payload = json!({"history": raw, "live": raw, "output": raw, "name": "lane-a"});
-        redact_peek_payload(&mut payload);
-        for field in ["history", "live", "output"] {
-            let text = payload[field].as_str().unwrap_or("");
-            assert!(text.contains("REDACTED") && !text.contains("fake-login-value"), "{field}: {text}");
-        }
-        assert_eq!(payload["name"], json!("lane-a"));
     }
 
     /// The file/DB-backed verbs, exercised through the full router shape on a
@@ -22474,8 +22599,8 @@ mod pipe_reconcile_tests {
     /// `node` agent with 1 child and pane_pipe=0, logging nothing.
     #[test]
     fn a_live_agent_with_no_pipe_is_rearmed() {
-        assert!(should_rearm_pipe(0, 1), "rec-gov's exact shape must re-arm");
-        assert!(should_rearm_pipe(0, 5));
+        assert!(should_rearm_pipe(0, 1, false), "rec-gov's exact shape must re-arm");
+        assert!(should_rearm_pipe(0, 5, false));
     }
 
     /// THE NEGATIVE CASE, and the one that makes this check worth having.
@@ -22484,7 +22609,8 @@ mod pipe_reconcile_tests {
     /// 10 of the 11 unpiped panes measured were bare shells (smprobe*, zz-*).
     #[test]
     fn a_bare_shell_is_never_rearmed() {
-        assert!(!should_rearm_pipe(0, 0), "a pane whose agent is gone has nothing to log");
+        assert!(!should_rearm_pipe(0, 0, false), "a pane whose agent is gone has nothing to log");
+        assert!(!should_rearm_pipe(1, 0, true), "writer migrations must also skip bare shells");
     }
 
     /// An already-piped pane is left alone. Re-arming it would be harmless
@@ -22492,8 +22618,15 @@ mod pipe_reconcile_tests {
     /// would restart 51 writer processes a minute across the fleet.
     #[test]
     fn an_already_piped_pane_is_left_alone() {
-        assert!(!should_rearm_pipe(1, 1));
-        assert!(!should_rearm_pipe(1, 0));
+        assert!(!should_rearm_pipe(1, 1, false));
+        assert!(!should_rearm_pipe(1, 0, false));
+    }
+
+    /// Deploying a changed writer must replace the already-running child once;
+    /// pane_pipe=1 only says a pipe exists, not that it runs current code.
+    #[test]
+    fn an_already_piped_live_agent_is_upgraded_when_the_writer_changes() {
+        assert!(should_rearm_pipe(1, 1, true));
     }
 }
 

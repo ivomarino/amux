@@ -98,19 +98,20 @@ use crate::api::session_verbs::BOARD_DRIVE_GUARD as GUARD;
 const ADVANCE_COOLDOWN_S: f64 = 15.0 * 60.0;
 /// py:12855 `_DECOMPOSE_NUDGE_COOLDOWN`.
 const DECOMPOSE_COOLDOWN_S: f64 = 6.0 * 3600.0;
-/// py:14514 freshness gate — never auto-run a card nobody has touched in 7 days.
-/// Default; overridable via `AMUX_PICKUP_FRESHNESS_S` (AMUX-3779). With pickup
-/// scoring on, age SURFACES old cards before they reach this edge, so the gate
-/// is a backstop for a genuinely-overwhelmed lane, not the thing that hides a
-/// starved card — and when it does exclude a todo, `select_pickup` now says so
-/// in the trace instead of the card silently vanishing from auto-pickup.
-const PICKUP_FRESHNESS_S_DEFAULT: i64 = 7 * 86400;
+/// Optional compatibility gate for operators that deliberately expire untouched
+/// To Do cards. Disabled by default: age is a priority signal, not a hidden status.
 pub(crate) fn pickup_freshness_s() -> i64 {
     std::env::var("AMUX_PICKUP_FRESHNESS_S")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
         .filter(|v| *v > 0)
-        .unwrap_or(PICKUP_FRESHNESS_S_DEFAULT)
+        .unwrap_or(0)
+}
+pub(crate) fn pickup_fresh_cut(now: f64) -> i64 {
+    match pickup_freshness_s() {
+        seconds if seconds > 0 => (now as i64).saturating_sub(seconds),
+        _ => i64::MIN / 2,
+    }
 }
 /// Per-card re-claim cooldown (py:14515 / AMUX-1857), now a knob and much
 /// SHORTER (AMUX-2987). It exempts a card from re-pickup for this long after it
@@ -123,10 +124,9 @@ pub(crate) fn pickup_freshness_s() -> i64 {
 /// a running, idle, ready lane sat doing nothing while holding cards it could
 /// not be handed (measured 2026-08-12: backend idle 80min on 8 todo cards, ALL
 /// claimed 1-24h ago; 9 lanes fleet-wide in the same state). Violates the
-/// no-stall guarantee (Invariant 10). Default is now aligned WITH the breaker
-/// window (2h): a card is exempt exactly as long as it still counts as a recent
-/// bounce, and re-dispatchable the moment it stops — the two mechanisms share
-/// one window instead of fighting. A lane that truly cannot do a card moves it
+/// no-stall guarantee (Invariant 10). Five minutes prevents an immediate hot
+/// loop without turning one model lifecycle decision into a lane-wide stall.
+/// A lane that truly cannot do a card moves it
 /// to backlog/review (the honest exits the pickup prompt names), so it never
 /// re-enters this loop; only a card left in `todo` gets another turn.
 fn reclaim_cooldown_s() -> f64 {
@@ -134,7 +134,7 @@ fn reclaim_cooldown_s() -> f64 {
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| *v >= 0.0)
-        .unwrap_or(7200.0)
+        .unwrap_or(300.0)
 }
 /// Verify-nudge cooldown: once per 24h per session. A session that has no
 /// todo/doing/review work but holds `done` cards gets a batched nudge to
@@ -1352,7 +1352,7 @@ const DISPATCHABLE_WHERE: &str = "i.session=?1 AND i.status='todo' \
 /// happen inside the loop and surface as `all-candidates-refused` — an honest
 /// difference, since those are judgments about a card, not queue membership.
 fn eligible_todo_count(conn: &Connection, session: &str, now: f64) -> i64 {
-    let fresh_cut = (now as i64) - pickup_freshness_s();
+    let fresh_cut = pickup_fresh_cut(now);
     let reclaim_cut = now - reclaim_cooldown_s();
     conn.query_row(
         &format!("SELECT COUNT(*) FROM issues i WHERE {DISPATCHABLE_WHERE}"),
@@ -1665,7 +1665,7 @@ fn oldest_drainable_backlog(conn: &Connection, session: &str, now: f64) -> Optio
 /// stalls the whole lane. That fix moved the per-card refusals inside the loop;
 /// this one moves the queue repair ahead of the guard that skips the loop.
 fn promote_blocked_self_owned_deps(conn: &Connection, session: &str, now: f64) -> Option<Pickup> {
-    let fresh_cut = (now as i64) - pickup_freshness_s();
+    let fresh_cut = pickup_fresh_cut(now);
     let reclaim_cut = now - reclaim_cooldown_s();
     let ids: Vec<String> = conn
         .prepare(&format!(
@@ -2652,37 +2652,6 @@ pub fn select_pickup_with(
         };
     }
 
-    // BOUNCE-LOOP BREAKER (backend, 2026-08-11). A lane that keeps returning
-    // its pickups to todo converts its queue into 24h reclaim-cooldowns at
-    // one card per tick — measured 16 claims in one hour, 19 cards enriched
-    // with notes and nothing executed, and the drive kept feeding it. Three
-    // bounced claims inside two hours means the NEXT card will not fare
-    // better: stop dealing, say so in the trace, and let the advance/nudge
-    // paths (and the fixed pickup prompt's honest exits) resolve the state.
-    // The breaker clears itself: it counts only claims whose card is BACK in
-    // todo, so moving any of them forward (or to backlog/review) releases it.
-    let bounced: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM session_events e WHERE e.type='task.claimed' \
-             AND e.session=?1 AND e.ts > ?2 \
-             AND EXISTS (SELECT 1 FROM issues i WHERE i.status='todo' AND i.deleted IS NULL \
-                         AND e.data LIKE '%\"' || i.id || '\"%')",
-            rusqlite::params![session, now - 7200.0],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    if bounced >= 3 {
-        tracing::warn!(session = %session, bounced,
-            "pickup bounce-loop: this lane returned its recent pickups to todo — dealing it more cards would only burn cooldowns");
-        return Pickup::None {
-            reason: "bounce-loop",
-            detail: format!(
-                "{bounced} claims in the last 2h are back in todo — the lane is declining \
-                 pickups, not working them; withholding further cards until one moves"
-            ),
-        };
-    }
-
     // py:14487 candidate selection. Board drag order IS the priority queue
     // (AMUX-2128): `pos` is what the user reorders in the UI, so dragging a card
     // up prioritizes it; `created` breaks ties for never-dragged cards.
@@ -2694,7 +2663,7 @@ pub fn select_pickup_with(
     // from one loop and dispatchable by the other. Unifying on the LIKE form
     // only ever WIDENS the exemption, so the first run after the change emits
     // nothing; the opposite direction would have discharged a backlog.
-    let fresh_cut = (now as i64) - pickup_freshness_s();
+    let fresh_cut = pickup_fresh_cut(now);
     let reclaim_cut = now - reclaim_cooldown_s();
     // Candidate ordering. Legacy (AMUX_PICKUP_SCORING=0): board-drag order
     // `pos ASC, created ASC` — newest-first by default, because a new card lands
@@ -2773,6 +2742,13 @@ pub fn select_pickup_with(
         } else {
             String::new()
         };
+        let freshness_note = if days > 0 { format!(", stale >{days}d") } else { String::new() };
+        let cooldown_s = reclaim_cooldown_s();
+        let cooldown = if cooldown_s >= 3600.0 {
+            format!("{:.1}h", cooldown_s / 3600.0)
+        } else {
+            format!("{:.0}m", cooldown_s / 60.0)
+        };
         // OPT-IN BACKLOG DRAIN (AMUX-4055). The todo queue is empty, which is the
         // only moment this may fire: a lane with todo work must work THAT, and
         // reaching into backlog while todo has cards would reorder the owner's
@@ -2829,8 +2805,7 @@ pub fn select_pickup_with(
             reason: "no-eligible-card",
             detail: format!(
                 "queue holds nothing dispatchable (needs:you, archived, dormant, \
-                 stale >{days}d and cards claimed in the last {}h are all exempt){aged_note}{drain_note}",
-                (reclaim_cooldown_s() / 3600.0).round() as i64
+                 cards claimed in the last {cooldown} are exempt{freshness_note}){aged_note}{drain_note}"
             ),
         };
     }
@@ -3706,7 +3681,7 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
             // same action — the AMUX-2140 class.)
             qnote.push_str(
                 " Triage first: move not-ready cards to `backlog`, owner-blocked to review. \
-                 Do not bounce ready cards to todo (24h cooldown). Work this card or move it \
+                 Do not bounce ready cards to todo (brief re-claim cooldown). Work this card or move it \
                  where it honestly belongs.",
             );
         }
@@ -3717,7 +3692,7 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
     let mut prompt = format!(
         "{PICKUP_ANCHOR}{} — work it now. Card text below is historical, \
          not a live message. If blocked on an owner decision, move to review (not todo, \
-         which re-queues after 24h cooldown):\n{}{}",
+         which re-queues after a brief cooldown):\n{}{}",
         row.id,
         quoted_card_text(&row.title, &row.id),
         qnote
@@ -4750,6 +4725,39 @@ pub async fn drive_tick<F: Fleet>(state: &AppState, fleet: &F) -> DriveReport {
     }
     publish(&report);
     report
+}
+
+/// Event-driven arm for one live lane. It intentionally goes through the same
+/// fleet membership, isolation, configuration, liveness and boundary gates as
+/// the periodic sweep; the sweep remains the backstop.
+pub async fn drive_session(state: &AppState, lane: &str) -> LaneTrace {
+    let fleet = LiveFleet { state: state.clone() };
+    if !fleet.lanes().iter().any(|candidate| candidate == lane) {
+        let trace = if crate::api::session_verbs::session_is_isolated(lane) {
+            LaneTrace::skip(lane, "isolated", "isolated workers never receive board automation")
+        } else {
+            LaneTrace::skip(lane, "not-registered", "worker is not in the live fleet registry")
+        };
+        publish_lane(trace.clone());
+        return trace;
+    }
+    let _ = complete_finished_epics(state).await;
+    let _ = promote_ready_backlog(state).await;
+    let _ = promote_due_backlog(state).await;
+    let trace = drive_lane(state, &fleet, lane).await;
+    publish_lane(trace.clone());
+    trace
+}
+
+fn publish_lane(trace: LaneTrace) {
+    if let Ok(mut slot) = report_slot().write() {
+        let report = slot.get_or_insert_with(|| DriveReport { started_at: now_f64(), ..Default::default() });
+        report.lanes.retain(|row| row.session != trace.session);
+        report.lanes.push(trace);
+        report.finished_at = now_f64();
+        report.assigned = report.lanes.iter().filter(|row| row.outcome == "assigned").count();
+        report.nudged = report.lanes.iter().filter(|row| row.outcome != "assigned" && row.outcome != "skipped").count();
+    }
 }
 
 async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTrace {
@@ -5879,7 +5887,13 @@ fn fleet_queue_shape(conn: &Connection) -> Value {
             }
         }
     }
-    let todo = by_status.get("todo").and_then(Value::as_i64).unwrap_or(0);
+    // Reuse the exact per-lane predicate; a raw Todo count is not a ready count.
+    let now = now_f64();
+    let lanes: Vec<String> = conn
+        .prepare("SELECT DISTINCT session FROM issues WHERE session IS NOT NULL AND session <> '' AND status='todo' AND deleted IS NULL AND COALESCE(archived,0)=0")
+        .and_then(|mut st| st.query_map([], |r| r.get::<_, String>(0)).map(|rows| rows.flatten().collect()))
+        .unwrap_or_default();
+    let dispatchable: i64 = lanes.iter().map(|lane| eligible_todo_count(conn, lane, now)).sum();
     // Median age of the human-blocked pile, in days. The COUNT alone reads the
     // same for 387 questions asked this morning and 387 asked a fortnight ago,
     // and only the second is a bottleneck.
@@ -5898,8 +5912,8 @@ fn fleet_queue_shape(conn: &Connection) -> Value {
     json!({
         "open_total": total,
         "by_status": by_status,
-        "dispatchable_todo": todo,
-        "dispatchable_pct": if total > 0 { (todo as f64 * 1000.0 / total as f64).round() / 10.0 } else { 0.0 },
+        "dispatchable_todo": dispatchable,
+        "dispatchable_pct": if total > 0 { (dispatchable as f64 * 1000.0 / total as f64).round() / 10.0 } else { 0.0 },
         "needsyou_median_age_d": needsyou_median_age_d,
         "note": "`dispatchable_todo` is the ONLY slice DISPATCHABLE_WHERE selects. A lane idling \
                  on a full board is usually this: its queue is real and its workable queue is \
@@ -8245,6 +8259,8 @@ mod tests {
         let conn = board_db();
         let now = now_f64();
         add_card(&conn, "T-1", "lane", "todo", "workable", "SCOPE: x");
+        add_card(&conn, "T-PARKED", "lane", "todo", "waiting on owner", "SCOPE: x");
+        tag(&conn, "T-PARKED", "needs:you:decision", now);
         for (n, days) in [("N-1", 2.0), ("N-2", 10.0), ("N-3", 30.0)] {
             add_card(&conn, n, "lane", "needsyou", "asked a human", "SCOPE: x");
             conn.execute(
@@ -8263,9 +8279,10 @@ mod tests {
         conn.execute("UPDATE issues SET archived=1 WHERE id='Z-1'", []).expect("archive");
 
         let s = fleet_queue_shape(&conn);
-        assert_eq!(s["open_total"], json!(10), "1 todo + 3 needsyou + 6 backlog: {s}");
+        assert_eq!(s["open_total"], json!(11), "2 raw todo + 3 needsyou + 6 backlog: {s}");
         assert_eq!(s["dispatchable_todo"], json!(1));
-        assert_eq!(s["dispatchable_pct"], json!(10.0), "1 of 10, to one decimal: {s}");
+        assert_eq!(s["dispatchable_pct"], json!(9.1), "1 of 11, to one decimal: {s}");
+        assert_eq!(s["by_status"]["todo"], json!(2));
         assert_eq!(s["by_status"]["backlog"], json!(6));
         assert_eq!(s["by_status"]["needsyou"], json!(3));
         let med = s["needsyou_median_age_d"].as_f64().expect("a median");
@@ -8443,35 +8460,21 @@ mod tests {
         }
     }
 
-    /// Backend, 2026-08-11 afternoon: 16 claims in one hour, every card
-    /// bounced `doing -> todo` with notes, nothing executed — and the drive
-    /// kept dealing. Three bounced claims in 2h now stop the deal. The
-    /// controls: two bounces do NOT trip it, and a bounced card that MOVED
-    /// (worked, or re-shaped to backlog) no longer counts toward the trip.
+    /// A few bounced cards must not freeze unrelated ready work lane-wide.
     #[test]
-    fn a_lane_bouncing_its_pickups_stops_being_dealt_cards() {
+    fn bounced_cards_do_not_freeze_unrelated_ready_work() {
         let conn = board_db();
         let now = now_f64();
         for n in 1..=3 {
             add_card(&conn, &format!("B-{n}"), "lane", "todo", "bounced back", "SCOPE: x\n- [ ] y");
             conn.execute(
                 "INSERT INTO session_events (session, type, ts, data) VALUES ('lane','task.claimed',?1,?2)",
-                rusqlite::params![now - 600.0 * n as f64, format!("{{\"issue\":\"B-{n}\",\"status\":\"doing\"}}")],
+                rusqlite::params![now - 30.0 * n as f64, format!("{{\"issue\":\"B-{n}\",\"status\":\"doing\"}}")],
             )
             .expect("claim event");
         }
         add_card(&conn, "T-1", "lane", "todo", "fresh work", "SCOPE: x\n- [ ] y");
-        match select_pickup_with(&conn, "lane", now, false) {
-            Pickup::None { reason, .. } => assert_eq!(reason, "bounce-loop"),
-            _ => panic!("three bounced claims in 2h must stop the deal"),
-        }
-        // Working one of them (todo -> done) releases the breaker: only
-        // claims whose card is still parked in todo count.
-        conn.execute("UPDATE issues SET status='done' WHERE id='B-1'", []).expect("advance");
-        assert!(
-            !matches!(select_pickup_with(&conn, "lane", now, false), Pickup::None { reason: "bounce-loop", .. }),
-            "moving a bounced card must release the breaker"
-        );
+        assert_eq!(claimed(&select_pickup_with(&conn, "lane", now, false)), Some("T-1"));
     }
 
     /// Ethan/backend 2026-08-11: BACKE-3249 sat `doing` + needs:you for 31
@@ -8535,11 +8538,7 @@ mod tests {
     /// re-claimed the same card at the very next idle — infinite churn.
     #[test]
     fn a_recently_claimed_card_cools_down_but_the_dead_zone_is_closed() {
-        // The re-claim cooldown is now 2h (AMUX-2987), aligned with the
-        // bounce-breaker window, NOT 24h. Pins both ends: still exempt inside
-        // the window, dispatchable again the moment it passes — which is the
-        // fix for the idle-lane stall (a card claimed 3h ago used to be dead
-        // for another 21 hours while its lane sat idle).
+        // Brief per-card anti-spin window, never a multi-hour hidden state.
         let conn = board_db();
         add_card(&conn, "T-1", "lane", "todo", "returned", "SCOPE: x\n- [ ] y");
         let claim_at = |ts: f64| {
@@ -8551,25 +8550,22 @@ mod tests {
             )
             .expect("event");
         };
-        // 1h ago: inside the 2h window -> still exempt.
-        claim_at(now_f64() - 3600.0);
+        claim_at(now_f64() - 60.0);
         assert!(
             claimed(&select_pickup_with(&conn, "lane", now_f64(), false)).is_none(),
-            "a card claimed 1h ago is inside the 2h cooldown and must not re-deal"
+            "a card claimed 1m ago is inside the brief cooldown and must not re-deal"
         );
-        // 3h ago: THE DEAD ZONE. Under the old 24h cooldown this was exempt for
-        // 21 more hours and the lane starved; now it is dispatchable.
-        claim_at(now_f64() - 3.0 * 3600.0);
+        claim_at(now_f64() - 10.0 * 60.0);
         assert_eq!(
             claimed(&select_pickup_with(&conn, "lane", now_f64(), false)),
             Some("T-1"),
-            "a card claimed 3h ago (past the 2h window) must be re-dealt — this is the AMUX-2987 fix"
+            "a card claimed 10m ago must not leave the lane stalled"
         );
     }
 
-    /// py:14510: fossils get triaged by a human, not silently executed at idle.
+    /// Age is priority input, not a hidden lifecycle state.
     #[test]
-    fn a_card_nobody_has_touched_in_seven_days_is_not_auto_run() {
+    fn an_old_todo_remains_dispatchable_by_default() {
         let conn = board_db();
         add_card(&conn, "T-1", "lane", "todo", "fossil", "SCOPE: x\n- [ ] y");
         conn.execute(
@@ -8577,7 +8573,7 @@ mod tests {
             rusqlite::params![now_f64() as i64 - 8 * 86400],
         )
         .expect("age");
-        assert!(claimed(&select_pickup_with(&conn, "lane", now_f64(), false)).is_none());
+        assert_eq!(claimed(&select_pickup_with(&conn, "lane", now_f64(), false)), Some("T-1"));
     }
 
     /// py:14581, AMUX-2128: refusals used to RETURN, so one refusable card at the

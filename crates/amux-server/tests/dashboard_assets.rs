@@ -152,6 +152,28 @@ fn messages_link_schedule_ids_to_the_scheduler() {
 }
 
 #[test]
+fn long_shell_runs_have_an_immediate_visible_state() {
+    let app = asset("app.js");
+    for needle in [
+        "case 'running':",
+        "Already running on the host",
+        "Started on the host",
+        "running: 'running'",
+        "_schedRunDotClass(r)",
+    ] {
+        assert!(
+            app.contains(needle),
+            "the scheduler UI lost its in-progress/overlap rendering `{needle}`"
+        );
+    }
+    let css = asset("app.css");
+    assert!(
+        css.contains(".sched-run-dot.running"),
+        "a durable running row must not render as the unknown grey dot"
+    );
+}
+
+#[test]
 fn sse_message_invalidation_refreshes_each_visible_message_surface() {
     let app = asset("app.js");
     let start = app
@@ -166,6 +188,44 @@ fn sse_message_invalidation_refreshes_each_visible_message_surface() {
     ] {
         assert!(body.contains(needle), "message invalidation no longer refreshes `{needle}`");
     }
+}
+
+#[test]
+fn live_doing_card_stays_visible_and_clickable_during_sessions_poll_lag() {
+    let app = asset("app.js");
+    let helper_start = app
+        .find("function _cardDoingItem(name)")
+        .expect("dashboard must derive the live doing card from SSE-synced board data");
+    let helper_tail = &app[helper_start..];
+    let helper_end = helper_tail
+        .find("function _nudgeWorkersOnBoardChange()")
+        .expect("live-card helper must precede board-change invalidation");
+    let helper = &helper_tail[..helper_end];
+    for needle in [
+        "c.session !== name",
+        "c.status !== 'doing'",
+        "c.deleted || c.archived",
+        "c.updated || c.created",
+    ] {
+        assert!(helper.contains(needle), "live-card selection lost `{needle}`");
+    }
+
+    let render_start = app
+        .find("function _renderSessionCard(s)")
+        .expect("session-card renderer must exist");
+    let render = &app[render_start..render_start + 16_000.min(app.len() - render_start)];
+    for needle in [
+        "const liveBoardTask = _cardDoingItem(s.name)",
+        "liveBoardTask ? (liveBoardTask.title || liveBoardTask.id)",
+        "liveBoardTask ? liveBoardTask.id : s.task_board_id",
+        "_taskIdChip({task_board_id: displayTaskBoardId})",
+    ] {
+        assert!(render.contains(needle), "session card lost live board linkage `{needle}`");
+    }
+    assert!(
+        app.contains("board-card-live-label\"><span class=\"board-live-dot\"></span>Working now"),
+        "a live board card needs an explicit visible label, not only a border or tooltip"
+    );
 }
 
 /// The parser above must be able to FAIL, or the test above it is theatre —

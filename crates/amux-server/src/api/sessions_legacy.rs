@@ -2792,6 +2792,8 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             "tokens": {"input": 0, "output": 0, "total": 0},
             "preview_lines": [],
             "task_source": "",
+            "task_override": "",
+            "task_override_updated": 0,
             "task_time": 0,
             "task_updated": 0,
             "task_board_id": "",
@@ -2892,6 +2894,8 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
             "preview_lines": [],
             "task_name": "",
             "task_source": "",
+            "task_override": "",
+            "task_override_updated": 0,
             "task_board_id": "",
             "task_updated": 0,
             "task_board_age": 0,
@@ -2978,6 +2982,8 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
             );
             v["task_name"] = json!(tname);
             v["task_source"] = json!(tsrc);
+            v["task_override"] = json!(summary);
+            v["task_override_updated"] = json!(summary_ts);
             v["task_board_id"] =
                 json!(if tsrc == "board" { board.map(|(i, _, _)| i.clone()).unwrap_or_default() } else { String::new() });
             // A summary-sourced task now carries its own stamp (AMUX-2676);
@@ -3001,6 +3007,25 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
                     0
                 }
             );
+        }
+    }
+
+    if let Some(report) = crate::runtime_jobs::board_drive::last_report() {
+        let traces: BTreeMap<&str, &crate::runtime_jobs::board_drive::LaneTrace> =
+            report.lanes.iter().map(|trace| (trace.session.as_str(), trace)).collect();
+        for worker in out.iter_mut() {
+            let Some(name) = worker["name"].as_str() else { continue };
+            if let Some(trace) = traces.get(name) {
+                worker["board_drive"] = json!({
+                    "outcome": trace.outcome,
+                    "reason": trace.reason,
+                    "detail": trace.detail,
+                    "eligible_todos": trace.eligible_todos,
+                    "open_cards": trace.open_cards,
+                    "card": trace.card,
+                    "checked_at": report.finished_at,
+                });
+            }
         }
     }
 

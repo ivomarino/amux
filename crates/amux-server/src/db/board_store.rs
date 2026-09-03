@@ -868,12 +868,25 @@ pub fn asset_refs(text: &str) -> Vec<String> {
                     if !stem.is_empty()
                         && (1..=12).contains(&ext.len())
                         && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                        && ext.chars().any(|c| c.is_ascii_alphabetic())
                     {
                         push(tok);
                         continue;
                     }
                 }
             }
+        } else if file_like_component(tok)
+            && tok
+                .rsplit_once('.')
+                .is_some_and(|(_, ext)| ext.chars().any(|c| c.is_ascii_alphabetic()))
+        {
+            // A produced file is very often reported as a filename because
+            // the worker already named the containing folder in the previous
+            // sentence. Requiring a slash made `launch.mp4` disappear from the
+            // card even though `./launch.mp4` was accepted. The alphabetic
+            // extension guard keeps versions such as `release.2026` out.
+            push(tok);
+            continue;
         }
         if (7..=40).contains(&tok.len()) && tok.bytes().all(|c| c.is_ascii_hexdigit()) {
             push(tok);
@@ -2970,6 +2983,8 @@ mod tests {
         assert!(has_asset_link("wrote it up in [the doc](docs/x.md)"));
         assert!(has_asset_link("landed in docs/design/connectors.md"));
         assert!(has_asset_link("crates/amux-server/src/api/board.rs updated"));
+        assert!(has_asset_link("produced video-moderation-launch.mp4"));
+        assert!(has_asset_link("and video-moderation-launch-9x16.mp4"));
         assert!(has_asset_link("shipped as 53a868f"));
         assert!(has_asset_link("closes #106"));
         // A short hex-ish word is not a sha, a bare year is too short.

@@ -464,6 +464,8 @@
      would train people to ignore red. `unknown` is every row written before the
      verdict existed — grey, never green, because "not recorded" is not "fine". */
   .sched-run-dot.queued { background:transparent;box-shadow:inset 0 0 0 1.5px var(--accent); }
+  .sched-run-dot.running { background:var(--yellow,#fbbf24);animation:sched-running-pulse 1.2s ease-in-out infinite; }
+  @keyframes sched-running-pulse { 50% { opacity:0.35;transform:scale(0.8); } }
   .sched-run-dot.warn { background:var(--yellow,#fbbf24); }
   .sched-run-dot.unknown { background:var(--dim,#6b7280);opacity:0.45; }
   .sched-cmd-expand { margin-top:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 10px;max-height:180px;overflow-y:auto; }
@@ -3562,6 +3564,13 @@
     background:var(--green,#3fb950); margin-right:5px; vertical-align:1px;
     animation: boardLivePulse 1.6s ease-in-out infinite;
   }
+  .board-card-live-label {
+    display:inline-flex; align-items:center; margin-left:8px; padding:1px 6px;
+    border-radius:8px; color:var(--green,#3fb950); background:rgba(63,185,80,0.12);
+    border:1px solid rgba(63,185,80,0.35); font-family:system-ui,sans-serif;
+    font-size:0.62rem; font-weight:700; letter-spacing:0; text-transform:none;
+  }
+  .board-card-live-label .board-live-dot { flex:0 0 auto; }
   @keyframes boardLivePulse { 0%,100% { opacity:1; } 50% { opacity:0.35; } }
   .board-card-live .board-card-session { color: var(--green,#3fb950); border-color: rgba(63,185,80,0.4); }
   .board-pin-btn {

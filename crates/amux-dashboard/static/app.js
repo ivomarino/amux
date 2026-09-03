@@ -3036,6 +3036,23 @@ function _cardBoardStatusCounts(name) {
   });
   return counts;
 }
+// The sessions payload and board SSE arrive independently. During auto-pickup,
+// the board can already have the new doing card while /api/sessions still
+// carries the worker's description fallback. Prefer the newest live board
+// fact in that window so a working worker never says "no active card" and the
+// task remains clickable. The server-provided task remains the fallback while
+// boardItems is loading.
+function _cardDoingItem(name) {
+  let newest = null;
+  let newestAt = -1;
+  (boardItems || []).forEach(c => {
+    if (c.deleted || c.archived || c.session !== name || c.status !== 'doing') return;
+    const raw = c.updated || c.created || 0;
+    const at = typeof raw === 'number' ? raw : (Date.parse(raw) || 0);
+    if (!newest || at >= newestAt) { newest = c; newestAt = at; }
+  });
+  return newest;
+}
 // Worker cards embed board-derived figures (the helpers above), so ANY
 // boardItems ingest must repaint the workers view when those inputs move —
 // the board fetch used to end at renderBoard(), and a board response landing
@@ -3046,9 +3063,10 @@ function _cardBoardStatusCounts(name) {
 // free, keyed on exactly the fields the helpers read.
 function _nudgeWorkersOnBoardChange() {
   try {
-    const sig = (boardItems || [])
-      .map(c => `${c.id}:${c.status}:${c.session || ''}:${c.archived ? 1 : 0}${c.deleted ? 'd' : ''}`)
-      .join('|');
+    const sig = JSON.stringify((boardItems || []).map(c => [
+      c.id, c.status, c.session || '', c.archived ? 1 : 0, c.deleted ? 1 : 0,
+      c.title || '', c.updated || c.created || 0,
+    ]));
     if (window._boardCountSig === sig) return;
     window._boardCountSig = sig;
     if (activeView === 'sessions') render();
@@ -3248,9 +3266,17 @@ function render() {
     const model = sessionConfiguredModel(s);
     const effort = provider === 'claude' ? flagValue(flags, '--effort') : '';
     const pLabel = providerLabel(provider);
-    const taskStale = _taskStaleAge(s);
+    const liveBoardTask = _cardDoingItem(s.name);
+    // A board transition and the next sessions poll are not atomic. Render the
+    // SSE-synced doing card immediately, then naturally converge on the server
+    // fields on the next poll. This also repairs old/stale task summaries while
+    // the board has a stronger, current fact.
+    const displayTaskName = liveBoardTask ? (liveBoardTask.title || liveBoardTask.id) : (s.task_name || '');
+    const displayTaskSource = liveBoardTask ? 'board' : s.task_source;
+    const displayTaskBoardId = liveBoardTask ? liveBoardTask.id : s.task_board_id;
+    const taskStale = liveBoardTask ? 0 : _taskStaleAge(s);
     const offCached = !!(_peekIndex && _peekIndex[s.name]);
-    const taskDim = taskStale && s.task_source === 'board';   // stale board title shown as last resort
+    const taskDim = taskStale && displayTaskSource === 'board';   // stale board title shown as last resort
     // AF-148: a lane with no active card falls back to its static DESCRIPTION,
     // and the payload says so (`task_source: 'desc'`) — but the client only ever
     // read task_source to dim a STALE BOARD title, so the fallback rendered
@@ -3266,7 +3292,7 @@ function render() {
     // Same discriminator the stale case already uses, applied to the case it
     // skipped. Not a mood, not a guess: the field was in the payload the whole
     // time and one consumer read it for one branch.
-    const taskIsDesc = s.task_source === 'desc' && !!s.task_name;
+    const taskIsDesc = displayTaskSource === 'desc' && !!displayTaskName;
     return `
     <div class="card ${isExp ? 'expanded' : ''}" data-session="${esc(s.name)}" onclick="event.stopPropagation();toggle('${s.name}')">
       <div class="card-header" onclick="headerTap('${s.name}', event)" onmousedown="tileMouseDown(event,'${s.name}')">
@@ -3275,7 +3301,7 @@ function render() {
           <div class="card-name">${s.pinned ? '<span class="pin-icon">&#x1F4CC;</span> ' : ''}${s.isolated ? '<span class="card-isolated" title="ISOLATED (raw agent): tmux plus the CLI, no amux harness — no AMUX_SESSION/AMUX_URL, no MCP config, no self-report hooks. Undiscoverable to peers: hidden from their fleet list and roster, and peer sends are refused. You can still peek and send from here. Applies at the next spawn.">ISOLATED</span> ' : ''}${esc(s.name)}${offCached ? ' <span class="card-offline-dot" title="Scrollback saved on this device — readable offline">&#x2B07;</span>' : ''}</div>
           <button class="card-menu-btn" onclick="event.stopPropagation();toggleMenu('${s.name}')" title="Options">&#x22EF;</button>
           <div class="card-menu" id="menu-${s.name}">
-          <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','task','${escJs(s.task_name||"")}')"><span class="mi">&#x270F;</span> Task label${s.task_name ? '' : ' (none)'}</div>
+          <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','task','${escJs(s.task_override||"")}')"><span class="mi">&#x270F;</span> Task label${s.task_override ? '' : ' (none)'}</div>
           <div class="card-menu-sep"></div>
           <div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();openPeek('${s.name}')"><span class="mi">&#x1F4BB;</span> Peek terminal</div>
           <div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();_readLatestMessage('${s.name}')"><span class="mi">&#x1F50A;</span> Read latest message</div>
@@ -3345,6 +3371,13 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
             }
             if (d) parts.push(`<span class="mc-doing">${d}</span> doing`);
             if (todo) parts.push(`<span class="mc-active mc-todo">${todo}</span> todo`);
+            const drive = s.board_drive || null;
+            const driveFresh = drive && drive.checked_at && (Date.now()/1000 - drive.checked_at) < 180;
+            if (s.status === 'idle' && todo && driveFresh) {
+              const ready = Number(drive.eligible_todos || 0);
+              const why = drive.reason || drive.outcome || 'checked';
+              parts.push(`<span class="mc-total" title="${esc(drive.detail || 'Latest board-drive decision')}">${ready} ready · ${esc(why)}</span>`);
+            }
             if (backlog) parts.push(`<span class="mc-total mc-backlog">${backlog}</span> backlog`);
             if (needsYou) parts.push(`<span class="mc-total">${needsYou}</span> needs you`);
             if (review) parts.push(`<span class="mc-total">${review}</span> review`);
@@ -3359,7 +3392,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
       ${s.dir ? _renderBranchBadge(s.name, s.branch) : ''}
       ${isExp && s.desc ? `<div class="card-desc">${esc(s.desc)}</div>` : ''}
 
-      ${!isExp && s.task_name ? `<div class="card-preview${taskDim || taskIsDesc ? ' task-stale' : ''}" style="font-weight:600;color:var(--text);">${esc(s.task_name)}${_taskIdChip(s)}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}${taskIsDesc ? ` <span class="task-stale-badge">&middot; no active card</span>` : ''}</div>` : ''}
+      ${!isExp && displayTaskName ? `<div class="card-preview${taskDim || taskIsDesc ? ' task-stale' : ''}" style="font-weight:600;color:var(--text);">${esc(displayTaskName)}${_taskIdChip({task_board_id: displayTaskBoardId})}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}${taskIsDesc ? ` <span class="task-stale-badge">&middot; no active card</span>` : ''}</div>` : ''}
       ${isExp && s.preview ? `<div class="card-preview">${esc(s.preview)}</div>` : ''}
       ${logSearchMode && _logMatches[s.name] ? (() => {
         const hits = _logMatches[s.name];
@@ -3380,7 +3413,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
         <button class="btn primary" style="width:100%;" onclick="doStart('${s.name}')">&#x25B6; Start</button>
       </div>` : ''}
       <div class="panel" onclick="event.stopPropagation()">
-        ${isExp && s.task_name ? `<div class="card-task-name${taskDim || taskIsDesc ? ' task-stale' : ''}" title="Click the id to open the board card" style="font-weight:600;"><span onclick="event.stopPropagation();editField('${s.name}','task','${esc(s.task_name)}')" style="cursor:pointer;">${esc(s.task_name)}</span>${_taskIdChip(s)}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}${taskIsDesc ? ` <span class="task-stale-badge">&middot; no active card</span>` : ''}</div>` : ''}
+        ${isExp && displayTaskName ? `<div class="card-task-name${taskDim || taskIsDesc ? ' task-stale' : ''}" title="Click the id to open the board card" style="font-weight:600;"><span onclick="event.stopPropagation();editField('${s.name}','task','${escJs(s.task_override || '')}')" style="cursor:pointer;">${esc(displayTaskName)}</span>${_taskIdChip({task_board_id: displayTaskBoardId})}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}${taskIsDesc ? ` <span class="task-stale-badge">&middot; no active card</span>` : ''}</div>` : ''}
         ${isExp && s.running ? `<div class="card-timing">
           ${s.session_created ? `<div class="timing-item"><span class="timing-label">Worker</span><span class="timing-value">${fmtDuration(Math.floor(Date.now()/1000) - s.session_created)}</span></div>` : ''}
           ${s.task_time ? `<div class="timing-item"><span class="timing-label">Task</span><span class="timing-value accent">${esc(s.task_time)}</span></div>` : ''}
@@ -6639,7 +6672,7 @@ function _workerPrimaryConfigurationsHTML(name) {
   let rows = '';
   rows += _workerConfigurationRow('name', 'Name', s.name || name, 'Renaming preserves tasks, messages, memory, and worker identity.', edit('name', s.name || name));
   rows += _workerConfigurationRow('description', 'Description', s.desc || '', 'Used by people and peer-worker discovery.', edit('desc', s.desc || ''));
-  rows += _workerConfigurationRow('task_label', 'Task label override', s.task_name || '', 'Blank returns the card to its board/source-derived label.', edit('task', s.task_name || ''));
+  rows += _workerConfigurationRow('task_label', 'Task label override', s.task_override || '', 'Blank returns the card to its board/source-derived label.', edit('task', s.task_override || ''));
   rows += _workerConfigurationRow('groups', 'Groups', (s.tags || []).join(', '), 'Controls membership, inherited configuration, and default message reach.', edit('tags', (s.tags || []).join(', ')));
   rows += _workerConfigurationRow('directory', 'Working directory', s.dir || '', 'Changing it restarts a running worker in the new directory.', edit('dir', s.dir || ''));
   rows += _workerConfigurationRow('branch', 'Git branch', s.branch || '', 'Blank follows the detected branch; “none” explicitly uses the main checkout.', edit('branch', s.branch || ''));
@@ -8599,7 +8632,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.789';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.790';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -22885,6 +22918,8 @@ function _schedRunToast(d) {
     case 'delivered': return 'Delivered to ' + (d.session || 'the worker') +
       (d.submission === 'unverified' ? ' (submission unverified)' : '') + tail;
     case 'queued':    return 'Queued · lands at the worker’s next turn boundary';
+    case 'running':   return (d.deduped ? 'Already running on the host' : 'Started on the host')
+      + (d.run_id ? ' · run #' + d.run_id : '') + tail;
     case 'refused':   return 'Not delivered' + (tail || ' · refused');
     case 'skipped':   return 'Skipped' + tail;
     case 'error':     return 'Failed' + (tail || ' · delivery failed');
@@ -22907,13 +22942,13 @@ function _schedRunToast(d) {
 // the mechanism (ethos rule 1).
 const _SCHED_RUN_TONE = {
   ok: 'ok', delivered: 'ok', done: 'done', queued: 'queued',
-  refused: 'warn', skipped: 'warn', error: 'err',
+  running: 'running', refused: 'warn', skipped: 'warn', error: 'err',
 };
 function _schedRunTone(status) { return _SCHED_RUN_TONE[String(status || '')] || 'unknown'; }
 function _schedRunDotClass(r) { return _schedRunTone(r.status); }
 function _schedRunColor(status) {
   return {
-    ok: 'var(--green,#4ade80)', done: 'var(--accent)', queued: 'var(--accent)',
+    ok: 'var(--green,#4ade80)', done: 'var(--accent)', queued: 'var(--accent)', running: 'var(--yellow,#fbbf24)',
     warn: 'var(--yellow,#fbbf24)', err: 'var(--red)', unknown: 'var(--dim)',
   }[_schedRunTone(status)];
 }
@@ -23151,7 +23186,7 @@ function renderScheduler(opts) {
     const renderDisabledCard = (s) => {
       const recLabel = s.schedule_expr || (s.sched_type === 'once' ? 'once' : (s.recurrence || 'recurring'));
       const runs = runMap[s.id] || [];
-      const dots = runs.map(r => `<span class="sched-run-dot ${r.status === 'ok' ? 'ok' : 'err'}" title="${esc(r.status)}"></span>`).join('');
+      const dots = runs.map(r => `<span class="sched-run-dot ${_schedRunDotClass(r)}" title="${esc(r.status)}"></span>`).join('');
       return `<div class="card sched-item" data-sched-id="${esc(s.id)}" style="padding:8px 12px;">
         <div style="display:flex;align-items:flex-start;gap:8px;">
           <label class="sched-toggle-label" title="Enable">
@@ -25261,7 +25296,9 @@ function _renderBoardCard(item) {
   h += '<div class="board-drag-handle" onclick="event.stopPropagation()" title="Drag to move"><svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><circle cx="3.5" cy="2.5" r="1.25"/><circle cx="8.5" cy="2.5" r="1.25"/><circle cx="3.5" cy="6" r="1.25"/><circle cx="8.5" cy="6" r="1.25"/><circle cx="3.5" cy="9.5" r="1.25"/><circle cx="8.5" cy="9.5" r="1.25"/></svg></div>';
   h += '<button class="board-pin-btn' + (pinned ? ' active' : '') + '" onclick="event.stopPropagation();_togglePin(\'' + item.id + '\')" title="' + (pinned ? 'Unpin' : 'Pin to top') + '">&#x1F4CC;</button>';
   const _bq = typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '';
-  h += '<div class="board-card-key">' + _hlSearch(esc(item.id), _bq) + '</div>';
+  h += '<div class="board-card-key">' + _hlSearch(esc(item.id), _bq)
+    + (_liveNow ? '<span class="board-card-live-label"><span class="board-live-dot"></span>Working now</span>' : '')
+    + '</div>';
   if (item.doing_rot) h += '<div class="board-card-rot" title="Rotting: ' + item.doing_rot_days + 'd in doing with no board update and no commit/PR evidence. Evidence it forward or demote it.">&#x26A0; ' + Math.round(item.doing_rot_days) + 'd no evidence</div>';
   if (item.no_executor) h += '<div class="board-card-noexec" title="In doing, but nobody is executing it: ' + esc(item.no_executor) + '. Shepherding is not ownership.">&#x1F6A8; no executor</div>';
   // ISOLATED OWNER (AMUX-3728). The server computes owner_isolated and a
