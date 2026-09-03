@@ -645,7 +645,13 @@ if [ -n "$STAGED" ] && echo "$STAGED" | grep -q '^crates/'; then
     while IFS= read -r _p; do
       [ -n "$_p" ] || continue
       _idx=$(git ls-files -s -- "$_p" 2>/dev/null | awk '{print $2}')
-      _was=$(awk -F'\t' -v p="$_p" '$2==p {print $1; exit}' "$_rcpt")
+      # LAST match, not first. The writer emits HEAD's blob for every tracked
+      # file and then OVERRIDES the dirty ones, so a dirty path appears twice
+      # and the worktree row is the second. Reading the first took HEAD's blob
+      # and reported every file you had edited-and-tested as "DIFFERS" — which
+      # is exactly what this said on its first real commit, about a run that had
+      # finished 27 seconds earlier with no edit in between.
+      _was=$(awk -F'\t' -v p="$_p" '$2==p {v=$1} END{if (v!="") print v}' "$_rcpt")
       if [ -z "$_was" ]; then
         _changed="$_changed
     $_p (not in the tested set at all)"

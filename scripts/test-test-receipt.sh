@@ -79,6 +79,45 @@ o=$(run "$(mkr 0 "$REALSHA")" "$REALP
 crates/amux-server/src/never_tested_xyz.rs")
 ok "flags the unseen path" "$(echo "$o" | grep -c 'not in the tested set')" "1"
 
+echo "cell h: a NEW untracked crate file is recorded by the receipt writer"
+# Drives the SHIPPED writer block, extracted by line range like the hook block
+# above. Grepping test-contended.sh for the flag would pass on a line that is
+# commented out, in a dead branch, or spelled right and never reached.
+WSTART=$(grep -n 'THE RECEIPT (AF-195)' "$ROOT_REPO/scripts/test-contended.sh" | cut -d: -f1)
+[ -n "$WSTART" ] || { echo "FATAL: the receipt writer is gone"; exit 1; }
+sed -n "${WSTART},\$p" "$ROOT_REPO/scripts/test-contended.sh" | grep -v '^exit "\$RC"$' > "$TMP/writer.sh"
+NEWREL="crates/amux-core/src/__receipt_cell_$$.rs"
+echo "// throwaway" > "$ROOT_REPO/$NEWREL"
+WHOME="$TMP/whome"
+# RC=101, not 0. With RC=0 a writer that HARDCODES "# rc 0" is
+# indistinguishable from one that reads the variable, and the exit-code
+# assertion below could not have failed. Caught by mutating the writer.
+( cd "$ROOT_REPO" && AMUX_HOME="$WHOME" AMUX_SESSION=wcell RC=101 bash "$TMP/writer.sh" -p amux-server ) >/dev/null 2>&1
+rm -f "$ROOT_REPO/$NEWREL"
+ok "the new file is in the receipt" \
+   "$(grep -c "$NEWREL" "$WHOME/test-receipts/wcell.tsv" 2>/dev/null || echo 0)" "1"
+ok "and a long-tracked file is too" \
+   "$(grep -c "	$REALP\$" "$WHOME/test-receipts/wcell.tsv" 2>/dev/null || echo 0)" "1"
+ok "the receipt carries the run's REAL exit code" \
+   "$(grep -c '^# rc	101$' "$WHOME/test-receipts/wcell.tsv" 2>/dev/null || echo 0)" "1"
+
+echo "cell i: a path listed TWICE resolves to the LAST row, not the first"
+# The writer emits HEAD's blob for every tracked file, then overrides the dirty
+# ones. Reading the first row takes HEAD's blob and reports every file you
+# edited-and-tested as DIFFERS. That is not hypothetical: it is what the block
+# said on its first real commit, 27 seconds after a green run with no edit in
+# between.
+f="$TMP/dup.tsv"
+{ printf '# repo\t%s\n' "$ROOT_REPO"
+  printf '# head\tdeadbeef\n# rc\t0\n'
+  printf '# at\t%s\n' "$(date -u +%s)"
+  printf '# args\t-p amux-server\n'
+  printf '%s\t%s\n' 0000000000000000000000000000000000000000 "$REALP"   # HEAD row
+  printf '%s\t%s\n' "$REALSHA" "$REALP"; } > "$f"                        # worktree row
+o=$(run "$f" "$REALP")
+ok "the override row wins" "$(echo "$o" | grep -c 'match the bytes')" "1"
+ok "no false drift report" "$(echo "$o" | grep -c 'DIFFER')" "0"
+
 echo ""
 echo "test-test-receipt: $pass passed, $fail failed"
 [ "$fail" = 0 ]
