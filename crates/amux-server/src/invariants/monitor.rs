@@ -122,6 +122,64 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     out.extend(checks::route_callers_have_routes(&mounted, &callers));
 
     tm.mark(&out, "1. route contract");
+
+    // -- 1a. do the routes that EXIST actually answer? (AF-453)
+    //
+    // Section 1 checks existence and passes `GET /api/workers/{id}` cleanly
+    // while it returns 2xx for 0 of 15 calls. These are two different questions
+    // and only one of them had a check.
+    //
+    // TWO-STAGE AGGREGATION, deliberately. The grouping key is
+    // `normalize_target_verb`, a Rust function, so SQL cannot GROUP BY it. SQL
+    // collapses to (method, RAW path) first, which is bounded by distinct paths
+    // rather than by the 1.6M-row window, and Rust folds those into shapes.
+    // Grouping in SQL by `family` instead would be cheaper and would report the
+    // fleet clean: `/api/workers` is 4,016/4,394 healthy at family level because
+    // `/api/workers/{id}/<verb>` drowns `/api/workers/{id}`.
+    match state.store.read() {
+        Err(_) => out.push(InvariantResult::unknown(
+            "route.mounted_routes_answer",
+            "store unreadable",
+        )),
+        Ok(conn) => {
+            let since = crate::config::now_f64() - 14.0 * 86400.0;
+            let mut acc: std::collections::HashMap<(String, String), (i64, i64)> =
+                std::collections::HashMap::new();
+            let rows = conn
+                .prepare(
+                    "SELECT method, path,                             SUM(CASE WHEN status >= 200 AND status < 300 THEN 1 ELSE 0 END),                             COUNT(*)                      FROM _amux_request_log WHERE ts >= ?1 GROUP BY method, path",
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map([since], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, i64>(3)?,
+                        ))
+                    })
+                    .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+                })
+                .unwrap_or_default();
+            for (method, path, ok, n) in rows {
+                let shape = crate::api::request_log::normalize_target_verb(&path);
+                let e = acc.entry((method, shape)).or_insert((0, 0));
+                e.0 += ok;
+                e.1 += n;
+            }
+            let groups: Vec<checks::RouteOutcomeRow> = acc
+                .into_iter()
+                .map(|((method, shape), (ok, n))| checks::RouteOutcomeRow {
+                    method,
+                    shape,
+                    n,
+                    ok,
+                })
+                .collect();
+            out.extend(checks::mounted_routes_answer(&groups, &mounted));
+        }
+    }
+    tm.mark(&out, "1a. mounted routes answer");
     // -- 1b. no two lanes share a Claude conversation (AMUX-1730 / AMUX-2819).
     //
     // Reads the session meta files, which are the same store the resume path

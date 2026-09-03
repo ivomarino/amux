@@ -88,6 +88,125 @@ const CALLER_GUARDED_ABSENT: &[&str] = &[];
 
 
 
+/// AF-453. `route.callers_have_routes` asks whether a route EXISTS. Nothing in
+/// this repo asked whether a mounted route ANSWERS, and the gap had a live
+/// specimen: `GET /api/workers/{id}` is in ROUTE_TABLE with GET/PATCH/DELETE,
+/// and returned 2xx for 0 of 15 calls over 14 days while 0 of 12 probed lanes
+/// resolved. The existence check passes it, correctly and uselessly.
+///
+/// GRANULARITY IS THE WHOLE CHECK, and the first version of this got it wrong.
+/// Aggregated by FAMILY, `/api/workers` reports 4,016 of 4,394 succeeding, which
+/// is healthy, because `/api/workers/{id}/<verb>` is 4,006/4,368 and drowns
+/// `/api/workers/{id}` at 1/17. A family-level version of this check reports the
+/// fleet clean and misses the one defect it was written for. Group by ROUTE
+/// SHAPE (`normalize_target_verb`), never by family.
+///
+/// WHAT A PASS DOES NOT MEAN. Four blind spots, published in the evidence of
+/// every result rather than left for a reader to rediscover (ethos rule 4),
+/// because "no findings" from this check means "no mounted route failed loudly
+/// enough, often enough, with a status", not "every mounted route answers":
+///
+///   1. n >= 10. A mounted route failing 9 times in the window is invisible.
+///   2. Never-called routes are invisible. 23 `/api` families had zero calls in
+///      the 14-day window that produced this check.
+///   3. A route answering 2xx for one input and failing every other stays above
+///      the threshold at low n.
+///   4. THE REAL ONE: this keys on STATUS. A route returning 200 with an error
+///      body passes it, and 1,646,523 2xx `/api` rows in the window are not
+///      inspected for that shape by anything.
+const MOUNTED_ANSWERS_BLIND_SPOTS: &[&str] = &[
+    "n >= 10: a mounted route failing fewer times in the window is invisible",
+    "never-called routes are invisible — this reads the request log, not the route table",
+    "a route answering 2xx for one input and failing the rest can stay above the threshold at low n",
+    "keys on STATUS ONLY: a route returning 200 with an error body passes this check",
+];
+
+/// One (method, route-shape) group from the request log. `shape` must come from
+/// `normalize_target_verb`, not `family` — see the granularity note above.
+#[derive(Debug, Clone)]
+pub struct RouteOutcomeRow {
+    pub method: String,
+    pub shape: String,
+    pub n: i64,
+    pub ok: i64,
+}
+
+/// Minimum calls before a shape is judged at all. Named rather than inlined so
+/// blind spot 1 and the code cannot drift apart.
+const MOUNTED_ANSWERS_MIN_N: i64 = 10;
+/// A shape is "not answering" below this 2xx percentage.
+const MOUNTED_ANSWERS_MAX_OK_PCT: i64 = 10;
+
+pub fn mounted_routes_answer(
+    rows: &[RouteOutcomeRow],
+    mounted: &[(&str, &[&str])],
+) -> Vec<InvariantResult> {
+    const ID: &str = "route.mounted_routes_answer";
+    // The empty-probe trap, same one `route.callers_have_routes` guards: a log
+    // that yielded nothing reports the identical silence to a fleet where every
+    // mounted route answers. Say which happened.
+    if rows.is_empty() {
+        return vec![InvariantResult::unknown(
+            ID,
+            "no request-log groups in the window — the probe did not run, which is not \
+             the same as every mounted route answering",
+        )];
+    }
+    let considered: i64 = rows.len() as i64;
+    let judged: Vec<&RouteOutcomeRow> = rows
+        .iter()
+        .filter(|r| r.n >= MOUNTED_ANSWERS_MIN_N)
+        .collect();
+    // n_considered BESIDE the answer (ethos rule 4): a zero here is only
+    // meaningful next to how many shapes cleared the threshold to produce it.
+    let ev = |extra: serde_json::Value| -> serde_json::Value {
+        serde_json::json!({
+            "measured": true,
+            "n_considered": considered,
+            "n_judged": judged.len(),
+            "min_n": MOUNTED_ANSWERS_MIN_N,
+            "max_ok_pct": MOUNTED_ANSWERS_MAX_OK_PCT,
+            "blind_spots": MOUNTED_ANSWERS_BLIND_SPOTS,
+            "detail": extra,
+        })
+    };
+    let mut out = Vec::new();
+    let mut failed = 0usize;
+    for r in &judged {
+        if r.ok * 100 > r.n * MOUNTED_ANSWERS_MAX_OK_PCT {
+            continue; // answering well enough
+        }
+        // MOUNTED filter. An unmounted path failing is a client guessing a URL,
+        // which /api/logs/analyze already reports as a 404 group with
+        // nearest_routes. This check is only about routes that DO exist.
+        if !matches!(match_route_full(mounted, &r.method, &r.shape), RouteMatch::Ok) {
+            continue;
+        }
+        failed += 1;
+        out.push(
+            InvariantResult::fail(
+                ID,
+                format!(
+                    "a route in ROUTE_TABLE answers 2xx for more than {}% of its calls",
+                    MOUNTED_ANSWERS_MAX_OK_PCT
+                ),
+                format!("{} {} — {}/{} 2xx", r.method, r.shape, r.ok, r.n),
+            )
+            .entity(format!("{} {}", r.method, r.shape))
+            .evidence(ev(serde_json::json!({ "n": r.n, "ok": r.ok }))),
+        );
+    }
+    if failed == 0 {
+        out.push(
+            InvariantResult::pass(ID).evidence(ev(serde_json::json!({
+                "means": "no MOUNTED route failed loudly enough, often enough, with a status — \
+                          see blind_spots; this is not 'every mounted route answers'"
+            }))),
+        );
+    }
+    out
+}
+
 pub fn route_callers_have_routes(
     mounted: &[(&str, &[&str])],
     callers: &[CallerPath],
@@ -4330,6 +4449,65 @@ mod negative_controls {
         let row = rs2.iter().find(|r| r.entity_key == "POST /api/tunnel/start").unwrap();
         assert_eq!(row.status, Status::Fail);
         assert!(row.observed.contains("STALE"), "{}", row.observed);
+    }
+
+    /// AF-453, both arms. A check that flags every mounted route would satisfy
+    /// the first assertion alone and be worthless, so the healthy-route arm is
+    /// what makes this a test rather than a tautology.
+    #[test]
+    fn a_mounted_route_that_never_answers_is_reported_and_a_healthy_one_is_not() {
+        let mounted: Vec<(&str, &[&str])> = vec![
+            ("/api/workers/{id}", &["GET", "PATCH", "DELETE"]),
+            ("/api/workers/{id}/send", &["POST"]),
+        ];
+        let rows = vec![
+            // The live specimen: mounted, called 15 times, answered 0.
+            RouteOutcomeRow { method: "GET".into(), shape: "/api/workers/{id}".into(), n: 15, ok: 0 },
+            // ARM 2 — a HEALTHY mounted route. Without this the check could
+            // flag everything and still pass arm 1.
+            RouteOutcomeRow { method: "POST".into(), shape: "/api/workers/{id}/send".into(), n: 4368, ok: 4006 },
+            // Below the threshold: judged on nothing, so reported as nothing.
+            RouteOutcomeRow { method: "GET".into(), shape: "/api/workers/{id}".into(), n: 0, ok: 0 },
+            // UNMOUNTED and failing: a client guessing a URL. /api/logs/analyze
+            // already reports these as 404 groups with nearest_routes, and this
+            // check must not double-file them.
+            RouteOutcomeRow { method: "GET".into(), shape: "/api/stripe/status".into(), n: 430, ok: 0 },
+        ];
+        let rs = mounted_routes_answer(&rows, &mounted);
+        let fails: Vec<_> = rs.iter().filter(|r| r.status == Status::Fail).collect();
+        assert_eq!(fails.len(), 1, "expected exactly the mounted-and-dead route, got {:?}",
+                   fails.iter().map(|r| &r.entity_key).collect::<Vec<_>>());
+        assert_eq!(fails[0].entity_key, "GET /api/workers/{id}");
+        assert!(fails[0].observed.contains("0/15"), "{}", fails[0].observed);
+        assert!(!rs.iter().any(|r| r.entity_key.contains("/send")),
+                "a mounted route answering 4006/4368 must not be reported");
+        assert!(!rs.iter().any(|r| r.entity_key.contains("stripe")),
+                "an UNMOUNTED failing path is a client guessing a URL, not this check's finding");
+
+        // ARM 3 — the caveat must SHIP, not live in a doc comment. A pass here
+        // means "nothing failed loudly enough, often enough, with a status",
+        // and a reader who cannot see that will read it as "every route answers".
+        let clean = mounted_routes_answer(
+            &[RouteOutcomeRow { method: "POST".into(), shape: "/api/workers/{id}/send".into(), n: 4368, ok: 4006 }],
+            &mounted,
+        );
+        assert_eq!(clean.len(), 1);
+        assert_eq!(clean[0].status, Status::Pass);
+        let ev = &clean[0].evidence;
+        assert_eq!(ev["measured"], true);
+        assert_eq!(ev["n_considered"], 1, "a zero finding is only readable beside its population");
+        assert_eq!(ev["blind_spots"].as_array().map(|a| a.len()), Some(4),
+                   "all four blind spots ship with every result");
+        assert!(ev["blind_spots"].to_string().contains("error body"),
+                "the status-only blind spot is the one most likely to be forgotten");
+
+        // ARM 4 — an empty log is UNKNOWN, never a pass. This is the trap
+        // route.callers_have_routes already guards: a probe that could not run
+        // reports the same silence as a clean fleet.
+        let none = mounted_routes_answer(&[], &mounted);
+        assert_eq!(none.len(), 1);
+        assert_eq!(none[0].status, Status::Unknown);
+        assert!(none[0].observed.contains("did not run"), "{}", none[0].observed);
     }
 
     /// AF-137 both directions: unowned auto-filed cards must go RED naming
