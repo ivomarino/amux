@@ -117,7 +117,25 @@ def lane_repo(session: str) -> str:
 # is computed and not guessed.
 # ---------------------------------------------------------------------------
 RULE_CLASSES = [
-    ("verification", r"\bverif(?:y|ied|ication)\b|\bactually (?:works|live|shipped)\b|\bprove it\b|\bin prod\b|\be2e\b",
+    # `e2e` MUST BE ADJACENT TO A VERB, never bare (AF-450).
+    #
+    # The bare `\be2e\b` arm counted Ethan's own harness prompt NAMES as
+    # restatements of the verification rule: "ISOLATED-E2E-20260903",
+    # "September 3 Gemini E2E workflow", "E2E-Q-20260903-CLAUDE". Measured
+    # 2026-09-03 — 9 of the signal's 18 window hits fired on that arm ALONE, and
+    # every one of the nine was a task label rather than a demand. It reported
+    # 4.2x against baseline where the honest figure is 2.8x.
+    #
+    # The theme this feeds ("Verification is something Ethan has to demand,
+    # every single time") is one of the highest-value entries in the ledger, so
+    # the noise landed on the signal least able to absorb it.
+    #
+    # NOT dropped, because "did you run e2e?" is a real restatement that no
+    # other arm catches and `testing`'s pattern needs the word "tests" after it.
+    # Requiring a verb within 24 non-sentence characters keeps all five demand
+    # forms and drops all four labels.
+    ("verification", r"\bverif(?:y|ied|ication)\b|\bactually (?:works|live|shipped)\b|\bprove it\b|\bin prod\b|"
+                     r"\b(?:run|ran|rerun|re-run|do|did|does|pass(?:ed|es)?|no|any)\b[^.\n]{0,24}\be2e\b",
      r"verified|VERIFY\.md|verification"),
     ("evidence", r"\bevidence\b|\bshow me the\b|\bproof\b|\bpaste the\b|\bwhat did you run\b",
      r"evidence|--evidence"),

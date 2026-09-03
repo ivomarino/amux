@@ -399,6 +399,43 @@ else
   bad "G: a timestamp unit flip is absorbed silently"
 fi
 
+# H. AF-450: `e2e` as a task LABEL is not a restatement of the verification rule.
+#
+# The bare \be2e\b arm counted Ethan's own harness prompt names — measured
+# 2026-09-03, 9 of the signal's 18 window hits fired on that arm alone and every
+# one was a label. THE CONTROL IS THE SECOND HALF: a real demand mentioning e2e
+# must still match, or the fix has deleted the signal rather than sharpened it.
+if python3 - <<'PY'
+import re, sys
+sys.path.insert(0, "scripts")
+import importlib.util
+spec = importlib.util.spec_from_file_location("ft", "scripts/friction_themes.py")
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+pat = dict((k, p) for k, p, _ in m.RULE_CLASSES)["verification"]
+rx = re.compile(pat, re.I)
+LABELS = [
+    "ISOLATED-E2E-20260903: Reply only with isolated-ok.",
+    "September 3 Gemini E2E workflow. Work only in /tmp/amux-reverify-20260903/gemini",
+    "E2E-Q-20260903-CLAUDE: What is the difference between todo and backlog?",
+    "September 3 Claude E2E workflow. Work only in /tmp/amux-reverify-20260903/claude",
+]
+DEMANDS = [
+    "did you run e2e?", "no e2e tests?", "run the e2e suite before you call it done",
+    "did the e2e pass", "rerun e2e",
+]
+bad = [s for s in LABELS if rx.search(s)]
+assert not bad, f"harness prompt NAMES still count as restatements: {bad}"
+missed = [s for s in DEMANDS if not rx.search(s)]
+assert not missed, f"real e2e demands no longer match — the arm was deleted, not fixed: {missed}"
+# And the arms that never had this problem must be untouched.
+assert rx.search("did you verify it in prod?"), "the verify/in-prod arms regressed"
+PY
+then
+  ok "H: e2e as a label is not a restatement, and a real e2e demand still is"
+else
+  bad "H: the e2e arm counts task labels, or the fix deleted real demands"
+fi
+
 echo
 echo "  $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
