@@ -1030,7 +1030,31 @@ async fn start(
             }
             Json(v).into_response()
         }
-        Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
+        Err(e) => err(start_status(&e), json!({ "error": with_cause(&e) })),
+    }
+}
+
+/// 409 for a launch the CALLER can resolve, 502 for one that genuinely failed.
+///
+/// AF-381: `start` mapped every launch failure to 502, so "another Chrome
+/// already holds this --user-data-dir" — whose own hint says "Try again, or GET
+/// /api/browser/status and stop it first" — went out as "the upstream is broken,
+/// your request was fine". A client that retries on 5xx retries a conflict that
+/// will not clear itself, and 5xx is what alerting keys on, so a resolvable
+/// state inflated the error budget of a server behaving correctly.
+///
+/// 409 rather than 400 because it matches the taxonomy this file already has:
+/// `driver_err` answers 409 for `NotRunning`, the other state the caller fixes
+/// by acting on the browser rather than by changing the request.
+///
+/// Decided on the TYPE, exactly as `cdp_status` above states and for the same
+/// reason: this error's message is a hint someone will reword, and a status that
+/// depends on wording breaks the first time they do.
+fn start_status(e: &anyhow::Error) -> StatusCode {
+    if e.downcast_ref::<chrome::ProfileDelegated>().is_some() {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::BAD_GATEWAY
     }
 }
 
@@ -2334,6 +2358,66 @@ mod tests {
         let wrapped = anyhow::Error::new(chrome::CdpTimeout { method: "X".into(), secs: 1 })
             .context("while resizing the viewport");
         assert_eq!(cdp_status(&wrapped), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    /// AF-381: a launch the CALLER can resolve is 409, not 502.
+    ///
+    /// `start` mapped every launch failure to BAD_GATEWAY, so "another Chrome
+    /// already holds this --user-data-dir" — whose own hint says "Try again, or
+    /// GET /api/browser/status and stop it first" — went out as "the upstream is
+    /// broken, your request was fine". Measured live on 2026-09-03: 3 such 502s
+    /// in a 24h window carrying that exact body.
+    #[test]
+    fn a_delegated_launch_is_409_and_a_real_launch_failure_stays_502() {
+        let msg = "Chrome (pid Some(33823)) exited exit status: 0 before CDP on port 64178 \
+                   came up — exit 0 is the delegation signature: another Chrome already holds \
+                   this --user-data-dir.";
+        let delegated = anyhow::Error::new(chrome::ProfileDelegated(msg.into()));
+        assert_eq!(start_status(&delegated), StatusCode::CONFLICT);
+
+        // CONTROL 1, and the one that matters: a launch that genuinely failed
+        // must stay 502. A classifier answering 409 for everything passes the
+        // assertion above and hides every real browser fault behind a status
+        // nothing alerts on — the inverse of the bug being fixed.
+        let real = anyhow::anyhow!(
+            "Chrome (pid Some(41)) exited exit status: 1 before CDP on port 9 came up"
+        );
+        assert_eq!(start_status(&real), StatusCode::BAD_GATEWAY);
+
+        // CONTROL 2: wrapped in CONTEXT it is still delegated. `?` adds context
+        // freely on this path and a downcast reading only the outermost error
+        // regresses to 502 the first time someone writes `.context(...)` —
+        // exactly the trap cdp_status's own third control names.
+        let wrapped = anyhow::Error::new(chrome::ProfileDelegated(msg.into()))
+            .context("while starting the browser");
+        assert_eq!(start_status(&wrapped), StatusCode::CONFLICT);
+
+        // CONTROL 3: the MESSAGE is unchanged. The body is quoted in AF-443's
+        // card, in the log-sweep contract's cleared AMUX-3689 line, and in the
+        // hint callers read. Typing the error must not reword it.
+        assert_eq!(delegated.to_string(), msg);
+    }
+
+    /// The SEAM between "what Chrome did" and "which error type gets built".
+    ///
+    /// `a_delegated_launch_is_409...` pins the classifier and this pins the
+    /// decision that feeds it. Neither reaches the other: mutating the
+    /// construction site to never build `ProfileDelegated` passed the entire
+    /// suite, because the classifier's test hands it a value the launch loop
+    /// never had to produce. Same shape as AF-438, closed the same way.
+    #[cfg(unix)]
+    #[test]
+    fn exit_zero_before_cdp_is_delegation_and_any_other_code_is_a_real_failure() {
+        use std::os::unix::process::ExitStatusExt;
+        let code = |c: i32| std::process::ExitStatus::from_raw(c << 8);
+        assert!(
+            chrome::is_delegation_exit(&code(0)),
+            "exit 0 before CDP is the delegation signature — another Chrome took the URL"
+        );
+        // The CONTROL: a real launch failure must not read as delegation, or
+        // every broken start answers 409 and stops alerting.
+        assert!(!chrome::is_delegation_exit(&code(1)), "exit 1 is a genuine launch failure");
+        assert!(!chrome::is_delegation_exit(&code(127)), "exit 127 is a genuine launch failure");
     }
 
     /// AMUX-98. A malformed selector (Playwright-style `text=...` syntax

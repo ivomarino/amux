@@ -1294,7 +1294,7 @@ pub async fn start(
             // it, so reaching here means an orphan slipped past reconciliation
             // (e.g. an untracked Chrome outside the running-file). Name the cause
             // and WARN so a log sweep catches the class, not just this instance.
-            let delegated = status.success();
+            let delegated = is_delegation_exit(&status);
             let hint = if delegated {
                 " — exit 0 is the delegation signature: another Chrome already holds this \
                  --user-data-dir. amux reconciles known orphans before launch (AMUX-3207); an \
@@ -1309,10 +1309,16 @@ pub async fn start(
                     "browser: launch delegated to an existing Chrome and exited 0 before CDP bound (AMUX-3207)"
                 );
             }
-            anyhow::bail!(
+            let msg = format!(
                 "Chrome (pid {pid:?}) exited {status} before CDP on port {port} came up{}{hint}",
                 chrome_stderr_tail(&stderr_path)
             );
+            // Same string either way; only the TYPE differs, and only when the
+            // caller can act (AF-381).
+            if delegated {
+                return Err(anyhow::Error::new(ProfileDelegated(msg)));
+            }
+            anyhow::bail!(msg);
         }
         attempts += 1;
         let outcome = probe
@@ -1873,6 +1879,44 @@ impl std::fmt::Display for PageException {
 }
 
 impl std::error::Error for PageException {}
+
+/// The launch was DELEGATED, not broken: a Chrome already holding this
+/// `--user-data-dir` accepted the URL and the new process exited 0 before CDP
+/// bound. The caller can resolve it (stop the holder, or just retry), which is
+/// the same class `DriverError::NotRunning` already answers 409 for.
+///
+/// TYPED FOR THE SAME REASON `PageException` IS (AF-381). `api/browser.rs`'s
+/// `start` maps every `Err` to 502, so this arrived as "the upstream is broken,
+/// your request was fine" while its own hint told the caller to go and fix it —
+/// and a client that retries on 5xx retries a conflict that will not clear
+/// itself. `cdp_status`'s rule applies verbatim: decide on the TYPE, never by
+/// matching the message, or the status breaks the first time someone rephrases
+/// the hint.
+///
+/// Display reproduces the `bail!()` string it replaces EXACTLY, so nothing that
+/// quotes the message sees a difference; only the type is now inspectable.
+#[derive(Debug)]
+pub struct ProfileDelegated(pub String);
+
+impl std::fmt::Display for ProfileDelegated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for ProfileDelegated {}
+
+/// Is a Chrome that exited BEFORE CDP bound the delegation signature?
+///
+/// Exit 0 means it handed its URL to an instance already holding the profile
+/// and quit cleanly; any other code means the launch genuinely failed. One line,
+/// extracted only so it can be PINNED: mutating the construction site to never
+/// build `ProfileDelegated` survived the whole suite, because the classifier had
+/// a test and the decision feeding it did not (AF-381, and the same seam class
+/// as AF-438). The launch loop needs a real Chrome to exercise; this does not.
+pub fn is_delegation_exit(status: &std::process::ExitStatus) -> bool {
+    status.success()
+}
 
 impl From<anyhow::Error> for DriverError {
     fn from(e: anyhow::Error) -> Self {
