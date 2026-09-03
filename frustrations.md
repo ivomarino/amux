@@ -2702,3 +2702,63 @@ NOTE: CAUSE CORRECTED, 2026-09-03, same session. The codesign SIGKILL is real
  do. The deeper problem this exposed: the fleet's live server is an UNSUPERVISED
  background job that dies with its parent shell, while the supervisor that should
  own it is locked out of the port.
+
+## `--trigger` destroys the value it replaces and records only the field name
+
+AREA: board
+SEVERITY: data-loss
+STATUS: fixed
+DATE: 2026-09-03
+SESSION: gtm-engine
+CARD: AF-459
+SYMPTOM: `amux board <status> --trigger` writes `source_ref` as a plain overwrite.
+ Only an `autofix:` prefix is protected (AMUX-3686), and that narrowness is
+ deliberate: a trigger replacing a trigger is normal. The PATCH log builds one line
+ per patch from a Vec of FIELD NAMES, so the overwrite rendered as the bare word
+ `source_ref` — that it moved, and nothing about what it moved from. `/api/history`
+ carries no row with the value either. The column being written WAS the only copy
+ in existence.
+COST: gtm-engine lost a five-item inventory dated 2026-08-09 while probing whether
+ `--trigger` works on an archived card (it does). They recovered four items from a
+ prefix they happened to have printed earlier in their own transcript; the fifth is
+ gone permanently. Second known clobber of this field on that board, so the first
+ one cost something too and nobody logged it.
+FIX: e56fff8b. One match arm. This is now the one field whose log line names the
+ DESTROYED value rather than the arriving one, because the log's own stated rule
+ ("VALUES ARE SUMMARISED, NOT COPIED ... the new value is already on the card") is
+ correct for every other field and inverts here: there is no redundancy to trade
+ against readability when the value exists nowhere else. Old value kept at 200
+ chars against 60 for arrivals, with a mutation pinning it, because the failure
+ mode is specifically PARTIAL recovery and a truncated sole copy reproduces the
+ prefix-survives-tail-dies loss exactly. Three mutations, including a negative
+ control (printing WAS unconditionally would claim data loss on every card
+ creation).
+
+## An archived card is listed as actionable and refuses every closing action
+
+AREA: board
+SEVERITY: wrong-conclusion
+STATUS: open
+DATE: 2026-09-03
+SESSION: gtm-engine
+CARD: AF-460
+SYMPTOM: a card can hold `archived: 1`, `status: backlog` and `closed_at: None` at
+ once. It appears in the DEFAULT `/api/board` list, which is what the idle nudge
+ reads, so it is offered as a drainable backlog card with "you have to pull from
+ it". Every closing verb then refuses with `archived_task_immutable` / "task is
+ archived; restore it first". The nudge says drain it; the board says you cannot.
+ The asymmetry is what makes it permanent: `--trigger` DOES work on an archived
+ card, so such a card is silenceable forever and closeable never.
+COST: 26 days on GE-564, whose trigger sat 617h stale while it re-listed. A triage
+ on 2026-08-20 chose ARCHIVE, the archive neither closed nor hid it, and nobody
+ could close it afterwards. SECOND INSTANCE, and mine is the worse one: I hit the
+ identical refusal on AF-224 the same day and read it as "already archived, no
+ action needed" rather than as a defect. A lane that shrugs at the refusal never
+ reports it, which is why one card absorbed 26 days before anyone said so.
+FIX: not chosen — three candidates land in different places and it is a data-model
+ call: (1) archiving sets a terminal status, (2) the default list excludes
+ archived, (3) the nudge filters them. Recommending (1), because (2) and (3) leave
+ a card that is simultaneously backlog and archived and merely stop showing it to
+ one reader. Workaround that works today and is documented nowhere: PATCH
+ archived:0, then done. Companion entry: the refusal message is correct and only
+ reaches you when you ACT, never where the card is listed (AF-461).
