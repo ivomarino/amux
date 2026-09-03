@@ -16550,6 +16550,48 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
         out[field] = json!(effective);
         return j200(out);
     }
+    // EXTERNAL EMAIL AUTHORIZATION. This is a standing worker policy, not a
+    // provider startup flag, so it is resolved on every send and takes effect
+    // immediately. `null` restores worker > group > global inheritance; an
+    // explicit false at the worker layer can close a broader group/global
+    // allowance. The email gate reads this exact scoped key.
+    if let Some(v) = body.get("external_email_allowed") {
+        let key = "AMUX_EMAIL_EXTERNAL_ALLOW";
+        let inherit = v.is_null();
+        if inherit {
+            cfg.remove(key);
+        } else {
+            cfg.set(key, if py_truthy(v) { "1" } else { "0" });
+        }
+        if cfg.write(&f).is_err() {
+            return jresp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": "could not write session env"}),
+            );
+        }
+        let effective = crate::api::email_approval::external_email_allowed(
+            &crate::config::amux_home(),
+            name,
+        );
+        tracing::warn!(
+            session = %name,
+            effective,
+            inherited = inherit,
+            "config: external-email standing authorization changed"
+        );
+        return j200(json!({
+            "ok": true,
+            "external_email_allowed": effective,
+            "inherited": inherit,
+            "message": if inherit {
+                format!("external email authorization: worker override removed; effective value is {}", if effective { "on" } else { "off" })
+            } else if effective {
+                "this worker may send external email without per-message approval".to_string()
+            } else {
+                "this worker's external email still requires per-message approval".to_string()
+            },
+        }));
+    }
     if body.get("spans_groups").is_some() || body.get("send_allow").is_some() {
         let value = if let Some(sv) = body.get("send_allow").and_then(Value::as_str) {
             sv.trim().to_string()
@@ -19939,6 +19981,30 @@ mod tests {
         }
         assert_eq!(parse_env("probe").get("CC_AUTO_PICKUP"), None);
         assert_eq!(parse_env("probe").get("CC_AUTO_CONTINUE"), None);
+
+        // External-email authorization is a first-class, immediately-applied
+        // worker configuration. It writes the exact key the email gate reads,
+        // and null restores inheritance rather than inventing another flag.
+        let (st, v) = call(
+            &app,
+            "PATCH",
+            "/api/sessions/probe/config",
+            Some(json!({"external_email_allowed": true})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(parse_env("probe").get("AMUX_EMAIL_EXTERNAL_ALLOW"), Some("1"));
+        assert_eq!(v["external_email_allowed"], json!(true));
+        let (st, v) = call(
+            &app,
+            "PATCH",
+            "/api/sessions/probe/config",
+            Some(json!({"external_email_allowed": null})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["inherited"], json!(true));
+        assert_eq!(parse_env("probe").get("AMUX_EMAIL_EXTERNAL_ALLOW"), None);
 
         let (st, v) =
             call(&app, "PATCH", "/api/sessions/probe/config", Some(json!({"mcp": "bogus"}))).await;

@@ -3829,6 +3829,28 @@
   .scope-tile-val { font-size:0.66rem; color:var(--dim);
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .scope-detail { border-top:1px solid var(--border); padding-top:7px; margin-top:2px; }
+  .worker-config-intro { color:var(--dim); font-size:0.7rem; line-height:1.45; margin:0 0 9px; }
+  .worker-config-grid { display:grid; grid-template-columns:minmax(0,1fr); gap:10px; margin-bottom:10px; }
+  .worker-config-section { border:1px solid var(--border); background:color-mix(in srgb, var(--card) 72%, transparent); border-radius:10px; overflow:hidden; min-width:0; }
+  .worker-config-section-head { padding:10px 11px 8px; background:color-mix(in srgb, var(--hover) 72%, transparent); border-bottom:1px solid var(--border); }
+  .worker-config-section-title { color:var(--text); font-size:0.78rem; font-weight:700; }
+  .worker-config-section-note { color:var(--dim); font-size:0.65rem; line-height:1.35; margin-top:2px; }
+  .worker-config-section-rows { padding:0 11px; }
+  .worker-config-row { display:flex; align-items:center; gap:8px; padding:9px 0; border-top:1px solid var(--border); }
+  .worker-config-row:first-child { border-top:0; }
+  .worker-config-copy { min-width:0; flex:1; }
+  .worker-config-label { color:var(--text); font-size:0.74rem; font-weight:600; }
+  .worker-config-note { color:var(--dim); font-size:0.66rem; line-height:1.35; overflow-wrap:anywhere; }
+  .worker-config-actions { display:flex; align-items:center; gap:5px; flex:0 0 auto; }
+  .worker-config-grid-board { margin-top:0; }
+  @media (min-width: 980px) {
+    #peek-scope-panel .worker-config-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    #peek-scope-panel .worker-config-grid-board { grid-template-columns:minmax(0,1fr); }
+  }
+  @media (max-width: 560px) {
+    .worker-config-row { align-items:flex-start; flex-direction:column; }
+    .worker-config-actions { width:100%; justify-content:flex-end; }
+  }
   @media (max-width: 600px) {
     .scope-tile { min-width:118px; padding:9px 10px; }
     .scope-tile-label { font-size:0.8rem; }
