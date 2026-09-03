@@ -182,6 +182,11 @@ fn message_card_links_survive_the_capped_board_working_set() {
         app.contains("card_title: x.card_title, card_status: x.card_status"),
         "normalizing history rows must preserve card metadata"
     );
+    assert!(
+        app.contains("async function openBoardDetail(id)")
+            && app.contains("await apiCall(API + '/api/board/' + encodeURIComponent(id))"),
+        "clicking a message's older/terminal task must hydrate it even when the capped board list omitted it"
+    );
 }
 
 #[test]
