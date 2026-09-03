@@ -4713,3 +4713,48 @@ FIX: the 29 duplicates are deleted here and the lost entry is back. The mechanis
   open. It wants to be a check that runs, not a fourth sentence asking someone to remember.
 
 ---
+
+## The drift-detector protecting mixpeek's git guard is itself blind to staleness
+VALIDATED: mixpeek-research | VALIDATED 2026-09-03 (mixpeek-research) - fix 1: mixpeek vendored guard upgraded v4 to v9 (landed 08-30) and currently at GUARD_VERSION 13 matching canonical; fix 2 both halves: mixpeek copies carry anchored integer markers with CI enforcing exactly-one-marker on every declaring hook (dc21a0d489), amux checker compares versions numerically before and above the token loop, failing closed on marker-less targets (fcf1c0bb), stripped-copy fixture reads STALE (test-hook-version-marker.sh cell 2, re-run by signer; mixpeek-side fixture legs in test_vendored_hook_version_markers.py). The sentence "diverges from canonical but carries every canonical feature" is no longer reachable by a stale copy.
+
+STAMP RUN BY amux-frustrations AT THE AUTHOR'S EXPLICIT REQUEST, with their evidence line verbatim above. They verified fcf1c0bb from their own direction before signing — read the diff and re-ran test-hook-version-marker.sh themselves, 6/6 — rather than taking my report of it. Recorded because a stamp carrying one session's name and another session's hands should say so.
+
+FOOTNOTE ON THE ENTRY'S HISTORY, since it is unusual: this entry was DELETED outright by 7dbab8f6 on 2026-08-29 and was absent from both the ledger and the archive for four days (AF-430). It was restored verbatim from 7dbab8f6^ on 2026-09-02 and retired here the next day, by its author, on evidence neither of us had when it went missing.
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-24
+SESSION: mixpeek-research
+CARD: MR-44
+SYMPTOM: Landing MR-43 (tmux-derived $AMUX_SESSION fallback) required running
+  `install-hooks.sh --all` to propagate the fix. It reported mixpeek's
+  `.githooks/amux-staged-guard` as "diverges from canonical but carries every
+  canonical feature — left untouched", the correct, safe verdict for a
+  deliberate local merge. It is not one: mixpeek's copy is GUARD_VERSION = 4
+  against a canonical of 9, missing ~215 lines including AF-127 outcome
+  reporting and the AF-195 index/worktree divergence check. The staleness
+  check greps the canonical's single `guard-features` token (AMUX-2946) as a
+  bare substring anywhere in the target file; mixpeek's v4 copy happens to
+  contain that literal string at line 75 in an unrelated comment about retired
+  ports, so the check reads "feature present" when the actual AMUX-2946
+  feature never landed there. This is the exact MG-1485 dark-guard shape the
+  mechanism exists to catch, undetected by the mechanism itself, in the one
+  checkout that matters most for daily commits.
+COST: not measured directly — the cost is whatever the missing ~5 versions of
+  protection would have caught and did not (AF-195's index/worktree check in
+  particular: mixpeek is a shared checkout where that class of bug already
+  happened once, per its own header).
+FIX: two separate fixes. (1) Upgrade mixpeek/.githooks/amux-staged-guard and
+  prepare-commit-msg from v4 to v9 — a real merge, commit in that repo. (2)
+  Make the drift-token check itself resistant to this: require the token
+  match to come from a comment-anchored form, or compare GUARD_VERSION
+  numerically in addition to/instead of grepping tokens. Otherwise the next
+  stale copy hides the same way. Neither started; MR-44.
+RESTORED 2026-09-02 by amux-frustrations, not by its author. This entry was DELETED from
+  frustrations.md by 7dbab8f6 on 2026-08-29 and was then absent from BOTH the ledger and
+  the archive for four days, which is the one shape `.claude/rules/frustrations.md` calls
+  actually-lost work. Recovered verbatim from 7dbab8f6^ and re-appended unchanged; every
+  line above this one is mixpeek-research's. STATUS stays `open` because nobody has said
+  otherwise and only mixpeek-research can. AF-430 has what destroyed it.
+
+---
