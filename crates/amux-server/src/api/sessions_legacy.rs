@@ -2041,6 +2041,17 @@ fn load_meta(name: &str) -> serde_json::Value {
     val
 }
 
+fn confirmed_active_model(meta: &serde_json::Value, provider: &str) -> String {
+    let same_provider = meta["active_model_provider"].as_str() == Some(provider);
+    let from_this_life = meta["active_model_confirmed_at"].as_i64().unwrap_or(0)
+        >= meta["last_started"].as_i64().unwrap_or(0);
+    if same_provider && from_this_life {
+        meta["active_model_confirmed"].as_str().unwrap_or("").to_string()
+    } else {
+        String::new()
+    }
+}
+
 /// Pick the worker's task label and its source from the freshness verdicts.
 ///
 /// Pure so the precedence — and especially the SUMMARY freshness gate — can be
@@ -2640,6 +2651,15 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
         // activity, which updates every snapshot tick and made every lane
         // look equally busy.
         let meta = load_meta(&name);
+        let configured_provider = env
+            .get("CC_PROVIDER")
+            .cloned()
+            .unwrap_or_else(|| "claude".into());
+        // Written only after a restart/hot switch has positively applied. A
+        // provider tag prevents a manual/provider edit from reusing another
+        // runtime's model, and the start boundary rejects facts from a prior
+        // process life.
+        let confirmed_model = confirmed_active_model(&meta, &configured_provider);
         let last_activity = {
             let send = meta["last_send"].as_i64().unwrap_or(0);
             if send != 0 { send } else { meta["last_started"].as_i64().unwrap_or(0) }
@@ -2682,6 +2702,7 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             // guessing, and so a value supplied by a group or global layer shows
             // as on rather than as an unset worker key (AMUX-4055).
             "auto_drain_backlog": crate::runtime_jobs::board_drive::dispatch_backlog_when_idle(&name),
+            "auto_drain_backlog_own": env.contains_key(crate::runtime_jobs::board_drive::DISPATCH_BACKLOG_KEY),
             // AMUX-3048: the raw event-driven count behind agents_working, so a
             // LEAKED count (a lost SubagentStop pinning a lane "working") is
             // diagnosable rather than hidden — null on a hookless/mtime-only lane.
@@ -2713,8 +2734,11 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             // state, exposed so the SPA can show WHY a lane is quiet without
             // re-deriving the layering.
             "auto_continue": crate::api::session_verbs::standing_orders_on(&name, "CC_AUTO_CONTINUE"),
+            "auto_continue_own": env.contains_key("CC_AUTO_CONTINUE"),
             "auto_pickup": crate::api::session_verbs::standing_orders_on(&name, "CC_AUTO_PICKUP"),
+            "auto_pickup_own": env.contains_key("CC_AUTO_PICKUP"),
             "standing_orders": crate::api::session_verbs::standing_orders_on(&name, "CC_STANDING_ORDERS"),
+            "standing_orders_own": env.contains_key("CC_STANDING_ORDERS"),
             "worktree": env.get("CC_WORKTREE").cloned().unwrap_or_default(),
             "worktree_repo": env.get("CC_WORKTREE_REPO").cloned().unwrap_or_default(),
             "mcp": env.get("CC_MCP").cloned().unwrap_or_default(),
@@ -2725,7 +2749,8 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             // correct-TYPED honest empty (Invariant 20: never invent). `status`
             // is no longer in that set — it derives above from stores the Python
             // scanner itself persists.
-            "active_model": "",
+            "active_model": confirmed_model,
+            "model_source": if confirmed_model.is_empty() { "" } else { "confirmed-switch" },
             // api_error IS computed now (Ethan 2026-08-18) — it is exactly the
             // `api_error` status derived above, exposed as a side boolean so a
             // log sweep / autofix can find a 5xx-stuck lane without re-deriving
@@ -2786,7 +2811,7 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
                 json!(status.clone())
             },
             "running": is_running,
-            "provider": env.get("CC_PROVIDER").cloned().unwrap_or_else(|| "claude".into()),
+            "provider": configured_provider,
             "model": env.get("CC_MODEL").cloned().unwrap_or_default(),
             "dir": env.get("CC_DIR").cloned().unwrap_or_default(),
             "preview": "",
@@ -3052,8 +3077,8 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
     // {state, age_s, source} card shape (py:20429).
     if signals.reports.is_object() {
         for v in out.iter_mut() {
-            if let Some(name) = v["name"].as_str() {
-                if let Some(rep) = signals.reports.get(name) {
+            if let Some(name) = v["name"].as_str().map(str::to_string) {
+                if let Some(rep) = signals.reports.get(&name) {
                     // ts is time.time() — a FLOAT; as_i64() read it as 0 and
                     // age_s came out as the whole epoch (found 2026-08-09).
                     let ts = rep["ts"].as_f64().unwrap_or(0.0);
@@ -3070,13 +3095,19 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
                         "ts": ts as i64,
                         "source": rep["source"].as_str().unwrap_or(""),
                     });
+                    let state = rep["state"].as_str().unwrap_or("");
+                    let started = signals.started.get(&name).copied().unwrap_or(0.0);
+                    let report_current = report_applies(state, ts, started, signals.now);
                     // AMUX-2676: a REPORTED model/token count replaces the
                     // honest-empty above. Still never invented — the empty
                     // stays empty unless the harness itself said otherwise,
                     // which is the whole point of preferring the report
                     // endpoint over a scraper.
-                    if let Some(m) = rep["model"].as_str().filter(|m| !m.is_empty()) {
-                        v["active_model"] = json!(m);
+                    if report_current {
+                        if let Some(m) = rep["model"].as_str().filter(|m| !m.is_empty()) {
+                            v["active_model"] = json!(m);
+                            v["model_source"] = json!("self-report");
+                        }
                     }
                     // Same over-window rejection the compaction path applies
                     // (a5b272e). Without it the two disagree about one fact:
@@ -3090,7 +3121,7 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
                         .as_u64()
                         .map(|t| t <= crate::api::session_verbs::context_window())
                         .unwrap_or(false);
-                    if rep["tokens"].is_object() && plausible {
+                    if report_current && rep["tokens"].is_object() && plausible {
                         v["tokens"] = rep["tokens"].clone();
                     }
                 }
@@ -3317,6 +3348,26 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confirmed_model_must_match_provider_and_current_process_life() {
+        let current = json!({
+            "active_model_confirmed": "gpt-5.6-sol",
+            "active_model_provider": "codex",
+            "active_model_confirmed_at": 200,
+            "last_started": 190,
+        });
+        assert_eq!(confirmed_active_model(&current, "codex"), "gpt-5.6-sol");
+        assert_eq!(confirmed_active_model(&current, "claude"), "");
+
+        let stale = json!({
+            "active_model_confirmed": "claude-sonnet-5",
+            "active_model_provider": "claude",
+            "active_model_confirmed_at": 100,
+            "last_started": 101,
+        });
+        assert_eq!(confirmed_active_model(&stale, "claude"), "");
+    }
 
     /// AMUX-3700: a pane capture that will not return is KILLED, and one that
     /// returns is not.

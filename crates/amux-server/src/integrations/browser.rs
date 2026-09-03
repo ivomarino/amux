@@ -8,17 +8,20 @@
 //! - `default` (or empty)  -> `<amux_home>/playwright-auth/profile`
 //! - named, legacy         -> `<amux_home>/playwright-auth/profiles/<name>`
 //!   when that directory exists (the 35+ real logged-in profiles are here)
-//! - named, otherwise      -> `<chrome-user-data-dir>/<name>` (a Chrome
-//!   `--profile-directory` inside the user's real Chrome data dir)
+//! - named, otherwise      -> imported on first use from
+//!   `<chrome-user-data-dir>/<name>` into the amux-owned location above
 //!
 //! NEW profiles are created under `playwright-auth/profiles/<name>` — the
 //! amux-owned location — because this launcher passes `--user-data-dir`
 //! straight at the profile dir. (Python's create targets the shared Chrome
 //! dir for browser-use interop; the native launcher IS the consumer here, so
 //! amux-owned is the location whose create-path == use-path.) Existing
-//! Chrome-dir profiles still resolve and launch via
-//! `--user-data-dir=<chrome dir> --profile-directory=<name>`, exactly like
-//! `_bu_profile_launch_target`.
+//! Chrome-dir profiles are never launched in place. Chrome locks its ENTIRE
+//! user-data-dir even when a different `--profile-directory` is selected, so
+//! doing that made automation require quitting every ordinary Chrome window.
+//! First use now takes an atomic, cache-free snapshot into an isolated amux
+//! user-data-dir and launches the snapshot. The user's browser can stay open,
+//! and its profile is never driven or mutated by amux.
 //!
 //! Lock-file hygiene: Chrome drops `SingletonLock`/`SingletonCookie`/
 //! `SingletonSocket` on a clean exit and leaves them when killed; a stale set
@@ -109,6 +112,177 @@ pub fn launch_target(home: &Path, chrome_dir: &Path, name: &str) -> LaunchTarget
     } else {
         LaunchTarget { user_data_dir: d, profile_directory: None }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedChromeProfile {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+    pub files: u64,
+    pub bytes: u64,
+}
+
+/// Import a human Chrome profile into an isolated amux user-data-dir.
+///
+/// Chrome's profile lock belongs to the whole user-data-dir, not the selected
+/// profile directory. Launching `--user-data-dir=<the human Chrome dir>` thus
+/// delegates to an already-running Chrome and exits before CDP binds. More
+/// importantly, deleting that lock to force the launch would risk the user's
+/// browser data. A point-in-time copy is the safe boundary: workers get the
+/// login state they selected while ordinary Chrome remains independent.
+///
+/// The copy is assembled under a unique sibling and renamed into place, so a
+/// crash never exposes a half-profile as runnable. Volatile caches and lock
+/// files are omitted; Chrome recreates them. Symlinks are skipped so a profile
+/// cannot make the importer escape either tree.
+pub fn import_chrome_profile(
+    home: &Path,
+    chrome_dir: &Path,
+    name: &str,
+) -> anyhow::Result<Option<ImportedChromeProfile>> {
+    let name = name.trim();
+    if name.is_empty() || name == "default" {
+        return Ok(None);
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
+        anyhow::bail!("Chrome profile name must be [A-Za-z0-9._-]+");
+    }
+    let destination = home.join("playwright-auth").join("profiles").join(name);
+    if destination.is_dir() {
+        return Ok(None);
+    }
+    let source = chrome_dir.join(name);
+    if !source.is_dir() {
+        anyhow::bail!(
+            "Chrome profile {name:?} does not exist at {}; create an amux profile with POST \
+             /api/browser/profile/create instead",
+            source.display()
+        );
+    }
+
+    let parent = destination
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("browser profile destination has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp = parent.join(format!(".import-{name}-{}-{stamp}", std::process::id()));
+    let copied = (|| -> anyhow::Result<(u64, u64)> {
+        std::fs::create_dir(&temp)?;
+        let profile_root = temp.join("Default");
+        let mut stats = (0u64, 0u64);
+        copy_profile_tree(&source, &profile_root, &mut stats)?;
+        copy_import_local_state(chrome_dir, name, &temp)?;
+        Ok(stats)
+    })();
+    let (files, bytes) = match copied {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&temp);
+            return Err(e);
+        }
+    };
+    match std::fs::rename(&temp, &destination) {
+        Ok(()) => {}
+        // A concurrent importer won the race. Its atomic destination is valid;
+        // discard our complete duplicate and let this start use the winner.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && destination.is_dir() => {
+            let _ = std::fs::remove_dir_all(&temp);
+            return Ok(None);
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&temp);
+            return Err(e.into());
+        }
+    }
+    // This is selected login state, not disposable scratch. Registering it
+    // exempts the isolated copy from the profile TTL reaper. A failed registry
+    // write rolls back only the destination we just created; the human source
+    // remains untouched throughout.
+    if let Err(e) = registry_register(home, name, "", "") {
+        let _ = std::fs::remove_dir_all(&destination);
+        return Err(e.context("register imported Chrome profile"));
+    }
+    Ok(Some(ImportedChromeProfile { source, destination, files, bytes }))
+}
+
+fn copy_profile_tree(src: &Path, dst: &Path, stats: &mut (u64, u64)) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = match entry {
+            Ok(v) => v,
+            // A live Chrome can rotate a transient entry between read_dir and
+            // inspection. A vanished cache is not an import failure.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let name = entry.file_name();
+        let label = name.to_string_lossy();
+        if import_entry_is_volatile(&label) {
+            continue;
+        }
+        let ty = match entry.file_type() {
+            Ok(v) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let to = dst.join(&name);
+        if ty.is_symlink() {
+            continue;
+        }
+        if ty.is_dir() {
+            copy_profile_tree(&entry.path(), &to, stats)?;
+        } else if ty.is_file() {
+            match std::fs::copy(entry.path(), &to) {
+                Ok(n) => {
+                    stats.0 += 1;
+                    stats.1 += n;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn import_entry_is_volatile(name: &str) -> bool {
+    name == "LOCK"
+        || name.starts_with("Singleton")
+        || matches!(
+            name,
+            "Cache"
+                | "Code Cache"
+                | "GPUCache"
+                | "DawnCache"
+                | "GrShaderCache"
+                | "GraphiteDawnCache"
+                | "ShaderCache"
+                | "Crashpad"
+        )
+}
+
+fn copy_import_local_state(chrome_dir: &Path, source_name: &str, dst: &Path) -> anyhow::Result<()> {
+    let path = chrome_dir.join("Local State");
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let mut value: serde_json::Value = serde_json::from_str(&raw)?;
+    if let Some(profile) = value.get_mut("profile").and_then(serde_json::Value::as_object_mut) {
+        let source_info = profile
+            .get("info_cache")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|m| m.get(source_name))
+            .cloned()
+            .unwrap_or_else(|| json!({ "name": source_name }));
+        profile.insert("last_used".into(), json!("Default"));
+        profile.insert("last_active_profiles".into(), json!(["Default"]));
+        profile.insert("info_cache".into(), json!({ "Default": source_info }));
+    }
+    std::fs::write(dst.join("Local State"), serde_json::to_vec(&value)?)?;
+    Ok(())
 }
 
 /// Is this dir one amux owns outright (safe to create, clean locks in,
@@ -1003,6 +1177,14 @@ fn amux_cert_spki_b64(home: &Path) -> Option<String> {
 #[derive(Debug, Clone, Serialize)]
 pub struct StartedBrowser {
     pub profile: String,
+    /// Present only on the first start of a profile selected from ordinary
+    /// Chrome. The browser runs from `user_data_dir`, never from this source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_imported_from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_imported_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_imported_bytes: Option<u64>,
     pub pid: Option<u32>,
     pub cdp_port: u16,
     pub cdp_http: String,
@@ -1226,7 +1408,43 @@ pub async fn start(
     // before CDP came up", AMUX-3207). The driver-verb path already reconciles
     // via adopt_if_orphaned (connect_session); start() did not. Reconcile here,
     // before the replace-check, so the orphan is STOPPED rather than delegated to.
-    let target = launch_target(home, &chrome_user_data_dir(), profile);
+    let chrome_dir = chrome_user_data_dir();
+    let unresolved = launch_target(home, &chrome_dir, profile);
+    let imported = if is_amux_owned(home, &unresolved.user_data_dir) {
+        None
+    } else {
+        // Never launch automation against the human browser's user-data-dir.
+        // Besides risking profile corruption, Chrome delegates the launch to
+        // the already-running app and exits before CDP exists. Copying can be
+        // substantial, so keep it off the async runtime's worker threads.
+        let import_home = home.to_path_buf();
+        let import_chrome = chrome_dir.clone();
+        let import_name = profile.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            import_chrome_profile(&import_home, &import_chrome, &import_name)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Chrome profile import task failed: {e}"))??;
+        if let Some(i) = &result {
+            tracing::info!(
+                profile,
+                source = %i.source.display(),
+                destination = %i.destination.display(),
+                files = i.files,
+                bytes = i.bytes,
+                "browser: imported a human Chrome profile into an isolated amux profile"
+            );
+        }
+        result
+    };
+    let target = launch_target(home, &chrome_dir, profile);
+    if !is_amux_owned(home, &target.user_data_dir) {
+        anyhow::bail!(
+            "refusing to launch automation against the human Chrome user-data-dir {}; the \
+             isolated profile import did not produce a runnable destination",
+            target.user_data_dir.display()
+        );
+    }
     reconcile_orphan_before_launch(home, &target.user_data_dir).await;
 
     // A profile inside the HUMAN'S Chrome directory shares one SingletonLock
@@ -1486,6 +1704,9 @@ pub async fn start(
     let started_at = chrono::Utc::now().timestamp();
     let info = StartedBrowser {
         profile: profile.to_string(),
+        profile_imported_from: imported.as_ref().map(|i| i.source.display().to_string()),
+        profile_imported_files: imported.as_ref().map(|i| i.files),
+        profile_imported_bytes: imported.as_ref().map(|i| i.bytes),
         pid,
         cdp_port: port,
         cdp_http: http,
@@ -3705,6 +3926,71 @@ mod tests {
         let t = launch_target(home.path(), &chrome, "Work");
         assert_eq!(t.user_data_dir, chrome);
         assert_eq!(t.profile_directory.as_deref(), Some("Work"));
+    }
+
+    #[test]
+    fn chrome_profile_import_is_atomic_isolated_and_cache_free() {
+        let home = fake_home();
+        let chrome = home.path().join("fake-chrome-udd");
+        let source = chrome.join("ethan-tubescience");
+        std::fs::create_dir_all(source.join("Network")).unwrap();
+        std::fs::create_dir_all(source.join("Cache")).unwrap();
+        std::fs::write(source.join("Network/Cookies"), b"logged-in").unwrap();
+        std::fs::write(source.join("Preferences"), b"prefs").unwrap();
+        std::fs::write(source.join("Cache/disposable"), b"cache").unwrap();
+        std::fs::write(source.join("LOCK"), b"held").unwrap();
+        std::fs::write(
+            chrome.join("Local State"),
+            r#"{"os_crypt":{"encrypted_key":"keep-me"},"profile":{"last_used":"ethan-tubescience","last_active_profiles":["ethan-tubescience"],"info_cache":{"ethan-tubescience":{"name":"TubeScience"},"Other":{"name":"Other"}}}}"#,
+        )
+        .unwrap();
+
+        let imported = import_chrome_profile(home.path(), &chrome, "ethan-tubescience")
+            .unwrap()
+            .expect("first use imports the Chrome profile");
+        let dest = home.path().join("playwright-auth/profiles/ethan-tubescience");
+        assert_eq!(imported.source, source);
+        assert_eq!(imported.destination, dest);
+        assert_eq!(std::fs::read(dest.join("Default/Network/Cookies")).unwrap(), b"logged-in");
+        assert_eq!(std::fs::read(dest.join("Default/Preferences")).unwrap(), b"prefs");
+        assert!(!dest.join("Default/Cache").exists(), "cache is recreated, not imported");
+        assert!(!dest.join("Default/LOCK").exists(), "a live profile's lock must not cross over");
+
+        let state: Value =
+            serde_json::from_slice(&std::fs::read(dest.join("Local State")).unwrap()).unwrap();
+        assert_eq!(state["os_crypt"]["encrypted_key"], "keep-me");
+        assert_eq!(state["profile"]["last_used"], "Default");
+        assert_eq!(state["profile"]["last_active_profiles"], json!(["Default"]));
+        assert_eq!(state["profile"]["info_cache"]["Default"]["name"], "TubeScience");
+        assert!(state["profile"]["info_cache"].get("Other").is_none());
+
+        let target = launch_target(home.path(), &chrome, "ethan-tubescience");
+        assert_eq!(target.user_data_dir, dest);
+        assert!(is_amux_owned(home.path(), &target.user_data_dir));
+        assert_eq!(target.profile_directory, None);
+        let inventory = list_profiles(home.path(), false);
+        assert!(
+            inventory.iter().any(|p| p.name == "ethan-tubescience" && p.registered),
+            "imported login state must be exempt from scratch-profile TTL cleanup"
+        );
+        assert!(
+            import_chrome_profile(home.path(), &chrome, "ethan-tubescience")
+                .unwrap()
+                .is_none(),
+            "later starts reuse the durable isolated copy"
+        );
+    }
+
+    #[test]
+    fn chrome_profile_import_rejects_escape_and_missing_sources() {
+        let home = fake_home();
+        let chrome = home.path().join("fake-chrome-udd");
+        std::fs::create_dir_all(&chrome).unwrap();
+        let escape = import_chrome_profile(home.path(), &chrome, "../outside").unwrap_err();
+        assert!(escape.to_string().contains("[A-Za-z0-9._-]+"));
+        let missing = import_chrome_profile(home.path(), &chrome, "missing").unwrap_err();
+        assert!(missing.to_string().contains("does not exist"));
+        assert!(!home.path().join("playwright-auth/profiles/missing").exists());
     }
 
     #[test]

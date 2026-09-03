@@ -3027,14 +3027,16 @@ function _cardBoardActive(name) {
   });
   return n;
 }
-function _cardBoardTotal(name) {
-  let n = 0;
+function _cardBoardStatusCounts(name) {
+  const counts = {};
   (boardItems || []).forEach(c => {
-    if (!c.deleted && !c.archived && c.session === name) n++;
+    if (c.deleted || c.archived || c.session !== name) return;
+    const status = String(c.status || 'unknown').toLowerCase();
+    counts[status] = (counts[status] || 0) + 1;
   });
-  return n;
+  return counts;
 }
-// Worker cards embed board-derived figures (the three helpers above), so ANY
+// Worker cards embed board-derived figures (the helpers above), so ANY
 // boardItems ingest must repaint the workers view when those inputs move —
 // the board fetch used to end at renderBoard(), and a board response landing
 // AFTER the workers view painted left every card without its counts until
@@ -3294,8 +3296,8 @@ function render() {
                (AMUX-2559, "I cant add a worker to a group"). The label is the
                vocab; the field is the contract. */ ''}
           <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','tags','${escJs(s.tags.join(", "))}')"><span class="mi">&#x1F3F7;</span> Groups</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();toggleAutoDrain('${s.name}')" title="When this worker runs out of todo cards, pull its oldest backlog card into todo automatically. Cards parked on a human (needs:you) or on a live trigger are always skipped. Off by default; a group or global layer can also set it from the Scope tab."><span class="mi">${s.auto_drain_backlog?'&#x2611;':'&#x2610;'}</span> Auto-drain backlog</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();toggleSpansGroups('${s.name}')" title="Let this worker message workers in OTHER groups with no per-message approval. Writes CC_SEND_ALLOW on this worker; a group or global layer can also grant it from the Scope tab."><span class="mi">${s.spans_groups?'&#x2611;':'&#x2610;'}</span> Spans groups${_spansLabel(s)}</div>
+          <div class="card-menu-item" onclick="event.stopPropagation();toggleAutoDrain('${s.name}')" title="When this worker runs out of todo cards, pull its oldest eligible backlog card into todo automatically. On by default for every worker. Cards parked on a human (needs:you) or on a live trigger are always skipped; a worker, group, or global configuration can opt out."><span class="mi">${s.auto_drain_backlog?'&#x2611;':'&#x2610;'}</span> Auto-drain backlog</div>
+          <div class="card-menu-item" onclick="event.stopPropagation();toggleSpansGroups('${s.name}')" title="Let this worker message workers in OTHER groups with no per-message approval. Writes CC_SEND_ALLOW on this worker; a group or global layer can also grant it from Configurations."><span class="mi">${s.spans_groups?'&#x2611;':'&#x2610;'}</span> Spans groups${_spansLabel(s)}</div>
           <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','dir','${esc(s.dir)}')"><span class="mi">&#x1F4C1;</span> Directory</div>
           ${s.running ? `<div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();doRestart('${s.name}')"><span class="mi">&#x21BB;</span> Restart</div>` : ''}
           ${s.running ? `<div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();doStop('${s.name}')"><span class="mi">&#x23F9;</span> Stop</div>` : ''}
@@ -3325,22 +3327,29 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
           ${s.last_activity ? `<span class="last-active">${timeAgo(s.last_activity)}</span>` : ''}
           ${(() => {
             /* Bare numbers, no chips (Ethan: "just numbers no outline ...
-               conservative with real estate"). sched = active/inactive
-               schedules from the payload; doing = this worker's in-progress
-               board issues, computed from the boardItems the client already
-               holds. Successor to the counts row 09aa88e removed — this is
-               the two-figure version of it. */
-            const d = _cardDoingCount(s.name);
-            const active = _cardBoardActive(s.name);
-            const tot = _cardBoardTotal(s.name);
+               conservative with real estate"). Keep runtime status and board
+               state separate: "idle · 11 active" called parked/human-blocked
+               and even done cards active, making Primis's correctly parked
+               queue look like a stalled worker. Spell out the nonzero board
+               columns from the SSE-synced boardItems instead. */
+            const byStatus = _cardBoardStatusCounts(s.name);
+            const d = byStatus.doing || 0;
+            const todo = byStatus.todo || 0;
+            const backlog = byStatus.backlog || 0;
+            const needsYou = (byStatus.needsyou || 0) + (byStatus.blocked || 0);
+            const review = byStatus.review || 0;
+            const done = byStatus.done || 0;
             const parts = [];
             if (s.sched_on || s.sched_off) {
               parts.push(_schedCountHTML(s.sched_on, s.sched_off) + ' sched');
             }
             if (d) parts.push(`<span class="mc-doing">${d}</span> doing`);
-            if (active) parts.push(`<span class="mc-active">${active}</span> active`);
-            if (tot && tot !== active) parts.push(`<span class="mc-total">${tot}</span> total`);
-            return parts.length ? `<span class="meta-count">${parts.join(' · ')}</span>` : '';
+            if (todo) parts.push(`<span class="mc-active mc-todo">${todo}</span> todo`);
+            if (backlog) parts.push(`<span class="mc-total mc-backlog">${backlog}</span> backlog`);
+            if (needsYou) parts.push(`<span class="mc-total">${needsYou}</span> needs you`);
+            if (review) parts.push(`<span class="mc-total">${review}</span> review`);
+            if (done) parts.push(`<span class="mc-total">${done}</span> done`);
+            return parts.length ? `<span class="meta-count" title="Board status breakdown; parked or review work does not mean this worker is running">${parts.join(' · ')}</span>` : '';
           })()}
           ${!online ? '<span class="cached-badge">cached</span>' : ''}
         </div>` : ''}
@@ -5062,8 +5071,8 @@ function _editAddGroup(sel) {
 let editState = null;  // {session, field, current}
 function editField(session, field, current, provider) {
   closeAllMenus();
-  const titles = { name: 'Rename worker', provider: 'Change provider', model: 'Change model', effort: 'Reasoning effort', dir: 'Change directory', desc: 'Set description', tags: 'Edit groups', task: 'Edit task label', duplicate: 'Duplicate worker', clone: 'Clone & continue' };
-  const placeholders = { name: 'Worker name', model: 'e.g. opus, sonnet, haiku', dir: window._cloudEmail ? '/root' : '/path/to/project', desc: 'Brief description...', tags: 'e.g. work, frontend, urgent', task: 'e.g. Fix login bug (blank to auto-generate)', duplicate: 'New worker name', clone: 'New worker name' };
+  const titles = { name: 'Rename worker', provider: 'Change provider', model: 'Change model', effort: 'Reasoning effort', dir: 'Change directory', desc: 'Set description', tags: 'Edit groups', task: 'Edit task label', branch: 'Set worker branch', mcp: 'Browser tooling', send_allow: 'Cross-group messaging', duplicate: 'Duplicate worker', clone: 'Clone & continue' };
+  const placeholders = { name: 'Worker name', model: 'e.g. opus, sonnet, haiku', dir: window._cloudEmail ? '/root' : '/path/to/project', desc: 'Brief description...', tags: 'e.g. work, frontend, urgent', task: 'e.g. Fix login bug (blank to auto-generate)', branch: 'Branch name; blank = detected branch; none = main', send_allow: 'Comma-separated groups, * for all, blank to refuse', duplicate: 'New worker name', clone: 'New worker name' };
   document.getElementById('edit-title').textContent = titles[field] || 'Edit';
   const inp = document.getElementById('edit-input');
   const sel = document.getElementById('edit-select');
@@ -5094,7 +5103,11 @@ function editField(session, field, current, provider) {
       {v:'claude-haiku-4-5-20251001',l:'claude-haiku-4-5-20251001'}
     ];
     const codexModels = [
-      {v:'',l:'Default'},{v:'gpt-5.6-sol',l:'GPT-5.6 Sol'},{v:'gpt-5.5',l:'gpt-5.5'},
+      {v:'',l:'Default'},
+      {v:'gpt-5.6-sol',l:'GPT-5.6 Sol'},{v:'gpt-5.6-terra',l:'GPT-5.6 Terra'},
+      {v:'gpt-5.6-luna',l:'GPT-5.6 Luna'},{v:'gpt-5.5',l:'GPT-5.5'},
+      {v:'gpt-5.4',l:'GPT-5.4'},{v:'gpt-5.4-mini',l:'GPT-5.4 Mini'},
+      {v:'gpt-5.3-codex-spark',l:'GPT-5.3 Codex Spark'},
       {v:'o3',l:'o3'},{v:'o4-mini',l:'o4-mini'},
       {v:'gpt-4o',l:'gpt-4o'},{v:'gpt-4.1',l:'gpt-4.1'},{v:'gpt-4.1-mini',l:'gpt-4.1-mini'}
     ];
@@ -5154,6 +5167,13 @@ function editField(session, field, current, provider) {
     ];
     sel.innerHTML = '';
     efforts.forEach(e => { const o = document.createElement('option'); o.value = e.v; o.textContent = e.l; sel.appendChild(o); });
+    inpWrap.style.display = 'none';
+    sel.style.display = 'block';
+    sel.value = current || '';
+  } else if (field === 'mcp') {
+    const modes = [{v:'',l:'Disabled'},{v:'chrome',l:'Chrome browser tooling'}];
+    sel.innerHTML = '';
+    modes.forEach(m => { const o = document.createElement('option'); o.value = m.v; o.textContent = m.l; sel.appendChild(o); });
     inpWrap.style.display = 'none';
     sel.style.display = 'block';
     sel.value = current || '';
@@ -5220,10 +5240,10 @@ function _editSelectChanged() {
 }
 async function submitEdit() {
   if (!editState) return;
-  const val = (editState.field === 'model' || editState.field === 'provider' || editState.field === 'effort')
+  const val = (editState.field === 'model' || editState.field === 'provider' || editState.field === 'effort' || editState.field === 'mcp')
     ? document.getElementById('edit-select').value.trim()
     : document.getElementById('edit-input').value.trim();
-  if (!val && editState.field !== 'desc' && editState.field !== 'tags' && editState.field !== 'model' && editState.field !== 'task' && editState.field !== 'effort') return;
+  if (!val && !['desc','tags','model','task','effort','branch','mcp','send_allow'].includes(editState.field)) return;
   const { session, field } = editState;
   // Capture the reasoning-effort dial before closeEdit() tears the dialog down.
   let _effortVal = null;
@@ -5244,10 +5264,15 @@ async function submitEdit() {
       body: JSON.stringify({ new_name: val })
     });
   } else if (field === 'name') {
-    await apiCall(API + '/api/sessions/' + session + '/config', {
+    const renamed = await apiCall(API + '/api/sessions/' + session + '/config', {
       method: 'PATCH', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ rename: val })
     });
+    // The worker identity survives a rename, but this legacy surface addresses
+    // it by display name. Keep the open Configurations panel attached to the
+    // renamed worker instead of reloading the now-stale route and showing an
+    // unexplained 404.
+    if (renamed && peekSession === session) peekSession = val;
   } else if (field === 'model') {
     const payload = { model: val };
     if (_effortVal !== null) payload.effort = _effortVal;  // Claude only
@@ -5285,8 +5310,26 @@ async function submitEdit() {
       method: 'PATCH', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ tags: val })
     });
+  } else if (field === 'branch') {
+    await apiCall(API + '/api/sessions/' + session + '/config', {
+      method: 'PATCH', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ branch: val })
+    });
+  } else if (field === 'mcp') {
+    await apiCall(API + '/api/sessions/' + session + '/config', {
+      method: 'PATCH', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ mcp: val })
+    });
+  } else if (field === 'send_allow') {
+    await apiCall(API + '/api/sessions/' + session + '/config', {
+      method: 'PATCH', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ send_allow: val })
+    });
   }
   await fetchSessions();
+  if (peekSession && (peekSession === session || (field === 'name' && peekSession === val)) && _peekTab === 'scope') {
+    _scopeLoad({ level: 'worker', name: peekSession }, 'peek-scope-body');
+  }
 }
 
 // Edit modal dir autocomplete
@@ -5470,7 +5513,7 @@ function _spansLabel(s) {
 }
 
 // AUTO-DRAIN BACKLOG (AMUX-4055). Ethan: "the configuration needs to be a
-// button/toggle too". Same worker-scope key the Scope tab writes, so the toggle
+// button/toggle too". Same worker-level key Configurations writes, so the toggle
 // and the env box are two views of one setting.
 //
 // The toast says what it will and will NOT do, because the honest answer to
@@ -5505,7 +5548,7 @@ async function toggleSpansGroups(session) {
   // granted it, the server says so in its reply rather than reporting success
   // for a change the next send would disprove.
   if (was && s && !s.spans_groups_own) {
-    showToast('Granted by a group or global layer — turn it off in the Scope tab');
+    showToast('Granted by a group or global layer — turn it off in Configurations');
     return;
   }
   const next = !was;
@@ -6236,7 +6279,7 @@ async function loadPeekTranscript(showLoading) {
   }
 }
 
-// ── Scope tab: what this worker operates under, and which layer set it ──────
+// ── Configurations tab: editable values plus the layer that supplies each ──
 // Ethan: "a very easy way in the user experience to understand each of these
 // scoped characteristics." The provenance existed across five API surfaces and
 // nobody opens five surfaces to answer one question.
@@ -6331,6 +6374,18 @@ function _grpOpenBoard(g) {
 
 let _scopeRowOpen = {};   // capability rows are CONTRACTED by default
 
+/// Where a scope panel re-renders after a write. Mirrors `_scopeRowToggle`,
+/// which is the only place that got it right.
+///
+/// The save paths computed this as `name ? 'grp-scope-body-'+name : undefined`,
+/// which for a WORKER names the GROUP panel's element id. That element does not
+/// exist in the peek, `_scopeLoad` returns early on a missing target, and the
+/// tile keeps showing its pre-save value underneath a green "Saved". The write
+/// landed; only the panel disagreed, which gets reported as "it doesn't save".
+function _scopeTargetId(lvl, name) {
+  return (lvl === 'group') ? ('grp-scope-body-' + name) : 'peek-scope-body';
+}
+
 function _scopeRowToggle(key) {
   _scopeRowOpen[key] = !_scopeRowOpen[key];
   const parts = key.split(':');
@@ -6389,533 +6444,7 @@ function _grpGoto(g, where) {
 // a closed onclick cycle only its own buttons could enter. The real pages ARE
 // the group views now, scoped by their own filter controls.
 
-// The WRITE surface for one capability at one level (AMUX-2359). Renders a
-// control ONLY where the server says a value can actually be set; everywhere
-// else it renders the REASON. A field whose write the resolver would outrank is
-// worse than no field — it is an instruction you can follow exactly that does
-// nothing (AMUX-2140), and the read half already publishes `supported`, so
-// there is no excuse for the client to guess.
-// ── Scope tile editors (AMUX-4076) ────────────────────────────────────────
-// Ethan, on the worker Scope tab: "test all of these make sure they're all
-// configurable." Two of the seven tiles (memory, rules) had a textarea. The
-// other five rendered "Edited where it lives (<kind>). Writable via PUT
-// /api/scope" — a true sentence that is not a control, so the capability
-// existed and reached nobody who was not going to write curl (ethos rule 1).
-//
-// The API was never the gap: a read→write→verify→restore probe of all seven at
-// worker level came back 7/7 clean, with negative controls (unknown capability,
-// invalid mode, non-object skin, writing a peer's layer) all refusing. So each
-// kind now edits in the shape `scope.rs` already validates, rather than one
-// JSON box for everything: env is KEY=VALUE with null-deletes, gates is a list
-// per status, status availability is a per-status opt-in, connectors is
-// tri-state per connector, and a skin is terms/colours/tabs with a raw escape
-// hatch for the parts that are free-form by design.
-
-/// Where a scope panel re-renders after a write. Mirrors `_scopeRowToggle`.
-///
-/// The two save paths used to compute this as `name ? 'grp-scope-body-'+name :
-/// undefined`, which for a WORKER named the GROUP panel's element id. That
-/// element does not exist in the peek, `_scopeLoad` returns early on a missing
-/// target, and the tile kept showing its pre-save value underneath a green
-/// "Saved". The write had landed; only the panel disagreed, which is the shape
-/// of bug that gets reported as "it doesn't save".
-function _scopeTargetId(lvl, name) {
-  return (lvl === 'group') ? ('grp-scope-body-' + name) : 'peek-scope-body';
-}
-
-// Statuses and connectors are fetched once and cached: the gates / status
-// availability / connectors editors all need a catalogue the peek does not
-// otherwise load. `boardStatuses` exists as a SPA global but ships as a
-// 7-entry default with no `mode` field until the board view has been opened,
-// and `mode` is exactly what the availability editor has to read.
-let _scopeStatusCache = null, _scopeConnCache = null;
-
-async function _scopeStatusList() {
-  if (_scopeStatusCache) return _scopeStatusCache;
-  try {
-    const r = await fetch(API + '/api/board/statuses', { headers: _authHeaders() });
-    const d = await r.json();
-    if (Array.isArray(d) && d.length) _scopeStatusCache = d;
-  } catch (e) { /* fall back to the SPA default below */ }
-  return _scopeStatusCache
-    || (typeof boardStatuses !== 'undefined' ? boardStatuses : []);
-}
-
-async function _scopeConnectorList() {
-  if (_scopeConnCache) return _scopeConnCache;
-  try {
-    const r = await fetch(API + '/api/connectors', { headers: _authHeaders() });
-    const d = await r.json();
-    if (d && Array.isArray(d.connectors)) _scopeConnCache = d.connectors;
-  } catch (e) { /* an empty catalogue still renders stored entries */ }
-  return _scopeConnCache || [];
-}
-
-/// One PUT for every editor. `value` is already in the capability's own shape.
-async function _scopeSaveValue(lvl, name, key, value, msgId) {
-  const msg = document.getElementById(msgId);
-  if (msg) { msg.textContent = 'Saving…'; msg.style.color = 'var(--dim)'; }
-  try {
-    const r = await fetch(API + '/api/scope', {
-      method: 'PUT',
-      headers: Object.assign({ 'Content-Type': 'application/json' }, _authHeaders()),
-      body: JSON.stringify({ level: lvl, name: name, capability: key, value: value }),
-    });
-    const d = await r.json();
-    if (!r.ok || d.error) {
-      // The server's REASON verbatim. A 403 here is a real policy answer ("a
-      // session may not write the group layer"), not a glitch.
-      if (msg) { msg.textContent = d.error || ('save failed (' + r.status + ')'); msg.style.color = '#f85149'; }
-      return false;
-    }
-    if (msg) { msg.textContent = 'Saved'; msg.style.color = 'var(--green)'; }
-    // Re-read, so the tile's supplying-layer badge reflects the write rather
-    // than the request having returned 200 (ethos rule 4).
-    _scopeLoad(lvl === 'global' ? { level: 'global' } : { level: lvl, name: name },
-               _scopeTargetId(lvl, name));
-    return true;
-  } catch (e) {
-    if (msg) { msg.textContent = 'save failed: ' + e.message; msg.style.color = '#f85149'; }
-    return false;
-  }
-}
-
-function _scopeEdFoot(id, lvl, name, key, kind, note) {
-  return '<div class="scope-ed-foot">'
-    + '<button class="btn primary scope-ed-btn" onclick="event.stopPropagation();'
-    + '_scopeEdSave(\'' + escJs(lvl) + '\',\'' + escJs(name || '') + '\',\'' + escJs(key)
-    + '\',\'' + escJs(kind) + '\',\'' + escJs(id) + '\')">Save</button>'
-    + '<span class="scope-ed-msg" id="' + id + '-msg">' + esc(note || '') + '</span>'
-    + '</div>';
-}
-
-// ── env (kind: keys) ──────────────────────────────────────────────────────
-// The read deliberately returns key NAMES and no values: the file is 0600 and
-// carries credentials, so there is no payload to prefill from. The editor says
-// that rather than rendering empty boxes that look like empty values — saving
-// those back would blank every key on the layer.
-function _scopeEdEnv(id, lvl, name, cap) {
-  const keys = ((cap.value || {}).keys) || [];
-  const path = (cap.value || {}).path || '';
-  let h = '<div class="scope-ed" id="' + id + '">'
-    + '<div class="scope-ed-hint">Values are never read back (this file is 0600 and '
-    + 'carries credentials). Leave a value blank to keep it as it is; tick Remove to '
-    + 'delete the key.' + (path ? '<br><code style="font-size:0.62rem;">' + esc(path) + '</code>' : '')
-    + '</div><div class="scope-ed-grid">';
-  keys.forEach(k => {
-    h += '<div class="scope-ed-row" data-envk="' + esc(k) + '">'
-      + '<code class="scope-ed-key">' + esc(k) + '</code>'
-      + '<input class="scope-ed-in" type="text" data-role="val" placeholder="set — type to replace"'
-      + ' oninput="event.stopPropagation();">'
-      + '<label class="scope-ed-chk"><input type="checkbox" data-role="rm"'
-      + ' onclick="event.stopPropagation();">Remove</label>'
-      + '</div>';
-  });
-  if (!keys.length) {
-    h += '<div class="scope-ed-hint">Nothing set at this level.</div>';
-  }
-  h += '</div><div class="scope-ed-grid" id="' + id + '-new">'
-    + _scopeEdEnvNewRow()
-    + '</div>'
-    + '<div><button class="btn scope-ed-btn" onclick="event.stopPropagation();'
-    + '_scopeEdAddEnvRow(\'' + escJs(id) + '\')">+ Add another key</button></div>'
-    + _scopeEdFoot(id, lvl, name, 'env', 'keys',
-        keys.length + ' key' + (keys.length === 1 ? '' : 's') + ' at this level');
-  return h + '</div>';
-}
-
-function _scopeEdEnvNewRow() {
-  return '<div class="scope-ed-row" data-envnew="1">'
-    + '<input class="scope-ed-in" type="text" data-role="newk" placeholder="NEW_KEY"'
-    + ' oninput="event.stopPropagation();">'
-    + '<input class="scope-ed-in" type="text" data-role="newv" placeholder="value"'
-    + ' oninput="event.stopPropagation();">'
-    + '</div>';
-}
-
-function _scopeEdAddEnvRow(id) {
-  const box = document.getElementById(id + '-new');
-  if (box) box.insertAdjacentHTML('beforeend', _scopeEdEnvNewRow());
-}
-
-function _scopeCollectEnv(id) {
-  const root = document.getElementById(id);
-  const out = {};
-  if (!root) return out;
-  root.querySelectorAll('[data-envk]').forEach(r => {
-    const k = r.getAttribute('data-envk');
-    const rm = r.querySelector('[data-role="rm"]');
-    if (rm && rm.checked) { out[k] = null; return; }   // null DELETES the key
-    const v = r.querySelector('[data-role="val"]');
-    if (v && v.value !== '') out[k] = v.value;
-  });
-  root.querySelectorAll('[data-envnew]').forEach(r => {
-    const k = (r.querySelector('[data-role="newk"]') || {}).value || '';
-    const v = (r.querySelector('[data-role="newv"]') || {}).value || '';
-    if (k.trim()) out[k.trim()] = v;
-  });
-  return out;   // merge-by-key, exactly what write_env consumes
-}
-
-// ── gates (kind: list-per-status) ─────────────────────────────────────────
-function _scopeEdGates(id, lvl, name, cap, statuses) {
-  const cur = cap.value || {};
-  let h = '<div class="scope-ed" id="' + id + '">'
-    + '<div class="scope-ed-hint">One criterion per line. Emptying a box clears that '
-    + "status's gate at this level. Gates resolve per card, so a card also inherits "
-    + 'whatever the global and group layers set.</div>';
-  (statuses || []).forEach(st => {
-    const lines = Array.isArray(cur[st.id]) ? cur[st.id].join('\n') : '';
-    h += '<div class="scope-ed-blk" data-gst="' + esc(st.id) + '">'
-      + '<div class="scope-ed-lbl">' + esc(st.label || st.id)
-      + (lines ? '' : ' <span class="scope-ed-note">no gate here</span>') + '</div>'
-      + '<textarea class="scope-ed-ta" data-role="gate" oninput="event.stopPropagation();"'
-      + ' placeholder="One criterion per line">' + esc(lines) + '</textarea>'
-      + '</div>';
-  });
-  if (!(statuses || []).length) h += '<div class="scope-ed-hint">No board statuses loaded.</div>';
-  return h + _scopeEdFoot(id, lvl, name, 'gates', 'list-per-status',
-    Object.keys(cur).length + ' gated status' + (Object.keys(cur).length === 1 ? '' : 'es')
-    + ' at this level') + '</div>';
-}
-
-function _scopeCollectGates(id) {
-  const root = document.getElementById(id);
-  const out = {};
-  if (!root) return out;
-  root.querySelectorAll('[data-gst]').forEach(b => {
-    const ta = b.querySelector('[data-role="gate"]');
-    // Every status is sent, including the empty ones: write_gates upserts a
-    // non-empty list and DELETES an empty one, so omitting a status a user just
-    // cleared would leave the old gate in place while the box shows it gone.
-    out[b.getAttribute('data-gst')] =
-      (ta ? ta.value : '').split('\n').map(x => x.trim()).filter(Boolean);
-  });
-  return out;
-}
-
-// ── status availability (kind: mode) ──────────────────────────────────────
-// Two genuinely different shapes behind one capability, so two editors. Global
-// decides whether a status is `implicit` (everyone may use it) or `explicit`
-// (only scopes opted in). Group and worker hold the OPT-IN list, which is
-// meaningless for an implicit status — so those rows say so instead of
-// offering a checkbox that would change nothing.
-function _scopeEdMode(id, lvl, name, cap, statuses) {
-  const sts = statuses || [];
-  let h = '<div class="scope-ed" id="' + id + '">';
-  if (lvl === 'global') {
-    const cur = cap.value || {};
-    h += '<div class="scope-ed-hint"><b>implicit</b> — any worker may move a card here. '
-      + '<b>explicit</b> — only workers or groups opted in below can.</div>';
-    sts.forEach(st => {
-      const m = cur[st.id] || st.mode || 'implicit';
-      h += '<div class="scope-ed-row" data-mst="' + esc(st.id) + '">'
-        + '<span class="scope-ed-key">' + esc(st.label || st.id) + '</span>'
-        + '<select class="scope-ed-sel" data-role="mode" onclick="event.stopPropagation();">'
-        + '<option value="implicit"' + (m === 'implicit' ? ' selected' : '') + '>implicit</option>'
-        + '<option value="explicit"' + (m === 'explicit' ? ' selected' : '') + '>explicit</option>'
-        + '</select></div>';
-    });
-  } else {
-    const on = new Set(Array.isArray(cap.value) ? cap.value : []);
-    const explicit = sts.filter(st => (st.mode || 'implicit') === 'explicit');
-    h += '<div class="scope-ed-hint">Which <b>explicit</b> statuses this '
-      + esc(lvl) + ' may use. Implicit statuses are open to everyone and are not '
-      + 'listed here; make one explicit at the global level first.</div>';
-    explicit.forEach(st => {
-      h += '<label class="scope-ed-chk" data-mst="' + esc(st.id) + '">'
-        + '<input type="checkbox" data-role="opt"' + (on.has(st.id) ? ' checked' : '')
-        + ' onclick="event.stopPropagation();">' + esc(st.label || st.id) + '</label>';
-    });
-    if (!explicit.length) {
-      h += '<div class="scope-ed-hint">No status is explicit right now, so there is '
-        + 'nothing to opt into. Every status is already available here.</div>';
-    }
-    // An opted-in status that is no longer explicit still has a row in the DB
-    // and still shows on the tile, so it has to be un-tickable from here.
-    const orphan = [...on].filter(x => !explicit.some(st => st.id === x));
-    orphan.forEach(x => {
-      h += '<label class="scope-ed-chk" data-mst="' + esc(x) + '">'
-        + '<input type="checkbox" data-role="opt" checked onclick="event.stopPropagation();">'
-        + esc(x) + ' <span class="scope-ed-note">(no longer explicit — untick to clear)</span></label>';
-    });
-  }
-  const _note = (lvl === 'global')
-    ? (sts.filter(x => (x.mode || 'implicit') === 'explicit').length + ' explicit')
-    : ((Array.isArray(cap.value) ? cap.value.length : 0) + ' opted in at this level');
-  return h + _scopeEdFoot(id, lvl, name, 'status_mode', 'mode', _note) + '</div>';
-}
-
-function _scopeCollectMode(id, lvl) {
-  const root = document.getElementById(id);
-  if (!root) return lvl === 'global' ? {} : [];
-  if (lvl === 'global') {
-    const out = {};
-    root.querySelectorAll('[data-mst]').forEach(r => {
-      const sel = r.querySelector('[data-role="mode"]');
-      if (sel) out[r.getAttribute('data-mst')] = sel.value;
-    });
-    return out;
-  }
-  const out = [];
-  root.querySelectorAll('[data-mst]').forEach(r => {
-    const c = r.querySelector('[data-role="opt"]');
-    if (c && c.checked) out.push(r.getAttribute('data-mst'));
-  });
-  return out;
-}
-
-// ── connectors (kind: json) ───────────────────────────────────────────────
-// Tri-state, not a checkbox. The layers merge by key, so an ABSENT connector
-// inherits from the group and global layers while `{enabled:false}` overrides
-// them to off. A two-state toggle cannot express the difference, and the
-// difference is the whole reason this is a scope capability.
-function _scopeEdConnectors(id, lvl, name, cap, catalog) {
-  const cur = ((cap.value || {}).connectors) || {};
-  const known = (catalog || []).map(c => c.id);
-  const ids = known.concat(Object.keys(cur).filter(k => known.indexOf(k) < 0));
-  let h = '<div class="scope-ed" id="' + id + '">'
-    + '<div class="scope-ed-hint"><b>Inherit</b> leaves this connector to the group and '
-    + 'global layers. <b>On</b> / <b>Off</b> override them here.</div>';
-  ids.forEach(cid => {
-    const c = (catalog || []).find(x => x.id === cid) || {};
-    const e = cur[cid];
-    const state = (e === undefined || e === null) ? '' : (e.enabled ? 'on' : 'off');
-    h += '<div class="scope-ed-row" data-conn="' + esc(cid) + '"'
-      + ' data-orig="' + esc(JSON.stringify(e === undefined ? null : e)) + '">'
-      + '<span class="scope-ed-key">' + esc(c.label || cid)
-      + (c.category ? ' <span class="scope-ed-note">' + esc(c.category) + '</span>' : '')
-      + '</span>'
-      + '<select class="scope-ed-sel" data-role="state" onclick="event.stopPropagation();">'
-      + '<option value=""' + (state === '' ? ' selected' : '') + '>Inherit</option>'
-      + '<option value="on"' + (state === 'on' ? ' selected' : '') + '>On</option>'
-      + '<option value="off"' + (state === 'off' ? ' selected' : '') + '>Off</option>'
-      + '</select>'
-      + '<input class="scope-ed-in" type="text" data-role="account" placeholder="account (optional)"'
-      + ' value="' + esc((e && e.account) || '') + '" oninput="event.stopPropagation();">'
-      + '</div>';
-  });
-  if (!ids.length) h += '<div class="scope-ed-hint">No connectors in the catalogue.</div>';
-  return h + _scopeEdFoot(id, lvl, name, 'connectors', 'json',
-    Object.keys(cur).length + ' override' + (Object.keys(cur).length === 1 ? '' : 's')
-    + ' at this level') + '</div>';
-}
-
-function _scopeCollectConnectors(id) {
-  const root = document.getElementById(id);
-  const out = {};
-  if (!root) return out;
-  root.querySelectorAll('[data-conn]').forEach(r => {
-    const cid = r.getAttribute('data-conn');
-    const st = (r.querySelector('[data-role="state"]') || {}).value || '';
-    if (st === '') return;   // Inherit: no key at all on this layer
-    // Carry forward fields this editor does not show (`mcp` and anything a
-    // later version adds) rather than dropping them on every save.
-    let base = {};
-    try { base = JSON.parse(r.getAttribute('data-orig') || 'null') || {}; } catch (e) { base = {}; }
-    const acct = ((r.querySelector('[data-role="account"]') || {}).value || '').trim();
-    const ent = Object.assign({}, base, { enabled: st === 'on' });
-    if (acct) ent.account = acct; else delete ent.account;
-    out[cid] = ent;
-  });
-  return out;
-}
-
-// ── skin (kind: json) ─────────────────────────────────────────────────────
-// `terms`, `colors` and `tabs` get real controls because they are what a skin
-// is for; everything else stays a JSON box because the merge is deliberately
-// arbitrary-depth (`ui.peek.font` is a documented example) and pretending
-// otherwise would make the editor the ceiling on what a skin can say.
-const _SCOPE_SKIN_SECTIONS = ['terms', 'colors', 'tabs'];
-
-function _scopeEdSkin(id, lvl, name, cap) {
-  const sk = ((cap.value || {}).skin) || {};
-  const terms = (sk.terms && typeof sk.terms === 'object') ? sk.terms : {};
-  const colors = (sk.colors && typeof sk.colors === 'object') ? sk.colors : {};
-  const tabs = Array.isArray(sk.tabs) ? sk.tabs : null;
-  const rest = {};
-  Object.keys(sk).forEach(k => { if (_SCOPE_SKIN_SECTIONS.indexOf(k) < 0) rest[k] = sk[k]; });
-  const allTabs = (typeof ALL_TABS !== 'undefined' ? ALL_TABS : []);
-
-  let h = '<div class="scope-ed" id="' + id + '">'
-    + '<div class="scope-ed-hint">A skin renames things, recolours them, and narrows which '
-    + 'tabs are visible. Layers merge per key, so setting one noun here keeps the rest.</div>';
-
-  h += '<div class="scope-ed-sec">Terms</div><div class="scope-ed-grid" id="' + id + '-terms">';
-  Object.keys(terms).forEach(k => { h += _scopeEdKvRow('term', k, terms[k], 'noun', 'label'); });
-  h += _scopeEdKvRow('term', '', '', 'noun', 'label');
-  h += '</div><div><button class="btn scope-ed-btn" onclick="event.stopPropagation();'
-    + '_scopeEdAddKv(\'' + escJs(id) + '-terms\',\'term\',\'noun\',\'label\')">+ Add term</button></div>';
-
-  h += '<div class="scope-ed-sec">Colours</div><div class="scope-ed-grid" id="' + id + '-colors">';
-  Object.keys(colors).forEach(k => { h += _scopeEdKvRow('color', k, colors[k], 'name', '#58a6ff'); });
-  h += _scopeEdKvRow('color', '', '', 'name', '#58a6ff');
-  h += '</div><div><button class="btn scope-ed-btn" onclick="event.stopPropagation();'
-    + '_scopeEdAddKv(\'' + escJs(id) + '-colors\',\'color\',\'name\',\'#58a6ff\')">+ Add colour</button></div>';
-
-  h += '<div class="scope-ed-sec">Tabs</div>'
-    + '<label class="scope-ed-chk"><input type="checkbox" id="' + id + '-tabson"'
-    + (tabs ? ' checked' : '') + ' onclick="event.stopPropagation();">'
-    + 'Restrict which tabs are visible</label>'
-    + '<div class="scope-ed-hint">Unticked, this layer says nothing about tabs and inherits. '
-    + 'Ticked, only the ticked tabs are shown.</div><div class="scope-ed-grid" id="' + id + '-tabs">';
-  allTabs.forEach(t => {
-    const on = tabs ? tabs.indexOf(t.id) >= 0 : true;
-    h += '<label class="scope-ed-chk" data-tab="' + esc(t.id) + '">'
-      + '<input type="checkbox" data-role="tab"' + (on ? ' checked' : '')
-      + ' onclick="event.stopPropagation();">' + esc(t.label || t.id) + '</label>';
-  });
-  if (!allTabs.length) h += '<div class="scope-ed-hint">No tabs discovered.</div>';
-  h += '</div>';
-
-  h += '<div class="scope-ed-sec">Anything else (JSON)</div>'
-    + '<textarea class="scope-ed-ta" id="' + id + '-rest" oninput="event.stopPropagation();"'
-    + ' placeholder=\'{"ui": {"peek": {"font": "mono"}}}\'>'
-    + esc(Object.keys(rest).length ? JSON.stringify(rest, null, 2) : '') + '</textarea>';
-
-  return h + _scopeEdFoot(id, lvl, name, 'skin', 'json',
-    Object.keys(sk).length ? 'set at this level' : 'unset at this level') + '</div>';
-}
-
-function _scopeEdKvRow(kind, k, v, kph, vph) {
-  const sw = (kind === 'color')
-    ? '<span class="scope-ed-sw" data-role="sw" style="background:' + esc(v || 'transparent') + ';"></span>'
-    : '';
-  return '<div class="scope-ed-row" data-kv="' + esc(kind) + '">'
-    + '<input class="scope-ed-in" type="text" data-role="k" placeholder="' + esc(kph) + '"'
-    + ' value="' + esc(k) + '" oninput="event.stopPropagation();">'
-    + '<input class="scope-ed-in" type="text" data-role="v" placeholder="' + esc(vph) + '"'
-    + ' value="' + esc(v == null ? '' : v) + '"'
-    + ' oninput="event.stopPropagation();' + (kind === 'color'
-        ? 'var s=this.parentNode.querySelector(\'[data-role=&quot;sw&quot;]\');if(s)s.style.background=this.value;' : '') + '">'
-    + sw + '</div>';
-}
-
-function _scopeEdAddKv(boxId, kind, kph, vph) {
-  const box = document.getElementById(boxId);
-  if (box) box.insertAdjacentHTML('beforeend', _scopeEdKvRow(kind, '', '', kph, vph));
-}
-
-function _scopeCollectSkin(id) {
-  const root = document.getElementById(id);
-  if (!root) return {};
-  const grab = (boxId) => {
-    const out = {}, box = document.getElementById(boxId);
-    if (!box) return out;
-    box.querySelectorAll('[data-kv]').forEach(r => {
-      const k = ((r.querySelector('[data-role="k"]') || {}).value || '').trim();
-      const v = ((r.querySelector('[data-role="v"]') || {}).value || '').trim();
-      if (k && v) out[k] = v;
-    });
-    return out;
-  };
-  const restEl = document.getElementById(id + '-rest');
-  let out = {};
-  if (restEl && restEl.value.trim()) {
-    try {
-      const parsed = JSON.parse(restEl.value);
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        _scopeEdErr(id, 'The JSON box must hold an object, not an array or a bare value.');
-        return undefined;
-      }
-      out = parsed;
-    } catch (e) {
-      _scopeEdErr(id, 'Not valid JSON: ' + e.message);
-      return undefined;   // undefined aborts the save; {} would CLEAR the layer
-    }
-  }
-  const terms = grab(id + '-terms'), colors = grab(id + '-colors');
-  if (Object.keys(terms).length) out.terms = terms;
-  if (Object.keys(colors).length) out.colors = colors;
-  const on = document.getElementById(id + '-tabson');
-  if (on && on.checked) {
-    const tabs = [];
-    const box = document.getElementById(id + '-tabs');
-    if (box) box.querySelectorAll('[data-tab]').forEach(r => {
-      const c = r.querySelector('[data-role="tab"]');
-      if (c && c.checked) tabs.push(r.getAttribute('data-tab'));
-    });
-    out.tabs = tabs;
-  }
-  return out;
-}
-
-function _scopeEdErr(id, text) {
-  const msg = document.getElementById(id + '-msg');
-  if (msg) { msg.textContent = text; msg.style.color = '#f85149'; }
-}
-
-/// The one save entry point. Each collector returns the capability's own shape,
-/// or `undefined` to abort after reporting its own error — which is NOT the
-/// same as `{}`, since an empty object legitimately CLEARS a layer.
-async function _scopeEdSave(lvl, name, key, kind, id) {
-  let value;
-  if (kind === 'keys') value = _scopeCollectEnv(id);
-  else if (kind === 'list-per-status') value = _scopeCollectGates(id);
-  else if (kind === 'mode') value = _scopeCollectMode(id, lvl);
-  else if (key === 'connectors') value = _scopeCollectConnectors(id);
-  else if (key === 'skin') value = _scopeCollectSkin(id);
-  else {
-    const ta = document.getElementById(id + '-rest') || document.getElementById(id);
-    try { value = JSON.parse((ta && ta.value) || '{}'); }
-    catch (e) { _scopeEdErr(id, 'Not valid JSON: ' + e.message); return; }
-  }
-  if (value === undefined) return;
-  await _scopeSaveValue(lvl, name, key, value, id + '-msg');
-}
-
-function _scopeEditorHTML(lvl, name, cap, statuses, connectors) {
-  const id = 'scope-ed-' + lvl + '-' + (name || 'global') + '-' + cap.key;
-  if (!cap.supported) {
-    return '<div style="margin-top:6px;font-size:0.68rem;color:#d29922;">'
-      + 'Not settable here. It is decided at: ' + esc((cap.order || []).filter(x => x !== lvl).join(' > '))
-      + '</div>';
-  }
-  const v = cap.value || {};
-  // Text-backed capabilities get a textarea; keyed/structured ones are edited
-  // where they live (env file, gate editor) rather than half-edited here.
-  if (cap.kind === 'text') {
-    // A capped read must never be writable: saving it back would replace the
-    // file with its own first N bytes, turning a DISPLAY limit into data loss.
-    if (v.truncated) {
-      return '<div style="margin-top:6px;font-size:0.68rem;color:#d29922;">'
-        + 'Too large to edit here (' + (v.bytes || 0) + ' bytes, shown truncated), so editing is '
-        + 'disabled — saving a truncated copy would delete the rest. Edit '
-        + '<code>' + esc(v.path || '') + '</code> directly.</div>';
-    }
-    return '<div style="margin-top:7px;">'
-      + '<textarea id="' + id + '" placeholder="Nothing set at this level. Type to set it."'
-      + ' style="width:100%;min-height:74px;background:var(--bg);border:1px solid var(--border);'
-      + 'border-radius:6px;padding:6px 8px;font-size:0.72rem;color:var(--text);font-family:inherit;'
-      + 'resize:vertical;" oninput="event.stopPropagation();">' + esc(v.text || '') + '</textarea>'
-      + '<div style="display:flex;gap:6px;align-items:center;margin-top:5px;">'
-      + '<button class="btn primary" style="font-size:0.68rem;min-height:32px;padding:4px 10px;"'
-      + ' onclick="event.stopPropagation();_scopeSave(\'' + escJs(lvl) + '\',\'' + escJs(name || '') + '\',\''
-      + escJs(cap.key) + '\',\'' + escJs(id) + '\')">Save</button>'
-      + '<span id="' + id + '-msg" style="font-size:0.64rem;color:var(--dim);">'
-      + (v.bytes ? v.bytes + ' bytes at this level' : 'unset at this level') + '</span>'
-      + '</div></div>';
-  }
-  // Every remaining kind now has a control. The branch this replaced printed
-  // "Edited where it lives (<kind>). Writable via PUT /api/scope" for env,
-  // gates, status availability, skin and connectors — five of the seven tiles.
-  if (cap.kind === 'keys') return _scopeEdEnv(id, lvl, name, cap);
-  if (cap.kind === 'list-per-status') return _scopeEdGates(id, lvl, name, cap, statuses);
-  if (cap.kind === 'mode') return _scopeEdMode(id, lvl, name, cap, statuses);
-  if (cap.key === 'connectors') return _scopeEdConnectors(id, lvl, name, cap, connectors);
-  if (cap.key === 'skin') return _scopeEdSkin(id, lvl, name, cap);
-  // A capability added later with no editor here still says something true and
-  // actionable, rather than rendering a blank panel.
-  return '<div class="scope-ed" id="' + id + '">'
-    + '<div class="scope-ed-hint">No typed editor for <code>' + esc(cap.kind) + '</code> yet. '
-    + 'Edit it as JSON, or use <code>PUT /api/scope</code> with capability '
-    + '<code>' + esc(cap.key) + '</code>.</div>'
-    + '<textarea class="scope-ed-ta" id="' + id + '-rest" oninput="event.stopPropagation();">'
-    + esc(cap.value == null ? '' : JSON.stringify(cap.value, null, 2)) + '</textarea>'
-    + _scopeEdFoot(id, lvl, name, cap.key, cap.kind, '') + '</div>';
-}
-
-// ── Scope editor (AMUX-2436) ──────────────────────────────────────────────
+// ── Configuration editor (AMUX-2436) ──────────────────────────────────────
 // Ethan: "when I click memory, environment, board gates in the expandable group
 // bar I should be able to see/override/edit group level overrides ... same ux as
 // the actual memory environment and board gates pages."
@@ -6928,7 +6457,7 @@ function _scopeEditorHTML(lvl, name, cap, statuses, connectors) {
 let _scopeEditCtx = null, _scopeEditDirty = false;
 
 function _scopeEditClose() {
-  if (_scopeEditDirty && !confirm('Discard unsaved changes to this scope?')) return;
+  if (_scopeEditDirty && !confirm('Discard unsaved configuration changes?')) return;
   document.getElementById('scope-edit-backdrop').classList.remove('open');
   _scopeEditCtx = null; _scopeEditDirty = false;
 }
@@ -6939,6 +6468,8 @@ const _SCOPE_EDIT_HINT = {
   env:    'KEY=VALUE per line, shell style. Merged by key; a worker’s own .env wins on a clash.',
   gates:  'JSON: {"status": ["criterion", ...]}. Replaces this level’s gate for the statuses named; omit a status to inherit.',
   status_mode: 'JSON array of status ids this level opts into, e.g. ["verified"].',
+  skin: 'JSON object. Keys override terms, colours, and tabs at this level; omitted keys inherit.',
+  connectors: 'JSON object keyed by connector. Each value can set enabled, account, and mcp; omitted connectors inherit.',
 };
 
 async function _scopeEditOpen(lvl, name, key) {
@@ -6976,11 +6507,12 @@ async function _scopeEditOpen(lvl, name, key) {
       text = v.text || '';
     } else if (key === 'env') {
       const keys = v.keys || [];
+      _scopeEditCtx.originalKeys = keys.slice();
       text = keys.length
         ? keys.map(k => k + '=').join('\n')
         : '';
       document.getElementById('scope-edit-msg').textContent = keys.length
-        ? 'Values are not shown (secrets). Re-enter a value to change it; a bare KEY= is ignored.'
+        ? 'Values are hidden. Re-enter a value to change it, leave KEY= to preserve it, or remove the line to delete it.'
         : '';
     } else {
       text = JSON.stringify(v && Object.keys(v).length ? v : (Array.isArray(v) ? v : {}), null, 2);
@@ -7015,12 +6547,20 @@ async function _scopeEditSave() {
   let value;
   if (key === 'memory' || key === 'rules') value = { text: ta.value };
   else if (key === 'env') {
-    // Only lines with an actual value are sent — a bare KEY= from the masked
-    // read would otherwise BLANK the secret it was standing in for.
+    // Existing values stay masked. A bare KEY= preserves one, a changed value
+    // overwrites it, and removing the line emits null so the server deletes it.
+    // Without the original-key diff the UI could add env keys but never remove
+    // them, which is not a configuration editor.
     const out = {};
+    const present = new Set();
     (ta.value || '').split('\n').forEach(l => {
       const m = l.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$/);
-      if (m && m[2].trim() !== '') out[m[1]] = m[2].trim();
+      if (!m) return;
+      present.add(m[1]);
+      if (m[2].trim() !== '') out[m[1]] = m[2].trim();
+    });
+    ((_scopeEditCtx && _scopeEditCtx.originalKeys) || []).forEach(k => {
+      if (!present.has(k)) out[k] = null;
     });
     value = out;
   } else {
@@ -7052,32 +6592,108 @@ async function _scopeEditSave() {
   }
 }
 
-async function _scopeSave(lvl, name, key, elId) {
-  const ta = document.getElementById(elId);
-  const msg = document.getElementById(elId + '-msg');
-  if (!ta) return;
-  if (msg) { msg.textContent = 'Saving…'; msg.style.color = 'var(--dim)'; }
-  try {
-    const r = await fetch(API + '/api/scope', {
-      method: 'PUT',
-      headers: Object.assign({ 'Content-Type': 'application/json' }, _authHeaders()),
-      body: JSON.stringify({ level: lvl, name: name, capability: key, value: { text: ta.value } }),
-    });
-    const d = await r.json();
-    if (!r.ok || d.error) {
-      // Show the server's REASON verbatim. A 403 here is a real policy answer
-      // ("a session may not write the group layer"), not a glitch, and
-      // paraphrasing it into "save failed" would hide the one useful sentence.
-      if (msg) { msg.textContent = d.error || ('save failed (' + r.status + ')'); msg.style.color = '#f85149'; }
-      return;
-    }
-    if (msg) { msg.textContent = 'Saved · ' + (d.value && d.value.bytes != null ? d.value.bytes + ' bytes' : 'ok'); msg.style.color = 'var(--green)'; }
-    // Re-read so the tile's supplying-layer badge reflects the write, which is
-    // the card's acceptance criterion — not just "the POST returned 200".
-    _scopeLoad(lvl === 'global' ? { level: 'global' } : { level: lvl, name: name },
-               _scopeTargetId(lvl, name));
-  } catch (e) {
-    if (msg) { msg.textContent = 'save failed: ' + e.message; msg.style.color = '#f85149'; }
+// Board automation is configuration, so expose the runtime's actual switches
+// beside gates/status availability instead of scattering one in a card menu
+// and hiding the other two as environment-variable trivia. Each switch writes
+// the worker layer; Inherit removes that override and immediately re-resolves
+// global -> group -> worker precedence on the server.
+const _WORKER_BOARD_CONFIGS = [
+  { field: 'auto_drain_backlog', value: 'auto_drain_backlog', own: 'auto_drain_backlog_own',
+    label: 'Backlog → To Do', note: 'Pull the oldest eligible backlog card when To Do is empty. On by default; parked and human-owned cards stay put.' },
+  { field: 'board_auto_pickup', value: 'auto_pickup', own: 'auto_pickup_own',
+    label: 'To Do → In Progress', note: 'Claim the next eligible To Do card when the worker is idle.' },
+  { field: 'board_auto_continue', value: 'auto_continue', own: 'auto_continue_own',
+    label: 'Continue non-terminal work', note: 'Re-check actionable blocked work instead of stopping early.' },
+  { field: 'board_standing_orders', value: 'standing_orders', own: 'standing_orders_own',
+    label: 'Pickup / continue master', note: 'Master switch for To Do pickup and non-terminal continuation.' },
+];
+
+function _workerConfigurationRow(key, label, value, note, controls) {
+  return '<div data-worker-config="' + esc(key) + '" style="display:flex;align-items:center;gap:8px;padding:7px 0;border-top:1px solid var(--border);">'
+    + '<div style="min-width:0;flex:1;"><div style="font-size:0.74rem;color:var(--text);font-weight:600;">'
+    + esc(label) + '</div><div style="font-size:0.68rem;color:var(--dim);overflow-wrap:anywhere;">'
+    + (value ? '<span style="color:var(--text);">' + esc(value) + '</span>' + (note ? ' · ' : '') : '')
+    + esc(note || '') + '</div></div><div style="display:flex;gap:5px;flex:0 0 auto;">'
+    + controls + '</div></div>';
+}
+
+// Complete inventory of the durable PATCH /config surface. Commands that do
+// not describe durable worker state (restart, archive, duplicate, fresh
+// conversation) stay in the worker menu; every actual configuration field is
+// reachable here. The raw Environment editor remains the escape hatch for
+// open-ended startup keys such as CC_BACKEND/CC_CREATOR/CC_FLAGS — it is part
+// of this same tab, not a hidden file-editing workflow.
+function _workerPrimaryConfigurationsHTML(name) {
+  const s = sessions.find(x => x.name === name) || {};
+  const provider = sessionProvider(s);
+  const model = sessionConfiguredModel(s);
+  const effort = flagValue(s.flags || '', '--effort');
+  const q = escJs(name);
+  const edit = (field, current, extra) => '<button class="btn" style="font-size:0.68rem;min-height:32px;padding:4px 8px;"'
+    + ' onclick="event.stopPropagation();editField(\'' + q + '\',\'' + field + '\',\''
+    + escJs(current || '') + '\'' + (extra ? ',\'' + escJs(extra) + '\'' : '') + ')">Edit</button>';
+  const sw = (on, fn, label) => '<button class="btn' + (on ? ' primary' : '') + '" role="switch" aria-checked="'
+    + !!on + '" style="font-size:0.68rem;min-height:32px;min-width:48px;padding:4px 8px;"'
+    + ' onclick="event.stopPropagation();' + fn + '(\'' + q + '\')" aria-label="' + esc(label) + '">'
+    + (on ? 'On' : 'Off') + '</button>';
+  let rows = '';
+  rows += _workerConfigurationRow('name', 'Name', s.name || name, 'Renaming preserves tasks, messages, memory, and worker identity.', edit('name', s.name || name));
+  rows += _workerConfigurationRow('description', 'Description', s.desc || '', 'Used by people and peer-worker discovery.', edit('desc', s.desc || ''));
+  rows += _workerConfigurationRow('task_label', 'Task label override', s.task_name || '', 'Blank returns the card to its board/source-derived label.', edit('task', s.task_name || ''));
+  rows += _workerConfigurationRow('groups', 'Groups', (s.tags || []).join(', '), 'Controls membership, inherited configuration, and default message reach.', edit('tags', (s.tags || []).join(', ')));
+  rows += _workerConfigurationRow('directory', 'Working directory', s.dir || '', 'Changing it restarts a running worker in the new directory.', edit('dir', s.dir || ''));
+  rows += _workerConfigurationRow('branch', 'Git branch', s.branch || '', 'Blank follows the detected branch; “none” explicitly uses the main checkout.', edit('branch', s.branch || ''));
+  rows += _workerConfigurationRow('provider', 'Model provider', providerLabel(provider), 'Provider swaps preserve durable board state and restart only when required.', edit('provider', provider));
+  rows += _workerConfigurationRow('model', 'Model version', model || 'Provider default', 'A supported live switch keeps the conversation; restart fallback rehydrates from board state.', edit('model', model || '', provider));
+  rows += _workerConfigurationRow('effort', 'Reasoning effort', effort || 'Provider default', provider === 'claude' ? 'Can be changed independently or together with the model.' : 'This provider does not expose the effort picker.', provider === 'claude' ? edit('effort', effort || '', provider) : '');
+  rows += _workerConfigurationRow('mcp', 'Browser tooling', s.mcp === 'chrome' ? 'Chrome enabled' : 'Disabled', 'Applied on the next worker start.', edit('mcp', s.mcp || ''));
+  rows += _workerConfigurationRow('yolo', 'Approval bypass (YOLO)', s.yolo ? 'Enabled' : 'Disabled', 'Uses the selected provider’s native permission flag.', sw(!!s.yolo, 'toggleYolo', 'Toggle approval bypass'));
+  rows += _workerConfigurationRow('isolated', 'Isolated raw agent', s.isolated ? 'Enabled' : 'Disabled', 'No amux harness, hooks, MCP config, or peer discovery; restart to apply.', sw(!!s.isolated, 'toggleIsolated', 'Toggle isolated mode'));
+  rows += _workerConfigurationRow('cross_group', 'Cross-group messaging', s.spans_groups_value || 'Refused', s.spans_groups_own ? 'Worker override.' : (s.spans_groups ? 'Inherited from a group/global layer.' : 'No standing allowance.'), edit('send_allow', s.spans_groups_own ? (s.spans_groups_value || '') : ''));
+  rows += _workerConfigurationRow('pinned', 'Pinned in worker list', s.pinned ? 'Pinned' : 'Not pinned', 'Presentation preference; does not change execution priority.', sw(!!s.pinned, 'togglePin', 'Toggle pinned state'));
+  rows += _workerConfigurationRow('advanced_environment', 'Advanced startup environment', 'backend: ' + (s.backend || 'tmux') + (s.creator ? ' · creator: ' + s.creator : ''), 'Edit arbitrary worker-level environment, including backend, creator, and startup flags. Process-scoped changes apply on restart.', '<button class="btn" style="font-size:0.68rem;min-height:32px;padding:4px 8px;" onclick="event.stopPropagation();_scopeEditOpen(\'worker\',\'' + q + '\',\'env\')">Edit environment</button>');
+  return '<div class="scope-detail" style="margin-bottom:10px;">'
+    + '<div style="font-size:0.8rem;font-weight:700;color:var(--text);margin-bottom:2px;">Worker settings</div>'
+    + '<div style="font-size:0.67rem;color:var(--dim);margin-bottom:5px;">Every durable worker setting exposed by the worker API, in one place. Lifecycle commands remain in the worker menu.</div>'
+    + rows + '</div>';
+}
+
+function _workerBoardConfigurationsHTML(name) {
+  const s = sessions.find(x => x.name === name) || {};
+  const rows = _WORKER_BOARD_CONFIGS.map(c => {
+    const on = s[c.value] !== false;
+    const own = !!s[c.own];
+    return '<div style="display:flex;align-items:center;gap:8px;padding:7px 0;border-top:1px solid var(--border);">'
+      + '<div style="min-width:0;flex:1;"><div style="font-size:0.74rem;color:var(--text);font-weight:600;">'
+      + esc(c.label) + (own ? ' <span style="font-size:0.62rem;color:var(--accent);">worker override</span>'
+                              : ' <span style="font-size:0.62rem;color:var(--dim);">inherited/default</span>')
+      + '</div><div style="font-size:0.65rem;color:var(--dim);">' + esc(c.note) + '</div></div>'
+      + '<button class="btn' + (on ? ' primary' : '') + '" role="switch" aria-checked="' + on + '"'
+      + ' style="font-size:0.68rem;min-height:32px;min-width:48px;padding:4px 8px;"'
+      + ' onclick="event.stopPropagation();_workerBoardConfigurationSet(\'' + escJs(name) + '\',\''
+      + escJs(c.field) + '\',' + (!on) + ')">' + (on ? 'On' : 'Off') + '</button>'
+      + (own ? '<button class="btn" style="font-size:0.65rem;min-height:32px;padding:4px 7px;"'
+          + ' onclick="event.stopPropagation();_workerBoardConfigurationSet(\'' + escJs(name) + '\',\''
+          + escJs(c.field) + '\',null)">Inherit</button>' : '')
+      + '</div>';
+  }).join('');
+  return '<div class="scope-detail" style="margin-bottom:10px;">'
+    + '<div style="font-size:0.8rem;font-weight:700;color:var(--text);margin-bottom:2px;">Board automation</div>'
+    + '<div style="font-size:0.67rem;color:var(--dim);margin-bottom:5px;">'
+    + 'Controls dispatch from backlog through active work. Status availability and Board gates below configure the remaining transitions and terminal states.'
+    + '</div>' + rows + '</div>';
+}
+
+async function _workerBoardConfigurationSet(name, field, value) {
+  const r = await apiCall(API + '/api/sessions/' + encodeURIComponent(name) + '/config', {
+    method: 'PATCH', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ [field]: value }),
+  });
+  if (!r) return;
+  showToast(r.message || 'Worker configuration saved');
+  await fetchSessions();
+  if (peekSession === name && _peekTab === 'scope') {
+    _scopeLoad({ level: 'worker', name: name }, 'peek-scope-body');
   }
 }
 
@@ -7123,12 +6739,13 @@ async function _scopeLoad(scope, targetId) {
     const sum = (c) => {
       let v = c && c.value;
       if (!v) return '\u2014';
-      // UNWRAP THE ENVELOPE FIRST (AMUX-4076). `skin` and `connectors` arrive
-      // as {"skin": {...}} / {"connectors": {...}}, so the object branch below
-      // asked an OBJECT for its `.length`, got undefined, filtered the only key
-      // out, and reported a configured layer as unset. Measured live: the
-      // Connectors tile read "global · —" while the global layer had granola
-      // enabled — the tile named the supplying layer and denied it had a value.
+      // UNWRAP THE ENVELOPE FIRST. `skin` and `connectors` come back as
+      // {"skin": {...}} / {"connectors": {...}}, so every branch below sees a
+      // one-key object and summarises it as the literal word "connectors"
+      // rather than what is configured. Measured: the tile read "global ·
+      // connectors" while the global layer had granola enabled. (An earlier
+      // form of the predicate below returned an em-dash for the same input,
+      // which is the same defect one stage worse.)
       if (typeof v === 'object' && !Array.isArray(v)) {
         const ks = Object.keys(v);
         if (ks.length === 1 && (ks[0] === 'skin' || ks[0] === 'connectors')) v = v[ks[0]];
@@ -7142,13 +6759,12 @@ async function _scopeLoad(scope, targetId) {
       if (v.keys) return v.keys.length + ' key' + (v.keys.length === 1 ? '' : 's');
       if (typeof v.bytes === 'number') return v.bytes ? v.bytes + ' bytes' : '\u2014';
       if (typeof v === 'object') {
-        // "Non-empty" has to cover a nested OBJECT, not just an array or a
-        // scalar. `v[x] && v[x].length` was the whole bug above: true for
-        // ['a'] and for 'implicit', false for {enabled:true}.
-        const filled = (x) => Array.isArray(x) ? x.length > 0
-          : (x && typeof x === 'object') ? Object.keys(x).length > 0
-          : !!x;
-        const k = Object.keys(v).filter(x => filled(v[x]));
+        const k = Object.keys(v).filter(x => {
+          const z = v[x];
+          if (Array.isArray(z) || typeof z === 'string') return z.length > 0;
+          if (z && typeof z === 'object') return Object.keys(z).length > 0;
+          return z !== null && z !== undefined && z !== '';
+        });
         return k.length ? k.join(', ') : '\u2014';
       }
       return String(v);
@@ -7159,7 +6775,8 @@ async function _scopeLoad(scope, targetId) {
     // group thing should be horizontal above the workers below the pills"), and
     // stack on a phone. The wrapper classes carry that; the tile row itself was
     // already horizontal.
-    let h = '<div class="grp-scope-row">'
+    let h = (lvl === 'worker' ? _workerPrimaryConfigurationsHTML(w) + _workerBoardConfigurationsHTML(w) : '')
+          + '<div class="grp-scope-row">'
           + '<div class="grp-scope-ident" style="color:var(--text);font-size:0.86rem;">'
           + '<b>' + esc(lvl === 'global' ? 'Global' : w) + '</b>'
           + (lvl === 'worker' ? ' \u00b7 groups: ' + (groups.length ? chips(groups) : '<i>none</i>') : '')
@@ -7171,7 +6788,7 @@ async function _scopeLoad(scope, targetId) {
     // 2026-08-06: "remove rules(binding) from group configs. it should just be
     // memory, board gates and env variables for now"). A DISPLAY trim, not a
     // capability removal: _SCOPE_CAPS, GET/PUT /api/scope and the worker peek
-    // Scope tab still carry rules and status_mode — "for now" means the panel,
+    // Configurations tab still carries rules and status_mode — "for now" means the panel,
     // and hiding a tile must not silently delete the API behind it.
     const _visCaps = (lvl === 'worker') ? d.capabilities
       : d.capabilities.filter(c => ['memory', 'gates', 'env'].includes(c.key));
@@ -7215,17 +6832,6 @@ async function _scopeLoad(scope, targetId) {
     // open in _scopeRowOpen from before the trim would otherwise render a detail
     // panel for a tile that no longer exists above it.
     const _selCap = _visCaps.find(c => _scopeRowOpen[lvl + ':' + w + ':' + c.key]);
-    // Only the OPEN tile's editor renders, so only its catalogue is fetched —
-    // and only when this level can actually edit it (group/global route to the
-    // modal instead, which loads its own). Both are cached after the first hit.
-    let _edStatuses = null, _edConnectors = null;
-    if (_selCap && _selCap.supported && lvl === 'worker') {
-      if (_selCap.kind === 'list-per-status' || _selCap.kind === 'mode') {
-        _edStatuses = await _scopeStatusList();
-      } else if (_selCap.key === 'connectors') {
-        _edConnectors = await _scopeConnectorList();
-      }
-    }
     if (_selCap) {
       const _l = _selCap;
       h += '<div class="scope-detail">'
@@ -7239,13 +6845,13 @@ async function _scopeLoad(scope, targetId) {
         + ' <span style="opacity:0.6;">\u00b7 ' + esc(_l.merge) + '</span>'
         + (_l.supported ? '' : ' <span style="color:#d29922;">\u00b7 not settable at this level</span>')
         + '</div>'
-        + ((lvl === 'group' || lvl === 'global') && _l.supported
+        + (_l.supported
             ? '<div style="margin-top:7px;"><button class="btn primary" '
               + 'style="font-size:0.7rem;min-height:36px;padding:5px 11px;" '
               + 'onclick="event.stopPropagation();_scopeEditOpen(\'' + escJs(lvl) + '\',\''
               + escJs(w || '') + '\',\'' + escJs(_l.key) + '\')">Edit ' + esc(_l.label)
               + ' at this level</button></div>'
-            : _scopeEditorHTML(lvl, w, _l, _edStatuses, _edConnectors))
+            : '<div style="margin-top:6px;font-size:0.68rem;color:#d29922;">Not settable at this level.</div>')
         + '</div>';
     }
     h += '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:6px;">'
@@ -7267,7 +6873,7 @@ async function _scopeLoad(scope, targetId) {
     dst.innerHTML = h;
   } catch (e) {
     const dst = document.getElementById(targetId || 'peek-scope-body') || el;
-    dst.textContent = 'Could not load scope: ' + e.message;
+    dst.textContent = 'Could not load configurations: ' + e.message;
   }
 }
 
@@ -8993,7 +8599,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.785';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.789';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -14168,6 +13774,28 @@ function _linkifyCardIds(safeHtml) {
         : m);
   } catch (e) { return safeHtml; }
 }
+
+// Schedule ids in Messages are navigation, not inert provenance. Scheduler
+// deliveries already stamp `[SCHED-N]` into origin; leaving that token as plain
+// text forced the reader to copy it, change tabs, and search manually. Load the
+// current schedule set before opening so a Messages-only visit is not dependent
+// on whether the Scheduler tab happened to be opened earlier.
+async function _openScheduleFromMessage(id) {
+  const sid = String(id || '');
+  if (!/^SCHED-\d+$/.test(sid)) return;
+  switchView('scheduler');
+  await Promise.all([fetchSchedules(), fetchSchedulerRuns(), fetchSchedulerAudit()]);
+  renderScheduler();
+  if ((schedules || []).some(s => s.id === sid && !s.deleted)) openSchedModal(sid);
+  else showToast(sid + ' is no longer active — see scheduler audit');
+}
+function _linkifyScheduleIds(safeHtml) {
+  try {
+    return String(safeHtml).replace(/\b(SCHED-\d+)\b/g, (m, id) =>
+      '<a href="javascript:void(0)" onclick="event.stopPropagation();_openScheduleFromMessage(\''
+      + id + '\')" style="color:var(--accent);text-decoration:underline dotted;">' + id + '</a>');
+  } catch (e) { return safeHtml; }
+}
 // Turn bare http(s) URLs in ALREADY-escaped HTML into clickable links, so a
 // resume / sign-in deep link an agent drops in a needs-you ask (AMUX-3073) is
 // clickable rather than dead plain text — the card's whole premise is a
@@ -14287,7 +13915,7 @@ function _cmdHistItemHTML(e, ctx) {
   // path — "Human · queued" vs plain "Human".
   const originTxt = kind === 'human'
     ? ''   // delivery chip below carries direct/queued for every kind now
-    : (origin ? ' &middot; ' + origin.replace(/&/g,'&amp;').replace(/</g,'&lt;').slice(0,32) : '');
+    : (origin ? ' &middot; ' + _linkifyScheduleIds(origin.replace(/&/g,'&amp;').replace(/</g,'&lt;').slice(0,32)) : '');
   const tag = `<span style="display:inline-block;font-size:0.7rem;font-weight:600;padding:1px 7px;border-radius:3px;background:${km.bg};color:${km.color};margin-right:6px;">${km.label}${originTxt}</span>`;
   const sessTag = session ? `<span style="color:var(--dim);font-size:0.7rem;margin-right:6px;">${session.replace(/&/g,'&amp;').replace(/</g,'&lt;')}</span>` : '';
   const tsTag = ts ? `<span style="color:var(--dim);font-size:0.7rem;">${ts}</span>` : '';
@@ -14310,7 +13938,7 @@ function _cmdHistItemHTML(e, ctx) {
   const _matches = _mq && safe.toLowerCase().includes(_mq.trim().toLowerCase());
   const _collapsed = _msgCollapsed.has(_pk) && !_matches;
   const caret = `<button class="msg-caret" aria-expanded="${!_collapsed}" title="${_collapsed ? 'Expand message' : 'Collapse message'}" onclick="_msgToggleCollapse(this,&#39;${escJs(_pk)}&#39;,event)">${_collapsed ? '&#9656;' : '&#9662;'}</button>`;
-  return `<div class="${ctx.rowClass||''}" data-msg-key="${esc(_pk)}" onclick="${ctx.onOpen ? ctx.onOpen(e, enc) : `_pickCmdHistory(decodeURIComponent('${enc}'))`}" title="Click to insert into the composer" style="cursor:pointer;padding:8px 12px;background:${km.bg};border:1px solid var(--border);border-left:3px solid ${km.color};border-radius:6px;font-size:0.85rem;color:var(--text);transition:border-color 0.15s;display:flex;gap:6px;align-items:flex-start;position:relative;" onmouseenter="this.style.borderColor='${km.color}'" onmouseleave="this.style.borderColor='var(--border)'"><input type="checkbox" class="pm-check" ${_psel?"checked":""} onclick="${ctx.toggle}(&#39;${escJs(_pk)}&#39;,event)" title="Select for bulk resend">${caret}<div style="flex:1;min-width:0;">${meta?`<div style="margin-bottom:4px;">${meta}</div>`:''}<div class="msg-body${_collapsed?' collapsed':''}" style="white-space:pre-wrap;word-break:break-word;line-height:1.45;">${_hlSearch(_linkifyCardIds(safe), _mq)}</div></div><div class="pm-actions"><button class="btn pm-dots" onclick="_msgMenu(this,event)" title="Actions">&#x22ef;</button><div class="msg-menu"><button onclick="event.stopPropagation();${ctx.resend}([&#39;${escJs(_pk)}&#39;])">Resend to ${esc(_target || 'session')}</button><button onclick="event.stopPropagation();_msgCopyBtn(this,&#39;${enc}&#39;)">Copy text</button><button onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent(&#39;${enc}&#39;),this)">Read aloud</button>${locSess ? `<button onclick="event.stopPropagation();_msgLocate(&#39;${escJs(locSess)}&#39;,&#39;${enc}&#39;)" title="Open that worker's peek and scroll to where this was sent">Find in ${esc(locSess)}</button>` : ''}</div></div></div>`;
+  return `<div class="${ctx.rowClass||''}" data-msg-key="${esc(_pk)}" onclick="${ctx.onOpen ? ctx.onOpen(e, enc) : `_pickCmdHistory(decodeURIComponent('${enc}'))`}" title="Click to insert into the composer" style="cursor:pointer;padding:8px 12px;background:${km.bg};border:1px solid var(--border);border-left:3px solid ${km.color};border-radius:6px;font-size:0.85rem;color:var(--text);transition:border-color 0.15s;display:flex;gap:6px;align-items:flex-start;position:relative;" onmouseenter="this.style.borderColor='${km.color}'" onmouseleave="this.style.borderColor='var(--border)'"><input type="checkbox" class="pm-check" ${_psel?"checked":""} onclick="${ctx.toggle}(&#39;${escJs(_pk)}&#39;,event)" title="Select for bulk resend">${caret}<div style="flex:1;min-width:0;">${meta?`<div style="margin-bottom:4px;">${meta}</div>`:''}<div class="msg-body${_collapsed?' collapsed':''}" style="white-space:pre-wrap;word-break:break-word;line-height:1.45;">${_hlSearch(_linkifyScheduleIds(_linkifyCardIds(safe)), _mq)}</div></div><div class="pm-actions"><button class="btn pm-dots" onclick="_msgMenu(this,event)" title="Actions">&#x22ef;</button><div class="msg-menu"><button onclick="event.stopPropagation();${ctx.resend}([&#39;${escJs(_pk)}&#39;])">Resend to ${esc(_target || 'session')}</button><button onclick="event.stopPropagation();_msgCopyBtn(this,&#39;${enc}&#39;)">Copy text</button><button onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent(&#39;${enc}&#39;),this)">Read aloud</button>${locSess ? `<button onclick="event.stopPropagation();_msgLocate(&#39;${escJs(locSess)}&#39;,&#39;${enc}&#39;)" title="Open that worker's peek and scroll to where this was sent">Find in ${esc(locSess)}</button>` : ''}</div></div></div>`;
 }
 function _peekMessagesFor() {
   if (!peekSession) return [];
@@ -17720,7 +17348,7 @@ async function _connCreate() {
       await _connScopeEnable(body.id, level, scopeName);
       if (msg) { msg.textContent = 'Created and enabled at ' + level + ' scope. Paste the key in its row below.'; msg.style.color = ''; }
     } catch (e) {
-      if (msg) { msg.textContent = 'Created, but the scope write failed: ' + String(e.message || e) + ' — set it in the Scope tab.'; msg.style.color = '#b8860b'; }
+      if (msg) { msg.textContent = 'Created, but the configuration write failed: ' + String(e.message || e) + ' — set it in Configurations.'; msg.style.color = '#b8860b'; }
     }
     _connAddToggle();
     _connectorsTabLoad();
@@ -25412,30 +25040,9 @@ function _colMenu(e, st, lane) {
   m.style.top = Math.max(6, Math.min(e.clientY, window.innerHeight - r.height - 6)) + 'px';
   return false;
 }
-// WHAT YOU SEE IS WHAT MOVES (AMUX-4058). Ethan: "when I do a filter, it still
-// has the 500 or something number".
-//
-// This counted `boardItems` and applied only status + lane, so with a filter
-// active the menu offered to migrate ~500 cards while the column in front of
-// you showed twelve. Worse than a wrong number: the migrate would have MOVED
-// all 500, because the server takes a column and not a selection.
-//
-// Reading the ids straight out of the rendered column removes the whole class.
-// The DOM is the filtered set by construction — whatever `renderBoard` decided
-// to show, after search, facets, owner filter and saved views, is exactly what
-// this returns. A second reimplementation of the filter predicate here would be
-// one more thing to keep in step, and the failure mode of drift is silently
-// moving cards the user could not see.
-function _colVisibleIds(st) {
-  const col = document.querySelector('.board-col[data-col="' + (window.CSS && CSS.escape ? CSS.escape(st) : st) + '"]');
-  if (!col) return [];
-  return [...col.querySelectorAll('.board-card[data-id]')].map(e => e.getAttribute('data-id'));
-}
+// The SAME canon `deleteBoardStatus` counts with, so the number in the dialog
+// matches the number on the column header you just clicked.
 function _colCardCount(st, lane) {
-  const vis = _colVisibleIds(st);
-  if (vis.length) return vis.length;
-  // No rendered column (a collapsed or off-screen board): fall back to the
-  // model, and say so at the call site rather than pretending to be filtered.
   return (typeof boardItems !== 'undefined' ? boardItems : [])
     .filter(i => !i.archived && !i.deleted && _statusCanon(i.status) === st
                  && (!lane || i.session === lane)).length;
@@ -25443,8 +25050,7 @@ function _colCardCount(st, lane) {
 async function _colMigrateAll(from, to, lane) {
   _colMenuClose();
   lane = lane || '';
-  const ids = _colVisibleIds(from);
-  const n = ids.length || _colCardCount(from, lane);
+  const n = _colCardCount(from, lane);
   const fl = (boardStatuses.find(x => x.id === from) || {}).label || from;
   const tl = (boardStatuses.find(x => x.id === to) || {}).label || to;
   if (!n) { showToast('"' + fl + '" has no cards to migrate'); return; }
@@ -25458,14 +25064,8 @@ async function _colMigrateAll(from, to, lane) {
     const r = await fetch(API + '/api/board/bulk-migrate', {
       method: 'POST',
       headers: Object.assign({ 'Content-Type': 'application/json' }, _authHeaders()),
-      // Send the VISIBLE ids when the column is rendered, so a filtered view
-      // migrates exactly what it shows. Falling back to the whole column only
-      // when there is no rendered column to read.
-      body: JSON.stringify(Object.assign(
-        { from: from, to: to },
-        lane ? { session: lane } : {},
-        ids.length ? { ids: ids } : {}
-      )),
+      body: JSON.stringify(lane ? { from: from, to: to, session: lane }
+                                 : { from: from, to: to }),
     });
     const d = await r.json();
     if (!r.ok) { showToast('Migrate refused: ' + (d.error || ('HTTP ' + r.status))); return; }
@@ -26786,9 +26386,14 @@ function _bdArtifactRef(a) {
   if (/^https?:\/\//i.test(target)) {
     return '<a href="' + esc(target) + '" target="_blank" rel="noopener noreferrer">' + esc(ref) + '</a>';
   }
-  if (/^(?:\/|\.\.?\/)/.test(target) || /(?:^|\/)\S+\.[a-z0-9]{1,12}$/i.test(ref)) {
+  const refPath = ref.replace(/#.*$/, '');
+  const targetPath = target.replace(/#.*$/, '');
+  const explicitPath = /^(?:\/|\.\.?\/)/.test(refPath)
+    || (!/\s/.test(refPath) && (refPath.includes('/') || /\.[a-z0-9]{1,12}$/i.test(refPath)));
+  const serverResolvedPath = target !== ref && /^(?:\/|\.\.?\/)/.test(targetPath);
+  if (explicitPath || serverResolvedPath) {
     return '<span class="file-link" onclick="event.stopPropagation();openFilePreview(\''
-      + escJs(target) + '\')" title="Open ' + esc(target) + '">' + esc(ref) + '</span>';
+      + escJs(targetPath) + '\')" title="Open ' + esc(targetPath) + '">' + esc(ref) + '</span>';
   }
   return '<code>' + esc(ref) + '</code>';
 }
@@ -27028,11 +26633,23 @@ function openBoardDetail(id) {
 
 // ── Improved detail: status banner, typed History, permalink (AMUX-2178) ───
 function _bdParseHistory(log) {
-  // Each backtick-timestamped line becomes a typed event for styled rendering.
-  return (log || '').split('\n').filter(l => l.trim()).map(line => {
+  // A timestamp STARTS an event; wrapped/continued prose belongs to it until
+  // the next timestamp. Treating every physical line as an action turned one
+  // worker update into 115 sentence fragments on MR-137.
+  const grouped = [];
+  for (const line of (log || '').split('\n').filter(l => l.trim())) {
     const m = line.match(/^`(\d{1,2}:\d{2})`\s*(.*)$/);
     const ts = m ? m[1] : '';
     const body = m ? m[2] : line;
+    if (!m && grouped.length && grouped[grouped.length - 1].ts) {
+      grouped[grouped.length - 1].body += '\n' + body.trim();
+    } else {
+      grouped.push({ ts, body });
+    }
+  }
+  return grouped.map(e => {
+    const ts = e.ts;
+    const body = e.body;
     let kind = 'note';
     if (/^STATUS\s*\(/i.test(body)) kind = 'status';
     else if (/^status:\s/i.test(body)) kind = 'transition';
@@ -29343,6 +28960,7 @@ let _pollTimer = null;
 
 let _invBoardTimer = null;
 let _invSessTimer = null;
+let _invMessagesTimer = null;
 function connectSSE() {
   if (_sseFallback || _sse) return;
   _sse = new EventSource(_authUrl(API + '/api/events'));
@@ -29456,6 +29074,23 @@ function connectSSE() {
           if (key === 'sessions') {
             clearTimeout(_invSessTimer);
             _invSessTimer = setTimeout(fetchSessions, 400);
+          }
+          if (key === 'messages') {
+            clearTimeout(_invMessagesTimer);
+            _invMessagesTimer = setTimeout(() => {
+              // Refresh only visible message surfaces. The event is fleet-wide;
+              // fetching history in every background tab on every scheduler or
+              // worker send would turn correctness into avoidable load.
+              if (activeView === 'messages') _messagesLoad(true);
+              if (typeof peekSession !== 'undefined' && peekSession
+                  && typeof _peekTab !== 'undefined' && _peekTab === 'messages') {
+                _peekMessagesLoad();
+              }
+              const hist = document.getElementById('cmd-history-modal');
+              if (hist && hist.classList.contains('active')) {
+                _loadCmdHistoryFromServer().then(() => _renderCmdHistoryList());
+              }
+            }, 400);
           }
         }
       } else if (msg.type === 'ping') {
@@ -35989,9 +35624,12 @@ async function _bwLoadProfiles() {
       sel.appendChild(sep);
     }
     scratch.forEach(p => sel.appendChild(opt(p, '🔓')));
-    (d.chrome_profiles || []).forEach(p => {
+    const isolatedNames = new Set(all.map(p => p.name));
+    (d.chrome_profiles || []).filter(p => !isolatedNames.has(p)).forEach(p => {
       const o = document.createElement('option');
-      o.value = p; o.textContent = '🌐 ' + p;
+      o.value = p;
+      o.textContent = '🌐 ' + p + ' — import on first use';
+      o.title = 'Copies login state into an isolated amux profile; your normal Chrome can stay open';
       sel.appendChild(o);
     });
     if (cur) sel.value = cur;
@@ -36073,7 +35711,9 @@ async function _bwGo() {
     const _landed = d.launch_url || (d.data && d.data.url) || '';
     _bwCurrentUrl = _landed || url;
     _bwShowProfile(d.profile, d.auto_profile);
-    let _msg = 'Navigated' + (d.profile_fallback ? ' (no profile — Chrome busy)' : '');
+    let _msg = d.profile_imported_from
+      ? 'Imported the Chrome login into an isolated profile and navigated'
+      : 'Navigated' + (d.profile_fallback ? ' (no profile — Chrome busy)' : '');
     if (_landed && !/^about:/.test(_landed)) {
       const _host = u => { try { return new URL(u).host.replace(/^www\./, ''); } catch (e) { return ''; } };
       const _want = _host(url), _got = _host(_landed);

@@ -3237,15 +3237,104 @@ pub async fn create_item(
 // ---- GET /api/board/{id} -------------------------------------------------
 
 fn resolve_task_asset(reference: &str, work_dir: &str) -> String {
+    let reference = reference.trim();
     let is_external = reference.starts_with("http://")
         || reference.starts_with("https://")
         || reference.starts_with('#')
         || ((7..=40).contains(&reference.len())
             && reference.bytes().all(|c| c.is_ascii_hexdigit()));
     if is_external || reference.starts_with('/') || work_dir.is_empty() {
+        return reference.to_string();
+    }
+
+    // A produced asset is not necessarily a file. Saved-retriever ids,
+    // namespace ids and prose such as `origin commit abc123` are legitimate
+    // references too. The old resolver joined EVERY non-URL value to the
+    // worker directory, so the card rendered those logical ids as clickable
+    // local files that could never open (observed on TUBES-2379). Resolve only
+    // values that actually have a path shape. A spaced relative path is still
+    // supported when it exists; otherwise whitespace means the worker put a
+    // description in `ref` instead of the artifact's description field and it
+    // must stay plain text rather than becoming a bogus path.
+    let (path_ref, fragment) = reference
+        .split_once('#')
+        .map(|(p, f)| (p, Some(f)))
+        .unwrap_or((reference, None));
+    let path = std::path::Path::new(path_ref);
+    let path_shaped = path_ref.starts_with("./")
+        || path_ref.starts_with("../")
+        || path_ref.contains('/')
+        || path.extension().is_some();
+    if !path_shaped {
+        return reference.to_string();
+    }
+
+    let append_fragment = |candidate: std::path::PathBuf| {
+        let mut out = candidate.to_string_lossy().into_owned();
+        if let Some(fragment) = fragment {
+            out.push('#');
+            out.push_str(fragment);
+        }
+        out
+    };
+    let direct = std::path::Path::new(work_dir).join(path);
+    if direct.exists() {
+        return append_fragment(direct);
+    }
+
+    // Workers commonly speak in repository-relative paths even when their
+    // configured cwd is a subdirectory of that repository. Prefer the nearest
+    // existing ancestor-relative match before manufacturing `a/b/a/b/file`.
+    for ancestor in std::path::Path::new(work_dir).ancestors().skip(1) {
+        let candidate = ancestor.join(path);
+        if candidate.exists() {
+            return append_fragment(candidate);
+        }
+    }
+
+    if path_ref.chars().any(char::is_whitespace) {
         reference.to_string()
     } else {
-        std::path::Path::new(work_dir).join(reference).to_string_lossy().into_owned()
+        append_fragment(direct)
+    }
+}
+
+#[cfg(test)]
+mod task_asset_resolution_tests {
+    use super::resolve_task_asset;
+
+    #[test]
+    fn logical_asset_ids_and_descriptions_do_not_become_fake_files() {
+        let cwd = "/tmp/amux-asset-resolution";
+        assert_eq!(resolve_task_asset("ret_8d00ed37a392f1", cwd), "ret_8d00ed37a392f1");
+        assert_eq!(resolve_task_asset("origin commit 3b398814dd", cwd), "origin commit 3b398814dd");
+        assert_eq!(resolve_task_asset("3b398814dd", cwd), "3b398814dd");
+        assert_eq!(
+            resolve_task_asset("migration/mxp.py (ts-parity-v2 sanction)", cwd),
+            "migration/mxp.py (ts-parity-v2 sanction)"
+        );
+    }
+
+    #[test]
+    fn file_shaped_assets_resolve_without_doubling_repo_relative_prefixes() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("mixpeek");
+        let cwd = repo.join("customers/tubescience");
+        let file = cwd.join("migration/mxp.py");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "# asset").unwrap();
+
+        assert_eq!(
+            resolve_task_asset("migration/mxp.py", cwd.to_str().unwrap()),
+            file.to_string_lossy()
+        );
+        assert_eq!(
+            resolve_task_asset(
+                "customers/tubescience/migration/mxp.py#contract",
+                cwd.to_str().unwrap()
+            ),
+            format!("{}#contract", file.to_string_lossy())
+        );
     }
 }
 

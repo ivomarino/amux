@@ -817,13 +817,32 @@ pub fn asset_refs(text: &str) -> Vec<String> {
     let number_ref = NUMBER_REF
         .get_or_init(|| Regex::new(r"(?:^|\s)(#\d+)\b").expect("asset ref regex"));
 
+    fn file_like_component(part: &str) -> bool {
+        let Some((stem, ext)) = part.rsplit_once('.') else { return false };
+        !stem.is_empty()
+            && (1..=12).contains(&ext.len())
+            && ext.chars().all(|c| c.is_ascii_alphanumeric())
+    }
+    fn ambiguous_joined_files(value: &str) -> bool {
+        !value.contains("://")
+            && value.split('/').filter(|part| file_like_component(part)).count() > 1
+    }
+
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     let mut push = |raw: &str| {
         let clean = raw
             .trim()
             .trim_matches(|c: char| matches!(c, ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}'));
-        if !clean.is_empty() && seen.insert(clean.to_string()) {
+        // `plan.md/result-a.txt/result-b.txt` is a prose list missing spaces,
+        // not one produced file. Accepting it manufactured a clickable path in
+        // the repo that could never exist. A dotted directory is possible, but
+        // two file-shaped path components are ambiguous evidence and should be
+        // written as separate pointers by the worker.
+        if !clean.is_empty()
+            && !ambiguous_joined_files(clean)
+            && seen.insert(clean.to_string())
+        {
             out.push(clean.to_string());
         }
     };
@@ -2955,6 +2974,9 @@ mod tests {
         assert!(has_asset_link("closes #106"));
         // A short hex-ish word is not a sha, a bare year is too short.
         assert!(!has_asset_link("the cafe was open in 2026"));
+        assert!(!has_asset_link("result-a.txt/result-b.txt"));
+        assert!(!has_asset_link("plan.md/result-a.txt/result-b.txt"));
+        assert!(asset_refs("[ghost](plan.md/result-a.txt)").is_empty());
 
         // The card renderer consumes the SAME parser and must receive every
         // produced asset, not just the first boolean proof that let Done pass.
