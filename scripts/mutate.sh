@@ -128,10 +128,17 @@ RULES = [
 counts = {}
 for l in lines:
     counts[l] = counts.get(l, 0) + 1
-out, skipped_dup, skipped_nomut = [], 0, 0
+# EVERY EXCLUSION IS COUNTED, AND THEY MUST SUM (ts-gke, 2026-09-03: apply the
+# positive control to a filter's EXCLUSIONS, not only to its matches).
+# `skipped_nomut` was computed here and never printed, and comment/blank lines
+# were dropped with no counter at all — so "84 mutable lines found" could not be
+# told from "84 found out of 1391 scanned, 900 of which I silently ignored".
+# That is precisely the property this tool's own docstring claims to have.
+out, skipped_dup, skipped_nomut, skipped_text = [], 0, 0, 0
 for i, l in enumerate(lines[:stop]):
     st = l.strip()
     if not st or st.startswith(('//', '#', '*', '/*')):
+        skipped_text += 1
         continue
     hit = None
     for a, b in RULES:
@@ -146,7 +153,13 @@ for i, l in enumerate(lines[:stop]):
         continue
     a, b = hit
     out.append((i + 1, l, l.replace(a, b, 1), f"{a.strip()} -> {b.strip()}"))
-print(f"#META\t{len(out)}\t{skipped_dup}\t{stop}\t{len(lines)}")
+# The identity that makes a silent drop impossible: every scanned line is in
+# exactly one bucket. A future rule that `continue`s without a counter breaks
+# this loudly instead of quietly shrinking the survey.
+assert len(out) + skipped_dup + skipped_nomut + skipped_text == stop, (
+    f"survey accounting lost {stop - (len(out) + skipped_dup + skipped_nomut + skipped_text)} "
+    f"line(s): some exclusion is not counted")
+print(f"#META\t{len(out)}\t{skipped_dup}\t{stop}\t{len(lines)}\t{skipped_nomut}\t{skipped_text}")
 for ln, old, new, label in out[:limit]:
     print(f"{ln}\t{old}\t{new}\t{label}")
 PY
@@ -157,10 +170,15 @@ PY
   n_dup=$(printf '%s' "$meta" | cut -f3)
   stop_line=$(printf '%s' "$meta" | cut -f4)
   n_lines=$(printf '%s' "$meta" | cut -f5)
+  n_norule=$(printf '%s' "$meta" | cut -f6)
+  n_text=$(printf '%s' "$meta" | cut -f7)
   body=$(printf '%s\n' "$cands" | tail -n +2)
   n_run=$(printf '%s\n' "$body" | grep -c . || true)
   echo "mutate survey: $file — $n_all mutable line(s) found, running $n_run (limit $limit)."
-  echo "mutate survey: scope: lines 1-$stop_line of $n_lines (--stop-at '$stop_at'); $n_dup skipped as non-unique."
+  echo "mutate survey: scope: lines 1-$stop_line of $n_lines (--stop-at '$stop_at')."
+  echo "mutate survey: of those $stop_line: $n_all mutable, $n_dup non-unique, $n_norule with no"
+  echo "mutate survey: applicable rule, $n_text comment or blank. Every scanned line is in exactly"
+  echo "mutate survey: one bucket and the four are asserted to sum, so no exclusion is silent."
   echo ""
   killed=0; survived=0; survivors=""
   while IFS=$'\t' read -r ln old new label; do
