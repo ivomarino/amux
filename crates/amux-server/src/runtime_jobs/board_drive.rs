@@ -7908,11 +7908,31 @@ mod tests {
     /// that keeps this a repair rather than a hole: with nothing promotable, a
     /// capped lane must still be told `wip-cap` and handed no work.
     /// AMUX-4055. An empty To Do column with actionable backlog is work the
+    /// Serialises the three tests that mutate `AMUX_DISPATCH_BACKLOG_WHEN_IDLE`.
+    ///
+    /// The variable is PROCESS-GLOBAL and cargo runs tests as threads in ONE
+    /// process, so `remove_var` in the default-on test and `set_var(.., "0")`
+    /// in the other two are the same memory. Interleave them and the default-on
+    /// test reads "0" between its own remove_var and its assertion, then fails
+    /// with "default-on backlog dispatch did not run" — a red that points at
+    /// the dispatcher and is really this.
+    ///
+    /// MEASURED, not theorised: 1 failure in 12 consecutive runs of this module
+    /// with the auto-builder idle and the worktree clean, so build contention
+    /// (AMUX-3853) was ruled out first. It also survived a full-suite run once
+    /// and failed the next, which is what makes it expensive — it reads as a
+    /// regression in whatever landed that day.
+    ///
+    /// Poisoning is recovered rather than propagated: one panicking test must
+    /// not convert the other two into failures that hide their own result.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// worker is expected to keep driving. Default-on is safe because the drain
     /// query excludes every parked/human/trigger shape; an explicit 0 remains
     /// the worker/group/global opt-out.
     #[test]
     fn backlog_dispatch_is_on_by_default_and_supports_an_explicit_opt_out() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The default must be tested against an actually empty scope chain,
         // not the developer machine's ~/.amux global configuration.
         let home = tempfile::tempdir().expect("temp home");
@@ -7956,6 +7976,7 @@ mod tests {
     /// mentioned that a drain had been considered and declined.
     #[test]
     fn the_trace_says_why_a_drain_declined() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let conn = board_db();
         add_card(&conn, "P-1", "lane", "backlog", "parked on a trigger", "SCOPE: x");
         conn.execute(
@@ -7992,6 +8013,7 @@ mod tests {
     /// The two cards this must never touch, even when opted in.
     #[test]
     fn a_drain_skips_a_human_parked_card_and_a_live_trigger() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(DISPATCH_BACKLOG_KEY, "1");
         let conn = board_db();
         // Parked ON A HUMAN.
