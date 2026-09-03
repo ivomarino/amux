@@ -3083,3 +3083,59 @@ FIX: the 29 duplicates are deleted here and the lost entry is back. The mechanis
   guidance existed and did not reach the moment it was needed.
   A title present in both files is a one-line predicate over two files this repo already has
   open. It wants to be a check that runs, not a fourth sentence asking someone to remember.
+
+---
+
+## The append-only guard's PASS is not evidence for any particular line: a rescue by the substring test is silent
+AREA: hooks
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-09-02
+SESSION: amux-frustrations
+CARD: AF-432
+SYMPTOM: Repairing AF-430 I deleted 29 resurrected entries, and one line went with them
+  that is in NO other file: `CARD: AF-10`, whose archived copy carries `CARD: AF-242` plus
+  a NOTE-CARD explaining the repoint. I ran the guard expecting a refusal I would then have
+  to acknowledge out loud. It passed, exit 0, silent.
+  It passed for a reason unrelated to whether the content survived. The classifier tests
+  `nl in head` as a SUBSTRING over the whole pushed union, and `CARD: AF-106` contains
+  `CARD: AF-10`. Reproduced out-of-tree with commit-tree so no worktree was touched, with
+  the control in both directions:
+    drop `CARD: AF-10`  while `CARD: AF-106` survives  -> exit 0, no output, no WARN
+    drop `CARD: AF-242` while neither covers it        -> exit 1, refused
+  So the guard CAN fail, and does, on the shape it was built for. It cannot fail for a line
+  that some longer or identical line covers, and it says nothing when that rescue happens.
+  MEASURED, and the measurement is the part I nearly got wrong. At HEAD, 122 of the ledger's
+  2470 distinct non-blank lines (4%) would be invisible if deleted: 118 because an identical
+  line exists elsewhere in the union, 4 because a longer line contains them. The masked set
+  is field lines, which are duplicated by construction (DATE 19, CARD 15, AREA 14, SESSION
+  10, SEVERITY 3, STATUS 2, plus 46 prose lines repeated across entries).
+  MY FIRST NUMBER WAS 34%, and it was wrong in the alarming direction. I ran it against
+  origin/main, which still held the 29 resurrected duplicates I was in the middle of
+  deleting, so every duplicated entry counted its own lines as covering each other. The
+  measurement of the bug was contaminated by the bug. mixpeek-general made the identical
+  error the same afternoon on the same subsystem (a DATE|AREA key that collided, giving 11
+  false resurrections in their ledger, caught by a repeated key in their own output). Two
+  independent instances in one day of a count inflated by an artifact of the thing being
+  counted, both landing on "there is a problem here" rather than away from it.
+COST: about a minute of believing exit 0 was evidence my dropped line was fine. It was not
+  evidence either way; what actually justified that deletion was the line-by-line comparison
+  against the archive I had already run by hand. Small today because I happened to have the
+  better proof already. The standing cost is that this file's own guard gives a session no
+  signal at all for the class of edit this file gets most often after prose: a field
+  correction. A `STATUS:` flip or a `CARD:` repoint reverted by a stale copy passes clean.
+FIX: not the substring test, which earns its keep — the guard's own comments record that a
+  strict test refused 5 of 6 real deletion commits and that a guard firing daily teaches
+  setting the escape blind. That reasoning holds.
+  The gap is that the rescue is INVISIBLE. The guard already distinguishes LOST (refuse)
+  from EDITED (warn, allow); a line rescued only because something else happens to contain
+  it is a third class and currently reads as the healthy one. Count them and print the
+  count: "N line(s) matched only as a substring of other content — not verified as
+  surviving in their own right." That is a WARN the author can act on, it costs one counter
+  in a classifier that is already walking every candidate line, and it turns exit 0 from a
+  claim about the file into a claim with a stated scope.
+  The guard's header already names the adjacent residual out loud ("a republish stale by so
+  little that it reverts only entry BODIES passes with warnings"). This is its neighbour:
+  a republish that reverts only a DUPLICATED FIELD LINE passes with NO warning, which is
+  the one case the author's own mitigation (the WARN log line keeps it visible) does not
+  cover.
