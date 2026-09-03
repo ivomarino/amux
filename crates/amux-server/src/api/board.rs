@@ -587,7 +587,20 @@ async fn bulk_migrate(
     let result = state
         .store
         .write_async(move |conn| {
-            let ids: Vec<String> = {
+            // AN EXPLICIT SELECTION WINS (AMUX-4058). The UI sends the ids it
+            // actually rendered, so a filtered column migrates what the human
+            // saw. Without this the server took a whole column and a filtered
+            // view would have moved ~500 cards while showing twelve.
+            //
+            // Still re-checked against status and lane below by `advance`'s
+            // `expected_from`, so a stale id from a view rendered minutes ago
+            // refuses rather than moving a card that has since left the column.
+            let explicit: Vec<String> = body
+                .get("ids")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            let ids: Vec<String> = if !explicit.is_empty() { explicit } else {
                 let (sql, params): (String, Vec<String>) = match &lane3 {
                     Some(l) => (
                         "SELECT id FROM issues WHERE status=?1 AND session=?2 \

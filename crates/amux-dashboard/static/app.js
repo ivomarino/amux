@@ -6395,7 +6395,473 @@ function _grpGoto(g, where) {
 // worse than no field — it is an instruction you can follow exactly that does
 // nothing (AMUX-2140), and the read half already publishes `supported`, so
 // there is no excuse for the client to guess.
-function _scopeEditorHTML(lvl, name, cap) {
+// ── Scope tile editors (AMUX-4076) ────────────────────────────────────────
+// Ethan, on the worker Scope tab: "test all of these make sure they're all
+// configurable." Two of the seven tiles (memory, rules) had a textarea. The
+// other five rendered "Edited where it lives (<kind>). Writable via PUT
+// /api/scope" — a true sentence that is not a control, so the capability
+// existed and reached nobody who was not going to write curl (ethos rule 1).
+//
+// The API was never the gap: a read→write→verify→restore probe of all seven at
+// worker level came back 7/7 clean, with negative controls (unknown capability,
+// invalid mode, non-object skin, writing a peer's layer) all refusing. So each
+// kind now edits in the shape `scope.rs` already validates, rather than one
+// JSON box for everything: env is KEY=VALUE with null-deletes, gates is a list
+// per status, status availability is a per-status opt-in, connectors is
+// tri-state per connector, and a skin is terms/colours/tabs with a raw escape
+// hatch for the parts that are free-form by design.
+
+/// Where a scope panel re-renders after a write. Mirrors `_scopeRowToggle`.
+///
+/// The two save paths used to compute this as `name ? 'grp-scope-body-'+name :
+/// undefined`, which for a WORKER named the GROUP panel's element id. That
+/// element does not exist in the peek, `_scopeLoad` returns early on a missing
+/// target, and the tile kept showing its pre-save value underneath a green
+/// "Saved". The write had landed; only the panel disagreed, which is the shape
+/// of bug that gets reported as "it doesn't save".
+function _scopeTargetId(lvl, name) {
+  return (lvl === 'group') ? ('grp-scope-body-' + name) : 'peek-scope-body';
+}
+
+// Statuses and connectors are fetched once and cached: the gates / status
+// availability / connectors editors all need a catalogue the peek does not
+// otherwise load. `boardStatuses` exists as a SPA global but ships as a
+// 7-entry default with no `mode` field until the board view has been opened,
+// and `mode` is exactly what the availability editor has to read.
+let _scopeStatusCache = null, _scopeConnCache = null;
+
+async function _scopeStatusList() {
+  if (_scopeStatusCache) return _scopeStatusCache;
+  try {
+    const r = await fetch(API + '/api/board/statuses', { headers: _authHeaders() });
+    const d = await r.json();
+    if (Array.isArray(d) && d.length) _scopeStatusCache = d;
+  } catch (e) { /* fall back to the SPA default below */ }
+  return _scopeStatusCache
+    || (typeof boardStatuses !== 'undefined' ? boardStatuses : []);
+}
+
+async function _scopeConnectorList() {
+  if (_scopeConnCache) return _scopeConnCache;
+  try {
+    const r = await fetch(API + '/api/connectors', { headers: _authHeaders() });
+    const d = await r.json();
+    if (d && Array.isArray(d.connectors)) _scopeConnCache = d.connectors;
+  } catch (e) { /* an empty catalogue still renders stored entries */ }
+  return _scopeConnCache || [];
+}
+
+/// One PUT for every editor. `value` is already in the capability's own shape.
+async function _scopeSaveValue(lvl, name, key, value, msgId) {
+  const msg = document.getElementById(msgId);
+  if (msg) { msg.textContent = 'Saving…'; msg.style.color = 'var(--dim)'; }
+  try {
+    const r = await fetch(API + '/api/scope', {
+      method: 'PUT',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, _authHeaders()),
+      body: JSON.stringify({ level: lvl, name: name, capability: key, value: value }),
+    });
+    const d = await r.json();
+    if (!r.ok || d.error) {
+      // The server's REASON verbatim. A 403 here is a real policy answer ("a
+      // session may not write the group layer"), not a glitch.
+      if (msg) { msg.textContent = d.error || ('save failed (' + r.status + ')'); msg.style.color = '#f85149'; }
+      return false;
+    }
+    if (msg) { msg.textContent = 'Saved'; msg.style.color = 'var(--green)'; }
+    // Re-read, so the tile's supplying-layer badge reflects the write rather
+    // than the request having returned 200 (ethos rule 4).
+    _scopeLoad(lvl === 'global' ? { level: 'global' } : { level: lvl, name: name },
+               _scopeTargetId(lvl, name));
+    return true;
+  } catch (e) {
+    if (msg) { msg.textContent = 'save failed: ' + e.message; msg.style.color = '#f85149'; }
+    return false;
+  }
+}
+
+function _scopeEdFoot(id, lvl, name, key, kind, note) {
+  return '<div class="scope-ed-foot">'
+    + '<button class="btn primary scope-ed-btn" onclick="event.stopPropagation();'
+    + '_scopeEdSave(\'' + escJs(lvl) + '\',\'' + escJs(name || '') + '\',\'' + escJs(key)
+    + '\',\'' + escJs(kind) + '\',\'' + escJs(id) + '\')">Save</button>'
+    + '<span class="scope-ed-msg" id="' + id + '-msg">' + esc(note || '') + '</span>'
+    + '</div>';
+}
+
+// ── env (kind: keys) ──────────────────────────────────────────────────────
+// The read deliberately returns key NAMES and no values: the file is 0600 and
+// carries credentials, so there is no payload to prefill from. The editor says
+// that rather than rendering empty boxes that look like empty values — saving
+// those back would blank every key on the layer.
+function _scopeEdEnv(id, lvl, name, cap) {
+  const keys = ((cap.value || {}).keys) || [];
+  const path = (cap.value || {}).path || '';
+  let h = '<div class="scope-ed" id="' + id + '">'
+    + '<div class="scope-ed-hint">Values are never read back (this file is 0600 and '
+    + 'carries credentials). Leave a value blank to keep it as it is; tick Remove to '
+    + 'delete the key.' + (path ? '<br><code style="font-size:0.62rem;">' + esc(path) + '</code>' : '')
+    + '</div><div class="scope-ed-grid">';
+  keys.forEach(k => {
+    h += '<div class="scope-ed-row" data-envk="' + esc(k) + '">'
+      + '<code class="scope-ed-key">' + esc(k) + '</code>'
+      + '<input class="scope-ed-in" type="text" data-role="val" placeholder="set — type to replace"'
+      + ' oninput="event.stopPropagation();">'
+      + '<label class="scope-ed-chk"><input type="checkbox" data-role="rm"'
+      + ' onclick="event.stopPropagation();">Remove</label>'
+      + '</div>';
+  });
+  if (!keys.length) {
+    h += '<div class="scope-ed-hint">Nothing set at this level.</div>';
+  }
+  h += '</div><div class="scope-ed-grid" id="' + id + '-new">'
+    + _scopeEdEnvNewRow()
+    + '</div>'
+    + '<div><button class="btn scope-ed-btn" onclick="event.stopPropagation();'
+    + '_scopeEdAddEnvRow(\'' + escJs(id) + '\')">+ Add another key</button></div>'
+    + _scopeEdFoot(id, lvl, name, 'env', 'keys',
+        keys.length + ' key' + (keys.length === 1 ? '' : 's') + ' at this level');
+  return h + '</div>';
+}
+
+function _scopeEdEnvNewRow() {
+  return '<div class="scope-ed-row" data-envnew="1">'
+    + '<input class="scope-ed-in" type="text" data-role="newk" placeholder="NEW_KEY"'
+    + ' oninput="event.stopPropagation();">'
+    + '<input class="scope-ed-in" type="text" data-role="newv" placeholder="value"'
+    + ' oninput="event.stopPropagation();">'
+    + '</div>';
+}
+
+function _scopeEdAddEnvRow(id) {
+  const box = document.getElementById(id + '-new');
+  if (box) box.insertAdjacentHTML('beforeend', _scopeEdEnvNewRow());
+}
+
+function _scopeCollectEnv(id) {
+  const root = document.getElementById(id);
+  const out = {};
+  if (!root) return out;
+  root.querySelectorAll('[data-envk]').forEach(r => {
+    const k = r.getAttribute('data-envk');
+    const rm = r.querySelector('[data-role="rm"]');
+    if (rm && rm.checked) { out[k] = null; return; }   // null DELETES the key
+    const v = r.querySelector('[data-role="val"]');
+    if (v && v.value !== '') out[k] = v.value;
+  });
+  root.querySelectorAll('[data-envnew]').forEach(r => {
+    const k = (r.querySelector('[data-role="newk"]') || {}).value || '';
+    const v = (r.querySelector('[data-role="newv"]') || {}).value || '';
+    if (k.trim()) out[k.trim()] = v;
+  });
+  return out;   // merge-by-key, exactly what write_env consumes
+}
+
+// ── gates (kind: list-per-status) ─────────────────────────────────────────
+function _scopeEdGates(id, lvl, name, cap, statuses) {
+  const cur = cap.value || {};
+  let h = '<div class="scope-ed" id="' + id + '">'
+    + '<div class="scope-ed-hint">One criterion per line. Emptying a box clears that '
+    + "status's gate at this level. Gates resolve per card, so a card also inherits "
+    + 'whatever the global and group layers set.</div>';
+  (statuses || []).forEach(st => {
+    const lines = Array.isArray(cur[st.id]) ? cur[st.id].join('\n') : '';
+    h += '<div class="scope-ed-blk" data-gst="' + esc(st.id) + '">'
+      + '<div class="scope-ed-lbl">' + esc(st.label || st.id)
+      + (lines ? '' : ' <span class="scope-ed-note">no gate here</span>') + '</div>'
+      + '<textarea class="scope-ed-ta" data-role="gate" oninput="event.stopPropagation();"'
+      + ' placeholder="One criterion per line">' + esc(lines) + '</textarea>'
+      + '</div>';
+  });
+  if (!(statuses || []).length) h += '<div class="scope-ed-hint">No board statuses loaded.</div>';
+  return h + _scopeEdFoot(id, lvl, name, 'gates', 'list-per-status',
+    Object.keys(cur).length + ' gated status' + (Object.keys(cur).length === 1 ? '' : 'es')
+    + ' at this level') + '</div>';
+}
+
+function _scopeCollectGates(id) {
+  const root = document.getElementById(id);
+  const out = {};
+  if (!root) return out;
+  root.querySelectorAll('[data-gst]').forEach(b => {
+    const ta = b.querySelector('[data-role="gate"]');
+    // Every status is sent, including the empty ones: write_gates upserts a
+    // non-empty list and DELETES an empty one, so omitting a status a user just
+    // cleared would leave the old gate in place while the box shows it gone.
+    out[b.getAttribute('data-gst')] =
+      (ta ? ta.value : '').split('\n').map(x => x.trim()).filter(Boolean);
+  });
+  return out;
+}
+
+// ── status availability (kind: mode) ──────────────────────────────────────
+// Two genuinely different shapes behind one capability, so two editors. Global
+// decides whether a status is `implicit` (everyone may use it) or `explicit`
+// (only scopes opted in). Group and worker hold the OPT-IN list, which is
+// meaningless for an implicit status — so those rows say so instead of
+// offering a checkbox that would change nothing.
+function _scopeEdMode(id, lvl, name, cap, statuses) {
+  const sts = statuses || [];
+  let h = '<div class="scope-ed" id="' + id + '">';
+  if (lvl === 'global') {
+    const cur = cap.value || {};
+    h += '<div class="scope-ed-hint"><b>implicit</b> — any worker may move a card here. '
+      + '<b>explicit</b> — only workers or groups opted in below can.</div>';
+    sts.forEach(st => {
+      const m = cur[st.id] || st.mode || 'implicit';
+      h += '<div class="scope-ed-row" data-mst="' + esc(st.id) + '">'
+        + '<span class="scope-ed-key">' + esc(st.label || st.id) + '</span>'
+        + '<select class="scope-ed-sel" data-role="mode" onclick="event.stopPropagation();">'
+        + '<option value="implicit"' + (m === 'implicit' ? ' selected' : '') + '>implicit</option>'
+        + '<option value="explicit"' + (m === 'explicit' ? ' selected' : '') + '>explicit</option>'
+        + '</select></div>';
+    });
+  } else {
+    const on = new Set(Array.isArray(cap.value) ? cap.value : []);
+    const explicit = sts.filter(st => (st.mode || 'implicit') === 'explicit');
+    h += '<div class="scope-ed-hint">Which <b>explicit</b> statuses this '
+      + esc(lvl) + ' may use. Implicit statuses are open to everyone and are not '
+      + 'listed here; make one explicit at the global level first.</div>';
+    explicit.forEach(st => {
+      h += '<label class="scope-ed-chk" data-mst="' + esc(st.id) + '">'
+        + '<input type="checkbox" data-role="opt"' + (on.has(st.id) ? ' checked' : '')
+        + ' onclick="event.stopPropagation();">' + esc(st.label || st.id) + '</label>';
+    });
+    if (!explicit.length) {
+      h += '<div class="scope-ed-hint">No status is explicit right now, so there is '
+        + 'nothing to opt into. Every status is already available here.</div>';
+    }
+    // An opted-in status that is no longer explicit still has a row in the DB
+    // and still shows on the tile, so it has to be un-tickable from here.
+    const orphan = [...on].filter(x => !explicit.some(st => st.id === x));
+    orphan.forEach(x => {
+      h += '<label class="scope-ed-chk" data-mst="' + esc(x) + '">'
+        + '<input type="checkbox" data-role="opt" checked onclick="event.stopPropagation();">'
+        + esc(x) + ' <span class="scope-ed-note">(no longer explicit — untick to clear)</span></label>';
+    });
+  }
+  return h + _scopeEdFoot(id, lvl, name, 'status_mode', 'mode', '') + '</div>';
+}
+
+function _scopeCollectMode(id, lvl) {
+  const root = document.getElementById(id);
+  if (!root) return lvl === 'global' ? {} : [];
+  if (lvl === 'global') {
+    const out = {};
+    root.querySelectorAll('[data-mst]').forEach(r => {
+      const sel = r.querySelector('[data-role="mode"]');
+      if (sel) out[r.getAttribute('data-mst')] = sel.value;
+    });
+    return out;
+  }
+  const out = [];
+  root.querySelectorAll('[data-mst]').forEach(r => {
+    const c = r.querySelector('[data-role="opt"]');
+    if (c && c.checked) out.push(r.getAttribute('data-mst'));
+  });
+  return out;
+}
+
+// ── connectors (kind: json) ───────────────────────────────────────────────
+// Tri-state, not a checkbox. The layers merge by key, so an ABSENT connector
+// inherits from the group and global layers while `{enabled:false}` overrides
+// them to off. A two-state toggle cannot express the difference, and the
+// difference is the whole reason this is a scope capability.
+function _scopeEdConnectors(id, lvl, name, cap, catalog) {
+  const cur = ((cap.value || {}).connectors) || {};
+  const known = (catalog || []).map(c => c.id);
+  const ids = known.concat(Object.keys(cur).filter(k => known.indexOf(k) < 0));
+  let h = '<div class="scope-ed" id="' + id + '">'
+    + '<div class="scope-ed-hint"><b>Inherit</b> leaves this connector to the group and '
+    + 'global layers. <b>On</b> / <b>Off</b> override them here.</div>';
+  ids.forEach(cid => {
+    const c = (catalog || []).find(x => x.id === cid) || {};
+    const e = cur[cid];
+    const state = (e === undefined || e === null) ? '' : (e.enabled ? 'on' : 'off');
+    h += '<div class="scope-ed-row" data-conn="' + esc(cid) + '"'
+      + ' data-orig="' + esc(JSON.stringify(e === undefined ? null : e)) + '">'
+      + '<span class="scope-ed-key">' + esc(c.label || cid)
+      + (c.category ? ' <span class="scope-ed-note">' + esc(c.category) + '</span>' : '')
+      + '</span>'
+      + '<select class="scope-ed-sel" data-role="state" onclick="event.stopPropagation();">'
+      + '<option value=""' + (state === '' ? ' selected' : '') + '>Inherit</option>'
+      + '<option value="on"' + (state === 'on' ? ' selected' : '') + '>On</option>'
+      + '<option value="off"' + (state === 'off' ? ' selected' : '') + '>Off</option>'
+      + '</select>'
+      + '<input class="scope-ed-in" type="text" data-role="account" placeholder="account (optional)"'
+      + ' value="' + esc((e && e.account) || '') + '" oninput="event.stopPropagation();">'
+      + '</div>';
+  });
+  if (!ids.length) h += '<div class="scope-ed-hint">No connectors in the catalogue.</div>';
+  return h + _scopeEdFoot(id, lvl, name, 'connectors', 'json',
+    Object.keys(cur).length + ' override' + (Object.keys(cur).length === 1 ? '' : 's')
+    + ' at this level') + '</div>';
+}
+
+function _scopeCollectConnectors(id) {
+  const root = document.getElementById(id);
+  const out = {};
+  if (!root) return out;
+  root.querySelectorAll('[data-conn]').forEach(r => {
+    const cid = r.getAttribute('data-conn');
+    const st = (r.querySelector('[data-role="state"]') || {}).value || '';
+    if (st === '') return;   // Inherit: no key at all on this layer
+    // Carry forward fields this editor does not show (`mcp` and anything a
+    // later version adds) rather than dropping them on every save.
+    let base = {};
+    try { base = JSON.parse(r.getAttribute('data-orig') || 'null') || {}; } catch (e) { base = {}; }
+    const acct = ((r.querySelector('[data-role="account"]') || {}).value || '').trim();
+    const ent = Object.assign({}, base, { enabled: st === 'on' });
+    if (acct) ent.account = acct; else delete ent.account;
+    out[cid] = ent;
+  });
+  return out;
+}
+
+// ── skin (kind: json) ─────────────────────────────────────────────────────
+// `terms`, `colors` and `tabs` get real controls because they are what a skin
+// is for; everything else stays a JSON box because the merge is deliberately
+// arbitrary-depth (`ui.peek.font` is a documented example) and pretending
+// otherwise would make the editor the ceiling on what a skin can say.
+const _SCOPE_SKIN_SECTIONS = ['terms', 'colors', 'tabs'];
+
+function _scopeEdSkin(id, lvl, name, cap) {
+  const sk = ((cap.value || {}).skin) || {};
+  const terms = (sk.terms && typeof sk.terms === 'object') ? sk.terms : {};
+  const colors = (sk.colors && typeof sk.colors === 'object') ? sk.colors : {};
+  const tabs = Array.isArray(sk.tabs) ? sk.tabs : null;
+  const rest = {};
+  Object.keys(sk).forEach(k => { if (_SCOPE_SKIN_SECTIONS.indexOf(k) < 0) rest[k] = sk[k]; });
+  const allTabs = (typeof ALL_TABS !== 'undefined' ? ALL_TABS : []);
+
+  let h = '<div class="scope-ed" id="' + id + '">'
+    + '<div class="scope-ed-hint">A skin renames things, recolours them, and narrows which '
+    + 'tabs are visible. Layers merge per key, so setting one noun here keeps the rest.</div>';
+
+  h += '<div class="scope-ed-sec">Terms</div><div class="scope-ed-grid" id="' + id + '-terms">';
+  Object.keys(terms).forEach(k => { h += _scopeEdKvRow('term', k, terms[k], 'noun', 'label'); });
+  h += _scopeEdKvRow('term', '', '', 'noun', 'label');
+  h += '</div><div><button class="btn scope-ed-btn" onclick="event.stopPropagation();'
+    + '_scopeEdAddKv(\'' + escJs(id) + '-terms\',\'term\',\'noun\',\'label\')">+ Add term</button></div>';
+
+  h += '<div class="scope-ed-sec">Colours</div><div class="scope-ed-grid" id="' + id + '-colors">';
+  Object.keys(colors).forEach(k => { h += _scopeEdKvRow('color', k, colors[k], 'name', '#58a6ff'); });
+  h += _scopeEdKvRow('color', '', '', 'name', '#58a6ff');
+  h += '</div><div><button class="btn scope-ed-btn" onclick="event.stopPropagation();'
+    + '_scopeEdAddKv(\'' + escJs(id) + '-colors\',\'color\',\'name\',\'#58a6ff\')">+ Add colour</button></div>';
+
+  h += '<div class="scope-ed-sec">Tabs</div>'
+    + '<label class="scope-ed-chk"><input type="checkbox" id="' + id + '-tabson"'
+    + (tabs ? ' checked' : '') + ' onclick="event.stopPropagation();">'
+    + 'Restrict which tabs are visible</label>'
+    + '<div class="scope-ed-hint">Unticked, this layer says nothing about tabs and inherits. '
+    + 'Ticked, only the ticked tabs are shown.</div><div class="scope-ed-grid" id="' + id + '-tabs">';
+  allTabs.forEach(t => {
+    const on = tabs ? tabs.indexOf(t.id) >= 0 : true;
+    h += '<label class="scope-ed-chk" data-tab="' + esc(t.id) + '">'
+      + '<input type="checkbox" data-role="tab"' + (on ? ' checked' : '')
+      + ' onclick="event.stopPropagation();">' + esc(t.label || t.id) + '</label>';
+  });
+  if (!allTabs.length) h += '<div class="scope-ed-hint">No tabs discovered.</div>';
+  h += '</div>';
+
+  h += '<div class="scope-ed-sec">Anything else (JSON)</div>'
+    + '<textarea class="scope-ed-ta" id="' + id + '-rest" oninput="event.stopPropagation();"'
+    + ' placeholder=\'{"ui": {"peek": {"font": "mono"}}}\'>'
+    + esc(Object.keys(rest).length ? JSON.stringify(rest, null, 2) : '') + '</textarea>';
+
+  return h + _scopeEdFoot(id, lvl, name, 'skin', 'json',
+    Object.keys(sk).length ? 'set at this level' : 'unset at this level') + '</div>';
+}
+
+function _scopeEdKvRow(kind, k, v, kph, vph) {
+  const sw = (kind === 'color')
+    ? '<span class="scope-ed-sw" data-role="sw" style="background:' + esc(v || 'transparent') + ';"></span>'
+    : '';
+  return '<div class="scope-ed-row" data-kv="' + esc(kind) + '">'
+    + '<input class="scope-ed-in" type="text" data-role="k" placeholder="' + esc(kph) + '"'
+    + ' value="' + esc(k) + '" oninput="event.stopPropagation();">'
+    + '<input class="scope-ed-in" type="text" data-role="v" placeholder="' + esc(vph) + '"'
+    + ' value="' + esc(v == null ? '' : v) + '"'
+    + ' oninput="event.stopPropagation();' + (kind === 'color'
+        ? 'var s=this.parentNode.querySelector(\'[data-role=&quot;sw&quot;]\');if(s)s.style.background=this.value;' : '') + '">'
+    + sw + '</div>';
+}
+
+function _scopeEdAddKv(boxId, kind, kph, vph) {
+  const box = document.getElementById(boxId);
+  if (box) box.insertAdjacentHTML('beforeend', _scopeEdKvRow(kind, '', '', kph, vph));
+}
+
+function _scopeCollectSkin(id) {
+  const root = document.getElementById(id);
+  if (!root) return {};
+  const grab = (boxId) => {
+    const out = {}, box = document.getElementById(boxId);
+    if (!box) return out;
+    box.querySelectorAll('[data-kv]').forEach(r => {
+      const k = ((r.querySelector('[data-role="k"]') || {}).value || '').trim();
+      const v = ((r.querySelector('[data-role="v"]') || {}).value || '').trim();
+      if (k && v) out[k] = v;
+    });
+    return out;
+  };
+  const restEl = document.getElementById(id + '-rest');
+  let out = {};
+  if (restEl && restEl.value.trim()) {
+    try {
+      const parsed = JSON.parse(restEl.value);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        _scopeEdErr(id, 'The JSON box must hold an object, not an array or a bare value.');
+        return undefined;
+      }
+      out = parsed;
+    } catch (e) {
+      _scopeEdErr(id, 'Not valid JSON: ' + e.message);
+      return undefined;   // undefined aborts the save; {} would CLEAR the layer
+    }
+  }
+  const terms = grab(id + '-terms'), colors = grab(id + '-colors');
+  if (Object.keys(terms).length) out.terms = terms;
+  if (Object.keys(colors).length) out.colors = colors;
+  const on = document.getElementById(id + '-tabson');
+  if (on && on.checked) {
+    const tabs = [];
+    const box = document.getElementById(id + '-tabs');
+    if (box) box.querySelectorAll('[data-tab]').forEach(r => {
+      const c = r.querySelector('[data-role="tab"]');
+      if (c && c.checked) tabs.push(r.getAttribute('data-tab'));
+    });
+    out.tabs = tabs;
+  }
+  return out;
+}
+
+function _scopeEdErr(id, text) {
+  const msg = document.getElementById(id + '-msg');
+  if (msg) { msg.textContent = text; msg.style.color = '#f85149'; }
+}
+
+/// The one save entry point. Each collector returns the capability's own shape,
+/// or `undefined` to abort after reporting its own error — which is NOT the
+/// same as `{}`, since an empty object legitimately CLEARS a layer.
+async function _scopeEdSave(lvl, name, key, kind, id) {
+  let value;
+  if (kind === 'keys') value = _scopeCollectEnv(id);
+  else if (kind === 'list-per-status') value = _scopeCollectGates(id);
+  else if (kind === 'mode') value = _scopeCollectMode(id, lvl);
+  else if (key === 'connectors') value = _scopeCollectConnectors(id);
+  else if (key === 'skin') value = _scopeCollectSkin(id);
+  else {
+    const ta = document.getElementById(id + '-rest') || document.getElementById(id);
+    try { value = JSON.parse((ta && ta.value) || '{}'); }
+    catch (e) { _scopeEdErr(id, 'Not valid JSON: ' + e.message); return; }
+  }
+  if (value === undefined) return;
+  await _scopeSaveValue(lvl, name, key, value, id + '-msg');
+}
+
+function _scopeEditorHTML(lvl, name, cap, statuses, connectors) {
   const id = 'scope-ed-' + lvl + '-' + (name || 'global') + '-' + cap.key;
   if (!cap.supported) {
     return '<div style="margin-top:6px;font-size:0.68rem;color:#d29922;">'
@@ -6427,10 +6893,23 @@ function _scopeEditorHTML(lvl, name, cap) {
       + (v.bytes ? v.bytes + ' bytes at this level' : 'unset at this level') + '</span>'
       + '</div></div>';
   }
-  return '<div style="margin-top:6px;font-size:0.66rem;color:var(--dim);">'
-    + 'Edited where it lives (' + esc(cap.kind) + '). Writable via '
-    + '<code>PUT /api/scope</code> with capability <code>' + esc(cap.key) + '</code>.'
-    + '</div>';
+  // Every remaining kind now has a control. The branch this replaced printed
+  // "Edited where it lives (<kind>). Writable via PUT /api/scope" for env,
+  // gates, status availability, skin and connectors — five of the seven tiles.
+  if (cap.kind === 'keys') return _scopeEdEnv(id, lvl, name, cap);
+  if (cap.kind === 'list-per-status') return _scopeEdGates(id, lvl, name, cap, statuses);
+  if (cap.kind === 'mode') return _scopeEdMode(id, lvl, name, cap, statuses);
+  if (cap.key === 'connectors') return _scopeEdConnectors(id, lvl, name, cap, connectors);
+  if (cap.key === 'skin') return _scopeEdSkin(id, lvl, name, cap);
+  // A capability added later with no editor here still says something true and
+  // actionable, rather than rendering a blank panel.
+  return '<div class="scope-ed" id="' + id + '">'
+    + '<div class="scope-ed-hint">No typed editor for <code>' + esc(cap.kind) + '</code> yet. '
+    + 'Edit it as JSON, or use <code>PUT /api/scope</code> with capability '
+    + '<code>' + esc(cap.key) + '</code>.</div>'
+    + '<textarea class="scope-ed-ta" id="' + id + '-rest" oninput="event.stopPropagation();">'
+    + esc(cap.value == null ? '' : JSON.stringify(cap.value, null, 2)) + '</textarea>'
+    + _scopeEdFoot(id, lvl, name, cap.key, cap.kind, '') + '</div>';
 }
 
 // ── Scope editor (AMUX-2436) ──────────────────────────────────────────────
@@ -6564,7 +7043,7 @@ async function _scopeEditSave() {
     msg.textContent = 'Saved'; msg.style.color = 'var(--green)';
     showToast(key + ' saved at ' + (lvl === 'global' ? 'global' : lvl + ' ' + name));
     _scopeLoad(lvl === 'global' ? { level: 'global' } : { level: lvl, name: name },
-               name ? 'grp-scope-body-' + name : undefined);
+               _scopeTargetId(lvl, name));
   } catch (e) {
     msg.textContent = 'Save failed: ' + e.message; msg.style.color = '#f85149';
   }
@@ -6593,7 +7072,7 @@ async function _scopeSave(lvl, name, key, elId) {
     // Re-read so the tile's supplying-layer badge reflects the write, which is
     // the card's acceptance criterion — not just "the POST returned 200".
     _scopeLoad(lvl === 'global' ? { level: 'global' } : { level: lvl, name: name },
-               name ? 'grp-scope-body-' + name : undefined);
+               _scopeTargetId(lvl, name));
   } catch (e) {
     if (msg) { msg.textContent = 'save failed: ' + e.message; msg.style.color = '#f85149'; }
   }
@@ -6713,6 +7192,17 @@ async function _scopeLoad(scope, targetId) {
     // open in _scopeRowOpen from before the trim would otherwise render a detail
     // panel for a tile that no longer exists above it.
     const _selCap = _visCaps.find(c => _scopeRowOpen[lvl + ':' + w + ':' + c.key]);
+    // Only the OPEN tile's editor renders, so only its catalogue is fetched —
+    // and only when this level can actually edit it (group/global route to the
+    // modal instead, which loads its own). Both are cached after the first hit.
+    let _edStatuses = null, _edConnectors = null;
+    if (_selCap && _selCap.supported && lvl === 'worker') {
+      if (_selCap.kind === 'list-per-status' || _selCap.kind === 'mode') {
+        _edStatuses = await _scopeStatusList();
+      } else if (_selCap.key === 'connectors') {
+        _edConnectors = await _scopeConnectorList();
+      }
+    }
     if (_selCap) {
       const _l = _selCap;
       h += '<div class="scope-detail">'
@@ -6732,7 +7222,7 @@ async function _scopeLoad(scope, targetId) {
               + 'onclick="event.stopPropagation();_scopeEditOpen(\'' + escJs(lvl) + '\',\''
               + escJs(w || '') + '\',\'' + escJs(_l.key) + '\')">Edit ' + esc(_l.label)
               + ' at this level</button></div>'
-            : _scopeEditorHTML(lvl, w, _l))
+            : _scopeEditorHTML(lvl, w, _l, _edStatuses, _edConnectors))
         + '</div>';
     }
     h += '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:6px;">'
@@ -8480,7 +8970,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.782';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.784';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -24899,9 +25389,30 @@ function _colMenu(e, st, lane) {
   m.style.top = Math.max(6, Math.min(e.clientY, window.innerHeight - r.height - 6)) + 'px';
   return false;
 }
-// The SAME canon `deleteBoardStatus` counts with, so the number in the dialog
-// matches the number on the column header you just clicked.
+// WHAT YOU SEE IS WHAT MOVES (AMUX-4058). Ethan: "when I do a filter, it still
+// has the 500 or something number".
+//
+// This counted `boardItems` and applied only status + lane, so with a filter
+// active the menu offered to migrate ~500 cards while the column in front of
+// you showed twelve. Worse than a wrong number: the migrate would have MOVED
+// all 500, because the server takes a column and not a selection.
+//
+// Reading the ids straight out of the rendered column removes the whole class.
+// The DOM is the filtered set by construction — whatever `renderBoard` decided
+// to show, after search, facets, owner filter and saved views, is exactly what
+// this returns. A second reimplementation of the filter predicate here would be
+// one more thing to keep in step, and the failure mode of drift is silently
+// moving cards the user could not see.
+function _colVisibleIds(st) {
+  const col = document.querySelector('.board-col[data-col="' + (window.CSS && CSS.escape ? CSS.escape(st) : st) + '"]');
+  if (!col) return [];
+  return [...col.querySelectorAll('.board-card[data-id]')].map(e => e.getAttribute('data-id'));
+}
 function _colCardCount(st, lane) {
+  const vis = _colVisibleIds(st);
+  if (vis.length) return vis.length;
+  // No rendered column (a collapsed or off-screen board): fall back to the
+  // model, and say so at the call site rather than pretending to be filtered.
   return (typeof boardItems !== 'undefined' ? boardItems : [])
     .filter(i => !i.archived && !i.deleted && _statusCanon(i.status) === st
                  && (!lane || i.session === lane)).length;
@@ -24909,7 +25420,8 @@ function _colCardCount(st, lane) {
 async function _colMigrateAll(from, to, lane) {
   _colMenuClose();
   lane = lane || '';
-  const n = _colCardCount(from, lane);
+  const ids = _colVisibleIds(from);
+  const n = ids.length || _colCardCount(from, lane);
   const fl = (boardStatuses.find(x => x.id === from) || {}).label || from;
   const tl = (boardStatuses.find(x => x.id === to) || {}).label || to;
   if (!n) { showToast('"' + fl + '" has no cards to migrate'); return; }
@@ -24923,8 +25435,14 @@ async function _colMigrateAll(from, to, lane) {
     const r = await fetch(API + '/api/board/bulk-migrate', {
       method: 'POST',
       headers: Object.assign({ 'Content-Type': 'application/json' }, _authHeaders()),
-      body: JSON.stringify(lane ? { from: from, to: to, session: lane }
-                                 : { from: from, to: to }),
+      // Send the VISIBLE ids when the column is rendered, so a filtered view
+      // migrates exactly what it shows. Falling back to the whole column only
+      // when there is no rendered column to read.
+      body: JSON.stringify(Object.assign(
+        { from: from, to: to },
+        lane ? { session: lane } : {},
+        ids.length ? { ids: ids } : {}
+      )),
     });
     const d = await r.json();
     if (!r.ok) { showToast('Migrate refused: ' + (d.error || ('HTTP ' + r.status))); return; }

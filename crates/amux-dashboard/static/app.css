@@ -180,7 +180,16 @@
   .card-menu {
     display: none; position: fixed;
     background: var(--card); border: 1px solid var(--border);
-    border-radius: 10px; min-width: 200px; z-index: 50;
+    /* ABOVE THE PEEK OVERLAY (AMUX-4058). At z-index 50 this menu opened
+       BEHIND .peek-overlay (z-index 100), so on a worker's board page the
+       ellipsis appeared to do nothing: the menu was built, populated and
+       positioned correctly, and painted underneath. It worked on the global
+       board, which is not inside an overlay, which is exactly why it passed
+       review there. Measured: elementFromPoint at the menu's own corner
+       returned the tab bar, not the menu.
+       310 clears the overlay (100) and the modal backdrop (300), and stays
+       under the toast/picker layers (2000+) which must cover it. */
+    border-radius: 10px; min-width: 200px; z-index: 310;
     box-shadow: 0 8px 24px rgba(0,0,0,0.4);
     overflow-x: hidden; overflow-y: auto; max-height: 500px;
   }
@@ -3812,6 +3821,52 @@
     .scope-tile { min-width:118px; padding:9px 10px; }
     .scope-tile-label { font-size:0.8rem; }
     .scope-tile-src, .scope-tile-val { font-size:0.72rem; }
+  }
+  /* Scope tile EDITORS (AMUX-4076). Two of the seven capabilities had a
+     textarea and the other five printed "Writable via PUT /api/scope", which
+     is a true sentence and not a control. Each kind now edits in the shape the
+     server already validates, so these classes cover a key/value grid (env), a
+     per-status block (gates, status availability), and a tri-state row
+     (connectors). */
+  .scope-ed { margin-top:7px; display:flex; flex-direction:column; gap:6px; }
+  .scope-ed-hint { font-size:0.66rem; color:var(--dim); line-height:1.35; }
+  .scope-ed-sec { font-size:0.68rem; font-weight:600; color:var(--text);
+    margin-top:2px; }
+  .scope-ed-row { display:flex; gap:5px; align-items:center; flex-wrap:wrap; }
+  .scope-ed-key { flex:0 0 auto; min-width:96px; max-width:190px; font-size:0.68rem;
+    color:var(--accent); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .scope-ed-in { flex:1 1 110px; min-width:0; background:var(--bg);
+    border:1px solid var(--border); border-radius:6px; padding:5px 7px;
+    font-size:0.7rem; color:var(--text); font-family:inherit; min-height:34px; }
+  .scope-ed-in:focus { outline:none; border-color:var(--accent); }
+  .scope-ed-ta { width:100%; min-height:56px; background:var(--bg);
+    border:1px solid var(--border); border-radius:6px; padding:5px 7px;
+    font-size:0.7rem; color:var(--text); font-family:inherit; resize:vertical; }
+  .scope-ed-ta:focus { outline:none; border-color:var(--accent); }
+  .scope-ed-blk { border:1px solid var(--border); border-radius:7px; padding:6px 7px;
+    background:var(--bg); }
+  .scope-ed-lbl { font-size:0.68rem; font-weight:600; color:var(--text);
+    margin-bottom:3px; display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+  .scope-ed-note { font-size:0.62rem; color:var(--dim); font-weight:400; }
+  .scope-ed-chk { display:flex; align-items:center; gap:5px; font-size:0.68rem;
+    color:var(--text); min-height:34px; cursor:pointer; }
+  .scope-ed-chk input { width:16px; height:16px; flex:0 0 auto; }
+  .scope-ed-sel { background:var(--bg); border:1px solid var(--border);
+    border-radius:6px; padding:4px 6px; font-size:0.68rem; color:var(--text);
+    font-family:inherit; min-height:34px; }
+  .scope-ed-sw { width:22px; height:22px; flex:0 0 auto; border-radius:5px;
+    border:1px solid var(--border); }
+  .scope-ed-btn { font-size:0.68rem; min-height:36px; padding:5px 11px; }
+  .scope-ed-foot { display:flex; gap:6px; align-items:center; margin-top:4px;
+    flex-wrap:wrap; }
+  .scope-ed-msg { font-size:0.64rem; color:var(--dim); }
+  .scope-ed-grid { display:flex; flex-direction:column; gap:5px; }
+  @media (max-width: 600px) {
+    /* 44x44 touch targets on a phone (.claude/rules/css-mobile.md). Desktop
+       keeps the tighter 34/36px so the panel does not grow a scrollbar. */
+    .scope-ed-in, .scope-ed-sel, .scope-ed-chk { min-height:44px; }
+    .scope-ed-btn { min-height:44px; }
+    .scope-ed-key { flex:1 1 100%; max-width:none; }
   }
   .grp-chip { display:inline-block; margin-left:6px; padding:1px 7px; border-radius:10px;
     font-size:0.66rem; font-weight:600; cursor:pointer; vertical-align:middle;
