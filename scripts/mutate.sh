@@ -30,10 +30,44 @@
 # Exit 0 on success, 1 if the target is absent or not unique.
 set -uo pipefail
 
+# ── THIS SCRIPT MUST NOT MUTATE ITSELF (AF-440) ─────────────────────────────
+#
+# Measured 2026-09-03, twice in five minutes, on this file. `run` applies the
+# mutation, executes the command, and reverts from a trap — but bash reads a
+# script by BYTE OFFSET as it executes, so rewriting the file underneath the
+# running interpreter shifts every offset after the edit. The revert never
+# happened. Both times the file was left MUTATED, `bash -n` passed, and the
+# damage surfaced only as the NEXT invocation refusing with "the replacement
+# already occurs 1 time(s)" — which reads as a bad argument, not as a corrupted
+# file.
+#
+# That is AF-368's mechanism arriving inside the tool whose entire purpose is to
+# make mutation safe on a shared checkout. Refuse it: a self-mutation cannot be
+# made safe from within the process being edited, and the tool that leaves a
+# mutation behind is worse than no tool, because its failure is silent and its
+# next refusal blames the caller.
+refuse_self_mutation() {
+  local target="$1" self_path
+  self_path=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
+  local abs
+  abs=$(cd "$(dirname "$target")" 2>/dev/null && pwd)/$(basename "$target") || return 0
+  [[ "$abs" == "$self_path" ]] || return 0
+  echo "mutate: REFUSING to mutate $target — that is this script (AF-440)." >&2
+  echo "  bash reads a script by byte offset as it runs, so rewriting this file" >&2
+  echo "  underneath the running interpreter loses the revert and leaves the" >&2
+  echo "  mutation applied. Measured twice on 2026-09-03; both times \`bash -n\`" >&2
+  echo "  passed and the only symptom was the NEXT run refusing with an argument" >&2
+  echo "  error." >&2
+  echo "  To test a change to this script, copy it and mutate the copy:" >&2
+  echo "    cp $target /tmp/mutate-under-test.sh && $0 run /tmp/mutate-under-test.sh ..." >&2
+  exit 2
+}
+
 usage() {
   echo "usage: $0 <apply|revert> <file> <old-string> <new-string>" >&2
   echo "       $0 run <file> <old-string> <new-string> -- <command...>" >&2
   echo "       $0 survey <file> [--limit N] [--stop-at REGEX] -- <command...>" >&2
+  echo "       $0 seams <file> [--limit N] [--build <cmd>] -- <test-command...>" >&2
   exit 2
 }
 
@@ -54,6 +88,160 @@ usage() {
 #
 # The command's exit status is preserved and returned, because the whole point is
 # to read the suite's colour under the mutation.
+# ── `seams`: IS ANYTHING HOLDING THESE TWO ARGUMENTS APART? (AF-438) ─────────
+#
+# A DIFFERENT CLASS FROM `survey`, and `survey` cannot find it. Survey asks
+# whether a LINE's value matters. This asks whether two things that must AGREE
+# are held together by anything but the fact that they were written together.
+#
+# Seven instances in one night, four of them mvs-pitr's from a different repo:
+#   AF-429  a writer and a detector, each with its own green test, and a fixture
+#           hand-typing the writer's output so nothing pinned the pair
+#   AF-437  a deriver and four readers of the same env var name
+#   AF-438  a resolver and a message, both tested, the call site between them not
+#   MP-100  two checks that fired on every fixture, so either could be deleted
+#   MP-125  two roots that agreed on a name, so reading the wrong one survived
+#   + two more where a fixture agreed with the reader and neither with the writer
+#
+# mvs-pitr's diagnosis is the one that made this buildable: every instance was a
+# missing DIRECTION rather than a missing assertion, and none was visible from
+# either side alone. A test per component passes exactly as well when the seam
+# between them is broken.
+#
+#   scripts/mutate.sh seams <file> [--limit N] [--build <cmd>] -- <test-cmd>
+#
+# THE PROBE IS AN ARGUMENT SWAP. At each call site with two or more bare
+# identifier arguments, exchange the first two and see what objects. Three
+# outcomes, and all three are worth knowing:
+#
+#   HELD-BY-TYPES  the swap does not compile. The type system is the assertion,
+#                  which is the best possible answer and needs no test.
+#   KILLED         it compiles and a test fails. Something observes the pair.
+#   SURVIVED       it compiles and every test passes. NOTHING holds these two
+#                  apart — the seam is real, and this is the AF-438 shape
+#                  exactly: `build(dir, ...)` and `build(&label, ...)` are both
+#                  `&str`, both valid, and one of them is wrong.
+#
+# Pass `--build` to separate the first outcome from the second. Without it a
+# compile failure and a test failure both read as KILLED, which understates the
+# seams that only the compiler is holding — those are safe today and become
+# unheld the moment someone widens a type.
+if [[ "${1:-}" == "seams" ]]; then
+  shift
+  file="${1:-}"; shift || usage
+  [[ -f "$file" ]] || { echo "mutate: no such file: $file" >&2; exit 1; }
+  limit=15; build_cmd=""
+  while [[ $# -gt 0 && "${1:-}" != "--" ]]; do
+    case "$1" in
+      --limit) limit="${2:-15}"; shift 2 ;;
+      --build) build_cmd="${2:-}"; shift 2 ;;
+      *) usage ;;
+    esac
+  done
+  [[ "${1:-}" == "--" ]] || usage
+  shift
+  [[ $# -ge 1 ]] || usage
+  self="${BASH_SOURCE[0]}"
+  before=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$file")
+
+  cands=$(python3 - "$file" "$limit" <<'PY'
+import re, sys
+path, limit = sys.argv[1], int(sys.argv[2])
+lines = open(path, encoding='utf-8').read().split('\n')
+counts = {}
+for l in lines:
+    counts[l] = counts.get(l, 0) + 1
+# A call with >=2 arguments that are bare identifiers, possibly &-borrowed.
+# Deliberately NOT expressions: swapping `foo()` with `bar.baz()` changes far
+# more than a direction and its failure says nothing about a seam.
+CALL = re.compile(r'\b([a-z_][a-z0-9_]*)\(\s*(&?[a-z_][a-z0-9_]*)\s*,\s*(&?[a-z_][a-z0-9_]*)\s*[,)]')
+SKIP = {'assert_eq', 'assert_ne', 'min', 'max', 'swap', 'zip', 'format', 'write', 'writeln',
+        'push', 'insert', 'replace', 'splitn', 'saturating_sub', 'checked_sub', 'eq', 'ne'}
+out, skipped_dup, skipped_same, skipped_nocall, skipped_text = [], 0, 0, 0, 0
+for i, l in enumerate(lines):
+    st = l.strip()
+    if not st or st.startswith(('//', '#', '*', '/*')):
+        skipped_text += 1
+        continue
+    m = CALL.search(l)
+    if not m:
+        skipped_nocall += 1
+        continue
+    fn, a, b = m.group(1), m.group(2), m.group(3)
+    # Identical arguments cannot be swapped into a different meaning, and a
+    # SKIP-listed callee is symmetric by definition — reporting either would be
+    # noise that teaches skipping the real ones.
+    if a == b or fn in SKIP:
+        skipped_same += 1
+        continue
+    if counts[l] != 1:
+        skipped_dup += 1
+        continue
+    lo, hi = m.span(2), m.span(3)
+    new = l[:lo[0]] + b + l[lo[1]:hi[0]] + a + l[hi[1]:]
+    out.append((i + 1, l, new, f"{fn}({a},{b}) -> ({b},{a})"))
+assert len(out) + skipped_dup + skipped_same + skipped_nocall + skipped_text == len(lines), \
+    "seams accounting lost a line: some exclusion is not counted"
+print(f"#META\t{len(out)}\t{skipped_dup}\t{skipped_same}\t{skipped_nocall}\t{skipped_text}\t{len(lines)}")
+for ln, old, new, label in out[:limit]:
+    print(f"{ln}\t{old}\t{new}\t{label}")
+PY
+  ) || { echo "mutate seams: could not enumerate call sites" >&2; exit 1; }
+
+  meta=$(printf '%s\n' "$cands" | head -1)
+  n_all=$(printf '%s' "$meta" | cut -f2)
+  n_dup=$(printf '%s' "$meta" | cut -f3)
+  n_same=$(printf '%s' "$meta" | cut -f4)
+  n_nocall=$(printf '%s' "$meta" | cut -f5)
+  n_text=$(printf '%s' "$meta" | cut -f6)
+  n_lines=$(printf '%s' "$meta" | cut -f7)
+  body=$(printf '%s\n' "$cands" | tail -n +2)
+  n_run=$(printf '%s\n' "$body" | grep -c . || true)
+  echo "mutate seams: $file — $n_all swappable call site(s), running $n_run (limit $limit)."
+  echo "mutate seams: of $n_lines lines: $n_all swappable, $n_dup non-unique, $n_same symmetric or"
+  echo "mutate seams: identical args, $n_nocall no qualifying call, $n_text comment or blank."
+  [ -n "$build_cmd" ] || echo "mutate seams: no --build given, so HELD-BY-TYPES cannot be told from KILLED."
+  echo ""
+  held=0; killed=0; survived=0
+  while IFS=$'\t' read -r ln old new label; do
+    [ -n "$ln" ] || continue
+    verdict=""
+    if [ -n "$build_cmd" ]; then
+      if ! "$self" run "$file" "$old" "$new" -- bash -c "$build_cmd" >/dev/null 2>&1; then
+        verdict="held-by-types"; held=$((held + 1))
+      fi
+    fi
+    if [ -z "$verdict" ]; then
+      if "$self" run "$file" "$old" "$new" -- "$@" >/dev/null 2>&1; then
+        verdict="SURVIVED"; survived=$((survived + 1))
+      else
+        verdict="killed"; killed=$((killed + 1))
+      fi
+    fi
+    printf '  %-14s L%-5s %s\n' "$verdict" "$ln" "$label"
+    now=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$file")
+    if [ "$now" != "$before" ]; then
+      echo "" >&2
+      echo "mutate seams: ABORTING — $file did not return to its starting bytes after L$ln." >&2
+      exit 3
+    fi
+  done <<< "$body"
+  echo ""
+  echo "mutate seams: $held held-by-types, $killed killed, $survived SURVIVED."
+  if [ "$survived" -gt 0 ]; then
+    echo "mutate seams: a SURVIVED swap compiled and passed every test. Two arguments that"
+    echo "mutate seams: must mean different things, and nothing anywhere says so. Some are"
+    echo "mutate seams: harmless (genuinely interchangeable); each is a question about which"
+    echo "mutate seams: DIRECTION is authoritative, which is the thing no per-component test"
+    echo "mutate seams: can answer (AF-438, and mvs-pitr's four)."
+  fi
+  if [ "$n_all" -gt "$n_run" ]; then
+    echo "mutate seams: $((n_all - n_run)) call site(s) NOT run (--limit $limit); this result"
+    echo "mutate seams: describes the $n_run that were."
+  fi
+  exit 0
+fi
+
 # ── `survey`: WHICH LINES DOES THIS COMMAND ACTUALLY DEPEND ON? (AF-422) ─────
 #
 # `run` answers "can THIS check fail", one mutation at a time, and it only gets
@@ -223,6 +411,7 @@ if [[ "${1:-}" == "run" ]]; then
   [[ "${1:-}" == "--" ]] || usage
   shift
   [[ -f "$file" ]] || { echo "mutate: no such file: $file" >&2; exit 1; }
+  refuse_self_mutation "$file"
   self="${BASH_SOURCE[0]}"
   "$self" apply "$file" "$old" "$new" || exit 1
   # Armed only AFTER a successful apply: a trap set earlier would "revert" a
@@ -244,6 +433,7 @@ fi
 [[ $# -eq 4 ]] || usage
 op="$1"; file="$2"; old="$3"; new="$4"
 [[ -f "$file" ]] || { echo "mutate: no such file: $file" >&2; exit 1; }
+refuse_self_mutation "$file"
 
 case "$op" in
   apply)  from="$old"; to="$new" ;;

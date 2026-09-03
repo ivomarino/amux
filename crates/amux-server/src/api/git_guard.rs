@@ -352,6 +352,27 @@ pub(crate) async fn owner_committed_since(
     owner: &str,
     edit_age_secs: i64,
 ) -> Option<String> {
+    // A DIRECTION ASSERTION, not a validation (AF-439).
+    //
+    // `dir` and `path` are both `&str` and both plausible, so swapping them
+    // compiles and runs: `git -C <path> log -- <dir>` fails, this returns None,
+    // and the caller reads that as "the owner has not committed" — settled work
+    // reported as unsettled, silently, with no error anywhere.
+    //
+    // Found by `scripts/mutate.sh seams` on its first real run: the swap at
+    // commit_nudge.rs:1447 compiled and passed the whole suite. This function
+    // HAS a test; the call site's argument ORDER had nothing, which is the
+    // seven-instance class this assertion exists to close (mvs-pitr's framing:
+    // a missing DIRECTION, invisible from either side alone).
+    //
+    // At the boundary rather than per call site, so it covers every caller
+    // including ones not yet written, and `debug_assert` so it costs nothing in
+    // release while failing loudly in every test that gets the order wrong.
+    debug_assert!(
+        std::path::Path::new(dir).is_dir(),
+        "owner_committed_since: `dir` must be a directory, got {dir:?} \
+         (arguments swapped with `path`? — AF-439)"
+    );
     let out = git_out(
         dir,
         &["log", "-8", "--format=%h%x09%ct%x09%(trailers:key=Amux-Session,valueonly,separator=)", "--", path],
@@ -4127,6 +4148,44 @@ mod tests {
         git(&["commit", "-q", "-m", "no trailer here"]);
         assert!(owner_owns_newest_commit(&d, "other.rs", "alice").await.is_none());
         assert!(owner_owns_newest_commit(&d, "other.rs", "").await.is_none());
+    }
+
+    /// AF-439. Pins the DIRECTION assertion itself, which is a narrower claim
+    /// than it looks and the difference matters.
+    ///
+    /// `scripts/mutate.sh seams` found that swapping `dir` and `path` at
+    /// commit_nudge.rs:1447 compiles and passes the entire suite. The assertion
+    /// added to this function makes that swap LOUD instead of silent — a
+    /// panicking debug build rather than a None the caller reads as "the owner
+    /// has not committed", which reports settled work as unsettled.
+    ///
+    /// IT DOES NOT CLOSE THE SEAM, and this cell exists partly to say so. No
+    /// test reaches that call site (the sweep needs a live lane, a repo and the
+    /// guard API), so the assertion never executes there and `seams` still
+    /// reports SURVIVED for it — correctly. What is pinned here is that the
+    /// assertion exists and fires; what is still unheld is the argument order
+    /// at a caller no test exercises.
+    #[tokio::test]
+    #[should_panic(expected = "must be a directory")]
+    async fn owner_committed_since_rejects_a_swapped_dir_and_path() {
+        let f = std::env::temp_dir().join(format!("af439-{}.txt", std::process::id()));
+        std::fs::write(&f, b"x").unwrap();
+        // The swapped call: a FILE where the directory belongs. Without the
+        // assertion this returns None and every caller reads it as a fact
+        // about the repo.
+        let _ = owner_committed_since(f.to_str().unwrap(), "some/path.rs", "amux", 60).await;
+    }
+
+    /// The control. A real directory must NOT trip the assertion, or the guard
+    /// above would be a function that always panics and the cell would pass for
+    /// the wrong reason.
+    #[tokio::test]
+    async fn owner_committed_since_accepts_a_real_directory() {
+        let d = std::env::temp_dir();
+        // No repo there, so the git call fails and this returns None. That is
+        // the point: it returns rather than panicking.
+        let r = owner_committed_since(d.to_str().unwrap(), "some/path.rs", "amux", 60).await;
+        assert!(r.is_none(), "a non-repo directory yields None, not a panic");
     }
 
     #[tokio::test]
