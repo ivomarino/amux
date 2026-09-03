@@ -8719,7 +8719,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.793';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.794';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -13934,21 +13934,38 @@ function _linkifyUrls(safeHtml) {
     });
   } catch (e) { return safeHtml; }
 }
-function _msgCardChip(cardId) {
+function _msgCardChip(cardId, message) {
   if (!cardId) return '';
-  const c = (typeof boardItems !== 'undefined' && Array.isArray(boardItems))
+  const live = (typeof boardItems !== 'undefined' && Array.isArray(boardItems))
     ? boardItems.find(i => i.id === cardId) : null;
+  // Message history can outlive the board's deliberately capped working set.
+  // Treat the history API's authoritative issues-table metadata as a real card,
+  // rather than claiming an archived/older card is "gone" merely because this
+  // browser has not loaded it into `boardItems` (MSG-38618 / TUBES-2372).
+  const recorded = message && typeof message === 'object'
+    && (message.card_title != null || message.card_status != null);
+  const c = live || (recorded ? {
+    id: cardId,
+    title: message.card_title || '',
+    status: message.card_status || 'todo',
+    archived: !!message.card_archived,
+    deleted: message.card_deleted != null,
+    log: ''
+  } : null);
   const stC = st => st === 'verified' ? 'var(--green)' : st === 'done' ? '#3fb950'
     : st === 'doing' ? '#d29922' : st === 'review' ? '#bc8cff'
     : st === 'discarded' ? 'var(--dim)' : 'var(--accent)';
   const st = c ? (c.status || 'todo') : '';
+  const displaySt = c && c.deleted ? 'deleted'
+    : c && c.archived ? 'archived'
+    : st;
   const undec = c && ((c.log || '').indexOf('capture: worker prompt') !== -1) && st === 'todo';
   const lastCommit = c ? (((c.log || '').match(/commit ([0-9a-f]{7,12}) \u2014 [^\n]*/g) || []).pop() || '') : '';
   return '<span class="msg-card-chip" onclick="event.stopPropagation();switchView(\'board\');setTimeout(() => openBoardDetail(\'' + escJs(cardId) + '\'), 250);" '
     + 'title="' + esc(c ? (c.title || '') : 'card no longer on the board') + (lastCommit ? '\n' + esc(lastCommit) : '') + '" '
     + 'style="cursor:pointer;font-size:0.68rem;border:1px solid ' + (c ? stC(st) : 'var(--border)') + ';border-radius:6px;padding:1px 7px;white-space:nowrap;'
     + 'color:' + (c ? stC(st) : 'var(--dim)') + ';">\u2192 ' + esc(cardId)
-    + (c ? ' \u00B7 ' + esc(undec ? 'captured, not yet decomposed' : st) : ' \u00B7 gone')
+    + (c ? ' \u00B7 ' + esc(undec ? 'captured, not yet decomposed' : displaySt) : ' \u00B7 gone')
     + (lastCommit ? ' \u00B7 \u2318' : '') + '</span>';
 }
 
@@ -13979,7 +13996,9 @@ function _msgNorm(x) {
   const t = (x.time !== undefined && x.time !== null) ? x.time : x.ts;
   return { id: x.id, text: x.text, type: x.type, session: x.session,
            time: t, ts: t, origin: x.origin || '', kind: x.kind,
-           queued: x.queued, card_id: x.card_id || '' };
+           queued: x.queued, card_id: x.card_id || '',
+           card_title: x.card_title, card_status: x.card_status,
+           card_archived: x.card_archived, card_deleted: x.card_deleted };
 }
 // ONE row renderer for all three message surfaces. `ctx` carries only what
 // genuinely differs — which selection set the checkbox belongs to, which resend
@@ -14047,7 +14066,8 @@ function _cmdHistItemHTML(e, ctx) {
   const idTag = _mid
     ? `<code class="msg-id-badge" title="Message id — click to copy" onclick="event.stopPropagation();_copyMsgId('${esc(_mid)}')">MSG-${esc(_mid)}</code>`
     : '';
-  const meta = tag + _msgDeliveryChip(e) + _msgSubmitChip(e) + sessTag + tsTag + idTag + _msgCardChip(typeof e === 'string' ? '' : (e.card_id || ''));
+  const meta = tag + _msgDeliveryChip(e) + _msgSubmitChip(e) + sessTag + tsTag + idTag
+    + _msgCardChip(typeof e === 'string' ? '' : (e.card_id || ''), e);
   const locSess = (session || (typeof peekSession !== 'undefined' ? peekSession : '') || '').replace(/'/g,'');
   const _target = ctx.target(e) || locSess;
   // A MATCHING message is force-expanded while a search is active, even if the
