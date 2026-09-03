@@ -2310,10 +2310,17 @@ FIX: Two halves, and only the first is shipped.
 ## Six checks in one afternoon that ran, passed, and could not have failed
 AREA: instruments
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-09-02
 SESSION: amux-frustrations
-CARD: AF-422
+CARD: AF-435
+NOTE-CARD: repointed 2026-09-03. This said CARD: AF-422, which is the STAGED-GUARD MIRROR
+  card (the server-side victim notice lacking AF-391 and MC-1561). Two unrelated units of
+  work were sharing one card, so no status was a true statement about it: the mirror work
+  was done and production-confirmed while this cluster was untouched, and reopening the
+  card to be honest about the cluster made it dishonest about the mirror. AF-435 is this
+  entry's own card. The mis-link was mine, made the same afternoon I logged an entry about
+  checks that cannot fail.
 SYMPTOM: Not one bug. Five instances in a single afternoon, three mine and two
   reported by mixpeek-general, of a check that EXECUTED, reported success, and was
   structurally incapable of failing. Ethos rule 7 already names this class and points
@@ -2381,8 +2388,30 @@ UPDATED 2026-09-02, evening. The cluster is EIGHT, and the two new ones are the 
   look; both of today's were caught by the reflex itself, in under a minute each, on
   cells I had just written and believed. That is the case for making `mutate.sh` cheap
   enough to be automatic rather than for another sentence telling people to remember.
-  THE CARD IS REOPENED, not the entry retired. AF-422 read `done` over this, and the
-  mechanism the FIX asks for does not exist.
+  THE MECHANISM SHIPPED, 1d93d14a: `scripts/mutate.sh survey <file> -- <command>` walks a
+  file's mutable lines and reports which ones the command's outcome does not depend on.
+  Line-scoped and syntax-preserving, through the same apply/trap-revert path as `run`, so
+  the blast radius and the duration bound are unchanged; it re-hashes the file after every
+  mutation and ABORTS if the bytes did not return. It states what it did NOT examine —
+  non-unique lines skipped, `--limit` truncation, the `--stop-at` scope — because a survey
+  that quietly examined 6 of 84 lines and reported "all killed" is this entry's own shape
+  wearing a tool's clothes. A survivor is a question, not a verdict: log strings and
+  defensive branches survive honestly, and demanding zero survivors would be the gate with
+  no truthful path that rule 3 forbids.
+  IT PAID FOR ITSELF ON THE FIRST TWO RUNS, which is the only evidence that matters here.
+  Run one, on invariants/checks.rs: `return want.len() > i` in `segments_match` survives as
+  `>=`. That is the `{*rest}` wildcard arm, whose own comment says "must have at least one
+  segment left to consume" and whose neighbouring cell exists to prevent exactly the prefix
+  false-pass `>=` reintroduces. Documented invariant, explanatory comment, nothing holding
+  it. Run two, on AF-422's own subject: `n_at_risk == 0` flipped to `>= 0` and `all_mine`'s
+  `.all()` flipped to `.any()`, both surviving the whole git_guard suite. The first deletes
+  the loud mirror notice; the second restores the exact possessive AF-422 was filed to
+  remove. That card's acceptance criterion asked for BOTH arms and only the quiet one was
+  held. Three survivors, three real gaps, on the first two files it was pointed at.
+  And a fourth, in the tool's own suite: cell 2 asserted `*SURVIVED*`, which also matches
+  the summary line "0 SURVIVED.", so it would have passed on a survey that found nothing.
+  Caught because cell 6 failed on the same glob. Instance nine, in the harness built to
+  catch instances.
 
 ---
 
@@ -2482,46 +2511,6 @@ FIX: Amux does not infer lifecycle from Claude's notification text. The status f
   consumes the provider's explicit subagent start/stop hooks and keeps notification
   content as display-only evidence. The provider-side duplicate/early notification
   remains outside this repository.
-
-## The drift-detector protecting mixpeek's git guard is itself blind to staleness
-AREA: attribution
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-24
-SESSION: mixpeek-research
-CARD: MR-44
-SYMPTOM: Landing MR-43 (tmux-derived $AMUX_SESSION fallback) required running
-  `install-hooks.sh --all` to propagate the fix. It reported mixpeek's
-  `.githooks/amux-staged-guard` as "diverges from canonical but carries every
-  canonical feature — left untouched", the correct, safe verdict for a
-  deliberate local merge. It is not one: mixpeek's copy is GUARD_VERSION = 4
-  against a canonical of 9, missing ~215 lines including AF-127 outcome
-  reporting and the AF-195 index/worktree divergence check. The staleness
-  check greps the canonical's single `guard-features` token (AMUX-2946) as a
-  bare substring anywhere in the target file; mixpeek's v4 copy happens to
-  contain that literal string at line 75 in an unrelated comment about retired
-  ports, so the check reads "feature present" when the actual AMUX-2946
-  feature never landed there. This is the exact MG-1485 dark-guard shape the
-  mechanism exists to catch, undetected by the mechanism itself, in the one
-  checkout that matters most for daily commits.
-COST: not measured directly — the cost is whatever the missing ~5 versions of
-  protection would have caught and did not (AF-195's index/worktree check in
-  particular: mixpeek is a shared checkout where that class of bug already
-  happened once, per its own header).
-FIX: two separate fixes. (1) Upgrade mixpeek/.githooks/amux-staged-guard and
-  prepare-commit-msg from v4 to v9 — a real merge, commit in that repo. (2)
-  Make the drift-token check itself resistant to this: require the token
-  match to come from a comment-anchored form, or compare GUARD_VERSION
-  numerically in addition to/instead of grepping tokens. Otherwise the next
-  stale copy hides the same way. Neither started; MR-44.
-RESTORED 2026-09-02 by amux-frustrations, not by its author. This entry was DELETED from
-  frustrations.md by 7dbab8f6 on 2026-08-29 and was then absent from BOTH the ledger and
-  the archive for four days, which is the one shape `.claude/rules/frustrations.md` calls
-  actually-lost work. Recovered verbatim from 7dbab8f6^ and re-appended unchanged; every
-  line above this one is mixpeek-research's. STATUS stays `open` because nobody has said
-  otherwise and only mixpeek-research can. AF-430 has what destroyed it.
-
----
 
 ## The append-only guard's PASS is not evidence for any particular line: a rescue by the substring test is silent
 AREA: hooks
