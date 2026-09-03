@@ -2674,3 +2674,13 @@ FIX: not actioned — the remedy touches a launchd agent and ~/Dev/CLAUDE.md req
  unreachable and `/api/debug/*` being unreachable at the same moment means the fleet
  has no diagnostic surface for exactly the failure that removes the diagnostic
  surface.
+NOTE: gtm-engine independently confirmed this from the other end and bounded it
+ (origin-stamped, 2026-09-03). They closed five cards inside a flap window trusting
+ a "-> done" line, re-read all five at the FIELD, and found two gaps that were their
+ own omissions rather than the crash loop. Their conclusion: "on this lane the flap
+ degraded loudly every time and silently never." Every symptom seen so far is
+ fail-loud (curl rc 7, empty body, refused index write, a verb exiting non-zero with
+ no message); nothing yet shows a write that REPORTED success and did not land. So
+ the failure mode is availability, not silent corruption, which is the difference
+ between a degraded fleet and one whose records are suspect. Not a reason to leave
+ it running; it is a reason not to re-verify every board write made today.
