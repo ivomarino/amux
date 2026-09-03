@@ -5337,3 +5337,70 @@ FIX: e6b80033. The arm now names the files that block the merge and gives each a
   where the obvious command stops working. `drop_paths_identical_to_origin()`
   already computed this comparison for the idle nudge; the surface every lane
   reads at SessionStart did not (ethos rule 1).
+
+## A local `cargo clippy` OOM-kill doesn't just kill the build — it kills the WHOLE interactive session
+VALIDATED: amux | This entry itself already says (its own FIX line): "FIX: none in code yet...
+AMUX-70 filed for a durable fix (either that wrapper baked into the sanctioned
+local-build path, or making the remote-offload fallback actually reliable)".
+That wrapper now exists and is the sanctioned path: scripts/safe-cargo.sh,
+documented in CLAUDE.md's own Workflow section ("The wrapper runs cargo in
+its own sibling scope so an OOM kill there can't cascade into the session").
+
+Card AMUX-70 (this entry's own CARD field) is `verified` with concrete
+evidence recorded on the card itself:
+  scripts/safe-cargo.sh check -p amux-server -> Finished `dev` profile ...
+    in 46.77s (via wrapper, own systemd scope confirmed:
+    run-p<pid>-i<id>.scope vs tmux-spawn-*.scope)
+  cargo test -p amux-server --lib pane_scope_oom_kill_tests ->
+    test result: ok. 3 passed; 0 failed
+  Live proof: a real commit (bfc64954) went through the newly-fixed
+    pre-commit hook (cargo clippy --workspace --all-targets via
+    safe-cargo.sh) with no hang, no AMUX_SKIP_RUST_GATE
+  tmux list-sessions -> 8 (unchanged before/after every step)
+
+Reconfirmed live in THIS session, 2026-09-02: every local cargo invocation
+this session ran (multiple git commits, each triggering the pre-commit
+hook's check+clippy gate) went through this exact wrapper via the
+pre-commit hook, completed normally, and never took the interactive pane
+down — the specific failure mode this entry describes (the whole
+tmux-spawn scope dying, session restarting mid-conversation) did not
+recur across ~6 local check+clippy runs today.
+AREA: build
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-01
+SESSION: amux
+CARD: AMUX-70
+SYMPTOM: Ran `cargo clippy -p amux-server --all-targets` locally in this
+  interactive pane as a fallback when the remote build host's toolchain
+  image kept failing to rebuild (rustup uplink flakiness, already
+  documented in CLAUDE.local.md — host details deliberately omitted here,
+  this file is public). `clippy-driver` grew to ~2GB RSS and got OOM-killed
+  (`dmesg -T`: 08:54:28 and 09:22:32). Confirmed via `journalctl --user`:
+  every process in an interactive amux pane — including the Claude Code
+  process itself — shares ONE systemd scope,
+  `tmux-spawn-<uuid>.scope`. Systemd does not reap just the OOM-killed
+  process: it marks the WHOLE SCOPE `Failed with result 'oom-kill'`
+  (`tmux-spawn-006a872a....scope: Failed with result 'oom-kill' (3.7G
+  memory peak)`), and whatever launches the pane tears it down and starts
+  a brand-new one 26 seconds later (`Started tmux-spawn-baff1e65-...`).
+  The entire interactive session restarted mid-conversation as a result —
+  not the build process, the SESSION. Surfaced to the session only as
+  orphaned background-task notifications ("stopped ... may have been
+  stopped via agent teardown") — nothing points at OOM or the scope
+  failure; that only came from reading `journalctl`/`dmesg` directly.
+COST: This exact session lost an in-flight `git commit` (had to be
+  re-run), an in-flight `cargo clippy` verification pass (had to restart
+  from a fresh session with no memory of the interrupted state until the
+  transcript resumed), and cost real wall-clock time diagnosing "why does
+  amux keep stopping" as a SEPARATE investigation from the work that
+  caused it. Anyone running local cargo/clippy/test/build directly in an
+  interactive pane hits this identically.
+FIX: none in code yet. Documented as a hard rule in this session's own
+  `offload-builds` memory: never run cargo build/check/clippy/test
+  directly in an interactive pane, even as a one-off fallback — that pane
+  IS the session. If local is unavoidable, run it via `systemd-run --user
+  --scope -- cargo ...` so the build gets its OWN scope, not the pane's.
+  AMUX-70 filed for a durable fix (either that wrapper baked into the
+  sanctioned local-build path, or making the remote-offload fallback
+  actually reliable so this is never reached for).
