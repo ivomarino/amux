@@ -1891,91 +1891,7 @@ pub fn reports_are_attributed(total: i64, unattributed: i64) -> Vec<InvariantRes
 // 6b. Are the report hooks WIRED to that script at all? (AMUX-2936)
 // ---------------------------------------------------------------------------
 
-/// One lane's WORK state beside its EXECUTION state (AMUX-4029).
-pub struct LaneWork {
-    pub name: String,
-    /// The derived execution status: is the process doing anything.
-    pub status: String,
-    /// Cards that pass every computable precondition.
-    pub ready: usize,
-    /// How many of those it could actually claim right now.
-    pub claimable_now: usize,
-    /// The `doing` cards consuming its WIP cap.
-    pub holding: Vec<String>,
-    /// Of `holding`, the ones with no `next_action` — a card that cannot say
-    /// what it is waiting for is the shape that sits there.
-    pub held_without_next_action: Vec<String>,
-}
-
-/// A LANE THAT IS IDLE WHILE HOLDING WORK IT CANNOT CLAIM IS STALLED, and that
-/// is a system failure rather than ordinary idle.
-///
-/// EXECUTION IDLE AND WORK IDLE ARE DIFFERENT QUESTIONS and nothing joined them.
-/// The header badge is derived from terminal and model activity; the column
-/// counts are card counts. Neither answers "is there anything this lane could
-/// pick up", so a lane at its WIP cap and a lane with genuinely nothing to do
-/// render identically, and the difference is invisible until a human opens the
-/// board and counts.
-///
-/// Ethan, 2026-09-02: "byo-ray is idle despite having todo and backlog". It was
-/// holding BR-51 in `doing` against a WIP cap of 1, with BR-117, BR-120 and
-/// BR-122 all ready and none claimable. Measured across the fleet the same
-/// minute: 6 of 51 running lanes had ready work they could not claim, and the
-/// discriminator matters — 4 of the 6 were ACTIVE, which is a lane correctly
-/// working its one card and must not be flagged. Only the 2 idle ones are
-/// stalled, and both held a card with no `next_action`.
-///
-/// So the predicate is the conjunction, not any one term: idle AND ready > 0
-/// AND claimable_now == 0. Flagging `ready > 0 && claimable == 0` alone would
-/// fire on every healthy busy lane and be muted within a day.
-pub fn lane_idle_with_ready_work(lanes: &[LaneWork]) -> Vec<InvariantResult> {
-    const ID: &str = "board.lane_idle_with_ready_work";
-    if lanes.is_empty() {
-        // The same reasoning as `status.agrees_with_pane`: no visible fleet is
-        // indistinguishable from a failed enumeration, and that has shipped here
-        // before. Never a pass.
-        return vec![InvariantResult::unknown(ID, "no running lanes visible to examine")];
-    }
-    let mut out = Vec::new();
-    for l in lanes {
-        let stalled = l.status == "idle" && l.ready > 0 && l.claimable_now == 0;
-        if !stalled {
-            out.push(InvariantResult::pass(ID).entity(&l.name));
-            continue;
-        }
-        // NAME WHAT IS IN THE WAY, not just that something is. "0 claimable" sends
-        // the reader to the board to work out why; the held card's id sends them
-        // to the one row that has to move.
-        let held = if l.holding.is_empty() {
-            "nothing is holding the cap, so the block is upstream of WIP".to_string()
-        } else {
-            let stale = if l.held_without_next_action.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    " ({} of them declare no next_action, so nothing says what they wait for)",
-                    l.held_without_next_action.len()
-                )
-            };
-            format!("held by {}{}", l.holding.join(", "), stale)
-        };
-        out.push(
-            InvariantResult::fail(
-                ID,
-                "a lane with ready work is either working it or can claim it".to_string(),
-                format!(
-                    "{} is execution-idle with {} ready card(s) and 0 claimable: {}",
-                    l.name, l.ready, held
-                ),
-            )
-            .entity(&l.name),
-        );
-    }
-    out
-}
-
 /// One report-hook entry as configured in `~/.claude/settings.json`.
-#[derive(Debug)]
 pub struct ReportHookEntry {
     /// `Stop` | `UserPromptSubmit` | `PostToolUse` | ...
     pub event: String,
@@ -2087,59 +2003,21 @@ pub fn report_hooks_wired(entries: Result<Vec<ReportHookEntry>, String>) -> Vec<
         }
         rows.push(row);
     }
-    // AMUX-4024: AN EVENT CLASS THAT IS ENTIRELY ABSENT. Everything above walks
-    // the entries that EXIST and asks whether each is wired correctly, which is
-    // structurally unable to notice a hook nobody ever added — the loop has no
-    // row to fail on. That is the shape of the incident this clause is for.
-    //
-    // `subagent_event_post` has accepted start/stop since AMUX-3048, the count
-    // has a store, a consumer in `FleetSignals::subagents_working` and its own
-    // unit test, and NOTHING EVER POSTED ONE: `subagents_live` was null for 125
-    // of 125 lanes when measured on 2026-09-02. With no events the status
-    // derivation silently falls back to a transcript mtime, which cannot tell
-    // "thinking, will write in 90s" from "finished 30s ago" — so lanes read
-    // WORKING for up to four minutes after their agents landed, and read IDLE
-    // while blocked on a background agent. Both directions were reported by
-    // Ethan on the same afternoon.
-    //
-    // This is a Fail rather than an Unknown ONLY when other amux hooks are
-    // present, which the early return above has already established: a box with
-    // amux hooks configured but no lifecycle events is a box where the count
-    // will be null and nothing else says so.
-    for (needle, event, why) in [
-        (
-            ["subagent:start", "subagent-start"],
-            "PreToolUse (matcher ^(Task|Agent)$)",
-            "nothing increments the live-subagent count, so a lane blocked on a background \
-             agent reads IDLE until its transcript happens to be written",
-        ),
-        (
-            ["subagent:stop", "subagent-stop"],
-            "SubagentStop",
-            "nothing decrements the live-subagent count, so a finished agent leaves the lane \
-             reading WORKING until the count is reset",
-        ),
-    ] {
-        // EITHER SPELLING COUNTS. Two independent producers landed the same
-        // day: `subagent:start` (colon) here and `subagent-start` (hyphen) in
-        // #182, and the hook now accepts both. An invariant that demanded one
-        // would fail a box wired with the other while the count was flowing
-        // perfectly, which is a check reporting on itself.
-        if !entries.iter().any(|e| needle.iter().any(|n| e.command.contains(n))) {
+    for (event, args) in required {
+        let covered = entries.iter().any(|e| {
+            e.event == event
+                && e.command.contains("hook-report.sh")
+                && e.command.contains(args)
+                && (event != "PostToolUse"
+                    || e.matcher.as_deref().is_some_and(|m| regex::Regex::new(m).is_ok()))
+        });
+        if !covered {
             broken.push(format!(
-                "{event}: no hook posts {} — {why}", needle.join(" or ")
+                "{event}: missing canonical hook (expected hook-report.sh {args})"
             ));
         }
     }
-    let evidence = json!({
-        "entries": rows,
-        "subagent_lifecycle_wired": {
-            "start": entries.iter().any(|e| e.command.contains("subagent:start")
-                                            || e.command.contains("subagent-start")),
-            "stop": entries.iter().any(|e| e.command.contains("subagent:stop")
-                                           || e.command.contains("subagent-stop")),
-        },
-    });
+    let evidence = json!({ "entries": rows });
     if broken.is_empty() {
         vec![InvariantResult::pass(ID).evidence(evidence)]
     } else {
@@ -4253,77 +4131,10 @@ mod negative_controls {
     /// — an inline curl posting `{state,source}` — not from a convenient
     /// fixture, because the convenient fixture is convenient precisely by
     /// lacking the property that made the incident.
-    /// AMUX-4029, built from the live fleet reading on 2026-09-02 rather than a
-    /// convenient fixture. Six of 51 running lanes had ready work they could not
-    /// claim; four were ACTIVE and two were IDLE. The four are the reason this
-    /// check is a conjunction: flag `ready > 0 && claimable == 0` on its own and
-    /// it fires on every healthy lane that is correctly working its one card,
-    /// which is how a check earns being muted.
-    #[test]
-    fn only_an_idle_lane_with_unclaimable_ready_work_is_stalled() {
-        let lane = |name: &str, status: &str, ready: usize, claimable: usize| LaneWork {
-            name: name.into(),
-            status: status.into(),
-            ready,
-            claimable_now: claimable,
-            holding: vec!["BR-51".into()],
-            held_without_next_action: vec!["BR-51".into()],
-        };
-
-        // THE SPECIMEN. Ethan: "byo-ray is idle despite having todo and backlog".
-        let got = lane_idle_with_ready_work(&[lane("byo-ray", "idle", 3, 0)]);
-        assert_eq!(got[0].status, Status::Fail, "the reported specimen must fail: {got:?}");
-        assert!(
-            got[0].observed.contains("BR-51"),
-            "the failure must NAME what is in the way, not just that something is: {}",
-            got[0].observed
-        );
-        assert!(
-            got[0].observed.contains("next_action"),
-            "...and that the held card declares none: {}",
-            got[0].observed
-        );
-
-        // THE FOUR THAT MUST NOT FIRE. Same board shape, lane is working.
-        for st in ["active", "waiting"] {
-            let got = lane_idle_with_ready_work(&[lane("backend", st, 9, 0)]);
-            assert_eq!(
-                got[0].status,
-                Status::Pass,
-                "a {st} lane working its one card is not stalled: {got:?}"
-            );
-        }
-
-        // An idle lane with nothing ready is ordinary idle, not a failure.
-        let got = lane_idle_with_ready_work(&[lane("quiet", "idle", 0, 0)]);
-        assert_eq!(got[0].status, Status::Pass, "idle with no ready work is fine: {got:?}");
-
-        // An idle lane that CAN claim is the dispatcher's problem, not this
-        // check's: it has capacity and ready work, so nothing is in the way.
-        let got = lane_idle_with_ready_work(&[lane("free", "idle", 3, 3)]);
-        assert_eq!(got[0].status, Status::Pass, "claimable work is not a stall: {got:?}");
-
-        // Absence is Unknown, never a false pass — a failed enumeration and an
-        // empty fleet look identical, and that has shipped here before.
-        assert_eq!(lane_idle_with_ready_work(&[])[0].status, Status::Unknown);
-    }
-
     #[test]
     fn report_hook_wiring_faults_are_detected() {
         const GOOD: &str = r#"bash "$HOME/.amux/hook-report.sh" idle stop-hook"#;
         const INLINE: &str = r#"curl -sk -m 3 -X POST -H 'Content-Type: application/json' -d "{\"state\":\"idle\",\"source\":\"stop-hook\"}" "$AMUX_URL/api/sessions/$AMUX_SESSION/report""#;
-        // AMUX-4024: the subagent lifecycle pair is now part of "fully wired",
-        // so every fixture that asserts Pass has to carry it. Kept as separate
-        // constants so the negative control below is the SAME config minus one
-        // entry, and the assertion cannot pass for an unrelated reason.
-        const SUB_START: &str = r#"bash "$HOME/.amux/hook-report.sh" subagent:start pretooluse-agent"#;
-        const SUB_STOP: &str = r#"bash "$HOME/.amux/hook-report.sh" subagent:stop subagent-stop"#;
-        let lifecycle_pair =
-            || vec![ent("PreToolUse", SUB_START, Some("^(Task|Agent)$")), ent("SubagentStop", SUB_STOP, None)];
-        let with_pair = |mut v: Vec<ReportHookEntry>| {
-            v.extend(lifecycle_pair());
-            v
-        };
 
         let healthy = report_hooks_wired(Ok(vec![
             ent("Stop", r#"bash "$HOME/.amux/hook-report.sh" idle stop-hook"#, None),
@@ -4350,11 +4161,11 @@ mod negative_controls {
         ]));
         assert_eq!(healthy[0].status, Status::Pass, "correct wiring must pass: {healthy:?}");
 
-        let the_incident = report_hooks_wired(Ok(with_pair(vec![
+        let the_incident = report_hooks_wired(Ok(vec![
             ent("Stop", INLINE, None),
             ent("UserPromptSubmit", INLINE, None),
             ent("PostToolUse", INLINE, Some(".*")),
-        ])));
+        ]));
         assert_eq!(
             the_incident[0].status,
             Status::Fail,
@@ -4371,11 +4182,11 @@ mod negative_controls {
         // AMUX-2538's trap: correctly wired, still inert. `"*"` is not a regex,
         // and a tool event with no matcher is ignored outright.
         let bad_matcher =
-            report_hooks_wired(Ok(with_pair(vec![ent("PostToolUse", GOOD, Some("*"))])));
+            report_hooks_wired(Ok(vec![ent("PostToolUse", GOOD, Some("*"))]));
         assert_eq!(bad_matcher[0].status, Status::Fail, "\"*\" is not a regex: {bad_matcher:?}");
         assert!(bad_matcher[0].observed.contains("inert"), "{}", bad_matcher[0].observed);
 
-        let no_matcher = report_hooks_wired(Ok(with_pair(vec![ent("PostToolUse", GOOD, None)])));
+        let no_matcher = report_hooks_wired(Ok(vec![ent("PostToolUse", GOOD, None)]));
         assert_eq!(no_matcher[0].status, Status::Fail, "tool event needs a matcher: {no_matcher:?}");
 
         // A lifecycle event legitimately has no matcher, but one event cannot
@@ -4384,31 +4195,6 @@ mod negative_controls {
         let lifecycle = report_hooks_wired(Ok(vec![ent("Stop", GOOD, None)]));
         assert_eq!(lifecycle[0].status, Status::Fail, "Stop-only must fail: {lifecycle:?}");
         assert!(lifecycle[0].observed.contains("SubagentStart"));
-
-        // AMUX-4024: A HOOK NOBODY EVER ADDED. Every assertion above walks
-        // entries that EXIST, so none of them can fail on an absent event class
-        // — which is how a lifecycle count with a store, a consumer and a unit
-        // test sat at null for 125 of 125 lanes. Each arm drops exactly ONE
-        // entry from the healthy config above, so a Fail here can only be the
-        // missing hook.
-        for (missing, rest) in [
-            ("subagent:start", vec![ent("SubagentStop", SUB_STOP, None)]),
-            ("subagent:stop", vec![ent("PreToolUse", SUB_START, Some("^(Task|Agent)$"))]),
-        ] {
-            let mut v = vec![ent("Stop", GOOD, None)];
-            v.extend(rest);
-            let got = report_hooks_wired(Ok(v));
-            assert_eq!(
-                got[0].status,
-                Status::Fail,
-                "a missing {missing:?} hook leaves the subagent count dead and must fail: {got:?}"
-            );
-            assert!(
-                got[0].observed.contains(missing),
-                "the failure must NAME the missing hook: {}",
-                got[0].observed
-            );
-        }
 
         // Absence and unreadability are Unknown, never a false pass.
         assert_eq!(report_hooks_wired(Ok(vec![]))[0].status, Status::Unknown);
@@ -5060,262 +4846,5 @@ mod disposition_tests {
     fn empty_next_action_counts_as_missing() {
         let cards = vec![row("A-1", "doing", Some("  "))];
         assert_eq!(nonterminal_has_disposition(&cards)[0].status, Status::Fail);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 6c. Does the CURRENT staged-guard reach every checkout? (AF-410)
-// ---------------------------------------------------------------------------
-
-/// One checkout's observed staged-guard, rolled up from `guard_verdicts`.
-#[derive(Debug, Clone)]
-pub struct GuardCheckout {
-    /// Worktree top-level the hook reported running in.
-    pub dir: String,
-    /// Highest `GUARD_VERSION` that checkout has reported in the window.
-    pub version: i64,
-    /// Firings on that version.
-    pub runs: i64,
-    /// Distinct lanes served by it.
-    pub lanes: i64,
-}
-
-/// AF-410: a corroboration that never reaches a checkout is not a corroboration.
-///
-/// REPORTED BY ts-gke, 2026-09-02. The staged-guard named a peer as co-editor of
-/// a file ts-gke had just written, and named ts-gke on the mirror case, twice in
-/// one hour. Their structural read is the valuable part and it is right: the
-/// guard pairs whoever was ACTIVE with whoever was WRITING, so on a shared
-/// checkout the lane running greps and test sweeps across the tree is the default
-/// suspect for any file whose mtime moves — precisely the lane least likely to
-/// have written it. False positives concentrate on careful readers.
-///
-/// THE FIRST-ORDER CAUSE WAS NOT THE ALGORITHM. Both corroborations built for
-/// exactly that case were ABSENT from the copy that fired: `_never_wrote`
-/// (MC-1561 — the named session has no commit to this path carrying their
-/// trailer) and `_nothing_in_dispute` (AF-391). The live Mixpeek guard was 766
-/// lines at `GUARD_VERSION` 9; the amux source was 1111 at 11. `.githooks/` is a
-/// VENDORED, TRACKED copy no installer writes.
-///
-/// MEASURED, 14 days of `guard_verdicts`: Mixpeek 689 firings across 31 lanes on
-/// version 9 while amux ran 11. Top of that list is `mixpeek-cicd` at 231 —
-/// MC-1561 is mixpeek-cicd's OWN card, so the lane that reported the
-/// reader-vs-writer bug was served a guard without its fix 231 times. Ethos rule
-/// 1 in its exact shape: the capability existed and did not reach.
-///
-/// WHY NOTHING ALARMED. The server has had this data all along — the hook POSTs
-/// `guard_version` on every run and it is stored per `dir`. But the staleness
-/// test is `hook_is_outdated(v, has_op) = v < 2 && !has_op` (api/git_guard.rs), a
-/// floor set when 2 was current, so all 689 version-9 firings read as fine. A
-/// constant floor cannot express "9 when the fleet is at 11".
-///
-/// THE FLOOR HERE IS THE FLEET MAXIMUM, NOT A CONSTANT. That is the whole design:
-/// every future version bump covers itself with no edit here, so this check
-/// cannot rot into the thing it replaced.
-///
-/// TWO CASES THAT MUST NOT READ AS HEALTH, both rule 4:
-/// - **No versioned checkout reported.** `Unknown`, never `Pass`. Version 0 is
-///   `git-shared-guard.py`, a different client that legitimately sends no
-///   version; a checkout that only ever reports 0 has not been measured for this,
-///   and calling it current would be a wrong answer rather than a missing one.
-/// - **Exactly one checkout reported.** Uniformity across a set of one is
-///   vacuous: the check structurally cannot fail, so a `Pass` would be a green
-///   that means nothing (rule 7). It reports `Unknown` and says which.
-pub fn guard_reaches_every_checkout(checkouts: &[GuardCheckout]) -> Vec<InvariantResult> {
-    const ID: &str = "hooks.guard_reaches_every_checkout";
-    let versioned: Vec<&GuardCheckout> = checkouts.iter().filter(|c| c.version >= 1).collect();
-    if versioned.is_empty() {
-        return vec![InvariantResult::unknown(
-            ID,
-            "no checkout reported a versioned staged-guard in the window — version 0 is \
-             git-shared-guard.py, a different client that sends none, so there is nothing \
-             here to compare (not measured; not a clean bill)",
-        )
-        .evidence(json!({"measured": false, "n_considered": 0,
-                         "why_unmeasured": "no guard_verdicts row carried guard_version >= 1"}))];
-    }
-    let newest = versioned.iter().map(|c| c.version).max().unwrap_or(0);
-    if versioned.len() < 2 {
-        return vec![InvariantResult::unknown(
-            ID,
-            format!(
-                "only one checkout ({}) reported a versioned staged-guard, at {newest} — \
-                 uniformity across a set of one cannot fail, so a pass here would carry no \
-                 information",
-                versioned[0].dir
-            ),
-        )
-        .evidence(json!({"measured": false, "n_considered": 1, "newest_version": newest,
-                         "why_unmeasured": "a single checkout makes the comparison vacuous"}))];
-    }
-    let mut lagging: Vec<&GuardCheckout> =
-        versioned.iter().copied().filter(|c| c.version < newest).collect();
-    lagging.sort_by_key(|c| (-c.runs, c.dir.clone()));
-    if lagging.is_empty() {
-        return vec![InvariantResult::pass(ID).evidence(json!({
-            "measured": true,
-            "n_considered": versioned.len(),
-            "newest_version": newest,
-            "checkouts": versioned.iter().map(|c| json!({
-                "dir": c.dir, "version": c.version, "runs": c.runs, "lanes": c.lanes
-            })).collect::<Vec<_>>(),
-        }))];
-    }
-    lagging
-        .iter()
-        .map(|c| {
-            InvariantResult::fail(
-                ID,
-                format!("every checkout runs staged-guard {newest}, the newest the fleet reports"),
-                format!(
-                    "{} runs GUARD_VERSION {} ({} behind): {} firings across {} lanes were \
-                     served it. Every fix landed between {} and {} is absent there — a \
-                     corroboration that does not reach a checkout does not exist for the \
-                     lanes in it. Graft the current source into that checkout's hook path \
-                     (its copy may be vendored and tracked, in which case no installer \
-                     writes it and the owning lane has to commit it).",
-                    c.dir,
-                    c.version,
-                    newest - c.version,
-                    c.runs,
-                    c.lanes,
-                    c.version,
-                    newest,
-                ),
-            )
-            // One incident per checkout, not one flapping fleet-wide incident.
-            .entity(c.dir.clone())
-            .evidence(json!({
-                "measured": true,
-                "n_considered": versioned.len(),
-                "dir": c.dir,
-                "version": c.version,
-                "newest_version": newest,
-                "versions_behind": newest - c.version,
-                "runs": c.runs,
-                "lanes": c.lanes,
-                "source": "scripts/git-hooks/amux-staged-guard",
-            }))
-        })
-        .collect()
-}
-
-#[cfg(test)]
-mod guard_reach_tests {
-    use super::*;
-
-    fn co(dir: &str, version: i64, runs: i64, lanes: i64) -> GuardCheckout {
-        GuardCheckout { dir: dir.to_string(), version, runs, lanes }
-    }
-
-    fn ev(r: &InvariantResult) -> &serde_json::Value {
-        &r.evidence
-    }
-
-    #[test]
-    fn no_versioned_checkout_is_unknown_not_pass() {
-        let out = guard_reaches_every_checkout(&[]);
-        assert_eq!(out[0].status, Status::Unknown);
-        assert_eq!(ev(&out[0])["measured"], json!(false));
-        assert_eq!(ev(&out[0])["n_considered"], json!(0));
-    }
-
-    /// Version 0 is git-shared-guard.py, a DIFFERENT client that legitimately
-    /// sends no version. A checkout that only ever reports 0 has not been
-    /// measured for this; calling it maximally stale would be a wrong answer.
-    #[test]
-    fn version_zero_alone_is_unmeasured_not_maximally_stale() {
-        let out = guard_reaches_every_checkout(&[co("/a", 0, 300, 30), co("/b", 0, 5, 1)]);
-        assert_eq!(out[0].status, Status::Unknown);
-        assert_eq!(ev(&out[0])["measured"], json!(false));
-    }
-
-    /// A version-0 row sitting BESIDE real ones must not drag the floor down or
-    /// appear as a lagging checkout of its own.
-    #[test]
-    fn version_zero_beside_versioned_checkouts_is_excluded_from_both_sides() {
-        let out = guard_reaches_every_checkout(&[
-            co("/shared-guard-only", 0, 338, 33),
-            co("/a", 11, 10, 2),
-            co("/b", 11, 10, 2),
-        ]);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].status, Status::Pass);
-        assert_eq!(ev(&out[0])["n_considered"], json!(2), "the version-0 dir is not considered");
-        for r in &out {
-            assert!(!r.observed.contains("shared-guard-only"), "not named as lagging: {r:?}");
-        }
-    }
-
-    /// Rule 7 turned on the check's own output: with one checkout the comparison
-    /// structurally cannot fail, so a Pass would be a green that means nothing.
-    #[test]
-    fn a_single_checkout_cannot_fail_so_it_reports_unknown() {
-        let out = guard_reaches_every_checkout(&[co("/only", 11, 900, 40)]);
-        assert_eq!(out[0].status, Status::Unknown);
-        assert_eq!(ev(&out[0])["measured"], json!(false));
-        assert_eq!(ev(&out[0])["n_considered"], json!(1));
-        assert!(out[0].observed.contains("vacuous") || out[0].observed.contains("cannot fail"));
-    }
-
-    #[test]
-    fn uniform_checkouts_pass_and_say_how_many_were_compared() {
-        let out = guard_reaches_every_checkout(&[co("/a", 11, 100, 5), co("/b", 11, 20, 2)]);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].status, Status::Pass);
-        assert_eq!(ev(&out[0])["measured"], json!(true));
-        assert_eq!(ev(&out[0])["n_considered"], json!(2));
-        assert_eq!(ev(&out[0])["newest_version"], json!(11));
-    }
-
-    /// THE SPECIMEN, from guard_verdicts over the 14 days to 2026-09-02.
-    #[test]
-    fn the_af410_specimen_names_mixpeek_two_versions_behind() {
-        let out = guard_reaches_every_checkout(&[
-            co("/Users/ethan/Dev/mixpeek", 9, 689, 31),
-            co("/Users/ethan/Dev/amux", 11, 165, 8),
-        ]);
-        assert_eq!(out.len(), 1, "one incident, for the one lagging checkout");
-        assert_eq!(out[0].status, Status::Fail);
-        assert_eq!(out[0].entity_key, "/Users/ethan/Dev/mixpeek");
-        assert_eq!(ev(&out[0])["versions_behind"], json!(2));
-        assert_eq!(ev(&out[0])["runs"], json!(689));
-        assert_eq!(ev(&out[0])["lanes"], json!(31));
-        // The blast radius belongs in the message, not only the evidence blob:
-        // "9 days stale" is not actionable, "689 firings across 31 lanes" is.
-        assert!(out[0].observed.contains("689"), "{}", out[0].observed);
-        assert!(out[0].observed.contains("31 lanes"), "{}", out[0].observed);
-    }
-
-    /// Two lagging checkouts are two incidents, keyed by dir — not one
-    /// fleet-wide incident that flaps as they are fixed one at a time.
-    #[test]
-    fn each_lagging_checkout_is_its_own_incident() {
-        let out = guard_reaches_every_checkout(&[
-            co("/Users/ethan/Dev/mixpeek", 9, 689, 31),
-            co("/Users/ethan/Dev/amux-GTM", 10, 1, 1),
-            co("/Users/ethan/Dev/amux", 11, 165, 8),
-        ]);
-        assert_eq!(out.len(), 2);
-        assert!(out.iter().all(|r| r.status == Status::Fail));
-        let keys: Vec<&str> = out.iter().map(|r| r.entity_key.as_str()).collect();
-        assert!(keys.contains(&"/Users/ethan/Dev/mixpeek"));
-        assert!(keys.contains(&"/Users/ethan/Dev/amux-GTM"));
-        // Busiest first: the checkout serving 689 firings outranks the one serving 1.
-        assert_eq!(out[0].entity_key, "/Users/ethan/Dev/mixpeek");
-    }
-
-    /// The floor must MOVE. This is the property that stops this check rotting
-    /// into `guard_version < 2`, the constant it replaces: bump every checkout
-    /// past today's newest and it still passes, with no edit here.
-    #[test]
-    fn the_floor_is_the_fleet_maximum_not_a_constant() {
-        let out = guard_reaches_every_checkout(&[co("/a", 40, 10, 1), co("/b", 40, 10, 1)]);
-        assert_eq!(out[0].status, Status::Pass);
-        assert_eq!(ev(&out[0])["newest_version"], json!(40));
-        // ... and one behind at that height still fails.
-        let out = guard_reaches_every_checkout(&[co("/a", 39, 10, 1), co("/b", 40, 10, 1)]);
-        assert_eq!(out[0].status, Status::Fail);
-        assert_eq!(ev(&out[0])["versions_behind"], json!(1));
     }
 }

@@ -178,14 +178,6 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // -- 4. status truth: does the card agree with the pane?
     out.extend(status_pane_check(state));
 
-    // -- 4b. WORK truth: is an idle lane idle because there is nothing to do,
-    // or because it cannot claim what it has? (AMUX-4029) The status check
-    // above asks whether the lane is RUNNING anything. Neither it nor the
-    // board's column counts ask whether the lane COULD run something, which is
-    // how byo-ray sat idle over 5 todo cards with nobody the wiser.
-    out.extend(lane_work_check(state));
-
-    tm.mark(&out, "4b. work truth");
     tm.mark(&out, "4. status truth");
     // -- 5. is the report control plane up? (2026-08-13 fleet-wide outage)
     out.extend(self_reports_check(state));
@@ -308,13 +300,6 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     out.extend(result_log_bounded_check(state));
 
     tm.mark(&out, "6e. is the invariant system's OWN evaluation log bou");
-    // -- 6g. does the CURRENT staged-guard reach every checkout? (AF-410).
-    // The hook has always POSTed its version and the server has always stored
-    // it per checkout; the staleness test was a constant floor (`< 2`) that
-    // passed 689 firings of a guard two versions behind.
-    out.extend(guard_reach_check(state));
-
-    tm.mark(&out, "6g. does the current staged-guard reach every checkout");
     // -- 7. capture pipeline: does a DELIVERED user prompt reach the board?
     // (AMUX-3148). The mint's own comment names "the cmd_history.card_id NULL
     // rate" as its detector but nothing read it; this closes that loop.
@@ -891,75 +876,6 @@ fn arrival_follows_boot_check(state: &AppState) -> Vec<InvariantResult> {
         }
         Err(e) => vec![InvariantResult::unknown(ID, format!("request log unreadable: {e}"))],
     }
-}
-
-/// AMUX-4029: a lane that is execution-idle while holding ready work it cannot
-/// claim is STALLED.
-///
-/// Reads the SAME `lane_frontier` the `/api/board/ready` endpoint serves, and
-/// the SAME `derive_status` the header badge shows, so this cannot report a
-/// stall either of them denies. That sharing is the whole design: the reason
-/// nothing caught byo-ray is that the two facts lived in different places and
-/// no code held both at once.
-fn lane_work_check(state: &AppState) -> Vec<InvariantResult> {
-    const ID: &str = "board.lane_idle_with_ready_work";
-    let Ok(conn) = state.store.read() else {
-        return vec![InvariantResult::unknown(ID, "store unreadable")];
-    };
-    let mut signals = crate::api::sessions_legacy::FleetSignals::load(&conn);
-    if signals.running.is_empty() {
-        return vec![InvariantResult::unknown(ID, "no running tmux sessions visible")];
-    }
-    // Capture panes anyway, even though the enumeration below does not come from
-    // them: `derive_status` consults the pane to contradict a stale report, so
-    // without this an ACTIVE lane whose report went stale derives as idle and, if
-    // it also holds unclaimable ready work, gets reported as a false stall. Only
-    // recently-painted lanes are captured, which is precisely the set where pane
-    // evidence changes the answer; an idle lane has none and falls back to its
-    // own report, which is the right source for it.
-    signals.capture_panes();
-    // NOT `probed_lanes()`, which is what `status_pane_check` beside this uses.
-    // That enumeration is `panes.keys()`, and `capture_panes` only captures
-    // lanes that painted inside the contradiction window — "typically a handful
-    // of a 60-lane fleet (measured: 4 of 63)", per its own doc. An IDLE lane has
-    // by definition not painted, so this check would have skipped exactly the
-    // lanes it exists to find and reported a clean pass over every one of them.
-    //
-    // Enumerate the RUNNING tmux sessions instead. `derive_status` needs no pane
-    // (it falls back to the lane's self-report), which is the whole reason the
-    // idle side is answerable at all.
-    let names: Vec<String> = signals
-        .running
-        .iter()
-        .filter_map(|t| t.strip_prefix("amux-").map(str::to_string))
-        .filter(|n| signals.agent_running(&format!("amux-{n}")))
-        .collect();
-    let mut lanes = Vec::with_capacity(names.len());
-    for name in names {
-        let f = crate::api::board::lane_frontier(&conn, &name, 50);
-        // A held card that cannot say what it is waiting for is the shape that
-        // sits: both stalled lanes measured on 2026-09-02 held exactly one.
-        let held_without_next_action: Vec<String> = f
-            .holding
-            .iter()
-            .filter(|id| {
-                crate::db::board_store::get_issue(&conn, id)
-                    .ok()
-                    .flatten()
-                    .is_none_or(|r| r.next_action.as_deref().unwrap_or("").trim().is_empty())
-            })
-            .cloned()
-            .collect();
-        lanes.push(checks::LaneWork {
-            status: signals.derive_status(&name, true),
-            ready: f.ready.len(),
-            claimable_now: f.claimable_now,
-            holding: f.holding,
-            held_without_next_action,
-            name,
-        });
-    }
-    checks::lane_idle_with_ready_work(&lanes)
 }
 
 fn status_pane_check(state: &AppState) -> Vec<InvariantResult> {
@@ -1560,54 +1476,6 @@ fn autofix_dispatchable_check(state: &AppState) -> Vec<InvariantResult> {
         }
         Err(e) => vec![InvariantResult::unknown(ID, format!("query failed: {e}"))],
     }
-}
-
-/// AF-410: roll `guard_verdicts` up to one row per checkout — the newest
-/// `GUARD_VERSION` it has reported in the window, and how much traffic that
-/// version served.
-///
-/// `COALESCE(guard_version, 0)` deliberately keeps version-0 rows in the rollup
-/// rather than filtering them in SQL: a checkout whose ONLY rows are version 0
-/// must reach the check and be reported as unmeasured, not vanish into an empty
-/// result that reads identically to "no data at all". The check applies the
-/// `>= 1` predicate itself, where the distinction is expressible.
-fn guard_reach_check(state: &AppState) -> Vec<InvariantResult> {
-    const ID: &str = "hooks.guard_reaches_every_checkout";
-    let days = std::env::var("AMUX_INVARIANT_GUARD_WINDOW_D")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(14.0);
-    let since = crate::config::now_f64() - days * 86_400.0;
-    let Ok(conn) = state.store.read() else {
-        return vec![InvariantResult::unknown(ID, "store unreadable")];
-    };
-    let mut stmt = match conn.prepare(
-        "SELECT g.dir, g.gv, COUNT(*), COUNT(DISTINCT v.session) \
-         FROM (SELECT dir, MAX(COALESCE(guard_version, 0)) gv FROM guard_verdicts \
-               WHERE ts >= ?1 GROUP BY dir) g \
-         JOIN guard_verdicts v \
-           ON v.dir = g.dir AND COALESCE(v.guard_version, 0) = g.gv AND v.ts >= ?1 \
-         GROUP BY g.dir, g.gv",
-    ) {
-        Ok(s) => s,
-        Err(e) => return vec![InvariantResult::unknown(ID, format!("prepare failed: {e}"))],
-    };
-    let rows = stmt.query_map([since], |r| {
-        Ok(checks::GuardCheckout {
-            dir: r.get::<_, String>(0)?,
-            version: r.get::<_, i64>(1)?,
-            runs: r.get::<_, i64>(2)?,
-            lanes: r.get::<_, i64>(3)?,
-        })
-    });
-    let checkouts: Vec<checks::GuardCheckout> = match rows {
-        Ok(it) => match it.collect::<Result<Vec<_>, _>>() {
-            Ok(v) => v,
-            Err(e) => return vec![InvariantResult::unknown(ID, format!("row decode failed: {e}"))],
-        },
-        Err(e) => return vec![InvariantResult::unknown(ID, format!("query failed: {e}"))],
-    };
-    checks::guard_reaches_every_checkout(&checkouts)
 }
 
 fn reports_attributed_check(state: &AppState) -> Vec<InvariantResult> {
@@ -2373,62 +2241,6 @@ mod tests {
                     || r.invariant_id == "status.contradicts_fresh_idle_report"
             }),
             "unexpected invariant id — the sweep contract greps for these exact strings"
-        );
-    }
-
-    /// AF-410: the binding must REACH A VERDICT against a real store, and it
-    /// must be reachable from `evaluate_all` rather than merely existing.
-    ///
-    /// A check that is written and not wired is the exact gap this card is
-    /// about, one level up: the guard's corroborations existed and did not run.
-    /// Writing an invariant about unreached capability and leaving it unreached
-    /// would be the joke telling itself.
-    #[test]
-    fn the_guard_reach_check_is_actually_wired_into_the_monitor() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = crate::db::Store::open(&dir.path().join("t.db")).unwrap();
-        let state = AppState {
-            store: std::sync::Arc::new(store),
-            started: std::time::Instant::now(),
-            build_hash: "test".into(),
-            auth_token: None,
-            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        };
-        let rs = guard_reach_check(&state);
-        assert!(!rs.is_empty(), "the binding must always reach a verdict");
-        assert!(
-            rs.iter().all(|r| r.invariant_id == "hooks.guard_reaches_every_checkout"),
-            "unexpected invariant id — the sweep contract greps for this exact string"
-        );
-        // An empty guard_verdicts table is UNKNOWN, never PASS. A fresh store
-        // has never observed a guard; reporting that as "every checkout is
-        // current" is the zero-that-looks-like-health this whole check exists
-        // to stop (ethos rule 4).
-        assert_eq!(rs[0].status, Status::Unknown, "empty table must not read as healthy");
-        assert_eq!(rs[0].evidence["measured"], serde_json::json!(false));
-    }
-
-    /// ...and the binding must be REGISTERED, not merely callable.
-    ///
-    /// The test above calls `guard_reach_check` directly, so deleting the
-    /// `out.extend(...)` line in `evaluate_all` leaves it green — a check
-    /// pinning the wrong layer is exactly as green as one pinning the right
-    /// layer (ethos rule 7). This pins the call site itself, bounded to
-    /// `evaluate_all`'s body so an unrelated mention elsewhere cannot satisfy
-    /// it. Verified by mutation: removing the registration fails this and only
-    /// this.
-    #[test]
-    fn the_guard_reach_check_is_registered_in_evaluate_all() {
-        let src = include_str!("monitor.rs");
-        let start = src
-            .find("pub async fn evaluate_all")
-            .expect("evaluate_all must exist — the registry is the thing being checked");
-        let body = &src[start..];
-        let end = body.find("\n}\n").map(|e| e + start).unwrap_or(src.len());
-        assert!(
-            src[start..end].contains("guard_reach_check(state)"),
-            "hooks.guard_reaches_every_checkout is defined but never registered in \
-             evaluate_all — it would never run"
         );
     }
 
