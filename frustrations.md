@@ -2955,6 +2955,39 @@ FIX: no tooling proposed, deliberately. `mutate.sh seams` and `survey` both answ
   minutes; all three took a DIFFERENT SOURCE, not more care with the same one.
   Logged rather than built because I do not have a mechanism and would rather say so than
   ship a checklist item that joins the prose nobody enforces.
+INSTANCE 4, and it is MINE, produced inside the card for this entry within the hour. Having
+  written "no mechanism proposed", I built one: group the request log by family, flag any
+  family that was called and never returned 2xx. It reported ONE finding across 89 families
+  and looked clean and cheap. /api/workers was not in it — the family reports 4,016 of 4,394
+  succeeding, because /api/workers/{id}/<verb> is 4,006/4,368 while /api/workers/{id} itself
+  is 1/17. So the detector I wrote to catch instance 2 answered CORRECTLY at the granularity
+  I chose and could not have found instance 2. A pass from it would have felt like evidence
+  that AF-290's premise was fine. Re-run by ROUTE SHAPE it finds the defect immediately:
+  713 shapes -> 9 candidates -> 1 survives a "is it actually mounted" filter, which is
+  `GET /api/workers/{id}` at 0/15. Predicate and blind spots recorded on AF-298.
+INSTANCE 5, from mixpeek-cicd, applying this entry to their own work an hour after reading
+  it — and it sharpens the entry's own remedy rather than repeating it. They had pinned a
+  config file with an assertion that the line above a key STARTS WITH `#`. `# TODO: revisit
+  this setting` satisfies it, while the comment's actual job is to stop a future editor from
+  restoring pytest defaults and silently deleting 49 tests. A comment-EXISTS check wearing
+  comment-ANSWERS clothes.
+  THE PART THAT CHANGES HOW I WORK: they had mutation-tested it. Their mutation DELETED the
+  comment, which the weak assertion already caught, so the mutation passed and told them
+  nothing. Their words: "A mutation is derived from the same understanding as the assertion,
+  so it inherits the same blind spot by default. Mine was not a second derivation, it was the
+  first one run backwards."
+  That lands directly on this session, which has treated a killed mutation as proof roughly
+  twenty times today. A killed mutation proves the assertion catches THE FAILURE I IMAGINED.
+  It says nothing about the failure I did not. Their tell is the cheap version and it costs
+  one sentence: STATE A MUTATION THE ASSERTION SHOULD CATCH AND DOES NOT. If you cannot
+  generate one, that is a fact about your imagination, not about the assertion.
+  Applied immediately to instance 4's own predicate before proposing it, which produced four
+  blind spots I would otherwise have shipped silently — the worst being that it keys on
+  STATUS, so a route answering 200 with an error body passes it, across 1,646,523 2xx rows
+  nothing inspects for that shape.
 NOTE: distinct from AF-435 (checks that ran, passed and could not have failed). That one is
   about an instrument with no discriminating power. This is about an instrument that
   discriminated CORRECTLY and a human generalising the wrong invariant from the result.
+  Instances 4 and 5 are the bridge between them: a check with real discriminating power, at
+  the wrong granularity or over the wrong property, produces a TRUE result that supports a
+  false conclusion — and a mutation drawn from the same understanding confirms it.
