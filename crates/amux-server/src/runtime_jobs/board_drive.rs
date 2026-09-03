@@ -9617,6 +9617,61 @@ mod tests {
     }
 
     /// And the real verbs must pass, so the check is not simply always-panicking.
+    /// THE PROSE THAT DOCUMENTS THIS FLAG MUST NAME THE REAL KEY (AF-449).
+    ///
+    /// AMUX-4055 shipped this switch on 2026-09-02 at 22:00, default off, named
+    /// in no prompt, no doc and no nudge text. Within eleven hours Ethan asked
+    /// for it 23 times across BOTH repos — "there should be an environment
+    /// variable in the scope" — for a switch that already existed. The friction
+    /// sweep measured that at n=23 against a 0.54/day baseline with
+    /// `prose_exists: false`.
+    ///
+    /// The fix was a paragraph in ~/.claude/CLAUDE.md, and a paragraph naming a
+    /// constant is exactly the unenforceable prose the friction-themes contract
+    /// warns about: rename the key and the documentation silently becomes a lie
+    /// pointing at a variable nothing reads. So the doc is checked against the
+    /// CONSTANT rather than against a copy of its text.
+    ///
+    /// ABSENT IS REPORTED, NOT PASSED. The global prompt is per-machine and is
+    /// legitimately missing on a cloud image, so this cannot fail there — but a
+    /// silent skip is how a check stops covering anything without saying so, and
+    /// this file's own signal is that unnamed capabilities reach nobody. It
+    /// prints why it could not measure.
+    #[test]
+    fn the_global_prompt_names_the_real_backlog_dispatch_key() {
+        let Some(home) = std::env::var_os("HOME") else {
+            println!("UNMEASURED: no HOME, cannot locate the global prompt");
+            return;
+        };
+        let p = std::path::Path::new(&home).join(".claude/CLAUDE.md");
+        let Ok(txt) = std::fs::read_to_string(&p) else {
+            println!("UNMEASURED: {} is absent (expected on a cloud image); \
+                      the key/doc agreement is UNCHECKED on this box, not confirmed",
+                     p.display());
+            return;
+        };
+        assert!(
+            txt.contains(DISPATCH_BACKLOG_KEY),
+            "~/.claude/CLAUDE.md documents backlog dispatch but does not name {DISPATCH_BACKLOG_KEY}. \
+             Either the key was renamed and the prose now points at a variable nothing reads, or the \
+             paragraph was dropped — both leave the capability unnameable, which is the state \
+             AMUX-4055 was in for eleven hours while Ethan asked for it 23 times."
+        );
+        // The CONTROL. Asserting only "the key appears" would pass on a file
+        // that mentions it in passing, so require the sentence that makes it
+        // actionable: that `backlog` is not dispatched by default.
+        // Case-INSENSITIVE: the property is that the behaviour is stated, not
+        // that it is stated in lower case. Pinning the exact casing is the
+        // hand-typed-fixture trap one level down — the first version of this
+        // cell failed on "NOT dispatched by default", which says the same thing.
+        let lower = txt.to_lowercase();
+        assert!(
+            lower.contains("backlog") && lower.contains("not dispatched by default"),
+            "the key is named but the behaviour it changes is not stated; a reader learns the \
+             variable exists and not what it is for"
+        );
+    }
+
     #[test]
     fn the_real_board_verbs_are_accepted() {
         assert_cli_verbs_exist("amux board show X, amux board done X, amux board reviewer X y");
