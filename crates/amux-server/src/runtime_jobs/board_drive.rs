@@ -4606,23 +4606,21 @@ fn needsyou_renag_text(
             |r| r.get(0),
         )
         .unwrap_or(0.0);
+    // Cooldown only: once re-nagged, stay quiet for one window. `last_ts=0` (never
+    // re-nagged) falls through and fires — the first reminder should.
     if last_ts > 0.0 && (now - last_ts) < win {
         return None;
     }
-    if last_ts > 0.0 {
-        let updated: f64 = conn
-            .query_row(
-                "SELECT COALESCE(updated,0) FROM issues WHERE id=?1",
-                rusqlite::params![card],
-                |r| r.get::<_, f64>(0),
-            )
-            .unwrap_or(0.0);
-        if updated > last_ts {
-            // Re-stated since we last asked: that IS the remedy the message
-            // prescribes. Say nothing this round.
-            return None;
-        }
-    }
+    // REMOVED (AF-465): the `updated > last_ts` "re-stated since we last asked, say
+    // nothing" check. It made re-statement a silence lever, which is the abuse
+    // vector the decision closed — a lane could keep a human's ask quiet forever by
+    // touching the card every window, and the `updated` bump fired on ANY desc
+    // write, not a deliberate re-statement. It also silenced only AFTER the first
+    // re-nag (last_ts>0), so the escape the old text advertised did not work the
+    // one time a lane tried it (AF-111). Keep MIN(added_at) as the monotonic ask
+    // clock and the cooldown above; re-statement no longer silences. The nudge now
+    // fires once per window until the HUMAN answers or the ask is cleared as
+    // overtaken — loud nagging over quiet suppression, per the decision.
     let days = (asked_age / 86400.0) as i64;
     let arch = if archived != 0 {
         "This card is ARCHIVED, which does NOT clear the ask — needs:you stays visible to the \
@@ -4630,12 +4628,26 @@ fn needsyou_renag_text(
     } else {
         ""
     };
+    // The old text promised "Re-state it on the card (silences this for Nd)".
+    // That was false, measured on AF-111 (AF-465): re-statement is meant to
+    // silence via the `updated > last_ts` check above, but that check is gated on
+    // `last_ts > 0`, so the FIRST re-nag skips it and fires regardless — which is
+    // exactly when a lane tries the escape. It is also unreliable after, since any
+    // desc write bumps `updated`. So we no longer tell the lane an action it
+    // cannot rely on. A needs:you card is waiting on the HUMAN (the age-gate above
+    // says as much: "the human owes the answer, not the lane"), and the ONE thing
+    // the lane can actually do is clear an OVERTAKEN ask — which is the drain that
+    // keeps needs:you from accreting. We do NOT claim the owner is reminded
+    // elsewhere: whether the owner digest carries needs:you cards is unverified in
+    // this file, so promising it here would be the same assert-without-reading the
+    // old line was. AF-465's full split (route the reminder to the owner digest,
+    // drop the lane nudge entirely) waits on confirming that producer.
     Some(format!(
-        "[amux] {card} needs:you for {days}d: {}\n\n\
-         {arch}Still the right question? Re-state it on the card (silences this for {}d). \
-         Overtaken? Clear needs:you and move the card.",
+        "[amux] {card} needs:you for {days}d — waiting on the HUMAN, not the lane: {}\n\n\
+         {arch}The only lane action here is if the ask is OVERTAKEN: clear needs:you and \
+         move the card. Re-stating does NOT silence this (it never reliably did — the first \
+         re-nag ignores it; AF-465).",
         quoted_card_text(&title.chars().take(90).collect::<String>(), card),
-        needsyou_renag_days() as i64
     ))
 }
 
@@ -8768,15 +8780,21 @@ mod tests {
         }
     }
 
-    /// py:12979: the message asks the lane to "re-state it on the card so it
-    /// resurfaces fresh". A card edited SINCE the last re-nag counts as
-    /// re-confirmed — a guard whose prescribed remedy cannot clear it teaches
-    /// sessions to ignore it.
+    /// AF-465 REVERSED the old py:12979 behaviour: re-stating a needs:you card no
+    /// longer silences the re-nag. Re-statement as a silence lever was an abuse
+    /// vector (a lane could keep a human's ask quiet forever by touching the card
+    /// each window, and any desc write tripped it), and it silenced only after the
+    /// first re-nag — so the escape the old text advertised did not work the one
+    /// time a lane tried it (AF-111). Now: MIN(added_at) is the monotonic ask
+    /// clock, the cooldown is the only silence, and a re-stated but still-open ask
+    /// past the window IS re-nagged.
     #[test]
-    fn re_stating_a_needs_you_card_resets_the_window() {
+    fn re_stating_a_needs_you_card_no_longer_silences_the_renag() {
         let conn = board_db();
         add_card(&conn, "D-1", "lane", "doing", "asked Ethan", "SCOPE: x");
         tag(&conn, "D-1", "needs:you", now_f64() - 10.0 * 86400.0);
+        // Last re-nag was a full window+ ago (cooldown expired), then the card was
+        // re-stated one minute after that fire.
         let renagged_at = now_f64() - 10.0 * 86400.0 + 1.0;
         conn.execute(
             "INSERT INTO session_events (ts,session,type,data,source) \
@@ -8789,9 +8807,21 @@ mod tests {
             rusqlite::params![(renagged_at + 60.0) as i64],
         )
         .expect("restate");
+        let text = needsyou_renag_text(&conn, "lane", "D-1", "t", 10.0 * 86400.0, 0, now_f64());
         assert!(
-            needsyou_renag_text(&conn, "lane", "D-1", "t", 10.0 * 86400.0, 0, now_f64()).is_none(),
-            "a re-stated ask must not be re-nagged"
+            text.is_some(),
+            "a re-stated ask past the cooldown MUST still be re-nagged (AF-465): re-statement is not a silence lever"
+        );
+        let text = text.unwrap();
+        // And the message must not promise the removed escape, nor claim an
+        // unverified owner-digest reminder.
+        assert!(
+            !text.contains("silences this"),
+            "the re-nag must not promise re-statement silences it: {text}"
+        );
+        assert!(
+            text.contains("OVERTAKEN"),
+            "the re-nag must keep the one real lane action — clear an overtaken ask: {text}"
         );
     }
 
