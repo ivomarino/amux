@@ -591,26 +591,31 @@ pub fn build(
         let list = tagged_list(&stale_paths);
         let whose_s = whose(&stale_paths);
         sections.push(format!(
-            "STALE: {n} {whose_s} under {dir} are OLDER than origin/main. Origin \
-             has commits on these paths that your local HEAD does not (this checkout is behind). \
-             DO NOT COMMIT them. `git add -A` or `git commit -a` would carry the older copy \
-             forward and SILENTLY REVERT origin (no conflict, the older file just wins, \
-             AMUX-3000):\n\
+            "STALE: {n} {whose_s} under {dir} are behind origin/main — origin has commits on \
+             these paths that your local HEAD does not. THAT IS A FACT ABOUT HISTORY, NOT ABOUT \
+             YOUR BYTES, and it does not tell you what to do with them:\n\
              {list}\
-             But do NOT blind-restore them either. Behind-on-history does not prove the \
+             RUN THE PER-PATH TEST FIRST. The two remedies are opposites and this label cannot \
+             pick between them — measured 2026-09-03 by general-canvas-apps and \
+             mixpeek-homepage-claude independently, FOUR OF FOUR paths carrying this label were \
+             NOVEL mid-edits a restore would have deleted, i.e. the answer was the opposite one \
+             every time. Two lanes reaching that verdict separately is why the test leads here \
+             now and the label does not.\n\
+             \x20 git log --all --oneline --find-object=$(git hash-object <path>) -- <path>\n\
+             PRINTS A COMMIT -> a genuine old copy. RESTORE it (`git checkout origin/main -- \
+             <path>`); do NOT commit it, because `git add -A` or `git commit -a` carries the \
+             older copy forward and SILENTLY REVERTS origin — no conflict, the older file just \
+             wins (AMUX-3000).\n\
+             ANYTHING ELSE -> DO NOT RESTORE; COMMIT the path instead. An empty result means \
+             this content is in no commit on any ref: a novel mid-edit a restore DELETES \
+             irreversibly (AMUX-3172/AMUX-3188; social-media caught 16 such paths whose \
+             worktree matched NEITHER local HEAD nor origin). An error, a timeout, or a result \
+             you cannot read is also DO-NOT-RESTORE, because a declined restore is recoverable \
+             and a deleted keystroke is not.\n\
+             The rest of this is why the obvious shortcut does not work. Behind-on-history does \
+             not prove the \
              worktree is a pure old copy: a path can be behind origin AND carry NOVEL \
-             uncommitted content (mid-edit), and `git checkout origin/main -- <path>` DELETES \
-             that novel work irreversibly (AMUX-3172/AMUX-3188; social-media caught 16 such \
-             paths whose worktree matched NEITHER local HEAD nor origin). PROVE the copy is a \
-             pure old revision per path BEFORE restoring: \
-             `git log --all --oneline --find-object=$(git hash-object <path>) -- <path>`. RESTORE \
-             (`git checkout origin/main -- <path>`) ONLY if it prints a commit: that means this \
-             exact content is reachable from a commit on some ref, so it is a genuine old copy and \
-             restoring loses nothing. ANY other outcome is DO-NOT-RESTORE, commit the path \
-             instead. An empty result means the content is in NO commit anywhere, a novel mid-edit \
-             a restore would DELETE; an error, a timeout, or a result you cannot read is also \
-             DO-NOT-RESTORE, because a declined restore is recoverable and a deleted keystroke is \
-             not. Do NOT substitute `git cat-file -e $(git hash-object <path>)`: `git add` (and \
+             uncommitted content, which is exactly the four-of-four case above. Do NOT substitute `git cat-file -e $(git hash-object <path>)`: `git add` (and \
              `git hash-object -w`) writes the blob into the object DB WITHOUT committing, so it \
              answers yes for a never-committed mid-edit and cannot separate a committed old copy \
              from novel work. It is strictly weaker than was-this-committed and its remedy here is \
@@ -3046,7 +3051,23 @@ mod tests {
         let msg = build("/repo", &dirty, &Ownership::default(), &fresh, "test-provenance")
             .expect("a stale file is worth warning about");
         assert!(msg.contains("git checkout origin/main -- "), "must give the RESTORE command: {msg}");
-        assert!(msg.contains("DO NOT COMMIT"), "must say not to commit the stale copy: {msg}");
+        // AF-336: "do not commit" is now CONDITIONAL, and that is the fix rather
+        // than a rewording. This arm used to OPEN with "DO NOT COMMIT them",
+        // while its own do-not-restore branch said "commit the path instead" —
+        // two opposite directives in one message, with the reader left to know
+        // which applied. Measured 2026-09-03 by general-canvas-apps and
+        // mixpeek-homepage-claude independently: FOUR OF FOUR paths carrying
+        // this label were novel mid-edits, i.e. the leading directive was the
+        // wrong one every time. So the don't-commit instruction now sits inside
+        // the branch where it is true.
+        assert!(
+            msg.contains("do NOT commit it") && msg.contains("SILENTLY REVERTS origin"),
+            "the don't-commit warning must survive, attached to the genuinely-stale branch: {msg}"
+        );
+        assert!(
+            msg.contains("COMMIT the path instead"),
+            "and the opposite branch must be present, since 4 of 4 measured paths needed it: {msg}"
+        );
         assert!(msg.contains("stale.rs"), "must name the stale path: {msg}");
         assert!(
             !msg.contains("uncommitted change(s)"),
@@ -3069,7 +3090,19 @@ mod tests {
         let fresh = Freshness { stale: s(&["stale.rs"]), ..Default::default() };
         let msg = build("/repo", &dirty, &Ownership::default(), &fresh, "test-provenance")
             .expect("a stale file is worth warning about");
-        assert!(msg.contains("do NOT blind-restore"), "must not prescribe an unconditional restore: {msg}");
+        // AF-336: the guard is no longer a caveat AFTER a directive, it is the
+        // FIRST instruction. "The label is the trap, the per-path test is the
+        // protocol" — so assert the ORDER, which is the property that changed.
+        let test_at = msg.find("--find-object=").expect("the per-path test must be present");
+        let restore_at = msg.find("git checkout origin/main -- ").expect("restore command present");
+        assert!(
+            test_at < restore_at,
+            "the per-path test must come BEFORE the restore command it gates: {msg}"
+        );
+        assert!(
+            msg.contains("RUN THE PER-PATH TEST FIRST"),
+            "and say so, since the label alone reads as an instruction: {msg}"
+        );
         assert!(msg.contains("mid-edit"), "must name the mid-edit case: {msg}");
         // The prove-it-first guard must be the reachable-from-a-commit test, and
         // the restore must be explicitly conditional on it printing a commit.
@@ -3077,9 +3110,19 @@ mod tests {
             msg.contains("--find-object=$(git hash-object <path>)"),
             "must give the reachable-from-a-commit guard, not blob existence: {msg}"
         );
+        // Same property, re-pinned in the restructured form: the restore is
+        // reachable ONLY inside the prints-a-commit branch, and the opposite
+        // branch explicitly refuses it. Asserting the gate's SHAPE rather than
+        // the old sentence, so a future rewording cannot pass this while
+        // detaching the remedy from its condition.
+        let prints_at = msg.find("PRINTS A COMMIT").expect("the positive branch must be labelled");
         assert!(
-            msg.contains("ONLY if it prints a commit"),
-            "the restore must be gated on the guard, never unconditional: {msg}"
+            prints_at < restore_at,
+            "the restore must sit INSIDE the prints-a-commit branch, never before it: {msg}"
+        );
+        assert!(
+            msg.contains("ANYTHING ELSE -> DO NOT RESTORE"),
+            "and every other outcome must refuse the restore explicitly: {msg}"
         );
         // The unsound recipe (AMUX-3264) must never be the prescribed check.
         assert!(
@@ -3095,7 +3138,7 @@ mod tests {
         let dirty = s(&["stale.rs", "new.rs"]);
         let fresh = Freshness { stale: s(&["stale.rs"]), new: s(&["new.rs"]), ..Default::default() };
         let msg = build("/repo", &dirty, &Ownership::default(), &fresh, "test-provenance").unwrap();
-        let stale_at = msg.find("are OLDER than origin/main").expect("stale block present");
+        let stale_at = msg.find("are behind origin/main").expect("stale block present");
         let commit_at = msg.find("uncommitted change(s)").expect("commit block present");
         assert!(stale_at < commit_at, "STALE must be rendered FIRST: {msg}");
         assert!(msg.contains("1 uncommitted change(s)"), "count MUST exclude the stale path: {msg}");
