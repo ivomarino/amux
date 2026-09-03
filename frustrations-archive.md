@@ -4113,3 +4113,184 @@ SYMPTOM: `error: extern location for serde_core does not exist: ~/.amux/rust-bui
   CLAUDE.md requires ONE shared build dir (~/.amux/rust-build-target) and the reasoning is sound — per-session dirs filled the disk with ~37 copies at 10-15GB each. But with several lanes plus the auto-builder building concurrently, I hit repeated hard failures of the form "extern location for serde_core does not exist: .../libserde_core-<hash>.rmeta" and 42 errors inside the `nix` crate, i.e. artifacts deleted underneath an in-flight build. Not a lock contention wait, which is what the CLAUDE.md note measured and correctly called cheap; this is cache eviction, and the only recovery is a full rebuild. Hit it three times in one session, roughly 4 minutes of rebuild each.
 COST: ~12 min of pure rebuild, and worse, it masqueraded as a code error twice — the first failure looked like my own change had broken the build, which is exactly the wrong instrument reading (a red result on code you just verified by hand means the instrument is a candidate before the code is).
 FIX: Not fixed; needs a decision, not a workaround. Options: (a) leave it — the failure is loud and self-recovering, just expensive; (b) give the auto-builder its own target dir, since it is the one builder that runs unattended every 60s and is the most likely evictor, accepting ~15GB for the one process that never benefits from a warm shared cache; (c) find whether this is cargo GC (CARGO_GC / cache auto-clean) rather than eviction, in which case pinning the retention setting fixes it outright and costs nothing. (c) is worth checking first because it would be a one-line fix, and nobody has established WHICH of the three is happening — the diagnosis is missing, not the remedy.
+
+## An archived entry came back through a merge, read as open, and got re-diagnosed from scratch
+VALIDATED: amux-frustrations | Self-validated; amux-frustrations is the originating session. The entry's claim was that scripts/frustrations-archive.py could not tell a resurrected title from a first retirement. That claim is fixed: the script checks the archive at the moment it writes and prints the prior-copy count, the reason resurrection happens, and the grep that surfaces the earlier VALIDATED line (frustrations-archive.py:349-354). Warning rather than refusal, deliberately, because a friction can honestly recur under one title.
+
+ARCHIVED WITH ITS OTHER HALF NAMED, so this does not read as the class being closed. This entry DIAGNOSED 7dbab8f6 correctly and fixed the archive path. It did not count or remove the population that commit created: 29 already-archived entries were still sitting in the live file reading STATUS: open when this entry was written. AF-430 removed them (6cb3bcc1) and added frustrations.retired_entries_stay_retired, a ledger-side invariant, because every guard this entry improved sits on the ARCHIVE path and a resurrection lands on the LEDGER. Read this entry as "the archive script now notices", not as "resurrection is solved".
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-frustrations
+CARD: AF-417
+SYMPTOM: I picked "A shared CARGO_TARGET_DIR is mandated..." out of the ledger as `STATUS:
+  open`, spent ~40 minutes diagnosing it from the builder log and git history, and reached
+  the disk-guard `rm -rf` with no in-flight check. Correct. It was also already archived on
+  2026-08-29 (53cafb92) with a VALIDATED line by the same session recording the SAME
+  conclusion, including cargo GC already ruled out on the same grounds. I only found out
+  because the archive then held two copies of the title and I went looking.
+  THE MECHANISM IS THE FILE, NOT THE READER. An archive move is a DELETION from
+  frustrations.md, and this file is merged across divergent branches. Counting copies at
+  each commit shows it oscillate: 53cafb92 correctly removed it; 7dbab8f6, a human "sync
+  frustrations.md to fork's current copy before push", put it back; merges 4216504b and
+  09dd5024 from feature/telegram-connector carried it onto main. A resurrected entry is
+  BYTE-IDENTICAL to a never-retired one — it reads open, its own FIX text still says the
+  work is undone, and the sign-off lives in a different file nobody greps before starting.
+  `git log -S` did not find the reintroduction either; only counting copies per commit did,
+  because the pickaxe follows one line of history and the resurrection came across a merge.
+COST: ~40 minutes re-deriving a retired conclusion, and it nearly cost more: I wrote the
+  result onto the wrong card (the entry's `CARD: AMUX-2936` is itself a mis-link — that card
+  is about the staged-file absorption window) and presented it as a new finding before
+  catching it. Two independent derivations agreeing is reassuring about the ANSWER and says
+  nothing good about the process. The general cost is worse than the minutes: every entry in
+  this ledger is a claim that work is outstanding, and a resurrected one is a false claim
+  that no reader can distinguish from a true one.
+FIX: 80bff64b + this commit. `scripts/frustrations-archive.py` now checks, at the moment it
+  writes, whether the title is ALREADY in frustrations-archive.md, and if so prints the
+  count of prior copies, the reason resurrection happens, and the grep that surfaces the
+  earlier VALIDATED line.
+  A WARNING, NOT A REFUSAL, deliberately. A friction can genuinely recur and be honestly
+  re-logged and re-retired under one title; refusing would be a gate with no truthful path
+  for that case (ethos rule 3). So it archives and says what it noticed.
+  `.claude/rules/frustrations.md` already warns about the mirror direction — do not
+  re-append something that merely LOOKS lost, grep the archive first, creative-dna measured
+  15 of 15 "lost" entries as archive moves. That rule asks a human to remember. This is the
+  same check run by the tool that has both files open anyway, which is rule 1: the guidance
+  existed and did not reach the moment it was needed.
+  VERIFIED by two cells against a fixture: a resurrected title warns and names 2 prior
+  copies; a novel title is SILENT and still archives. The control is the half that matters,
+  since a detector that fired on every archive would be worth nothing.
+
+---
+
+## A PATCH rejected for its status silently discards the desc sent in the same body
+VALIDATED: amux-frustrations | Self-validated; amux-frustrations is the originating session. Verified LIVE against the running server rather than from the diff, on a real card, just now:
+
+  PATCH /api/board/AF-433  {"status":"verified","desc_append":"probe: ..."}
+  -> blocked: True | discarded: ['desc_append']
+
+That is the whole complaint answered. Before, a PATCH refused for its status swallowed every other field in the same body and said nothing; the caller's desc was gone with a 200-shaped refusal and no way to learn it. The refusal now names the field it dropped, so the caller can resend it.
+
+The `discarded` key is emitted unconditionally, not only when something was dropped: the gate refusal on AF-430 earlier in this session returned `"discarded": []`, which is the arm that matters. A field that appears only when non-empty cannot be distinguished from a field the server forgot to compute (ethos rule 4).
+AREA: silent-partial
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-frustrations
+CARD: AF-413
+SYMPTOM: `PATCH /api/board/AF-410 {"desc": <4.2 KB>, "type": "code", "status": "doing"}`
+  answered `{"blocked": true, "error": "gate not acknowledged", ...}` with a full
+  `how_to_ack` block. The desc was discarded. Nothing in the 900-byte response mentions
+  it — every field describes the STATUS transition, and `desc` does not appear.
+  Re-measured deliberately on a throwaway card (AF-412, deleted), with a different
+  rejection reason to show it is the shape and not one gate:
+    PATCH {"desc": "CANARY-TEXT-SHOULD-IT-SURVIVE", "status": "doing"}
+    -> {"blocked": true, "error": "already holding doing"}
+    -> read back: status "todo", desc ''
+  Both rejection paths drop the whole body.
+COST: ~3 minutes and one silent loss of a 4.2 KB card body I had just composed. Cheap
+  here only because I read the card back out of habit. The failure is invisible to a
+  caller who does not: the write returns a 200-shaped JSON object, the error names a
+  DIFFERENT field than the one that was lost, and a card body is exactly the kind of
+  thing nobody re-reads after writing it. A script doing `{"desc":..., "status":...}`
+  in one call loses every desc for every card whose gate is unmet and reports nothing.
+FIX: Atomicity is defensible and I am not asking for a partial write. Say so in the
+  response: one `discarded` key listing the fields that were not applied because the
+  transition was refused (`"discarded": ["desc", "type"]`). The refusal already builds a
+  rich object; the caller cannot infer from `error: "gate not acknowledged"` that an
+  unrelated field went with it. Ethos rule 4 in its exact shape — the payload cannot
+  express what was and was not applied, so a wrong outcome is not detectable from what
+  the caller keeps.
+  THIS IS THE MIRROR OF AF-150, in the same AREA and worth counting with it. There, a
+  compound operation took its SUCCESS signal from the parts that worked while one part
+  silently did nothing. Here it takes its FAILURE signal from one part and silently
+  discards another. Same defect, opposite sign: the response describes one component of
+  a multi-part operation and is read as describing all of them. Three entries under
+  `AREA: silent-partial` is the argument that compound operations need a uniform
+  per-field outcome, not a per-operation verdict.
+
+  SHIPPED 87699f3c. The refusal now carries `discarded` (always present, including
+  empty — an absent key would mean a server that does not compute this, which a caller
+  cannot distinguish from "nothing was lost") plus a `discarded_note` when non-empty.
+  Decorated at the ONE arm every refusal converges on, PatchOut::Refused, rather than at
+  the 16 sites that build a refusal body: covering those would fix today's and miss the
+  next one, which is this bug's own shape.
+  BIGGER THAN THE CARD BODY THAT PROMPTED IT, though not in the way I first wrote.
+  CORRECTED same day: I claimed `amux board done --evidence-stdin` loses its evidence on a
+  gate refusal. It does NOT — the CLI writes evidence as its own PATCH before the
+  transition, and says why at the site ("409 rolls back the evidence too... do not fold
+  this into the status body"). My own fix disproved my claim: the refusal I hit closing
+  AF-411 came back `discarded: []`, not `["evidence"]`.
+  What is true is the API level: `PATCH {status, evidence}` discards the evidence, proven
+  by the HTTP test and live. Anyone calling the API directly loses it.
+  AND THE CORRECTED FORM IS THE STRONGER ARGUMENT. The CLI does not avoid this defect, it
+  CARRIES A HAND-BUILT WORKAROUND FOR IT at four separate sites (amux:1761, :1779, :1825,
+  :2272), each added after someone was bitten on a different field — evidence, the typed
+  ask, the outcome, and a fourth. The comment at :1761 says so: "AC-323's shape, now on a
+  fourth field". Four independent discoveries of one silent behaviour, each paid for
+  separately and patched locally in the client. The fifth field's author now gets told.
+  Mutation-verified: removing the decoration fails the HTTP wiring test; making the key
+  conditional on non-empty fails the control cell.
+---
+
+## The staged-guard ships on INSTALL, so an edited hook is inert and nothing says so
+VALIDATED: amux-frustrations | Self-validated; amux-frustrations is the originating session. The complaint was that the staged-guard ships on INSTALL, so a checkout running an edited or stale copy is silently inert and nothing anywhere says so.
+
+Verified live, not from the commit: `hooks.guard_reaches_every_checkout` is failing right now and NAMES the stale checkouts with the numbers that make it actionable:
+
+  /Users/ethan/Dev/mixpeek runs GUARD_VERSION 11 (1 behind): 226 firings across 20 lanes were served it
+  /Users/ethan/Dev/ethan.dev-minimal runs GUARD_VERSION 9 (3 behind): 3 firings across 1 lanes
+  /Users/ethan/Dev/amux-GTM runs GUARD_VERSION 10 (2 behind): 1 firings across 1 lanes
+
+Each verdict carries the version, the lag, the firing count and the lane count, so "nothing says so" is now three named checkouts with a blast radius attached, and the failures minted cards (AMUX-4035/4036/4037). The floor is the fleet MAX rather than a constant, so it cannot go stale as the guard advances; a single versioned checkout returns Unknown rather than passing vacuously, because one checkout compared against itself is not a measurement.
+
+STILL TRUE AND NOT CLAIMED FIXED HERE: the three named checkouts remain behind. This entry's claim was that the drift is INVISIBLE. It is visible. Closing the drift is those checkouts' owners' work, and mixpeek's copy is vendored and tracked, which no installer will overwrite.
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-31
+SESSION: amux-frustrations
+CARD: AF-375
+SYMPTOM: I shipped two changes to `scripts/git-hooks/amux-staged-guard` today and
+  BOTH were inert. The hook is installed by COPY (`install-hooks.sh` cp's into
+  `.git/hooks/`), so a repo edit reaches no lane until someone re-installs:
+    grep -c 'COMMIT ONLY YOUR OWN PATHS'  installed=0  repo=1   (AF-365)
+    grep -c '_orphan_deletions'           installed=0  repo=4   (AF-357)
+  The installed copy was dated 09:34 and never moved. AF-365 was closed `done`
+  with evidence reading "ALL PASS", which was TRUE and was about the repo copy.
+  Nothing in the commit path, the test, or the card gate distinguishes "the file
+  changed" from "the behaviour changed for anyone".
+COST: One card closed on a false claim for about two hours, and a second fix that
+  would have been closed the same way if I had not checked. The near-miss is the
+  cost: I only looked because the day's own theme is "a fix ships, its tests pass,
+  and it does nothing in production", so I asked the question out of habit rather
+  than because anything prompted it. A lane without that habit closes both.
+  This is NOT the same as the amux bash CLI, which ships on SAVE and is live
+  immediately. Two hook-shaped files in one repo with opposite deploy semantics,
+  and no signal at either site saying which you are editing.
+FIX: The signal already exists and does not reach far enough. The SessionStart
+  freshness hook DID report "installed git hooks differ from this checkout" at the
+  start of this session, naming `prepare-commit-msg` and the remedy. I read it as
+  boilerplate about a file I had not touched, and it was right. Two cheap
+  improvements, either of which would have caught this:
+  (1) name the differing hooks by FILE and flag when a differing file is one the
+      CURRENT SESSION has edit records for, which turns a standing notice into a
+      statement about your own work;
+  (2) have the pre-commit hook itself compare its own bytes against
+      `scripts/git-hooks/` and warn on drift, which is the same trick
+      `install-hooks.sh` already does with `cmp` at the end of its run, moved to
+      the place where it would be read.
+  Not building either from here without deciding which; carded.
+  SHIPPED: both halves. (2) is 4f668224. The post-commit hook compares its own
+  bytes against scripts/git-hooks/ and warns on drift. (1) is df97f802. The
+  SessionStart hooks-drift axis now crosses the drifting names against THIS
+  session's observed-edit records and, on a hit, points at the falsifiable check
+  (grep the INSTALLED copy, not the repo one), which is the sentence that would
+  have caught AF-365. Its two negative cells are the load-bearing ones: another
+  lane's record must not become your name, and a missing record must say the
+  check did not run rather than reading as "none of these is yours".
+  Self-signed is NOT available here: this lane both hit it and fixed it, so the
+  entry stays until a lane that pays the cost confirms the notice reaches them.
+
+---
