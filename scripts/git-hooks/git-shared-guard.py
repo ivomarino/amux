@@ -534,15 +534,47 @@ def _amend_verdict(cmd, scrubbed, run_dir):
     # ABSENT can still block on a lock taken a millisecond later. That
     # refinement is mvs-research's, made against their own proposal. This
     # removes the case that fired, not the class.
+    # A LOCK IS NOT ALWAYS A LIVE PEER, which is why this AGES it. Git's own
+    # error says so: "a git process may have crashed in this repository earlier
+    # ... remove the file manually to continue". On a ~40-lane checkout a
+    # crashed or SIGKILLed git is not rare, and a naive refuse-on-present turns
+    # a stale lock into "every lane's amend is refused forever, blaming a peer
+    # who is not there" (mvs-research, who hit the lock state twice in one
+    # evening while reviewing this patch).
+    #
+    # THE THRESHOLD IS GENEROUS ON PURPOSE. `git commit` holds this lock across
+    # its hooks, and on the mixpeek checkout pre-commit routinely runs for
+    # MINUTES: commits of 2 to 9 minutes were measured on 2026-09-03 and one
+    # pre-push gate ran 917s. A 120s cutoff would call a legitimately-held lock
+    # stale, which is the failure that matters, because it re-opens the exact
+    # window this check exists to close. 900s is longer than any commit observed
+    # here and far shorter than a lock nobody has noticed.
+    #
+    # Deliberately NOT "is a git process running": pgrep matching text it was
+    # handed has already produced one wrong conclusion on this box today, and a
+    # process check is the part most likely to be wrong in a way that fails
+    # CLOSED (mvs-research's caution).
+    _LOCK_FRESH_S = 900
     try:
         git_dir = _git("rev-parse", "--absolute-git-dir")
-        if git_dir and os.path.exists(os.path.join(git_dir, "index.lock")):
-            return ("git commit --amend while .git/index.lock is HELD — another session "
-                    "has a commit in flight, so HEAD is about to move and your "
-                    "AMUX_AMEND_EXPECT pin is checked BEFORE your command runs, not after. "
-                    "That is exactly how a correctly-pinned amend rewrote a peer's commit "
-                    "on 2026-09-03. Wait for the lock to clear and re-run: the pin will "
-                    "then be re-checked against the new HEAD.")
+        lock = os.path.join(git_dir, "index.lock") if git_dir else ""
+        if lock and os.path.exists(lock):
+            age = time.time() - os.stat(lock).st_mtime
+            if age < _LOCK_FRESH_S:
+                return ("git commit --amend while .git/index.lock is HELD (age "
+                        f"{int(age)}s) — another session has a commit in flight, so HEAD "
+                        "is about to move and your AMUX_AMEND_EXPECT pin is checked "
+                        "BEFORE your command runs, not after. That is exactly how a "
+                        "correctly-pinned amend rewrote a peer's commit on 2026-09-03. "
+                        "Wait for the lock and re-run; the pin is then re-checked "
+                        "against the new HEAD.\n"
+                        "  If it never clears, the lock may be STALE from a crashed git "
+                        "rather than a live peer. Distinguish before removing it:\n"
+                        f"    ls -l {lock}\n"
+                        "  A lock whose mtime is not advancing and older than 15m is "
+                        "treated as stale by this guard and stops blocking you.")
+            # Stale: not evidence of a peer. Allow rather than block every lane
+            # indefinitely; the pin check above still applies.
     except Exception:
         pass  # fail-open: a stat we cannot do must not block a legitimate amend
     m = re.search(r'AMUX_AMEND_EXPECT=([0-9a-f]{7,40})\b', cmd)
