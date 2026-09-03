@@ -381,27 +381,35 @@ a line when it resolves; do not let one rot unchecked.
 
 - **2026-08-20: zero 504s of ANY kind in the 24h window** (`SELECT COUNT(*) ...
   WHERE status=504` -> 0). AF-86 below could not discriminate; not a pass.
+  Re-checked 2026-09-03: still 0 across the whole window. Fourteen days with no
+  specimen. Worth stating in the summary each time rather than silently carrying
+  the line: a check that has never once had an input to judge is not accumulating
+  evidence, and if this reaches a month it is worth asking whether the helper
+  timeout path is reachable at all rather than continuing to wait for it.
 
-- **2026-08-25: does the CDP wait still fail, and does it now say WHICH way?**
-  AMUX-3689 (`6d179755`, 2026-08-24 18:52) fixed the MESSAGE — "CDP never answered
-  within 30s" was reported identically for connection-refused, a 1s poll timeout, a
-  403 and a 500, while the stderr in the same message said `DevTools listening on
-  ws://127.0.0.1:<that very port>`. It also hoisted a `reqwest::Client::new()` out of
-  a loop that built one ~120 times per start, each reading macOS system proxy
-  settings — the only one of its three defects that could plausibly be the CAUSE, and
-  the commit does not claim it was.
-  So there are two open questions and one of them cannot be answered by a green day:
-  **(a)** does `POST /api/browser/start` still 502? **(b)** when it does, does the
-  body now name the poll outcome (`HTTP 403 from .../json/version`, `connection
-  refused (nothing listening)`, `no response within the 1s poll timeout`) and the
-  attempt count, rather than the old flat "never answered"?
-  Query: `GET /api/logs/analyze?since_h=24`, any 502 group under `/api/browser`.
-  **Zero browser 502s is NOT a pass on its own — check the traffic first.** On
-  2026-08-25 the sweep found 48 browser 502s all predating the fix, 0 after it, and
-  **0 `/api/browser` requests of any kind after it**. An empty family is an absent
-  specimen, not a working fix. `SELECT COUNT(*) FROM _amux_request_log WHERE path
-  LIKE '/api/browser%' AND ts >= <fix ts>` separates the two, and the sweep that
-  reports "browser is clean" without it is reporting that nobody opened a browser.
+- **RESOLVED 2026-09-03 — the CDP wait now says WHICH way.** (Was: 2026-08-25,
+  AMUX-3689.) Both open questions are answered, and the specimen check the line
+  itself demanded is what makes that trustworthy rather than an empty family:
+  `SELECT COUNT(*) ... WHERE path LIKE '/api/browser%'` returned **2,096 rows in
+  the window**, so the family was live, not dormant.
+  **(a)** Yes, `/api/browser` still 502s: 3 on `POST /api/browser/start`, 2 on
+  `GET /api/browser/screenshot`.
+  **(b)** Yes, the body names the poll outcome and the reason, which is the whole
+  point of the fix. Verbatim from the `start` group's sample:
+  `Chrome (pid Some(33823)) exited exit status: 0 before CDP on port 64178 came
+  up — exit 0 is the delegation signature: another Chrome already holds this
+  --user-data-dir. amux reconciles known orphans before launch (AMUX-3207); an
+  untracked Chrome on this profile can still cause it. Try again, or GET
+  /api/browser/status and stop it first.`
+  That is a named cause with a named remedy, not the old flat "CDP never answered
+  within 30s". The screenshot 502s carry their own distinct body
+  (`WebSocket protocol error: Connection reset without closing handshake`), which
+  is the same property holding on a second path.
+  Note what this does NOT claim: the 502s did not stop, and the fix never promised
+  they would — AMUX-3689 fixed the MESSAGE and hoisted a per-loop
+  `reqwest::Client::new()`, and its commit explicitly does not claim the hoist was
+  the cause. A separate line if the 502 RATE ever matters; this one was about
+  whether the operator can tell the four failure modes apart, and they can.
 
 - **AF-86 — helper 504 must report the TOTAL the caller waited.** On any 504 group
   for `/api/orchestrate/plan` or `/api/lookup`, read `error_body`. PASS is
