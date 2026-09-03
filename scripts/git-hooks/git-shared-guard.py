@@ -480,9 +480,27 @@ def _amend_verdict(cmd, scrubbed, run_dir):
     can't discriminate: every session commits as the same git user). Rule:
     amend requires PROOF OF INSPECTION — the caller must have looked at HEAD
     and pinned it: `AMUX_AMEND_EXPECT=<head-sha> git commit --amend ...`.
-    Allowed iff the pinned sha == actual current HEAD (kills the race where
-    a foreign commit lands between your commit and your amend) AND HEAD is
-    not already pushed (published history is never amended on shared trunk).
+    Allowed iff the pinned sha == actual current HEAD AND HEAD is not already
+    pushed (published history is never amended on shared trunk).
+
+    THE PIN NARROWS THE RACE, IT DOES NOT KILL IT, and this docstring used to
+    claim otherwise ("kills the race where a foreign commit lands between your
+    commit and your amend"). That claim is false whenever anything DELAYS the
+    command between this hook admitting it and git executing it, because the
+    check happens at ADMISSION and nothing re-verifies at execution.
+
+    Measured 2026-09-03 (mixpeek MC-1624, self-disclosed by mvs-research against
+    themselves): they pinned correctly, their command then waited 30 iterations
+    on .git/index.lock held by another lane's commit, and by the time the amend
+    ran HEAD was that other lane's commit, which it rewrote. They had read this
+    docstring, concluded the pin was sufficient, and followed the documented
+    procedure exactly. A guard that overstates its coverage turns a careful
+    operator into a confident one.
+
+    So the lock check below is a LARGE, CHEAP REDUCTION, not a proof. Closing
+    the class needs a re-verify at execution time, and git has no atomic
+    compare-and-amend to build it from. Do not restore the "kills the race"
+    wording.
     Returns None to allow, or a block-reason string."""
     if not re.search(r'\bgit\s+(?:-C\s+\S+\s+)?commit\b[^\n;&|]*--amend\b', scrubbed):
         return None
@@ -499,6 +517,34 @@ def _amend_verdict(cmd, scrubbed, run_dir):
         if base == head:
             return ("git commit --amend on a PUSHED commit — published shared history is "
                     "never rewritten; make a follow-up commit instead")
+    # A PRESENT INDEX LOCK MEANS HEAD IS ABOUT TO MOVE. That is the window this
+    # guard cannot otherwise see: the pin is checked HERE, at admission, and a
+    # caller that then blocks waiting for the lock executes its amend against a
+    # HEAD this hook never looked at. Refusing while the lock is held converts
+    # the dangerous case into "retry in a moment", costs one stat, and needs no
+    # cooperation from the caller.
+    #
+    # ORDERED AFTER THE PUSHED CHECK ON PURPOSE. "Wait for the lock and re-run"
+    # is useless advice if the amend is going to be refused anyway for touching
+    # published history, and telling a caller to retry against an absolute rule
+    # sends them into a loop. The transient reason must not mask the permanent
+    # one.
+    #
+    # NOT COMPLETE, deliberately stated: a command admitted while the lock is
+    # ABSENT can still block on a lock taken a millisecond later. That
+    # refinement is mvs-research's, made against their own proposal. This
+    # removes the case that fired, not the class.
+    try:
+        git_dir = _git("rev-parse", "--absolute-git-dir")
+        if git_dir and os.path.exists(os.path.join(git_dir, "index.lock")):
+            return ("git commit --amend while .git/index.lock is HELD — another session "
+                    "has a commit in flight, so HEAD is about to move and your "
+                    "AMUX_AMEND_EXPECT pin is checked BEFORE your command runs, not after. "
+                    "That is exactly how a correctly-pinned amend rewrote a peer's commit "
+                    "on 2026-09-03. Wait for the lock to clear and re-run: the pin will "
+                    "then be re-checked against the new HEAD.")
+    except Exception:
+        pass  # fail-open: a stat we cannot do must not block a legitimate amend
     m = re.search(r'AMUX_AMEND_EXPECT=([0-9a-f]{7,40})\b', cmd)
     if m and head.startswith(m.group(1)):
         # AF-106 durable half (AMUX-3407): the pin proves the COMMIT BEING
