@@ -246,6 +246,41 @@ else
   esac
 fi
 
+# 6. WHAT THE RECEIVER SEES (AF-455). Sections 1-5 are all about the SENDER:
+#    what is recorded, and what the sender is told. This one is the other side.
+#
+#    A send that reaches the server arrives stamped "[amux-origin: <lane> —
+#    server-verified ...]". An injection used to arrive with no prefix at all,
+#    making it shape-identical to a prompt typed by the OWNER — whose turns
+#    carry standing authority the sending peer does not have.
+KEYS=$(grep -n 'tmux send-keys .* -l "' amux | head -1)
+case "$KEYS" in
+  *'-l "$marked"'*) ok "the injected body carries a marker, not the bare text" ;;
+  *'-l "$text"'*)   bad "the injection is sent bare — the receiver cannot tell it from an owner prompt (AF-455)" ;;
+  *)                bad "could not find the fallback's send-keys body line; this check proves nothing" ;;
+esac
+# The marker must assert the ABSENCE of verification. A marker that claimed
+# identity would be the body signature AMUX-1768 forbids.
+MARKER=$(grep -n 'local marked=' amux | head -1)
+if [ -z "$MARKER" ]; then
+  bad "no marker is constructed for fallback injections"
+else
+  case "$MARKER" in
+    *'NOT server-verified'*) ok "the marker asserts the absence of verification, not an identity (AMUX-1768)" ;;
+    *) bad "the marker does not say it is unverified — a prefix that merely names a sender is the forgeable kind AMUX-1768 forbids" ;;
+  esac
+  case "$MARKER" in
+    *'\n'*) bad "the marker embeds a newline — send-keys -l would submit it as a prompt of its own" ;;
+    *) ok "the marker is a single line, so the separately-sent Enter still submits body and marker together" ;;
+  esac
+fi
+# The AUDIT row keeps the original text. The marker is for the human reading the
+# pane; a trail that stored the decorated string would drift from what was sent.
+case "$(grep -n '_record_unstamped_send "' amux | tail -1)" in
+  *'_record_unstamped_send "$name" "$text"'*) ok "the audit row records the ORIGINAL body, undecorated" ;;
+  *) bad "the audit row no longer records \$text — the trail and the pane would disagree" ;;
+esac
+
 echo
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
