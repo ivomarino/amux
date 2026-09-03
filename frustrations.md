@@ -2831,10 +2831,71 @@ FIX: 54cef57c for the defect: the label resolves to the repo root, and a set-wid
   one function wide and has not swallowed the resolver's definition — an unbounded search
   would be satisfied by the resolver's own name several hundred lines away and could not
   fail. Mutation-verified four ways, including that control.
-  WHAT I DO NOT HAVE is a general instrument. `mutate.sh survey` finds a line the tests do
-  not depend on; it cannot find a WIRING nobody asserted, because the call site is exercised
-  and the mutation that matters is an argument swap between two valid names. All three
-  instances would have been caught by one question asked at review time — "which test fails
-  if these two agree with each other and with nothing else?" — and that is a question, not a
-  check. Logging it as a third instance rather than proposing prose, because the count is
-  the argument and I do not yet know what the mechanism is.
+  WHAT I DID NOT HAVE, WHEN THIS WAS WRITTEN, was a general instrument. `mutate.sh survey`
+  finds a line the tests do not depend on; it cannot find a WIRING nobody asserted, because
+  the call site IS exercised and the mutation that matters is an argument swap between two
+  valid names.
+SUPERSEDED BY ITS OWN MECHANISM, 51699975 (AF-439). mvs-pitr sent four more instances the
+  same night — MP-100, two checks that fired on every fixture so either could be deleted
+  unseen; MP-125, two roots that agreed on a name so reading the wrong one survived; and two
+  where a fixture agreed with the reader and neither with the writer — which took the count
+  to SEVEN across two repos. Their diagnosis is the sentence that made it buildable: every
+  one was a missing DIRECTION rather than a missing assertion, and none was visible from
+  either side alone.
+  So the probe is an argument swap. `scripts/mutate.sh seams <file> -- <cmd>` exchanges two
+  same-typed arguments at each call site and reports which of three things objects:
+  HELD-BY-TYPES (it does not compile — the type system is the assertion, and that is the
+  best possible answer), KILLED (a test observes the pair), SURVIVED (nothing anywhere holds
+  these two apart). `--build` is what separates the first from the second, and without it the
+  report says the axis is missing, because a compile-held seam is safe today and unheld the
+  moment someone widens a type.
+  IT FOUND ONE ON ITS FIRST REAL RUN, in this same file: `owner_committed_since(dir, path)`
+  swaps to `(path, dir)`, compiles, and passes the entire suite. That call is
+  `git -C dir log -- path`; swapped it fails, returns None, and every caller reads None as
+  "the owner has not committed" — settled work reported as unsettled, silently. The function
+  has a test. The call site's argument ORDER had nothing, which is instance eight.
+  Fixed at the BOUNDARY, a `debug_assert` that `dir` is a directory, so it covers every
+  caller including unwritten ones. And stated narrowly on purpose: that makes the swap LOUD,
+  it does not CLOSE the seam. No test reaches that call site, so the assertion never runs
+  there and `seams` still reports SURVIVED for it. Correctly.
+  The question I said was a question and not a check — "which test fails if these two agree
+  with each other and with nothing else?" — turned out to be a check after all. What was
+  missing was not the idea but the probe, and the probe was a peer's sentence away.
+
+---
+
+## The mutation tool corrupted itself twice, and its only symptom was the next run blaming the caller
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-03
+SESSION: amux-frustrations
+CARD: AF-440
+SYMPTOM: Testing a new verb, I ran `scripts/mutate.sh run scripts/mutate.sh <old> <new> -- ...`
+  — the tool on itself. It printed `mutate apply: LANDED`, ran the command, and the revert
+  never happened. Twice in five minutes, on two different mutations.
+  Bash reads a script by BYTE OFFSET as it executes. Rewriting the file underneath the
+  running interpreter shifts every offset after the edit, so the trap that reverts is never
+  reached. The tool's whole design is that the revert fires from a trap even on a timeout or
+  a Ctrl-C (AF-284); none of that survives the file being the one under edit.
+  WHAT MADE IT EXPENSIVE IS THE SYMPTOM. `bash -n` passed both times. The suite kept
+  running. The only visible sign was the NEXT invocation refusing with "the replacement
+  already occurs 1 time(s) — revert would be ambiguous", which is a message about
+  ARGUMENTS. I read it as my mutation string being wrong, twice, before checking the file.
+  The refusal was correct and it blamed the caller, which is the worst combination.
+COST: about ten minutes, and two hand-repairs of a shared file. The larger cost is what did
+  not happen: I committed nothing while corrupted, but only because the refusal happened to
+  fire before the commit. A run that mutated a line the next test did not touch would have
+  left the mutation in a file I then staged.
+FIX: 51699975. Refused outright, at both write paths, with the reason and the copy-and-mutate
+  route in the message. A self-mutation cannot be made safe from inside the process being
+  edited — there is no ordering of apply, run and revert that survives the interpreter
+  losing its place — so the honest move is to decline rather than to try harder.
+  Cells 7 and 8: refuses with exit 2, names the reason, offers the copy path, leaves itself
+  byte-identical — and the CONTROL, that it still applies and reverts on any OTHER file, or
+  the refusal would be a tool that refuses everything and the cell would pass for it.
+NOTE: this is AF-368's mechanism ("editing a running .sh corrupts it mid-run, and the
+  instrument cannot report its own corruption") arriving inside the tool built to make
+  mutation safe. The generalisable half is the second clause of that title, and it is why
+  this took two occurrences to notice: an instrument that edits files cannot be trusted to
+  report an edit to ITSELF, so its error messages are precisely the ones that will mislead.
