@@ -3683,6 +3683,64 @@ mod tests {
         assert_eq!(full, slim, "snapshot_slim drifted from snapshot minus prose");
     }
 
+    /// AF-346's TRAP, written BEFORE that optimisation lands rather than after.
+    ///
+    /// AF-346 proposes hydrating the slim list without `desc`/`log`, on the
+    /// premise that "the slim serializer then drops both". It does not. The slim
+    /// branch of `list_body` makes FIVE derivations over those two columns —
+    /// `desc_len`, `log_n`, `desc_head`, `folded_n` and the NEEDS-YOU marker —
+    /// and the SPA renders three of them. Hydrating without the prose blanks all
+    /// five, for every card, silently.
+    ///
+    /// NOTHING WOULD HAVE CAUGHT IT. `capped_two_pass_equals_the_single_pass_it_
+    /// replaced` below guards `hydrate_light` and does catch a prose-free
+    /// hydration (verified by mutation: blanking desc/log there reds it) — but
+    /// AF-346's own shape is a SEPARATE slim hydrate with `hydrate_light` kept
+    /// for other callers, so that guard would not cover the new path. And
+    /// `list_body`'s own slim tests construct `IssueRow` BY HAND with the prose
+    /// populated, so they exercise the serializer and can never observe what
+    /// hydration supplied. A test per component, none over the seam — the same
+    /// shape as AF-429 and AF-438.
+    ///
+    /// The card's proposed test ("a slim list response must contain no
+    /// desc/log") passes TODAY and would pass after the change, so it cannot
+    /// discriminate. This one goes through the real hydration path and asserts
+    /// the derived facts survive it.
+    #[test]
+    fn the_slim_lists_derived_facts_survive_whatever_hydration_supplies() {
+        let conn = create_db();
+        let now = 1_788_000_000i64;
+        conn.execute(
+            "INSERT INTO issues (id, title, \"desc\", status, session, created, updated, log, type) \
+             VALUES ('D-1', 'a card', ?1, 'todo', 's', ?2, ?2, ?3, 'code')",
+            rusqlite::params![
+                "First line is the preview.\nNew task: folded one",
+                now,
+                "`10:00` did a thing\n`10:01` New task: folded two",
+            ],
+        )
+        .unwrap();
+
+        let (kept, _, _) =
+            list_issues_capped(&conn, &[], &[], ArchivedFilter::All, 100).unwrap();
+        let row = kept.iter().find(|r| r.id == "D-1").expect("the seeded card");
+        let slim = crate::api::board::list_body(row, true, false);
+
+        // The diet still holds: the prose itself is not shipped.
+        assert!(slim["desc"].is_null(), "slim must not ship the prose");
+        assert!(slim["log"].is_null());
+
+        // ...and every derivation over it survived the round trip. These are
+        // the assertions the card's proposed test does not make.
+        assert_eq!(
+            slim["desc_head"], "First line is the preview.",
+            "app.js renders this as the card preview — blank means every card lost its preview"
+        );
+        assert_eq!(slim["folded_n"], 2, "counts 'New task:' across desc AND log");
+        assert_eq!(slim["desc_len"], 47);
+        assert_eq!(slim["log_n"], 2);
+    }
+
     /// AMUX-3491 — list_issues_capped is an OPTIMIZATION and must be
     /// byte-equivalent to the single-pass it replaced, across every axis the
     /// two passes could disagree on: filter canon, sort ties (shared
