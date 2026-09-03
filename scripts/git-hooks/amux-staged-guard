@@ -50,7 +50,7 @@ import json, os, ssl, subprocess, sys, time, urllib.error, urllib.request
 # `^`-anchored, because an unanchored match now finds the comment line first
 # (checked: it returned empty, which would have made `grep -L` match nothing and
 # report a clean fleet).
-GUARD_VERSION = 12
+GUARD_VERSION = 13
 
 
 def amux_base_url():
@@ -446,7 +446,28 @@ def _render_orphan_deletions(staged, w):
         w("      nothing else in this commit touches `%s/`\n" % topdir)
     w("  A deletion is the direction nobody notices: the file is not there to\n"
       "  read, and the co-edit notice cannot see it because nobody holds an edit\n"
-      "  record for a file they only removed. If this is not yours, unstage it:\n")
+      "  record for a file they only removed.\n")
+    # AF-420. This block offered `git restore --staged` and NOTHING ELSE, while
+    # the two other remedy blocks in this file (unclaimed-staged, foreign) both
+    # lead with the pathspec commit and mark the restore as the one that edits
+    # shared state. The reasoning was already written down for the foreign case
+    # and simply never carried here, so the dangerous exit was the ONLY exit on
+    # the one notice that fires about work you cannot see.
+    #
+    # It also contradicted the fleet's own instructions. ~/.claude/CLAUDE.md,
+    # shared-checkouts section: "When you must commit while a peer has work
+    # staged, commit by pathspec... `git restore --staged <their files>` edits
+    # state that belongs to them." A guard that recommends the thing the
+    # instructions forbid teaches the wrong habit at the moment of most pressure.
+    #
+    # For a staged DELETION the pathspec exit is quieter still: you decline it by
+    # not naming the path, so nothing of theirs is touched and no index is edited.
+    w("\n  IF THIS IS NOT YOURS, the safe exit is to leave it alone. A pathspec\n"
+      "  commit ignores the index for everything it does not name, so simply not\n"
+      "  naming this path declines the deletion and touches nothing of theirs:\n")
+    w("      git commit <your paths> -m ...\n")
+    w("\n  Or unstage it — but note this EDITS THE SHARED INDEX, which is their\n"
+      "  state, not yours:\n")
     for path, _ in orphans:
         w("      git restore --staged %s\n" % path)
     w("  If it IS yours, say so in the message. `git log` on that path will name\n"
@@ -996,7 +1017,12 @@ def main():
               "staging a file makes it yours to commit. Scope the commit to your "
               "own paths and the shared index is never read:\n\n"
               "      git commit -m \"...\" -- <your paths>\n\n"
-              "  Or unstage what is not yours:  git restore --staged -- <path>\n"
+              # AF-420: the ordering here was already right; this only adds the
+              # same shared-index caveat the foreign block carries, so all three
+              # remedy blocks describe the restore identically.
+              "  Or unstage what is not yours — but note this EDITS THE SHARED "
+              "INDEX, which is their state, not yours:\n"
+              "      git restore --staged -- <path>\n"
               "  If you have checked and they ARE yours from earlier, "
               "AMUX_ALLOW_UNCLAIMED=1 proceeds.\n")
             return 1
