@@ -2717,3 +2717,51 @@ FIX: the script now names both files and prints the runnable command, by pathspe
   The general shape, which is the part worth carrying: when an operation spans two files,
   its completion message must name both. The reader's next command is formed from what
   they were just told, and a summary that names one file will get one file staged.
+
+---
+
+## Five greps for one pattern gave five different answers, and the check that read the producer found what all five missed
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-03
+SESSION: amux-frustrations
+CARD: AF-437
+SYMPTOM: ts-gke, generalizing AF-429: a fixture that hand-types a producer's output is a copy
+  of a BELIEF about the producer and cannot detect it drifting, while calling the producer
+  makes it a sample of the BEHAVIOUR. "Those look identical in review and only one can fail."
+  I tried to mechanize it — find every place this codebase hand-types a string some producer
+  emits — and got five answers from five greps: 32, then 5, then 1, then 1 again, then 2.
+    32  matched any `[tag] text` literal; almost all were ordinary messages.
+     5  tightened on a distinctive anchor; four were a different env-var family sharing the
+        `AMUX_` prefix.
+     1  required the producer's exact template; missed every qualified `super::` call site.
+     1  fixed that and still missed board_drive.rs, because the scan stopped at each file's
+        first `#[cfg(test)]` and that file's spawn call is 5000 lines AFTER its tests.
+     2  the two I could see by hand.
+  The real answer is FOUR, and I only have it because I stopped writing greps and wrote the
+  check the way ts-gke described the fixture: derive the string from `per_job_disable_var`
+  itself, scan whole files, assert nothing else spells it. It named heartbeat.rs and
+  status_history.rs immediately — two modules every grep had missed.
+COST: the defect itself is latent, not live: `spawn_periodic` derives each job's
+  fleet-isolation gate from the job NAME as AMUX_<NAME>_SECS, and four jobs also read that
+  same variable for their interval by literal. One knob, two spellings, and they agree today.
+  A change to the convention moves the gate and not the reader, splitting one switch in two
+  with nothing red, which is the kind of bug that is found by whoever changes the convention
+  six months from now and cannot see why the switch half-works.
+  The real cost is the five iterations. Each ran, produced a confident table, and was wrong
+  in a way the previous one could not reveal — so "my detector agrees with my last detector"
+  was never available as a check, and neither was a green result. I nearly reported 32.
+FIX: 3675f126. All four derive it now (`per_job_disable_var` is pub(crate); board_drive and
+  autofix gained the `JOB` const the others already had), and the check lives in the repo
+  rather than in my shell history.
+  SCOPED, and the scope is the interesting part: only modules that call `spawn_periodic`.
+  commit_nudge reads AMUX_COMMIT_NUDGE_SECS and spawns with a bare `tokio::spawn`, so
+  nothing derives that name and its single spelling is CORRECT. Flagging it would tell a
+  module to stop duplicating something it does not duplicate. Mutating the filter out reds
+  the check on exactly that module, which is how I know the filter is load-bearing.
+  THE TRANSFERABLE PART is not "hand-typed fixtures are bad", which rule 7 already covers.
+  It is that a detector for a code pattern, written as a grep, is itself a copy of a belief
+  about the pattern — so it fails the same way the fixture does, and its wrongness is
+  invisible for the same reason. The version that reads the real producer is the only one
+  that can be wrong LOUDLY.
