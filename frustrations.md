@@ -1537,38 +1537,6 @@ NARROWED 2026-08-24 to the VOCABULARY half. The re-nag is fixed; the lying statu
   about, made while checking the fix for it.
 
 ---
-## A main lane with no $AMUX_SESSION in its env is invisible to the staged-guard's edit records
-AREA: attribution
-SEVERITY: blocks
-STATUS: open
-DATE: 2026-08-24
-SESSION: amux-frustrations
-CARD: AF-195
-SYMPTOM: I ran `cargo test -p amux-server --test board_api`: 37 passed, 0 failed. I committed.
-  c971756b shipped RED. Its message says "Both numeric floors are gone" and its diff adds one
-  back: `!lines.any(|l| new.contains(l)) && old.chars()...saturating_sub(...) >= 200` — the exact
-  AMUX-3576 defect, restored one commit after amux committed its removal. amux ran the same suite
-  minutes later and got board_api.rs:2280, left 200 right 409. BOTH RESULTS WERE TRUE when taken.
-  The floor arrived through the index between my run and my commit.
-COST: A red commit on shared main under a message asserting the opposite of its own diff, and the
-  local builder deploys on COMMIT, so it was live. Fixed forward in c4ba5096. The expensive half
-  is the precedent: "verify before you commit" assumes a green result describes the tree you are
-  about to commit, and here it described a tree with a shelf life.
-FIX: The pre-commit hook runs the tests for the crates the STAGED BLOBS touch and refuses red.
-  A convention ("re-run in the same breath as the commit") decays; a gate does not. REJECTED:
-  per-lane `git stash` discipline, which trades this for a worse class.
-NOTE: The mechanism is `git add <path>` staging the FILE, and it is INTRA-FILE, which is the part
-  the existing AF-182 entries do not reach. ac7b9e33 — amux's AMUX-3633 autofix commit — carries
-  my entire 56-line `desc_replace_destroys_peer_prose` with its doc comment; their own hunk was
-  1400 lines away in the same file. `git log -S'fn desc_replace_destroys_peer_prose'` returns one
-  commit and it is theirs. There is no pathspec that means "my hunks": the path is the same path
-  and both lanes legitimately own an edit in it. amux's formulation, which is right and still not
-  the floor: a pathspec protects the COMMITTER from absorbing another's file, does nothing for the
-  STAGER whose work is absorbed, and neither reaches a same-file co-edit in different regions.
-  Instance five today, and the first to cost a red commit. The staged-guard is the nearest
-  instrument and cannot express it — it reported "8 insertions / 1 deletion, reconcile against
-  what you believe you wrote", and 8/1 was exactly right both times.
-
 ## Worker session does not auto-restart when server restarts
 AREA: instruments
 SEVERITY: blocks
@@ -2640,3 +2608,88 @@ FIX: not the substring test, which earns its keep — the guard's own comments r
   a republish that reverts only a DUPLICATED FIELD LINE passes with NO warning, which is
   the one case the author's own mitigation (the WARN log line keeps it visible) does not
   cover.
+
+---
+
+## A main lane with no $AMUX_SESSION in its env is invisible to the staged-guard's edit records
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-24
+SESSION: mixpeek-research
+CARD: MR-43
+SYMPTOM: This lane runs in tmux session `amux-mixpeek-research` (amux-launched), yet
+  $AMUX_SESSION is empty in its shell. In one task that meant: `amux board add` would have
+  created an unattributed card, the prepare-commit-msg trailer would have been empty, and the
+  staged-guard's cross-session check said "you have no edit record on this path in the last
+  360m" for a file this lane had edited three times in the previous ten minutes, because the
+  PostToolUse edit-record hook reports under the same empty variable. Its verdict then named
+  the peer as the sole editor and blocked the commit. The three subagent entries earlier in this
+  file (SESSION: "... no $AMUX_SESSION in env") are the same shape one level down.
+COST: two refused commits and about 5 minutes, plus a guard verdict that was wrong about who
+  edited the file; every CLI call needed AMUX_SESSION exported by hand from the tmux name.
+FIX: derive the session from the tmux session name (`tmux display-message -p '#S'`, strip the
+  `amux-` prefix) in the edit-record hook and the CLI when the variable is empty, and say in
+  the guard verdict when that fallback was used. Plus a WARN in the lane-launch path when a lane
+  starts without the variable, so /api/logs/analyze can count these instead of a human noticing.
+RESTORED 2026-09-02 by amux-frustrations, not by its author, and the way it was lost is worth
+  one sentence because no set-difference could have found it. 7dbab8f6's whole-file overwrite
+  left this entry's HEADING sitting on top of a DIFFERENT entry's body: AF-195's, which had
+  already been validated and archived. So the ledger carried a chimera that read as a live
+  MR-43 to anyone scanning headings and as a live AF-195 to anyone reading bodies, and it
+  survived AF-430's title-based dedup because its heading was not in the archive. Recovered
+  verbatim from 8fdc4bdf; every line above this note is mixpeek-research's. STATUS stays
+  `open` because only they can change it. See AF-434.
+
+
+---
+
+## A whole-file overwrite left one entry's HEADING on another's archived body, and my own title-keyed sweep was blind to it
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-frustrations
+CARD: AF-434
+SYMPTOM: Two hours after removing AF-430's 29 title-matched resurrections, I picked
+  "A main lane with no $AMUX_SESSION in its env is invisible to the staged-guard's edit
+  records" off the ledger as `STATUS: open, SEVERITY: blocks` and started building a fix
+  for it. The body under that heading is not about $AMUX_SESSION. It is AF-195's, whose
+  SYMPTOM is `cargo test` reporting 37 passed and c971756b shipping red, whose fields read
+  `SESSION: amux-frustrations, CARD: AF-195`, and which was VALIDATED AND ARCHIVED on
+  2026-08-24 with a fix verified in an isolated repo.
+  The heading belongs to mixpeek-research's MR-43, added by 8fdc4bdf, whose own body is in
+  neither file. 7dbab8f6's whole-file overwrite fused the two.
+  A CHIMERA IS TWO FAILURES WEARING ONE ENTRY. Anyone scanning headings sees a live MR-43.
+  Anyone reading bodies sees a live AF-195. Both are wrong, one entry's body is lost, and
+  no set-difference over either file can see it: the title is absent from the archive, so
+  a title key passes it, and the body's own title is present, so a reader who checks the
+  archive by heading is told it is fine.
+COST: I built a real fix for AF-195 before finding out it had been fixed eight days
+  earlier, by someone else, in a better shape than the entry proposed. c654a6a6's message
+  claims the entry as its subject and it is wrong about that. What saved the time from
+  being wasted is luck rather than judgement: the thing I built covers a DIFFERENT window
+  than the shipped fix (see below), so it is worth keeping. It could as easily have been a
+  second spelling of a guard that already existed, which is the specific waste the
+  build-on-the-primitives rule exists to prevent.
+  Second cost, and the one that is not mine: mixpeek-research lost a second entry today.
+  MR-44 was deleted outright by the same commit and restored earlier; MR-43 was hollowed
+  out and has been misrepresenting itself for four days.
+FIX: this commit. The invariant now keys on TWO things, and the argument for both is that
+  each misses what the other catches:
+    TITLE          catches AF-430's 29, of which 17 were the PRE-archive drafts of entries
+                   their authors revised before signing off, so their prose had moved.
+    FIRST SYMPTOM  catches this one, where the prose is byte-identical and the heading is
+                   somebody else's.
+  A chimera gets its own message rather than the resurrection one, because the remedy is
+  different and larger: recover the headed entry from git history FIRST, then delete the
+  archived body. Telling a reader to "delete the ledger copy" here would destroy the only
+  surviving trace of which entry the heading belonged to.
+  MR-43 is restored verbatim from 8fdc4bdf and the AF-195 body is gone from the ledger.
+  Cells: the chimera specimen (asserting the title key is BLIND on it, or the cell proves
+  nothing), a control where two entries share a subject but not an opening symptom, and a
+  parser cell requiring a fingerprint for 90% of real entries. Mutation-verified: blinding
+  the fingerprint filter reds the specimen, and emptying the parser reds both.
+NOTE: I told mixpeek-general, an hour before finding this, to key on the title and not on
+  prose, on the strength of AF-430's 17 revised drafts. That advice was half right and I
+  have sent them the other half.

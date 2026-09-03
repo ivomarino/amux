@@ -2776,6 +2776,62 @@ pub fn frustration_cards_are_reachable(
     }))]
 }
 
+/// The first SYMPTOM line of each entry, normalised, paired with its title.
+///
+/// AF-434. Titles alone are not enough. `7dbab8f6`'s whole-file overwrite left
+/// one entry's HEADING sitting on top of a DIFFERENT entry's body: MR-43's
+/// title over AF-195's already-archived symptom, fields and all. That chimera
+/// read as a live MR-43 to anyone scanning headings and as a live AF-195 to
+/// anyone reading bodies, and it survived a title-keyed sweep because its
+/// heading was not in the archive.
+///
+/// The inverse is equally real, which is why BOTH keys are needed and neither
+/// replaces the other: 17 of AF-430's 29 resurrections were the PRE-archive
+/// drafts of entries their authors edited before signing off, so their titles
+/// matched and their prose did not. Title alone misses the chimera; prose alone
+/// misses the revised draft.
+///
+/// The key is the SYMPTOM's first line rather than the whole body because the
+/// body is what gets edited: an entry gains a VERIFIED paragraph, a re-check, a
+/// correction. What it opens with is what identifies it.
+pub fn frustration_entry_fingerprints(md: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut started = false;
+    let mut cur: Option<String> = None;
+    let mut done_this = false;
+    for line in md.lines() {
+        if !started {
+            if line.trim() == "---" {
+                started = true;
+            }
+            continue;
+        }
+        if let Some(t) = line.strip_prefix("## ") {
+            cur = Some(t.trim().to_string());
+            done_this = false;
+            continue;
+        }
+        if done_this {
+            continue;
+        }
+        let Some(title) = cur.as_ref() else { continue };
+        if let Some(v) = line.strip_prefix("SYMPTOM:") {
+            let norm: String = v
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(120)
+                .collect();
+            if !norm.is_empty() {
+                out.push((title.clone(), norm));
+            }
+            done_this = true;
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // 11c. A retired entry stays retired (AF-430)
 // ---------------------------------------------------------------------------
@@ -2808,9 +2864,18 @@ pub fn frustration_cards_are_reachable(
 /// deletion (creative-dna measured 15 of 15 "lost" entries as archive moves).
 /// It means the ledger is serving a copy of something already signed off. The
 /// remedy is to delete the LEDGER copy, never to un-archive.
+fn trunc(s: &str, n: usize) -> String {
+    match s.char_indices().nth(n) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_string(),
+    }
+}
+
 pub fn frustration_retired_entries_stay_retired(
     ledger_titles: &[String],
     archive_titles: &[String],
+    ledger_prints: &[(String, String)],
+    archive_prints: &[(String, String)],
     source: &str,
 ) -> InvariantResult {
     const ID: &str = "frustrations.retired_entries_stay_retired";
@@ -2835,11 +2900,60 @@ pub fn frustration_retired_entries_stay_retired(
     let archived: BTreeSet<&str> = archive_titles.iter().map(|s| s.as_str()).collect();
     let both: Vec<&String> =
         ledger_titles.iter().filter(|t| archived.contains(t.as_str())).collect();
-    if both.is_empty() {
+    // AF-434, the second key. An entry whose SYMPTOM opens exactly like an
+    // archived one, under a title the archive does not have, is a resurrection
+    // wearing someone else's heading. Reported separately because the remedy
+    // differs: a title match means delete the ledger copy, while a chimera also
+    // means a DIFFERENT entry's heading is orphaned and its body may be lost.
+    let arch_prints: BTreeSet<&str> = archive_prints.iter().map(|(_, f)| f.as_str()).collect();
+    let chimeras: Vec<&(String, String)> = ledger_prints
+        .iter()
+        .filter(|(t, f)| arch_prints.contains(f.as_str()) && !archived.contains(t.as_str()))
+        .collect();
+    if both.is_empty() && chimeras.is_empty() {
         return InvariantResult::pass(ID).evidence(json!({
             "ledger_entries": ledger_titles.len(),
             "archive_entries": archive_titles.len(),
+            "ledger_fingerprints": ledger_prints.len(),
+            "archive_fingerprints": archive_prints.len(),
+            "keys": "title and first-SYMPTOM-line; neither alone is sufficient (AF-434)",
             "source": source,
+        }));
+    }
+    // A chimera with no title overlap is its own message: the title-only text
+    // below would send the reader to delete a ledger copy whose HEADING belongs
+    // to a different, possibly lost, entry.
+    if both.is_empty() {
+        let ex: Vec<String> = chimeras
+            .iter()
+            .take(3)
+            .map(|(t, f)| format!("\"{}\" opens like an archived entry: {}…", trunc(t, 60), trunc(f, 70)))
+            .collect();
+        return InvariantResult::fail(
+            ID,
+            "no frustrations.md entry duplicates an archived one, by title OR by opening \
+             SYMPTOM"
+                .to_string(),
+            format!(
+                "{} ledger entry/entries open with the SAME SYMPTOM as an archived entry while \
+                 carrying a title the archive does not have ({}). That is a CHIMERA, not an \
+                 ordinary resurrection: a whole-file overwrite left one entry's heading on top \
+                 of another's body (AF-434, MR-43's title over AF-195's archived body). Two \
+                 things are wrong, not one — the archived body is live again under a false \
+                 name, AND the entry that owns the heading has lost its own body, which is \
+                 probably in neither file. Recover the headed entry from git before deleting \
+                 anything. Ledger read from {source}.",
+                chimeras.len(),
+                ex.join("; "),
+            ),
+        )
+        .evidence(json!({
+            "chimeras": chimeras.iter().map(|(t, f)| json!({"title": t, "symptom_opens": f}))
+                .collect::<Vec<_>>(),
+            "ledger_entries": ledger_titles.len(),
+            "archive_entries": archive_titles.len(),
+            "source": source,
+            "remedy": "recover the headed entry from git history, then delete the archived body",
         }));
     }
     let sample: Vec<String> = both.iter().take(4).map(|t| {
@@ -3199,7 +3313,7 @@ mod negative_controls {
     fn detects_an_archived_entry_resurrected_into_the_ledger() {
         let led = ttl(&["a live one", "amux-launched browser does not survive a server self-adopt"]);
         let arc = ttl(&["amux-launched browser does not survive a server self-adopt", "another"]);
-        let r = frustration_retired_entries_stay_retired(&led, &arc, "worktree");
+        let r = frustration_retired_entries_stay_retired(&led, &arc, &[], &[], "worktree");
         assert_eq!(r.status, Status::Fail, "{}", r.observed);
         let obs = &r.observed;
         assert!(obs.contains("1 ledger entry"), "{obs}");
@@ -3214,6 +3328,8 @@ mod negative_controls {
         let r = frustration_retired_entries_stay_retired(
             &ttl(&["one", "two"]),
             &ttl(&["three", "four"]),
+            &[],
+            &[],
             "worktree",
         );
         assert_eq!(r.status, Status::Pass, "{}", r.observed);
@@ -3224,11 +3340,74 @@ mod negative_controls {
     /// forbids, and `unknown` is the only honest answer.
     #[test]
     fn an_empty_archive_is_unknown_not_a_pass() {
-        let r = frustration_retired_entries_stay_retired(&ttl(&["one"]), &[], "worktree");
+        let r = frustration_retired_entries_stay_retired(&ttl(&["one"]), &[], &[], &[], "worktree");
         assert_eq!(r.status, Status::Unknown, "{}", r.observed);
         assert!(r.observed.contains("for the wrong reason"), "{}", r.observed);
-        let r2 = frustration_retired_entries_stay_retired(&[], &ttl(&["one"]), "HEAD");
+        let r2 = frustration_retired_entries_stay_retired(&[], &ttl(&["one"]), &[], &[], "HEAD");
         assert_eq!(r2.status, Status::Unknown);
+    }
+
+    fn fp(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    }
+
+    /// AF-434's specimen, rebuilt: MR-43's heading sitting on AF-195's already
+    /// archived body. Title-keyed detection CANNOT see this, which is the whole
+    /// reason the second key exists, so the cell asserts the title key is blind
+    /// AND the fingerprint key is not.
+    #[test]
+    fn detects_a_chimera_whose_heading_is_not_in_the_archive() {
+        let led = ttl(&["A main lane with no $AMUX_SESSION in its env"]);
+        let arc = ttl(&["A green test suite EXPIRES through the shared index"]);
+        // The control first: on titles alone this pair is clean.
+        assert_eq!(
+            frustration_retired_entries_stay_retired(&led, &arc, &[], &[], "worktree").status,
+            Status::Pass,
+            "the title key must be BLIND here, or this cell proves nothing"
+        );
+        let lp = fp(&[("A main lane with no $AMUX_SESSION in its env", "I ran cargo test -p amux-server --test board_api: 37 passed")]);
+        let ap = fp(&[("A green test suite EXPIRES through the shared index", "I ran cargo test -p amux-server --test board_api: 37 passed")]);
+        let r = frustration_retired_entries_stay_retired(&led, &arc, &lp, &ap, "worktree");
+        assert_eq!(r.status, Status::Fail, "{}", r.observed);
+        assert!(r.observed.contains("CHIMERA"), "{}", r.observed);
+        assert!(
+            r.observed.contains("lost its own body"),
+            "the remedy must name BOTH halves: {}",
+            r.observed
+        );
+    }
+
+    /// The control for the second key. Two entries that merely share a subject
+    /// must not collide; only an identical opening SYMPTOM counts.
+    #[test]
+    fn different_symptoms_under_different_titles_are_not_a_chimera() {
+        let r = frustration_retired_entries_stay_retired(
+            &ttl(&["live one"]),
+            &ttl(&["retired one"]),
+            &fp(&[("live one", "the board refused a PATCH and dropped the desc")]),
+            &fp(&[("retired one", "the guard named a peer it could not identify")]),
+            "worktree",
+        );
+        assert_eq!(r.status, Status::Pass, "{}", r.observed);
+    }
+
+    /// The fingerprint parser on the real file: it must actually find symptoms,
+    /// or the second key is an empty set that can never match.
+    #[test]
+    fn the_fingerprint_parser_finds_a_symptom_for_almost_every_entry() {
+        const LED: &str = include_str!("../../../../frustrations.md");
+        let n_entries = parse_frustration_entries(LED).len();
+        let prints = frustration_entry_fingerprints(LED);
+        assert!(n_entries > 20, "only {n_entries} entries parsed");
+        assert!(
+            prints.len() * 10 >= n_entries * 9,
+            "only {} of {n_entries} entries yielded a SYMPTOM fingerprint",
+            prints.len()
+        );
+        assert!(
+            prints.iter().all(|(_, f)| f.len() <= 120 && !f.contains("  ")),
+            "fingerprints must be normalised and bounded"
+        );
     }
 
     /// The live pair, which is the cell that would have caught AF-430 four days
@@ -3243,7 +3422,10 @@ mod negative_controls {
         let at: Vec<String> =
             parse_frustration_entries(ARC).into_iter().map(|e| e.1).collect();
         assert!(at.len() > 20, "archive parsed only {} entries", at.len());
-        let r = frustration_retired_entries_stay_retired(&lt, &at, "baked-at-build");
+        let lp = frustration_entry_fingerprints(LED);
+        let ap = frustration_entry_fingerprints(ARC);
+        assert!(ap.len() > 20, "archive yielded only {} fingerprints", ap.len());
+        let r = frustration_retired_entries_stay_retired(&lt, &at, &lp, &ap, "baked-at-build");
         assert_eq!(r.status, Status::Pass, "{}", r.observed);
     }
 

@@ -1385,6 +1385,11 @@ fn frustration_ledger_check(state: &AppState) -> Vec<InvariantResult> {
     let (archive_md, archive_source) = load("frustrations-archive.md", BAKED_ARCHIVE);
     let archive_titles: Vec<String> =
         checks::parse_frustration_entries(&archive_md).into_iter().map(|e| e.1).collect();
+    // AF-434: the second key. Title alone missed a chimera (one entry's heading
+    // over another's archived body); prose alone would miss the 17 AF-430
+    // resurrections whose authors had revised the text before signing off.
+    let archive_prints = checks::frustration_entry_fingerprints(&archive_md);
+    let ledger_prints = checks::frustration_entry_fingerprints(&md);
 
     let entries = checks::parse_frustration_entries(&md);
     // Taken BEFORE the join loop consumes `entries`, and it is every title
@@ -1413,6 +1418,8 @@ fn frustration_ledger_check(state: &AppState) -> Vec<InvariantResult> {
             checks::frustration_retired_entries_stay_retired(
                 &ledger_titles,
                 &archive_titles,
+                &ledger_prints,
+                &archive_prints,
                 source,
             ),
         ];
@@ -1479,6 +1486,8 @@ fn frustration_ledger_check(state: &AppState) -> Vec<InvariantResult> {
     out.push(checks::frustration_retired_entries_stay_retired(
         &ledger_titles,
         &archive_titles,
+        &ledger_prints,
+        &archive_prints,
         if source == archive_source { source } else { "ledger and archive from different sources" },
     ));
     out
