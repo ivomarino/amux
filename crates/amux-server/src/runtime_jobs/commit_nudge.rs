@@ -391,7 +391,22 @@ pub fn build(
              can move /tmp/merged into place; non-zero means real judgment is needed and the \
              markers show exactly where. Handing it to the owner stays the right answer when the \
              conflicts are not yours to resolve — but now you know how many there are before you \
-             decide that."
+             decide that.\n\n\
+             NOT FOR GENERATED FILES, and conflicts=0 is exactly when this bites. A merge of \
+             two generator outputs is syntactically valid, matches NEITHER source model, was \
+             produced by no code, and is silently overwritten by the next regen — so it is \
+             wrong and invisible at once. `git checkout origin/main -- <path>` is equally \
+             wrong: it restores a spec that does not match the models now in the tree, and the \
+             next commit regenerates the divergence. The only correct remedy for that class is \
+             REGENERATE FROM SOURCE once the underlying change lands, which belongs to the \
+             source owner rather than to whoever this nudge happened to wake.\n\
+             HOW TO TELL, since this arm cannot: a path with NO edit record from ANY lane — not \
+             just none of yours — is the signature, because a generator writes it as a \
+             pre-commit side effect and that write carries no record by construction. Check \
+             your repo's pre-commit config for a hook whose output this path is. Reported by \
+             mixpeek-frustrations and backend, who hit this independently in one night on \
+             server/openapi.json and docs/api-reference/openapi.json and both declined the \
+             recipe above on their own judgement."
         ));
     }
 
@@ -2385,6 +2400,54 @@ mod tests {
     /// procedure, in a block whose every other bullet ends in a runnable command.
     /// The DIVERGED section and this protocol are rendered by different functions,
     /// so the section's cell could not see this one.
+    /// The DIVERGED merge recipe is right for hand-written files and WRONG for
+    /// generator output, and conflicts=0 is exactly when it bites.
+    ///
+    /// Reported by mixpeek-frustrations 2026-09-02: the nudge listed
+    /// server/openapi.json and docs/api-reference/openapi.json as DIVERGED with
+    /// "no edit record of yours" — true, and true for every lane, because a
+    /// pre-commit hook regenerates them as a side effect and that write carries
+    /// no record by construction. Merging two generator outputs yields a spec
+    /// matching neither source model: valid, produced by no code, and
+    /// overwritten by the next regen. Two lanes hit it in one night and both
+    /// declined the recipe on their own judgement; a lane that followed it
+    /// lands a spec no generator produced, with nothing downstream to report it.
+    #[test]
+    fn the_diverged_merge_recipe_carves_out_generated_files() {
+        let dirty = vec!["server/openapi.json".to_string()];
+        let fresh =
+            Freshness { diverged: vec!["server/openapi.json".to_string()], ..Default::default() };
+        let m = build("/repo", &dirty, &Ownership::default(), &fresh, "S")
+            .expect("diverged section must render");
+        assert!(m.contains("DIVERGED:"), "premise: the diverged arm must be firing: {m}");
+        assert!(
+            m.contains("merge-file -p"),
+            "premise: the merge recipe must still be there — this is a carve-out, not a removal: {m}"
+        );
+        assert!(
+            m.contains("NOT FOR GENERATED FILES"),
+            "the recipe must name the class it is wrong for: {m}"
+        );
+        assert!(
+            m.contains("REGENERATE FROM SOURCE"),
+            "and name the correct remedy, not just the wrong ones: {m}"
+        );
+        // The reader has to be able to TELL, or the caveat is a worry rather
+        // than an instruction. The signature is the one this arm cannot check
+        // itself: no edit record from ANY lane, not merely none of yours.
+        assert!(
+            m.contains("ANY lane"),
+            "say how to recognise the class, since this arm cannot detect it: {m}"
+        );
+        // AND the restore path must be named as equally wrong. Naming only the
+        // merge would push the reader onto `git checkout origin/main --`, which
+        // regenerates the divergence on the next commit.
+        assert!(
+            m.contains("equally wrong"),
+            "restoring from origin is wrong for this class too, and must say so: {m}"
+        );
+    }
+
     #[test]
     fn the_protocols_diverged_bullet_carries_the_merge_it_prescribes() {
         let dirty = vec!["src/thing.rs".to_string()];
