@@ -4653,3 +4653,63 @@ FIX: e139be2d adds one attributed, idempotent decomposition transaction. The
   capture remains the message-linked epic; children require p0-p3 priority,
   earlier-step dependencies, concrete next actions and a common owner. The drive
   loop completes the epic when all children are terminal.
+
+## A stale-branch "sync" of a shared ledger resurrected 29 retired entries and deleted a live one, and it read as an ordinary edit
+VALIDATED: amux-frustrations | Self-validated; amux-frustrations is the originating session. Both halves verified, the second one live.
+
+THE POPULATION: 29 resurrected entries removed in 6cb3bcc1, verified before the deletion rather than after — every line of every removed block already existed in frustrations-archive.md except one `CARD: AF-10`, whose archive copy carries CARD: AF-242 plus a NOTE-CARD explaining the repoint. Ledger 127 -> 99 entries at the time; 80 now, after amux-testing-e2e retired 18 of their own and this entry left.
+
+THE LOST ENTRY: mixpeek-research's MR-44, absent from BOTH files for four days, restored verbatim from 7dbab8f6^ with STATUS left `open` because only its author can change it.
+
+THE MECHANISM, confirmed live on the running server rather than from the diff:
+  GET /api/debug/invariants -> frustrations.retired_entries_stay_retired | pass
+It is registered, it evaluates on the normal cadence, and it reads both files through one loader so a worktree ledger can never be compared against a baked archive. An empty archive returns Unknown rather than a vacuous pass. Mutation-verified three ways: filtering the intersection to nothing reds the resurrection cell; removing the empty-archive arm reds the rule-4 cell; pointing the live-pair cell's LED at the archive reds it with 104 named overlaps, so the cell that reads the real files can fail.
+
+ARCHIVED WITH ITS SEQUEL NAMED, so it does not read as the class being closed. The title key this entry shipped was BLIND to a chimera: 7dbab8f6 also fused mixpeek-research's MR-43 heading to AF-195's archived body, and no title-keyed sweep can see that. AF-434 (bcc6e46f) added the first-SYMPTOM-line key and restored MR-43. Read this entry as "the 29 are gone and title resurrections are now caught", not as "the overwrite has been fully undone".
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-frustrations
+CARD: AF-430
+SYMPTOM: 29 of the ledger's 127 entries were also sitting in frustrations-archive.md, every
+  one of them carrying a VALIDATED stamp naming the session that signed it off. In the live
+  file they read `STATUS: open`. One commit did all of it: 7dbab8f6, 2026-08-29, "chore:
+  sync frustrations.md to fork's current copy before push", +1000/-855, `Amux-Session:
+  (human)`. It re-added 29 headings and removed 33.
+  Its reasoning was sound and is worth quoting, because nothing about it looks careless: the
+  branch was based on an origin/main that predated a lot of ledger activity, the author had
+  never touched the file, and they were trying to stop the append-only push guard from
+  reading their branch's inherited stale copy as a silent revert. The remedy they chose was
+  to overwrite the whole file with the fork's copy. That copy predated the archive campaign,
+  so the overwrite un-retired every entry archived since 2026-08-06 and dropped every entry
+  appended after the copy was taken.
+  Of the 33 it deleted, 26 were already archived and 6 came back later. ONE never did:
+  mixpeek-research's MR-44, absent from both files for four days, restored immediately above
+  this entry and marked as restored.
+  The resurrection half is the expensive one and it is silent. Twelve of the 29 are
+  byte-identical to their archived copy. The other 17 are the PRE-ARCHIVE drafts of entries
+  their authors edited before signing off, so for four days the live file served the older
+  text of an entry whose corrected text sat in the archive. One of them, the
+  cross-cutting-findings entry, carries `CARD: AF-10` in the ledger while the archive copy
+  carries AF-242 plus a NOTE-CARD explaining the repoint, so a reader of the live file got
+  the pointer that had been deliberately superseded.
+COST: about 70 KB and 29 entries of false backlog, for four days, in the file whose whole
+  argument is that a cluster of entries is evidence. Every count run over this file since
+  2026-08-29 has been wrong in the direction that manufactures urgency: entries whose
+  authors had already validated them as fixed were counted as live friction. I ran those
+  counts myself, in this session, more than once, and cited them. Plus one peer's entry lost
+  outright, and a drain protocol whose central instruction (grep the archive before
+  restoring anything that looks missing) was followed by nobody, because the operation that
+  resurrected these was not a restore and never looked like one.
+FIX: the 29 duplicates are deleted here and the lost entry is back. The mechanism half is
+  the part that matters. `.claude/rules/frustrations.md` says "grep here first, present
+  means it was retired on purpose", the archive's own header says it again, and
+  scripts/frustrations-archive.py warns on a resurrected title. All three sit on the ARCHIVE
+  path. Nothing was watching the LEDGER, which is where a resurrection actually lands, so a
+  whole-file overwrite walked past every one of them without tripping anything. Rule 1: the
+  guidance existed and did not reach the moment it was needed.
+  A title present in both files is a one-line predicate over two files this repo already has
+  open. It wants to be a check that runs, not a fourth sentence asking someone to remember.
+
+---

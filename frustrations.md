@@ -2366,6 +2366,23 @@ FIX: instance 6 has a mechanical fix the others do not, and it is worth stating 
   mixpeek-general's framing, kept because it is the argument: "three instances in one
   afternoon of 'the check ran and could not have failed' is enough that I would rather
   have the reflex than the three stories."
+UPDATED 2026-09-02, evening. The cluster is EIGHT, and the two new ones are the first
+  that argue FOR the proposed mechanism rather than merely adding to the count, because
+  both were caught by running the mutation at the moment the cell was written:
+    7. A test harness gave every cell the same AMUX_HOME, so the previous cell's fixture
+       survived into the "no receipt at all" cell. It passed, and it would have passed
+       with the feature deleted. Caught on the first run because a DIFFERENT cell in the
+       same file failed and made me read the harness.
+    8. A cell asserting "the receipt carries the run's exit code" drove the writer with
+       RC=0, so a writer that HARDCODES `# rc 0` is indistinguishable from one that reads
+       the variable. Caught by mutating the writer to hardcode it: 14 passed, 0 failed.
+       The cell now drives RC=101 and the same mutation reds it.
+  The ratio is the finding. Six instances were caught by luck, a compiler, or a second
+  look; both of today's were caught by the reflex itself, in under a minute each, on
+  cells I had just written and believed. That is the case for making `mutate.sh` cheap
+  enough to be automatic rather than for another sentence telling people to remember.
+  THE CARD IS REOPENED, not the entry retired. AF-422 read `done` over this, and the
+  mechanism the FIX asks for does not exist.
 
 ---
 
@@ -2503,55 +2520,6 @@ RESTORED 2026-09-02 by amux-frustrations, not by its author. This entry was DELE
   actually-lost work. Recovered verbatim from 7dbab8f6^ and re-appended unchanged; every
   line above this one is mixpeek-research's. STATUS stays `open` because nobody has said
   otherwise and only mixpeek-research can. AF-430 has what destroyed it.
-
----
-
-## A stale-branch "sync" of a shared ledger resurrected 29 retired entries and deleted a live one, and it read as an ordinary edit
-AREA: instruments
-SEVERITY: slows
-STATUS: open
-DATE: 2026-09-02
-SESSION: amux-frustrations
-CARD: AF-430
-SYMPTOM: 29 of the ledger's 127 entries were also sitting in frustrations-archive.md, every
-  one of them carrying a VALIDATED stamp naming the session that signed it off. In the live
-  file they read `STATUS: open`. One commit did all of it: 7dbab8f6, 2026-08-29, "chore:
-  sync frustrations.md to fork's current copy before push", +1000/-855, `Amux-Session:
-  (human)`. It re-added 29 headings and removed 33.
-  Its reasoning was sound and is worth quoting, because nothing about it looks careless: the
-  branch was based on an origin/main that predated a lot of ledger activity, the author had
-  never touched the file, and they were trying to stop the append-only push guard from
-  reading their branch's inherited stale copy as a silent revert. The remedy they chose was
-  to overwrite the whole file with the fork's copy. That copy predated the archive campaign,
-  so the overwrite un-retired every entry archived since 2026-08-06 and dropped every entry
-  appended after the copy was taken.
-  Of the 33 it deleted, 26 were already archived and 6 came back later. ONE never did:
-  mixpeek-research's MR-44, absent from both files for four days, restored immediately above
-  this entry and marked as restored.
-  The resurrection half is the expensive one and it is silent. Twelve of the 29 are
-  byte-identical to their archived copy. The other 17 are the PRE-ARCHIVE drafts of entries
-  their authors edited before signing off, so for four days the live file served the older
-  text of an entry whose corrected text sat in the archive. One of them, the
-  cross-cutting-findings entry, carries `CARD: AF-10` in the ledger while the archive copy
-  carries AF-242 plus a NOTE-CARD explaining the repoint, so a reader of the live file got
-  the pointer that had been deliberately superseded.
-COST: about 70 KB and 29 entries of false backlog, for four days, in the file whose whole
-  argument is that a cluster of entries is evidence. Every count run over this file since
-  2026-08-29 has been wrong in the direction that manufactures urgency: entries whose
-  authors had already validated them as fixed were counted as live friction. I ran those
-  counts myself, in this session, more than once, and cited them. Plus one peer's entry lost
-  outright, and a drain protocol whose central instruction (grep the archive before
-  restoring anything that looks missing) was followed by nobody, because the operation that
-  resurrected these was not a restore and never looked like one.
-FIX: the 29 duplicates are deleted here and the lost entry is back. The mechanism half is
-  the part that matters. `.claude/rules/frustrations.md` says "grep here first, present
-  means it was retired on purpose", the archive's own header says it again, and
-  scripts/frustrations-archive.py warns on a resurrected title. All three sit on the ARCHIVE
-  path. Nothing was watching the LEDGER, which is where a resurrection actually lands, so a
-  whole-file overwrite walked past every one of them without tripping anything. Rule 1: the
-  guidance existed and did not reach the moment it was needed.
-  A title present in both files is a one-line predicate over two files this repo already has
-  open. It wants to be a check that runs, not a fourth sentence asking someone to remember.
 
 ---
 
