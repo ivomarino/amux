@@ -2526,7 +2526,7 @@ RESTORED 2026-09-02 by amux-frustrations, not by its author. This entry was DELE
 ## The append-only guard's PASS is not evidence for any particular line: a rescue by the substring test is silent
 AREA: hooks
 SEVERITY: annoys
-STATUS: open
+STATUS: fixed
 DATE: 2026-09-02
 SESSION: amux-frustrations
 CARD: AF-432
@@ -2576,6 +2576,26 @@ FIX: not the substring test, which earns its keep — the guard's own comments r
   a republish that reverts only a DUPLICATED FIELD LINE passes with NO warning, which is
   the one case the author's own mitigation (the WARN log line keeps it visible) does not
   cover.
+SHIPPED, and the shape is sharper than what this entry proposed. "Count the rescues" would
+  have fired on every archive move, because a retirement rescues every moved line and the
+  note would have appeared on each one until people learned to skip it. The classifier now
+  splits the rescue in two: an EXACT whole-line match elsewhere in the pushed union is real
+  survival and stays silent (that is the union rule doing its job), while a match that is
+  only a SUBSTRING of some longer line is counted, named and logged as `SUBSTR`.
+  Reported, never refused, and the reason is stated in the code: an in-place extension
+  leaves the old line as a prefix of the new one and so does a coincidental id, and this
+  check genuinely cannot tell them apart. Refusing would fire on the routine edit these
+  files get most, which is the exact trade the substring test was added to avoid. So it
+  says what it could not express and leaves the judgement with the author.
+  PRECISION MEASURED ON THE REAL RANGE, because a report that fires constantly is worth
+  less than no report: across 55 commits that archived 47 entries and moved thousands of
+  lines, it names exactly ONE — `CARD: AF-10`, the line that started this.
+  Cells in scripts/test-append-only-substring-scope.sh. Cell 2 is the one that matters and
+  it is the control, not the specimen: an ordinary archive move must stay SILENT. It caught
+  a fixture bug on the first run (a `printf '%s'` left the moved entry as one long line, so
+  nothing in it was a whole line), which is the only reason I know the cell can fail.
+  Mutation-verified three ways: restoring the silent rescue reds three assertions; reporting
+  every rescue reds the archive-move control; deleting the block reds three.
 
 ---
 
