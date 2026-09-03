@@ -603,3 +603,71 @@ if echo "$STAGED" | grep -qx 'frustrations.md' && [ -f "$ROOT/scripts/frustratio
     echo "frustrations.md structure ok."
   fi
 fi
+
+# ── DOES YOUR GREEN RESULT DESCRIBE THIS COMMIT? (AF-195) ────────────────────
+#
+# A test run describes the bytes cargo compiled. A commit ships the bytes in the
+# INDEX. On a shared checkout those come apart in the window between the two:
+# a peer stages a change to a file you tested, and the commit carries a version
+# no test ever saw. Specimen, 2026-08-24: `cargo test -p amux-server --test
+# board_api` gave 37 passed / 0 failed, the commit that cited it (c971756b)
+# shipped RED, and a rerun minutes later failed at board_api.rs:2280. Both
+# results were TRUE when taken. The floor arrived through the index in between.
+#
+# THIS DOES NOT RUN TESTS AND DOES NOT BLOCK. The Rust gate above records, with
+# measurements, why it compiles tests and does not run them: ~40s on every
+# commit across ~50 lanes, and a failing assertion blocks only its author. That
+# trade stands. This costs one `ls-files -s` and a file read, and it answers a
+# question nothing else here can: whether the run you are about to cite covers
+# the bytes you are about to commit.
+#
+# WHY IT REPORTS WHEN THERE IS NO RECEIPT. "Silent" and "everything matches"
+# must not look the same (ethos rule 4). A commit with no receipt has no claim
+# behind it, which is fine and common; what is not fine is a reader inferring
+# coverage from silence.
+if [ -n "$STAGED" ] && echo "$STAGED" | grep -q '^crates/'; then
+  _rcpt="${AMUX_HOME:-$HOME/.amux}/test-receipts/${AMUX_SESSION:-unknown}.tsv"
+  _staged_crates=$(echo "$STAGED" | grep '^crates/' || true)
+  _n_staged=$(printf '%s\n' "$_staged_crates" | grep -c . || true)
+  if [ ! -f "$_rcpt" ]; then
+    echo "test receipt: none for session '${AMUX_SESSION:-unknown}' — $_n_staged staged crate"
+    echo "test receipt: file(s) carry no claim that any run compiled these bytes. Not a"
+    echo "test receipt: problem; said out loud so silence is not read as coverage."
+  elif [ "$(grep -m1 '^# repo	' "$_rcpt" | cut -f2)" != "$ROOT" ]; then
+    echo "test receipt: the receipt on file is from a DIFFERENT checkout"
+    echo "test receipt: ($(grep -m1 '^# repo	' "$_rcpt" | cut -f2)) — it says nothing about this one."
+  else
+    _rc=$(grep -m1 '^# rc	' "$_rcpt" | cut -f2)
+    _age=$(( $(date -u +%s) - $(grep -m1 '^# at	' "$_rcpt" | cut -f2) ))
+    _args=$(grep -m1 '^# args	' "$_rcpt" | cut -f2-)
+    # The index blob sha per staged path, which git already has — no hashing.
+    _changed=""
+    while IFS= read -r _p; do
+      [ -n "$_p" ] || continue
+      _idx=$(git ls-files -s -- "$_p" 2>/dev/null | awk '{print $2}')
+      _was=$(awk -F'\t' -v p="$_p" '$2==p {print $1; exit}' "$_rcpt")
+      if [ -z "$_was" ]; then
+        _changed="$_changed
+    $_p (not in the tested set at all)"
+      elif [ "$_idx" != "$_was" ]; then
+        _changed="$_changed
+    $_p"
+      fi
+    done <<< "$_staged_crates"
+    if [ "$_rc" != "0" ]; then
+      echo "test receipt: your last run EXITED $_rc (\`$_args\`, ${_age}s ago). A red run"
+      echo "test receipt: vouches for nothing — do not cite it as evidence for this commit."
+    fi
+    if [ -n "$_changed" ]; then
+      _nc=$(printf '%s' "$_changed" | grep -c . || true)
+      echo "test receipt: $_nc of $_n_staged staged crate file(s) DIFFER from the bytes your"
+      echo "test receipt: last run compiled (\`$_args\`, ${_age}s ago):$_changed"
+      echo "test receipt: That green result does not describe this commit. It may still be"
+      echo "test receipt: fine — you may have edited after testing — but the run is not"
+      echo "test receipt: evidence for these bytes until you re-run it."
+    elif [ "$_rc" = "0" ]; then
+      echo "test receipt: all $_n_staged staged crate file(s) match the bytes your last run"
+      echo "test receipt: compiled (\`$_args\`, ${_age}s ago, exit 0)."
+    fi
+  fi
+fi
