@@ -152,6 +152,39 @@ fn messages_link_schedule_ids_to_the_scheduler() {
 }
 
 #[test]
+fn message_card_links_survive_the_capped_board_working_set() {
+    let app = asset("app.js");
+    let start = app
+        .find("function _msgCardChip(cardId, message)")
+        .expect("message card chip must accept authoritative card metadata");
+    let tail = &app[start..];
+    let end = tail
+        .find("function _msgCtxPeek")
+        .expect("message card chip must precede the shared message renderer");
+    let body = &tail[..end];
+    for needle in [
+        "message.card_title",
+        "message.card_status",
+        "message.card_archived",
+        "message.card_deleted",
+        "const c = live ||",
+    ] {
+        assert!(
+            body.contains(needle),
+            "message card chip lost authoritative history metadata `{needle}`"
+        );
+    }
+    assert!(
+        app.contains("_msgCardChip(typeof e === 'string' ? '' : (e.card_id || ''), e)"),
+        "the shared history row must pass its authoritative card metadata to the chip"
+    );
+    assert!(
+        app.contains("card_title: x.card_title, card_status: x.card_status"),
+        "normalizing history rows must preserve card metadata"
+    );
+}
+
+#[test]
 fn long_shell_runs_have_an_immediate_visible_state() {
     let app = asset("app.js");
     for needle in [
