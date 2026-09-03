@@ -197,6 +197,14 @@ pub fn import_chrome_profile(
             return Err(e.into());
         }
     }
+    // This is selected login state, not disposable scratch. Registering it
+    // exempts the isolated copy from the profile TTL reaper. A failed registry
+    // write rolls back only the destination we just created; the human source
+    // remains untouched throughout.
+    if let Err(e) = registry_register(home, name, "", "") {
+        let _ = std::fs::remove_dir_all(&destination);
+        return Err(e.context("register imported Chrome profile"));
+    }
     Ok(Some(ImportedChromeProfile { source, destination, files, bytes }))
 }
 
@@ -3863,6 +3871,11 @@ mod tests {
         assert_eq!(target.user_data_dir, dest);
         assert!(is_amux_owned(home.path(), &target.user_data_dir));
         assert_eq!(target.profile_directory, None);
+        let inventory = list_profiles(home.path(), false);
+        assert!(
+            inventory.iter().any(|p| p.name == "ethan-tubescience" && p.registered),
+            "imported login state must be exempt from scratch-profile TTL cleanup"
+        );
         assert!(
             import_chrome_profile(home.path(), &chrome, "ethan-tubescience")
                 .unwrap()
