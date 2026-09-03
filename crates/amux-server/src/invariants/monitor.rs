@@ -1351,29 +1351,46 @@ fn card_type_vocabulary_check(state: &AppState) -> Vec<InvariantResult> {
 fn frustration_ledger_check(state: &AppState) -> Vec<InvariantResult> {
     const AGREE: &str = "frustrations.ledger_agrees_with_board";
     const REACH: &str = "frustrations.cards_are_reachable";
+    const RETIRED: &str = "frustrations.retired_entries_stay_retired";
     const BAKED: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../frustrations.md"
     ));
+    const BAKED_ARCHIVE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../frustrations-archive.md"
+    ));
     let repo = crate::api::self_update::repo_dir();
-    let (md, source) = repo
-        .as_ref()
-        .and_then(|d| {
-            std::fs::read_to_string(d.join("frustrations.md")).ok().map(|s| (s, "worktree"))
-        })
-        .or_else(|| {
-            let dir = repo.as_ref()?;
-            let out = std::process::Command::new("git")
-                .args(["-C", &dir.to_string_lossy(), "show", "HEAD:frustrations.md"])
-                .output()
-                .ok()?;
-            out.status
-                .success()
-                .then(|| (String::from_utf8_lossy(&out.stdout).into_owned(), "HEAD"))
-        })
-        .unwrap_or_else(|| (BAKED.to_string(), "baked-at-build"));
+    // One resolver for both files, so the ledger and the archive can never be
+    // read from DIFFERENT commits. Comparing a worktree ledger against a baked
+    // archive would report every entry archived since the last build as a
+    // resurrection, which is the AF-132 trap this module already carries a
+    // warning about one function up.
+    let load = |name: &str, baked: &'static str| -> (String, &'static str) {
+        repo.as_ref()
+            .and_then(|d| std::fs::read_to_string(d.join(name)).ok().map(|s| (s, "worktree")))
+            .or_else(|| {
+                let dir = repo.as_ref()?;
+                let out = std::process::Command::new("git")
+                    .args(["-C", &dir.to_string_lossy(), "show", &format!("HEAD:{name}")])
+                    .output()
+                    .ok()?;
+                out.status
+                    .success()
+                    .then(|| (String::from_utf8_lossy(&out.stdout).into_owned(), "HEAD"))
+            })
+            .unwrap_or_else(|| (baked.to_string(), "baked-at-build"))
+    };
+    let (md, source) = load("frustrations.md", BAKED);
+    let (archive_md, archive_source) = load("frustrations-archive.md", BAKED_ARCHIVE);
+    let archive_titles: Vec<String> =
+        checks::parse_frustration_entries(&archive_md).into_iter().map(|e| e.1).collect();
 
     let entries = checks::parse_frustration_entries(&md);
+    // Taken BEFORE the join loop consumes `entries`, and it is every title
+    // rather than only the ones that yielded a card: all 29 of AF-430's
+    // resurrected entries carried perfectly good CARD lines.
+    let ledger_titles: Vec<String> = entries.iter().map(|e| e.1.clone()).collect();
     if entries.is_empty() {
         // Zero entries makes BOTH checks pass vacuously, which is the exact
         // theatre this module forbids. An empty ledger is either a drained file
@@ -1381,13 +1398,23 @@ fn frustration_ledger_check(state: &AppState) -> Vec<InvariantResult> {
         let msg = format!("parsed 0 entries from {source} ({} bytes)", md.len());
         return vec![
             InvariantResult::unknown(AGREE, msg.clone()),
-            InvariantResult::unknown(REACH, msg),
+            InvariantResult::unknown(REACH, msg.clone()),
+            InvariantResult::unknown(RETIRED, msg),
         ];
     }
     let Ok(conn) = state.store.read() else {
+        // The board join needs the store; the ledger/archive comparison does
+        // NOT, so it still runs and still reports. A check that goes silent
+        // because a DIFFERENT check's dependency is down is how a resurrection
+        // sits unseen through an outage.
         return vec![
             InvariantResult::unknown(AGREE, "store unreadable"),
             InvariantResult::unknown(REACH, "store unreadable"),
+            checks::frustration_retired_entries_stay_retired(
+                &ledger_titles,
+                &archive_titles,
+                source,
+            ),
         ];
     };
     // The prefixes THIS instance mints, read off the board rather than
@@ -1447,6 +1474,12 @@ fn frustration_ledger_check(state: &AppState) -> Vec<InvariantResult> {
         &cardless,
         &local_prefixes,
         source,
+    ));
+    // AF-430.
+    out.push(checks::frustration_retired_entries_stay_retired(
+        &ledger_titles,
+        &archive_titles,
+        if source == archive_source { source } else { "ledger and archive from different sources" },
     ));
     out
 }

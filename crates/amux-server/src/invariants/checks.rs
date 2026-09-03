@@ -2777,6 +2777,101 @@ pub fn frustration_cards_are_reachable(
 }
 
 // ---------------------------------------------------------------------------
+// 11c. A retired entry stays retired (AF-430)
+// ---------------------------------------------------------------------------
+
+/// No title appears in BOTH `frustrations.md` and `frustrations-archive.md`.
+///
+/// INCIDENT (AF-430, 2026-08-29 to 2026-09-02). One commit, `7dbab8f6`,
+/// overwrote the ledger with a fork's older copy to satisfy the append-only
+/// push guard. It re-added 29 headings that had already been archived with a
+/// `VALIDATED:` stamp, and deleted 33 that had been appended since. For four
+/// days the live file carried 29 retired entries reading `STATUS: open`, and
+/// every count run over it overstated the backlog by that much. Twelve were
+/// byte-identical to their archived copy; the other seventeen were the
+/// PRE-archive drafts of entries their authors had corrected before signing
+/// off, so the ledger served older text than the archive held.
+///
+/// WHY THIS IS A CHECK AND NOT A FOURTH SENTENCE. Three separate places already
+/// state the rule: `.claude/rules/frustrations.md` ("grep here first, present
+/// means it was retired on purpose"), the archive file's own header, and
+/// `scripts/frustrations-archive.py`, which warns when it is asked to archive a
+/// title the archive already holds. All three sit on the ARCHIVE path. A
+/// resurrection lands on the LEDGER, which nothing was watching, so a
+/// whole-file overwrite walked past all three without tripping anything. That
+/// is ethos rule 1: the guidance existed and did not reach the moment it was
+/// needed.
+///
+/// The direction matters and is the reason the message says so out loud. A
+/// title in both files does NOT mean an entry was lost; the archive exists
+/// precisely so a set-difference over the ledger alone cannot read a MOVE as a
+/// deletion (creative-dna measured 15 of 15 "lost" entries as archive moves).
+/// It means the ledger is serving a copy of something already signed off. The
+/// remedy is to delete the LEDGER copy, never to un-archive.
+pub fn frustration_retired_entries_stay_retired(
+    ledger_titles: &[String],
+    archive_titles: &[String],
+    source: &str,
+) -> InvariantResult {
+    const ID: &str = "frustrations.retired_entries_stay_retired";
+    // Rule 4: an empty side makes the intersection empty and the check pass
+    // vacuously, which is exactly the theatre this module forbids. Zero
+    // archived entries is a broken read or a broken parse, never a healthy
+    // archive, because the archive is append-only and has held entries since
+    // 2026-08-06.
+    if archive_titles.is_empty() {
+        return InvariantResult::unknown(
+            ID,
+            format!("parsed 0 entries from the archive (ledger read from {source}); with no \
+                    archived titles the intersection is empty for the wrong reason"),
+        );
+    }
+    if ledger_titles.is_empty() {
+        return InvariantResult::unknown(
+            ID,
+            format!("parsed 0 entries from the ledger ({source})"),
+        );
+    }
+    let archived: BTreeSet<&str> = archive_titles.iter().map(|s| s.as_str()).collect();
+    let both: Vec<&String> =
+        ledger_titles.iter().filter(|t| archived.contains(t.as_str())).collect();
+    if both.is_empty() {
+        return InvariantResult::pass(ID).evidence(json!({
+            "ledger_entries": ledger_titles.len(),
+            "archive_entries": archive_titles.len(),
+            "source": source,
+        }));
+    }
+    let sample: Vec<String> = both.iter().take(4).map(|t| {
+        let t = t.as_str();
+        if t.len() > 70 { format!("{}…", &t[..t.char_indices().nth(70).map_or(t.len(), |(i, _)| i)]) }
+        else { t.to_string() }
+    }).collect();
+    InvariantResult::fail(
+        ID,
+        "no frustrations.md entry title also appears in frustrations-archive.md".to_string(),
+        format!(
+            "{} ledger entry/entries are also in the archive, where each carries a VALIDATED \
+             stamp naming the session that signed it off ({}). They read as live friction and \
+             `grep '^STATUS: open' frustrations.md` counts every one of them. This is a \
+             RESURRECTION, not a loss: the archive is where retired entries are supposed to be, \
+             so the fix is to delete the LEDGER copy, never to un-archive. Check the archived \
+             copy's text first, because it may be a later revision than the ledger's \
+             (17 of AF-430's 29 were). Ledger read from {source}.",
+            both.len(),
+            sample.join("; "),
+        ),
+    )
+    .evidence(json!({
+        "resurrected": both.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
+        "ledger_entries": ledger_titles.len(),
+        "archive_entries": archive_titles.len(),
+        "source": source,
+        "remedy": "delete the frustrations.md copy; the archive copy is the signed-off one",
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Negative controls (AMUX-2624). Each proves the check DETECTS the real bug.
 // ---------------------------------------------------------------------------
 
@@ -3087,6 +3182,69 @@ mod negative_controls {
             "unexpected STATUS values: {:?}",
             es.iter().map(|e| &e.2).collect::<BTreeSet<_>>()
         );
+    }
+
+    // -- AF-430: a retired entry stays retired ---------------------------
+
+    fn ttl(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The positive control, rebuilt from the incident: `7dbab8f6` put 29
+    /// already-archived headings back into the ledger. The check must FAIL on
+    /// exactly that, and its message must send the reader at the ledger copy,
+    /// because the opposite reading (the entry was lost, restore it) is the
+    /// mistake the archive exists to prevent.
+    #[test]
+    fn detects_an_archived_entry_resurrected_into_the_ledger() {
+        let led = ttl(&["a live one", "amux-launched browser does not survive a server self-adopt"]);
+        let arc = ttl(&["amux-launched browser does not survive a server self-adopt", "another"]);
+        let r = frustration_retired_entries_stay_retired(&led, &arc, "worktree");
+        assert_eq!(r.status, Status::Fail, "{}", r.observed);
+        let obs = &r.observed;
+        assert!(obs.contains("1 ledger entry"), "{obs}");
+        assert!(obs.contains("delete the LEDGER copy"), "remedy must name the side to delete: {obs}");
+        assert!(obs.contains("RESURRECTION"), "must say which direction this is: {obs}");
+    }
+
+    /// The control that matters. A checker that fires on every ledger is worth
+    /// nothing, and the honest ledger is the far more common state.
+    #[test]
+    fn a_ledger_sharing_no_title_with_the_archive_passes() {
+        let r = frustration_retired_entries_stay_retired(
+            &ttl(&["one", "two"]),
+            &ttl(&["three", "four"]),
+            "worktree",
+        );
+        assert_eq!(r.status, Status::Pass, "{}", r.observed);
+    }
+
+    /// Rule 4. An empty archive makes the intersection empty, so the check
+    /// would PASS while measuring nothing. That is the shape this module
+    /// forbids, and `unknown` is the only honest answer.
+    #[test]
+    fn an_empty_archive_is_unknown_not_a_pass() {
+        let r = frustration_retired_entries_stay_retired(&ttl(&["one"]), &[], "worktree");
+        assert_eq!(r.status, Status::Unknown, "{}", r.observed);
+        assert!(r.observed.contains("for the wrong reason"), "{}", r.observed);
+        let r2 = frustration_retired_entries_stay_retired(&[], &ttl(&["one"]), "HEAD");
+        assert_eq!(r2.status, Status::Unknown);
+    }
+
+    /// The live pair, which is the cell that would have caught AF-430 four days
+    /// earlier than a human did. It reads both real files rather than a
+    /// fixture, because a fixture cannot go stale and the ledger can.
+    #[test]
+    fn the_real_ledger_holds_nothing_the_real_archive_has_already_retired() {
+        const LED: &str = include_str!("../../../../frustrations.md");
+        const ARC: &str = include_str!("../../../../frustrations-archive.md");
+        let lt: Vec<String> =
+            parse_frustration_entries(LED).into_iter().map(|e| e.1).collect();
+        let at: Vec<String> =
+            parse_frustration_entries(ARC).into_iter().map(|e| e.1).collect();
+        assert!(at.len() > 20, "archive parsed only {} entries", at.len());
+        let r = frustration_retired_entries_stay_retired(&lt, &at, "baked-at-build");
+        assert_eq!(r.status, Status::Pass, "{}", r.observed);
     }
 
     /// AMUX-3203, rebuilt from the incident artifact: both channels ENABLED with

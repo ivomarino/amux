@@ -10,9 +10,14 @@ MOVE and reports it as a deletion every time. Before restoring anything that loo
 missing from `frustrations.md`, grep here first: present means it was retired on
 purpose, and re-appending it manufactures a duplicate.
 
-Nothing here is live. `frustrations.md` is the live file and the invariants
+Nothing here is live. `frustrations.md` is the live file, and
 `frustrations.ledger_agrees_with_board` / `frustrations.cards_are_reachable` read
-only that one.
+only that one. A third invariant, `frustrations.retired_entries_stay_retired`,
+reads BOTH and fails when a title is in both files at once (AF-430). It exists
+because the three places that already stated the rule above all sit on the
+ARCHIVE path, and a resurrection lands on the LEDGER: on 2026-08-29 one
+whole-file overwrite put 29 signed-off entries back into the live file, where
+they read `STATUS: open` for four days and were counted as backlog.
 
 ---
 
