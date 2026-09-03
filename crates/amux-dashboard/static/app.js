@@ -3344,8 +3344,8 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
               parts.push(_schedCountHTML(s.sched_on, s.sched_off) + ' sched');
             }
             if (d) parts.push(`<span class="mc-doing">${d}</span> doing`);
-            if (todo) parts.push(`<span class="mc-active">${todo}</span> todo`);
-            if (backlog) parts.push(`<span class="mc-total">${backlog}</span> backlog`);
+            if (todo) parts.push(`<span class="mc-active mc-todo">${todo}</span> todo`);
+            if (backlog) parts.push(`<span class="mc-total mc-backlog">${backlog}</span> backlog`);
             if (needsYou) parts.push(`<span class="mc-total">${needsYou}</span> needs you`);
             if (review) parts.push(`<span class="mc-total">${review}</span> review`);
             if (done) parts.push(`<span class="mc-total">${done}</span> done`);
@@ -8575,7 +8575,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.787';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.788';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -35600,9 +35600,12 @@ async function _bwLoadProfiles() {
       sel.appendChild(sep);
     }
     scratch.forEach(p => sel.appendChild(opt(p, '🔓')));
-    (d.chrome_profiles || []).forEach(p => {
+    const isolatedNames = new Set(all.map(p => p.name));
+    (d.chrome_profiles || []).filter(p => !isolatedNames.has(p)).forEach(p => {
       const o = document.createElement('option');
-      o.value = p; o.textContent = '🌐 ' + p;
+      o.value = p;
+      o.textContent = '🌐 ' + p + ' — import on first use';
+      o.title = 'Copies login state into an isolated amux profile; your normal Chrome can stay open';
       sel.appendChild(o);
     });
     if (cur) sel.value = cur;
@@ -35684,7 +35687,9 @@ async function _bwGo() {
     const _landed = d.launch_url || (d.data && d.data.url) || '';
     _bwCurrentUrl = _landed || url;
     _bwShowProfile(d.profile, d.auto_profile);
-    let _msg = 'Navigated' + (d.profile_fallback ? ' (no profile — Chrome busy)' : '');
+    let _msg = d.profile_imported_from
+      ? 'Imported the Chrome login into an isolated profile and navigated'
+      : 'Navigated' + (d.profile_fallback ? ' (no profile — Chrome busy)' : '');
     if (_landed && !/^about:/.test(_landed)) {
       const _host = u => { try { return new URL(u).host.replace(/^www\./, ''); } catch (e) { return ''; } };
       const _want = _host(url), _got = _host(_landed);

@@ -25,6 +25,14 @@ test('worker Configurations edits the full board lifecycle and every scoped capa
     expect(created.status()).toBe(201);
 
     await page.reload();
+    // CHAOS CELL: another worker can create pending permission grants while
+    // this operator is opening Configurations. The real full-suite race grew
+    // this global strip over the upward-opening worker menu and swallowed the
+    // Peek click. Keep that concurrency shape deterministic in this spec.
+    await page.locator('#email-approvals-banner').evaluate((el: HTMLElement) => {
+      el.style.display = 'block';
+      el.innerHTML = '<div style="height:240px">Concurrent permission request</div>';
+    });
     const card = page.locator(`.card[data-session="${name}"]`).locator('visible=true').first();
     await expect(card).toBeVisible({ timeout: 10_000 });
     await card.locator('.card-menu-btn').click();
