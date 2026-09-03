@@ -174,6 +174,56 @@ fn long_shell_runs_have_an_immediate_visible_state() {
 }
 
 #[test]
+fn cross_group_default_can_initialize_before_the_main_api_constant() {
+    let app = asset("app.js");
+    let read_start = app
+        .find("async function readCrossGroupDefault()")
+        .expect("cross-group settings need an authoritative reader");
+    let init_end = app[read_start..]
+        .find("async function toggleYoloDefault")
+        .map(|n| read_start + n)
+        .expect("cross-group initialization must precede the next settings helper");
+    let early_boot = &app[read_start..init_end];
+    let api_decl = app
+        .find("const API = ''")
+        .expect("the main API transport constant must still exist");
+
+    assert!(
+        init_end < api_decl,
+        "this regression guard is specifically about the early settings initializer"
+    );
+    assert!(
+        early_boot.contains("fetch('/api/config/cross-group'"),
+        "the early reader/writer must use the root-relative endpoint"
+    );
+    assert!(
+        !early_boot.contains("fetch(API + '/api/config/cross-group'"),
+        "referencing API before its declaration throws in the temporal dead zone and silently leaves the toggle off"
+    );
+}
+
+#[test]
+fn all_worker_backlog_drain_is_a_persistent_settings_control() {
+    let app = asset("app.js");
+    let html = asset("index.html");
+    for needle in [
+        "async function readBoardDrainDefault()",
+        "async function toggleBoardDrainDefault(checked)",
+        "fetch('/api/config/board-drain'",
+        "initBoardDrainDefault",
+    ] {
+        assert!(app.contains(needle), "board-drain settings lost `{needle}`");
+    }
+    for needle in [
+        "board-drain-default-checkbox",
+        "Auto-drain backlog for all workers",
+        "Default ON: when To Do is empty",
+    ] {
+        assert!(html.contains(needle), "worker settings lost `{needle}`");
+    }
+}
+
+#[test]
 fn sse_message_invalidation_refreshes_each_visible_message_surface() {
     let app = asset("app.js");
     let start = app

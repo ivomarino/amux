@@ -11314,6 +11314,9 @@ pub fn routes() -> Router<AppState> {
         // Fleet-wide cross-group default (AMUX-4018). GET is open; PUT is
         // owner-only, enforced in the handler.
         .route("/api/config/cross-group", axum::routing::get(get_cross_group_config).put(put_cross_group_config))
+        // Fleet-wide board-drain default.  Per-worker/group values still win,
+        // but this is the operator control for "all workers on by default".
+        .route("/api/config/board-drain", axum::routing::get(get_board_drain_config).put(put_board_drain_config))
         .route("/api/sessions/{name}", any(session_root_handler))
         // A WARN nobody can query is the same gap one layer out: this is
         // where a sweep or an autofix loop asks "did anything get delivered
@@ -13246,6 +13249,65 @@ async fn put_cross_group_config(headers: HeaderMap, body: Option<Json<Value>>) -
             "every worker may now send to any group by default, no approval needed"
         } else {
             "workers may now send to the listed groups by default"
+        },
+    }))
+}
+
+/// GET /api/config/board-drain — the fleet-wide backlog -> To Do default.
+///
+/// Absence means ON. That is the product default, so a fresh install and an
+/// old install with no override agree. Worker and group scope may still opt a
+/// lane out through the ordinary configuration resolver.
+async fn get_board_drain_config() -> Response {
+    let home = crate::config::amux_home();
+    let key = crate::runtime_jobs::board_drive::DISPATCH_BACKLOG_KEY;
+    let configured = EnvFile::load(&home.join("amux.env"))
+        .get(key)
+        .map(|v| v.trim().trim_matches('"').to_string());
+    let enabled = configured
+        .as_deref()
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(true);
+    j200(json!({
+        "enabled": enabled,
+        "configured": configured,
+        "default_when_unset": true,
+        "note": "worker and group configuration may explicitly opt individual lanes out",
+    }))
+}
+
+/// PUT /api/config/board-drain — set the all-worker backlog-drain default.
+/// Owner-only for the same reason as the cross-group fleet setting: a worker
+/// may tune its own lane, but may not rewrite every peer's automation policy.
+async fn put_board_drain_config(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    if ["x-amux-session", "x-amux-worker"].iter().any(|h| {
+        headers.get(*h).and_then(|v| v.to_str().ok()).is_some_and(|s| !s.trim().is_empty())
+    }) {
+        return jresp(StatusCode::FORBIDDEN, json!({
+            "error": "a worker may not set the fleet-wide board-drain default",
+            "how": "set it from dashboard Settings, or use the worker's Configurations tab for one lane",
+        }));
+    }
+    let b = body.map(|Json(v)| v).unwrap_or(Value::Null);
+    let Some(enabled) = b.get("enabled").and_then(Value::as_bool) else {
+        return jresp(StatusCode::BAD_REQUEST, json!({"error": "enabled must be a boolean"}));
+    };
+    let home = crate::config::amux_home();
+    let path = home.join("amux.env");
+    let key = crate::runtime_jobs::board_drive::DISPATCH_BACKLOG_KEY;
+    let mut cfg = EnvFile::load(&path);
+    cfg.set(key, if enabled { "1" } else { "0" });
+    if cfg.write(&path).is_err() {
+        return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write amux.env"}));
+    }
+    tracing::warn!(enabled, "config: fleet-wide backlog drain default changed");
+    j200(json!({
+        "ok": true,
+        "enabled": enabled,
+        "message": if enabled {
+            "all workers will drain eligible backlog by default"
+        } else {
+            "workers will not drain backlog unless a group or worker override enables it"
         },
     }))
 }
