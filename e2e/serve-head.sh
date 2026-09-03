@@ -87,6 +87,14 @@ done
 # commit before patching anything.
 export AMUX_NO_SELF_ADOPT=1
 
+# A throwaway home is not enough isolation: tmux, process tables, hook files and
+# provider credentials are host-wide. Without the process-wide fleet switch,
+# three browser-test servers run cleanup/autofix/invariant loops against the real
+# machine and write those findings into their temporary boards. The registry
+# keeps every suppressed job visible with this exact reason, so isolation does
+# not turn monitoring into a silent absence.
+export AMUX_ISOLATED=1
+
 dirty="$(git -C "$REPO" status --porcelain -- crates/ Cargo.toml Cargo.lock 2>/dev/null || true)"
 
 if [ "${AMUX_E2E_WORKING_TREE:-0}" = "1" ]; then

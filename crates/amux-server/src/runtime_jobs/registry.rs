@@ -117,6 +117,11 @@ pub mod ids {
     pub const TELEGRAM_RELAY: &str = "telegram-relay";
     pub const QUEUE_DISPOSITION: &str = "queue-disposition";
     pub const MAC_HEALTH: &str = "mac-health";
+    pub const ACCOUNTABILITY_NUDGE: &str = "accountability-nudge";
+    pub const CONTEXT_HEALTH: &str = "context-health";
+    pub const DISK_WATCH: &str = "disk-watch";
+    pub const STATUS_HISTORY: &str = "status-history";
+    pub const TOKEN_LEDGER: &str = "token-ledger";
 }
 
 /// Every id above, enumerated. `mod ids` is a set of constants and Rust cannot
@@ -152,6 +157,11 @@ pub const ALL_IDS: &[&str] = &[
     ids::TELEGRAM_RELAY,
     ids::QUEUE_DISPOSITION,
     ids::MAC_HEALTH,
+    ids::ACCOUNTABILITY_NUDGE,
+    ids::CONTEXT_HEALTH,
+    ids::DISK_WATCH,
+    ids::STATUS_HISTORY,
+    ids::TOKEN_LEDGER,
 ];
 
 /// An env var this job reads at startup. It is a READOUT, never a switch: a
@@ -476,8 +486,15 @@ pub const CATALOG: &[Doc] = &[
     Doc {
         id: ids::SELF_ADOPT,
         name: "Self-adoption watch",
-        purpose: "Exits 0 when the installed binary changes on disk so launchd relaunches the new build instead of serving stale code.",
-        env: NO_ENV,
+        purpose: "Execs the installed binary in place when it changes on disk instead of serving stale code; a test harness may deliberately disable it while pinning one build.",
+        env: &[EnvControl {
+            var: "AMUX_NO_SELF_ADOPT",
+            effect: "truthy = do not exec a replacement binary; the inert registry row names this switch",
+            // The startup branch registers its own disabled_reason because
+            // this negative boolean accepts 1/true/yes/on, not one exact
+            // off-value the catalog could safely re-derive.
+            off: None,
+        }],
         pref: None,
         detail: None,
     },
@@ -496,7 +513,9 @@ pub const CATALOG: &[Doc] = &[
         env: &[EnvControl {
             var: "TELEGRAM_BOT_TOKEN",
             effect: "unset = loop idles, checking every 5 minutes; set = polls continuously",
-            off: Some(""),
+            // The loop remains spawned and instrumented while idle, so an
+            // absent connector is not the same state as a disabled job.
+            off: None,
         }],
         pref: None,
         detail: Some("/api/telegram/status"),
@@ -516,7 +535,7 @@ pub const CATALOG: &[Doc] = &[
     Doc {
         id: ids::MAC_HEALTH,
         name: "Mac process health",
-        purpose: "Reaps orphaned Ray workers (ray:: processes with no live raylet), and warns when the claude process count exceeds the ceiling. Runs every 30 minutes.",
+        purpose: "Safely reaps aged orphaned Ray, Playwright Chrome, debug rustc, and server-owned zombie children; warns on foreign zombies and excessive claude processes. Runs every 30 minutes.",
         env: &[
             EnvControl {
                 var: "AMUX_MAC_HEALTH_TICK_S",
@@ -533,7 +552,92 @@ pub const CATALOG: &[Doc] = &[
                 effect: "minimum age (seconds) before an orphaned ray:: worker is killed (default 120)",
                 off: None,
             },
+            EnvControl {
+                var: "AMUX_MAC_HEALTH_PLAYWRIGHT_GRACE_S",
+                effect: "minimum age (seconds) before an orphaned Playwright Chrome is killed (default 300)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_MAC_HEALTH_RUSTC_GRACE_S",
+                effect: "minimum age (seconds) before an orphaned debug rustc is killed (default 600)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_MAC_HEALTH_ZOMBIE_GRACE_S",
+                effect: "minimum age (seconds) before an owned zombie child is reaped (default 60)",
+                off: None,
+            },
         ],
+        pref: None,
+        detail: None,
+    },
+    Doc {
+        id: ids::ACCOUNTABILITY_NUDGE,
+        name: "Accountability nudge",
+        purpose: "Reminds non-isolated workers when recent owner messages have produced no tracked board work; the per-worker cooldown prevents repeated nagging.",
+        env: &[EnvControl {
+            var: "AMUX_ACCOUNTABILITY_SWEEP_SECS",
+            effect: "sweep interval in seconds (default 1800 = 30 min)",
+            off: None,
+        }],
+        pref: None,
+        detail: Some("/api/messages"),
+    },
+    Doc {
+        id: ids::CONTEXT_HEALTH,
+        name: "Context health",
+        purpose: "Measures worker conversation compaction generations and warns when a lane is answering from a deeply summarized context.",
+        env: NO_ENV,
+        pref: None,
+        detail: Some("/api/debug/context-health"),
+    },
+    Doc {
+        id: ids::DISK_WATCH,
+        name: "Disk watch",
+        purpose: "Measures disk pressure and regenerable cache growth, starts bounded scans when due, and reports findings without deleting user data.",
+        env: &[
+            EnvControl {
+                var: "AMUX_DISK_WATCH_EVERY_SECS",
+                effect: "minimum seconds between routine scans (default 604800 = 7 days)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_DISK_WATCH_LOW_FREE_EVERY_SECS",
+                effect: "minimum seconds between low-space scans (default 21600 = 6 hours)",
+                off: None,
+            },
+        ],
+        pref: None,
+        detail: Some("/api/reclaim/scan"),
+    },
+    Doc {
+        id: ids::STATUS_HISTORY,
+        name: "Status history",
+        purpose: "Samples each live worker's derived status so time-driven and subagent-driven state changes remain explainable after the fact.",
+        env: &[
+            EnvControl {
+                var: "AMUX_STATUS_HISTORY_SECS",
+                effect: "sample interval in seconds (default 20, minimum 5)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_STATUS_HISTORY_DAYS",
+                effect: "retention in days (default 14)",
+                off: None,
+            },
+        ],
+        pref: None,
+        detail: None,
+    },
+    Doc {
+        id: ids::TOKEN_LEDGER,
+        name: "Token ledger",
+        purpose: "Indexes provider transcript usage into the durable cost ledger so worker, card, and model totals do not silently read as zero.",
+        env: &[EnvControl {
+            var: "AMUX_LEDGER_INDEX_SECS",
+            effect: "index interval in seconds; 0 disables the job",
+            off: Some("0"),
+        }],
         pref: None,
         detail: None,
     },
@@ -785,6 +889,15 @@ pub fn spawn_loop<F>(id: &'static str, interval: Option<Duration>, fut: F) -> to
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    if let Some(reason) = super::fleet_isolation_reason(id) {
+        register_disabled(id, "loop", interval, reason.clone());
+        tracing::info!(
+            job = id,
+            switch = %reason,
+            "long-lived job suppressed: fleet isolation is on, this loop will NOT run"
+        );
+        return tokio::spawn(async {});
+    }
     let h = tokio::spawn(fut);
     register(id, "loop", interval, Some(h.abort_handle()));
     h
@@ -793,6 +906,16 @@ where
 /// Register a loop somebody else already spawned (its `spawn()` owns the
 /// `tokio::spawn`). Same contract as [`spawn_loop`], called at the same place.
 pub fn adopt(id: &'static str, interval: Option<Duration>, h: &tokio::task::JoinHandle<()>) {
+    if let Some(reason) = super::fleet_isolation_reason(id) {
+        h.abort();
+        register_disabled(id, "loop", interval, reason.clone());
+        tracing::info!(
+            job = id,
+            switch = %reason,
+            "adopted job suppressed: fleet isolation is on, its task was aborted"
+        );
+        return;
+    }
     register(id, "loop", interval, Some(h.abort_handle()));
 }
 
@@ -885,6 +1008,92 @@ pub fn classify(f: &Facts, now: f64) -> &'static str {
             _ => "starting",
         },
     }
+}
+
+/// Extend the liveness verdict with the duration of the last completed tick.
+/// This is kept beside [`classify`] so the endpoint and autofix cannot disagree
+/// about a tick that was hung long enough to exceed its budget but eventually
+/// returned before either observer looked.
+pub fn classify_observed(f: &Facts, last_tick_ms: Option<f64>, now: f64) -> &'static str {
+    let status = classify(f, now);
+    if status == "ok"
+        && last_tick_ms
+            .zip(f.interval_s)
+            .is_some_and(|(ms, interval)| ms > stall_after_s(interval) * 1000.0)
+    {
+        "slow"
+    } else {
+        status
+    }
+}
+
+/// One unhealthy system-job observation, derived from the same registry and
+/// staleness predicate as `GET /api/system-jobs`. Autofix consumes this rather
+/// than maintaining a second definition of "stalled" that could disagree with
+/// the red row a human sees in the Scheduler tab.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HealthIssue {
+    pub id: String,
+    pub name: String,
+    pub status: &'static str,
+    pub interval_s: Option<f64>,
+    pub ticks: u64,
+    pub last_tick_age_s: Option<f64>,
+    pub last_tick_ms: Option<f64>,
+    pub in_flight_age_s: Option<f64>,
+    pub documented: bool,
+}
+
+/// Unhealthy jobs at `now`, including catalogued jobs that were never spawned
+/// and registered jobs whose documentation was forgotten. A completed tick
+/// that exceeded the same budget used for `hung` is retained as `slow` until
+/// the next tick, so scheduler latency is observable even after the closure
+/// finally returns.
+pub fn health_issues(now: f64) -> Vec<HealthIssue> {
+    let live: BTreeMap<String, Snapshot> =
+        snapshot().into_iter().map(|s| (s.id.clone(), s)).collect();
+    let mut all: Vec<String> = CATALOG.iter().map(|d| d.id.to_string()).collect();
+    for id in live.keys() {
+        if !all.iter().any(|x| x == id) {
+            all.push(id.clone());
+        }
+    }
+
+    let mut out = Vec::new();
+    for id in all {
+        let d = doc_for(&id);
+        let disabled_by_control = d.map(|d| env_json(d).1).unwrap_or(false);
+        let l = live.get(&id);
+        let f = Facts {
+            spawned: l.is_some(),
+            dead: l.map(|x| x.dead).unwrap_or(false),
+            disabled: disabled_by_control
+                || l.and_then(|x| x.disabled_reason.as_ref()).is_some(),
+            interval_s: l.and_then(|x| x.interval_s),
+            spawned_at: l.map(|x| x.spawned_at),
+            last_tick_at: l.and_then(|x| x.last_tick_at),
+            in_flight_since: l.and_then(|x| x.in_flight_since),
+            instrumented: l
+                .map(|x| x.ticks > 0 || x.in_flight_since.is_some())
+                .unwrap_or(false),
+        };
+        let status = classify_observed(&f, l.and_then(|x| x.last_tick_ms), now);
+        if !matches!(status, "stalled" | "dead" | "hung" | "not_spawned" | "slow") {
+            continue;
+        }
+        out.push(HealthIssue {
+            id: id.clone(),
+            name: d.map(|d| d.name).unwrap_or(&id).to_string(),
+            status,
+            interval_s: f.interval_s,
+            ticks: l.map(|x| x.ticks).unwrap_or(0),
+            last_tick_age_s: f.last_tick_at.map(|t| now - t),
+            last_tick_ms: l.and_then(|x| x.last_tick_ms),
+            in_flight_age_s: f.in_flight_since.map(|t| now - t),
+            documented: d.is_some(),
+        });
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1177,8 +1386,8 @@ pub async fn system_jobs(
                 .map(|x| x.ticks > 0 || x.in_flight_since.is_some())
                 .unwrap_or(false),
         };
-        let status = classify(&f, now);
-        if matches!(status, "stalled" | "dead" | "hung" | "not_spawned") {
+        let status = classify_observed(&f, l.and_then(|x| x.last_tick_ms), now);
+        if matches!(status, "stalled" | "dead" | "hung" | "not_spawned" | "slow") {
             unhealthy += 1;
         }
         jobs.push(json!({
@@ -1235,7 +1444,7 @@ pub async fn system_jobs(
         "jobs": jobs,
         "count": jobs.len(),
         "unhealthy": unhealthy,
-        "stall_rule": "a job is STALLED when its last tick is older than 2.5x its interval + 15s",
+        "stall_rule": "a job is STALLED when its last tick is older than 2.5x its interval + 15s; a completed tick over the same budget is SLOW until its next result",
     });
     (axum::http::StatusCode::OK, axum::Json(body)).into_response()
 }
@@ -1311,6 +1520,15 @@ mod tests {
         assert_eq!(classify(&f, T + 66.0), "stalled");
         // A fresh tick is never stalled no matter the interval.
         assert_eq!(classify(&base(), T + 1.0), "ok");
+    }
+
+    #[test]
+    fn completed_tick_over_the_liveness_budget_is_slow() {
+        let f = base(); // 20s interval -> 65s budget
+        assert_eq!(classify_observed(&f, Some(64_999.0), T + 1.0), "ok");
+        assert_eq!(classify_observed(&f, Some(65_001.0), T + 1.0), "slow");
+        // A stronger liveness failure is never hidden by the duration label.
+        assert_eq!(classify_observed(&f, Some(90_000.0), T + 70.0), "stalled");
     }
 
     #[test]
@@ -1415,6 +1633,50 @@ mod tests {
         assert!(j.last_end.is_some());
         drop(m);
         t.abort();
+    }
+
+    #[tokio::test]
+    async fn isolation_suppresses_spawned_and_adopted_loops_before_they_act() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        const SPAWNED: &str = "af69-isolated-spawn-loop-probe";
+        const ADOPTED: &str = "af69-isolated-adopt-loop-probe";
+        let spawned_var = super::super::per_job_disable_var(SPAWNED);
+        let adopted_var = super::super::per_job_disable_var(ADOPTED);
+        std::env::set_var(&spawned_var, "0");
+        std::env::set_var(&adopted_var, "0");
+
+        let spawned_count = Arc::new(AtomicUsize::new(0));
+        let count = spawned_count.clone();
+        let spawned = spawn_loop(SPAWNED, Some(Duration::from_millis(20)), async move {
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let adopted_count = Arc::new(AtomicUsize::new(0));
+        let count = adopted_count.clone();
+        let adopted = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+        adopt(ADOPTED, Some(Duration::from_millis(20)), &adopted);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(spawned_count.load(Ordering::SeqCst), 0);
+        assert_eq!(adopted_count.load(Ordering::SeqCst), 0);
+        for (id, reason) in [
+            (SPAWNED, "AMUX_AF69_ISOLATED_SPAWN_LOOP_PROBE_SECS=0"),
+            (ADOPTED, "AMUX_AF69_ISOLATED_ADOPT_LOOP_PROBE_SECS=0"),
+        ] {
+            let row = snapshot().into_iter().find(|s| s.id == id).expect("suppressed loop visible");
+            assert_eq!(row.disabled_reason.as_deref(), Some(reason));
+            assert_eq!(row.ticks, 0);
+        }
+
+        spawned.abort();
+        adopted.abort();
+        std::env::remove_var(spawned_var);
+        std::env::remove_var(adopted_var);
     }
 
     /// Every catalog row must name a job id that some spawn site can produce.

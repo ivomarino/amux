@@ -10,7 +10,11 @@
 # Fails open in every direction: no stdin, no transcript, no python -> report
 # the state anyway with tokens omitted. A liveness report is worth more than a
 # token count, and this must never be the reason a hook fails.
-STATE="${1:-idle}"; SRC="${2:-stop-hook}"
+# MODE is either a main-turn state or one of the two event-driven subagent
+# lifecycle modes. Claude Code exposes SubagentStart/SubagentStop directly;
+# routing both through this one canonical reporter keeps attribution,
+# conversation adoption, endpoint resolution and failure logging identical.
+MODE="${1:-idle}"; SRC="${2:-stop-hook}"
 DERIVED=0
 if [ -z "$AMUX_SESSION" ]; then
   # MR-43: the var can go missing INSIDE a lane that IS running in its
@@ -103,7 +107,14 @@ case "$U" in *localhost:$L|*127.0.0.1:$L) U="${C:-$U}";; esac
 # reuses the POST + failure-logging below rather than adding a second sender,
 # so a refused subagent event is visible in the same log as every other
 # refused report.
-case "$STATE" in
+# BOTH SPELLINGS ARE ACCEPTED, and that is not politeness. Two independent
+# implementations of this producer landed on the same day: this one uses
+# `subagent:start` (colon) and #182 used `subagent-start` (hyphen). The
+# settings.json wired on this box and verified live calls the COLON form, so
+# dropping it would silently stop the counting — the hook would post
+# {"state":"subagent:start"}, the server would refuse it, and the only symptom
+# would be lanes reading WORKING for four minutes again.
+case "${MODE/subagent-/subagent:}" in
   subagent:reset)
     # SessionStart fires for startup, resume AND compact, and only the first two
     # mean a NEW process. A compact keeps the same process, so its background
@@ -114,14 +125,17 @@ case "$STATE" in
     esac
     BODY="{\"subagent\":\"reset\",\"source\":\"$SRC\"}"
     ;;
-  subagent:*) BODY="{\"subagent\":\"${STATE#subagent:}\",\"source\":\"$SRC\"}" ;;
+  subagent:*) BODY="{\"subagent\":\"${MODE#subagent[:-]}\",\"source\":\"$SRC\"}" ;;
 esac
 if [ -z "$BODY" ]; then
 BODY=$(printf '%s' "$IN" | /usr/bin/python3 -c '
 import json,sys,os
 raw=sys.stdin.read()
-state,src=sys.argv[1],sys.argv[2]
-out={"state":state,"source":src}
+mode,src=sys.argv[1],sys.argv[2]
+if mode in ("subagent-start", "subagent-stop"):
+    out={"subagent":mode[len("subagent-"):],"source":src}
+else:
+    out={"state":mode,"source":src}
 h={}; tp=""; nlines=0; err=""
 try:
     h=json.loads(raw) if raw.strip() else {}
@@ -191,7 +205,7 @@ if tp:
 # unreadable file, and a transcript carrying neither field all produced the
 # identical empty report. Written only when something is missing, so it
 # self-extinguishes as this gets fixed instead of growing across 47 lanes.
-if not out.get("model") or not out.get("tokens"):
+if "subagent" not in out and (not out.get("model") or not out.get("tokens")):
     try:
         d2={"s":os.environ.get("AMUX_SESSION",""),"src":src,"keys":sorted(h.keys())[:12],
             "tp":bool(tp),"tp_exists":bool(tp) and os.path.exists(tp),"lines":nlines,
@@ -201,9 +215,12 @@ if not out.get("model") or not out.get("tokens"):
         with open(lg,"a") as f: f.write(json.dumps(d2)+"\n")
     except Exception: pass
 print(json.dumps(out))
-' "$STATE" "$SRC" 2>/dev/null)
+' "$MODE" "$SRC" 2>/dev/null)
 fi
-[ -n "$BODY" ] || BODY="{\"state\":\"$STATE\",\"source\":\"$SRC\"}"
+# #182's subagent case is deliberately NOT repeated here: the block above
+# already produced BODY for either spelling, and it also handles `reset`, which
+# that case did not. A second case would be a fork of one rule.
+[ -n "$BODY" ] || BODY="{\"state\":\"$MODE\",\"source\":\"$SRC\"}"
 # Surgery, not a third JSON encoder: BODY is always a flat object ending in
 # "}" (python's json.dumps above, or the fallback literal on this same line),
 # so appending before the final brace is safe and avoids a second place this

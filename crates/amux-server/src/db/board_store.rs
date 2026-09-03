@@ -29,8 +29,10 @@ use amux_core::events::Actor;
 use amux_core::ids::{GateId, TaskId};
 use amux_core::verification::VerifierKind;
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use rusqlite::{params, Connection, OptionalExtension, Row};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
 // Ids: semantic ("AMUX-123") on the wire and in the DB, TaskId internally
@@ -795,49 +797,82 @@ pub fn revisit_arrived(due: Option<&str>, today: &str) -> bool {
     ok && d <= today
 }
 
-/// True when `text` contains at least one pointer to a produced artifact: an
-/// http(s) URL, a markdown link, a repo-relative file path (`a/b.ext`), a
-/// commit-sha-shaped token (7..=40 hex as a whole word), or a `#<number>`
-/// PR/issue reference. Deliberately generous on ACCEPT (a false accept only
-/// lets an honest-looking card through; a false reject would block real work),
-/// but it CAN fail: a done card that is pure prose with no artifact reference
-/// has none of these, which is exactly the case this gate exists to stop.
-pub fn has_asset_link(text: &str) -> bool {
-    if text.contains("http://") || text.contains("https://") || text.contains("](") {
-        return true;
-    }
-    // `#123` PR/issue reference.
-    let b = text.as_bytes();
-    for i in 0..b.len() {
-        if b[i] == b'#' && b.get(i + 1).is_some_and(|c| c.is_ascii_digit()) {
-            return true;
+/// Extract every distinct pointer to a produced artifact from worker-authored
+/// card text. This is the canonical parser used by BOTH the done-link gate and
+/// the card detail response: a reference accepted as proof must not disappear
+/// from the UI that is supposed to show that proof.
+///
+/// Accepted shapes are http(s) URLs, markdown-link targets, absolute or
+/// repo-relative file paths (`a/b.ext`), commit-sha-shaped tokens (7..=40 hex),
+/// and `#<number>` PR/issue references. Order is stable within each shape and
+/// duplicates are removed. Markdown targets are visited first so their clean
+/// target wins over the surrounding punctuation a token scan would see.
+pub fn asset_refs(text: &str) -> Vec<String> {
+    static MARKDOWN: OnceLock<Regex> = OnceLock::new();
+    static URL: OnceLock<Regex> = OnceLock::new();
+    static NUMBER_REF: OnceLock<Regex> = OnceLock::new();
+    let markdown = MARKDOWN
+        .get_or_init(|| Regex::new(r#"\[[^\]]*\]\(\s*([^\s\)]+)"#).expect("asset markdown regex"));
+    let url = URL.get_or_init(|| Regex::new(r#"https?://[^\s<>\"']+"#).expect("asset url regex"));
+    let number_ref = NUMBER_REF
+        .get_or_init(|| Regex::new(r"(?:^|\s)(#\d+)\b").expect("asset ref regex"));
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |raw: &str| {
+        let clean = raw
+            .trim()
+            .trim_matches(|c: char| matches!(c, ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}'));
+        if !clean.is_empty() && seen.insert(clean.to_string()) {
+            out.push(clean.to_string());
+        }
+    };
+
+    for caps in markdown.captures_iter(text) {
+        if let Some(target) = caps.get(1) {
+            push(target.as_str());
         }
     }
+    for m in url.find_iter(text) {
+        push(m.as_str());
+    }
     for raw in text.split_whitespace() {
-        // Keep path/word chars; drop surrounding prose punctuation.
         let tok = raw.trim_matches(|c: char| {
-            !c.is_ascii_alphanumeric() && c != '/' && c != '.' && c != '_' && c != '-'
+            !c.is_ascii_alphanumeric() && c != '/' && c != '.' && c != '_' && c != '-' && c != '~'
         });
-        // Repo-relative path: has a '/', last segment carries a short alnum ext.
+        if tok.is_empty() || tok.contains("://") || raw.contains("](") {
+            continue;
+        }
         if let Some((dir, last)) = tok.rsplit_once('/') {
-            if !dir.is_empty() {
+            if !dir.is_empty() || tok.starts_with('/') {
                 if let Some((stem, ext)) = last.rsplit_once('.') {
                     if !stem.is_empty()
-                        && (1..=8).contains(&ext.len())
+                        && (1..=12).contains(&ext.len())
                         && ext.chars().all(|c| c.is_ascii_alphanumeric())
                     {
-                        return true;
+                        push(tok);
+                        continue;
                     }
                 }
             }
         }
-        // Commit sha: the whole token is 7..=40 hex digits.
-        let hex = tok.trim_matches(|c: char| !c.is_ascii_alphanumeric());
-        if (7..=40).contains(&hex.len()) && hex.bytes().all(|c| c.is_ascii_hexdigit()) {
-            return true;
+        if (7..=40).contains(&tok.len()) && tok.bytes().all(|c| c.is_ascii_hexdigit()) {
+            push(tok);
         }
     }
-    false
+    for caps in number_ref.captures_iter(text) {
+        if let Some(reference) = caps.get(1) {
+            push(reference.as_str());
+        }
+    }
+    out
+}
+
+/// True when `text` contains at least one produced-asset pointer. Deliberately
+/// a projection of [`asset_refs`] so transition enforcement and card rendering
+/// cannot grow two subtly different definitions of evidence.
+pub fn has_asset_link(text: &str) -> bool {
+    !asset_refs(text).is_empty()
 }
 
 pub fn default_gates_for(item_type_raw: &str, target: TaskStatus) -> Vec<String> {
@@ -2920,6 +2955,22 @@ mod tests {
         assert!(has_asset_link("closes #106"));
         // A short hex-ish word is not a sha, a bare year is too short.
         assert!(!has_asset_link("the cafe was open in 2026"));
+
+        // The card renderer consumes the SAME parser and must receive every
+        // produced asset, not just the first boolean proof that let Done pass.
+        assert_eq!(
+            asset_refs(
+                "wrote [report](docs/report.md), screenshot /tmp/run.png and https://example.test/a; \
+                 commit 53a868f, PR #106; report again docs/report.md"
+            ),
+            vec![
+                "docs/report.md",
+                "https://example.test/a",
+                "/tmp/run.png",
+                "53a868f",
+                "#106",
+            ]
+        );
     }
 
     /// ONE ROW WITH A REAL TIMESTAMP MUST NOT TAKE THE WHOLE LIST DOWN.

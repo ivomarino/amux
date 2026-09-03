@@ -3223,6 +3223,19 @@ pub async fn create_item(
 
 // ---- GET /api/board/{id} -------------------------------------------------
 
+fn resolve_task_asset(reference: &str, work_dir: &str) -> String {
+    let is_external = reference.starts_with("http://")
+        || reference.starts_with("https://")
+        || reference.starts_with('#')
+        || ((7..=40).contains(&reference.len())
+            && reference.bytes().all(|c| c.is_ascii_hexdigit()));
+    if is_external || reference.starts_with('/') || work_dir.is_empty() {
+        reference.to_string()
+    } else {
+        std::path::Path::new(work_dir).join(reference).to_string_lossy().into_owned()
+    }
+}
+
 pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let store = state.store.clone();
     let key = id.clone();
@@ -3282,15 +3295,83 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
                 })?
                 .flatten(),
         );
-        let artifacts = crate::db::artifact_store::list_for_task(&conn, &row.id)?
+        let mut artifacts = crate::db::artifact_store::list_for_task(&conn, &row.id)?
             .into_iter()
             .map(|a| artifact_value(&a))
             .collect::<Vec<_>>();
-        Ok(Some((row, children, messages, artifacts)))
+
+        // A worker normally records produced files and URLs in `evidence`,
+        // `last_result`, or its append-only activity log. Requiring a second,
+        // obscure artifact-registry write made those references sufficient to
+        // pass the Done gate but invisible on the card — enforcement and the
+        // evidence surface disagreed. Extract with the SAME parser the gate
+        // uses and return every reference. Explicit registry artifacts remain
+        // richer and are merged by the client.
+        let mut asset_links = Vec::new();
+        let mut asset_seen = std::collections::HashSet::new();
+        let work_dir = row.session.as_deref()
+            .map(crate::api::session_verbs::session_work_dir)
+            .unwrap_or_default();
+        for artifact in &mut artifacts {
+            if let Some(reference) = artifact.get("ref").and_then(Value::as_str) {
+                artifact["resolved_ref"] = json!(resolve_task_asset(reference, &work_dir));
+            }
+        }
+        let mut add_asset = |reference: String, source: &str| {
+            if reference.is_empty() || !asset_seen.insert(reference.clone()) { return; }
+            let resolved_ref = resolve_task_asset(&reference, &work_dir);
+            asset_links.push(json!({
+                "ref": reference,
+                "resolved_ref": resolved_ref,
+                "source": source,
+            }));
+        };
+        for (source, text) in [
+            ("evidence", row.evidence.as_deref().unwrap_or("")),
+            ("last result", row.last_result.as_deref().unwrap_or("")),
+            ("activity", row.log.as_deref().unwrap_or("")),
+        ] {
+            for reference in bs::asset_refs(text) { add_asset(reference, source); }
+        }
+        let mut file_stmt = conn.prepare(
+            "SELECT path FROM issue_files WHERE issue_id=?1 ORDER BY added_at, path",
+        )?;
+        let files = file_stmt
+            .query_map(rusqlite::params![row.id], |r| r.get::<_, String>(0))?
+            .flatten()
+            .collect::<Vec<_>>();
+        for file in files { add_asset(file, "task file"); }
+
+        // The card must say what each workflow column will require BEFORE a
+        // worker tries to move it. Resolve through the exact same five-tier
+        // precedence walk transition enforcement uses, including worker and
+        // group scopes; listing only type defaults would be actively wrong for
+        // a scoped worker.
+        let groups = row.session.as_deref().filter(|s| !s.is_empty())
+            .map(crate::api::session_verbs::lane_groups)
+            .unwrap_or_default();
+        let gate_requirements = [
+            TaskStatus::Doing,
+            TaskStatus::Review,
+            TaskStatus::Done,
+            TaskStatus::Verified,
+        ].into_iter().map(|target| {
+            let trail = bs::effective_gate_trail(&conn, &row, target, &groups);
+            let source = trail.source.token();
+            let scope = trail.source.scope();
+            json!({
+                "status": bs::db_status_spelling(target),
+                "criteria": trail.criteria,
+                "source": source,
+                "scope": scope,
+                "layers": trail.layers,
+            })
+        }).collect::<Vec<_>>();
+        Ok(Some((row, children, messages, artifacts, asset_links, gate_requirements)))
     })
     .await;
     match joined {
-        Ok(Ok(Some((row, children, messages, artifacts)))) => {
+        Ok(Ok(Some((row, children, messages, artifacts, asset_links, gate_requirements)))) => {
             // Weak ETag for read-modify-write callers (AMUX-1711 parity).
             let mut headers = HeaderMap::new();
             if let Ok(v) = format!("W/\"{}-{}\"", row.id, row.rev).parse() {
@@ -3300,6 +3381,8 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
             body["children"] = json!(children);
             body["messages"] = json!(messages);
             body["artifacts"] = json!(artifacts);
+            body["asset_links"] = json!(asset_links);
+            body["gate_requirements"] = json!(gate_requirements);
             (StatusCode::OK, headers, Json(body)).into_response()
         }
         Ok(Ok(None)) => not_found(&id),

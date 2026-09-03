@@ -4142,6 +4142,7 @@
     resize: none; overflow: hidden; word-wrap: break-word;
   }
   .board-detail-title-input::placeholder { color: var(--dim); }
+  .board-detail-title-input[readonly] { cursor: default; }
   .board-detail-row { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
   .board-detail-status-row { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
   .board-detail-status-btn {
@@ -4166,12 +4167,15 @@
     margin-bottom: -1px; -webkit-tap-highlight-color: transparent;
   }
   .board-detail-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+  @media (max-width: 600px) {
+    .board-detail-tab { min-height: 44px; }
+  }
   .board-detail-desc-input {
     width: 100%; min-height: 200px; font-size: 0.92rem; background: none;
     border: none; color: var(--text); outline: none; padding: 10px 0;
     font-family: inherit; line-height: 1.65; resize: none; box-sizing: border-box;
   }
-  .board-detail-log { margin-top: 10px; padding: 8px 10px; background: var(--panel2, rgba(255,255,255,0.03)); border-radius: 8px; font-size: 0.74rem; line-height: 1.5; color: var(--dim); max-height: 180px; overflow-y: auto; }
+  .board-detail-log { margin-top: 10px; padding: 8px 10px; background: var(--panel2, rgba(255,255,255,0.03)); border-radius: 8px; font-size: 0.74rem; line-height: 1.5; color: var(--dim); max-height: 55vh; overflow-y: auto; }
   .board-detail-key { cursor: pointer; }
   .board-detail-key:hover { text-decoration: underline; }
   .bd-status-banner { background: var(--accent-dim, rgba(199,91,46,0.12)); border: 1px solid var(--accent);
@@ -4192,9 +4196,20 @@
   .bd-log-title { font-weight: 600; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px; color: var(--dim); }
   .bd-log-line { white-space: pre-wrap; word-break: break-word; }
   .board-detail-desc-input::placeholder { color: var(--dim); }
-  .board-detail-preview { min-height: 200px; font-size: 0.92rem; color: var(--text); padding: 10px 0; }
-  .board-detail-meta { margin-top: 12px; font-size: 0.78rem; color: var(--dim); border-top: 1px solid var(--border); padding-top: 10px; display: flex; flex-direction: column; gap: 5px; }
+  .board-detail-preview { min-height: 80px; font-size: 0.92rem; color: var(--text); padding: 10px 0; }
+  .board-detail-meta { margin: 2px 0 16px; font-size: 0.78rem; color: var(--dim); display: flex; flex-direction: column; gap: 8px; }
   .board-detail-meta-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .bd-card-facts { display:flex; flex-wrap:wrap; gap:5px 12px; padding:0 2px 2px; color:var(--dim); }
+  .bd-card-section { border:1px solid var(--border); border-radius:9px; padding:10px 12px; background:var(--panel2, rgba(255,255,255,0.025)); display:flex; flex-direction:column; gap:6px; }
+  .bd-card-section h4 { margin:0 0 2px; color:var(--text); font-size:0.72rem; text-transform:uppercase; letter-spacing:0.055em; }
+  .bd-link-chip { font:inherit; cursor:pointer; }
+  .bd-gate { padding:6px 0; border-top:1px solid var(--border); }
+  .bd-gate:first-of-type { border-top:0; padding-top:0; }
+  .bd-gate-head { display:flex; align-items:center; gap:7px; color:var(--dim); font-size:0.7rem; text-transform:uppercase; }
+  .bd-gate ul { margin:5px 0 0; padding-left:20px; color:var(--text); }
+  .bd-gate li { margin:3px 0; line-height:1.4; }
+  .bd-activity-all { align-self:flex-start; border:0; background:none; color:var(--accent); padding:4px 0; cursor:pointer; font-size:0.76rem; }
+  .bd-notes-empty { color:var(--dim); font-size:0.84rem; padding:12px 2px; line-height:1.5; }
   .board-detail-footer { display: flex; justify-content: space-between; align-items: center; padding-top: 10px; flex-shrink: 0; border-top: 1px solid var(--border); }
 
 
@@ -5744,59 +5759,6 @@ input.mdai-edge-path-input:focus { border-color: var(--accent); box-shadow: 0 0 
 .xlsx-empty { color: var(--dim); font-size: 0.85rem; padding: 16px 4px; }
 .xlsx-trunc { color: var(--yellow, #d4a017); font-size: 0.76rem; margin-top: 10px; }
 @media (max-width: 600px) { .xlsx-tab { min-height: 44px; } .xlsx-table th, .xlsx-table td { max-width: 220px; } }
-
-/* ── Lineage tab in the board card detail (AMUX-2393) ──────────────────────
-   Renders GET /api/why/task/<id>. The visual hierarchy is load-bearing, not
-   decoration: verdict and gaps come FIRST and are the only coloured blocks,
-   because a reader who scrolls a plausible-looking trail and never reaches the
-   caveats has been misled by layout alone. Zero-row sources stay visible (dimmed,
-   never hidden) — a source that found nothing is evidence, and hiding it would
-   recreate the ambiguity the endpoint reports its predicates to avoid. */
-.board-detail-lineage { margin-top: 10px; font-size: 0.76rem; line-height: 1.5; max-height: 420px; overflow-y: auto; -webkit-overflow-scrolling: touch; }
-.bd-lin-verdict { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; padding: 8px 10px; border-radius: 8px; border: 1px solid transparent; margin-bottom: 10px; }
-.bd-lin-vlabel { font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; font-size: 0.72rem; }
-.bd-lin-vwhy { color: var(--dim); flex: 1 1 180px; min-width: 0; }
-.bd-lin-ok   { background: rgba(46,160,67,0.10); border-color: rgba(46,160,67,0.35); }
-.bd-lin-warn { background: rgba(210,153,34,0.10); border-color: rgba(210,153,34,0.40); }
-.bd-lin-bad  { background: rgba(218,54,51,0.10);  border-color: rgba(218,54,51,0.40); }
-.bd-lin-h { font-weight: 600; color: var(--dim); text-transform: uppercase; letter-spacing: 0.05em; font-size: 0.68rem; margin: 12px 0 5px; }
-.bd-lin-gaps { background: rgba(210,153,34,0.07); border-left: 3px solid rgba(210,153,34,0.5); border-radius: 6px; padding: 6px 10px; }
-.bd-lin-gaps .bd-lin-h { margin-top: 2px; }
-.bd-lin-gaps ul { margin: 0; padding-left: 16px; }
-.bd-lin-gaps li { margin-bottom: 5px; }
-.bd-lin-srcs { display: flex; flex-direction: column; gap: 3px; }
-.bd-lin-src { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; padding: 3px 0; min-width: 0; }
-.bd-lin-src code { font-size: 0.72rem; background: var(--panel2, rgba(255,255,255,0.05)); padding: 1px 5px; border-radius: 4px; }
-.bd-lin-zero { opacity: 0.62; }
-.bd-lin-rows { font-variant-numeric: tabular-nums; color: var(--dim); }
-.bd-lin-cap { color: #d29922; font-size: 0.68rem; border: 1px solid rgba(210,153,34,0.4); border-radius: 4px; padding: 0 4px; }
-.bd-lin-dim { color: var(--dim); opacity: 0.75; font-size: 0.70rem; word-break: break-word; min-width: 0; }
-/* flex-basis:100% forces the note onto its own row inside the wrapping
-   .bd-lin-src line. These notes are full sentences (a reaped-journal horizon
-   runs to ~250 chars), so sharing a row with the table name and row count would
-   push past 375px — which the lineage e2e spec asserts against. */
-.bd-lin-srcnote { flex: 0 0 100%; min-width: 0; color: var(--dim); opacity: 0.85; font-size: 0.68rem;
-  line-height: 1.4; word-break: break-word; overflow-wrap: anywhere; padding-left: 2px; }
-.bd-lin-tl { display: flex; flex-direction: column; }
-.bd-lin-line { display: flex; gap: 8px; padding: 5px 0; border-top: 1px solid var(--border, rgba(255,255,255,0.07)); min-width: 0; }
-.bd-lin-when { flex: 0 0 96px; color: var(--dim); font-size: 0.68rem; font-variant-numeric: tabular-nums; }
-.bd-lin-what { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.bd-lin-sum { word-break: break-word; }
-.bd-lin-actor { color: var(--accent, #58a6ff); font-size: 0.70rem; }
-.bd-lin-badge { display: inline-block; margin-left: 5px; font-size: 0.60rem; text-transform: uppercase; border: 1px solid rgba(210,153,34,0.5); color: #d29922; border-radius: 3px; padding: 0 3px; }
-.bd-lin-untimed { background: rgba(210,153,34,0.04); }
-.bd-lin-note { color: var(--dim); padding: 8px 10px; }
-.bd-lin-todo { border: 1px dashed var(--border, rgba(255,255,255,0.15)); border-radius: 6px; margin-top: 12px; }
-
-@media (max-width: 600px) {
-  /* 375px: the fixed timestamp gutter costs a third of the width and forces the
-     summary into a 2-character column, so the trail stacks instead. */
-  .board-detail-lineage { max-height: 60vh; font-size: 0.78rem; }
-  .bd-lin-line { flex-direction: column; gap: 2px; }
-  .bd-lin-when { flex: none; }
-  /* Touch target: the tab row is what a thumb actually hits. */
-  #bd-tab-lineage { min-height: 44px; }
-}
 
 /* ARCHIVED SECTION (AMUX-3715, requested by tubescience).
    Read-only and appended after the columns — never a drop target, because they
