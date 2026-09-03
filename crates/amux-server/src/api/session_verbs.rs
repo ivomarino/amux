@@ -7130,7 +7130,14 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
         // server.env and pressing Start must not reuse the credentials that
         // shell inherited before the PATCH. Refresh tmux's session environment
         // now; the shell imports it below without ever printing a value.
-        let target = st(name);
+        // Bound as `st`, not `target`: tests/tmux_target_audit.rs whitelists the
+        // literal expressions ["st","pt","stq","ptq"] as a `-t` argument, so a
+        // correctly-derived target under any other name fails the audit. The
+        // VALUE was already exact here (st() is session_target(tmux_name(..)),
+        // i.e. "=amux-<n>"); only the binding's name was outside the list, and
+        // `let pt = pane_target(sess)` a few thousand lines down is the same
+        // convention.
+        let st = st(name);
         for key in super::settings::PROVIDER_ENV_KEYS {
             let value = if has_oauth && key == "ANTHROPIC_API_KEY" {
                 None
@@ -7138,8 +7145,8 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
                 provider_value(key)
             };
             let refreshed = match value {
-                Some(value) => tmux(&["set-environment", "-t", &target, key, &value]).await,
-                None => tmux(&["set-environment", "-u", "-t", &target, key]).await,
+                Some(value) => tmux(&["set-environment", "-t", &st, key, &value]).await,
+                None => tmux(&["set-environment", "-u", "-t", &st, key]).await,
             };
             if !refreshed.map(|out| out.status.success()).unwrap_or(false) {
                 return (
