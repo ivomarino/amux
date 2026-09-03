@@ -217,9 +217,25 @@ async fn needsyou_queue(
         })
         .collect();
     // Overdue first, then the existing score within each group. `true > false`,
-    // so the natural descending compare puts a passed deadline on top.
+    // so the natural descending compare puts a passed deadline on top. The
+    // stored creation time and id are deterministic tie-breakers; without
+    // them cards created within the same second inherited SQLite's incidental
+    // row order, which could put a new far-future item ahead of older work.
     scored.sort_by(|a, b| {
-        b.0.cmp(&a.0).then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| {
+                a.2["created"]
+                    .as_i64()
+                    .unwrap_or(i64::MAX)
+                    .cmp(&b.2["created"].as_i64().unwrap_or(i64::MAX))
+            })
+            .then_with(|| {
+                a.2["id"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(b.2["id"].as_str().unwrap_or(""))
+            })
     });
 
     let total = scored.len();
@@ -5550,25 +5566,29 @@ pub async fn patch_item(
                         // log, desc_len 0), and twice by amux, the second with a
                         // real commit sha sitting in --evidence.
                         //
-                        // Reuses `evidence_verdict` rather than testing the text
-                        // again here. That function already decides what counts
-                        // as an artifact — URL, path, sha, #N, a command, or
-                        // `none: <reason>` — and a second opinion in this file
-                        // would be the drift its own doc warns about. It also
-                        // means the DOCUMENTED escape finally works: CLAUDE.md
-                        // says `none: <reason>` "is stored and counted, not a
-                        // bypass", and until now this gate refused it, so an
-                        // honest close had to go through `--force` and was
-                        // logged as an override. That corrupted the override
-                        // signal itself — an audit of forced closes found two
-                        // that were the correct path.
-                        let evidence_names_artifact = next
-                            .evidence
-                            .as_deref()
-                            .is_some_and(|e| bs::evidence_verdict(e) == bs::EvidenceVerdict::Ok);
+                        // Evidence may satisfy the separate evidence gate with
+                        // a reproducible command, but a command is not a
+                        // produced asset. Keep the documented honest no-asset
+                        // escape, and otherwise require an actual pointer.
+                        let evidence_names_artifact = next.evidence.as_deref().is_some_and(|e| {
+                            bs::has_asset_link(e)
+                                || (e.trim().to_ascii_lowercase().starts_with("none:")
+                                    && bs::evidence_verdict(e) == bs::EvidenceVerdict::Ok)
+                        });
+                        // The explicit artifact registry is the canonical
+                        // structured path. Requiring its ref to be duplicated
+                        // in prose made a successful `amux board artifact`
+                        // write insufficient to close its own task.
+                        let registered_artifact = crate::db::artifact_store::list_for_task(
+                            conn,
+                            &next.id,
+                        )?
+                        .iter()
+                        .any(|a| !a.ref_value.trim().is_empty());
                         let has_link = bs::has_asset_link(&next.desc)
                             || next.log.as_deref().is_some_and(bs::has_asset_link)
-                            || evidence_names_artifact;
+                            || evidence_names_artifact
+                            || registered_artifact;
                         if !has_link {
                             // Surfaces so a sweep catches the next one without a
                             // human noticing (two-fixes rule): grep
@@ -7091,72 +7111,19 @@ pub async fn patch_item(
                     }
                 }
             }
-            // REACTIVE PICKUP: when a card transitions to a terminal state,
-            // immediately check if the lane has a next todo card and claim it.
-            // This removes the up-to-60s wait for the board-drive tick. The
-            // delivery still goes through steer_enqueue (turn-boundary gated),
-            // so this cannot interrupt a mid-turn session.
+            // REACTIVE DRIVE through the same gates as the periodic sweep.
             if let Some((session, _from, to)) = status_transition {
                 if matches!(to.as_str(), "done" | "verified" | "discarded")
                     && !session.is_empty()
                 {
                     let st = state.clone();
                     tokio::spawn(async move {
-                        reactive_pickup(&st, &session).await;
+                        let _ = crate::runtime_jobs::board_drive::drive_session(&st, &session).await;
+                        crate::api::session_verbs::steer_deliver_for_session(&st, &session).await;
                     });
                 }
             }
             (StatusCode::OK, Json(body)).into_response()
-        }
-    }
-}
-
-// ---- Reactive pickup (AMUX board-drive latency fix) -----------------------
-//
-// When a card transitions to done/verified/discarded, fire an immediate pickup
-// for the same session instead of waiting for the 60s board-drive tick. Uses the
-// SAME select_pickup + claim_card + deliver path as the drive loop, so every
-// guard (WIP cap, junk filter, freshness, cooldowns) applies identically.
-//
-// This is a SUPPLEMENT, not a replacement. The drive tick remains the backstop
-// (a crashed reactive path is invisible; the tick is visible in the trace). The
-// trace does NOT record reactive pickups — they are not part of the sweep — but
-// the `task.claimed` event they emit IS what the drive tick reads to avoid
-// re-claiming.
-
-async fn reactive_pickup(state: &AppState, session: &str) {
-    use crate::runtime_jobs::board_drive::{select_pickup, Pickup};
-
-    let conn = match state.store.read() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
-    let pickup = select_pickup(&conn, session, now);
-    drop(conn);
-
-    if let Pickup::Claim { card, prompt } = pickup {
-        // Same compare-and-swap guard as the drive loop (AMUX-2983): only
-        // dispatch if the atomic claim took. This reactive path has the exact
-        // race — select_pickup then drop(conn) then claim — so an unconditional
-        // claim+dispatch could re-open and re-run a card closed in the gap.
-        if crate::runtime_jobs::board_drive::claim_card(state, session, &card).await {
-            let _ = crate::api::session_verbs::steer_enqueue(
-                state,
-                session,
-                &prompt,
-                &format!("{}:reactive", crate::api::session_verbs::BOARD_DRIVE_GUARD),
-                "",
-            )
-            .await;
-            tracing::info!(
-                session,
-                card = card.as_str(),
-                "reactive pickup: claimed {card} immediately after status change"
-            );
         }
     }
 }

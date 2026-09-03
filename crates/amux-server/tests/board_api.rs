@@ -1653,9 +1653,7 @@ async fn done_requires_an_asset_link_and_gate_ack_cannot_fake_it() {
     let (app, _dir) = app();
     // No link anywhere: prose desc, and evidence that is prose too. Both of the
     // places this gate reads are empty of anything checkable, so it refuses.
-    // `PROSE_EV` rather than `EV` since AMUX-3914 — `EV` is a backticked command,
-    // which now legitimately satisfies the gate, and a refusal case that supplies
-    // a valid artifact tests nothing.
+    // `PROSE_EV` keeps the first refusal about completely unstructured prose.
     const PROSE_EV: &str = "implemented it and it works";
     let card = create(
         &app,
@@ -1673,12 +1671,9 @@ async fn done_requires_an_asset_link_and_gate_ack_cannot_fake_it() {
     assert_eq!(st, StatusCode::CONFLICT, "{v}");
     assert_eq!(v["code"], json!("done_requires_asset_link"));
 
-    // AMUX-3914: EVIDENCE NAMING AN ARTIFACT SATISFIES THIS GATE, with the desc
-    // still prose. Before this, the two verbs a lane reaches for first —
-    // `status-update` (writes log) and `--evidence` (writes its own column, and
-    // is SEPARATELY REQUIRED on done by AF-321) — both wrote where this gate
-    // could not look. Measured three times on 2026-08-30, the last with a real
-    // commit sha sitting in --evidence while the gate refused.
+    // A reproducible command satisfies the evidence gate, but it is not a
+    // produced asset. Keeping these predicates separate prevents `cargo test`
+    // from being presented as the file/URL/commit the card created.
     let (st, _, v) = send(
         &app,
         "PATCH",
@@ -1686,8 +1681,56 @@ async fn done_requires_an_asset_link_and_gate_ack_cannot_fake_it() {
         Some(json!({ "status": "done", "evidence": EV, "gate_ack": true })),
     )
     .await;
-    assert_eq!(st, StatusCode::OK, "evidence naming an artifact IS the link: {v}");
-    assert_eq!(v["status"], json!("done"));
+    assert_eq!(st, StatusCode::CONFLICT, "a command is evidence, not an asset: {v}");
+    assert_eq!(v["code"], json!("done_requires_asset_link"));
+
+    // The structured artifact registry is canonical and sufficient by itself;
+    // workers must not have to duplicate a successful artifact write into card
+    // prose. The single-card response also publishes the ref for a clickable UI.
+    let (st, _, artifact) = send(
+        &app,
+        "POST",
+        &format!("/api/board/{id}/artifacts"),
+        Some(json!({
+            "kind": "doc",
+            "ref": "summary.md",
+            "state": "created",
+            "description": "run summary"
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "artifact registration failed: {artifact}");
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "done", "evidence": EV, "gate_ack": true })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "a registered artifact must satisfy the asset gate: {v}");
+    let (_, _, detail) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(detail["artifacts"][0]["ref"], json!("summary.md"), "{detail}");
+
+    // Evidence that actually names an artifact remains a direct path, with the
+    // description still containing only prose.
+    let linked = create(
+        &app,
+        json!({ "title": "linked evidence", "status": "doing", "type": "chore", "desc": "prose only" }),
+    )
+    .await;
+    let linked_id = linked["id"].as_str().unwrap().to_string();
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{linked_id}"),
+        Some(json!({
+            "status": "done",
+            "evidence": "created video-moderation-launch.mp4",
+            "gate_ack": true
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "a bare produced filename is a real asset ref: {v}");
 
     // THE DOCUMENTED ESCAPE ACTUALLY WORKS NOW. CLAUDE.md says `none: <reason>`
     // "is stored and counted, not a bypass"; this gate used to refuse it, so an
@@ -4054,7 +4097,12 @@ async fn a_refused_transition_names_the_fields_it_discarded() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "done", "evidence": EV, "desc": "CANARY-BODY", "title": "renamed" })),
+        Some(json!({
+            "status": "done",
+            "evidence": EV,
+            "desc": "CANARY-BODY artifact: crates/amux-server/src/api/board.rs",
+            "title": "renamed"
+        })),
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT);

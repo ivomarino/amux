@@ -919,50 +919,32 @@ fn write_memory(
 /// (null deletes a key). 0600 — env files carry credentials.
 fn write_env(home: &Path, level: &str, name: &str, value: &Value) -> Result<(), (u16, String)> {
     let f = env_file(home, level, name);
-    if let Some(parent) = f.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| (500, e.to_string()))?;
-    }
-    let text = match value {
+    match value {
         Value::String(s) => {
-            if s.ends_with('\n') {
+            let text = if s.ends_with('\n') {
                 s.clone()
             } else {
                 format!("{s}\n")
-            }
+            };
+            crate::api::session_verbs::EnvFile::replace_text(&f, &text)
+                .map_err(|e| (500, e.to_string()))?;
         }
         _ => {
-            let mut cur: std::collections::BTreeMap<String, String> = if f.exists() {
-                crate::config::parse_env_file(&f).into_iter().collect()
-            } else {
-                Default::default()
-            };
+            let mut updates = Vec::new();
             if let Some(obj) = value.as_object() {
                 for (k, v) in obj {
-                    match v {
-                        Value::Null => {
-                            cur.remove(k);
-                        }
-                        // Python str(): strings bare, bools Title-case.
-                        Value::String(s) => {
-                            cur.insert(k.clone(), s.clone());
-                        }
-                        Value::Bool(b) => {
-                            cur.insert(k.clone(), if *b { "True".into() } else { "False".into() });
-                        }
-                        other => {
-                            cur.insert(k.clone(), other.to_string());
-                        }
-                    }
+                    let value = match v {
+                        Value::Null => None,
+                        Value::String(s) => Some(s.clone()),
+                        Value::Bool(b) => Some(if *b { "True".into() } else { "False".into() }),
+                        other => Some(other.to_string()),
+                    };
+                    updates.push((k.clone(), value));
                 }
             }
-            cur.iter().map(|(k, v)| format!("{k}={v}\n")).collect()
+            crate::api::session_verbs::EnvFile::merge_plain(&f, &updates)
+                .map_err(|e| (500, e.to_string()))?;
         }
-    };
-    std::fs::write(&f, text).map_err(|e| (500, e.to_string()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600));
     }
     Ok(())
 }
