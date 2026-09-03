@@ -21,6 +21,30 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 SRC_REPO="$(pwd)"
 PASS=0; FAIL=0
+
+# THE VERSION IS DERIVED, NEVER TYPED (AF-447).
+#
+# These cells hardcoded `11` in three places: the expected "GUARD_VERSION 11 on
+# both", the sed that manufactures a regression, and the expected "installed
+# GUARD_VERSION 8 < checkout 11". GUARD_VERSION then moved to 12 (f36b35f1) and
+# 13 (349a9ce4) and CI went red on all three — the sed matched nothing, so cell 3
+# never even created the regression it was asserting about.
+#
+# Bumping 11 to 13 would defer this to the next bump. The number belongs to
+# scripts/git-hooks/amux-staged-guard, so read it from there: a fixture that
+# hand-types a producer's output is a copy of a BELIEF about the producer and
+# cannot survive it changing (AF-437).
+GV="$(grep -m1 -E '^GUARD_VERSION[[:space:]]*=' "$SRC_REPO/scripts/git-hooks/amux-staged-guard" \
+      | grep -oE '[0-9]+' | head -1)"
+GV_OLD=$(( GV > 3 ? GV - 3 : 1 ))
+# THE CONTROL FOR THE DERIVATION ITSELF. An empty GV makes every expectation
+# below a substring match against "GUARD_VERSION  on both", which some output
+# could satisfy by accident and which no cell would report as a problem — the
+# vacuous pass this file exists to prevent, arriving in its own harness.
+if [ -z "$GV" ]; then
+  printf '  FAIL could not read GUARD_VERSION from the checkout — every cell below would be vacuous\n'
+  exit 1
+fi
 ok(){ PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
 no(){ FAIL=$((FAIL+1)); printf '  FAIL %s\n     %s\n' "$1" "${2:-}"; }
 
@@ -62,7 +86,7 @@ R="$(scratch)"
 printf '\n# a comment added by the drift cells\n' >> "$R/.git/hooks/amux-staged-guard"
 out="$(drift "$R")"
 case "$out" in
-  *"GUARD_VERSION 11 on both"*) ok "comment-only drift names the version on both sides" ;;
+  *"GUARD_VERSION $GV on both"*) ok "comment-only drift names the version on both sides" ;;
   *) no "same-version drift must report the version, not a bare name" "$out" ;;
 esac
 case "$out" in
@@ -75,11 +99,11 @@ rm -rf "$(dirname "$R")"
 # 3. A GENUINELY OLDER INSTALLED COPY. This is the case the old sentence was
 #    written for, and it must still read as serious.
 R="$(scratch)"
-sed -i.bak 's/^GUARD_VERSION = 11/GUARD_VERSION = 8/' "$R/.git/hooks/amux-staged-guard"
+sed -i.bak "s/^GUARD_VERSION = $GV/GUARD_VERSION = $GV_OLD/" "$R/.git/hooks/amux-staged-guard"
 rm -f "$R/.git/hooks/amux-staged-guard.bak"
 out="$(drift "$R")"
 case "$out" in
-  *"installed GUARD_VERSION 8 < checkout 11"*) ok "an older installed guard names both numbers" ;;
+  *"installed GUARD_VERSION $GV_OLD < checkout $GV"*) ok "an older installed guard names both numbers" ;;
   *) no "a version regression must be called out as such" "$out" ;;
 esac
 case "$out" in
