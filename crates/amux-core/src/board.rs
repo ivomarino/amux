@@ -1235,6 +1235,28 @@ fn capture_has_task_followup(lower: &str) -> bool {
         .any(|marker| lower.split(marker).skip(1).any(capture_clause_starts_task))
 }
 
+/// Whether every clause in a question's TAIL is a non-mutating "just answer"
+/// declaration, checked structurally instead of against an enumerable list of
+/// exact phrasings (ATE-17: "Answer only; do not change files or create board
+/// work." reproduced the informational-question bug the day after it was fixed,
+/// because that exact wording was never in the old literal ANSWER_ONLY_TAILS
+/// list — only "please answer only; do not change anything." was). Splits the
+/// tail on the same connectors `capture_has_task_followup` uses for the
+/// pre-question clause, plus a comma (a tail commonly stacks several no-op
+/// clauses, as in the ATE-17 specimen above), and requires that NO resulting
+/// clause starts a task per `capture_clause_starts_task`. An empty tail is
+/// vacuously answer-only (there is nothing after the question).
+fn tail_is_answer_only(tail: &str) -> bool {
+    if tail.is_empty() {
+        return true;
+    }
+    let mut clauses = vec![tail];
+    for marker in [";", ",", " — ", " -- ", " and ", " but ", " if not,"] {
+        clauses = clauses.into_iter().flat_map(|c| c.split(marker)).collect();
+    }
+    clauses.iter().all(|c| !capture_clause_starts_task(c))
+}
+
 /// A pure status / information query about existing work: "status on MSG-29602?",
 /// "any update on the deploy?". These are answered inline and produce no
 /// deliverable, yet capture minted them as type=code/doing — which a question can
@@ -1340,18 +1362,12 @@ pub fn is_informational_query(text: &str) -> bool {
     // Preserve the explicit non-mutating tails people naturally add when they
     // want only an answer.
     if !tail.is_empty() {
-        const ANSWER_ONLY_TAILS: &[&str] = &[
-            "answer only", "just answer", "please answer only", "no changes",
-            "do not change anything", "don't change anything", "do not make changes",
-            "don't make changes", "please answer only; do not change anything",
-            "please answer only; don't change anything",
-        ];
         const QUESTION_TAILS: &[&str] = &[
             "are ", "can ", "could ", "did ", "do ", "does ", "has ", "have ", "how ",
             "is ", "should ", "was ", "were ", "what ", "when ", "where ", "which ",
             "who ", "why ", "will ", "would ",
         ];
-        if !ANSWER_ONLY_TAILS.contains(&tail)
+        if !tail_is_answer_only(tail)
             && !(tail.ends_with('?') && QUESTION_TAILS.iter().any(|p| tail.starts_with(p)))
         {
             return false;
@@ -1626,6 +1642,11 @@ mod capture_tests {
             "What is backlog? How is todo different?",
             "[amux-origin: dashboard]   WHAT is backlog?",
             &format!("Why does this happen {}?", "in this particular configuration ".repeat(20)),
+            // ATE-17: the exact wording that reproduced this bug a day after the
+            // literal-list fix shipped — never matched ANSWER_ONLY_TAILS because
+            // that list only had "please answer only; do not change anything.".
+            "What is the difference between todo and backlog on this board? Answer only; do not change files or create board work.",
+            "[08:24 AM] What is the difference between todo and backlog in this September 3 rerun? Answer only; do not change files or create board work.",
         ] {
             assert!(is_informational_query(s), "{s:?} should remain message-only");
         }
@@ -1640,6 +1661,11 @@ mod capture_tests {
             "write an explanation to docs/status.md",
             "",
             "[broken stamp",
+            // A tail can stack a real task after its answer-only clause; the
+            // structural tail check must still catch it (negative control for
+            // the ATE-17 fix, so broadening the match cannot silently swallow
+            // real work stacked onto an answer-only opener).
+            "What is the difference between todo and backlog? Answer only, then update the docs.",
         ] {
             assert!(!is_informational_query(s), "{s:?} produces work and needs a card");
         }
