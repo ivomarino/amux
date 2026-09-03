@@ -313,7 +313,13 @@ let _yoloDefault = false;
 // because a session that could set it would be granting itself and every peer a
 // standing cross-group channel.
 async function readCrossGroupDefault() {
-  const r = await fetch(API + '/api/config/cross-group', { headers: _authHeaders() });
+  // This initializer runs before the main transport constants are declared
+  // below.  Referencing `API` here used to hit its temporal dead zone, get
+  // swallowed by initCrossGroupDefault's catch, and leave the unchecked HTML
+  // default on every page load even though amux.env correctly contained `*`.
+  // The dashboard is served at the API origin, so the root-relative endpoint
+  // is both sufficient and safe during early boot.
+  const r = await fetch('/api/config/cross-group', { headers: _authHeaders() });
   const d = await r.json().catch(() => ({}));
   if (!r.ok || d.error) throw new Error(d.error || 'could not read saved setting');
   return d;
@@ -324,7 +330,7 @@ async function toggleCrossGroupDefault(checked) {
   const cb = document.getElementById('crossgroup-default-checkbox');
   const rollback = () => { if (cb) cb.checked = !checked; };
   try {
-    const r = await fetch(API + '/api/config/cross-group', {
+    const r = await fetch('/api/config/cross-group', {
       method: 'PUT',
       headers: _authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ allow: checked ? '*' : '' }),
@@ -8608,7 +8614,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.790';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.791';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").

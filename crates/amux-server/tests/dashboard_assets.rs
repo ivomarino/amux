@@ -174,6 +174,35 @@ fn long_shell_runs_have_an_immediate_visible_state() {
 }
 
 #[test]
+fn cross_group_default_can_initialize_before_the_main_api_constant() {
+    let app = asset("app.js");
+    let read_start = app
+        .find("async function readCrossGroupDefault()")
+        .expect("cross-group settings need an authoritative reader");
+    let init_end = app[read_start..]
+        .find("async function toggleYoloDefault")
+        .map(|n| read_start + n)
+        .expect("cross-group initialization must precede the next settings helper");
+    let early_boot = &app[read_start..init_end];
+    let api_decl = app
+        .find("const API = ''")
+        .expect("the main API transport constant must still exist");
+
+    assert!(
+        init_end < api_decl,
+        "this regression guard is specifically about the early settings initializer"
+    );
+    assert!(
+        early_boot.contains("fetch('/api/config/cross-group'"),
+        "the early reader/writer must use the root-relative endpoint"
+    );
+    assert!(
+        !early_boot.contains("fetch(API + '/api/config/cross-group'"),
+        "referencing API before its declaration throws in the temporal dead zone and silently leaves the toggle off"
+    );
+}
+
+#[test]
 fn sse_message_invalidation_refreshes_each_visible_message_surface() {
     let app = asset("app.js");
     let start = app
