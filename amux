@@ -3285,7 +3285,8 @@ for tag in item.get('tags',[]):
       # which could never fire for exactly the flag-vs-status reason above: a
       # dead branch that made the renderer look like it handled this. Keyed off
       # the flag now, where it can actually fire.
-      _curl -sk -D "$_hdr" "$AMUX_API/api/board?$_lsq" | python3 -c "
+      local _lsout; _lsout=$(_curl -sk -D "$_hdr" "$AMUX_API/api/board?$_lsq")
+      printf '%s' "$_lsout" | python3 -c "
 import sys,json
 items=json.load(sys.stdin)
 n_arch = 0
@@ -3312,6 +3313,49 @@ if n_arch:
     print(\"  work and every closing verb refuses them (archived_task_immutable). To close:\")
     print(\"    amux board unarchive <ID>   # then done/discard as usual\")
 "
+      # SAY WHICH FIELDS THE ROWS DO NOT CARRY (AF-466).
+      #
+      # The list drops six fields and DOES declare them: every row carries a
+      # `slim` key holding the array of dropped names. So the disclosure exists,
+      # is complete, and sits in the same object as the None that misleads you.
+      # It still reached nobody. Two lanes hit it within an hour on 2026-09-03:
+      # ts-gke audited 24 backlog cards for wake conditions and got "0 with a
+      # trigger, 24 without", the exact opposite of the truth (all 24 had one);
+      # I counted machine-checkable triggers fleet-wide and got zero on a board
+      # carrying 918. Both of us were verifying a write we had JUST made with
+      # `--trigger`, which writes to source_ref, one of the six.
+      #
+      # That is ethos rule 1, not rule 4: the capability existed and reached no
+      # consumer. Three things stack — `slim` reads as a mode flag rather than a
+      # manifest (it WAS a boolean until 2026-08-27), `.get("source_ref")`
+      # returns None and None looks like a complete answer, and the verification
+      # path is the one that misreports, so care makes you MORE exposed.
+      #
+      # Printed here because the CLI is the common factor in both incidents, and
+      # this is the moment of the misreading rather than the moment of the data.
+      # NAMES the fields rather than counting them (ts-gke's refinement): "6
+      # fields dropped" sends you to the docs, "source_ref, gate, log, ..."
+      # answers the question in place.
+      #
+      # Note the fix is CLI-side deliberately. The API is already correct here.
+      # ts-gke checked the sibling case and the two systems split: amux declares
+      # its drops, Mixpeek's /batches list declares nothing, so that one needs
+      # the disclosure BUILT before anything can surface it. Same shape, opposite
+      # remedies.
+      local _dropped
+      _dropped=$(printf '%s' "$_lsout" | python3 -c "
+import sys,json
+try: rows=json.load(sys.stdin)
+except Exception: raise SystemExit
+rows=rows if isinstance(rows,list) else rows.get('items',[])
+d=rows[0].get('slim') if rows else None
+print(', '.join(d) if isinstance(d,list) and d else '')
+" 2>/dev/null)
+      if [[ -n "$_dropped" ]]; then
+        echo "${DIM}— these rows do NOT carry: ${_dropped}." >&2
+        echo "  Those keys are ABSENT, not empty, so .get() returns None either way." >&2
+        echo "  For them: amux board show <ID>   (or GET \$AMUX_API/api/board/<ID>)${RESET}" >&2
+      fi
       # One line, only when rows were actually dropped.
       if grep -qi '^x-amux-truncated: 1' "$_hdr" 2>/dev/null; then
         local _tt _tr
