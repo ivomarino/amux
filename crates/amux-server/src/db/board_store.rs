@@ -390,8 +390,12 @@ pub enum AskVerdict {
     NoType,
     /// An `ask_type` outside the closed vocabulary.
     UnknownType,
+    /// No specific person/external actor, or a generic placeholder.
+    NoActor,
     /// No question, or too short to be one.
     NoQuestion,
+    /// Prose was supplied, but it is not actually phrased as a question.
+    NotAQuestion,
     /// No statement of what ends the block.
     NoUnblocks,
 }
@@ -404,7 +408,7 @@ fn is_a_sentence(s: &str) -> bool {
 }
 
 /// Does this card say who is being asked what, and what ends the block?
-pub fn ask_verdict(ask_type: &str, question: &str, unblocks: &str) -> AskVerdict {
+pub fn ask_verdict(actor: &str, ask_type: &str, question: &str, unblocks: &str) -> AskVerdict {
     let t = ask_type.trim().to_ascii_lowercase();
     if t.is_empty() {
         return AskVerdict::NoType;
@@ -412,8 +416,17 @@ pub fn ask_verdict(ask_type: &str, question: &str, unblocks: &str) -> AskVerdict
     if !ASK_TYPES.contains(&t.as_str()) {
         return AskVerdict::UnknownType;
     }
+    let actor = actor.trim().to_ascii_lowercase();
+    if actor.is_empty()
+        || matches!(actor.as_str(), "human" | "user" | "owner" | "someone" | "you" | "me")
+    {
+        return AskVerdict::NoActor;
+    }
     if !is_a_sentence(question) {
         return AskVerdict::NoQuestion;
+    }
+    if !question.contains('?') {
+        return AskVerdict::NotAQuestion;
     }
     if !is_a_sentence(unblocks) {
         return AskVerdict::NoUnblocks;
@@ -1563,6 +1576,9 @@ pub struct IssueRow {
     /// falsifiable — without it nobody but the author can tell whether an
     /// answer landed.
     pub ask_unblocks: Option<String>,
+    /// Specific person or external actor whose response is required. Generic
+    /// values such as "human" are refused by the needsyou gate.
+    pub ask_actor: Option<String>,
     /// The continuation contract (AMUX-3946). `next_action` is what the next
     /// actor should DO and is the only one gated; `last_result` is what the
     /// previous attempt produced; `unresolved` is what is still open.
@@ -1607,6 +1623,22 @@ pub struct IssueRow {
     /// NULL means not waiting on anyone specific. A card keeps its lifecycle
     /// position and separately declares who it is waiting on.
     pub waiting_on: Option<String>,
+    /// Server-verified worker that created this card for a different worker.
+    /// This is board state, not provider conversation context.
+    pub requested_by: Option<String>,
+    /// Optional worker to notify after the card first enters a terminal state.
+    /// For peer requests the API constrains this to `requested_by`.
+    pub callback_session: Option<String>,
+    /// Optional instruction appended to the factual terminal notification.
+    pub callback_prompt: Option<String>,
+    /// `armed` -> `pending` -> `dispatching` -> `queued`, or `refused`.
+    pub callback_state: Option<String>,
+    /// Stable steering id used to make crash recovery idempotent.
+    pub callback_message_id: Option<String>,
+    /// Unix seconds when callback delivery was durably queued.
+    pub callback_fired_at: Option<i64>,
+    /// Visible refusal/recovery detail; never hidden in logs alone.
+    pub callback_error: Option<String>,
 }
 
 impl IssueRow {
@@ -1685,6 +1717,7 @@ impl IssueRow {
             "ask_type": self.ask_type,
             "ask_question": self.ask_question,
             "ask_unblocks": self.ask_unblocks,
+            "ask_actor": self.ask_actor,
             "entered_state_at": self.entered_state_at,
             "blocked_on": self.blocked_on,
             "next_action": self.next_action,
@@ -1697,6 +1730,16 @@ impl IssueRow {
             "decision_supersedes": self.decision_supersedes,
             "waiting_on": self.waiting_on.as_deref()
                 .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
+            "requested_by": self.requested_by,
+            "callback": self.callback_session.as_ref().map(|session| serde_json::json!({
+                "session": session,
+                "prompt": self.callback_prompt,
+                "trigger": "terminal",
+                "state": self.callback_state,
+                "message_id": self.callback_message_id,
+                "fired_at": self.callback_fired_at,
+                "error": self.callback_error,
+            })),
             // In BOTH snapshots deliberately, i.e. NOT in `slim_omits`. The
             // motivating question ("which cards closed in this window") is a
             // LIST query, so omitting it from the list body would ship the
@@ -1801,7 +1844,9 @@ const COLS: &str = "i.id, i.title, i.\"desc\", i.status, i.session, i.creator, i
      i.ask_type, i.ask_question, i.ask_unblocks, \
      i.next_action, i.last_result, i.unresolved, i.entered_state_at, i.blocked_on, \
      i.source, i.acceptance_criteria, i.decision_question, i.decision_rationale, \
-     i.decision_supersedes, i.waiting_on";
+     i.decision_supersedes, i.waiting_on, i.requested_by, i.callback_session, \
+     i.callback_prompt, i.callback_state, i.callback_message_id, \
+     i.callback_fired_at, i.callback_error, i.ask_actor";
 
 /// Read an INTEGER-typed timestamp column that some row may hold as REAL or TEXT.
 ///
@@ -1920,6 +1965,14 @@ fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
         decision_rationale: r.get(41)?,
         decision_supersedes: r.get(42)?,
         waiting_on: r.get(43)?,
+        requested_by: r.get(44)?,
+        callback_session: r.get(45)?,
+        callback_prompt: r.get(46)?,
+        callback_state: r.get(47)?,
+        callback_message_id: r.get(48)?,
+        callback_fired_at: r.get(49)?,
+        callback_error: r.get(50)?,
+        ask_actor: r.get(51)?,
         next_action: r.get(33)?,
         last_result: r.get(34)?,
         unresolved: r.get(35)?,
@@ -2355,6 +2408,7 @@ pub struct NewIssue {
     pub ask_type: Option<String>,
     pub ask_question: Option<String>,
     pub ask_unblocks: Option<String>,
+    pub ask_actor: Option<String>,
     /// WHO the card came from, as a KIND rather than a name: `agent` for a real
     /// create, `capture` for an auto-captured human prompt (AF-367).
     ///
@@ -2369,6 +2423,11 @@ pub struct NewIssue {
     /// guessing retroactively would manufacture the confident wrong attribution
     /// this field exists to end.
     pub source: Option<String>,
+    /// Verified requester when one worker files work for another.
+    pub requested_by: Option<String>,
+    /// Optional terminal callback target (normally the requester).
+    pub callback_session: Option<String>,
+    pub callback_prompt: Option<String>,
 }
 
 /// Insert a new card, replicating the Python POST exactly: id minted from
@@ -2398,9 +2457,10 @@ pub fn create_issue(conn: &Connection, new: &NewIssue, now: i64) -> rusqlite::Re
         "INSERT INTO issues (id, title, \"desc\", status, session, shepherd, type, creator, \
              due, due_time, created, updated, owner_type, pos, gate, reviewer, depends_on, \
              ask_type, ask_question, ask_unblocks, entered_state_at, source, \
+             requested_by, callback_session, callback_prompt, callback_state, ask_actor, \
              notified, pinned, archived, rev, version) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19, ?20, ?21, ?22, 0, 0, 0, 0, 0)",
+             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, 0, 0, 0, 0, 0)",
         params![
             id,
             new.title,
@@ -2426,6 +2486,11 @@ pub fn create_issue(conn: &Connection, new: &NewIssue, now: i64) -> rusqlite::Re
             // the start and only PRE-0040 rows carry the honest NULL.
             now,
             new.source.as_deref().filter(|x| !x.trim().is_empty()),
+            new.requested_by.as_deref().filter(|x| !x.trim().is_empty()),
+            new.callback_session.as_deref().filter(|x| !x.trim().is_empty()),
+            new.callback_prompt.as_deref().filter(|x| !x.trim().is_empty()),
+            new.callback_session.as_ref().map(|_| "armed"),
+            new.ask_actor.as_deref().filter(|x| !x.trim().is_empty()),
         ],
     )?;
     for tag in &new.tags {
@@ -2559,6 +2624,23 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
     // being a faithful record — which is the one property replay depends on.
     row.closed_at = closed_at_for_write(conn, row);
     row.entered_state_at = entered_state_at_for_write(conn, row);
+    // A callback is armed by the request create/edit and becomes an outbox
+    // item at the ONE write choke point every status transition uses. This is
+    // intentionally not a PATCH-handler side effect: board-drive, epic
+    // completion and future transition producers all call save_patched too.
+    let previous_status: Option<String> = conn
+        .query_row("SELECT status FROM issues WHERE id = ?1", params![row.id], |r| r.get(0))
+        .ok();
+    if previous_status
+        .as_deref()
+        .is_some_and(|s| !is_terminal_status(s))
+        && is_terminal_status(&row.status)
+        && row.callback_session.as_deref().is_some_and(|s| !s.trim().is_empty())
+        && row.callback_state.as_deref() == Some("armed")
+    {
+        row.callback_state = Some("pending".into());
+        row.callback_error = None;
+    }
     conn.execute(
         "UPDATE issues SET title = ?1, \"desc\" = ?2, status = ?3, session = ?4, due = ?5, \
              due_time = ?6, owner_type = ?7, pinned = ?8, pos = ?9, gate = ?10, shepherd = ?11, \
@@ -2569,7 +2651,10 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
              last_result = ?29, unresolved = ?30, entered_state_at = ?31, \
              blocked_on = ?32, acceptance_criteria = ?34, \
              decision_question = ?35, decision_rationale = ?36, \
-             decision_supersedes = ?37, waiting_on = ?38 \
+             decision_supersedes = ?37, waiting_on = ?38, requested_by = ?39, \
+             callback_session = ?40, callback_prompt = ?41, callback_state = ?42, \
+             callback_message_id = ?43, callback_fired_at = ?44, callback_error = ?45, \
+             ask_actor = ?46 \
          WHERE id = ?33 AND deleted IS NULL",
         params![
             row.title,
@@ -2610,6 +2695,14 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
             row.decision_rationale,
             row.decision_supersedes,
             row.waiting_on,
+            row.requested_by,
+            row.callback_session,
+            row.callback_prompt,
+            row.callback_state,
+            row.callback_message_id,
+            row.callback_fired_at,
+            row.callback_error,
+            row.ask_actor,
         ],
     )
 }
@@ -3646,6 +3739,81 @@ mod tests {
         }
     }
 
+    /// A peer request is durable board state, and its callback becomes an
+    /// outbox item at the shared transition choke point exactly once. This
+    /// deliberately uses `save_patched` directly rather than the HTTP handler:
+    /// board-drive, epic completion and future actors all reach this path too.
+    #[test]
+    fn terminal_transition_arms_one_durable_peer_callback() {
+        let conn = create_db();
+        let mut new = new_card("todo");
+        new.requested_by = Some("requester".into());
+        new.callback_session = Some("requester".into());
+        new.callback_prompt = Some("Start the dependent release card.".into());
+        let mut row = create_issue(&conn, &new, 1000).expect("create request");
+
+        assert_eq!(row.requested_by.as_deref(), Some("requester"));
+        assert_eq!(row.callback_state.as_deref(), Some("armed"));
+        assert_eq!(row.snapshot()["callback"]["session"], "requester");
+
+        // Ordinary progress must not fire the callback.
+        row.desc.push_str("progress");
+        row.updated = 2000;
+        save_patched(&conn, &mut row).expect("save progress");
+        assert_eq!(row.callback_state.as_deref(), Some("armed"));
+
+        // The first non-terminal -> terminal edge creates the pending outbox.
+        row.status = "done".into();
+        row.updated = 3000;
+        save_patched(&conn, &mut row).expect("finish");
+        assert_eq!(row.callback_state.as_deref(), Some("pending"));
+        assert_eq!(row.closed_at, Some(3000));
+
+        // Later terminal edits carry the pending state; they do not re-arm or
+        // mint a second delivery.
+        row.desc.push_str(" more detail");
+        row.updated = 4000;
+        save_patched(&conn, &mut row).expect("terminal detail edit");
+        let stored = get_issue(&conn, &row.id).unwrap().unwrap();
+        assert_eq!(stored.callback_state.as_deref(), Some("pending"));
+        assert!(stored.callback_message_id.is_none());
+    }
+
+    #[test]
+    fn needsyou_requires_a_routable_actor_a_real_question_and_an_exit() {
+        assert_eq!(
+            ask_verdict(
+                "Ethan",
+                "decision",
+                "Which launch date should we use?",
+                "The selected date is recorded on the card."
+            ),
+            AskVerdict::Ok
+        );
+        assert_eq!(
+            ask_verdict(
+                "human",
+                "decision",
+                "Which launch date should we use?",
+                "The selected date is recorded on the card."
+            ),
+            AskVerdict::NoActor
+        );
+        assert_eq!(
+            ask_verdict(
+                "vendor-support",
+                "external",
+                "Waiting for their deployment response",
+                "Their deployment response is attached to the card."
+            ),
+            AskVerdict::NotAQuestion
+        );
+        assert_eq!(
+            ask_verdict("Ethan", "judgment", "Does this read well?", "done"),
+            AskVerdict::NoUnblocks
+        );
+    }
+
     /// The column must reach the LIST, not only the full card. The board's slim
     /// payload has now dropped a needed column twice (`desc` at c207339,
     /// `reviewer` at AF-161), and the motivating question here — which cards
@@ -3686,7 +3854,11 @@ mod tests {
             ask_type: None,
             ask_question: None,
             ask_unblocks: None,
+            ask_actor: None,
             source: None,
+            requested_by: None,
+            callback_session: None,
+            callback_prompt: None,
         }
     }
 
@@ -3968,6 +4140,7 @@ mod tests {
             ask_type: None,
             ask_question: None,
             ask_unblocks: None,
+            ask_actor: None,
             entered_state_at: None,
             blocked_on: None,
             next_action: None,
@@ -3981,6 +4154,13 @@ mod tests {
             acceptance_criteria: None, decision_question: None,
             decision_rationale: None, decision_supersedes: None,
             waiting_on: None,
+            requested_by: None,
+            callback_session: None,
+            callback_prompt: None,
+            callback_state: None,
+            callback_message_id: None,
+            callback_fired_at: None,
+            callback_error: None,
         };
         let mut items: Vec<IssueRow> = Vec::new();
         for i in 0..400 {
@@ -4095,7 +4275,7 @@ mod configured_gate_tests {
             gate: gate.map(String::from), shepherd: None, item_type: item_type.into(),
             archived: 0, depends_on: vec![], reviewer: None, epic: None, log: None, rev: 0,
             source_ref: None, evidence: None, ask_type: None, ask_question: None,
-            ask_unblocks: None,
+            ask_unblocks: None, ask_actor: None,
             entered_state_at: None,
             blocked_on: None,
             next_action: None,
@@ -4106,6 +4286,9 @@ mod configured_gate_tests {
             acceptance_criteria: None, decision_question: None,
             decision_rationale: None, decision_supersedes: None,
             waiting_on: None,
+            requested_by: None, callback_session: None, callback_prompt: None,
+            callback_state: None, callback_message_id: None,
+            callback_fired_at: None, callback_error: None,
         }
     }
 

@@ -279,8 +279,9 @@ fn sse_message_invalidation_refreshes_each_visible_message_surface() {
 }
 
 #[test]
-fn live_doing_card_stays_visible_and_clickable_during_sessions_poll_lag() {
+fn only_the_explicitly_claimed_card_is_live_and_unclaimed_work_is_visible() {
     let app = asset("app.js");
+    let index = asset("index.html");
     let helper_start = app
         .find("function _cardDoingItem(name)")
         .expect("dashboard must derive the live doing card from SSE-synced board data");
@@ -290,10 +291,13 @@ fn live_doing_card_stays_visible_and_clickable_during_sessions_poll_lag() {
         .expect("live-card helper must precede board-change invalidation");
     let helper = &helper_tail[..helper_end];
     for needle in [
-        "c.session !== name",
-        "c.status !== 'doing'",
-        "c.deleted || c.archived",
-        "c.updated || c.created",
+        "session.task_board_id",
+        "c.id === claimed",
+        "c.session === name",
+        "c.status === 'doing'",
+        "!c.deleted && !c.archived",
+        "function _activeWithoutClaim()",
+        "function _boardUnclaimedWorkHTML()",
     ] {
         assert!(helper.contains(needle), "live-card selection lost `{needle}`");
     }
@@ -307,12 +311,52 @@ fn live_doing_card_stays_visible_and_clickable_during_sessions_poll_lag() {
         "liveBoardTask ? (liveBoardTask.title || liveBoardTask.id)",
         "liveBoardTask ? liveBoardTask.id : s.task_board_id",
         "_taskIdChip({task_board_id: displayTaskBoardId})",
+        "no board task claimed",
     ] {
         assert!(render.contains(needle), "session card lost live board linkage `{needle}`");
     }
     assert!(
         app.contains("board-card-live-label\"><span class=\"board-live-dot\"></span>Working now"),
         "a live board card needs an explicit visible label, not only a border or tooltip"
+    );
+    assert!(
+        app.contains("const _liveNow = !!(_liveCard && _liveCard.id === item.id)"),
+        "only the explicitly claimed card may say Working now"
+    );
+    assert!(
+        app.contains("board-unclaimed-mount") && index.contains("board-unclaimed-mount"),
+        "the board must expose active workers whose hooks have not named a card"
+    );
+}
+
+#[test]
+fn idle_workers_explain_blocked_and_parked_board_work() {
+    let app = asset("app.js");
+    let start = app
+        .find("function _boardDriveCardReason(drive)")
+        .expect("worker cards need a board-drive explanation helper");
+    let helper = &app[start..start + 2200.min(app.len() - start)];
+    for needle in [
+        "all-candidates-refused",
+        "(dependency root)",
+        "backlog auto-drain off",
+        "backlog parked on human/trigger",
+        "missing next action",
+    ] {
+        assert!(helper.contains(needle), "board-drive explanation lost `{needle}`");
+    }
+
+    let render_start = app
+        .find("function _renderSessionCard(s)")
+        .expect("session-card renderer must exist");
+    let render = &app[render_start..render_start + 16_000.min(app.len() - render_start)];
+    assert!(
+        render.contains("(todo || backlog || d || review) && driveFresh"),
+        "the explanation must cover every non-terminal work column, including backlog-only lanes"
+    );
+    assert!(
+        render.contains("_boardDriveCardReason(drive)"),
+        "the card must render the mechanism's explanation"
     );
 }
 
@@ -536,6 +580,9 @@ fn board_detail_leads_with_actionable_task_context() {
         "targetPath = target.replace(/#.*$/",
         "Produced assets (",
         "Source message",
+        "Worker request",
+        "Terminal callback",
+        "item.requested_by",
         "_bdOpenMessage(",
         "_bdWorkerActivity(",
         "Worker actions",

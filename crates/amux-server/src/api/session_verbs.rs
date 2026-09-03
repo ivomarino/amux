@@ -440,6 +440,28 @@ pub(crate) fn scoped_setting_in(home: &std::path::Path, lane: &str, key: &str) -
     EnvFile::load(&home.join("amux.env")).get(key).and_then(nonempty)
 }
 
+/// Resolve `CC_SEND_ALLOW` while preserving an explicit empty value.
+///
+/// The general scoped resolver deliberately treats empty as absent because
+/// most switches spell an override as `0`. Cross-worker reach predates that
+/// convention: its persisted opt-out is an empty allow-list. Once the product
+/// default became open, collapsing empty into absent made OFF reload as ON —
+/// exactly the resetting toggle the user observed. Same layer order as the
+/// launched shell and [`scoped_setting_in`], but presence and value stay two
+/// separate facts.
+pub(crate) fn cross_group_allow_setting_in(
+    home: &std::path::Path,
+    lane: &str,
+) -> Option<String> {
+    for path in scope_env_layers(home, lane).into_iter().rev() {
+        let cfg = EnvFile::load(&path);
+        if let Some(v) = cfg.get("CC_SEND_ALLOW") {
+            return Some(v.trim().trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
 fn provider_of(cfg: &EnvFile) -> String {
     let p = cfg.get_or("CC_PROVIDER", "claude").trim().to_lowercase();
     if SESSION_PROVIDERS.contains(&p.as_str()) && !p.is_empty() {
@@ -3746,8 +3768,12 @@ fn mint_capture_card(
             ask_type: None,
             ask_question: None,
             ask_unblocks: None,
+            ask_actor: None,
             // AF-367: an auto-captured human prompt — the population AF-367 is about.
             source: Some("capture".into()),
+            requested_by: None,
+            callback_session: None,
+            callback_prompt: None,
         },
         now_ms / 1000,
     )?;
@@ -4148,6 +4174,43 @@ pub(crate) async fn steer_enqueue_precond(
     sender: &str,
     precond: Option<(&str, i64)>,
 ) -> Result<String, &'static str> {
+    steer_enqueue_precond_with_id(store, name, text, guard, sender, precond, None).await
+}
+
+/// Board callbacks use a stable id so a crash between enqueue and marking the
+/// card cannot duplicate a callback. If the id is already queued its payload
+/// is refreshed in place; if it is in steering_history it is already delivered
+/// and is not queued again.
+#[must_use]
+pub(crate) async fn steer_enqueue_idempotent(
+    state: &AppState,
+    name: &str,
+    text: &str,
+    guard: &str,
+    sender: &str,
+    message_id: &str,
+) -> Result<String, &'static str> {
+    steer_enqueue_precond_with_id(
+        &state.store,
+        name,
+        text,
+        guard,
+        sender,
+        None,
+        Some(message_id),
+    )
+    .await
+}
+
+async fn steer_enqueue_precond_with_id(
+    store: &crate::db::SharedStore,
+    name: &str,
+    text: &str,
+    guard: &str,
+    sender: &str,
+    precond: Option<(&str, i64)>,
+    stable_id: Option<&str>,
+) -> Result<String, &'static str> {
     // ZERO AMUX HARNESS INTO AN ISOLATED LANE (Ethan, 2026-08-26: "isolated =
     // zero amux harness, just raw LLM pass through"), gated at the CHOKEPOINT
     // for the same reason AF-188 put the archived refusal here.
@@ -4220,7 +4283,9 @@ pub(crate) async fn steer_enqueue_precond(
         );
         return Err(reason);
     }
-    let msg_id = format!("steer-{}", (now_f64() * 1000.0) as i64);
+    let msg_id = stable_id
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("steer-{}", (now_f64() * 1000.0) as i64));
     let id = msg_id.clone();
     // The id we RETURN must be the row that actually exists. When a guarded
     // re-enqueue updates the prior row in place (AMUX-3557) the freshly minted
@@ -4234,9 +4299,46 @@ pub(crate) async fn steer_enqueue_precond(
     let guard_s = guard.to_string();
     let sender_s = sender.to_string();
     let precond_w = precond.map(|(c, r)| (c.to_string(), r));
-    let _ = store
+    let stable_w = stable_id.map(str::to_string);
+    let should_emit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let should_emit_w = should_emit.clone();
+    let persisted = store
         .write_async(move |conn| {
             ensure_fleet_tables(conn)?;
+            if let Some(ref fixed) = stable_w {
+                let delivered = conn
+                    .query_row(
+                        "SELECT 1 FROM steering_history WHERE id=?1 LIMIT 1",
+                        rusqlite::params![fixed],
+                        |_| Ok(true),
+                    )
+                    .unwrap_or(false);
+                if delivered {
+                    should_emit_w.store(false, std::sync::atomic::Ordering::SeqCst);
+                    if let Ok(mut g) = effective_id_w.lock() {
+                        *g = fixed.clone();
+                    }
+                    return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+                }
+                let queued = conn
+                    .query_row(
+                        "SELECT 1 FROM steering_queue WHERE id=?1 LIMIT 1",
+                        rusqlite::params![fixed],
+                        |_| Ok(true),
+                    )
+                    .unwrap_or(false);
+                if queued {
+                    conn.execute(
+                        "UPDATE steering_queue SET text=?1, session=?2, guard=?3, sender=?4 \
+                         WHERE id=?5",
+                        rusqlite::params![text_s, session, guard_s, sender_s, fixed],
+                    )?;
+                    if let Ok(mut g) = effective_id_w.lock() {
+                        *g = fixed.clone();
+                    }
+                    return Ok(crate::db::WriteOutcome { applied: true, events: vec![] });
+                }
+            }
             // A GUARDED RE-ENQUEUE UPDATES IN PLACE AND KEEPS `queued_at`
             // (AMUX-3557). This was DELETE-then-INSERT, which looks like the
             // same thing and is not: the new row got `now_f64()`, so a guarded
@@ -4298,15 +4400,20 @@ pub(crate) async fn steer_enqueue_precond(
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         })
         .await;
-    emit_event_store(
-        store,
-        name,
-        "message.queued",
-        Some(json!({"chars": text.chars().count(), "preview": chars_truncate(text, 120), "guard": if guard.is_empty() { Value::Null } else { json!(guard) }})),
-        Some(format!("q:{msg_id}")),
-        "steering",
-    )
-    .await;
+    if persisted.is_err() {
+        return Err("could not persist steering message");
+    }
+    if should_emit.load(std::sync::atomic::Ordering::SeqCst) {
+        emit_event_store(
+            store,
+            name,
+            "message.queued",
+            Some(json!({"chars": text.chars().count(), "preview": chars_truncate(text, 120), "guard": if guard.is_empty() { Value::Null } else { json!(guard) }})),
+            Some(format!("q:{msg_id}")),
+            "steering",
+        )
+        .await;
+    }
     // The row that exists, not the one we minted (AMUX-3557).
     Ok(effective_id.lock().map(|g| g.clone()).unwrap_or(msg_id))
 }
@@ -8714,9 +8821,10 @@ const FLEET_ROSTER_HEADER: &str = "\n## Fleet — who else is running (auto-gene
      Every live worker is listed, INCLUDING YOU — this file is shared by every lane in \
      this directory, so it cannot omit the reader. You are the one whose name matches \
      $AMUX_SESSION.\n\n\
-     Reach any of them with `amux send <name> --stdin` (origin-stamped). Peek before \
-     interrupting: `curl -sk $AMUX_URL/api/sessions/<name>/peek?lines=200`.\n\n\
-     | worker | groups | description |\n|---|---|---|\n";
+     Reach any of them with `amux send <name> --stdin` (origin-stamped), or make \
+     durable delegated work with `amux board request <name> <title>`. \
+     The latter keeps the request, gates, assets and terminal return on one card.\n\n\
+     | worker | groups | description | provider / model | workspace / branch |\n|---|---|---|---|---|\n";
 
 /// The fleet roster every worker gets, regenerated on each write.
 ///
@@ -8731,10 +8839,11 @@ const FLEET_ROSTER_HEADER: &str = "\n## Fleet — who else is running (auto-gene
 /// session env files that are already the source of truth for the worker list,
 /// so a roster cannot drift from the fleet the way a checked-in list would.
 ///
-/// Excludes archived lanes and the reader itself — "who else is out there" is
-/// the question, and 50 rows of which one is you is noise.
+/// Excludes archived/isolated lanes. It deliberately includes the reader: the
+/// roster is one shared generated file, so a per-reader omission would either
+/// require N copies or make the contents depend on whoever regenerated it.
 fn fleet_roster() -> String {
-    let mut rows: Vec<(String, String, String)> = Vec::new();
+    let mut rows: Vec<(String, String, String, String, String)> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(sessions_dir()) {
         let mut names: Vec<String> = rd
             .flatten()
@@ -8776,18 +8885,35 @@ fn fleet_roster() -> String {
                 })
                 .unwrap_or_default();
             let desc = env.get("CC_DESC").cloned().unwrap_or_default();
-            rows.push((other, groups, desc));
+            let provider = env.get("CC_PROVIDER").cloned().unwrap_or_else(|| "claude".into());
+            let model = env.get("CC_MODEL").cloned().unwrap_or_default();
+            let runtime = if model.is_empty() { provider } else { format!("{provider} / {model}") };
+            let dir = env.get("CC_DIR").cloned().unwrap_or_default();
+            let branch = env.get("CC_BRANCH").cloned().unwrap_or_default();
+            let workspace = if branch.is_empty() { dir } else { format!("{dir} @ {branch}") };
+            rows.push((other, groups, desc, runtime, workspace));
         }
     }
     if rows.is_empty() {
         return String::new();
     }
     let mut out = String::from(FLEET_ROSTER_HEADER);
-    for (n, g, d) in rows.iter().take(120) {
-        let d = d.replace('|', "\\|").chars().take(110).collect::<String>();
-        out.push_str(&format!("| `{n}` | {} | {} |\n", if g.is_empty() { "—" } else { g }, if d.is_empty() { "—" } else { &d }));
+    for (n, g, d, r, w) in rows.iter().take(120) {
+        let cell = |s: &str, max: usize| {
+            let escaped = s.replace('|', "\\|").replace('\n', " ");
+            let trimmed = escaped.chars().take(max).collect::<String>();
+            if trimmed.is_empty() { "—".to_string() } else { trimmed }
+        };
+        out.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} |\n",
+            cell(n, 64), cell(g, 80), cell(d, 110), cell(r, 80), cell(w, 140)
+        ));
     }
-    out.push_str(&format!("\n{} peer worker(s). Same-group peers share memory, env and gates.\n", rows.len()));
+    out.push_str(&format!(
+        "\n{} discoverable peer worker(s). Cross-group messaging is open by default; \
+         isolation is the explicit opt-out.\n",
+        rows.len()
+    ));
     out
 }
 
@@ -13077,20 +13203,20 @@ fn dirs_home() -> Option<std::path::PathBuf> {
 
 /// Why a worker-to-worker send is allowed, or `Err(reason)` if it is not.
 ///
-/// Ethan's rule: "worker to worker communication should be limited to intra
-/// group unless explicitly stated." The escapes are CONFIG, never something the
-/// sending agent can assert about itself in a request body — a flag any caller
-/// could set would make the rule advisory.
+/// Worker-to-worker communication is open across the fleet by default. An
+/// explicit empty `CC_SEND_ALLOW` remains a configuration-level opt-out; it is
+/// never a request-body flag that a caller can forge or accidentally override.
 ///
 /// - same group (or a self-send)          -> allowed
-/// - sender's `CC_SEND_ALLOW`             -> groups it may reach, or `*`
+/// - absent sender `CC_SEND_ALLOW`         -> `*` (the product default)
+/// - sender's `CC_SEND_ALLOW`             -> explicit groups, `*`, or empty opt-out
 /// - receiver's `CC_RECEIVE_ANY=1`        -> a documented fleet-wide routing
 ///   target. `amux` is one by construction: the worker roster tells every lane
 ///   to route amux platform bugs here, which IS the explicit statement, and
 ///   683 of the 908 worker-to-worker sends in the 24h before this shipped were
 ///   cross-group — mostly bug reports inbound to this lane. Blocking those
 ///   would have severed the fleet's only bug channel to fix a broadcast problem.
-fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, String> {
+pub(crate) fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, String> {
     if origin.is_empty() || origin == target {
         return Ok("self-or-human");
     }
@@ -13115,7 +13241,7 @@ fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, Strin
     // (AMUX-4015). Both switches below are POLICY — a standing order about who
     // may talk to whom — and AMUX-2930 already established that policy read
     // through `parse_env` is the ethos-rule-1 shape: `/api/scope` advertises
-    // `env` at all three levels and the Scope tab writes all three, so a
+    // `env` at all three levels and the Configurations tab writes all three, so a
     // group-level or global `CC_SEND_ALLOW` saved cleanly and changed nothing,
     // because this gate only ever consulted `sessions/<worker>.env`.
     //
@@ -13144,9 +13270,16 @@ fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, Strin
     if recently_contacted_by(target, origin) {
         return Ok("reply-to-inbound");
     }
-    let allow: Vec<String> = scoped_setting_in(&home, origin, "CC_SEND_ALLOW")
-        .map(|v| v.split(',').map(|t| t.trim().trim_matches('"').to_lowercase()).filter(|t| !t.is_empty()).collect())
-        .unwrap_or_default();
+    // OPEN BY DEFAULT (Ethan, 2026-09-03). An absent setting means `*`; an
+    // explicit empty worker/group/global value remains the opt-out. Keeping
+    // the policy in this one resolver means direct sends, board requests and
+    // reviewer routing cannot acquire three different defaults.
+    let allow: Vec<String> = cross_group_allow_setting_in(&home, origin)
+        .unwrap_or_else(|| "*".into())
+        .split(',')
+        .map(|t| t.trim().trim_matches('"').to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
     if allow.iter().any(|a| a == "*") || allow.iter().any(|a| tg.contains(a)) {
         return Ok("sender-allowlist");
     }
@@ -13154,12 +13287,13 @@ fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, Strin
         if g.is_empty() { "(untagged)".to_string() } else { g.iter().cloned().collect::<Vec<_>>().join(",") }
     };
     Err(format!(
-        "cross-group send refused: {origin} [{}] -> {target} [{}]. Worker-to-worker \
-         messaging is intra-group unless explicitly configured. To allow it \
-         STANDING (no per-message approval): set CC_SEND_ALLOW on {origin} \
+        "cross-group send refused: {origin} [{}] -> {target} [{}]. This worker has \
+         an explicit cross-group opt-out. To allow it STANDING (no per-message \
+         approval): clear that override so it inherits the open fleet default, \
+         or set CC_SEND_ALLOW on {origin} \
          (comma-separated groups, or *), or CC_RECEIVE_ANY=1 on {target} if it is a \
          fleet-wide routing target. BOTH RESOLVE worker > group > global, so the \
-         Scope tab can set them for this one worker, for its whole group, or \
+         Configurations tab can set them for this one worker, for its whole group, or \
          fleet-wide, and a worker-level value overrides a group or global one \
          (AMUX-4015). For a ONE-OFF instead, this refusal mints a grant the owner \
          approves from the dashboard. A human send is never \
@@ -13187,7 +13321,9 @@ async fn get_cross_group_config() -> Response {
     let global = crate::config::parse_env_file(&home.join("amux.env"))
         .get("CC_SEND_ALLOW")
         .map(|v| v.trim().trim_matches('"').to_string())
-        .unwrap_or_default();
+        // Product default: a fresh install is an open peer fleet. Writing an
+        // explicit empty value through PUT is how an owner opts it back out.
+        .unwrap_or_else(|| "*".into());
     let enforcing = std::env::var("AMUX_GROUP_SEND_ENFORCE")
         .map(|v| !matches!(v.trim(), "0" | "false" | "no"))
         .unwrap_or(true);
@@ -13244,7 +13380,7 @@ async fn put_cross_group_config(headers: HeaderMap, body: Option<Json<Value>>) -
         // A worker-level value still overrides this, so the honest message says
         // "default" rather than implying it settles every lane.
         "message": if allow.is_empty() {
-            "cross-group sends are refused by default again; per-worker allowances still apply"
+            "cross-group sends are disabled by an explicit global opt-out; per-worker allowances still apply"
         } else if allow == "*" {
             "every worker may now send to any group by default, no approval needed"
         } else {
@@ -13379,6 +13515,35 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
         .unwrap_or(true)
     {
         if let Err(reason) = cross_group_send_ok(&send_origin, name) {
+            // Isolation is a permanent reachability boundary, not a permission
+            // prompt. The generic refusal path below used to mint a one-shot
+            // cross-group grant even though approving it could never make an
+            // isolated raw-agent lane a valid peer target. Worse, a previously
+            // approved allowance was consumed before the refusal and bypassed
+            // the isolation check entirely. Return the exact refusal without a
+            // grant: only the owner/dashboard path (empty origin) is allowed.
+            if session_is_isolated(name) {
+                tracing::warn!(origin = %send_origin, target = %name, "{reason}");
+                emit_event(
+                    state,
+                    name,
+                    "send.isolated_refused",
+                    Some(json!({"origin": send_origin, "target": name})),
+                    None,
+                    "isolation",
+                )
+                .await;
+                return jresp(
+                    StatusCode::FORBIDDEN,
+                    json!({
+                        "ok": false,
+                        "error": reason,
+                        "blocked": "isolated",
+                        "code": "isolated_target",
+                        "what_to_do": "An isolated worker is reachable only by its owner from the dashboard; no approval can authorize peer delivery.",
+                    }),
+                );
+            }
             // AN OWNER-APPROVED, SINGLE-USE ALLOWANCE RELEASES EXACTLY ONE SEND
             // (AMUX-3997). Checked before the refusal so an approval the owner
             // already gave is honoured on the worker's own retry.
@@ -16608,8 +16773,8 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
         // enforce rather than what was just typed — a group or global layer can
         // still grant this lane even when its own value is now empty, and
         // reporting "off" there would be a lie the next send disproves.
-        let effective = scoped_setting_in(&crate::config::amux_home(), name, "CC_SEND_ALLOW")
-            .unwrap_or_default();
+        let effective = cross_group_allow_setting_in(&crate::config::amux_home(), name)
+            .unwrap_or_else(|| "*".into());
         let effective = effective.trim().trim_matches('"').to_string();
         tracing::info!(
             session = %name, send_allow = %value, effective = %effective,
@@ -17261,15 +17426,13 @@ mod tests {
         assert_eq!(r(sha), sha, "git sha must survive: {}", r(sha));
     }
 
-    /// Ethan, 2026-08-11: worker-to-worker messaging is intra-group unless
-    /// explicitly configured. The escapes must be CONFIG — a body flag any
-    /// caller could set would make the rule advisory.
-    /// CONFIGURE A WORKER (OR A WHOLE GROUP) TO SPAN GROUPS, WITHOUT A
-    /// PER-MESSAGE APPROVAL (AMUX-4015).
+    /// Worker-to-worker messaging is open by default. Configuration may narrow
+    /// an individual worker or a whole group without putting policy in a body
+    /// flag that a caller could forge (AMUX-4015).
     ///
     /// `CC_SEND_ALLOW` and `CC_RECEIVE_ANY` were read through `parse_env`, which
     /// reads `sessions/<worker>.env` and nothing else. `/api/scope` has always
-    /// advertised `env` at global/group/worker and the Scope tab writes all
+    /// advertised `env` at global/group/worker and the Configurations tab writes all
     /// three, so setting either switch at the GROUP or GLOBAL layer saved a file
     /// this gate never opened: it appeared to work and changed nothing. That is
     /// AMUX-2930's shape, still live for these two keys.
@@ -17290,8 +17453,16 @@ mod tests {
 
         w("roamer", "CC_TAGS=\"customers\"\n");
         w("target", "CC_TAGS=\"gtm\"\n");
-        // Baseline: no configuration anywhere, so it is refused.
-        assert!(cross_group_send_ok("roamer", "target").is_err(), "premise: refused unconfigured");
+        // Product baseline: no configuration anywhere means open peer discovery
+        // and messaging.
+        assert_eq!(
+            cross_group_send_ok("roamer", "target").expect("fresh fleet must be open"),
+            "sender-allowlist"
+        );
+        // An explicit empty global value is the fleet opt-out. More-specific
+        // group/worker configuration may still open a deliberately selected lane.
+        std::fs::write(dir.path().join("amux.env"), "CC_SEND_ALLOW=\"\"\n").expect("write");
+        assert!(cross_group_send_ok("roamer", "target").is_err(), "explicit opt-out must close");
 
         // GROUP LAYER on the SENDER's group. This is the "configure it once for
         // the group" case, and before the fix it did nothing at all.
@@ -17305,7 +17476,7 @@ mod tests {
         // once rather than per worker.
         std::fs::remove_file(groups.join("customers.env")).expect("rm");
         assert!(cross_group_send_ok("roamer", "target").is_err(), "control: grant withdrawn");
-        std::fs::write(dir.path().join("amux.env"), "CC_RECEIVE_ANY=1\n").expect("write");
+        std::fs::write(dir.path().join("amux.env"), "CC_SEND_ALLOW=\"\"\nCC_RECEIVE_ANY=1\n").expect("write");
         assert_eq!(
             cross_group_send_ok("roamer", "target").expect("global layer must grant"),
             "receiver-open"
@@ -17341,7 +17512,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_group_sends_are_refused_unless_configured() {
+    fn cross_group_sends_are_open_by_default_and_explicitly_opt_out() {
         let dir = tempfile::tempdir().expect("tmp");
         let _g = crate::api::settings::test_env::set_home(dir.path());
         let sessions = dir.path().join("sessions");
@@ -17356,7 +17527,11 @@ mod tests {
         write("broadcaster", "CC_TAGS=\"customers\"\nCC_SEND_ALLOW=\"gtm\"\n");
         write("lonely", "\n"); // untagged
 
-        // THE REPORTED CASE: different groups, no config -> refused.
+        // Fresh fleets are open across groups.
+        assert_eq!(cross_group_send_ok("ts-gke", "gtm-engine").unwrap(), "sender-allowlist");
+        // An explicit global empty value closes the default. This is the only
+        // state in which the refusal/approval path should appear.
+        std::fs::write(dir.path().join("amux.env"), "CC_SEND_ALLOW=\"\"\n").expect("write");
         let err = cross_group_send_ok("ts-gke", "gtm-engine").expect_err("must refuse");
         assert!(err.contains("cross-group send refused"), "{err}");
         // The refusal must NAME both escapes, or it is a wall rather than a rule.
@@ -17422,6 +17597,26 @@ mod tests {
         // owner peek/send to an isolated worker still works.
         assert_eq!(cross_group_send_ok("", "secret").unwrap(), "self-or-human");
     }
+
+    #[tokio::test]
+    async fn an_isolated_peer_refusal_never_mints_an_approval_request() {
+        let (state, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("caller.env"), "CC_TAGS=alpha\n").unwrap();
+        std::fs::write(sessions.join("raw.env"), "CC_TAGS=beta\nCC_ISOLATED=1\n").unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-amux-session", "caller".parse().unwrap());
+        let response = send_post(&state, "raw", &headers, &json!({"text": "do work"})).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["blocked"], json!("isolated"));
+        assert_eq!(body["code"], json!("isolated_target"));
+        assert!(body.get("grant_id").is_none(), "an impossible send must not ask for approval: {body}");
+    }
+
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -20660,8 +20855,12 @@ mod steer_boundary_tests {
                         ask_type: None,
                         ask_question: None,
                         ask_unblocks: None,
+                        ask_actor: None,
                         // AF-367: an auto-captured human prompt — the population AF-367 is about.
                         source: Some("capture".into()),
+                        requested_by: None,
+                        callback_session: None,
+                        callback_prompt: None,
                     },
                     now_ms / 1000,
                 )?;
@@ -20787,11 +20986,17 @@ mod steer_boundary_tests {
             "a same-group reviewer must still be assignable"
         );
 
-        // THE NEW CELL: registered, real, and in another group. The old gate
-        // passed this — it is ECOLO-14 and AMUX-3761 exactly — and the owner
-        // then could not message the reviewer it was waiting on.
+        // EXPLICITLY CLOSED: registered, real, and in another group. Fresh
+        // fleets are intentionally open now; preserve this boundary regression
+        // by closing the owner's lane through the documented worker-level
+        // override before checking reviewer reachability.
+        std::fs::write(
+            sessions.join("owner.env"),
+            "CC_DIR=/tmp\nCC_TAGS=\"alpha\"\nCC_SEND_ALLOW=\"\"\n",
+        )
+        .unwrap();
         let why = reviewer_unreachable_reason("owner", "far")
-            .expect("a cross-group reviewer must refuse even though it IS registered");
+            .expect("an explicitly opted-out cross-group reviewer must refuse");
         assert!(
             !why.contains("not a registered worker"),
             "the refusal must name the REACH problem, not mislead about existence: {why}"

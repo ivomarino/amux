@@ -1678,7 +1678,7 @@ of the five, it is not a block on a person:
   amux board backlog $id --trigger \"<the condition that re-arms it>\"   external wait
   amux board doing $id                                                work the blocker
 
-  amux board needsyou $id --ask decision --question \"...\" --unblocks \"...\""
+  amux board needsyou $id --actor Ethan --ask decision --question \"...?\" --unblocks \"...\""
 }
 
 _board_transition() {
@@ -2078,6 +2078,29 @@ before amux ever sees them (AMUX-1888).
 EOF
 }
 
+_board_request_usage() {
+  cat <<EOF
+Usage: amux board request <worker> <title>
+       amux board request <worker> --stdin | --file <path>
+
+Creates a board-managed worker-to-worker request in backlog. The verified
+requester is attached to the card, board-drive advances it through gates, and a
+terminal callback to the requester is armed by default.
+
+Optional:
+  --desc <text> | --desc-stdin | --desc-file <path>
+  --type <type>
+  --depends-on <ISSUE-ID>                 repeatable
+  --due <YYYY-MM-DD>
+  --callback-prompt <text>                what requester should do after return
+  --no-callback                           keep the request one-way
+  --help
+
+The card—not provider conversation history—is the durable contract, so model
+or provider changes do not lose the request or callback.
+EOF
+}
+
 # Outcome-based exit for board mutations (AMUX-2140): the CLI used to report
 # the TRANSPORT (curl ok = exit 0) while the server refused the write — every
 # `$?` caller and every `&& echo moved` printed success on blocked mutations,
@@ -2223,7 +2246,7 @@ cmd_board() {
       # Mark a card as blocked-on-human and RECORD THE ASK (AMUX-2167/2171):
       # additive tag (no clobber) + the question into the History, so Focus
       # mode and the card both show WHAT is needed, not just that it's stuck.
-      local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board needsyou <ISSUE-ID> --ask <type> --question \"...\" --unblocks \"...\""
+      local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board needsyou <ISSUE-ID> --actor <name> --ask <type> --question \"...?\" --unblocks \"...\""
       _board_id_guard "needsyou" "$id"
       shift 2>/dev/null || true
       # AF-318: the ask is TYPED now. 445 cards were parked here at a median age
@@ -2232,10 +2255,11 @@ cmd_board() {
       # worker decided to stop doing. Three fields, refused server-side without
       # them; the CLI refuses first so the five types are printed rather than
       # discovered by tripping a 409.
-      local ask_type="" ask_q="" ask_unblocks="" want_q_stdin=""
+      local ask_actor="" ask_type="" ask_q="" ask_unblocks="" want_q_stdin=""
       local -a _rest=()
       while [[ $# -gt 0 ]]; do
         case "$1" in
+          --actor) ask_actor="${2:-}"; [[ -n "$ask_actor" ]] || die "--actor needs a specific person or external actor"; shift 2 ;;
           --ask) ask_type="${2:-}"; [[ -n "$ask_type" ]] || die "--ask needs a type"; shift 2 ;;
           --question) ask_q="${2:-}"; [[ -n "$ask_q" ]] || die "--question needs text"; shift 2 ;;
           --question-stdin) want_q_stdin=1; shift ;;
@@ -2254,12 +2278,18 @@ cmd_board() {
       # and the exit.
       local ask="${ask_q:-$*}"
       _needsyou_types_or_die "$ask_type" "$id"
+      case "$(printf '%s' "$ask_actor" | tr '[:upper:]' '[:lower:]')" in
+        ''|human|user|owner|someone|you|me) die "amux board needsyou: --actor must name the specific person or external actor who can answer.
+Generic placeholders are not routable. Example: --actor Ethan or --actor vendor-support" ;;
+      esac
       [[ -n "$ask" ]] || die "amux board needsyou: --question is required — one sentence, what you are asking.
-  amux board needsyou $id --ask $ask_type --question \"...\" --unblocks \"...\""
+  amux board needsyou $id --actor $ask_actor --ask $ask_type --question \"...?\" --unblocks \"...\""
+      [[ "$ask" == *'?'* ]] || die "amux board needsyou: --question must be a direct question containing '?'.
+A status note is not an ask and cannot move a task into the human queue."
       [[ -n "$ask_unblocks" ]] || die "amux board needsyou: --unblocks is required — one sentence, what ENDS the block.
 Without it nobody but you can tell whether an answer landed, so the card can only
 leave this queue by you noticing. That is how 445 cards reached a median age of 15 days.
-  amux board needsyou $id --ask $ask_type --question \"$ask\" --unblocks \"...\""
+  amux board needsyou $id --actor $ask_actor --ask $ask_type --question \"$ask\" --unblocks \"...\""
       # A FLAG IS NOT AN ASK. This verb takes free prose, so an unrecognised
       # `--flag` was silently adopted AS the question: `amux board needsyou <id>
       # --stdin < file` printed "tagged needs:you", discarded the file entirely,
@@ -2322,7 +2352,7 @@ For long text use:                amux board progress $id \"\$(cat file)\"" ;;
       local _askresp _askcurl=0
       _askresp=$(_curl -sk -X PATCH -H 'Content-Type: application/json' \
         -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
-        -d "$(T="$ask_type" Q="$ask" U="$ask_unblocks" python3 -c 'import json,os;print(json.dumps({"ask_type":os.environ["T"],"ask_question":os.environ["Q"],"ask_unblocks":os.environ["U"]}))')" \
+        -d "$(A="$ask_actor" T="$ask_type" Q="$ask" U="$ask_unblocks" python3 -c 'import json,os;print(json.dumps({"ask_actor":os.environ["A"],"ask_type":os.environ["T"],"ask_question":os.environ["Q"],"ask_unblocks":os.environ["U"]}))')" \
         "${AMUX_API:-https://localhost:8824}/api/board/$id" 2>/dev/null) || _askcurl=$?
       if [[ "$_askcurl" -ne 0 ]]; then
         die "cannot reach the board at ${AMUX_API:-https://localhost:8824} (curl exit $_askcurl).
@@ -2335,8 +2365,8 @@ except Exception:
     sys.stderr.write("warning: the typed ask may not have been recorded — server sent no JSON. "
                      "The transition below was still attempted; check its result.\n"); sys.exit(0)
 ign = [f for f in (d.get("ignored_fields") or []) if f]
-if "ask_type" in ign:
-    sys.stderr.write("note: the ask_type/ask_question/ask_unblocks fields were not stored — "
+if "ask_type" in ign or "ask_actor" in ign:
+    sys.stderr.write("note: the structured ask fields were not stored — "
                      "this server predates AF-318. Your NEEDS-YOU note still persisted to the "
                      "card in full; only the typed columns were dropped.\n")
 '
@@ -2772,6 +2802,80 @@ A block with no named cause is unfalsifiable: nobody else can tell when it clear
         | _curl -sk -X PATCH -H 'Content-Type: application/json' \
             -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" -d @- "$AMUX_API/api/board/$id")
       echo "$result" | _board_outcome "$id" "" "unblocked"
+      return $?
+      ;;
+    callback)
+      local id="${1:-}"
+      _board_id_guard "callback" "$id"
+      [[ -n "$id" ]] || die "Usage: amux board callback <ISSUE-ID> [--prompt <what to do next> | --off]
+Arms a one-shot callback to this verified worker when the task first becomes terminal."
+      shift
+      local prompt="" enabled=1
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --prompt) [[ -n "${2:-}" ]] || die "--prompt needs text"; prompt="$2"; shift 2 ;;
+          --prompt-stdin) prompt=$(cat); shift ;;
+          --off) enabled=0; shift ;;
+          --help|-h) die "Usage: amux board callback <ISSUE-ID> [--prompt <text> | --prompt-stdin | --off]" ;;
+          --*) _board_bad_flag callback "$1" "--prompt <text> --prompt-stdin --off --help" ;;
+          *) prompt="${prompt:+$prompt }$1"; shift ;;
+        esac
+      done
+      local body result
+      body=$(P="$prompt" E="$enabled" python3 -c 'import json,os
+if os.environ.get("E")=="0": print(json.dumps({"callback":False}))
+else:
+    p=os.environ.get("P","").strip()
+    print(json.dumps({"callback":{"prompt":p}} if p else {"callback":True}))')
+      result=$(_curl -sk -X PATCH -H 'Content-Type: application/json' \
+        -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" -d "$body" "$AMUX_API/api/board/$id")
+      echo "$result" | _board_outcome "$id" "" "$([[ "$enabled" == 1 ]] && echo 'callback armed' || echo 'callback cleared')"
+      return $?
+      ;;
+    request)
+      local target="${1:-}"
+      [[ -n "$target" ]] || die "$(_board_request_usage)"
+      shift
+      local title="" desc="" itype="" due="" callback_prompt="" callback_on=1 _src=""
+      local -a deps=()
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --stdin|-)     title=$(cat); _src=1; shift ;;
+          --file)        [[ -n "${2:-}" && -r "${2:-}" ]] || die "usage: amux board request <worker> --file <path>"
+                         title=$(cat "$2"); _src=1; shift 2 ;;
+          --desc-stdin)  desc=$(cat); shift ;;
+          --desc-file)   [[ -n "${2:-}" && -r "${2:-}" ]] || die "usage: amux board request <worker> --desc-file <path>"
+                         desc=$(cat "$2"); shift 2 ;;
+          --desc)        [[ -n "${2:-}" ]] || die "--desc needs text"; desc="$2"; shift 2 ;;
+          --type)        [[ -n "${2:-}" ]] || die "--type needs a board type"; itype="$2"; shift 2 ;;
+          --depends-on)  [[ -n "${2:-}" ]] || die "--depends-on needs an issue id"; deps+=("$2"); shift 2 ;;
+          --due)         [[ "${2:-}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || die "--due wants YYYY-MM-DD"
+                         due="$2"; shift 2 ;;
+          --callback-prompt) [[ -n "${2:-}" ]] || die "--callback-prompt needs text"; callback_prompt="$2"; shift 2 ;;
+          --no-callback) callback_on=0; shift ;;
+          --help|-h)     _board_request_usage; return 0 ;;
+          --*)           _board_bad_flag request "$1" \
+                           "--stdin --file <p> --desc <t> --desc-stdin --desc-file <p> --type <t> --depends-on <ID> --due <date> --callback-prompt <t> --no-callback --help" ;;
+          *)             title="${title:+$title }$1"; _src=1; shift ;;
+        esac
+      done
+      [[ -n "${title// }" ]] || die "$(_board_request_usage)"
+      local _deps_joined="" body result
+      [[ ${#deps[@]} -gt 0 ]] && _deps_joined=$(printf '%s\n' "${deps[@]}")
+      body=$(T="$title" S="$target" D="$desc" TY="$itype" DEP="$_deps_joined" DUE="$due" CP="$callback_prompt" CB="$callback_on" python3 -c 'import json,os
+b={"title":os.environ["T"].strip(),"status":"backlog","session":os.environ["S"].strip()}
+for env,key in (("D","desc"),("TY","type"),("DUE","due")):
+    v=os.environ.get(env,"").strip()
+    if v: b[key]=v
+deps=[x.strip() for x in os.environ.get("DEP","").split("\n") if x.strip()]
+if deps: b["depends_on"]=deps
+if os.environ.get("CB")=="1":
+    prompt=os.environ.get("CP","").strip()
+    b["callback"]={"prompt":prompt} if prompt else True
+print(json.dumps(b))')
+      result=$(_curl -sk -X POST -H 'Content-Type: application/json' \
+        -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" -d "$body" "$AMUX_API/api/board")
+      echo "$result" | _board_outcome
       return $?
       ;;
     add|create)
@@ -3385,15 +3489,18 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
   amux board ls [--all]            List open issues (--all includes archived)
   amux board show <ID>             Print one card in full (title, desc, gate, history)
   amux board add <title>           Create a new todo issue
+  amux board request <worker> <title>  Delegate through the board + terminal callback
+  amux board callback <ID>        Arm/clear a terminal callback on any task
     --type T                       set the type at create time (the GATE is derived from it)
     --desc/--desc-stdin/--desc-file  give the card a body in the same write
                                    (--stdin/--file for the TITLE. Unknown flags are
                                     REFUSED, not folded into the title — AEAB-17.)
   amux board claim <ID>            Atomically claim a todo/backlog card for this worker
   amux board assign <ID> <worker>  Reassign a card to a worker (the claim 409's sanctioned exit)
-  amux board needsyou <ID> --ask <type> --question "..." --unblocks "..."
+  amux board needsyou <ID> --actor <name> --ask <type> --question "...?" --unblocks "..."
                                    Park a card on the human. The ask is TYPED:
                                    decision | access | credential | external | judgment
+                                   --actor     specific person/external actor (required)
                                    --question  one sentence, what you are asking
                                    --unblocks  one sentence, what ENDS the block
                                    Also --question-stdin / --question-file /
@@ -3828,6 +3935,8 @@ ${BOLD}CRM:${RESET}
 ${BOLD}Board:${RESET}
   amux board ls                  List all board issues
   amux board add <title>         Create a new issue (--type/--desc*; see \`amux board\`)
+  amux board request <worker> <title>  Durable peer request; callback on terminal
+  amux board callback <ID>      Arm/clear a terminal callback on any task
   amux board done <ID>           Mark issue as done
   amux board doing <ID>          Mark issue as in progress
   amux board todo <ID>           Mark issue as todo

@@ -650,6 +650,9 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     // which the caller stamps in seconds, and backfilled through
     // `strftime('%s', ...)` which yields seconds (AMUX-3609).
     ("issues", "closed_at", false),
+    // SECONDS: the callback outbox stamps this from board.rs `now_secs()` in
+    // the same write that updates the issue's seconds-valued `updated` field.
+    ("issues", "callback_fired_at", false),
     // SECONDS, same as every other `issues` timestamp and for the same reason:
     // `entered_state_at_for_write` stamps `row.updated`, and `create_issue`
     // stamps the same `now` it writes to `created`/`updated`. Nothing backfilled

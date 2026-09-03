@@ -2847,14 +2847,13 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             // `_own` says whether the WORKER's own file sets it, so the UI can
             // tell "this worker" from "inherited" and can refuse to offer a
             // local switch-off for something it did not set locally.
-            "spans_groups": crate::api::session_verbs::scoped_setting_in(
-                &crate::config::amux_home(), &name, "CC_SEND_ALLOW",
-            ).map(|v| !v.trim().trim_matches('"').is_empty()).unwrap_or(false),
-            "spans_groups_value": crate::api::session_verbs::scoped_setting_in(
-                &crate::config::amux_home(), &name, "CC_SEND_ALLOW",
-            ).map(|v| v.trim().trim_matches('"').to_string()).unwrap_or_default(),
-            "spans_groups_own": env.get("CC_SEND_ALLOW")
-                .map(|v| !v.trim().trim_matches('"').is_empty()).unwrap_or(false),
+            "spans_groups": crate::api::session_verbs::cross_group_allow_setting_in(
+                &crate::config::amux_home(), &name,
+            ).map(|v| !v.trim().trim_matches('"').is_empty()).unwrap_or(true),
+            "spans_groups_value": crate::api::session_verbs::cross_group_allow_setting_in(
+                &crate::config::amux_home(), &name,
+            ).map(|v| v.trim().trim_matches('"').to_string()).unwrap_or_else(|| "*".into()),
+            "spans_groups_own": env.get("CC_SEND_ALLOW").is_some(),
             "steering_queue": [],
             "managed_by": "python",
         }));

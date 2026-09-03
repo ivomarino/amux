@@ -308,11 +308,11 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
           <div class="settings-row" style="justify-content:space-between;align-items:center;margin-top:10px;">
             <span style="font-size:0.85rem;">Workers may message across groups</span>
             <label class="theme-toggle">
-              <input type="checkbox" id="crossgroup-default-checkbox" onchange="toggleCrossGroupDefault(this.checked)">
+              <input type="checkbox" id="crossgroup-default-checkbox" onchange="toggleCrossGroupDefault(this.checked)" checked>
               <span class="theme-track"><span class="theme-thumb"></span></span>
             </label>
           </div>
-          <div style="font-size:0.68rem;color:var(--dim);margin-top:3px;" id="crossgroup-default-note">Default OFF: worker-to-worker messaging stays inside a group unless configured. ON grants every worker a standing allowance, with no per-message approval. A worker-level setting from its &#x22EF; menu still overrides this, and isolated workers stay unreachable either way.</div>
+          <div style="font-size:0.68rem;color:var(--dim);margin-top:3px;" id="crossgroup-default-note">Default ON: workers can discover and message every non-isolated peer without per-message approval. A worker/group/global configuration may opt out; isolated raw workers stay unreachable.</div>
           <div class="settings-row" style="justify-content:space-between;align-items:center;margin-top:10px;">
             <span style="font-size:0.85rem;">Auto-drain backlog for all workers</span>
             <label class="theme-toggle">
@@ -652,6 +652,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   </div>
   <div class="board-views" id="board-views"></div>
   <div class="board-filters" id="board-filters"></div>
+  <div id="board-unclaimed-mount"></div>
   <div id="board-stats-mount"></div>
   <div class="board-columns" id="board-columns"></div>
 </div>

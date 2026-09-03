@@ -6972,8 +6972,12 @@ async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<St
                 ask_type: None,
                 ask_question: None,
                 ask_unblocks: None,
+                ask_actor: None,
                 // AF-367: filed by the autofix detector.
                 source: Some("autofix".into()),
+                requested_by: None,
+                callback_session: None,
+                callback_prompt: None,
             };
             let row = bs::create_issue(conn, &new, now_s)?;
             conn.execute(

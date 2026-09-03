@@ -123,17 +123,15 @@ case "${MODE/subagent-/subagent:}" in
     case "$IN" in
       *'"source":"compact"'*|*'"source": "compact"'*) exit 0 ;;
     esac
-    BODY="{\"subagent\":\"reset\",\"source\":\"$SRC\"}"
     ;;
-  subagent:*) BODY="{\"subagent\":\"${MODE#subagent[:-]}\",\"source\":\"$SRC\"}" ;;
 esac
-if [ -z "$BODY" ]; then
 BODY=$(printf '%s' "$IN" | /usr/bin/python3 -c '
 import json,sys,os
 raw=sys.stdin.read()
 mode,src=sys.argv[1],sys.argv[2]
-if mode in ("subagent-start", "subagent-stop"):
-    out={"subagent":mode[len("subagent-"):],"source":src}
+norm=mode.replace("subagent-","subagent:",1)
+if norm.startswith("subagent:"):
+    out={"subagent":norm.split(":",1)[1],"source":src}
 else:
     out={"state":mode,"source":src}
 h={}; tp=""; nlines=0; err=""
@@ -176,7 +174,7 @@ except Exception as e:
 # below — skipping the log in exactly the case the log exists to explain. Caught
 # by building a failing payload and checking the log stayed empty, which is the
 # only way that class of hole shows up: everything looked like it ran.
-if tp:
+if tp and "subagent" not in out:
     try:
         tot=0
         # MODEL FROM THE TRANSCRIPT, not only from the hook payload: the payload
@@ -216,10 +214,10 @@ if "subagent" not in out and (not out.get("model") or not out.get("tokens")):
     except Exception: pass
 print(json.dumps(out))
 ' "$MODE" "$SRC" 2>/dev/null)
-fi
-# #182's subagent case is deliberately NOT repeated here: the block above
-# already produced BODY for either spelling, and it also handles `reset`, which
-# that case did not. A second case would be a fork of one rule.
+# One parser above now owns both subagent spellings, reset, conversation
+# attribution, and main-turn reports. Keeping a fast hand-built JSON branch for
+# subagents dropped the hook payload's session_id and made subagent status less
+# attributable than the parent status it augments.
 [ -n "$BODY" ] || BODY="{\"state\":\"$MODE\",\"source\":\"$SRC\"}"
 # Surgery, not a third JSON encoder: BODY is always a flat object ending in
 # "}" (python's json.dumps above, or the fallback literal on this same line),

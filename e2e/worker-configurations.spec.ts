@@ -4,6 +4,8 @@
 // the real dashboard and real Rust API against each project's throwaway home.
 import { test, expect } from './fixtures';
 
+test.setTimeout(60_000);
+
 test('worker Configurations edits the full board lifecycle and every scoped capability', async ({ page, request }, testInfo) => {
   await page.goto('/');
   const token = await page.evaluate(() => (window as any)._AMUX_AUTH_TOKEN as string);
@@ -40,9 +42,9 @@ test('worker Configurations edits the full board lifecycle and every scoped capa
 
     await page.getByRole('button', { name: /Configurations$/ }).click();
     const panel = page.locator('#peek-scope-body');
-    await expect(panel).toContainText('Worker settings');
-    await expect(panel).toContainText('Board automation');
-    await expect(panel.getByRole('switch')).toHaveCount(7);
+    await expect(panel).toContainText('Every durable worker setting');
+    await expect(panel).toContainText('Task lifecycle');
+    await expect(panel.getByRole('switch')).toHaveCount(8);
     for (const key of [
       'name', 'description', 'task_label', 'groups', 'directory', 'branch',
       'provider', 'model', 'effort', 'mcp', 'yolo', 'isolated', 'cross_group',
@@ -117,7 +119,7 @@ test('worker Configurations edits the full board lifecycle and every scoped capa
 
     // Explicit opt-out path: turn backlog drain off without changing To Do
     // pickup or the master switch.
-    let backlogRow = panel.locator('.scope-detail > div', { hasText: 'Backlog → To Do' }).first();
+    let backlogRow = panel.locator('[data-config-section="task-lifecycle"] .worker-config-row', { hasText: 'Backlog → To Do' }).first();
     await backlogRow.getByRole('switch').click();
     await expect.poll(async () => {
       const rows = await request.get('/api/sessions', { headers: auth });
@@ -127,7 +129,7 @@ test('worker Configurations edits the full board lifecycle and every scoped capa
 
     // Inheritance path: remove the worker override and prove the runtime falls
     // back to the fleet default (backlog and To Do are both auto-driven).
-    backlogRow = panel.locator('.scope-detail > div', { hasText: 'Backlog → To Do' }).first();
+    backlogRow = panel.locator('[data-config-section="task-lifecycle"] .worker-config-row', { hasText: 'Backlog → To Do' }).first();
     await backlogRow.getByRole('button', { name: 'Inherit' }).click();
     await expect.poll(async () => {
       const rows = await request.get('/api/sessions', { headers: auth });

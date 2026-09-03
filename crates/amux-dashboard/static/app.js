@@ -3083,22 +3083,65 @@ function _cardBoardStatusCounts(name) {
   });
   return counts;
 }
-// The sessions payload and board SSE arrive independently. During auto-pickup,
-// the board can already have the new doing card while /api/sessions still
-// carries the worker's description fallback. Prefer the newest live board
-// fact in that window so a working worker never says "no active card" and the
-// task remains clickable. The server-provided task remains the fallback while
-// boardItems is loading.
+// The ONE board card a worker explicitly claims through `task_board_id`.
+//
+// Do not derive this from "worker active + card doing". A worker may have more
+// than one historical/captured card in doing (TubeScience had four), while one
+// terminal turn can execute only one parent task. The old newest-doing fallback
+// made all four cards say "Working now" and could also replace the task named by
+// the status hook with whichever card happened to be touched last. A short
+// "active, no claimed task" window while sessions and board SSE converge is
+// honest; guessing a task is not.
 function _cardDoingItem(name) {
-  let newest = null;
-  let newestAt = -1;
-  (boardItems || []).forEach(c => {
-    if (c.deleted || c.archived || c.session !== name || c.status !== 'doing') return;
-    const raw = c.updated || c.created || 0;
-    const at = typeof raw === 'number' ? raw : (Date.parse(raw) || 0);
-    if (!newest || at >= newestAt) { newest = c; newestAt = at; }
-  });
-  return newest;
+  const session = (sessions || []).find(s => s.name === name);
+  const claimed = String(session && session.task_board_id || '').trim();
+  if (!claimed) return null;
+  return (boardItems || []).find(c =>
+    !c.deleted && !c.archived && c.session === name && c.status === 'doing' && c.id === claimed
+  ) || null;
+}
+
+function _activeWithoutClaim() {
+  return (sessions || []).filter(s => s.status === 'active' && !_cardDoingItem(s.name));
+}
+
+function _boardUnclaimedWorkHTML() {
+  const rows = _activeWithoutClaim();
+  if (!rows.length) return '';
+  return '<div class="board-unclaimed-work" role="status"><strong>' + rows.length
+    + ' active worker' + (rows.length === 1 ? '' : 's')
+    + ' without a claimed board task</strong><span>This is live work, but amux cannot truthfully attach it to a card yet.</span><div>'
+    + rows.map(s => '<button type="button" onclick="openPeek(\'' + escJs(s.name)
+      + '\')">' + esc(s.name) + '</button>').join('') + '</div></div>';
+}
+
+// Turn the board-drive trace into the smallest useful operator explanation.
+// The trace keeps the complete detail for diagnostics; worker cards need the
+// actionable reason. In particular, "all-candidates-refused" hid a dependency
+// chain behind a generic label. Resolve the root blocker from the structured
+// prose the mechanism itself emitted instead of inventing a second readiness
+// predicate in the UI.
+function _boardDriveCardReason(drive) {
+  if (!drive) return '';
+  const detail = String(drive.detail || '');
+  if (drive.reason === 'all-candidates-refused') {
+    const edges = [...detail.matchAll(/(?:^|;\s*)([^;\s]+) blocked by ([^;,\s]+)/g)];
+    if (edges.length) {
+      const cards = new Set(edges.map(m => m[1]));
+      const roots = [...new Set(edges.map(m => m[2]).filter(id => !cards.has(id)))];
+      if (roots.length) return 'blocked by ' + roots.join(', ') + ' (dependency root)';
+      return 'dependency blocked';
+    }
+    if (detail.includes('continuation gate')) return 'missing next action';
+    return 'no dispatchable task';
+  }
+  if (drive.reason === 'no-eligible-card') {
+    if (/drain:\s*OFF/i.test(detail)) return 'backlog auto-drain off';
+    if (/parked on a human or a live trigger/i.test(detail)) return 'backlog parked on human/trigger';
+    return 'no dispatchable task';
+  }
+  if (drive.reason === 'mid-turn') return 'working now';
+  return String(drive.reason || drive.outcome || 'checked').replaceAll('-', ' ');
 }
 // Worker cards embed board-derived figures (the helpers above), so ANY
 // boardItems ingest must repaint the workers view when those inputs move —
@@ -3314,6 +3357,7 @@ function render() {
     const effort = provider === 'claude' ? flagValue(flags, '--effort') : '';
     const pLabel = providerLabel(provider);
     const liveBoardTask = _cardDoingItem(s.name);
+    const activeWithoutClaim = s.status === 'active' && !liveBoardTask;
     // A board transition and the next sessions poll are not atomic. Render the
     // SSE-synced doing card immediately, then naturally converge on the server
     // fields on the next poll. This also repairs old/stale task summaries while
@@ -3390,7 +3434,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
               that hits the banner never fires Stop and the active latch keeps
               claiming work). The payload now only reports FUTURE limits, so when
               rate_limited_until is set it is the true state and it supersedes
-              the status badge outright (AMUX-2566). */ ''}          ${s.rate_limited_until ? '' : `${s.status === 'rate_limited' ? '<span class="status-badge rate-limited" title="Hit a usage limit (on credits or waiting for reset)">rate limited</span>' : ''}${s.status === 'active' ? '<span class="status-badge active">working</span>' + _agentsChip(s) : ''}
+              the status badge outright (AMUX-2566). */ ''}          ${s.rate_limited_until ? '' : `${s.status === 'rate_limited' ? '<span class="status-badge rate-limited" title="Hit a usage limit (on credits or waiting for reset)">rate limited</span>' : ''}${s.status === 'active' ? '<span class="status-badge active">working</span>' + _agentsChip(s) : ''}${activeWithoutClaim ? '<span class="status-badge board-unclaimed-badge" title="The status hook says this worker is active, but it has not named a current board task. No card is guessed from its other in-progress work.">no board task claimed</span>' : ''}
           ${s.status === 'waiting' ? `<span class="status-badge waiting"${_waitingTitle(s)}>${_waitingLabel(s)}</span>${_stalledFor(s)}` : ''}
           ${s.status === 'idle' ? '<span class="status-badge idle">idle</span>' : ''}`}
           ${s.rate_limited_until ? `<span class="status-badge rate-limited" title="${s.rate_limit_weekly ? 'Weekly limit' : 'Rate-limited'} — auto-resume at ${_fmtResetTime(s.rate_limited_until)}">${s.rate_limit_weekly ? 'Weekly limit until' : 'Rate-limited until'} ${_fmtResetTime(s.rate_limited_until)}</span>` : ''}
@@ -3420,9 +3464,13 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
             if (todo) parts.push(`<span class="mc-active mc-todo">${todo}</span> todo`);
             const drive = s.board_drive || null;
             const driveFresh = drive && drive.checked_at && (Date.now()/1000 - drive.checked_at) < 180;
-            if (s.status === 'idle' && todo && driveFresh) {
+            // A non-empty queue plus an idle badge is never left unexplained.
+            // This applies to backlog-only and doing/review lanes too, not only
+            // todo: Primis was parked on a live trigger and looked abandoned;
+            // rtsp-connection had a dependency chain and looked identical.
+            if (s.status === 'idle' && (todo || backlog || d || review) && driveFresh) {
               const ready = Number(drive.eligible_todos || 0);
-              const why = drive.reason || drive.outcome || 'checked';
+              const why = _boardDriveCardReason(drive);
               parts.push(`<span class="mc-total" title="${esc(drive.detail || 'Latest board-drive decision')}">${ready} ready · ${esc(why)}</span>`);
             }
             if (backlog) parts.push(`<span class="mc-total mc-backlog">${backlog}</span> backlog`);
@@ -8719,7 +8767,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.795';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.796';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -14296,7 +14344,7 @@ function _mergeUnechoed(serverRows, session) {
 // still passes a worker, so the change is provably behaviour-preserving before a
 // group or global caller exists — the sequencing amux-cloud called the most
 // valuable paragraph on the original card, and the same order that made the
-// Scope tab's second caller a one-liner instead of a second renderer.
+// Configurations tab's second caller a one-liner instead of a second renderer.
 async function _peekMsgFetch(scope, offset) {
   const sc = (typeof scope === 'string') ? { level: 'worker', name: scope } : (scope || {});
   const q = sc.level === 'group'  ? '&group=' + encodeURIComponent(sc.name)
@@ -25390,13 +25438,17 @@ function _renderBoardCard(item) {
   const firstLine = (item.desc !== undefined ? item.desc : (item.desc_head || ''))
                       .split('\n')[0].slice(0, 80);
   const pinned = item.pinned ? 1 : 0;
-  // LIVE emphasis: this card is what its owning session is working on right now
-  // (item in doing + that session's terminal is actively generating).
+  // LIVE emphasis: this card is what its owning session explicitly claims it is
+  // working on right now. `active + doing` is not enough: a lane can contain
+  // several doing cards, but only one is the current parent task.
   // `sessions`, not the pre-rename `workers` (b009f6e's FOURTH casualty —
   // the typeof guard made the dead global read as false instead of throwing,
   // so the LIVE emphasis just silently never lit).
-  const _liveNow = item.status === 'doing' && item.session &&
-    (typeof sessions !== 'undefined') && (sessions || []).some(s => s.name === item.session && s.status === 'active');
+  const _liveSession = item.session && (typeof sessions !== 'undefined')
+    ? (sessions || []).find(s => s.name === item.session && s.status === 'active')
+    : null;
+  const _liveCard = _liveSession ? _cardDoingItem(item.session) : null;
+  const _liveNow = !!(_liveCard && _liveCard.id === item.id);
   // item.session, not the pre-rename item.worker — the dead field rendered
   // 'undefined is working on this right now' in the LIVE tooltip.
   let h = '<div class="board-card' + (pinned ? ' board-card-pinned' : '') + (_liveNow ? ' board-card-live' : '') + '" data-id="' + item.id + '"' + (_liveNow ? ' title="' + esc(item.session) + ' is working on this right now"' : '') + ' onclick="openBoardDetail(\'' + item.id + '\')" oncontextmenu="return _boardCtxMenu(event,\'' + escJs(item.id) + '\')">';
@@ -25773,11 +25825,15 @@ function _renderBoardBySession(visible, container) {
     const items = name ? groups[name] : noSession;
     const collapsed = _sessionGroupCollapsed[name || '__none__'];
     const groupKey = name || '__none__';
+    const liveSession = name ? (sessions || []).find(s => s.name === name && s.status === 'active') : null;
+    const unclaimed = !!(liveSession && !_cardDoingItem(name));
     html += '<div class="board-session-group">';
     html += '<div class="board-session-header" onclick="toggleSessionGroup(\'' + esc(groupKey) + '\')">';
     html += '<span class="board-session-chevron' + (collapsed ? '' : ' open') + '">\u25B6</span>';
     html += '<span class="board-session-name">' + (name ? esc(name) : '<span style="color:var(--dim)">Unassigned</span>') + '</span>';
-    html += '<div class="board-session-counts">' + _sessionCountsHtml(items) + '</div></div>';
+    html += '<div class="board-session-counts">'
+      + (unclaimed ? '<span class="board-session-unclaimed">working · no board task claimed</span>' : '')
+      + _sessionCountsHtml(items) + '</div></div>';
     if (!collapsed) {
       html += '<div class="board-session-items">';
       const _sPage = _boardColPages[groupKey] || 20;
@@ -25967,6 +26023,8 @@ function renderBoard() {
   if (document.body.classList.contains('board-dragging')) { _boardRenderPending = true; return; }
   renderBoardFilters();
   const container = document.getElementById('board-columns');
+  const unclaimedMount = document.getElementById('board-unclaimed-mount');
+  if (unclaimedMount) unclaimedMount.innerHTML = _boardUnclaimedWorkHTML();
 
   // Update view toggle buttons
   var bvS = document.getElementById('bv-session');
@@ -26590,6 +26648,41 @@ function _bdRenderMeta(item) {
           + '<span>' + (m.session ? esc(m.session) + ' · ' : '') + (sec ? timeAgo(sec) + ' · ' : '')
           + esc(String(m.text || '').slice(0,220)) + '</span></div>';
       }).join('') + '</section>';
+  }
+
+  if (item.requested_by || item.callback) {
+    let requestHtml = '';
+    if (item.requested_by) {
+      requestHtml += '<div class="board-detail-meta-row"><b>Requested by</b> '
+        + '<button class="task-id-chip bd-link-chip" onclick="event.stopPropagation();openPeek(\''
+        + escJs(item.requested_by) + '\')" title="Open requester">' + esc(item.requested_by) + '</button></div>';
+    }
+    if (item.callback) {
+      const cb = item.callback || {};
+      const state = String(cb.state || 'armed');
+      const stateColor = state === 'queued' ? 'var(--green)' : (state === 'refused' ? 'var(--red)' : 'var(--accent)');
+      requestHtml += '<div class="board-detail-meta-row"><b>Terminal callback</b> '
+        + '<button class="task-id-chip bd-link-chip" onclick="event.stopPropagation();openPeek(\''
+        + escJs(cb.session || '') + '\')">' + esc(cb.session || '') + '</button> '
+        + '<span style="color:' + stateColor + '">' + esc(state) + '</span>'
+        + (cb.fired_at ? ' · ' + timeAgo(Number(cb.fired_at)) : '') + '</div>';
+      if (cb.prompt) requestHtml += '<div class="board-detail-meta-row"><span style="color:var(--dim)">Then:</span> '
+        + _linkifyUrls(_linkifyCardIds(esc(String(cb.prompt)))) + '</div>';
+      if (cb.message_id) requestHtml += '<div class="board-detail-meta-row"><span style="color:var(--dim)">Delivery:</span> <code>'
+        + esc(String(cb.message_id)) + '</code></div>';
+      if (cb.error) requestHtml += '<div class="board-detail-meta-row" style="color:var(--red)">Callback not delivered: '
+        + esc(String(cb.error)) + '</div>';
+    }
+    html += '<section class="bd-card-section"><h4>Worker request</h4>' + requestHtml + '</section>';
+  }
+  if (item.ask_actor || item.ask_question || item.ask_unblocks) {
+    html += '<section class="bd-card-section"><h4>Human request</h4>'
+      + '<div class="board-detail-meta-row"><b>Waiting on</b> ' + esc(item.ask_actor || 'unspecified')
+      + (item.ask_type ? ' · ' + esc(item.ask_type) : '') + '</div>'
+      + (item.ask_question ? '<div class="board-detail-meta-row"><span style="color:var(--dim)">Question:</span> '
+          + _linkifyUrls(esc(String(item.ask_question))) + '</div>' : '')
+      + (item.ask_unblocks ? '<div class="board-detail-meta-row"><span style="color:var(--dim)">Unblocks when:</span> '
+          + esc(String(item.ask_unblocks)) + '</div>' : '') + '</section>';
   }
 
   let relationHtml = '';

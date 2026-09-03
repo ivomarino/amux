@@ -1453,7 +1453,7 @@ async fn needsyou_refuses_a_park_that_names_no_human_act() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "needsyou", "gate_ack": true, "ask_type": "blocked",
+        Some(json!({ "status": "needsyou", "gate_ack": true, "ask_actor": "Ethan", "ask_type": "blocked",
                      "ask_question": "can someone look at this",
                      "ask_unblocks": "someone looks at it" })),
     )
@@ -1467,7 +1467,7 @@ async fn needsyou_refuses_a_park_that_names_no_human_act() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "needsyou", "gate_ack": true, "ask_type": "decision",
+        Some(json!({ "status": "needsyou", "gate_ack": true, "ask_actor": "Ethan", "ask_type": "decision",
                      "ask_question": "blocked", "ask_unblocks": "Ethan answers this question" })),
     )
     .await;
@@ -1480,21 +1480,21 @@ async fn needsyou_refuses_a_park_that_names_no_human_act() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "needsyou", "gate_ack": true, "ask_type": "decision",
-                     "ask_question": "should idle GPU hours be reclaimed automatically",
+        Some(json!({ "status": "needsyou", "gate_ack": true, "ask_actor": "Ethan", "ask_type": "decision",
+                     "ask_question": "Should idle GPU hours be reclaimed automatically?",
                      "ask_unblocks": "yes" })),
     )
     .await;
     assert_eq!(v["code"], json!("needsyou_ask_has_no_exit"), "{v}");
     assert_eq!(st, StatusCode::CONFLICT);
 
-    // All three, and it parks.
+    // All four, and it parks.
     let (st, _, v) = send(
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "needsyou", "gate_ack": true, "ask_type": "decision",
-                     "ask_question": "should idle GPU hours be reclaimed automatically",
+        Some(json!({ "status": "needsyou", "gate_ack": true, "ask_actor": "Ethan", "ask_type": "decision",
+                     "ask_question": "Should idle GPU hours be reclaimed automatically?",
                      "ask_unblocks": "a yes or no from the owner on auto-reclaim" })),
     )
     .await;
@@ -1523,7 +1523,7 @@ async fn a_refused_park_does_not_discard_the_ask_it_asked_for() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "ask_type": "access", "ask_question": "who owns the staging console",
+        Some(json!({ "ask_actor": "platform-admin", "ask_type": "access", "ask_question": "Who owns the staging console?",
                      "ask_unblocks": "a name, or an invite to the console" })),
     )
     .await;
@@ -1546,8 +1546,8 @@ async fn the_needsyou_view_is_capped_and_ranks_by_blast_radius_not_age_alone() {
                 &app,
                 "PATCH",
                 &format!("/api/board/{id}"),
-                Some(json!({ "status": "needsyou", "gate_ack": true, "ask_type": "decision",
-                             "ask_question": "which way should this go",
+                Some(json!({ "status": "needsyou", "gate_ack": true, "ask_actor": "Ethan", "ask_type": "decision",
+                             "ask_question": "Which way should this go?",
                              "ask_unblocks": "a direction from the owner" })),
             )
             .await
@@ -1835,6 +1835,7 @@ async fn creating_a_needsyou_card_needs_a_typed_ask_just_like_the_transition_doe
             "title": "a real ask",
             "status": "needsyou",
             "type": "chore",
+            "ask_actor": "Ethan",
             "ask_type": "decision",
             "ask_question": "Should we raise the browser profile TTL above 30 days?",
             "ask_unblocks": "A yes or no from Ethan; either answer closes this.",
@@ -1855,6 +1856,7 @@ async fn creating_a_needsyou_card_needs_a_typed_ask_just_like_the_transition_doe
             "title": "invented type",
             "status": "needsyou",
             "type": "chore",
+            "ask_actor": "Ethan",
             "ask_type": "vibes",
             "ask_question": "Is this ok?",
             "ask_unblocks": "Someone says yes.",
@@ -3697,8 +3699,9 @@ async fn entering_an_undrained_status_stamps_a_revisit_date() {
         // link and evidence. The gate has its own coverage below.
         let mut body = json!({ "status": status, "gate_ack": true });
         if status == "needsyou" {
+            body["ask_actor"] = json!("Ethan");
             body["ask_type"] = json!("decision");
-            body["ask_question"] = json!("which retention window should this use");
+            body["ask_question"] = json!("Which retention window should this use?");
             body["ask_unblocks"] = json!("a number of days from the owner");
         }
         let (st, _, v) = send(&app, "PATCH", &format!("/api/board/{id}"), Some(body)).await;
@@ -4163,7 +4166,11 @@ async fn a_card_records_where_it_came_from_and_the_api_publishes_it() {
             ask_type: None,
             ask_question: None,
             ask_unblocks: None,
+            ask_actor: None,
             source: Some("capture".into()),
+            requested_by: None,
+            callback_session: None,
+            callback_prompt: None,
         },
         1_788_000_000,
     )
@@ -4284,7 +4291,7 @@ async fn a_refused_transition_names_the_fields_it_discarded() {
 async fn the_needsyou_queue_ranks_a_passed_deadline_above_an_older_undated_card() {
     let (app, _dir) = app();
     let ask = json!({
-        "status": "needsyou", "ask_type": "decision",
+        "status": "needsyou", "ask_actor": "Ethan", "ask_type": "decision",
         "ask_question": "Should this move to the new cluster, or stay where it is?",
         "ask_unblocks": "the migration can be scheduled either way",
     });

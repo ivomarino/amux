@@ -420,8 +420,12 @@ async fn file_nudge_escalation(state: &AppState, lane: &str, backlog: i64, unhee
         ask_type: None,
         ask_question: None,
         ask_unblocks: None,
+        ask_actor: None,
         // AF-367: filed by the board drive loop.
         source: Some("board_drive".into()),
+        requested_by: None,
+        callback_session: None,
+        callback_prompt: None,
     };
     let l = lane.to_string();
     let _ = state
@@ -4319,7 +4323,7 @@ pub fn select_advance_with(
         // This gate used to ask only "is `rev` a registered worker", which is
         // one predicate short. A registered CROSS-GROUP reviewer passed it, got
         // nudged, and the owner then could not talk to them: worker-to-worker
-        // messaging is intra-group unless configured, and `cross_group_send_ok`
+        // messaging is open across groups unless explicitly opted out, and `cross_group_send_ok`
         // is enforced in exactly ONE place — the send API. The review nudge goes
         // through `steer_enqueue` and never touches it.
         //
@@ -5771,6 +5775,18 @@ pub fn spawn(state: AppState) -> super::PeriodicTask {
     super::spawn_periodic(JOB, secs, move || {
         let state = state.clone();
         async move {
+            // Terminal callbacks are a durable board outbox. Drain it on every
+            // board tick so a restart or a transition produced outside the
+            // HTTP PATCH handler cannot strand a completed peer request.
+            let callbacks = crate::api::board::dispatch_pending_callbacks(&state, None).await;
+            if callbacks.attempted > 0 {
+                tracing::info!(
+                    attempted = callbacks.attempted,
+                    queued = callbacks.queued,
+                    refused = callbacks.refused,
+                    "[board-drive] terminal task callbacks"
+                );
+            }
             let fleet = LiveFleet { state: state.clone() };
             let r = drive_tick(&state, &fleet).await;
             if r.assigned > 0 || r.nudged > 0 || r.promoted > 0 || r.promoted_due > 0 {
