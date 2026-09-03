@@ -2492,3 +2492,34 @@ FIX: f999caff replaces the literal ANSWER_ONLY_TAILS list with `tail_is_answer_o
   still card); `scripts/mutate.sh` confirms the negative control can actually fail.
   NOT YET independently re-validated against the running server build — see AF-433's
   discipline for what that validation should check before this entry is archived.
+
+## The `verdict=READ verb` arm names a card by ID, and every one of its 17 positives is false
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-03
+SESSION: amux-frustrations
+CARD: AF-452
+SYMPTOM: `[staged-guard/inferred-edit]` publishes a `verdict` field with three arms. The
+ READ arm's text is "READ verb — is_pure_read_command missed a reader ... This is the
+ specimen AMUX-2841 wants". Over 75,758 firings in a 4-day window it produced 17 rows, all
+ `blocked_by=status`, on two mixpeek lanes. All 17 are artifacts, and the proof needs no
+ transcript: `first_blocking_verb` (git_guard.rs:1726) `continue`s on a real git read
+ subcommand, so a genuine `git status` can NEVER reach that field. A bare `status` token
+ there PROVES it came from quoted DATA tokenised as shell. `is_known_read_verb` (:1696)
+ then consults GIT_READ_SUBCMDS and reads it as a genuine read. The two functions disagree
+ on one vocabulary: `first_blocking_verb` checks READ_ONLY_VERBS only, `is_known_read_verb`
+ checks both.
+COST: AMUX-2841 was unparked from backlog to todo on 2026-09-03 because "the discriminator
+ AMUX-3822 added now exists", and it does exist and it does fire — with nothing but false
+ positives, each naming that card by ID. A 23-day specimen hunt was pointed at prose. Also
+ cost a wrong first measurement in the same sitting: I counted `blocked_by` (~30% non-verbs
+ across 1,076 distinct values) and nearly reported the discriminator as unreadable, when
+ that field's unclassifiable tokens are the EXPECTED input to the verdict arm that replaced
+ it. Correct observation, wrong field.
+FIX: the whole READ arm is unreachable for its stated meaning — `first_blocking_verb`
+ returns a verb only when it is NOT in READ_ONLY_VERBS, so the arm's first half is dead by
+ construction and its second half only matches the artifact. Checked the artifact case
+ FIRST and named it, so the log stops claiming a specimen: git_guard.rs
+ `inferred_edit_verdict`, extracted from the log site so the arms are testable at all.
+ Whether the READ arm should exist is AMUX-3822's author's call, recorded on AF-452.

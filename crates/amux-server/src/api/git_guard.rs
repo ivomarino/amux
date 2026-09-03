@@ -1757,6 +1757,39 @@ pub(crate) fn inferred_warn_fields(
     (r(base), r(verb), r(blocked_by))
 }
 
+/// The verdict the WARN can actually support for a `blocked_by` token (AF-452).
+///
+/// Extracted from the log site so the arms can be tested. They could not be
+/// before, and the first one was wrong for its whole life.
+///
+/// THE ORDER IS LOAD-BEARING. `first_blocking_verb` `continue`s on a real git
+/// read subcommand, so a genuine `git status` can NEVER reach this field. A
+/// BARE `status`/`show`/`log`/`blame` token therefore proves the OPPOSITE of
+/// what it looks like: it came from quoted DATA tokenised as shell, not from a
+/// git invocation. `is_known_read_verb` consults GIT_READ_SUBCMDS and so reads
+/// it as a genuine read, which is the upgrade that manufactured the lie.
+///
+/// Measured 2026-09-03 over 75,758 firings: all 17 `verdict=READ verb` rows
+/// ever emitted were this artifact (`blocked_by=status`, on two mixpeek lanes),
+/// and each told its reader it was the specimen AMUX-2841 had been parked on
+/// since 2026-08-11. Zero real specimens. Same class as AMUX-3822 — quoted data
+/// read as shell — arriving through a quoted string instead of a heredoc.
+fn inferred_edit_verdict(blocked_by: &str) -> &'static str {
+    if GIT_READ_SUBCMDS.contains(&blocked_by) {
+        "a BARE git read subcommand — impossible from a real git invocation, which \
+         first_blocking_verb skips, so this token came from QUOTED DATA tokenised as \
+         shell. NOT a specimen; it is AMUX-3822's defect through a quoted string (AF-452)"
+    } else if is_known_read_verb(blocked_by) {
+        "READ verb — is_pure_read_command missed a reader, so this record may be minting \
+         FALSE co-authorship. This is the specimen AMUX-2841 wants"
+    } else if blocked_by == "redirect" {
+        "output redirection — a write, the record working as designed"
+    } else {
+        "NOT a known read verb, and not classifiable from this token alone — treat as \
+         unmeasured rather than as a write (AMUX-3822)"
+    }
+}
+
 fn warn_inferred_edit(session: &str, abs_path: &str, cmd: &str) {
     // Same stripper as `first_blocking_verb` (AMUX-3822): this extractor had
     // the identical defect and produced `verb=persona_tick.json`, a filename.
@@ -1795,15 +1828,7 @@ fn warn_inferred_edit(session: &str, abs_path: &str, cmd: &str) {
     // third answer and must stay distinguishable from both others: it means the
     // token is in neither vocabulary, so this row cannot be classified and is
     // not evidence either way.
-    let verdict = if is_known_read_verb(&blocked_by) {
-        "READ verb — is_pure_read_command missed a reader, so this record may be minting \
-         FALSE co-authorship. This is the specimen AMUX-2841 wants"
-    } else if blocked_by == "redirect" {
-        "output redirection — a write, the record working as designed"
-    } else {
-        "NOT a known read verb, and not classifiable from this token alone — treat as \
-         unmeasured rather than as a write (AMUX-3822)"
-    };
+    let verdict = inferred_edit_verdict(&blocked_by);
     // AF-343: `verb`, `blocked_by` and `base` are TOKENS LIFTED OUT OF A BASH
     // COMMAND, so anything a lane typed can reach this line, and this line goes
     // to a file. Measured before the fix: 192 live-looking `mxp_sk_` secrets in
@@ -5584,6 +5609,51 @@ mod tests {
         //    silently rewriting every command it sees.
         let plain = "cd /repo && python3 -c 'open(\"x\",\"w\")'";
         assert_eq!(strip_heredoc_bodies(plain), plain);
+    }
+
+    /// AF-452: `verdict=READ verb` was reachable ONLY as an artifact.
+    ///
+    /// All 17 rows it ever produced were `blocked_by=status` from quoted prose,
+    /// each announcing itself as the specimen AMUX-2841 was parked on. Both
+    /// arms below, because the fix must not become a deletion: arm 1 kills the
+    /// false positive, arm 2 fails if the read arm was removed rather than
+    /// reordered.
+    #[test]
+    fn a_bare_git_read_token_is_an_artifact_and_says_so() {
+        // ARM 1 — the artifact. A REAL git read never reaches the field.
+        assert_eq!(
+            first_blocking_verb("cd /repo && git status"),
+            None,
+            "a real `git status` is a pure read and names no blocking verb, so a \
+             `status` in blocked_by cannot have come from one",
+        );
+        // ...but quoted DATA is tokenised as shell, so a bare one does reach it.
+        assert_eq!(
+            first_blocking_verb("echo \"checking\nstatus of the run\"").as_deref(),
+            Some("status"),
+            "the newline inside the quoted string splits it into a segment whose \
+             first token is a bare `status` — this is the live defect",
+        );
+        let v = inferred_edit_verdict("status");
+        assert!(
+            v.contains("BARE git read subcommand") && v.contains("NOT a specimen"),
+            "a bare git-read token must be reported as an artifact, got: {v}",
+        );
+        assert!(
+            !v.contains("specimen AMUX-2841 wants"),
+            "the artifact must not claim to be AMUX-2841's specimen",
+        );
+
+        // ARM 2 — the read arm still exists. Reordering must not delete it.
+        // (`cat` cannot reach blocked_by today either, which is AF-452's larger
+        // finding; the arm is kept so a future tokeniser fix has it to reach.)
+        assert!(
+            inferred_edit_verdict("cat").contains("specimen AMUX-2841 wants"),
+            "a genuine read verb must still classify as the specimen case",
+        );
+        // And the other two arms are untouched.
+        assert!(inferred_edit_verdict("redirect").contains("output redirection"));
+        assert!(inferred_edit_verdict("kubectl").contains("not classifiable"));
     }
 
     /// The WARN must state the verdict it can support, not hand the reader a
