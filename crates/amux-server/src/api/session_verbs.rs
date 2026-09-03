@@ -3330,7 +3330,7 @@ pub(crate) fn redact_secrets(text: &str) -> String {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
         regex::Regex::new(
-            r"((?:mxp|usr|ret)_sk)_[A-Za-z0-9_-]+|((?:AMUX_MIXPEEK_OPS_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY|GOOGLE_MAPS_API_KEY|GOOGLE_API_KEY|CLOUDFLARE_API_TOKEN|ELEVENLABS_API_KEY|POSTHOG_KEY|POSTHOG_PERSONAL_API_KEY)=)[^\s\r\n]+|(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]+|sk-ant-[A-Za-z0-9_-]+|sk-proj-[A-Za-z0-9_-]+|sk[_-][A-Za-z0-9]{32,}|AIza[0-9A-Za-z_-]{30,}|(?:phx|phc)_[A-Za-z0-9]+",
+            r"((?:mxp|usr|ret)_sk)_[A-Za-z0-9_-]+|((?i:[A-Z_][A-Z0-9_]*(?:PASSWORD|PASSWD|PWD|SECRET|TOKEN|API_KEY|ACCESS_KEY|PRIVATE_KEY|CLIENT_SECRET|CREDENTIAL|_KEY)[A-Z0-9_]*=))[^\s\r\n]+|(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]+|sk-ant-[A-Za-z0-9_-]+|sk-proj-[A-Za-z0-9_-]+|sk[_-][A-Za-z0-9]{32,}|AIza[0-9A-Za-z_-]{30,}|(?:phx|phc)_[A-Za-z0-9]+",
         )
         .expect("redact regex")
     });
@@ -6360,7 +6360,7 @@ fn tmux_rows() -> String {
 fn log_pipe_command(log_path: &Path) -> String {
     const PROG: &str = r#"import os,re,select,sys,time
 LOG=sys.argv[1]; MAXB=int(sys.argv[2]); RAW=sys.argv[3]=='1'; FLUSH=int(sys.argv[4])/1000.0
-SEC=re.compile(rb'((?:mxp|usr|ret)_sk)_[A-Za-z0-9_-]+|((?:AMUX_MIXPEEK_OPS_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY|GOOGLE_MAPS_API_KEY|GOOGLE_API_KEY|CLOUDFLARE_API_TOKEN|ELEVENLABS_API_KEY|POSTHOG_KEY|POSTHOG_PERSONAL_API_KEY)=)[^\s\r\n]+|(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]+|sk-ant-[A-Za-z0-9_-]+|sk-proj-[A-Za-z0-9_-]+|sk[_-][A-Za-z0-9]{32,}|AIza[0-9A-Za-z_-]{30,}|(?:phx|phc)_[A-Za-z0-9]+')
+SEC=re.compile(rb'((?:mxp|usr|ret)_sk)_[A-Za-z0-9_-]+|([A-Z_][A-Z0-9_]*(?:PASSWORD|PASSWD|PWD|SECRET|TOKEN|API_KEY|ACCESS_KEY|PRIVATE_KEY|CLIENT_SECRET|CREDENTIAL|_KEY)[A-Z0-9_]*=)[^\s\r\n]+|(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]+|sk-ant-[A-Za-z0-9_-]+|sk-proj-[A-Za-z0-9_-]+|sk[_-][A-Za-z0-9]{32,}|AIza[0-9A-Za-z_-]{30,}|(?:phx|phc)_[A-Za-z0-9]+',re.I)
 def repl(m):
     if m.group(1): return m.group(1)+b'_REDACTED'
     if m.group(2): return m.group(2)+b'REDACTED'
@@ -7364,14 +7364,24 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
     meta.insert("last_started".into(), json!(now_i64()));
     let count = meta.get("start_count").and_then(|v| v.as_i64()).unwrap_or(0);
     meta.insert("start_count".into(), json!(count + 1));
-    let pending_reload = meta.remove("pending_log_reload").is_some();
+    // Old `pending_log_reload` keys are consumed for migration, but the new
+    // worker never receives raw terminal replay. Durable board state is the
+    // cross-provider continuity contract.
+    let pending_resume = meta.remove("pending_structured_resume").is_some()
+        || meta.remove("pending_log_reload").is_some();
     let pending_reason = meta
-        .remove("pending_log_reload_reason")
+        .remove("pending_structured_resume_reason")
+        .or_else(|| meta.remove("pending_log_reload_reason"))
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_default();
     save_meta(name, &meta);
-    if pending_reload && log_path(name).exists() {
-        let prompt = log_reload_prompt(name, &pending_reason);
+    if pending_resume {
+        let prompt = structured_resume_prompt(name, &pending_reason);
+        tracing::info!(
+            session = %name,
+            reason = %pending_reason,
+            "context hydration: structured board state queued; raw terminal replay suppressed"
+        );
         let st2 = state.clone();
         let n = name.to_string();
         tokio::spawn(async move { send_after_ready(st2, n, prompt, 60, SendOrigin::Automation).await });
@@ -7411,20 +7421,16 @@ fn libc_geteuid() -> u32 {
     })
 }
 
-fn log_reload_prompt(name: &str, reason: &str) -> String {
-    let lp = log_path(name);
-    let size = lp.metadata().map(|m| m.len()).unwrap_or(0);
-    let size_mb = size as f64 / (1024.0 * 1024.0);
-    let cap_mb = MAX_LOG_BYTES / (1024 * 1024);
+fn structured_resume_prompt(name: &str, reason: &str) -> String {
     let reason_text = if reason.is_empty() { "session swap" } else { reason };
     format!(
-        "Before continuing, load the previous amux terminal context.\n\n\
-         The log tail captured for this {reason_text} is at:\n{}\n\n\
-         Read that file now. It contains up to the last {cap_mb} MB of this \
-         session's terminal history ({size_mb:.1} MB currently saved). Use it \
-         as continuity context for the work in this session. Do not summarize it \
-         back unless asked.",
-        lp.display()
+        "Continue this worker after a {reason_text} using durable amux state, not terminal \
+         replay. Run `amux board list --session {name}` and inspect every non-terminal card \
+         assigned to this worker with `amux board show <ID>`. Treat each card's source message, \
+         epic, dependencies, priority, next action, gates, worker actions, and produced assets \
+         as the source of truth. Resume the highest-priority actionable card and keep driving \
+         until no actionable non-terminal work remains. Consult a linked message only when the \
+         card says context is missing. Do not automatically load the worker terminal log."
     )
 }
 
@@ -7740,79 +7746,6 @@ fn write_plain_log(name: &str) -> Option<(PathBuf, usize)> {
     Some((cp, clean.len()))
 }
 
-/// py:22616 _capture_log_tail_for_reload — persist the last MAX_LOG_BYTES of
-/// output before a provider/model/effort/yolo swap.
-async fn capture_log_tail_for_reload(name: &str, reason: &str) -> bool {
-    if !valid_session_name(name) {
-        return false;
-    }
-    let _ = std::fs::create_dir_all(logs_dir());
-    let lp = log_path(name);
-    let mut chunks: Vec<u8> = Vec::new();
-    let existing = load_session_log(name, MAX_LOG_BYTES as u64);
-    chunks.extend_from_slice(existing.as_bytes());
-    let mut captured = String::new();
-    let mut was_piped = false;
-    if is_running(name).await {
-        let ptq = pt(name);
-        // Detaching the pipe is deliberate: the whole-file rewrite below would
-        // otherwise race the writer's appends. But it has to be put BACK —
-        // this used to detach and return, so any provider/model/effort/yolo
-        // swap left the session permanently unlogged with nothing reporting it.
-        was_piped = pane_is_piped(name).await;
-        let _ = tmux(&["pipe-pane", "-t", &ptq]).await;
-        if let Some(o) = run_cmd("tmux", &["capture-pane", "-t", &ptq, "-p", "-S", "-"], Duration::from_secs(30)).await {
-            captured = String::from_utf8_lossy(&o.stdout).into_owned();
-        }
-    }
-    if !captured.trim().is_empty() {
-        let safe_reason = reason.replace('\n', " ").trim().to_string();
-        let safe_reason = if safe_reason.is_empty() { "session swap".to_string() } else { safe_reason };
-        let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S");
-        let marker = format!("\n\n=== Captured before {safe_reason}: {ts} ===\n\n");
-        let cap_text = if tmux_alt_screen(name).await {
-            collapse_blank_runs(&captured)
-        } else {
-            captured
-        };
-        chunks.extend_from_slice(marker.as_bytes());
-        chunks.extend_from_slice(cap_text.as_bytes());
-    }
-    if chunks.is_empty() {
-        if was_piped {
-            rearm_log_pipe(name).await;
-        }
-        return false;
-    }
-    let start = chunks.len().saturating_sub(MAX_LOG_BYTES);
-    let ok = std::fs::write(&lp, &chunks[start..]).is_ok();
-    if was_piped {
-        rearm_log_pipe(name).await;
-    }
-    ok
-}
-
-/// Is this pane currently piped? `#{pane_pipe}` is tmux's own answer, and it
-/// is the field the stale-log verdict in `/api/debug/logs` keys off.
-async fn pane_is_piped(name: &str) -> bool {
-    let ptq = pt(name);
-    match tmux(&["list-panes", "-t", &ptq, "-F", "#{pane_pipe}"]).await {
-        Some(o) => String::from_utf8_lossy(&o.stdout).lines().any(|l| l.trim() == "1"),
-        None => false,
-    }
-}
-
-/// Re-attach the log pipe. Same construction as `start_session` and, like it,
-/// without `-o` — see the comment there for why `-o` silently disables the
-/// pipe it is supposed to guard.
-async fn rearm_log_pipe(name: &str) {
-    let _ = std::fs::create_dir_all(logs_dir());
-    let lp = log_path(name);
-    let ptq = pt(name);
-    let pipe_cmd = log_pipe_command(&lp);
-    let _ = tmux(&["pipe-pane", "-t", &ptq, &pipe_cmd]).await;
-}
-
 /// Previous generation produced by the writer's rotation.
 fn rotated_log_path(name: &str) -> PathBuf {
     logs_dir().join(format!("{name}.log.1"))
@@ -8084,11 +8017,31 @@ pub async fn debug_logs(RawQuery(q): RawQuery) -> Response {
     ))
 }
 
-fn mark_pending_log_reload(name: &str, reason: &str) {
+fn mark_pending_structured_resume(name: &str, reason: &str) {
     update_meta(
         name,
-        &[("pending_log_reload", json!(now_i64())), ("pending_log_reload_reason", json!(reason))],
+        &[
+            ("pending_structured_resume", json!(now_i64())),
+            ("pending_structured_resume_reason", json!(reason)),
+        ],
     );
+}
+
+/// A model/provider switch is the one moment the harness has direct evidence
+/// that a configured model became the running model. Keep that fact separate
+/// from provider self-reports, which may belong to the previous process life.
+fn set_confirmed_active_model(name: &str, provider: &str, model: Option<&str>) {
+    let mut meta = load_meta(name);
+    if let Some(model) = model.filter(|m| !m.trim().is_empty()) {
+        meta.insert("active_model_confirmed".into(), json!(model));
+        meta.insert("active_model_provider".into(), json!(provider));
+        meta.insert("active_model_confirmed_at".into(), json!(now_i64()));
+    } else {
+        meta.remove("active_model_confirmed");
+        meta.remove("active_model_provider");
+        meta.remove("active_model_confirmed_at");
+    }
+    save_meta(name, &meta);
 }
 
 // ---------------------------------------------------------------------------
@@ -8518,6 +8471,18 @@ async fn peek_response(name: &str, lines: i64, live_only: bool, no_trim: bool) -
     }
     let fallback = if output.is_empty() { "(no output)".to_string() } else { output };
     json!({"name": name, "output": collapse_blank_runs(&fallback)})
+}
+
+/// Defense in depth for the browser terminal. The pipe writer redacts before
+/// bytes reach the log, but old logs and a live pane can predate that writer.
+/// Every text-bearing peek field crosses this final boundary before JSON leaves
+/// the server.
+fn redact_peek_payload(value: &mut Value) {
+    let Some(obj) = value.as_object_mut() else { return };
+    for key in ["history", "live", "output"] {
+        let Some(text) = obj.get(key).and_then(Value::as_str) else { continue };
+        obj.insert(key.into(), json!(redact_prompt_secrets(&redact_secrets(text))));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -14118,6 +14083,7 @@ pub(crate) async fn peek_verb(name: &str, qs: &[(String, String)]) -> Response {
     // short-output, empty…) and a key added to one of them is a key the
     // reader cannot rely on. One injection site covers every shape.
     let mut resp = peek_response(name, lines, live_only, no_trim).await;
+    redact_peek_payload(&mut resp);
     if let (Some((cols, rows)), Some(obj)) =
         (tmux_pane_geometry(name).await, resp.as_object_mut())
     {
@@ -15779,19 +15745,16 @@ fn mode_after_delivery(fold: &HotFold) -> SwapMode {
     }
 }
 
-/// The restart path, with the scrollback capture that makes it survivable.
-/// Only ever called when a restart actually happens: `capture_log_tail_for_reload`
-/// stops the pane pipe as a side effect, which would be a real harm on a hot
-/// switch that never restarts anything.
-async fn restart_with_log_reload(
+/// The restart path queues a compact, structured re-hydration from the board.
+/// Terminal scrollback is diagnostic evidence, not a context protocol: replay
+/// leaked secrets and stale instructions across providers in the live audit.
+async fn restart_with_structured_resume(
     state: &AppState,
     name: &str,
     provider: &str,
     reason: &str,
 ) -> bool {
-    if capture_log_tail_for_reload(name, reason).await {
-        mark_pending_log_reload(name, reason);
-    }
+    mark_pending_structured_resume(name, reason);
     restart_for_swap(state, name, provider).await
 }
 
@@ -15855,12 +15818,12 @@ async fn apply_live_config_change(
                         HotFold::Failed(w) => w,
                         _ => String::new(),
                     };
-                    let restarted = restart_with_log_reload(state, name, provider, reason).await;
+                    let restarted = restart_with_structured_resume(state, name, provider, reason).await;
                     SwapReport {
                         mode: SwapMode::Restart,
                         applied: restarted,
                         note: if restarted {
-                            " (live switch failed; session restarted to apply it, log reload queued)"
+                            " (live switch failed; session restarted to apply it, board-state resume queued)"
                         } else {
                             " (live switch failed AND the restart failed — the session may still be on the old model)"
                         },
@@ -15880,12 +15843,12 @@ async fn apply_live_config_change(
             }
         }
         SwapMode::Restart => {
-            let restarted = restart_with_log_reload(state, name, provider, reason).await;
+            let restarted = restart_with_structured_resume(state, name, provider, reason).await;
             SwapReport {
                 mode,
                 applied: restarted,
                 note: if restarted {
-                    " (session restarted; log reload queued)"
+                    " (session restarted; board-state resume queued)"
                 } else {
                     " (restart failed)"
                 },
@@ -15966,14 +15929,19 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
         cfg.set("CC_PROVIDER", &provider_val);
         cfg.set("CC_FLAGS", &flags);
         let was_running = is_running(name).await;
-        if capture_log_tail_for_reload(name, "provider swap").await {
-            mark_pending_log_reload(name, "provider swap");
-        }
         if cfg.write(&f).is_err() {
             return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
         }
+        if was_running {
+            mark_pending_structured_resume(name, "provider swap");
+        }
         let restarted = if was_running { restart_for_swap(state, name, &old_provider).await } else { false };
-        let suffix = if restarted { " (session restarted; log reload queued)" } else { "" };
+        if restarted {
+            set_confirmed_active_model(name, &provider_val, Some(&default_model));
+        } else if !was_running {
+            set_confirmed_active_model(name, &provider_val, None);
+        }
+        let suffix = if restarted { " (session restarted; board-state resume queued)" } else { "" };
         let body = json!({"ok": true, "message": format!("provider set to {}{suffix}", provider_label(&provider_val))});
         return if restarted { j200_slow_ok(body, "worker-restart") } else { j200(body) };
     }
@@ -16037,8 +16005,8 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
         // process state this origin does not hold.
         // The env rewrite is the DURABLE half and happens either way: whatever
         // the live agent does, the next cold start must come up on the new
-        // model. Log-tail capture moved into restart_with_log_reload — it is
-        // only meaningful when a restart actually discards the scrollback.
+        // model. A restart resumes from structured board state, never from a
+        // raw terminal transcript.
         if cfg.write(&f).is_err() {
             return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
         }
@@ -16046,6 +16014,16 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
             state, name, &current_provider, was_running, &cmds, expressible, "model swap",
         )
         .await;
+        if rep.applied {
+            let confirmed = if model_val.is_empty() {
+                default_model_for_provider(&current_provider)
+            } else {
+                model_val.clone()
+            };
+            set_confirmed_active_model(name, &current_provider, Some(&confirmed));
+        } else if !was_running {
+            set_confirmed_active_model(name, &current_provider, None);
+        }
         let mut out = json!({
             "ok": true,
             "applied": rep.applied,
@@ -16138,15 +16116,15 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
         }
         cfg.set("CC_FLAGS", &new_flags);
         let was_running = is_running(name).await;
-        if was_running && capture_log_tail_for_reload(name, "YOLO mode change").await {
-            mark_pending_log_reload(name, "YOLO mode change");
-        }
         if cfg.write(&f).is_err() {
             return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
         }
+        if was_running {
+            mark_pending_structured_resume(name, "YOLO mode change");
+        }
         let restarted = if was_running { restart_for_swap(state, name, &provider).await } else { false };
         let state_word = if enabled { "enabled" } else { "disabled" };
-        let suffix = if restarted { " (session restarted; log reload queued)" } else { "" };
+        let suffix = if restarted { " (session restarted; board-state resume queued)" } else { "" };
         let body = json!({"ok": true, "message": format!("yolo {state_word}{suffix}")});
         return if restarted { j200_slow_ok(body, "worker-restart") } else { j200(body) };
     }
@@ -19263,6 +19241,38 @@ mod tests {
             redact_secrets("ANTHROPIC_API_KEY=sk-live-x y"),
             "ANTHROPIC_API_KEY=REDACTED y"
         );
+        let password_key = format!("AMUX_QA_{}", "PASSWORD");
+        let s3_key = format!("AMUX_S3_{}", "KEY");
+        let input = format!("{password_key}=fake-login-value {s3_key}=fake-storage-value");
+        let out = redact_secrets(&input);
+        assert_eq!(
+            out,
+            format!("{password_key}=REDACTED {s3_key}=REDACTED"),
+            "unlisted secret-bearing env names must be redacted by shape"
+        );
+    }
+
+    #[test]
+    fn provider_resume_uses_structured_state_not_terminal_replay() {
+        let prompt = structured_resume_prompt("lane-a", "provider swap");
+        assert!(prompt.contains("amux board list --session lane-a"), "{prompt}");
+        assert!(prompt.contains("amux board show <ID>"), "{prompt}");
+        assert!(prompt.contains("source message") && prompt.contains("dependencies"), "{prompt}");
+        assert!(!prompt.contains(".amux/logs"), "{prompt}");
+        assert!(!prompt.contains("terminal history"), "{prompt}");
+    }
+
+    #[test]
+    fn peek_payload_redacts_live_and_saved_secret_shapes() {
+        let key = format!("AMUX_QA_{}", "PASSWORD");
+        let raw = format!("{key}=fake-login-value");
+        let mut payload = json!({"history": raw, "live": raw, "output": raw, "name": "lane-a"});
+        redact_peek_payload(&mut payload);
+        for field in ["history", "live", "output"] {
+            let text = payload[field].as_str().unwrap_or("");
+            assert!(text.contains("REDACTED") && !text.contains("fake-login-value"), "{field}: {text}");
+        }
+        assert_eq!(payload["name"], json!("lane-a"));
     }
 
     /// The file/DB-backed verbs, exercised through the full router shape on a

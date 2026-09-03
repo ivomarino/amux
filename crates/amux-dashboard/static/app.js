@@ -8480,7 +8480,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.782';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.783';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -26487,11 +26487,23 @@ function openBoardDetail(id) {
 
 // ── Improved detail: status banner, typed History, permalink (AMUX-2178) ───
 function _bdParseHistory(log) {
-  // Each backtick-timestamped line becomes a typed event for styled rendering.
-  return (log || '').split('\n').filter(l => l.trim()).map(line => {
+  // A timestamp STARTS an event; wrapped/continued prose belongs to it until
+  // the next timestamp. Treating every physical line as an action turned one
+  // worker update into 115 sentence fragments on MR-137.
+  const grouped = [];
+  for (const line of (log || '').split('\n').filter(l => l.trim())) {
     const m = line.match(/^`(\d{1,2}:\d{2})`\s*(.*)$/);
     const ts = m ? m[1] : '';
     const body = m ? m[2] : line;
+    if (!m && grouped.length && grouped[grouped.length - 1].ts) {
+      grouped[grouped.length - 1].body += '\n' + body.trim();
+    } else {
+      grouped.push({ ts, body });
+    }
+  }
+  return grouped.map(e => {
+    const ts = e.ts;
+    const body = e.body;
     let kind = 'note';
     if (/^STATUS\s*\(/i.test(body)) kind = 'status';
     else if (/^status:\s/i.test(body)) kind = 'transition';

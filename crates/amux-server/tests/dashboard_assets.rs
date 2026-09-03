@@ -98,6 +98,28 @@ fn app_ver_and_the_sw_cache_version_agree() {
     );
 }
 
+#[test]
+fn board_worker_actions_group_wrapped_lines_under_their_timestamp() {
+    let app = asset("app.js");
+    let start = app
+        .find("function _bdParseHistory(log)")
+        .expect("board history parser must exist");
+    let rest = &app[start..];
+    let end = rest
+        .find("function _bdWorkerActivity(item)")
+        .expect("worker activity parser must follow history parser");
+    let parser = &rest[..end];
+    assert!(parser.contains("const grouped = []"), "parser no longer groups physical lines");
+    assert!(
+        parser.contains("grouped[grouped.length - 1].body += '\\n' + body.trim()"),
+        "an untimestamped continuation must append to the preceding timestamped action"
+    );
+    assert!(
+        !parser.contains("split('\\n').filter(l => l.trim()).map(line =>"),
+        "the old one-physical-line-equals-one-action parser returned"
+    );
+}
+
 /// The parser above must be able to FAIL, or the test above it is theatre —
 /// a `const_str` that always returned None would make both sides `expect`-panic,
 /// but one that silently returned the same string for everything would make the
