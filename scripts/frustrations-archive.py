@@ -364,6 +364,27 @@ def main():
     print(f"archived L{ln}: {title[:70]}")
     print(f"  {'SUPERSEDED (entry was WRONG)' if superseded else 'validated'} by {who}")
     print(f"  card: {carried}")
+    # NAME BOTH FILES, AND THE COMMAND (AF-436).
+    #
+    # This is a MOVE across two files and the summary above named neither, so
+    # the natural next step is `git add frustrations.md` -- the file you were
+    # reading, the file whose line number you passed. That stages the DELETION
+    # without the APPEND, and the resulting commit holds the entry in neither
+    # file, which is precisely the lost-work state AF-430 was filed about.
+    #
+    # Measured, self-inflicted 2026-09-03: eb552cc1 did exactly that, to MR-44,
+    # five hours after AF-430 restored MR-44 from an earlier instance of the
+    # same shape. The append-only push guard refused the push and named the 34
+    # missing lines, so it never reached origin -- but the guard is the LAST
+    # line of defence and it fires minutes to hours later, at push time, on
+    # whoever pushes next. This prints at the moment the two files diverge.
+    #
+    # A pathspec, not `git add -A`: this repo's shared checkout has one index
+    # for every lane, and `-A` is refused by its own guard for that reason.
+    print("")
+    print("  This was a MOVE across TWO files. Stage BOTH or the commit holds the")
+    print("  entry in neither (AF-436, and AF-430 is what that costs):")
+    print(f"    git add {LEDGER.name} {ARCHIVE.name}")
     return 0
 
 

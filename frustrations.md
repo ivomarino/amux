@@ -2670,3 +2670,50 @@ FIX: this commit. The invariant now keys on TWO things, and the argument for bot
 NOTE: I told mixpeek-general, an hour before finding this, to key on the title and not on
   prose, on the strength of AF-430's 17 revised drafts. That advice was half right and I
   have sent them the other half.
+
+---
+
+## Retiring an entry is a MOVE across two files, and the tool's own output named neither
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-03
+SESSION: amux-frustrations
+CARD: AF-436
+SYMPTOM: `scripts/frustrations-archive.py` removes an entry from frustrations.md and
+  appends it to frustrations-archive.md. Its summary reports the line, the validator and
+  the card, and names no file at all. So the natural next command is `git add
+  frustrations.md` — the file you were reading, the file whose line number you passed —
+  which stages the DELETION without the APPEND. The resulting commit holds the entry in
+  neither file.
+  That is the lost-work state AF-430 exists to describe. I did it in eb552cc1, to MR-44,
+  five hours after AF-430 restored MR-44 from an earlier instance of the same shape, on
+  the same afternoon I shipped an invariant to detect it.
+  THE INVARIANT DID NOT CATCH IT, and the reason is worth stating because it is a real
+  limit rather than a bug: `frustrations.retired_entries_stay_retired` fails when a title
+  is in BOTH files. This produces a title in NEITHER, and no set-difference over two files
+  can see an entry that is absent from both. It is the same blind spot the archive exists
+  to cover, arriving from the other direction.
+COST: none, and only because a different guard fired. The append-only push guard refused:
+  "PUSH BLOCKED — frustrations.md as pushed is MISSING 34 line(s)", with MR-44's own text
+  in the sample. That is the deletion half working on a genuine loss instead of a fixture,
+  and it is the reason this is a five-minute entry rather than a second recovery from git.
+  The real cost is where the catch happened. The push guard is the LAST line of defence
+  and it fires at push time, minutes to hours later, on whoever pushes next — who on this
+  checkout is usually not the author. Between the bad commit and the refused push, the
+  local builder had already adopted the commit.
+  Second-order, and the one I keep paying: my first read of the guard's verdict was
+  `--check ... | head -8`, which reported exit 141. That is SIGPIPE from head, not the
+  guard's status. Instance six of the AF-435 cluster is that exact error, logged by me
+  the day before, and I made it again inside the fix for it.
+FIX: the script now names both files and prints the runnable command, by pathspec because
+  `git add -A` is refused on this shared checkout. Three cells in
+  scripts/test-frustrations-archive-move.sh; cell 2 is the control that a hint naming only
+  the ledger is the defect with extra words. Mutation-verified twice: dropping the hint
+  reds one, naming only the ledger reds two.
+  DELIBERATELY NOT A REFUSAL OR AN AUTO-STAGE. The script does not own the index — on a
+  shared checkout with one index for every lane, a tool that stages on your behalf is the
+  thing `git add -A` is banned for. Print the command; the human runs it.
+  The general shape, which is the part worth carrying: when an operation spans two files,
+  its completion message must name both. The reader's next command is formed from what
+  they were just told, and a summary that names one file will get one file staged.
