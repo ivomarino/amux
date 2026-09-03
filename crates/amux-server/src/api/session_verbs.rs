@@ -16262,41 +16262,62 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
     // which a checkbox cannot express and which is the honest default for a
     // permission.
     //
-    // WRITES THE WORKER LAYER ONLY. Group and global layers are the Scope tab's
+    // WRITES THE WORKER LAYER ONLY. Group and global layers are Configurations'
     // to set, and silently writing one from a per-worker menu would change every
     // lane in that group from a control labelled with one worker's name.
-    // AUTO-DRAIN BACKLOG (AMUX-4055 follow-up). Ethan: "the configuration needs
-    // to be a button/toggle too". Writes the SAME worker-scope key the Scope tab
-    // and `dispatch_backlog_when_idle` already use, so the toggle and the text
-    // box are two views of one setting rather than two settings.
+    // BOARD AUTOMATION CONFIGURATION. These are the same scoped env keys the
+    // runtime reads on every drive tick, now exposed as first-class worker UI
+    // controls from backlog -> todo -> doing -> terminal rather than requiring
+    // somebody to know implementation-specific environment names.
     //
-    // Reports the RESOLVED value after the write, not the value just typed. A
-    // group or global layer can supply this, so echoing back what was sent
-    // would claim an "off" the next drive tick disproves — the same reason the
-    // spans_groups branch below re-resolves.
-    if let Some(v) = body.get("auto_drain_backlog") {
-        let on = py_truthy(v);
-        cfg.set(
+    // `null` removes the worker override and restores group/global/default
+    // inheritance. A boolean writes an explicit worker value. The response is
+    // the RESOLVED value after the write: a false master switch can still make
+    // an explicitly enabled pickup/continue class resolve false, and claiming
+    // otherwise would make the UI disagree with the next runtime tick.
+    let automation = [
+        (
+            "auto_drain_backlog",
             crate::runtime_jobs::board_drive::DISPATCH_BACKLOG_KEY,
-            if on { "1" } else { "0" },
-        );
+            "Backlog to To Do",
+        ),
+        ("board_auto_pickup", "CC_AUTO_PICKUP", "To Do pickup"),
+        ("board_auto_continue", "CC_AUTO_CONTINUE", "Non-terminal continuation"),
+        ("board_standing_orders", "CC_STANDING_ORDERS", "Pickup / continue master"),
+    ];
+    if let Some((field, key, label, v)) = automation
+        .iter()
+        .find_map(|(field, key, label)| body.get(*field).map(|v| (*field, *key, *label, v)))
+    {
+        let inherit = v.is_null();
+        if inherit {
+            cfg.remove(key);
+        } else {
+            cfg.set(key, if py_truthy(v) { "1" } else { "0" });
+        }
         if cfg.write(&f).is_err() {
             return jresp(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!({"error": "could not write session env"}),
             );
         }
-        let effective = crate::runtime_jobs::board_drive::dispatch_backlog_when_idle(name);
-        return j200(json!({
+        let effective = if key == crate::runtime_jobs::board_drive::DISPATCH_BACKLOG_KEY {
+            crate::runtime_jobs::board_drive::dispatch_backlog_when_idle(name)
+        } else {
+            standing_orders_on(name, key)
+        };
+        let mut out = json!({
             "ok": true,
-            "auto_drain_backlog": effective,
-            "message": if effective {
-                "Auto-drain on: when this worker runs out of todo it pulls its oldest \
-                 backlog card. Cards parked on a human or on a live trigger are skipped."
+            "effective": effective,
+            "inherited": inherit,
+            "message": if inherit {
+                format!("{label}: worker override removed; resolved {} from inherited/default configuration", if effective { "on" } else { "off" })
             } else {
-                "Auto-drain off: this worker's backlog stays parked."
+                format!("{label}: worker override set {}; effective value is {}", if py_truthy(v) { "on" } else { "off" }, if effective { "on" } else { "off" })
             },
-        }));
+        });
+        out[field] = json!(effective);
+        return j200(out);
     }
     if body.get("spans_groups").is_some() || body.get("send_allow").is_some() {
         let value = if let Some(sv) = body.get("send_allow").and_then(Value::as_str) {
@@ -19580,6 +19601,97 @@ mod tests {
             call(&app, "PATCH", "/api/sessions/probe/config", Some(json!({"toggle_pin": true}))).await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(parse_env("probe").get("CC_PINNED"), Some("1"));
+
+        // Every board-automation stage exposed in worker Configurations writes
+        // the exact scoped key the runtime consumes. Null removes the worker
+        // override instead of writing a second spelling for "inherit".
+        let (st, v) = call(
+            &app,
+            "PATCH",
+            "/api/sessions/probe/config",
+            Some(json!({"auto_drain_backlog": true})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(parse_env("probe").get("AMUX_DISPATCH_BACKLOG_WHEN_IDLE"), Some("1"));
+        assert_eq!(v["effective"], json!(true));
+
+        let (st, v) = call(
+            &app,
+            "PATCH",
+            "/api/sessions/probe/config",
+            Some(json!({"board_auto_pickup": false})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(parse_env("probe").get("CC_AUTO_PICKUP"), Some("0"));
+        assert_eq!(v["board_auto_pickup"], json!(false));
+
+        let (st, v) = call(
+            &app,
+            "PATCH",
+            "/api/sessions/probe/config",
+            Some(json!({"board_auto_continue": true})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(parse_env("probe").get("CC_AUTO_CONTINUE"), Some("1"));
+
+        let (st, v) = call(
+            &app,
+            "PATCH",
+            "/api/sessions/probe/config",
+            Some(json!({"board_standing_orders": false})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(parse_env("probe").get("CC_STANDING_ORDERS"), Some("0"));
+        assert_eq!(v["board_standing_orders"], json!(false));
+
+        // A child switch reports the resolved runtime truth while the master
+        // is off; removing the master override immediately restores it.
+        let (_, v) = call(
+            &app,
+            "PATCH",
+            "/api/sessions/probe/config",
+            Some(json!({"board_auto_pickup": true})),
+        )
+        .await;
+        assert_eq!(v["effective"], json!(false));
+        let (_, v) = call(
+            &app,
+            "PATCH",
+            "/api/sessions/probe/config",
+            Some(json!({"board_standing_orders": null})),
+        )
+        .await;
+        assert_eq!(v["inherited"], json!(true));
+        assert_eq!(v["effective"], json!(true));
+        assert_eq!(parse_env("probe").get("CC_STANDING_ORDERS"), None);
+
+        let (_, v) = call(
+            &app,
+            "PATCH",
+            "/api/sessions/probe/config",
+            Some(json!({"auto_drain_backlog": null})),
+        )
+        .await;
+        assert_eq!(v["effective"], json!(true));
+        assert_eq!(parse_env("probe").get("AMUX_DISPATCH_BACKLOG_WHEN_IDLE"), None);
+        for field in ["board_auto_pickup", "board_auto_continue"] {
+            let (st, v) = call(
+                &app,
+                "PATCH",
+                "/api/sessions/probe/config",
+                Some(json!({(field): null})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            assert_eq!(v["effective"], json!(true));
+        }
+        assert_eq!(parse_env("probe").get("CC_AUTO_PICKUP"), None);
+        assert_eq!(parse_env("probe").get("CC_AUTO_CONTINUE"), None);
+
         let (st, v) =
             call(&app, "PATCH", "/api/sessions/probe/config", Some(json!({"mcp": "bogus"}))).await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
