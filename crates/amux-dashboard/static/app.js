@@ -379,6 +379,47 @@ async function toggleCrossGroupDefault(checked) {
   } catch (e) {}
 })();
 
+async function readBoardDrainDefault() {
+  // Early-boot initializer: keep this root-relative for the same reason as the
+  // cross-group reader above (the main API constant is declared later).
+  const r = await fetch('/api/config/board-drain', { headers: _authHeaders() });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok || d.error) throw new Error(d.error || 'could not read saved setting');
+  return d;
+}
+
+async function toggleBoardDrainDefault(checked) {
+  const cb = document.getElementById('board-drain-default-checkbox');
+  const rollback = () => { if (cb) cb.checked = !checked; };
+  try {
+    const r = await fetch('/api/config/board-drain', {
+      method: 'PUT',
+      headers: _authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ enabled: !!checked }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (_isLocallyQueued(r) || !r.ok || d.error) {
+      showToast(d.error || 'could not save'); rollback(); return;
+    }
+    const saved = await readBoardDrainDefault();
+    if (!!saved.enabled !== !!checked) {
+      rollback(); showToast('setting was not persisted; please try again'); return;
+    }
+    if (cb) cb.checked = !!saved.enabled;
+    showToast(d.message || (checked ? 'Backlog drain on' : 'Backlog drain off'));
+  } catch (e) {
+    rollback(); showToast('failed: ' + String(e));
+  }
+}
+
+(async function initBoardDrainDefault() {
+  try {
+    const d = await readBoardDrainDefault();
+    const cb = document.getElementById('board-drain-default-checkbox');
+    if (cb) cb.checked = !!d.enabled;
+  } catch (e) {}
+})();
+
 async function toggleYoloDefault(checked) {
   _yoloDefault = !!checked;
   await fetch('/api/prefs', {
@@ -8614,7 +8655,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.791';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.792';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").

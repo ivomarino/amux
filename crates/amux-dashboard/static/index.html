@@ -314,6 +314,14 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
           </div>
           <div style="font-size:0.68rem;color:var(--dim);margin-top:3px;" id="crossgroup-default-note">Default OFF: worker-to-worker messaging stays inside a group unless configured. ON grants every worker a standing allowance, with no per-message approval. A worker-level setting from its &#x22EF; menu still overrides this, and isolated workers stay unreachable either way.</div>
           <div class="settings-row" style="justify-content:space-between;align-items:center;margin-top:10px;">
+            <span style="font-size:0.85rem;">Auto-drain backlog for all workers</span>
+            <label class="theme-toggle">
+              <input type="checkbox" id="board-drain-default-checkbox" onchange="toggleBoardDrainDefault(this.checked)" checked>
+              <span class="theme-track"><span class="theme-thumb"></span></span>
+            </label>
+          </div>
+          <div style="font-size:0.68rem;color:var(--dim);margin-top:3px;">Default ON: when To Do is empty, promote the oldest eligible Backlog card and keep driving it. Human-owned, triggered, epic, watch, and tripwire cards remain parked; a group or worker configuration can opt out.</div>
+          <div class="settings-row" style="justify-content:space-between;align-items:center;margin-top:10px;">
             <span style="font-size:0.85rem;">Auto-answer resume dialog</span>
             <label class="theme-toggle">
               <input type="checkbox" id="auto-resume-checkbox" onchange="toggleAutoResume(this.checked)" checked>

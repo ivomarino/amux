@@ -203,6 +203,27 @@ fn cross_group_default_can_initialize_before_the_main_api_constant() {
 }
 
 #[test]
+fn all_worker_backlog_drain_is_a_persistent_settings_control() {
+    let app = asset("app.js");
+    let html = asset("index.html");
+    for needle in [
+        "async function readBoardDrainDefault()",
+        "async function toggleBoardDrainDefault(checked)",
+        "fetch('/api/config/board-drain'",
+        "initBoardDrainDefault",
+    ] {
+        assert!(app.contains(needle), "board-drain settings lost `{needle}`");
+    }
+    for needle in [
+        "board-drain-default-checkbox",
+        "Auto-drain backlog for all workers",
+        "Default ON: when To Do is empty",
+    ] {
+        assert!(html.contains(needle), "worker settings lost `{needle}`");
+    }
+}
+
+#[test]
 fn sse_message_invalidation_refreshes_each_visible_message_surface() {
     let app = asset("app.js");
     let start = app
