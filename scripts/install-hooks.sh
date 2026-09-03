@@ -137,20 +137,77 @@ install_guard_only() {
     # copy (dark in the repo where it runs) is distinguishable from a
     # deliberate local merge. Tokens come from the canonical's own
     # `# guard-features:` line; absence of the line means cmp is all we have.
+    # THE NUMERIC MARKER RUNS FIRST, AND IT OUTRANKS THE TOKENS (AF-431 / MR-44).
+    #
+    # The token loop below is `grep -qi "$t" "$dst"` — a bare, case-insensitive
+    # SUBSTRING hunt anywhere in the file. mixpeek-research measured what that
+    # costs: mixpeek's GUARD_VERSION 4 copy of amux-staged-guard, ~215 lines and
+    # five versions behind, passed as "carries every canonical feature" because
+    # the literal string AMUX-2946 appears at its line 75 in an unrelated comment
+    # about retired ports. A token that a file can satisfy by TALKING about the
+    # feature cannot certify that it HAS the feature, and the failure is silent
+    # and in the reassuring direction.
+    #
+    # Marker format, mirroring mixpeek's dc21a0d489 so both repos agree: a file
+    # declaring `# guard-features:` carries exactly one anchored integer, either
+    # `^GUARD_VERSION = N` (self-reports at runtime) or `^# guard-version: N`
+    # (no runtime need). Anchored, so a mention in a comment cannot supply it.
+    #
+    # FAILS CLOSED. A declaring canonical whose TARGET has no marker reads STALE,
+    # because "no marker" is what every copy predating this convention looks
+    # like, and treating unknown as current is how the dark-guard shape survived
+    # for eighteen days.
+    local ver_of stale_ver="" src_v dst_v
+    ver_of() {
+      local f="$1" v
+      v=$(grep -m1 -E '^GUARD_VERSION[[:space:]]*=[[:space:]]*[0-9]+' "$f" 2>/dev/null \
+          | grep -oE '[0-9]+' | head -1)
+      [ -n "$v" ] || v=$(grep -m1 -E '^# guard-version:[[:space:]]*[0-9]+' "$f" 2>/dev/null \
+          | grep -oE '[0-9]+' | head -1)
+      printf '%s' "$v"
+    }
+    src_v=$(ver_of "$src"); dst_v=$(ver_of "$dst")
+    if [ -n "$src_v" ]; then
+      if [ -z "$dst_v" ]; then
+        stale_ver="no version marker at all (canonical is $src_v)"
+      elif [ "$dst_v" -lt "$src_v" ] 2>/dev/null; then
+        stale_ver="version $dst_v against a canonical of $src_v"
+      fi
+    fi
     local feats missing_feats="" t
     feats=$(grep -m1 '^# guard-features:' "$src" | cut -d: -f2-)
     for t in $feats; do
       grep -qi "$t" "$dst" || missing_feats="$missing_feats $t"
     done
-    if [ -n "$missing_feats" ]; then
+    if [ -n "$stale_ver" ]; then
+      echo "  WARN $dst is STALE — $stale_ver" >&2
+      echo "       This is the MG-1485 dark-guard shape, caught NUMERICALLY (AF-431): the" >&2
+      echo "       copy that RUNS is behind the canonical. Feature tokens agree only when" >&2
+      echo "       the version does; a token can be satisfied by a file that merely MENTIONS" >&2
+      echo "       the feature (MR-44: a v4 copy passed on AMUX-2946 in a comment about" >&2
+      echo "       retired ports). Merge $src into it — do not blind-copy, the vendored file" >&2
+      echo "       may carry local additions worth keeping — bump its marker, commit there." >&2
+      if [ -n "$missing_feats" ]; then
+        echo "       Tokens also missing:$missing_feats" >&2
+      else
+        echo "       Tokens all PRESENT, which is exactly why this needed a number." >&2
+      fi
+      fail=1
+    elif [ -n "$missing_feats" ]; then
       echo "  WARN $dst is STALE — missing canonical feature(s):$missing_feats" >&2
       echo "       This is the MG-1485 dark-guard shape: the copy that RUNS lacks what the" >&2
       echo "       canonical enforces. Merge $src into it (do not blind-copy: the vendored" >&2
       echo "       file may carry local additions worth keeping), then commit in that repo." >&2
       fail=1
     else
-      echo "  note $dst diverges from canonical but carries every canonical feature —"
-      echo "       reads as a deliberate local merge; left untouched"
+      if [ -n "$src_v" ]; then
+        echo "  note $dst diverges from canonical but carries every canonical feature AND"
+        echo "       version $dst_v >= $src_v — reads as a deliberate local merge; left untouched"
+      else
+        echo "  note $dst diverges from canonical but carries every canonical feature —"
+        echo "       reads as a deliberate local merge; left untouched (canonical declares no"
+        echo "       version marker, so tokens are all this can check)"
+      fi
     fi
     return 0
   }
