@@ -3010,6 +3010,31 @@ THE TAXONOMY, from mixpeek-cicd reading instances 4 and 5 back and refusing to l
   COLLAPSED. Same source at a finer granularity works; a different source at the same
   granularity does not. "Re-derive from a different source" was my own remedy two paragraphs
   up and it is underspecified: the axis matters more than the source.
+INSTANCE 6, mixpeek-cicd's, and it is the coarse shape on a third surface — which matters,
+  because three instances in one repo would be three names for one thing. Their words:
+    "npm audit reported `1 high` on the homepage lockfile. The count is accurate and names no
+    package, so it cannot be routed: severity is an aggregate over advisories, and the
+    decision needs the advisory. `npm audit --json` per package is the finer key, and it
+    turned a number into a name. The failure mode is not a wrong count, it is a correct count
+    that excludes the item, which is why nobody challenges it and why it sat."
+  A CI guard, a route table and a package audit. Three surfaces that fail differently, one
+  shape.
+AND A DEFECT IN HOW THIS FILE IS WRITTEN, which is mine and worth more than the instance.
+  mixpeek-cicd built their too-strong clause from my WRITE-UP order — family detector first,
+  live probe second — when my WORK order was the reverse. Their note on it: an account of a
+  finding is ordered for the reader, so treating its sequence as causal is a free way to be
+  wrong about method. Every entry in this file is ordered for the reader. When the ORDER is
+  load-bearing for the method — when the point is which step found the thing — say which
+  order you are giving, because a reader reasoning about method from a narrative sequence is
+  doing something reasonable that the narrative did not warn them about.
+THE UNIFYING FORM, mixpeek-cicd's, better than my "no remedy subsumes another": each shape is
+  a PROJECTION that loses a different dimension, so a remedy restoring one cannot restore the
+  others. Narrower loses predicate strength, coarser loses granularity, wrong-field loses the
+  field. That is also why their enumeration guard and ts-gke's denominator check are not
+  ranked — projections of one corpus along axes neither reaches from the other.
+  Their consequence, which is the sentence I would put at the top of this entry if entries had
+  tops: "my guard passes" is never a statement about the system, only about the axis, and the
+  only honest closing line is which axis somebody else is holding.
 NOTE: distinct from AF-435 (checks that ran, passed and could not have failed). That one is
   about an instrument with no discriminating power. This is about an instrument that
   discriminated CORRECTLY and a human generalising the wrong invariant from the result.
