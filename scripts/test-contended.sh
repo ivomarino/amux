@@ -225,7 +225,13 @@ fi
     # HEAD's blobs for every tracked file under crates/, then override with the
     # worktree hash of each dirty one. Order matters: the second write wins.
     git ls-tree -r HEAD --format='%(objectname)	%(path)' -- crates 2>/dev/null
-    for f in $(git diff --name-only -- crates 2>/dev/null; git diff --cached --name-only -- crates 2>/dev/null); do
+    # UNTRACKED FILES TOO. cargo compiles a new .rs the moment it exists, and
+    # `git diff` cannot see it, so omitting them made a brand-new module report
+    # "not in the tested set at all" on the very commit that adds it — a false
+    # alarm on the most ordinary case there is.
+    for f in $(git diff --name-only -- crates 2>/dev/null
+               git diff --cached --name-only -- crates 2>/dev/null
+               git ls-files --others --exclude-standard -- crates 2>/dev/null); do
       [ -f "$f" ] || continue
       printf '%s\t%s\n' "$(git hash-object "$f" 2>/dev/null)" "$f"
     done
