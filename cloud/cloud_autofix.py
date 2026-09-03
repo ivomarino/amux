@@ -635,12 +635,19 @@ def main():
             trace("no_fix", "dry run — skipping repairs", None)
         else:
             fixed_something = False
-            # Repair 1: truncated gateway.env (the incident's real blocker).
-            if d.get("env_missing") and d.get("env_backup"):
-                fixed_something |= fix_gateway_env(d["env_backup"])
-            # Repair 2: disk full of reclaimable LOGS.
+            # Repair 1: FREE DISK FIRST. fix_gateway_env writes a tempfile under
+            # /etc/amux, which FAILS on a 100%-full disk — so restoring before
+            # freeing space silently no-ops and leaves prod down. That is exactly
+            # what happened 2026-09-03 (AC-414): disk 100% -> gateway.env truncated
+            # -> restore ran first, could not write, failed -> 502 stood until a
+            # human restored by hand. Truncate logs BEFORE the env restore so the
+            # restore has room, and the whole outage self-heals in one pass.
             if (d.get("disk_pct", 0) >= 95) and d.get("reclaimable_log_mb", 0) >= 300:
                 fixed_something |= fix_logs()
+            # Repair 2: truncated gateway.env (the incident's real blocker) — now
+            # with space to write its atomic tempfile.
+            if d.get("env_missing") and d.get("env_backup"):
+                fixed_something |= fix_gateway_env(d["env_backup"])
             # Repair 3: bring the gateway up (covers crash-loop + post-repair).
             restart_gateway()
             # Re-probe.
