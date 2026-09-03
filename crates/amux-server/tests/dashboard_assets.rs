@@ -465,10 +465,24 @@ fn board_detail_hydration_refreshes_authoritative_state_and_relations() {
         .find("async function _bdHydrate(")
         .expect("_bdHydrate exists");
     let tail = &app[start..];
-    let end = tail
-        .find("\n}\n\nfunction openBoardDetail")
-        .expect("_bdHydrate closes");
+    // END AT THIS FUNCTION'S OWN TOP-LEVEL CLOSE, not at the next function's
+    // declaration. This used to look for "\n}\n\nfunction openBoardDetail", so it
+    // pinned _bdHydrate's extent to the literal TEXT of an unrelated neighbour.
+    // c6fd9832 ("fix(ui): open terminal tasks from message history") made
+    // openBoardDetail `async`, and main went red with "_bdHydrate closes" — a
+    // correct production change failing a test about a function it did not touch.
+    // Nothing in _bdHydrate had changed, and the assertions below all still held.
+    //
+    // A check pinned to the wrong layer is exactly as green as one pinned to the
+    // right layer, until it is not (ethos rule 7). "\n}\n" is the function's own
+    // terminator: inner braces are indented, so a `}` at column 0 ends it whatever
+    // follows.
+    let end = tail.find("\n}\n").expect("_bdHydrate closes");
     let body = &tail[..end];
+    assert!(
+        !body.contains("function openBoardDetail"),
+        "the extent ran past _bdHydrate into its neighbour — the anchor is wrong again"
+    );
     for needle in [
         "boardDetailStatus = full.status",
         "_populateSessionSelect('bd-session', full.session",
