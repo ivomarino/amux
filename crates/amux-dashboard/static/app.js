@@ -6640,7 +6640,10 @@ function _scopeEdMode(id, lvl, name, cap, statuses) {
         + esc(x) + ' <span class="scope-ed-note">(no longer explicit — untick to clear)</span></label>';
     });
   }
-  return h + _scopeEdFoot(id, lvl, name, 'status_mode', 'mode', '') + '</div>';
+  const _note = (lvl === 'global')
+    ? (sts.filter(x => (x.mode || 'implicit') === 'explicit').length + ' explicit')
+    : ((Array.isArray(cap.value) ? cap.value.length : 0) + ' opted in at this level');
+  return h + _scopeEdFoot(id, lvl, name, 'status_mode', 'mode', _note) + '</div>';
 }
 
 function _scopeCollectMode(id, lvl) {
@@ -7118,8 +7121,19 @@ async function _scopeLoad(scope, targetId) {
     const G = byKey(gl), Gr = grp.map(byKey);
     const esc = t => String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     const sum = (c) => {
-      const v = c && c.value;
+      let v = c && c.value;
       if (!v) return '\u2014';
+      // UNWRAP THE ENVELOPE FIRST (AMUX-4076). `skin` and `connectors` arrive
+      // as {"skin": {...}} / {"connectors": {...}}, so the object branch below
+      // asked an OBJECT for its `.length`, got undefined, filtered the only key
+      // out, and reported a configured layer as unset. Measured live: the
+      // Connectors tile read "global · —" while the global layer had granola
+      // enabled — the tile named the supplying layer and denied it had a value.
+      if (typeof v === 'object' && !Array.isArray(v)) {
+        const ks = Object.keys(v);
+        if (ks.length === 1 && (ks[0] === 'skin' || ks[0] === 'connectors')) v = v[ks[0]];
+        if (!v) return '\u2014';
+      }
       // Array check FIRST: an empty list is [] and `v.keys` on it is undefined,
       // but the object branch below rendered it as "0 keys" — a keyed summary
       // for something that has no keys, which reads as a real but empty setting
@@ -7127,7 +7141,16 @@ async function _scopeLoad(scope, targetId) {
       if (Array.isArray(v)) return v.length ? v.join(', ') : '\u2014';
       if (v.keys) return v.keys.length + ' key' + (v.keys.length === 1 ? '' : 's');
       if (typeof v.bytes === 'number') return v.bytes ? v.bytes + ' bytes' : '\u2014';
-      if (typeof v === 'object') { const k = Object.keys(v).filter(x => v[x] && v[x].length); return k.length ? k.join(', ') : '\u2014'; }
+      if (typeof v === 'object') {
+        // "Non-empty" has to cover a nested OBJECT, not just an array or a
+        // scalar. `v[x] && v[x].length` was the whole bug above: true for
+        // ['a'] and for 'implicit', false for {enabled:true}.
+        const filled = (x) => Array.isArray(x) ? x.length > 0
+          : (x && typeof x === 'object') ? Object.keys(x).length > 0
+          : !!x;
+        const k = Object.keys(v).filter(x => filled(v[x]));
+        return k.length ? k.join(', ') : '\u2014';
+      }
       return String(v);
     };
     const chips = (arr) => arr.map(g => '<span class="msg-tag" style="background:rgba(88,166,255,0.14);color:var(--accent);">' + esc(g) + '</span>').join(' ');
@@ -8970,7 +8993,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.784';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.785';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
