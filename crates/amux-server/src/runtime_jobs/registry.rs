@@ -486,8 +486,15 @@ pub const CATALOG: &[Doc] = &[
     Doc {
         id: ids::SELF_ADOPT,
         name: "Self-adoption watch",
-        purpose: "Exits 0 when the installed binary changes on disk so launchd relaunches the new build instead of serving stale code.",
-        env: NO_ENV,
+        purpose: "Execs the installed binary in place when it changes on disk instead of serving stale code; a test harness may deliberately disable it while pinning one build.",
+        env: &[EnvControl {
+            var: "AMUX_NO_SELF_ADOPT",
+            effect: "truthy = do not exec a replacement binary; the inert registry row names this switch",
+            // The startup branch registers its own disabled_reason because
+            // this negative boolean accepts 1/true/yes/on, not one exact
+            // off-value the catalog could safely re-derive.
+            off: None,
+        }],
         pref: None,
         detail: None,
     },
@@ -506,7 +513,9 @@ pub const CATALOG: &[Doc] = &[
         env: &[EnvControl {
             var: "TELEGRAM_BOT_TOKEN",
             effect: "unset = loop idles, checking every 5 minutes; set = polls continuously",
-            off: Some(""),
+            // The loop remains spawned and instrumented while idle, so an
+            // absent connector is not the same state as a disabled job.
+            off: None,
         }],
         pref: None,
         detail: Some("/api/telegram/status"),
@@ -828,6 +837,15 @@ pub fn spawn_loop<F>(id: &'static str, interval: Option<Duration>, fut: F) -> to
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    if let Some(reason) = super::fleet_isolation_reason(id) {
+        register_disabled(id, "loop", interval, reason.clone());
+        tracing::info!(
+            job = id,
+            switch = %reason,
+            "long-lived job suppressed: fleet isolation is on, this loop will NOT run"
+        );
+        return tokio::spawn(async {});
+    }
     let h = tokio::spawn(fut);
     register(id, "loop", interval, Some(h.abort_handle()));
     h
@@ -836,6 +854,16 @@ where
 /// Register a loop somebody else already spawned (its `spawn()` owns the
 /// `tokio::spawn`). Same contract as [`spawn_loop`], called at the same place.
 pub fn adopt(id: &'static str, interval: Option<Duration>, h: &tokio::task::JoinHandle<()>) {
+    if let Some(reason) = super::fleet_isolation_reason(id) {
+        h.abort();
+        register_disabled(id, "loop", interval, reason.clone());
+        tracing::info!(
+            job = id,
+            switch = %reason,
+            "adopted job suppressed: fleet isolation is on, its task was aborted"
+        );
+        return;
+    }
     register(id, "loop", interval, Some(h.abort_handle()));
 }
 
@@ -1484,6 +1512,50 @@ mod tests {
         assert!(j.last_end.is_some());
         drop(m);
         t.abort();
+    }
+
+    #[tokio::test]
+    async fn isolation_suppresses_spawned_and_adopted_loops_before_they_act() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        const SPAWNED: &str = "af69-isolated-spawn-loop-probe";
+        const ADOPTED: &str = "af69-isolated-adopt-loop-probe";
+        let spawned_var = super::super::per_job_disable_var(SPAWNED);
+        let adopted_var = super::super::per_job_disable_var(ADOPTED);
+        std::env::set_var(&spawned_var, "0");
+        std::env::set_var(&adopted_var, "0");
+
+        let spawned_count = Arc::new(AtomicUsize::new(0));
+        let count = spawned_count.clone();
+        let spawned = spawn_loop(SPAWNED, Some(Duration::from_millis(20)), async move {
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let adopted_count = Arc::new(AtomicUsize::new(0));
+        let count = adopted_count.clone();
+        let adopted = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+        adopt(ADOPTED, Some(Duration::from_millis(20)), &adopted);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(spawned_count.load(Ordering::SeqCst), 0);
+        assert_eq!(adopted_count.load(Ordering::SeqCst), 0);
+        for (id, reason) in [
+            (SPAWNED, "AMUX_AF69_ISOLATED_SPAWN_LOOP_PROBE_SECS=0"),
+            (ADOPTED, "AMUX_AF69_ISOLATED_ADOPT_LOOP_PROBE_SECS=0"),
+        ] {
+            let row = snapshot().into_iter().find(|s| s.id == id).expect("suppressed loop visible");
+            assert_eq!(row.disabled_reason.as_deref(), Some(reason));
+            assert_eq!(row.ticks, 0);
+        }
+
+        spawned.abort();
+        adopted.abort();
+        std::env::remove_var(spawned_var);
+        std::env::remove_var(adopted_var);
     }
 
     /// Every catalog row must name a job id that some spawn site can produce.

@@ -3549,7 +3549,7 @@ SEVERITY: blocks
 STATUS: fixed
 DATE: 2026-09-02
 SESSION: amux-testing-e2e
-CARD: none
+CARD: ATE-1 (source audit epic)
 SYMPTOM: Enabling "Allow workers to message beyond groups" in Settings immediately
   returned the switch to off. The global offline outbox synthesized an HTTP 202
   for `/api/config/cross-group`; the settings caller accepted that queued response
@@ -3567,7 +3567,7 @@ SEVERITY: blocks
 STATUS: fixed
 DATE: 2026-09-02
 SESSION: amux-testing-e2e
-CARD: none
+CARD: ATE-10
 SYMPTOM: Two real Claude subagents created files while the embedded terminal showed
   `2 agents`, but the Workers card remained idle for the entire 31-second window.
   The installed hook set had prompt/tool/stop events only; it omitted
@@ -3628,7 +3628,7 @@ SEVERITY: slows
 STATUS: open (provider-side notification defect; amux lifecycle handling is fixed)
 DATE: 2026-09-02
 SESSION: amux-testing-e2e
-CARD: none
+CARD: ATE-10
 SYMPTOM: Claude produced an initial subagent completion notification while that agent
   still reported waiting and its requested file did not exist; a second notification
   arrived only after the file was actually written.
@@ -3645,7 +3645,7 @@ SEVERITY: blocks
 STATUS: fixed
 DATE: 2026-09-02
 SESSION: amux-testing-e2e
-CARD: none
+CARD: ATE-1 (source audit epic)
 SYMPTOM: Prompt capture had a narrow exception for status and `why` questions,
   while ordinary answer-only prompts such as "what is the difference between todo
   and backlog?" could still be treated as code work. Direct, queued and orchestrator
@@ -3665,7 +3665,7 @@ SEVERITY: slows
 STATUS: fixed
 DATE: 2026-09-02
 SESSION: amux-testing-e2e
-CARD: none
+CARD: ATE-1 (source audit epic)
 SYMPTOM: The registered 30-minute `mac-health` job reaped orphaned Ray workers
   and Playwright Chrome roots, but its own module contract also promised orphaned
   debug rustc cleanup and had no corresponding code. True process-table zombies
@@ -3687,7 +3687,7 @@ SEVERITY: blocks
 STATUS: fixed
 DATE: 2026-09-02
 SESSION: amux-testing-e2e
-CARD: none
+CARD: ATE-1 (source audit epic)
 SYMPTOM: The live System Jobs section reported catalogued `telegram-relay` as
   `not_spawned` while a separate undocumented `telegram_relay` row ticked every
   30 seconds. Five other stable periodic jobs also rendered as "Undocumented job".
@@ -3705,7 +3705,7 @@ SEVERITY: blocks
 STATUS: fixed
 DATE: 2026-09-02
 SESSION: amux-testing-e2e
-CARD: none
+CARD: ATE-1 (source audit epic)
 SYMPTOM: The live Granola transcript schedule accumulated six consecutive
   traceback runs, but scheduler health remained green because the firing loop
   itself still ticked. A `delivered` run also had no closed-loop check that its
@@ -3725,7 +3725,7 @@ SEVERITY: blocks
 STATUS: fixed
 DATE: 2026-09-02
 SESSION: amux-testing-e2e
-CARD: none
+CARD: ATE-1 (source audit epic)
 SYMPTOM: The direct send path treated every cardable prompt within 45 seconds of
   another capture as a retry, even when the text and task were different. The
   orchestrator variant discarded every new command whenever any agent card was open.
@@ -3738,3 +3738,98 @@ FIX: The direct path now dedupes only an exact recent prompt already linked to a
   always enter the work ledger, including while another card is open, so the worker
   model can decide their correct relationship and ordered plan. Tests pin transport
   retry and distinct/repeated durable-message outcomes.
+
+## Deliberately idle or disabled jobs became false autofix incidents
+AREA: scheduler
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-1 (source audit epic)
+SYMPTOM: The full browser suite deliberately sets `AMUX_NO_SELF_ADOPT=1`, but
+  System Jobs reported `self-adoption` as `not_spawned`. An unconfigured Telegram
+  connector slept for its documented five minutes while its registry advertised a
+  45-second cadence, so it was reported `stalled` after 127.5 seconds. Autofix then
+  filed both expected states as failures.
+COST: Healthy test servers accumulated bogus repair cards and red scheduler logs,
+  obscuring real failures and perturbing board assertions during long E2E runs.
+FIX: Deliberate self-adoption opt-out now registers an inert job with the exact
+  disabling switch. Telegram records its live cadence atomically with each tick—45
+  seconds when configured, 300 while idle—and starts with the conservative cadence
+  so spawn scheduling cannot create a false first-tick window. The catalog describes
+  these mechanism-owned states rather than independently guessing them.
+
+## Slim card hydration left the visible Details text blank
+AREA: dashboard
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-5
+SYMPTOM: The board list correctly omitted full descriptions, and card hydration
+  filled the hidden edit textarea, but the active Details renderer was not repainted.
+  A card could therefore show relationships and assets while hiding its task context
+  until someone manually switched tabs.
+COST: The primary card view omitted the source work description, undermining the
+  card's role as the complete work record and making a healthy API response look like
+  missing data.
+FIX: Authoritative hydration now repaints Details only when that tab is still active,
+  preserving a user who switched to Edit or Worker actions while the request was in
+  flight. The former Lineage browser spec now exercises this real slim-to-detail path,
+  multiple clickable assets, worker actions, edit-only controls, legacy link fallback,
+  mobile targets, and overflow.
+
+## Zombie reporting flooded every server log with one warning per foreign process
+AREA: runtime
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-1 (source audit epic)
+SYMPTOM: Starting the three isolated browser-test servers on a host with accumulated
+  foreign zombies emitted hundreds of identical WARN lines per server, one for each
+  PID, before a single test began.
+COST: The useful scheduler and browser output was truncated, recurring-log analysis
+  saw a manufactured error pattern, and every 30-minute sweep would repeat an
+  unbounded warning storm for processes this server correctly cannot reap.
+FIX: Each sweep now emits one structured zombie warning with total, owned and foreign
+  counts plus at most eight PID/parent/age samples. Owned children still produce their
+  individual reap outcome because those are actions; the periodic summary retains the
+  full count, and a regression test pins the sample bound and ownership context.
+
+## Isolated browser-test servers still monitored and mutated the real host fleet
+AREA: isolation
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-1 (source audit epic)
+SYMPTOM: Each Playwright project had a private `AMUX_HOME`, but long-lived jobs
+  still inspected the shared tmux socket, process table, repository and user hook
+  files. A one-spec run opened four incidents about the real fleet in its temporary
+  database, filed disk/CI cards, and ran three host cleanup sweeps.
+COST: E2E results depended on ambient machine state and test servers could resize,
+  nudge, clean up or diagnose production workers despite claiming an isolated home.
+FIX: The existing `AMUX_ISOLATED=1` contract now applies at all three common job
+  constructors: periodic, long-lived and adopted loops. Suppressed work registers an
+  inert System Jobs row with the exact switch, and adopted tasks are aborted before
+  acting. The browser harness enables the process-wide switch; regression tests prove
+  spawned and adopted futures perform no effect while remaining observable.
+
+## A first-ever server start claimed an earlier process died unannounced
+AREA: runtime
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-1 (source audit epic)
+SYMPTOM: Every fresh Playwright home logged `boot: UNANNOUNCED` and stated that
+  “the previous process stopped” even though its database had never existed and no
+  predecessor was possible.
+COST: Normal installation and isolated-test startup produced a death warning, teaching
+  log-pattern detection to count a fabricated restart failure and obscuring genuine
+  crashes that use the same signal.
+FIX: Boot provenance now considers whether the database existed before `Store::open`
+  could create it. First boot, self-adoption and an existing-store restart without a
+  marker have distinct outcomes; filesystem uncertainty fails closed as an existing
+  store so a real unannounced restart is never mislabeled. Tests pin all branches.

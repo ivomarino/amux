@@ -255,6 +255,8 @@ fn board_detail_hydration_refreshes_authoritative_state_and_relations() {
         "boardDetailStatus = full.status",
         "_populateSessionSelect('bd-session', full.session",
         "_bdRenderMeta(merged)",
+        "previewTab.classList.contains('active')",
+        "renderMarkdown(d.value)",
         "full.due_time",
         "full.tags",
     ] {
@@ -285,6 +287,14 @@ fn board_detail_leads_with_actionable_task_context() {
     );
 
     let app = asset("app.js");
+    assert!(
+        !app.contains("_bdRenderLineage") && !app.contains("_bdLineageHtml"),
+        "the retired Lineage tab must not leave a hidden renderer or network path"
+    );
+    assert!(
+        app.contains("maybeTab === 'lineage' ? 'preview'"),
+        "old Lineage deep links must still resolve to the card's Details view"
+    );
     for needle in [
         "item.gate_requirements",
         "item.asset_links",

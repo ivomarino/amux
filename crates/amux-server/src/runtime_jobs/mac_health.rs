@@ -43,6 +43,7 @@
 use std::time::Duration;
 
 const JOB: &str = "mac-health";
+const ZOMBIE_LOG_SAMPLE: usize = 8;
 
 fn tick_secs() -> u64 {
     std::env::var("AMUX_MAC_HEALTH_TICK_S")
@@ -262,6 +263,15 @@ fn owned_zombie_children(
     (owned, visible)
 }
 
+fn zombie_log_sample(zombies: &[HealthProcess]) -> String {
+    zombies
+        .iter()
+        .take(ZOMBIE_LOG_SAMPLE)
+        .map(|p| format!("pid={}/ppid={}/age={}s", p.pid, p.ppid, p.elapsed_s))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn reap_owned_zombie(pid: u32) -> Result<bool, String> {
     let mut status: libc::c_int = 0;
     // SAFETY: waitpid is restricted to one PID observed as an aged zombie
@@ -411,14 +421,17 @@ fn one_pass() {
             let (owned, zombies) =
                 owned_zombie_children(&rows, zombie_grace, std::process::id());
             zombies_seen = zombies.len();
-            for child in &zombies {
+            if !zombies.is_empty() {
+                let foreign = zombies.len().saturating_sub(owned.len());
+                let sample = zombie_log_sample(&zombies);
                 tracing::warn!(
                     job = JOB,
-                    pid = child.pid,
-                    ppid = child.ppid,
-                    age_s = child.elapsed_s,
-                    owned_by_this_server = owned.contains(&child.pid),
-                    "mac-health: true zombie process detected"
+                    count = zombies.len(),
+                    owned_by_this_server = owned.len(),
+                    foreign_parent = foreign,
+                    sample = %sample,
+                    sample_limit = ZOMBIE_LOG_SAMPLE,
+                    "mac-health: true zombies detected; foreign children are report-only"
                 );
             }
             for pid in owned {
@@ -551,6 +564,23 @@ mod tests {
         let (owned, zombies) = owned_zombie_children(&rows, 60, 200);
         assert_eq!(owned, vec![201]);
         assert_eq!(zombies.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![201, 301, 401]);
+    }
+
+    #[test]
+    fn zombie_warning_sample_is_bounded_but_keeps_ownership_context() {
+        let rows = (0..12)
+            .map(|n| HealthProcess {
+                pid: 100 + n,
+                ppid: 200 + n,
+                state: "Z".into(),
+                elapsed_s: 300 + u64::from(n),
+                command: "[child] <defunct>".into(),
+            })
+            .collect::<Vec<_>>();
+        let sample = zombie_log_sample(&rows);
+        assert_eq!(sample.split(", ").count(), ZOMBIE_LOG_SAMPLE);
+        assert!(sample.contains("pid=100/ppid=200/age=300s"));
+        assert!(!sample.contains("pid=108/"), "the log sample must stay bounded: {sample}");
     }
 
     #[test]

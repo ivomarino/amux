@@ -8395,7 +8395,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.776';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.777';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -26052,7 +26052,18 @@ async function _bdHydrate(id) {
     }
     const d = document.getElementById('bd-desc');
     // Only fill if the user has not started typing into it.
-    if (d && d.value === (cached.desc || '')) d.value = full.desc || '';
+    if (d && d.value === (cached.desc || '')) {
+      d.value = full.desc || '';
+      // The board list is intentionally slim, so Details first opens without
+      // `desc`. Hydration must repaint the VISIBLE rendered copy as well as the
+      // hidden edit textarea; otherwise the task context stays blank until the
+      // user switches tabs even though the authoritative response arrived.
+      const previewTab = document.getElementById('bd-tab-preview');
+      const preview = document.getElementById('bd-preview');
+      if (previewTab && previewTab.classList.contains('active') && preview) {
+        preview.innerHTML = d.value.trim() ? renderMarkdown(d.value) : '';
+      }
+    }
     if (boardDetailStatus === (cached.status || 'todo')) {
       boardDetailStatus = full.status || 'todo';
       _renderDetailStatusBtns();
@@ -26233,173 +26244,6 @@ function boardDetailTab(tab) {
     desc.style.display = '';
     preview.style.display = 'none';
   }
-}
-
-// ── LINEAGE TAB (AMUX-2393) ────────────────────────────────────────────────
-//
-// Ethan: "we need more robust history so we have a full lineage trail — note it
-// should all come from logs which have request responses with the granular
-// control level based on action."
-//
-// The trail itself was already BUILT and unreachable. `GET /api/why/{kind}/{id}`
-// (RR-0109) correlates the durable trails — issues, issues.log, the state-event
-// journal, the structured request log, the turn ledger, interaction_log — and it
-// is good: it cites a table and row for every line and refuses to narrate when
-// the evidence does not support a story. It had 4 requests in 168 hours from one
-// client, its only consumer being `amux-rs why`, and ZERO call sites in this SPA.
-// So the work here is surfacing, not building: ethos rule 1, the mcp.json shape.
-// Nothing below re-implements any correlation — one place to be wrong is enough,
-// which the endpoint's own docstring says about its CLI printer.
-//
-// THIS RENDERER'S ONE JOB IS NOT TO UPGRADE A WEAK ANSWER. An explainer's
-// failure mode is confident narration from whatever it happened to find, and a
-// printer is exactly where that gets reintroduced after the API carefully avoided
-// it. So three things are non-negotiable here, each mirroring a guarantee the
-// endpoint makes:
-//
-//   - `verdict` and `verdict_reason` lead, never the timeline. `partial` and
-//     `cannot_tell` are answers, not degraded successes.
-//   - `gaps` are rendered in full. Dropping them turns "no turn ledger covers
-//     this card" into an apparently complete story with a quiet hole.
-//   - Sources that returned ZERO are shown WITH their predicate, because a zero
-//     from a probe that could have matched and a zero from a probe that never
-//     could look identical otherwise — and only the second is a gap.
-//
-// Truncation is surfaced too: the payload carries `rows` vs `rows_total` per
-// source and a `per_source_cap`, so a capped source says so rather than reading
-// as complete coverage.
-let _bdLineageFor = null;
-
-function _bdRenderLineage(id) {
-  const el = document.getElementById('bd-lineage');
-  if (!el || !id) return;
-  // Re-fetch per open: a card's trail changes as work happens, and this tab is
-  // opened deliberately rather than on every card open, so it is never on the
-  // hot path.
-  el.innerHTML = '<div class="bd-lin-note">Loading lineage for ' + esc(id) + '…</div>';
-  _bdLineageFor = id;
-  const path = '/api/why/task/' + encodeURIComponent(id);
-  // Plain fetch, NOT apiCall: apiCall is the MUTATION path — it returns null on
-  // failure after a toast, and queues to the offline outbox. Both are wrong
-  // here. A toast vanishes, and this panel's entire purpose is to state what it
-  // could and could not establish, so a failure has to render INTO the panel
-  // where the answer would have been. Returning null would have left the
-  // loading line up forever, which reads as a hang rather than an error.
-  fetch(API + path, { headers: _authHeaders({}) })
-    .then(r => r.ok ? r.json() : r.text().then(t => { throw new Error('HTTP ' + r.status + (t ? ': ' + t.slice(0, 200) : '')); }))
-    .then(d => {
-      if (_bdLineageFor !== id) return;   // a different card was opened meanwhile
-      el.innerHTML = _bdLineageHtml(d, id);
-    })
-    .catch(e => {
-      if (_bdLineageFor !== id) return;
-      // Name the endpoint. "Could not load" sends the next person grepping the
-      // SPA for a view that was never the problem.
-      el.innerHTML = '<div class="bd-lin-note bd-lin-bad">Could not read the lineage trail: '
-        + esc(String(e && e.message ? e.message : e))
-        + '<br><span class="bd-lin-dim">GET ' + esc(path) + '</span></div>';
-    });
-}
-
-function _bdLineageHtml(d, id) {
-  if (!d || typeof d !== 'object') return '<div class="bd-lin-note bd-lin-bad">Empty response.</div>';
-  const verdict = d.verdict || 'unknown';
-  const cls = verdict === 'ok' ? 'ok' : (verdict === 'partial' ? 'warn' : 'bad');
-  let h = '';
-
-  // 1. THE VERDICT LEADS. Not the timeline — a reader who scrolls a plausible
-  //    timeline and never reaches a caveat has been misled by layout alone.
-  h += '<div class="bd-lin-verdict bd-lin-' + cls + '">'
-    + '<span class="bd-lin-vlabel">' + esc(verdict) + '</span>'
-    + (d.verdict_reason ? '<span class="bd-lin-vwhy">' + esc(d.verdict_reason) + '</span>' : '')
-    + '</div>';
-
-  // 2. GAPS, IN FULL, ABOVE the trail. What the trail cannot tell you outranks
-  //    what it can.
-  const gaps = Array.isArray(d.gaps) ? d.gaps : [];
-  if (gaps.length) {
-    h += '<div class="bd-lin-gaps"><div class="bd-lin-h">What this trail cannot tell you ('
-      + gaps.length + ')</div><ul>'
-      + gaps.map(g => '<li>' + esc(String(g)) + '</li>').join('')
-      + '</ul></div>';
-  }
-
-  // 3. SOURCES, INCLUDING THE ZEROS, each with the predicate it ran.
-  const srcs = Array.isArray(d.sources) ? d.sources : [];
-  if (srcs.length) {
-    h += '<div class="bd-lin-h">Sources consulted (' + srcs.length + ')</div><div class="bd-lin-srcs">';
-    srcs.forEach(s => {
-      const rows = Number(s.rows || 0);
-      const total = (s.rows_total === undefined || s.rows_total === null) ? rows : Number(s.rows_total);
-      const capped = total > rows;
-      h += '<div class="bd-lin-src' + (rows === 0 ? ' bd-lin-zero' : '') + '">'
-        + '<code>' + esc(String(s.table || '?')) + '</code>'
-        + '<span class="bd-lin-rows">' + rows + (capped ? ' of ' + total + ' shown' : ' row' + (rows === 1 ? '' : 's')) + '</span>'
-        + (capped ? '<span class="bd-lin-cap">capped'
-            + (d.per_source_cap ? ' at ' + esc(String(d.per_source_cap)) : '') + '</span>' : '')
-        + (s.query ? '<span class="bd-lin-dim">' + esc(String(s.query)) + '</span>' : '')
-        // The endpoint attaches a `note` to a source whenever the row count
-        // alone would mislead — a reaped journal whose floor postdates the card,
-        // events that record THAT something changed but not into what, or the
-        // receipt that says a trail really is complete. Dropping it recreated
-        // the exact defect one layer up that the note exists to prevent: the
-        // panel looked careful and printed a number with no caveat attached.
-        + (s.note ? '<div class="bd-lin-srcnote">' + esc(String(s.note)) + '</div>' : '')
-        + '</div>';
-    });
-    h += '</div>';
-  }
-
-  // 4. THE TRAIL. Every line carries where it came from, so any claim here is
-  //    one SELECT away from being re-checked.
-  const tl = Array.isArray(d.timeline) ? d.timeline : [];
-  h += '<div class="bd-lin-h">Trail (' + tl.length + ')</div>';
-  if (!tl.length) {
-    h += '<div class="bd-lin-note">No trail lines. The sources above name what was searched'
-      + ' and with which predicate.</div>';
-  } else {
-    h += '<div class="bd-lin-tl">' + tl.map(t => {
-      const src = t.source || {};
-      const where = [src.table, src.column].filter(Boolean).join('.');
-      // `ordering` distinguishes a line PLACED BY TIME from one appended in
-      // source order because its record carries no date (issues.log is HH:MM
-      // only). Rendering them identically would invent a chronology.
-      const untimed = t.ordering && t.ordering !== 'timestamped';
-      return '<div class="bd-lin-line' + (untimed ? ' bd-lin-untimed' : '') + '">'
-        + '<div class="bd-lin-when">' + esc(t.at ? String(t.at).replace('T', ' ').replace(/\+.*$/, '') : '—')
-        + (untimed ? '<span class="bd-lin-badge" title="This record carries no date; placed in source order, not by time">order</span>' : '')
-        + '</div>'
-        + '<div class="bd-lin-what">'
-        + '<span class="bd-lin-sum">' + esc(String(t.summary || t.kind || '(no summary)')) + '</span>'
-        + (t.actor ? '<span class="bd-lin-actor">' + esc(String(t.actor)) + '</span>' : '')
-        + (where ? '<span class="bd-lin-dim">' + esc(where) + '</span>' : '')
-        + '</div></div>';
-    }).join('') + '</div>';
-  }
-
-  // 5. PART 3 OF THE REQUIREMENT IS NOT BUILT, AND SAYS SO HERE.
-  //    "granular control level based on action" — which permission scope
-  //    authorised each action, with global/worker/group layers individually
-  //    logged. The per-layer resolution exists at READ time (_gate_layers and
-  //    the scope/env/memory resolvers all return every layer with an `applied`
-  //    flag) but is not PERSISTED with the action, so no trail can answer it
-  //    yet. Stating that in the view is the point: a lineage panel that simply
-  //    omitted authorisation would read as though authorisation were covered.
-  // AMUX-3607 landed the board-transition half of part 3, so this notice no
-  // longer says "not covered" — it says WHAT is covered. Deleting it outright
-  // would have been the over-claim: the directive is "every action a worker
-  // takes" and only board transitions carry a trail today, so a reader seeing
-  // authz lines on a card would reasonably assume the same holds for scope
-  // writes and messages. Naming the boundary is the honest version, and it is
-  // worded to name the card so it cannot outlive the remaining gap.
-  h += '<div class="bd-lin-note bd-lin-todo">Authorisation trail: board status'
-    + ' transitions record which permission layer allowed them, every tier, on'
-    + ' the card log (look for <code>authz:</code> lines above &mdash;'
-    + ' <code>outranked</code> means a rule existed at that tier and lost).'
-    + ' Other actions a worker takes (scope writes, messages, session starts) do'
-    + ' NOT carry one yet, so their absence here is unrecorded rather than'
-    + ' unrestricted (AMUX-3607).</div>';
-  return h;
 }
 
 function _renderDetailStatusBtns() {
@@ -30726,21 +30570,18 @@ async function _handleDeeplink(hash) {
   // #issue=<id> — open a board card directly from anywhere (AMUX-2165), the
   // shareable twin of the task-label id chip.
   if (hash && hash.startsWith('#issue=')) {
-    // Optional `:<tab>` suffix — `#issue=AMUX-1:lineage` opens the card ON that
-    // tab. Two reasons, and the second is why it is here rather than in a
-    // backlog: a card's lineage is the thing you want to SEND someone ("look at
-    // how this card got here"), and a tab reachable only by tapping cannot be
-    // linked, screenshotted by the simulator rig, or deep-linked from a nudge.
-    // The rig drives UI states by deeplink because simctl has no tap primitive,
-    // so an untargetable tab is also an unverifiable one.
+    // Optional `:<tab>` suffix opens the card on Details, Worker actions or
+    // Edit. `lineage` used to be a fourth tab; keep it as an alias for Details
+    // so links already pasted into messages still open the card instead of
+    // treating the suffix as part of its id.
     const raw = decodeURIComponent(hash.slice(7));
     const cut = raw.lastIndexOf(':');
     // Card ids contain no colon, so a colon can only be the tab separator — but
     // validate against the known tabs anyway rather than trusting position, or a
     // future id format silently loses everything after its last colon.
-    const TABS = ['edit', 'preview', 'history', 'lineage'];
+    const TABS = ['edit', 'preview', 'history'];
     const maybeTab = cut > 0 ? raw.slice(cut + 1) : '';
-    const tab = TABS.includes(maybeTab) ? maybeTab : '';
+    const tab = TABS.includes(maybeTab) ? maybeTab : (maybeTab === 'lineage' ? 'preview' : '');
     const id = tab ? raw.slice(0, cut) : raw;
     const tryOpen = (attempt) => {
       if (typeof boardItems !== 'undefined' && boardItems.some(i => i.id === id)) {

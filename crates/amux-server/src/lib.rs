@@ -29,9 +29,26 @@ pub(crate) fn self_adopt_enabled() -> bool {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootProvenance {
+    FirstBoot,
+    SelfAdopted,
+    UnannouncedRestart,
+}
+
+fn boot_provenance(self_adopted: bool, store_existed: bool) -> BootProvenance {
+    if self_adopted {
+        BootProvenance::SelfAdopted
+    } else if !store_existed {
+        BootProvenance::FirstBoot
+    } else {
+        BootProvenance::UnannouncedRestart
+    }
+}
+
 #[cfg(test)]
 mod self_adopt_tests {
-    use super::self_adopt_enabled;
+    use super::{boot_provenance, self_adopt_enabled, BootProvenance};
 
     /// The env var is process-global and cargo runs tests in parallel, so this
     /// takes a lock — the du-budget tests in autofix.rs were already bitten by
@@ -63,6 +80,14 @@ mod self_adopt_tests {
             assert!(self_adopt_enabled(), "AMUX_NO_SELF_ADOPT={off:?} must leave it ENABLED");
         }
         std::env::remove_var("AMUX_NO_SELF_ADOPT");
+    }
+
+    #[test]
+    fn boot_provenance_never_invents_a_dead_predecessor_on_first_boot() {
+        assert_eq!(boot_provenance(false, false), BootProvenance::FirstBoot);
+        assert_eq!(boot_provenance(true, true), BootProvenance::SelfAdopted);
+        assert_eq!(boot_provenance(true, false), BootProvenance::SelfAdopted);
+        assert_eq!(boot_provenance(false, true), BootProvenance::UnannouncedRestart);
     }
 }
 pub mod db;
@@ -271,6 +296,10 @@ async fn async_main() {
     // when the fleet last got an answer. `env::var` is read BEFORE the runtime
     // starts so nothing can have cleared it.
     let self_adopted = std::env::var("AMUX_SELF_ADOPTED").is_ok();
+    // Read before Store::open creates the database. An absent store means
+    // there cannot have been a predecessor to die; filesystem uncertainty
+    // fails closed as "existing" so a real restart is never mislabeled first.
+    let store_existed = cfg.db_path.try_exists().unwrap_or(true);
     std::env::remove_var("AMUX_SELF_ADOPTED");
     // SAY IT AT BOOT, not only when a duration threshold happens to trip. This
     // is one line rather than a new detector because heartbeat.rs already owns
@@ -279,15 +308,21 @@ async fn async_main() {
     // drifting. The fact belongs on the record either way — an unannounced stop
     // is worth knowing at ANY length, and the 2026-08-23 22:28 one was 107s
     // against a 120s threshold, so nothing said anything at all.
-    if self_adopted {
-        tracing::info!("boot: self-adoption (the previous process exec'd this one deliberately)");
-    } else {
-        tracing::warn!(
-            "boot: UNANNOUNCED — no self-adoption marker, so the previous process stopped \
-             without saying so (death, SIGKILL, or a launchd stop). A planned rebuild sets \
-             AMUX_SELF_ADOPTED; its absence is the discriminator (AF-176). Duration, if any, \
-             is reported separately by the heartbeat's downtime check."
-        );
+    match boot_provenance(self_adopted, store_existed) {
+        BootProvenance::FirstBoot => {
+            tracing::info!("boot: first database start — there is no predecessor to classify")
+        }
+        BootProvenance::SelfAdopted => {
+            tracing::info!("boot: self-adoption (the previous process exec'd this one deliberately)")
+        }
+        BootProvenance::UnannouncedRestart => {
+            tracing::warn!(
+                "boot: UNANNOUNCED — no self-adoption marker, so the previous process stopped \
+                 without saying so (death, SIGKILL, or a launchd stop). A planned rebuild sets \
+                 AMUX_SELF_ADOPTED; its absence is the discriminator (AF-176). Duration, if any, \
+                 is reported separately by the heartbeat's downtime check."
+            )
+        }
     }
 
     let store = match db::Store::open(&cfg.db_path) {
@@ -706,6 +741,12 @@ async fn async_main() {
         // NOT an early return: everything after this block is the rest of server
         // startup (the port binds, the router). Skipping it would trade a flaky
         // suite for a server that never listens.
+        jobs::register_disabled(
+            jobs::ids::SELF_ADOPT,
+            "loop",
+            Some(secs(5)),
+            "AMUX_NO_SELF_ADOPT".into(),
+        );
         tracing::info!(
             "self-adoption DISABLED by AMUX_NO_SELF_ADOPT — this process will not exec on a \
              binary change (AEAB-52: a test harness pins its build on purpose)"
