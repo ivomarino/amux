@@ -2789,3 +2789,52 @@ FOLLOW-UP the same night, bc2c820b, and it is the better half of this entry. ts-
   therefore what you check; its EXCLUSIONS are what you assumed and therefore what nobody
   checks. The exclusions are also where the silence lives, which is why the failure is
   always in the reassuring direction.
+
+---
+
+## A test per component and none over the seam, three times in one night, twice inside the fix for the last one
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-03
+SESSION: amux-frustrations
+CARD: AF-438
+SYMPTOM: Three instances of one shape, and the third is the one that makes it an entry
+  rather than a bug report.
+    1. AF-429. `schedule_message_origin` had a test. The autofix detector had a test.
+       Nothing pinned that the writer's OUTPUT satisfies the detector's PREDICATE, so the
+       id arm matched 0 of 956 production rows for months with two green suites. ts-gke's
+       framing: the detector's fixture hand-typed the writer's output, making it a copy of
+       a BELIEF about the writer rather than a sample of its BEHAVIOUR.
+    2. AF-437. `spawn_periodic` derives a job's gate variable from the job name; four jobs
+       also spelled that variable by hand. One knob, two spellings, agreeing today, with
+       nothing asserting they must.
+    3. AF-438, and this one is mine, committed four hours after writing the other two up.
+       Fixing mvs-pitr's report I wrote a cell for the message and a cell for the root
+       resolver. Both passed. Then I mutated the call site back to the reported bug — the
+       sweep handing `build` the lane directory instead of the resolved root — and it
+       SURVIVED ALL 46 TESTS. Two components tested, the seam between them untested, in the
+       fix for a report about a different seam, on the night I logged the pattern twice.
+COST: for the shipped defect, a nudge that named the wrong directory for every lane whose
+  cwd is a subdirectory — and git pathspecs are cwd-relative, so an operator following the
+  remedies from the named directory runs `git checkout origin/main -- <path>` against a
+  different file, or none, with every command exiting 0. The one instrument whose purpose is
+  to stop a destructive command landing on the wrong bytes was naming the wrong bytes.
+  For the pattern: I now have three instances and no instrument. Every one was found by a
+  human reading code or by a peer's report, never by a suite, because the suites were green
+  by construction — each component's test passes exactly as well when the seam is broken.
+FIX: 54cef57c for the defect: the label resolves to the repo root, and a set-wide note gives
+  the runnable form `git -C <root> <remedy>` from `build`'s top-level block rather than an
+  arm, so it reaches all four readers instead of one.
+  For the pattern, a third cell that reads `nudge_tick`'s own body, bounded to that function,
+  and asserts the resolved label is what reaches `build`. Its controls check the window is
+  one function wide and has not swallowed the resolver's definition — an unbounded search
+  would be satisfied by the resolver's own name several hundred lines away and could not
+  fail. Mutation-verified four ways, including that control.
+  WHAT I DO NOT HAVE is a general instrument. `mutate.sh survey` finds a line the tests do
+  not depend on; it cannot find a WIRING nobody asserted, because the call site is exercised
+  and the mutation that matters is an argument swap between two valid names. All three
+  instances would have been caught by one question asked at review time — "which test fails
+  if these two agree with each other and with nothing else?" — and that is a question, not a
+  check. Logging it as a third instance rather than proposing prose, because the count is
+  the argument and I do not yet know what the mechanism is.
