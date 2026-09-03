@@ -4294,3 +4294,362 @@ FIX: The signal already exists and does not reach far enough. The SessionStart
   entry stays until a lane that pays the cost confirms the notice reaches them.
 
 ---
+
+## A first-ever server start claimed an earlier process died unannounced
+VALIDATED: amux-testing-e2e | Verified in crates/amux-server/src/lib.rs:~299-328: boot provenance now checks whether the DB existed BEFORE Store::open could create it, before logging 'boot: UNANNOUNCED'. First boot no longer claims an unannounced prior-process death. Shipped in commit 43d0ec84, an ancestor of the running server build (commit 6cb3bcc1, confirmed via /health).
+AREA: runtime
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-1 (source audit epic)
+SYMPTOM: Every fresh Playwright home logged `boot: UNANNOUNCED` and stated that
+  “the previous process stopped” even though its database had never existed and no
+  predecessor was possible.
+COST: Normal installation and isolated-test startup produced a death warning, teaching
+  log-pattern detection to count a fabricated restart failure and obscuring genuine
+  crashes that use the same signal.
+FIX: Boot provenance now considers whether the database existed before `Store::open`
+  could create it. First boot, self-adoption and an existing-store restart without a
+  marker have distinct outcomes; filesystem uncertainty fails closed as an existing
+  store so a real unannounced restart is never mislabeled. Tests pin all branches.
+
+---
+
+## Isolated browser-test servers still monitored and mutated the real host fleet
+VALIDATED: amux-testing-e2e | Verified in crates/amux-server/src/runtime_jobs/mod.rs:156-160 and registry.rs:748,1369,1441: AMUX_ISOLATED/AMUX_NO_FLEET is now checked at all three job constructors (periodic, long-lived, adopted), registering an inert System Jobs row instead of acting. Shipped in commit 43d0ec84.
+AREA: isolation
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-1 (source audit epic)
+SYMPTOM: Each Playwright project had a private `AMUX_HOME`, but long-lived jobs
+  still inspected the shared tmux socket, process table, repository and user hook
+  files. A one-spec run opened four incidents about the real fleet in its temporary
+  database, filed disk/CI cards, and ran three host cleanup sweeps.
+COST: E2E results depended on ambient machine state and test servers could resize,
+  nudge, clean up or diagnose production workers despite claiming an isolated home.
+FIX: The existing `AMUX_ISOLATED=1` contract now applies at all three common job
+  constructors: periodic, long-lived and adopted loops. Suppressed work registers an
+  inert System Jobs row with the exact switch, and adopted tasks are aborted before
+  acting. The browser harness enables the process-wide switch; regression tests prove
+  spawned and adopted futures perform no effect while remaining observable.
+
+## Zombie reporting flooded every server log with one warning per foreign process
+VALIDATED: amux-testing-e2e | Verified in crates/amux-server/src/runtime_jobs/mac_health.rs: zombie_log_sample() aggregates PID/parent/age samples into one structured warning with total/owned/foreign counts (fn owned_zombie_children, zombies_seen/zombies_reaped counters at ~L401-421) instead of one WARN line per PID. Shipped in commit 43d0ec84.
+AREA: runtime
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-1 (source audit epic)
+SYMPTOM: Starting the three isolated browser-test servers on a host with accumulated
+  foreign zombies emitted hundreds of identical WARN lines per server, one for each
+  PID, before a single test began.
+COST: The useful scheduler and browser output was truncated, recurring-log analysis
+  saw a manufactured error pattern, and every 30-minute sweep would repeat an
+  unbounded warning storm for processes this server correctly cannot reap.
+FIX: Each sweep now emits one structured zombie warning with total, owned and foreign
+  counts plus at most eight PID/parent/age samples. Owned children still produce their
+  individual reap outcome because those are actions; the periodic summary retains the
+  full count, and a regression test pins the sample bound and ownership context.
+
+## Slim card hydration left the visible Details text blank
+VALIDATED: amux-testing-e2e | Verified live in crates/amux-dashboard/static/app.js:26384-26391 (_bdHydrate): when #bd-tab-preview is the active tab, hydration now repaints #bd-preview's innerHTML from the freshly hydrated desc, not just the hidden edit textarea. e2e/lineage-tab.spec.ts was replaced by e2e/card-details.spec.ts in the same commit (43d0ec84), which exists in the current tree.
+AREA: dashboard
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-5
+SYMPTOM: The board list correctly omitted full descriptions, and card hydration
+  filled the hidden edit textarea, but the active Details renderer was not repainted.
+  A card could therefore show relationships and assets while hiding its task context
+  until someone manually switched tabs.
+COST: The primary card view omitted the source work description, undermining the
+  card's role as the complete work record and making a healthy API response look like
+  missing data.
+FIX: Authoritative hydration now repaints Details only when that tab is still active,
+  preserving a user who switched to Edit or Worker actions while the request was in
+  flight. The former Lineage browser spec now exercises this real slim-to-detail path,
+  multiple clickable assets, worker actions, edit-only controls, legacy link fallback,
+  mobile targets, and overflow.
+
+## Deliberately idle or disabled jobs became false autofix incidents
+VALIDATED: amux-testing-e2e | Verified in crates/amux-server/src/runtime_jobs/registry.rs:102,251,491-492 (SELF_ADOPT registered inert under AMUX_NO_SELF_ADOPT) and telegram_poll.rs's live-cadence recording. Shipped in commit 43d0ec84.
+AREA: scheduler
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-1 (source audit epic)
+SYMPTOM: The full browser suite deliberately sets `AMUX_NO_SELF_ADOPT=1`, but
+  System Jobs reported `self-adoption` as `not_spawned`. An unconfigured Telegram
+  connector slept for its documented five minutes while its registry advertised a
+  45-second cadence, so it was reported `stalled` after 127.5 seconds. Autofix then
+  filed both expected states as failures.
+COST: Healthy test servers accumulated bogus repair cards and red scheduler logs,
+  obscuring real failures and perturbing board assertions during long E2E runs.
+FIX: Deliberate self-adoption opt-out now registers an inert job with the exact
+  disabling switch. Telegram records its live cadence atomically with each tick—45
+  seconds when configured, 300 while idle—and starts with the conservative cadence
+  so spawn scheduling cannot create a false first-tick window. The catalog describes
+  these mechanism-owned states rather than independently guessing them.
+
+## Time-only capture dedup discarded distinct commands before a model saw them
+VALIDATED: amux-testing-e2e | Verified in crates/amux-server/src/api/session_verbs.rs mint_capture_card (~L3609-3631): the dedup query now checks COUNT(*) FROM cmd_history WHERE session=? AND text=? (exact match) AND card_id IS NOT NULL AND ts>cutoff — not a blanket 'any open card in this session' gate. A distinct rapid follow-up cards normally.
+AREA: harness
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-1 (source audit epic)
+SYMPTOM: The direct send path treated every cardable prompt within 45 seconds of
+  another capture as a retry, even when the text and task were different. The
+  orchestrator variant discarded every new command whenever any agent card was open.
+COST: Follow-up work vanished before the underlying model could relate, merge,
+  prioritize, or decompose it—the harness made a capability decision in a boolean
+  shim and then gave the model no opportunity to recover.
+FIX: The direct path now dedupes only an exact recent prompt already linked to a
+  card; the durable orchestrator path relies on its existing message-id command
+  idempotency rather than adding a second text heuristic. Distinct rapid commands
+  always enter the work ledger, including while another card is open, so the worker
+  model can decide their correct relationship and ordered plan. Tests pin transport
+  retry and distinct/repeated durable-message outcomes.
+
+## Repeated schedule failures never became one repair incident
+VALIDATED: amux-testing-e2e | Verified in crates/amux-server/src/runtime_jobs/autofix.rs: schedule_error_pattern()/schedule_error_streak() group consecutive failed runs into one incident once streak.len() >= schedule_error_streak() (default reflected at L2828-2863), and refused/queued/success outcomes break the streak per L398.
+AREA: scheduler
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-1 (source audit epic)
+SYMPTOM: The live Granola transcript schedule accumulated six consecutive
+  traceback runs, but scheduler health remained green because the firing loop
+  itself still ticked. A `delivered` run also had no closed-loop check that its
+  command appeared in Messages.
+COST: Recurring failures stayed as rows a human had to notice and correlate; a
+  delivery log could claim success while the worker-facing message ledger lacked
+  the artifact that proves it.
+FIX: Autofix now groups consecutive error notes into stable patterns and files one
+  durable incident after three failures; refused/queued/success outcomes break the
+  streak. Confirmed deliveries carry a clickable `[SCHED-N]` origin and are checked
+  against Messages after a grace period. The System Jobs predicate also feeds
+  autofix directly, including stalled, dead, hung, missing, and over-budget ticks.
+
+## Scheduler health showed a dead Telegram relay beside an undocumented live duplicate
+VALIDATED: amux-testing-e2e | Verified in crates/amux-server/src/runtime_jobs/registry.rs:117: pub const TELEGRAM_RELAY = "telegram-relay" is now the single id constant used at both the spawn site and the catalog row, so a name-drift becomes a compile/test failure rather than two live identities.
+AREA: scheduler
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-1 (source audit epic)
+SYMPTOM: The live System Jobs section reported catalogued `telegram-relay` as
+  `not_spawned` while a separate undocumented `telegram_relay` row ticked every
+  30 seconds. Five other stable periodic jobs also rendered as "Undocumented job".
+COST: The health surface raised a false red alarm for a working relay and could
+  not explain accountability, context, disk, status-history, or token-ledger jobs;
+  operators could not distinguish a missing spawn from a spelling drift.
+FIX: Every stable periodic job now uses a registry id constant at its spawn site
+  and has a catalog contract. Telegram relay uses the same hyphenated constant as
+  its catalog row, so a future name drift is a compile/test failure rather than a
+  second live job identity.
+
+## Periodic process cleanup described rustc zombies but never implemented that sweep
+VALIDATED: amux-testing-e2e | Verified in crates/amux-server/src/runtime_jobs/mac_health.rs:14,36,74,237,244,373-407: orphaned_debug_rustc() sends SIGTERM only to aged pid-1 rustc processes targeting target/debug, and a separate true-zombie (state=Z) sweep does non-blocking waitpid only for aged children of this exact server process. Both counts are in the periodic tick log. Shipped in commit 43d0ec84.
+AREA: runtime
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-1 (source audit epic)
+SYMPTOM: The registered 30-minute `mac-health` job reaped orphaned Ray workers
+  and Playwright Chrome roots, but its own module contract also promised orphaned
+  debug rustc cleanup and had no corresponding code. True process-table zombies
+  were neither counted nor distinguished from still-running orphans.
+COST: Interrupted builds could leave parentless compilers consuming CPU and memory,
+  while dead children could accumulate PID-table entries with no periodic signal
+  to their amux parent and no observable machine-health count.
+FIX: The existing registered job now takes a state-bearing process snapshot, sends
+  SIGTERM only to aged pid-1 rustc processes proven to target `target/debug`, and
+  detects true `Z` processes. Because a zombie child is already dead, it calls
+  non-blocking `waitpid` only for aged children of this exact server process and
+  merely reports foreign-parent zombies. Every count is included in the periodic
+  tick log; fixtures pin ownership, age, malformed input, debug/release and
+  living-parent negative controls. The System Jobs catalog exposes every grace.
+
+## Informational questions could consume board ids and WIP slots
+VALIDATED: amux-testing-e2e | Empirically re-verified today: extracted is_informational_query/is_status_query/capture_has_task_followup from crates/amux-core/src/board.rs into a standalone Rust program and ran it against the literal ATE-14 prompt text ('What is the difference between todo and backlog on this board? Please answer only; do not change anything.') -> returns true (informational, not carded). The fix (commit 53b3e952, 2026-09-02 19:06) landed AFTER ATE-14 was minted (18:06) by the pre-fix binary, which is exactly the SYMPTOM this entry describes. Confirmed 53b3e952 is an ancestor of the currently running server build (commit 6cb3bcc1 per /health). A later message in this same session asking the identical question ('What is the difference between todo and backlog on this board?') did NOT mint a new card, only ATE-14 (pre-fix) did — direct before/after confirmation. Both session_verbs.rs::mint_capture_card and the drain path gate on is_informational_query.
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-1 (source audit epic)
+SYMPTOM: Prompt capture had a narrow exception for status and `why` questions,
+  while ordinary answer-only prompts such as "what is the difference between todo
+  and backlog?" could still be treated as code work. Direct, queued and orchestrator
+  delivery did not all consult the same non-task predicate.
+COST: Conversation-only questions could create cards with no durable deliverable,
+  occupy WIP, enter decomposition/drive, and make the source message look like
+  unfinished work after the answer had already been given.
+FIX: A shared deterministic informational-intent boundary now keeps question-word,
+  plain yes/no/advice, and explicit answer-only prompts in Messages. Imperative
+  follow-ups and operational checks such as "does this build?" remain cardable.
+  Direct, queued, orchestrated and invariant-reader paths all consume the same
+  predicate; tests pin the message-without-card outcome and false-positive controls.
+
+## Task detail hid the gates, sources, relationships and produced assets needed to audit it
+VALIDATED: amux-testing-e2e | Verified in crates/amux-server/src/api/board.rs: card_effective_gates (~L939), asset_links with resolved_ref (~L3310-3323), and effective_gate_with_source (~L885) are all present in the task detail response. e2e/card-details.spec.ts (added by 43d0ec84) exercises this path; e2e/lineage-tab.spec.ts (dead surface) was removed in the same commit.
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-5
+SYMPTOM: A completed card exposed Edit, an empty Preview, History and Lineage, but
+  not one coherent audit view. The empty gate override did not show the effective
+  column gates; source messages and task relationships were scattered; created files
+  appeared only in prose; and opening an empty group field dumped a fleet-wide list
+  of detector/autofix suggestions unrelated to the task.
+COST: A reviewer could not establish from the card what command created it, which
+  epic/dependencies governed it, which gates it passed, what every worker action was,
+  or open the files and URLs it produced.
+FIX: The task API now returns resolved structured and inferred asset links plus the
+  effective gate trail. The card's Details view groups facts, exact source-message
+  links, epic/parent/child/dependency relationships, gates, work summary, multiple
+  clickable assets, and recent actions with a link to the full activity list.
+  Empty group input no longer invents suggestions; dead Preview/Lineage surface area
+  is removed from the detail UI, and displayed `MSG-N` links perform exact ID lookup.
+
+## Codex could read idle while working, then working after completion
+VALIDATED: amux-testing-e2e | Verified in crates/amux-server/src/api/session_verbs.rs:2359-2377: for Codex-family workers, status now maps ('turn.started'|'event_msg'/'task_started') -> active and ('turn.completed'|'event_msg'/'task_complete') -> idle from the structured rollout stream, overriding stale tmux activity signals.
+AREA: status
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-10
+SYMPTOM: During a real Codex gpt-5.5 run the embedded terminal visibly said Working
+  while the Workers card said idle and 41 minutes old. After the completed turn had
+  returned to an idle prompt, the card said working. Tmux activity time is not a
+  trustworthy lifecycle clock for Codex's alternate-screen UI, and pane churn after
+  completion can outvote the visible prompt.
+COST: Supervisors could start duplicate work during an active turn or wait forever
+  on work that had already completed, including turns that created real subagents.
+FIX: For Codex-family workers, status now reads the structured rollout lifecycle
+  (`task_started`/`task_complete`, plus equivalent turn events), ignores signals from
+  before the current session start, and uses those boundaries to override stale tmux
+  activity without overriding an explicit waiting prompt.
+
+## Claude subagent work was invisible to live worker status
+VALIDATED: amux-testing-e2e | Verified in crates/amux-server/src/api/session_verbs.rs: subagent_events_accumulate_a_floored_live_count (test at ~L20388) and the surrounding SubagentStart/SubagentStop handling (~L14670-14671) confirm a floored live count that survives main-agent report updates.
+AREA: status
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-10
+SYMPTOM: Two real Claude subagents created files while the embedded terminal showed
+  `2 agents`, but the Workers card remained idle for the entire 31-second window.
+  The installed hook set had prompt/tool/stop events only; it omitted
+  `SubagentStart` and `SubagentStop`. A later main-agent report also replaced the
+  full report object, erasing any subagent count, while subagent updates neither
+  invalidated the sessions cache nor emitted the normal session SSE event.
+COST: The status surface contradicted the actual terminal precisely during delegated
+  work, and could remain stale until an unrelated refresh.
+FIX: Installation now idempotently merges all five Claude lifecycle hooks while
+  preserving unrelated settings. Subagent reports keep a floored live count,
+  preserve that count across main-agent updates, invalidate the cache, and emit the
+  ordinary session update event. Hook, invariant, cache and SSE regressions cover it.
+
+## Cross-group worker permission looked saved, then silently reset
+VALIDATED: amux-testing-e2e | Verified live in crates/amux-dashboard/static/app.js:308-370: readCrossGroupDefault()/toggleCrossGroupDefault() reject a locally-queued (_isLocallyQueued) response, then re-GET after PUT and roll back the visible switch unless the authoritative read-back matches the intended value. The /api/config/cross-group route is excluded from the offline outbox queue matcher (_OUTBOX_SKIP, L2263). NOTE: I could not find a dedicated browser-contract test file covering the queued/read-back-mismatch/failure cases the FIX text describes (grepped repo-wide for the relevant JS identifiers, none found outside app.js itself) -- the behavioral fix is real and verified by reading the code, but that specific test-coverage claim is unconfirmed.
+AREA: settings
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-1 (source audit epic)
+SYMPTOM: Enabling "Allow workers to message beyond groups" in Settings immediately
+  returned the switch to off. The global offline outbox synthesized an HTTP 202
+  for `/api/config/cross-group`; the settings caller accepted that queued response
+  as durable server state, and its error path did not restore the prior value.
+COST: Operators were shown permission state that was never persisted, so workers
+  could not reliably use the intended routing policy after a refresh or outage.
+FIX: The cross-group route is no longer queueable. The toggle now rejects locally
+  synthesized responses, reads the setting back after PUT, and visibly rolls back
+  on transport failure or a mismatched server value. A browser-contract test covers
+  the real response, queued response, read-back mismatch, and failure cases.
+
+## Task artifacts existed outside the task's attributed action history
+VALIDATED: amux-testing-e2e | Verified in crates/amux-server/src/api/board.rs create_artifact (~L7655-7760): appends an attributed bs::append_log entry and a PendingEvent, and amux CLI has 'amux board artifact' (amux:2448-2471) wired to it.
+AREA: attribution
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-2
+SYMPTOM: The structured artifact API existed, but workers had no board CLI verb
+  for it and registering an artifact did not add an attributed action to the task log.
+COST: Files, URLs, commits and screenshots fell back to prose; the task could not
+  answer who attached an asset or expose it as a direct link in detail.
+FIX: e139be2d adds `amux board artifact`, validates artifact kind/state, appends an
+  attributed task-history event, emits a greppable registration log, and returns
+  artifacts in the authoritative task detail response.
+
+## Opening a fresh board card showed older status, owner and history than the board itself
+VALIDATED: amux-testing-e2e | Verified via crates/amux-server/tests/dashboard_assets.rs::board_detail_hydration_refreshes_authoritative_state_and_relations (added by e139be2d) pinning _bdHydrate; re-checked live against current app.js: boardDetailStatus = full.status, _populateSessionSelect('bd-session', full.session...), _bdRenderMeta(merged), full.due_time, full.tags are all present (L26373-26409).
+AREA: board
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-3
+SYMPTOM: The board list showed ATE-3 done, but its detail view showed To Do or In
+  Progress, owner none, `No status posted yet`, and empty History while Lineage
+  showed 29 events. The detail GET arrived, but hydration refreshed only desc/log.
+COST: The audit had to cross-check list, detail and lineage for every transition;
+  any single surface supported the wrong conclusion.
+FIX: e139be2d refreshes every authoritative detail field when the user has not
+  edited it, and renders one linked view of epic, children, dependencies, source
+  messages, work summary and artifacts.
+
+## Board create visibly selected an owner and groups, then the server discarded both
+VALIDATED: amux-testing-e2e | Verified via crates/amux-server/tests/dashboard_assets.rs::board_create_uses_the_server_field_names (added by e139be2d); re-checked live against current app.js addBoardItem: sends session: worker || '' and tags: groups || [] (not worker:/groups:), at L26740 and L26746.
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: AMUX-4047
+SYMPTOM: Creating a card in the dashboard with worker amux-testing-e2e and groups
+  selected produced `Not saved: server ignored groups, worker`; AMUX-4047 and
+  AMUX-4048 landed as duplicate, unowned backlog cards with no tags.
+COST: Two junk cards were created during one browser audit, and neither could be
+  driven by the worker the UI showed as selected.
+FIX: e139be2d makes both optimistic state and POST/PATCH payloads use the server's
+  real `session` and `tags` fields, with a static regression check at the wire boundary.
+
+## A multi-part prompt became unrelated leaves and the message reported only the first leaf
+VALIDATED: amux-testing-e2e | Verified in crates/amux-server/src/api/board.rs: decompose_item/validate_decomposition (~L3416-3471) require priority 0-3 and a concrete next_action, and the epic/child linkage is a single attributed transaction. Shipped in commit e139be2d, an ancestor of the running server build.
+AREA: scheduler
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-02
+SESSION: amux-testing-e2e
+CARD: ATE-1
+SYMPTOM: MSG-39225 captured as ATE-1, then the worker hand-created ATE-2 and
+  ATE-3 without an epic, structured dependency edge, or priority. The scheduler
+  selected ATE-3 before ATE-2, hit the WIP gate, and repaired the ordering only
+  after the refusal. The Messages chip stayed attached to ATE-1, which had been
+  reshaped as one leaf and reached done while the rest of the command remained open.
+COST: A supposedly automatic command required manual plan reconstruction; the
+  source message gave a false completion signal and work ran in the wrong order.
+FIX: e139be2d adds one attributed, idempotent decomposition transaction. The
+  capture remains the message-linked epic; children require p0-p3 priority,
+  earlier-step dependencies, concrete next actions and a common owner. The drive
+  loop completes the epic when all children are terminal.
