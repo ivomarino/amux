@@ -259,6 +259,43 @@ pub fn clean_locks(dir: &Path) -> Vec<String> {
     removed
 }
 
+/// PID Chrome records in the `SingletonLock` symlink (`<host>-<pid>`).
+///
+/// Chrome places the lock at the USER-DATA-DIR level, not inside the selected
+/// `--profile-directory`. That distinction matters for profiles from the
+/// human's normal Chrome: launching `Profile 7` while `Default` is open still
+/// delegates the URL to the already-running Chrome process. Parsing from the
+/// right keeps hostnames containing dashes valid.
+fn singleton_lock_owner_pid(dir: &Path) -> Option<u32> {
+    let target = std::fs::read_link(dir.join("SingletonLock")).ok()?;
+    let target = target.to_string_lossy();
+    let (_, pid) = target.rsplit_once('-')?;
+    let pid = pid.parse::<u32>().ok()?;
+    (pid != 0).then_some(pid)
+}
+
+/// A live Chrome outside amux already owns this human user-data-dir.
+///
+/// Never infer this from lock PRESENCE alone: Chrome can leave stale locks
+/// after a crash. The PID recorded in `SingletonLock` must still be alive, and
+/// it must not be one of amux's registered browsers (a same-profile restart is
+/// allowed to reach the normal stop-and-replace path below).
+fn unmanaged_live_lock_owner(home: &Path, dir: &Path) -> Option<u32> {
+    if is_amux_owned(home, dir) {
+        return None;
+    }
+    let pid = singleton_lock_owner_pid(dir)?;
+    if !pid_alive(pid) {
+        return None;
+    }
+    let managed = RUNNING
+        .lock()
+        .expect("browser registry poisoned")
+        .values()
+        .any(|r| r.pid == pid);
+    (!managed).then_some(pid)
+}
+
 /// Startup reconcile: at boot no amux-launched Chrome exists, so any lock in
 /// an amux-owned profile dir is stale by definition and blocks the next
 /// launch. Returns (dir, removed-locks) pairs so the caller can log WHAT was
@@ -1180,10 +1217,6 @@ pub async fn start(
     started_by: &str,
     headless: bool,
 ) -> anyhow::Result<StartedBrowser> {
-    let binary = chrome_binary().ok_or_else(|| {
-        anyhow::anyhow!("no Chrome/Chromium binary found (looked in /Applications and PATH)")
-    })?;
-
     // A Chrome from a PREVIOUS server process may still hold this profile. The
     // RUNNING registry is in-memory and does not survive the builder's constant
     // re-exec, so start() used to be blind to that orphan: it checked only
@@ -1195,6 +1228,39 @@ pub async fn start(
     // before the replace-check, so the orphan is STOPPED rather than delegated to.
     let target = launch_target(home, &chrome_user_data_dir(), profile);
     reconcile_orphan_before_launch(home, &target.user_data_dir).await;
+
+    // A profile inside the HUMAN'S Chrome directory shares one SingletonLock
+    // across every profile in that Chrome process. If the human Chrome is
+    // running, spawning another `Google Chrome` does not fail harmlessly: it
+    // hands the URL to the existing, non-debuggable process and exits 0. A
+    // retry loop therefore opens one real tab per retry (MO-3146: tubescience
+    // opened dozens before the user noticed).
+    //
+    // Fail BEFORE spawn. We neither stop the human's process nor remove its
+    // lock; both would mutate state amux does not own. The typed 409 tells an
+    // agent not to retry and gives both honest exits: fully quit Chrome once,
+    // or drive the live browser through /chrome-cdp after enabling remote
+    // debugging. The WARN is deliberately stable and carries a verdict so a
+    // log sweep sees prevented incidents rather than only the user's tab bar.
+    if let Some(owner_pid) = unmanaged_live_lock_owner(home, &target.user_data_dir) {
+        tracing::warn!(
+            profile,
+            owner_pid,
+            dir = %target.user_data_dir.display(),
+            verdict = "prevented_before_spawn",
+            retryable = false,
+            "browser: prevented launch into a live human Chrome — retrying would open another tab (MO-3146)"
+        );
+        return Err(anyhow::Error::new(ExternalProfileInUse {
+            profile: profile.to_string(),
+            user_data_dir: target.user_data_dir,
+            owner_pid,
+        }));
+    }
+
+    let binary = chrome_binary().ok_or_else(|| {
+        anyhow::anyhow!("no Chrome/Chromium binary found (looked in /Applications and PATH)")
+    })?;
 
     // ONE BROWSER PER PROFILE, and only this profile (AMUX-3828). This used to
     // stop whatever was running, which is what made the browser a machine
@@ -1905,6 +1971,37 @@ impl std::fmt::Display for ProfileDelegated {
 }
 
 impl std::error::Error for ProfileDelegated {}
+
+/// A live, non-amux Chrome owns the user-data-dir needed for this profile.
+///
+/// Typed so the API can return a structured, non-retryable 409 without
+/// message matching. Unlike [`ProfileDelegated`], this is detected BEFORE a
+/// Chrome process is spawned, so `spawned:false` is a fact the caller can use.
+#[derive(Debug)]
+pub struct ExternalProfileInUse {
+    pub profile: String,
+    pub user_data_dir: PathBuf,
+    pub owner_pid: u32,
+}
+
+impl std::fmt::Display for ExternalProfileInUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Chrome profile {:?} uses the human Chrome data directory {}, which is already \
+             locked by live process {}. amux did not launch Chrome: Chrome would hand the URL \
+             to that existing window, and every retry would open another tab. Do not retry \
+             while this 409 persists. Fully quit Chrome (all windows) and retry once, or \
+             enable remote debugging at chrome://inspect/#remote-debugging and use \
+             /chrome-cdp to drive the live browser.",
+            self.profile,
+            self.user_data_dir.display(),
+            self.owner_pid
+        )
+    }
+}
+
+impl std::error::Error for ExternalProfileInUse {}
 
 /// Is a Chrome that exited BEFORE CDP bound the delegation signature?
 ///
@@ -3666,6 +3763,49 @@ mod tests {
         assert!(removed.contains(&"SingletonCookie".to_string()));
         assert!(locks_present(&prof).is_empty(), "locks actually gone");
         assert!(prof.join("Preferences").exists(), "profile CONTENTS untouched");
+    }
+
+    /// MO-3146: a live lock on the HUMAN Chrome dir must be detected before
+    /// spawn. Chrome's exit-0 delegation is not harmless — every attempted
+    /// launch opens one more tab in the existing browser.
+    #[cfg(unix)]
+    #[test]
+    fn live_human_chrome_lock_is_a_pre_spawn_conflict_but_a_stale_lock_is_not() {
+        let home = fake_home();
+        let human_chrome = home.path().join("human-chrome-data");
+        std::fs::create_dir_all(&human_chrome).unwrap();
+        let lock = human_chrome.join("SingletonLock");
+
+        // SPECIMEN: the real lock on the incident machine was
+        // `ethan-m1-4.local-97230`; dashes in the hostname must not confuse
+        // the pid parser.
+        let me = std::process::id();
+        std::os::unix::fs::symlink(format!("ethan-m1-4.local-{me}"), &lock).unwrap();
+        assert_eq!(singleton_lock_owner_pid(&human_chrome), Some(me));
+        assert_eq!(
+            unmanaged_live_lock_owner(home.path(), &human_chrome),
+            Some(me),
+            "a live non-amux owner must stop the launch before Chrome sees its URL"
+        );
+
+        // CONTROL 1: lock presence is not liveness. A crashed Chrome can leave
+        // this symlink behind; treating every leftover as live would wedge the
+        // human profile forever.
+        std::fs::remove_file(&lock).unwrap();
+        let mut exited = std::process::Command::new("true").spawn().unwrap();
+        let stale_pid = exited.id();
+        exited.wait().unwrap();
+        std::os::unix::fs::symlink(format!("host-{stale_pid}"), &lock).unwrap();
+        assert_eq!(unmanaged_live_lock_owner(home.path(), &human_chrome), None);
+
+        // CONTROL 2: amux-owned dirs use the existing stale-lock cleanup and
+        // tracked-browser replacement path. This guard must never turn that
+        // ordinary path into a human-Chrome refusal.
+        std::fs::remove_file(&lock).unwrap();
+        let owned = home.path().join("playwright-auth/profiles/x");
+        std::fs::create_dir_all(&owned).unwrap();
+        std::os::unix::fs::symlink(format!("host-{me}"), owned.join("SingletonLock")).unwrap();
+        assert_eq!(unmanaged_live_lock_owner(home.path(), &owned), None);
     }
 
     #[test]

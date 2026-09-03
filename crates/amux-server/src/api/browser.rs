@@ -1030,7 +1030,10 @@ async fn start(
             }
             Json(v).into_response()
         }
-        Err(e) => err(start_status(&e), json!({ "error": with_cause(&e) })),
+        Err(e) => {
+            let (status, body) = start_failure(&e);
+            err(status, body)
+        }
     }
 }
 
@@ -1051,11 +1054,35 @@ async fn start(
 /// reason: this error's message is a hint someone will reword, and a status that
 /// depends on wording breaks the first time they do.
 fn start_status(e: &anyhow::Error) -> StatusCode {
-    if e.downcast_ref::<chrome::ProfileDelegated>().is_some() {
+    if e.downcast_ref::<chrome::ProfileDelegated>().is_some()
+        || e.downcast_ref::<chrome::ExternalProfileInUse>().is_some()
+    {
         StatusCode::CONFLICT
     } else {
         StatusCode::BAD_GATEWAY
     }
+}
+
+/// Status plus machine-readable launch verdict. The external-profile conflict
+/// is the one state where an undifferentiated error string is actively unsafe:
+/// retrying it opens another tab in the human's Chrome. Keep the ordinary
+/// failure shape unchanged; enrich only the typed pre-spawn refusal.
+fn start_failure(e: &anyhow::Error) -> (StatusCode, Value) {
+    let status = start_status(e);
+    let mut body = json!({ "error": with_cause(e) });
+    if let Some(conflict) = e.downcast_ref::<chrome::ExternalProfileInUse>() {
+        body["error_code"] = json!("human_chrome_profile_in_use");
+        body["retryable"] = json!(false);
+        body["spawned"] = json!(false);
+        body["profile"] = json!(conflict.profile);
+        body["lock_owner_pid"] = json!(conflict.owner_pid);
+        body["user_data_dir"] = json!(conflict.user_data_dir.display().to_string());
+        body["use_instead"] = json!({
+            "live_browser": "/chrome-cdp after enabling chrome://inspect/#remote-debugging",
+            "saved_profile": "fully quit Chrome, then retry POST /api/browser/start once"
+        });
+    }
+    (status, body)
 }
 
 async fn status() -> Response {
@@ -2396,6 +2423,27 @@ mod tests {
         // card, in the log-sweep contract's cleared AMUX-3689 line, and in the
         // hint callers read. Typing the error must not reword it.
         assert_eq!(delegated.to_string(), msg);
+
+        // MO-3146: the PRE-SPAWN version of the conflict is also 409, and its
+        // body is explicit that retrying is unsafe. This is what prevents an
+        // agent's retry watcher from turning one locked profile into dozens of
+        // user-visible tabs.
+        let external = anyhow::Error::new(chrome::ExternalProfileInUse {
+            profile: "ethan-tubescience".into(),
+            user_data_dir: "/Users/ethan/Library/Application Support/Google/Chrome".into(),
+            owner_pid: 97230,
+        });
+        let (status, body) = start_failure(&external);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error_code"], "human_chrome_profile_in_use");
+        assert_eq!(body["retryable"], false);
+        assert_eq!(body["spawned"], false);
+        assert_eq!(body["lock_owner_pid"], 97230);
+        assert_eq!(body["profile"], "ethan-tubescience");
+        assert!(body["use_instead"]["live_browser"].as_str().unwrap().contains("/chrome-cdp"));
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("every retry would open another tab"), "{error}");
+        assert!(error.contains("Do not retry"), "{error}");
     }
 
     /// The SEAM between "what Chrome did" and "which error type gets built".
