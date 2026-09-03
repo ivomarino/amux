@@ -2762,3 +2762,41 @@ FIX: not chosen — three candidates land in different places and it is a data-m
  one reader. Workaround that works today and is documented nowhere: PATCH
  archived:0, then done. Companion entry: the refusal message is correct and only
  reaches you when you ACT, never where the card is listed (AF-461).
+
+## The escape hatch the nudge advertises is what builds the pile it complains about
+
+AREA: notices
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-03
+SESSION: amux-frustrations
+CARD: AF-465
+SYMPTOM: two false promises in the board loop, in the same family. (1) The needs:you
+ re-nag said "Re-state it on the card (silences this for 3d)"; both silence checks in
+ `needsyou_renag_text` are gated on `last_ts > 0.0`, so the FIRST fire skips them and
+ re-stating does nothing. (2) The verify-nudge told lanes that a card they cannot
+ verify "should be tagged `needs:you` so they surface in the owner digest rather than
+ sitting here indefinitely" — and THE OWNER DIGEST DOES NOT EXIST. No job in
+ `registry.rs` builds one, no runtime job selects needs:you cards into one, `digest`
+ appears nowhere in live `/api/health`, and `review.rs`'s `digest_dir()` only SERVES
+ `docs/weekly-review`, which holds two files both dated Aug 1 with no producer. The
+ only surviving trace is a past-tense comment (`autofix.rs:6617`) about a digest that
+ "emitted 92 cards in one SMS". Tagging needs:you moves a card to a dashboard view
+ nobody is pushed to.
+COST: this is a mechanism for the pile, not a coincidence beside it. ~/.claude/CLAUDE.md
+ records "445 cards ... in needsyou with a median age of 15 days, most of which never
+ needed me at all". The loop advertised an escape hatch whose stated benefit does not
+ happen, lanes took it as instructed, and the cards parked. Live specimen, verified:
+ AC-214, a SECURITY escalation (rotate a leaked E2E_COOKIE_SECRET, still unrotated,
+ value present verbatim in a transcript), tagged needs:you on 2026-08-04 — 30 days,
+ correctly tagged, reaching the owner through zero channels. Also cost me a wrong
+ mechanism on (1): I named INSERT OR IGNORE + MIN(added_at) without reading the
+ function that implements the promise.
+FIX: 88f00fbd and cb3e966f, both amux-cloud. (1) The `updated > last_ts` silence is
+ DELETED rather than repaired — one deletion makes the new text true, closes the
+ abuse vector where a lane suppresses a human's ask by re-stating every 3d, and
+ dissolves the first-fire gap. MIN stays as the monotonic clock. (2) The verify-nudge
+ now says tagging moves the card to the dashboard needs:you view, that NOTHING pushes
+ it to the owner today, and to tag only when a human genuinely owes the next step.
+ 105 board_drive tests green. Whether a push surface should EXIST is Ethan's and is
+ deliberately still open.
