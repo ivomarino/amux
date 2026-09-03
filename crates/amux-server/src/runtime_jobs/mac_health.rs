@@ -1,6 +1,6 @@
 //! macOS process health sweep (2026-08-30).
 //!
-//! Four categories of runaway process cost Ethan a power cycle or a restart
+//! Five categories of runaway process cost Ethan a power cycle or a restart
 //! and have no other reaper:
 //!
 //! 1. **Orphaned Ray workers** (`ray::*`). Ray actors that outlive their
@@ -11,32 +11,39 @@
 //!    the raylet is not running AND the worker has been running for longer than
 //!    a short grace period (covers the teardown window).
 //!
-//! 2. **Zombie `rustc` debug processes** that outlived their parent cargo run.
+//! 2. **Orphaned `rustc` debug processes** that outlived their parent cargo run.
 //!    Only relevant when a `cargo check` or `cargo test` was interrupted mid-
 //!    flight. Detected by: parent PID is 1 (reparented to init = orphan) and
 //!    the command line includes the debug target dir.
 //!
-//! 3. **Accumulated `mds_stores` / Spotlight churn** from large build dirs.
-//!    Not killed (that would upset macOS) but logged when RSS > threshold so
-//!    the log sweep can notice the pattern.
+//! 3. **Orphaned Playwright Chrome roots** using a Playwright temporary
+//!    profile whose launcher is gone. Browser-owned profiles are handled by
+//!    `browser_reaper`; this covers launcher crashes before ownership exists.
 //!
 //! 4. **Ghost Claude Code processes** — `claude` processes whose tmux pane no
 //!    longer exists. The existing `ghost_rescue.rs` handles the amux-managed
 //!    subset; this watches the raw-count ceiling (AMUX_MAC_HEALTH_MAX_CLAUDE)
 //!    and logs when it is exceeded so the operator knows before the OOM.
 //!
+//! 5. **True process-table zombies** (`state=Z`). The child is already dead, so
+//!    signalling it cannot clean anything. The sweep calls non-blocking
+//!    `waitpid` only for an aged child owned by this amux-server process;
+//!    zombies owned by another application are reported and left alone.
+//!
 //! WHAT THIS WILL NOT DO:
 //! - Kill a process whose state it cannot verify. Silence is not dead.
 //! - Kill processes the raylet is still using (raylet running = ray is live).
 //! - Kill rustc processes whose parent is NOT pid 1 (they may still be running).
 //! - Take any action on processes it cannot identify by full command line.
+//! - Reap a zombie whose parent is not this exact server process.
 //!
-//! SAFE: every kill here is SIGTERM, not SIGKILL, and every target class has
+//! SAFE: every termination is SIGTERM, not SIGKILL, and every target class has
 //! a predicate that cannot be satisfied by a legitimate process doing real work.
 
 use std::time::Duration;
 
 const JOB: &str = "mac-health";
+const ZOMBIE_LOG_SAMPLE: usize = 8;
 
 fn tick_secs() -> u64 {
     std::env::var("AMUX_MAC_HEALTH_TICK_S")
@@ -62,6 +69,20 @@ fn ray_orphan_grace_s() -> u64 {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(120)
+}
+
+fn rustc_orphan_grace_s() -> u64 {
+    std::env::var("AMUX_MAC_HEALTH_RUSTC_GRACE_S")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(600)
+}
+
+fn zombie_grace_s() -> u64 {
+    std::env::var("AMUX_MAC_HEALTH_ZOMBIE_GRACE_S")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(60)
 }
 
 /// True when a local raylet process is running.
@@ -176,6 +197,96 @@ fn ps_row(line: &str) -> Option<(u32, u32, &str, String)> {
     Some((pid, ppid, etime, cmd))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HealthProcess {
+    pid: u32,
+    ppid: u32,
+    state: String,
+    elapsed_s: u64,
+    command: String,
+}
+
+fn health_process_rows(text: &str) -> Vec<HealthProcess> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let ppid = fields.next()?.parse().ok()?;
+            let state = fields.next()?.to_string();
+            let elapsed_s = parse_etime(fields.next()?)?;
+            let command = fields.collect::<Vec<_>>().join(" ");
+            if command.is_empty() {
+                return None;
+            }
+            Some(HealthProcess { pid, ppid, state, elapsed_s, command })
+        })
+        .collect()
+}
+
+fn health_process_snapshot() -> Option<Vec<HealthProcess>> {
+    let out = std::process::Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,state=,etime=,command="])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(health_process_rows(&String::from_utf8_lossy(&out.stdout)))
+}
+
+fn orphaned_debug_rustc(rows: &[HealthProcess], grace_s: u64) -> Vec<HealthProcess> {
+    rows.iter()
+        .filter(|p| {
+            p.ppid == 1
+                && p.elapsed_s >= grace_s
+                && (p.command.starts_with("rustc ") || p.command.contains("/rustc "))
+                && p.command.contains("--out-dir")
+                && p.command.contains("target/debug")
+        })
+        .cloned()
+        .collect()
+}
+
+fn owned_zombie_children(
+    rows: &[HealthProcess],
+    grace_s: u64,
+    server_pid: u32,
+) -> (Vec<u32>, Vec<HealthProcess>) {
+    let mut owned = Vec::new();
+    let mut visible = Vec::new();
+    for child in rows.iter().filter(|p| p.state.starts_with('Z') && p.elapsed_s >= grace_s) {
+        visible.push(child.clone());
+        if child.ppid == server_pid {
+            owned.push(child.pid);
+        }
+    }
+    (owned, visible)
+}
+
+fn zombie_log_sample(zombies: &[HealthProcess]) -> String {
+    zombies
+        .iter()
+        .take(ZOMBIE_LOG_SAMPLE)
+        .map(|p| format!("pid={}/ppid={}/age={}s", p.pid, p.ppid, p.elapsed_s))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn reap_owned_zombie(pid: u32) -> Result<bool, String> {
+    let mut status: libc::c_int = 0;
+    // SAFETY: waitpid is restricted to one PID observed as an aged zombie
+    // whose parent is this process. WNOHANG guarantees the health tick cannot
+    // block if another waiter wins the race.
+    let rc = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+    if rc == pid as libc::pid_t {
+        Ok(true)
+    } else if rc == 0 {
+        Ok(false)
+    } else {
+        Err(std::io::Error::last_os_error().to_string())
+    }
+}
+
 /// Minimum age (seconds) before an orphaned Playwright Chrome is eligible for
 /// reaping. Short grace covers the window between Chrome launch and the parent
 /// Playwright process registering the PID. Default 300s (5 minutes).
@@ -259,6 +370,8 @@ fn check_claude_count(max: usize) -> usize {
 fn one_pass() {
     let grace = ray_orphan_grace_s();
     let pw_grace = playwright_chrome_grace_s();
+    let rustc_grace = rustc_orphan_grace_s();
+    let zombie_grace = zombie_grace_s();
     let max_claude = max_claude();
 
     // --- Ray orphan sweep ---
@@ -283,6 +396,68 @@ fn one_pass() {
         }
     } else {
         tracing::debug!(job = JOB, "mac-health: raylet running, skipping ray orphan sweep");
+    }
+
+    // --- Orphaned rustc + true zombie sweep ---
+    let mut rustc_reaped = 0usize;
+    let mut zombies_seen = 0usize;
+    let mut zombies_reaped = 0usize;
+    match health_process_snapshot() {
+        Some(rows) if !rows.is_empty() => {
+            let rustc = orphaned_debug_rustc(&rows, rustc_grace);
+            for process in &rustc {
+                tracing::warn!(
+                    job = JOB,
+                    pid = process.pid,
+                    age_s = process.elapsed_s,
+                    "mac-health: SIGTERM orphaned debug rustc whose cargo parent is gone"
+                );
+                let _ = std::process::Command::new("kill")
+                    .args(["-TERM", &process.pid.to_string()])
+                    .output();
+            }
+            rustc_reaped = rustc.len();
+
+            let (owned, zombies) =
+                owned_zombie_children(&rows, zombie_grace, std::process::id());
+            zombies_seen = zombies.len();
+            if !zombies.is_empty() {
+                let foreign = zombies.len().saturating_sub(owned.len());
+                let sample = zombie_log_sample(&zombies);
+                tracing::warn!(
+                    job = JOB,
+                    count = zombies.len(),
+                    owned_by_this_server = owned.len(),
+                    foreign_parent = foreign,
+                    sample = %sample,
+                    sample_limit = ZOMBIE_LOG_SAMPLE,
+                    "mac-health: true zombies detected; foreign children are report-only"
+                );
+            }
+            for pid in owned {
+                match reap_owned_zombie(pid) {
+                    Ok(true) => {
+                        zombies_reaped += 1;
+                        tracing::info!(job = JOB, pid, "mac-health: reaped owned zombie child");
+                    }
+                    Ok(false) => tracing::info!(
+                        job = JOB,
+                        pid,
+                        "mac-health: zombie disappeared before reap (another waiter won)"
+                    ),
+                    Err(error) => tracing::warn!(
+                        job = JOB,
+                        pid,
+                        %error,
+                        "mac-health: waitpid failed; zombie was NOT reported as reaped"
+                    ),
+                }
+            }
+        }
+        _ => tracing::warn!(
+            job = JOB,
+            "mac-health: process-state snapshot unreadable; rustc/zombie cleanup did NOT run"
+        ),
     }
 
     // --- Orphaned Playwright Chrome sweep ---
@@ -327,6 +502,9 @@ fn one_pass() {
         max_claude,
         ray_alive = raylet_running(),
         playwright_chromes_reaped = pw_orphans.len(),
+        rustc_reaped,
+        zombies_seen,
+        zombies_reaped,
         "mac-health tick"
     );
 }
@@ -359,6 +537,59 @@ mod tests {
         assert!(age < 120, "60s < 120s grace, should not be reaped");
         let age2 = parse_etime("03:00").unwrap_or(0);
         assert!(age2 >= 120, "180s >= 120s grace, eligible");
+    }
+
+    #[test]
+    fn orphaned_debug_rustc_is_reaped_but_live_and_release_builds_are_not() {
+        let rows = health_process_rows(
+            " 101 1 S 11:00 /toolchain/bin/rustc crate.rs --out-dir /repo/target/debug/deps\n\
+             102 99 S 11:00 /toolchain/bin/rustc crate.rs --out-dir /repo/target/debug/deps\n\
+             103 1 S 11:00 /toolchain/bin/rustc crate.rs --out-dir /repo/target/release/deps\n\
+             104 1 S 00:20 /toolchain/bin/rustc crate.rs --out-dir /repo/target/debug/deps",
+        );
+        let selected = orphaned_debug_rustc(&rows, 600);
+        assert_eq!(selected.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![101]);
+    }
+
+    #[test]
+    fn zombie_cleanup_only_selects_children_owned_by_this_server() {
+        let rows = health_process_rows(
+            " 200 1 S 20:00 /opt/amux/bin/amux-server\n\
+             201 200 Z 05:00 [helper] <defunct>\n\
+             300 1 S 20:00 /Applications/Other.app/other\n\
+             301 300 Z 05:00 [child] <defunct>\n\
+             401 1 Z 05:00 [orphan] <defunct>\n\
+             402 200 Z 00:10 [young] <defunct>",
+        );
+        let (owned, zombies) = owned_zombie_children(&rows, 60, 200);
+        assert_eq!(owned, vec![201]);
+        assert_eq!(zombies.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![201, 301, 401]);
+    }
+
+    #[test]
+    fn zombie_warning_sample_is_bounded_but_keeps_ownership_context() {
+        let rows = (0..12)
+            .map(|n| HealthProcess {
+                pid: 100 + n,
+                ppid: 200 + n,
+                state: "Z".into(),
+                elapsed_s: 300 + u64::from(n),
+                command: "[child] <defunct>".into(),
+            })
+            .collect::<Vec<_>>();
+        let sample = zombie_log_sample(&rows);
+        assert_eq!(sample.split(", ").count(), ZOMBIE_LOG_SAMPLE);
+        assert!(sample.contains("pid=100/ppid=200/age=300s"));
+        assert!(!sample.contains("pid=108/"), "the log sample must stay bounded: {sample}");
+    }
+
+    #[test]
+    fn malformed_and_empty_process_snapshots_fail_closed() {
+        assert!(health_process_rows("").is_empty());
+        assert!(health_process_rows("not a ps row\n1 nope Z 1:00 cmd").is_empty());
+        let rows = health_process_rows(" 5 1 ? bad /toolchain/bin/rustc --out-dir /x/target/debug");
+        assert!(orphaned_debug_rustc(&rows, 0).is_empty());
+        assert_eq!(owned_zombie_children(&rows, 0, 1), (Vec::new(), Vec::new()));
     }
 }
 

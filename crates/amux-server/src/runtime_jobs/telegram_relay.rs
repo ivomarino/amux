@@ -20,7 +20,7 @@ use crate::api::AppState;
 use crate::db::telegram as tg_db;
 use std::time::Duration;
 
-const JOB: &str = "telegram_relay";
+const JOB: &str = super::registry::ids::TELEGRAM_RELAY;
 
 pub async fn run(state: AppState) {
     loop {

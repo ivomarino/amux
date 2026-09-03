@@ -303,6 +303,16 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
             </label>
           </div>
           <div style="font-size:0.68rem;color:var(--dim);margin-top:3px;">Every new worker starts in YOLO mode (skips permission prompts). Default OFF. You can still toggle YOLO per worker from its &#x22EF; menu.</div>
+          <!-- AMUX-4018: the fleet-wide cross-group default. Per-worker lives on
+               the card menu; this is the "everyone, unless overridden" layer. -->
+          <div class="settings-row" style="justify-content:space-between;align-items:center;margin-top:10px;">
+            <span style="font-size:0.85rem;">Workers may message across groups</span>
+            <label class="theme-toggle">
+              <input type="checkbox" id="crossgroup-default-checkbox" onchange="toggleCrossGroupDefault(this.checked)">
+              <span class="theme-track"><span class="theme-thumb"></span></span>
+            </label>
+          </div>
+          <div style="font-size:0.68rem;color:var(--dim);margin-top:3px;" id="crossgroup-default-note">Default OFF: worker-to-worker messaging stays inside a group unless configured. ON grants every worker a standing allowance, with no per-message approval. A worker-level setting from its &#x22EF; menu still overrides this, and isolated workers stay unreachable either way.</div>
           <div class="settings-row" style="justify-content:space-between;align-items:center;margin-top:10px;">
             <span style="font-size:0.85rem;">Auto-answer resume dialog</span>
             <label class="theme-toggle">
@@ -1880,24 +1890,31 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <button class="btn" onclick="closeBoardDetail()">&#x2190; Back</button>
       <span id="bd-key" class="board-detail-key" onclick="_bdCopyLink()" title="Copy link to this card"></span>
     </div>
-    <button class="btn" onclick="boardDetailDelete()" style="color:var(--red);border-color:rgba(248,81,73,0.3);">Delete</button>
+    <button id="bd-delete" class="btn" onclick="boardDetailDelete()" style="display:none;color:var(--red);border-color:rgba(248,81,73,0.3);">Delete</button>
   </div>
   <div class="board-detail-body">
     <textarea id="bd-title" class="board-detail-title-input" placeholder="Untitled" autocomplete="off" autocorrect="on" spellcheck="true" rows="1" oninput="this.style.height='auto';this.style.height=this.scrollHeight+'px'"></textarea>
     <div id="bd-status-banner" class="bd-status-banner" style="display:none;"></div>
     <div class="board-detail-status-row" id="bd-status-row"></div>
-    <div class="board-detail-row" id="bd-session-row">
+    <div class="board-detail-tabs">
+      <button class="board-detail-tab active" id="bd-tab-preview" onclick="boardDetailTab('preview')">Details</button>
+      <button class="board-detail-tab" id="bd-tab-history" onclick="boardDetailTab('history')">Worker actions<span id="bd-hist-n" class="bd-hist-n"></span></button>
+      <button class="board-detail-tab" id="bd-tab-edit" onclick="boardDetailTab('edit')">Edit</button>
+    </div>
+    <div class="board-detail-meta" id="bd-meta"></div>
+    <div id="bd-edit-fields" style="display:none;">
+      <div class="board-detail-row" id="bd-session-row">
       <span style="font-size:0.78rem;color:var(--dim);">Worker:</span>
       <select id="bd-session" class="board-detail-session-select"></select>
         <button id="bd-goto-session" class="btn" style="display:none;flex:0 0 auto;min-height:44px;font-size:0.78rem;" title="Open this worker's live progress, searched to this card">&#x2192; worker</button>
 
-    </div>
-    <div class="board-detail-row">
+      </div>
+      <div class="board-detail-row">
       <span style="font-size:0.78rem;color:var(--dim);">Due:</span>
       <input type="date" id="bd-due" class="board-detail-session-select amux-dp" style="flex:1;cursor:pointer;">
       <input type="time" id="bd-due-time" class="board-detail-session-select" style="width:110px;cursor:pointer;" title="Time (optional — leave blank for all-day)">
-    </div>
-    <div class="board-detail-row" style="align-items:flex-start;">
+      </div>
+      <div class="board-detail-row" style="align-items:flex-start;">
       <span style="font-size:0.78rem;color:var(--dim);padding-top:7px;">Groups:</span>
       <div style="flex:1;">
         <div class="be-tag-wrap" id="bd-tag-wrap" onclick="document.getElementById('bd-tag-input').focus()">
@@ -1908,26 +1925,19 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         </div>
         <div id="bd-tag-suggestions" class="be-tag-suggestions"></div>
       </div>
-    </div>
-    <div class="board-detail-row" style="align-items:flex-start;">
-      <span style="font-size:0.78rem;color:var(--dim);padding-top:7px;">Gate:</span>
+      </div>
+      <div class="board-detail-row" style="align-items:flex-start;">
+      <span style="font-size:0.78rem;color:var(--dim);padding-top:7px;">Gate override:</span>
       <div style="flex:1;">
         <textarea id="bd-gate" class="board-detail-desc-input" style="min-height:56px;resize:vertical;" placeholder="Gate override — one criterion per line. Leave blank to use the status's default gate."></textarea>
       </div>
-    </div>
-    <div class="board-detail-tabs">
-      <button class="board-detail-tab" id="bd-tab-edit" onclick="boardDetailTab('edit')">Edit</button>
-      <button class="board-detail-tab active" id="bd-tab-preview" onclick="boardDetailTab('preview')">Preview</button>
-      <button class="board-detail-tab" id="bd-tab-history" onclick="boardDetailTab('history')">History<span id="bd-hist-n" class="bd-hist-n"></span></button>
-      <button class="board-detail-tab" id="bd-tab-lineage" onclick="boardDetailTab('lineage')">Lineage</button>
+      </div>
     </div>
     <textarea id="bd-desc" class="board-detail-desc-input" placeholder="Add notes, description, or context... (supports Markdown)"></textarea>
     <div id="bd-log" class="board-detail-log" style="display:none"></div>
-    <div id="bd-lineage" class="board-detail-lineage" style="display:none"></div>
     <div id="bd-preview" class="board-detail-preview md-content" style="display:none;"></div>
-    <div class="board-detail-meta" id="bd-meta"></div>
   </div>
-  <div class="board-detail-footer">
+  <div id="bd-edit-footer" class="board-detail-footer" style="display:none;">
     <span id="bd-save-status" style="font-size:0.78rem;color:var(--dim);"></span>
     <button class="btn primary" onclick="boardDetailSave()">Save</button>
   </div>

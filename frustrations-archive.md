@@ -3681,3 +3681,88 @@ FIX: The structural half is a naming problem the code cannot express: "slim" des
  slim row's desc_len must equal the real desc length, and its desc_head the real first line.
  amux is adding that cell with the revert. Generally: when a payload drops a column, the test
  that matters asserts on what the payload DERIVES from it, not on the column's absence.
+
+## `GET /api/board/contract` advertises a `verified` gate the board does not enforce, and the refusal points you back at it
+VALIDATED: amux-frustrations | VALIDATED by the ORIGINATING session (amux-frustrations). SELF-SIGNOFF, labelled as
+one, not a peer review. Verified by running the entry's own test rather than by
+recalling that something shipped.
+
+THE SYMPTOM IS STILL LITERALLY TRUE, and that is now by design rather than a
+defect. The bare `GET /api/board/contract` still reports investigation.verified as
+["Outcome confirmed to still hold"] and still contains ZERO occurrences of
+"Peer-reviewed by a DIFFERENT worker" — the same control this entry used to prove
+it was not a nesting difference.
+
+WHAT CHANGED IS WHAT THE COST LINE SAID WAS WORTH THE ENTRY: where the refusal
+sends you. Captured from a live 409 on a throwaway investigation card:
+
+  how_to_ack.contract -> "GET /api/board/contract?card=AF-407 (the RESOLVED gate
+  for this card — the bare contract lists only type defaults, AF-112)"
+
+It names the ?card= form, states the bare form's limitation in the same breath, and
+cites this entry by number. And the resolved form is correct: for an investigation
+card in group amux it returns the four-criterion peer gate with
+gate_sources.verified.source = "group", alongside a note reading "this is the gate
+a transition will accept".
+
+So an agent following the sanctioned instruction is no longer refused, which is the
+AMUX-2325 shape this entry was filed under. The probe card was deleted after.
+
+WHAT I AM NOT CLAIMING: that the bare contract is now right for every reader. It
+lists type defaults and a lane whose gate comes from a group or worker scope will
+still see something a transition would refuse. That is documented in the pointer
+rather than fixed in the payload, and it is a deliberate trade — the resolved form
+needs a card id, and the bare form has no card. If it bites someone anyway, the
+honest move is a NEW entry rather than reopening this one, because the friction
+this entry names, the refusal pointing at the wrong source, is gone.
+AREA: gates
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-20
+SESSION: amux-frustrations
+CARD: AF-112
+SYMPTOM: Moving three re-verified investigation cards to `verified`, acking exactly what the
+  contract endpoint advertises, all three refused:
+    GET /api/board/contract -> investigation.verified == ["Outcome confirmed to still hold"]
+    409 body                -> gate == ["Functionality change is live and exercised, not just
+                                        merged", "Peer-reviewed by a DIFFERENT worker in group
+                                        `amux` (name them)", "That peer verified it themselves
+                                        rather than taking the author's word", "No regression in
+                                        what it touched"]
+  Control, so this is not a nesting difference: the string "Peer-reviewed by a DIFFERENT
+  worker" appears ZERO times anywhere in the contract response.
+  The same mismatch holds for doc / ops / chore / research / escalation, which the contract
+  all report as the single "Outcome confirmed to still hold".
+COST: three refused transitions and a round trip to learn the real gate. Small in minutes.
+  The part worth the entry is WHERE it sends you: the 409's own `how_to_ack.contract` field
+  names `GET /api/board/contract` as the place to learn the gate, so the sanctioned
+  instruction points at the source that is wrong. An agent following it correctly is
+  refused — AMUX-2325's shape, recoverable only because the refusal happens to print the
+  real gate.
+FIX: Derive both from ONE table. A view must share the predicate of the mechanism it
+  describes, and here the view is the mechanism's own documentation.
+  Note which direction the drift runs, because it is the dangerous one: the contract
+  advertises a LOWER bar than the gate enforces. The real gate requires peer verification
+  by a different worker who checked it themselves — Ethan's standing rule, encoded. An
+  agent reading only the contract would conclude a card can be self-verified on a re-check,
+  which is precisely the weaker practice the gate exists to prevent. A stale doc that
+  under-states a constraint teaches the wrong habit to everyone who never trips the gate.
+  Not fixed here: which of the two is authoritative is amux's call, not a guess of mine.
+
+---
+FIXED, verified 2026-09-02 by running the exact test this entry describes.
+  The SYMPTOM half is still literally true and that is now by design: the bare
+  `GET /api/board/contract` reports investigation.verified as
+  ["Outcome confirmed to still hold"] and contains ZERO occurrences of
+  "Peer-reviewed by a DIFFERENT worker", the same control this entry used.
+  What changed is the part the COST line said was worth the entry: WHERE the
+  refusal sends you. A live 409 now answers
+    how_to_ack.contract -> "GET /api/board/contract?card=AF-407 (the RESOLVED gate
+    for this card — the bare contract lists only type defaults, AF-112)"
+  It names the ?card= form, states the bare form's limitation in the same breath,
+  and cites this entry by number. And `?card=` resolves correctly: for an
+  investigation card in group amux it returns the four-criterion peer gate with
+  `gate_sources.verified.source = group`, plus a note reading "this is the gate a
+  transition will accept".
+  So the sanctioned instruction no longer points at a source that will refuse you.
+  Measured on a throwaway card and deleted after.

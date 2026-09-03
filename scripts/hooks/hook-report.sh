@@ -10,7 +10,11 @@
 # Fails open in every direction: no stdin, no transcript, no python -> report
 # the state anyway with tokens omitted. A liveness report is worth more than a
 # token count, and this must never be the reason a hook fails.
-STATE="${1:-idle}"; SRC="${2:-stop-hook}"
+# MODE is either a main-turn state or one of the two event-driven subagent
+# lifecycle modes. Claude Code exposes SubagentStart/SubagentStop directly;
+# routing both through this one canonical reporter keeps attribution,
+# conversation adoption, endpoint resolution and failure logging identical.
+MODE="${1:-idle}"; SRC="${2:-stop-hook}"
 DERIVED=0
 if [ -z "$AMUX_SESSION" ]; then
   # MR-43: the var can go missing INSIDE a lane that IS running in its
@@ -46,8 +50,11 @@ case "$U" in *localhost:$L|*127.0.0.1:$L) U="${C:-$U}";; esac
 BODY=$(printf '%s' "$IN" | /usr/bin/python3 -c '
 import json,sys,os
 raw=sys.stdin.read()
-state,src=sys.argv[1],sys.argv[2]
-out={"state":state,"source":src}
+mode,src=sys.argv[1],sys.argv[2]
+if mode in ("subagent-start", "subagent-stop"):
+    out={"subagent":mode[len("subagent-"):],"source":src}
+else:
+    out={"state":mode,"source":src}
 h={}; tp=""; nlines=0; err=""
 try:
     h=json.loads(raw) if raw.strip() else {}
@@ -117,7 +124,7 @@ if tp:
 # unreadable file, and a transcript carrying neither field all produced the
 # identical empty report. Written only when something is missing, so it
 # self-extinguishes as this gets fixed instead of growing across 47 lanes.
-if not out.get("model") or not out.get("tokens"):
+if "subagent" not in out and (not out.get("model") or not out.get("tokens")):
     try:
         d2={"s":os.environ.get("AMUX_SESSION",""),"src":src,"keys":sorted(h.keys())[:12],
             "tp":bool(tp),"tp_exists":bool(tp) and os.path.exists(tp),"lines":nlines,
@@ -127,8 +134,14 @@ if not out.get("model") or not out.get("tokens"):
         with open(lg,"a") as f: f.write(json.dumps(d2)+"\n")
     except Exception: pass
 print(json.dumps(out))
-' "$STATE" "$SRC" 2>/dev/null)
-[ -n "$BODY" ] || BODY="{\"state\":\"$STATE\",\"source\":\"$SRC\"}"
+' "$MODE" "$SRC" 2>/dev/null)
+if [ -z "$BODY" ]; then
+  case "$MODE" in
+    subagent-start) BODY="{\"subagent\":\"start\",\"source\":\"$SRC\"}" ;;
+    subagent-stop)  BODY="{\"subagent\":\"stop\",\"source\":\"$SRC\"}" ;;
+    *)              BODY="{\"state\":\"$MODE\",\"source\":\"$SRC\"}" ;;
+  esac
+fi
 # Surgery, not a third JSON encoder: BODY is always a flat object ending in
 # "}" (python's json.dumps above, or the fallback literal on this same line),
 # so appending before the final brace is safe and avoids a second place this

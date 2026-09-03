@@ -78,7 +78,7 @@ use serde_json::json;
 
 use crate::api::AppState;
 
-const JOB: &str = "status-history";
+const JOB: &str = super::registry::ids::STATUS_HISTORY;
 const TICK_SECS: u64 = 20;
 pub const EVENT: &str = "session.status_decided";
 

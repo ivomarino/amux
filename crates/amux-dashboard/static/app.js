@@ -305,6 +305,74 @@ async function toggleAutofix(checked) {
 // dropping the server-resolved --model (passing `flags` at create would replace
 // it). Default OFF: skipping permission prompts is opt-in, per worker or globally.
 let _yoloDefault = false;
+// FLEET-WIDE cross-group default (AMUX-4018). Writes the GLOBAL env layer, which
+// `cross_group_send_ok` resolves at worker > group > global — so a per-worker
+// setting still wins and this is genuinely a default rather than an override.
+//
+// No X-Amux-Session header: the server refuses this write from a worker origin,
+// because a session that could set it would be granting itself and every peer a
+// standing cross-group channel.
+async function readCrossGroupDefault() {
+  const r = await fetch(API + '/api/config/cross-group', { headers: _authHeaders() });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok || d.error) throw new Error(d.error || 'could not read saved setting');
+  return d;
+}
+
+async function toggleCrossGroupDefault(checked) {
+  const note = document.getElementById('crossgroup-default-note');
+  const cb = document.getElementById('crossgroup-default-checkbox');
+  const rollback = () => { if (cb) cb.checked = !checked; };
+  try {
+    const r = await fetch(API + '/api/config/cross-group', {
+      method: 'PUT',
+      headers: _authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ allow: checked ? '*' : '' }),
+    });
+    const d = await r.json().catch(() => ({}));
+    // This setting is a capability grant. A synthetic offline-outbox 202 says
+    // only "saved in this browser", not "persisted in amux.env". Treating it
+    // as success made the switch look saved until the next GET reset it.
+    if (_isLocallyQueued(r) || !r.ok || d.error) {
+      showToast(d.error || 'could not save');
+      rollback();
+      return;
+    }
+    // Read after write. The response echoes the intended value; only a fresh
+    // GET proves the global env layer now resolves to it. Keep the visible
+    // switch only when the authoritative reader agrees.
+    const saved = await readCrossGroupDefault();
+    if (!!saved.enabled !== !!checked) {
+      rollback();
+      showToast('setting was not persisted; please try again');
+      return;
+    }
+    if (cb) cb.checked = !!saved.enabled;
+    showToast(d.message || (checked ? 'Cross-group messaging on' : 'Cross-group messaging off'));
+    if (note && saved.gate_enforcing === false) {
+      note.textContent = 'Note: AMUX_GROUP_SEND_ENFORCE is off, so all cross-group sends pass regardless of this switch.';
+    }
+  } catch (e) {
+    rollback();
+    showToast('failed: ' + String(e));
+  }
+}
+
+(async function initCrossGroupDefault() {
+  try {
+    const d = await readCrossGroupDefault();
+    const cb = document.getElementById('crossgroup-default-checkbox');
+    if (cb) cb.checked = !!d.enabled;
+    // SAY IT OUT LOUD when the gate is not enforcing at all. Otherwise an
+    // operator reads an OFF switch as a closed door that is not there.
+    const note = document.getElementById('crossgroup-default-note');
+    if (note && d.gate_enforcing === false) {
+      note.textContent = 'AMUX_GROUP_SEND_ENFORCE is off, so ALL cross-group sends pass regardless of this switch.';
+      note.style.color = '#b8860b';
+    }
+  } catch (e) {}
+})();
+
 async function toggleYoloDefault(checked) {
   _yoloDefault = !!checked;
   await fetch('/api/prefs', {
@@ -2192,7 +2260,7 @@ const _origFetch = window.fetch.bind(window);
 // deploy has its fetch fail, get queued, and report success. Ethan saw the two
 // halves separately — "mdai files are stuck at running", and a banner reading
 // `Syncing 0/1 · POST /api/files/mdai/run` that never cleared.
-const _OUTBOX_SKIP = /\/api\/(client-debug|speedtest|tts|lookup|sql|suggest-branch|terminal\/|upload|fs\/upload|sessions\/login\/|tunnel\/|push\/test|browser|files\/mdai\/run)/;
+const _OUTBOX_SKIP = /\/api\/(client-debug|speedtest|tts|lookup|sql|suggest-branch|terminal\/|upload|fs\/upload|sessions\/login\/|tunnel\/|push\/test|browser|files\/mdai\/run|config\/cross-group)/;
 const _OUTBOX_METHODS = { POST: 1, PATCH: 1, PUT: 1, DELETE: 1 };
 function _outboxQueueable(url, init) {
   if (!url || typeof url !== 'string') return false;
@@ -3170,6 +3238,7 @@ function render() {
                (AMUX-2559, "I cant add a worker to a group"). The label is the
                vocab; the field is the contract. */ ''}
           <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','tags','${escJs(s.tags.join(", "))}')"><span class="mi">&#x1F3F7;</span> Groups</div>
+          <div class="card-menu-item" onclick="event.stopPropagation();toggleSpansGroups('${s.name}')" title="Let this worker message workers in OTHER groups with no per-message approval. Writes CC_SEND_ALLOW on this worker; a group or global layer can also grant it from the Scope tab."><span class="mi">${s.spans_groups?'&#x2611;':'&#x2610;'}</span> Spans groups${_spansLabel(s)}</div>
           <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','dir','${esc(s.dir)}')"><span class="mi">&#x1F4C1;</span> Directory</div>
           ${s.running ? `<div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();doRestart('${s.name}')"><span class="mi">&#x21BB;</span> Restart</div>` : ''}
           ${s.running ? `<div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();doStop('${s.name}')"><span class="mi">&#x23F9;</span> Stop</div>` : ''}
@@ -5332,6 +5401,39 @@ async function togglePin(session) {
 // harness (AMUX_SESSION/URL env, self-report hooks, --mcp-config) and hides the
 // worker from peers at the NEXT spawn, so the toast says restart to apply. Paint
 // the flip immediately like togglePin, then let fetchSessions be the truth.
+// Says WHERE the allowance comes from, because the resolved value and the
+// worker's own value are different facts. A lane granted by a group layer shows
+// a ticked box it cannot untick here, and saying "(inherited)" is the difference
+// between a confusing control and an honest one.
+function _spansLabel(s) {
+  if (!s.spans_groups) return '';
+  const v = s.spans_groups_value || '';
+  const scope = v === '*' ? 'all' : v;
+  return s.spans_groups_own ? ': ' + esc(scope) : ': ' + esc(scope) + ' (inherited)';
+}
+
+async function toggleSpansGroups(session) {
+  closeAllMenus();
+  const s = sessions.find(x => x.name === session);
+  const was = s ? !!s.spans_groups : false;
+  // Turning OFF only clears this worker's own value. If a group or global layer
+  // granted it, the server says so in its reply rather than reporting success
+  // for a change the next send would disprove.
+  if (was && s && !s.spans_groups_own) {
+    showToast('Granted by a group or global layer — turn it off in the Scope tab');
+    return;
+  }
+  const next = !was;
+  if (s) { s.spans_groups = next; lastSessionsJSON = ''; render(); }
+  const r = await apiCall(API + '/api/sessions/' + session + '/config', {
+    method: 'PATCH', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ spans_groups: next })
+  });
+  if (!r && s) { s.spans_groups = was; lastSessionsJSON = ''; render(); }
+  else if (r) { showToast(r.message || (next ? 'Spans groups on' : 'Spans groups off')); }
+  await fetchSessions();
+}
+
 async function toggleIsolated(session) {
   closeAllMenus();
   const s = sessions.find(x => x.name === session);
@@ -8293,7 +8395,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.769';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.777';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -9886,8 +9988,23 @@ async function _peekLoadEarlier() {
     } else {
       const text = await r.text();
       const remaining = parseInt(r.headers.get('X-Log-Remaining') || '0', 10);
-      // New chunk is OLDER than everything loaded — it goes on top.
-      _peekEarlier.chunks.unshift('<span class="pe-chunk">' + esc(text) + '</span>');
+      // THROUGH THE SAME PIPELINE AS THE LIVE VIEW (AMUX-4021). This was
+      // `esc(text)`, which is raw escaped text with none of the peek render
+      // stages — and `_peekHtml`'s own comment warns about exactly that: "the
+      // four call sites each spelled the chain out, so adding a stage meant
+      // finding all of them". This was a fifth call site that never got them.
+      //
+      // The symptom was not subtle. A worker log is full of box-drawing runs
+      // and long unbroken lines; without `wrapBoxBlocks` they inherit the
+      // container's pre-wrap + break-word and wrap at EVERY CHARACTER, so
+      // loading earlier output rendered a 2-3 character wide column of
+      // gibberish instead of a log. `wrapBoxBlocks` gives each box run its own
+      // `.peek-box` with white-space:pre and its own horizontal scroller, which
+      // is what keeps tables, diffs and framed output aligned; `_fitRules`
+      // stops a 220-column pane rule forcing a scroller; `_linkifyPaths` and
+      // `highlightPrompts` make the earlier text behave like the live text it
+      // is continuous with.
+      _peekEarlier.chunks.unshift('<span class="pe-chunk">' + _peekHtml(text) + '</span>');
       _peekEarlier.loadedKb += _PEEK_LOG_CHUNK_KB;
       _peekEarlier.done = remaining <= 0;
     }
@@ -22986,6 +23103,7 @@ const _SYSJOB_STATUS = {
   disabled:    { cls: 'idle',  label: 'off',      hint: 'switched off by configuration' },
   stalled:     { cls: 'bad',   label: 'STALLED',  hint: 'last tick is far older than this job’s interval' },
   hung:        { cls: 'bad',   label: 'HUNG',     hint: 'a tick started and never finished' },
+  slow:        { cls: 'bad',   label: 'SLOW',     hint: 'the last completed tick exceeded this job’s liveness budget' },
   dead:        { cls: 'bad',   label: 'DEAD',     hint: 'the task exited — it panicked or was aborted' },
   not_spawned: { cls: 'bad',   label: 'NOT RUNNING', hint: 'nothing started this job — the failure that cost hours' },
 };
@@ -23000,7 +23118,7 @@ function renderSystemJobs() {
     return;
   }
   const jobs = _systemJobs.jobs.slice();
-  const bad = jobs.filter(j => ['stalled', 'hung', 'dead', 'not_spawned'].includes(j.status));
+  const bad = jobs.filter(j => ['stalled', 'hung', 'slow', 'dead', 'not_spawned'].includes(j.status));
   if (head) {
     head.innerHTML = bad.length
       ? `<span class="sysjob-alarm">${bad.length} need${bad.length === 1 ? 's' : ''} attention</span>`
@@ -23008,7 +23126,7 @@ function renderSystemJobs() {
   }
   // Broken first — the whole point of the section is that a dead loop is not
   // something you have to scroll for.
-  const rank = j => (['stalled','hung','dead','not_spawned'].includes(j.status) ? 0
+  const rank = j => (['stalled','hung','slow','dead','not_spawned'].includes(j.status) ? 0
                    : j.status === 'alive' ? 1 : j.status === 'disabled' ? 3 : 2);
   jobs.sort((a, b) => rank(a) - rank(b) || String(a.name).localeCompare(String(b.name)));
 
@@ -23032,7 +23150,7 @@ function renderSystemJobs() {
     const tick = j.last_tick_at
       ? `<span title="last tick">✓ ${_sysAge(j.last_tick_age_s)} ago</span>`
       : (j.spawned ? `<span title="no tick recorded yet">no tick yet</span>` : '');
-    const budget = (j.stale_after_s != null && ['stalled','hung'].includes(j.status))
+    const budget = (j.stale_after_s != null && ['stalled','hung','slow'].includes(j.status))
       ? `<span class="sysjob-budget">budget ${_sysAge(j.stale_after_s)}</span>` : '';
     return `<div class="sysjob ${st.cls}">
       <div class="sysjob-top">
@@ -23643,11 +23761,16 @@ function _tagSuggestions(prefix, q) {
 
 function _beTagInputUpdate(prefix) {
   const inp = document.getElementById(prefix + '-tag-input');
-  const q = inp ? inp.value.toLowerCase() : '';
-  _themesRefresh(prefix);   // once per TTL; re-renders itself when it lands
-  const suggestions = _tagSuggestions(prefix, q);
   const el = document.getElementById(prefix + '-tag-suggestions');
   if (!el) return;
+  const q = inp ? inp.value.trim().toLowerCase() : '';
+  // Groups are card metadata, not a recommended taxonomy. An empty input used
+  // to dump twelve fleet-wide suggestions into every card and visually bury
+  // its source message, epic, gate and output. Suggestions are autocomplete:
+  // they exist only after the user asks by typing.
+  if (!q) { el.innerHTML = ''; return; }
+  _themesRefresh(prefix);   // once per TTL; re-renders itself when it lands
+  const suggestions = _tagSuggestions(prefix, q);
   // Data attributes + a delegated listener, NOT an inline onclick.
   //
   // The inline version was silently dead. `JSON.stringify(t)` emits DOUBLE
@@ -25797,6 +25920,158 @@ function _boardDraftsPersist() {
 // known to have one — see the guard in the save handler (AMUX-2840).
 let _bdHydrated = false;
 
+function _bdConfigureGo(item) {
+  const goBtn = document.getElementById('bd-goto-session');
+  if (!goBtn) return;
+  const sess = item.session || '';
+  goBtn.style.display = sess ? '' : 'none';
+  goBtn.onclick = (e) => {
+    e.stopPropagation();
+    try { closeBoardDetail(); } catch (err) {}
+    openPeek(sess, { query: item.id });
+  };
+}
+
+function _bdArtifactRef(a) {
+  const ref = String((a && a.ref) || '');
+  const target = String((a && a.resolved_ref) || ref);
+  if (/^https?:\/\//i.test(target)) {
+    return '<a href="' + esc(target) + '" target="_blank" rel="noopener noreferrer">' + esc(ref) + '</a>';
+  }
+  if (/^(?:\/|\.\.?\/)/.test(target) || /(?:^|\/)\S+\.[a-z0-9]{1,12}$/i.test(ref)) {
+    return '<span class="file-link" onclick="event.stopPropagation();openFilePreview(\''
+      + escJs(target) + '\')" title="Open ' + esc(target) + '">' + esc(ref) + '</span>';
+  }
+  return '<code>' + esc(ref) + '</code>';
+}
+
+function _bdOpenMessage(id) {
+  const displayId = 'MSG-' + String(id || '').replace(/^MSG-/i, '');
+  closeBoardDetail();
+  _msgsKind = 'all';
+  _msgsDeepQ = displayId;
+  _msgsGroup = '';
+  _msgsCounts = null;
+  const search = document.getElementById('msgs-search');
+  if (search) search.value = displayId;
+  const worker = document.getElementById('msgs-session-filter');
+  if (worker) worker.value = '';
+  if (typeof _msgSetMode === 'function') _msgSetMode('messages');
+  switchView('messages');
+}
+
+// One renderer for cached open and authoritative hydration. Keeping relation
+// rendering here prevents the list card and GET detail from growing separate
+// definitions of the task's epic, source message, summary and assets.
+function _bdRenderMeta(item) {
+  const meta = document.getElementById('bd-meta');
+  if (!meta || !item) return;
+  const parts = [];
+  if (item.type) parts.push('Type ' + esc(item.type));
+  if (item.creator) parts.push('From ' + esc(item.creator));
+  if (item.created) parts.push('Created ' + timeAgo(item.created));
+  if (item.updated && item.updated !== item.created) parts.push('Updated ' + timeAgo(item.updated));
+  if (item.reviewer) parts.push('Reviewer ' + esc(item.reviewer));
+  if (item.source_ref) {
+    const lv = item.last_verified_at;
+    const ageH = lv ? Math.round((Date.now()/1000 - lv) / 3600) : null;
+    const stale = !lv || ageH > 24;
+    parts.push('Derived from ' + esc(String(item.source_ref).slice(0,60))
+      + (lv ? (' · source re-checked ' + ageH + 'h ago') : ' · never re-verified')
+      + (stale ? ' <span style="color:var(--red);font-weight:600;">STALE — re-check the source before acting</span>' : ''));
+  }
+  let html = parts.length ? '<div class="bd-card-facts">'
+    + parts.map(p => '<span>' + p + '</span>').join('') + '</div>' : '';
+
+  const messages = Array.isArray(item.messages) ? item.messages : [];
+  if (messages.length) {
+    html += '<section class="bd-card-section"><h4>Source message' + (messages.length === 1 ? '' : 's') + '</h4>'
+      + messages.map(m => {
+        const ts = Number(m.ts || 0); const sec = ts > 100000000000 ? Math.floor(ts / 1000) : ts;
+        return '<div class="board-detail-meta-row"><button class="task-id-chip bd-link-chip" onclick="_bdOpenMessage('
+          + Number(m.id || 0) + ')" title="Open this exact message in Messages">MSG-' + esc(String(m.id)) + '</button> '
+          + '<span>' + (m.session ? esc(m.session) + ' · ' : '') + (sec ? timeAgo(sec) + ' · ' : '')
+          + esc(String(m.text || '').slice(0,220)) + '</span></div>';
+      }).join('') + '</section>';
+  }
+
+  let relationHtml = '';
+  if (item.epic) {
+    relationHtml += '<div class="board-detail-meta-row"><b>Epic</b> <span class="task-id-chip" onclick="_openIssue(\''
+      + escJs(item.epic) + '\')">' + esc(item.epic) + '</span></div>';
+  }
+  const deps = Array.isArray(item.depends_on) ? item.depends_on : [];
+  if (deps.length) relationHtml += '<div class="board-detail-meta-row"><b>Blocked by</b> ' + deps.map(d =>
+    '<span class="task-id-chip" onclick="_openIssue(\'' + escJs(d) + '\')">' + esc(d) + '</span>').join(' ') + '</div>';
+
+  const children = Array.isArray(item.children) ? item.children : [];
+  if (children.length) {
+    relationHtml += '<div class="board-detail-meta-row"><b>Child tasks (' + children.length + ')</b></div>'
+      + children.map(c => {
+        const sty = statusStyle(c.status || 'todo');
+        const pri = c.priority ? ' · ' + esc(c.priority) : '';
+        return '<div class="board-detail-meta-row" style="display:flex;gap:6px;align-items:center;">'
+          + '<span class="task-id-chip" onclick="_openIssue(\'' + escJs(c.id) + '\')">' + esc(c.id) + '</span>'
+          + '<span class="status-badge" style="background:' + sty.bg + ';color:' + sty.color + '">' + esc(c.status || 'todo') + '</span>'
+          + '<span>' + esc(c.title || '') + pri + '</span></div>';
+      }).join('');
+  }
+  if (relationHtml) html += '<section class="bd-card-section"><h4>Task relationships</h4>' + relationHtml + '</section>';
+
+  const gates = (Array.isArray(item.gate_requirements) ? item.gate_requirements : [])
+    .filter(g => Array.isArray(g.criteria) && g.criteria.length);
+  if (gates.length) {
+    html += '<section class="bd-card-section"><h4>Column gate requirements</h4>'
+      + gates.map(g => {
+        const src = String(g.source || 'type') + (g.scope ? ' · ' + String(g.scope) : '');
+        return '<div class="bd-gate"><div class="bd-gate-head"><span class="status-badge">'
+          + esc(String(g.status || '')) + '</span><span>' + esc(src) + '</span></div><ul>'
+          + g.criteria.map(c => '<li>' + esc(String(c)) + '</li>').join('') + '</ul></div>';
+      }).join('') + '</section>';
+  }
+
+  const summary = [
+    ['Next action', item.next_action],
+    ['Last result', item.last_result],
+    ['Unresolved', item.unresolved]
+  ].filter(x => x[1]);
+  if (summary.length) {
+    html += '<section class="bd-card-section"><h4>Work summary</h4>'
+      + summary.map(x => '<div class="board-detail-meta-row"><span style="color:var(--dim)">'
+        + esc(x[0]) + ':</span> ' + _linkifyUrls(_linkifyCardIds(esc(String(x[1])))) + '</div>').join('')
+      + '</section>';
+  }
+
+  const artifacts = [];
+  const artifactSeen = new Set();
+  (Array.isArray(item.artifacts) ? item.artifacts : [])
+    .concat(Array.isArray(item.asset_links) ? item.asset_links : [])
+    .forEach(a => {
+      const key = String((a && a.ref) || '');
+      if (key && !artifactSeen.has(key)) { artifactSeen.add(key); artifacts.push(a); }
+    });
+  if (artifacts.length) {
+    html += '<section class="bd-card-section"><h4>Produced assets (' + artifacts.length + ')</h4>'
+      + artifacts.map(a => '<div class="board-detail-meta-row">' + _bdArtifactRef(a)
+        + ' <span style="color:var(--dim)">· ' + esc(a.kind || a.source || 'artifact')
+        + (a.state ? ' · ' + esc(a.state) : '') + '</span>'
+        + (a.description ? '<div style="color:var(--dim)">' + esc(a.description) + '</div>' : '') + '</div>').join('');
+    html += '</section>';
+  }
+
+  const activity = _bdWorkerActivity(item);
+  if (activity.length) {
+    html += '<section class="bd-card-section"><h4>Worker actions</h4>'
+      + activity.slice(-8).reverse().map(e => '<div class="board-detail-meta-row"><span class="bd-hist-ic" style="color:'
+        + (_BD_KIND_COL[e.kind] || 'var(--dim)') + '">' + (_BD_KIND_ICON[e.kind] || '\u00B7') + '</span><span>'
+        + _linkifyUrls(_linkifyCardIds(esc(e.body))) + '</span>'
+        + (e.ts ? '<span class="bd-hist-ts">' + esc(e.ts) + '</span>' : '') + '</div>').join('')
+      + (activity.length > 8 ? '<button class="bd-activity-all" onclick="boardDetailTab(\'history\')">View all '
+        + activity.length + ' worker actions</button>' : '') + '</section>';
+  }
+  meta.innerHTML = html;
+}
+
 /// Fetch the authoritative card and fill desc/log, WITHOUT clobbering anything
 /// the user has typed.
 ///
@@ -25812,22 +26087,48 @@ async function _bdHydrate(id) {
     const full = await r.json();
     if (!full || full.id !== id || boardDetailId !== id) return;  // modal moved on
     const idx = boardItems.findIndex(i => i.id === id);
+    const cached = idx >= 0 ? { ...boardItems[idx] } : {};
     if (idx >= 0) boardItems[idx] = Object.assign({}, boardItems[idx], full);
+    const merged = idx >= 0 ? boardItems[idx] : full;
+    _bdRenderHistory(merged);
+    if (typeof _bdRenderStatusBanner === 'function') _bdRenderStatusBanner(merged);
+    _bdRenderMeta(merged);
     if (_boardDrafts[id]) { _bdHydrated = true; return; }  // user's draft wins
+    const title = document.getElementById('bd-title');
+    if (title && title.value === (cached.title || '')) {
+      title.value = full.title || '';
+      title.style.height = 'auto'; title.style.height = title.scrollHeight + 'px';
+    }
     const d = document.getElementById('bd-desc');
     // Only fill if the user has not started typing into it.
-    if (d && (d.value === '' || d.value === (full.desc || ''))) d.value = full.desc || '';
-    const l = document.getElementById('bd-log');
-    if (l && full.log !== undefined) l.textContent = full.log || '';
-    // RE-RENDER THE HISTORY TAB with the hydrated record. It was rendered at
-    // open time from the LIST item, and under slim that item carries no `log`
-    // — so the tab would show an empty history and a 0 count for every card,
-    // which reads as "nothing ever happened here" rather than as still
-    // loading. Same class as the blank desc, one surface over.
-    if (boardDetailId === id) {
-      const merged = idx >= 0 ? boardItems[idx] : full;
-      _bdRenderHistory(merged);
-      if (typeof _bdRenderStatusBanner === 'function') _bdRenderStatusBanner(merged);
+    if (d && d.value === (cached.desc || '')) {
+      d.value = full.desc || '';
+      // The board list is intentionally slim, so Details first opens without
+      // `desc`. Hydration must repaint the VISIBLE rendered copy as well as the
+      // hidden edit textarea; otherwise the task context stays blank until the
+      // user switches tabs even though the authoritative response arrived.
+      const previewTab = document.getElementById('bd-tab-preview');
+      const preview = document.getElementById('bd-preview');
+      if (previewTab && previewTab.classList.contains('active') && preview) {
+        preview.innerHTML = d.value.trim() ? renderMarkdown(d.value) : '';
+      }
+    }
+    if (boardDetailStatus === (cached.status || 'todo')) {
+      boardDetailStatus = full.status || 'todo';
+      _renderDetailStatusBtns();
+    }
+    const sess = document.getElementById('bd-session');
+    if (sess && sess.value === (cached.session || '')) _populateSessionSelect('bd-session', full.session || '');
+    _bdConfigureGo(full);
+    const due = document.getElementById('bd-due');
+    if (due && due.value === (cached.due || '')) { due.value = full.due || ''; try { _dpSyncLabel(due); } catch (e) {} }
+    const dueTime = document.getElementById('bd-due-time');
+    if (dueTime && dueTime.value === (cached.due_time || '')) dueTime.value = full.due_time || '';
+    const gate = document.getElementById('bd-gate');
+    const oldGate = (Array.isArray(cached.gate) ? cached.gate : []).join('\n');
+    if (gate && gate.value === oldGate) gate.value = (Array.isArray(full.gate) ? full.gate : []).join('\n');
+    if (JSON.stringify(_tagState['bd'] || []) === JSON.stringify(cached.tags || [])) {
+      _tagState['bd'] = [...(full.tags || [])]; _beTagRenderChips('bd'); _beTagInputUpdate('bd');
     }
     _bdHydrated = true;
   } catch (e) { /* leave unhydrated; the save guard covers it */ }
@@ -25861,19 +26162,7 @@ function openBoardDetail(id) {
   const keyEl = document.getElementById('bd-key');
   if (keyEl) keyEl.textContent = item.id || '';
   _populateSessionSelect('bd-session', draft ? draft.session : (item.session || ''));
-  // One-tap jump from a card to the owning session's live progress
-  // (Ethan 07:19): opens the peek on the terminal, prefilled to search for
-  // this card id so the jump lands where the session last touched it.
-  const goBtn = document.getElementById('bd-goto-session');
-  if (goBtn) {
-    const _sess = (draft ? draft.session : item.session) || '';
-    goBtn.style.display = _sess ? '' : 'none';
-    goBtn.onclick = (e) => {
-      e.stopPropagation();
-      try { closeBoardDetail(); } catch (err) {}
-      openPeek(_sess, { query: item.id });
-    };
-  }
+  _bdConfigureGo({ ...item, session: draft ? draft.session : item.session });
   const dueEl = document.getElementById('bd-due');
   if (dueEl) { dueEl.value = draft ? (draft.due || '') : (item.due || ''); try { _dpSyncLabel(dueEl); } catch (e) {} }
   const dueTimeEl = document.getElementById('bd-due-time');
@@ -25884,29 +26173,9 @@ function openBoardDetail(id) {
   _tagState['bd'] = [...(item.tags || [])];
   _beTagRenderChips('bd');
   _beTagInputUpdate('bd');
-  const meta = document.getElementById('bd-meta');
-  const parts = [];
-  if (item.type) parts.push('Type ' + esc(item.type));
-  if (item.creator) parts.push('From ' + esc(item.creator));
-  if (item.created) parts.push('Created ' + timeAgo(item.created));
-  if (item.updated && item.updated !== item.created) parts.push('Updated ' + timeAgo(item.updated));
-  if (item.reviewer) parts.push('Reviewer ' + esc(item.reviewer));
-  if (item.source_ref) {
-    const lv = item.last_verified_at;
-    const ageH = lv ? Math.round((Date.now()/1000 - lv) / 3600) : null;
-    const stale = !lv || ageH > 24;
-    parts.push('Derived from ' + esc(String(item.source_ref).slice(0,60))
-      + (lv ? (' · source re-checked ' + ageH + 'h ago') : ' · never re-verified')
-      + (stale ? ' <span style="color:var(--red);font-weight:600;">STALE — re-check the source before acting</span>' : ''));
-  }
-  const deps = Array.isArray(item.depends_on) ? item.depends_on : [];
-  let depHtml = '';
-  if (deps.length) depHtml = '<div class="board-detail-meta-row">Blocked by ' + deps.map(d =>
-    '<span class="task-id-chip" onclick="_openIssue(\'' + escJs(d) + '\')" style="cursor:pointer;">' + esc(d) + '</span>').join(' ') + '</div>';
-  meta.innerHTML = parts.map(p => '<div class="board-detail-meta-row">' + p + '</div>').join('') + depHtml;
+  _bdRenderMeta(item);
   document.getElementById('bd-save-status').textContent = '';
   document.getElementById('board-detail-overlay').classList.add('active');
-  setTimeout(() => document.getElementById('bd-title').focus(), 100);
 }
 
 // ── Improved detail: status banner, typed History, permalink (AMUX-2178) ───
@@ -25927,6 +26196,20 @@ function _bdParseHistory(log) {
     return { ts, body, kind };
   });
 }
+function _bdWorkerActivity(item) {
+  return _bdParseHistory((item && item.log) || '').filter(e => {
+    const body = String(e.body || '').trim();
+    // The complete mutation/audit trail remains on the server. This card view
+    // is the worker record, so suppress storage plumbing that buried every
+    // useful action in the old History screenshot.
+    if (/^authz:/i.test(body)) return false;
+    if (/^[^:]+:\s*(?:backlog|todo|doing|review|done|verified|discarded)\s*->/i.test(body)) return false;
+    if (/gate satisfied via|gate_checked/i.test(body)) return false;
+    if (/^[^:]+:\s*(?:desc\s+[+-]\d+\s+chars|evidence|last_result|next_action|unresolved)$/i.test(body)) return false;
+    if (/^capture:\s/i.test(body)) return false;
+    return true;
+  });
+}
 const _BD_KIND_ICON = { status:'\uD83D\uDCCD', transition:'\u2192', commit:'\u2318', claim:'\u270B',
   request:'\uD83D\uDCAC', decision:'\u2713', warn:'\u26A0', note:'\u00B7' };
 const _BD_KIND_COL = { status:'var(--accent)', transition:'var(--fg)', commit:'var(--green)',
@@ -25934,7 +26217,7 @@ const _BD_KIND_COL = { status:'var(--accent)', transition:'var(--fg)', commit:'v
 function _bdRenderHistory(item) {
   const el = document.getElementById('bd-log');
   const nb = document.getElementById('bd-hist-n');
-  const evs = _bdParseHistory(item.log);
+  const evs = _bdWorkerActivity(item);
   if (nb) nb.textContent = evs.length ? ' ' + evs.length : '';
   if (!el) return;
   el.innerHTML = evs.length
@@ -25944,7 +26227,7 @@ function _bdRenderHistory(item) {
         + '<div class="bd-hist-b"><span class="bd-hist-txt">' + _linkifyUrls(_linkifyCardIds(esc(e.body))) + '</span>'
         + (e.ts ? '<span class="bd-hist-ts">' + esc(e.ts) + '</span>' : '') + '</div></div>').join('')
       + '</div>'
-    : '<div style="color:var(--dim);font-size:0.85rem;padding:18px;text-align:center;">No activity recorded yet.</div>';
+    : '<div style="color:var(--dim);font-size:0.85rem;padding:18px;text-align:center;">No worker actions recorded yet.</div>';
 }
 function _bdRenderStatusBanner(item) {
   const el = document.getElementById('bd-status-banner');
@@ -25958,7 +26241,7 @@ function _bdRenderStatusBanner(item) {
       + (last.ts ? ' \u00B7 ' + esc(last.ts) : '') + '</div>'
       + '<div class="bd-sb-text">' + _linkifyUrls(_linkifyCardIds(esc(last.body.replace(/^STATUS\s*\([^)]*\):\s*/i, '')))) + '</div>'
       + (sess ? '<button class="btn" style="margin-top:8px;font-size:0.74rem;min-height:36px;" onclick="_askCardStatus(\'' + escJs(item.id) + '\',\'' + escJs(sess) + '\')">\uD83D\uDD04 Refresh from ' + esc(sess) + '</button>' : '');
-  } else if (sess) {
+  } else if (sess && !/^(done|verified|discarded)$/i.test(String(item.status || ''))) {
     el.style.display = '';
     el.innerHTML = '<div class="bd-sb-empty">No status posted yet.'
       + ' <button class="btn" style="font-size:0.74rem;min-height:36px;margin-left:6px;" onclick="_askCardStatus(\'' + escJs(item.id) + '\',\'' + escJs(sess) + '\')">\uD83D\uDCAC Ask ' + esc(sess) + '</button></div>';
@@ -25975,21 +26258,22 @@ function boardDetailTab(tab) {
   const editBtn = document.getElementById('bd-tab-edit');
   const previewBtn = document.getElementById('bd-tab-preview');
   const histBtn = document.getElementById('bd-tab-history');
-  const linBtn = document.getElementById('bd-tab-lineage');
   const desc = document.getElementById('bd-desc');
   const preview = document.getElementById('bd-preview');
   const log = document.getElementById('bd-log');
-  const lin = document.getElementById('bd-lineage');
+  const meta = document.getElementById('bd-meta');
+  const editFields = document.getElementById('bd-edit-fields');
+  const editFooter = document.getElementById('bd-edit-footer');
+  const deleteBtn = document.getElementById('bd-delete');
+  const title = document.getElementById('bd-title');
   if (!editBtn || !previewBtn || !desc || !preview) return;
-  [editBtn, previewBtn, histBtn, linBtn].forEach(bt => bt && bt.classList.remove('active'));
-  if (lin) lin.style.display = 'none';
-  if (tab === 'lineage') {
-    if (linBtn) linBtn.classList.add('active');
-    desc.style.display = 'none'; preview.style.display = 'none';
-    if (log) log.style.display = 'none';
-    if (lin) { lin.style.display = ''; _bdRenderLineage(boardDetailId); }
-    return;
-  }
+  [editBtn, previewBtn, histBtn].forEach(bt => bt && bt.classList.remove('active'));
+  const editing = tab === 'edit';
+  if (editFields) editFields.style.display = editing ? '' : 'none';
+  if (editFooter) editFooter.style.display = editing ? '' : 'none';
+  if (deleteBtn) deleteBtn.style.display = editing ? '' : 'none';
+  if (title) title.readOnly = !editing;
+  if (meta) meta.style.display = tab === 'preview' ? '' : 'none';
   if (tab === 'history') {
     if (histBtn) histBtn.classList.add('active');
     desc.style.display = 'none'; preview.style.display = 'none';
@@ -26002,180 +26286,13 @@ function boardDetailTab(tab) {
     previewBtn.classList.add('active');
     desc.style.display = 'none';
     preview.style.display = '';
-    preview.innerHTML = renderMarkdown(desc.value);
+    preview.innerHTML = desc.value.trim() ? renderMarkdown(desc.value) : '';
   } else {
     editBtn.classList.add('active');
     previewBtn.classList.remove('active');
     desc.style.display = '';
     preview.style.display = 'none';
   }
-}
-
-// ── LINEAGE TAB (AMUX-2393) ────────────────────────────────────────────────
-//
-// Ethan: "we need more robust history so we have a full lineage trail — note it
-// should all come from logs which have request responses with the granular
-// control level based on action."
-//
-// The trail itself was already BUILT and unreachable. `GET /api/why/{kind}/{id}`
-// (RR-0109) correlates the durable trails — issues, issues.log, the state-event
-// journal, the structured request log, the turn ledger, interaction_log — and it
-// is good: it cites a table and row for every line and refuses to narrate when
-// the evidence does not support a story. It had 4 requests in 168 hours from one
-// client, its only consumer being `amux-rs why`, and ZERO call sites in this SPA.
-// So the work here is surfacing, not building: ethos rule 1, the mcp.json shape.
-// Nothing below re-implements any correlation — one place to be wrong is enough,
-// which the endpoint's own docstring says about its CLI printer.
-//
-// THIS RENDERER'S ONE JOB IS NOT TO UPGRADE A WEAK ANSWER. An explainer's
-// failure mode is confident narration from whatever it happened to find, and a
-// printer is exactly where that gets reintroduced after the API carefully avoided
-// it. So three things are non-negotiable here, each mirroring a guarantee the
-// endpoint makes:
-//
-//   - `verdict` and `verdict_reason` lead, never the timeline. `partial` and
-//     `cannot_tell` are answers, not degraded successes.
-//   - `gaps` are rendered in full. Dropping them turns "no turn ledger covers
-//     this card" into an apparently complete story with a quiet hole.
-//   - Sources that returned ZERO are shown WITH their predicate, because a zero
-//     from a probe that could have matched and a zero from a probe that never
-//     could look identical otherwise — and only the second is a gap.
-//
-// Truncation is surfaced too: the payload carries `rows` vs `rows_total` per
-// source and a `per_source_cap`, so a capped source says so rather than reading
-// as complete coverage.
-let _bdLineageFor = null;
-
-function _bdRenderLineage(id) {
-  const el = document.getElementById('bd-lineage');
-  if (!el || !id) return;
-  // Re-fetch per open: a card's trail changes as work happens, and this tab is
-  // opened deliberately rather than on every card open, so it is never on the
-  // hot path.
-  el.innerHTML = '<div class="bd-lin-note">Loading lineage for ' + esc(id) + '…</div>';
-  _bdLineageFor = id;
-  const path = '/api/why/task/' + encodeURIComponent(id);
-  // Plain fetch, NOT apiCall: apiCall is the MUTATION path — it returns null on
-  // failure after a toast, and queues to the offline outbox. Both are wrong
-  // here. A toast vanishes, and this panel's entire purpose is to state what it
-  // could and could not establish, so a failure has to render INTO the panel
-  // where the answer would have been. Returning null would have left the
-  // loading line up forever, which reads as a hang rather than an error.
-  fetch(API + path, { headers: _authHeaders({}) })
-    .then(r => r.ok ? r.json() : r.text().then(t => { throw new Error('HTTP ' + r.status + (t ? ': ' + t.slice(0, 200) : '')); }))
-    .then(d => {
-      if (_bdLineageFor !== id) return;   // a different card was opened meanwhile
-      el.innerHTML = _bdLineageHtml(d, id);
-    })
-    .catch(e => {
-      if (_bdLineageFor !== id) return;
-      // Name the endpoint. "Could not load" sends the next person grepping the
-      // SPA for a view that was never the problem.
-      el.innerHTML = '<div class="bd-lin-note bd-lin-bad">Could not read the lineage trail: '
-        + esc(String(e && e.message ? e.message : e))
-        + '<br><span class="bd-lin-dim">GET ' + esc(path) + '</span></div>';
-    });
-}
-
-function _bdLineageHtml(d, id) {
-  if (!d || typeof d !== 'object') return '<div class="bd-lin-note bd-lin-bad">Empty response.</div>';
-  const verdict = d.verdict || 'unknown';
-  const cls = verdict === 'ok' ? 'ok' : (verdict === 'partial' ? 'warn' : 'bad');
-  let h = '';
-
-  // 1. THE VERDICT LEADS. Not the timeline — a reader who scrolls a plausible
-  //    timeline and never reaches a caveat has been misled by layout alone.
-  h += '<div class="bd-lin-verdict bd-lin-' + cls + '">'
-    + '<span class="bd-lin-vlabel">' + esc(verdict) + '</span>'
-    + (d.verdict_reason ? '<span class="bd-lin-vwhy">' + esc(d.verdict_reason) + '</span>' : '')
-    + '</div>';
-
-  // 2. GAPS, IN FULL, ABOVE the trail. What the trail cannot tell you outranks
-  //    what it can.
-  const gaps = Array.isArray(d.gaps) ? d.gaps : [];
-  if (gaps.length) {
-    h += '<div class="bd-lin-gaps"><div class="bd-lin-h">What this trail cannot tell you ('
-      + gaps.length + ')</div><ul>'
-      + gaps.map(g => '<li>' + esc(String(g)) + '</li>').join('')
-      + '</ul></div>';
-  }
-
-  // 3. SOURCES, INCLUDING THE ZEROS, each with the predicate it ran.
-  const srcs = Array.isArray(d.sources) ? d.sources : [];
-  if (srcs.length) {
-    h += '<div class="bd-lin-h">Sources consulted (' + srcs.length + ')</div><div class="bd-lin-srcs">';
-    srcs.forEach(s => {
-      const rows = Number(s.rows || 0);
-      const total = (s.rows_total === undefined || s.rows_total === null) ? rows : Number(s.rows_total);
-      const capped = total > rows;
-      h += '<div class="bd-lin-src' + (rows === 0 ? ' bd-lin-zero' : '') + '">'
-        + '<code>' + esc(String(s.table || '?')) + '</code>'
-        + '<span class="bd-lin-rows">' + rows + (capped ? ' of ' + total + ' shown' : ' row' + (rows === 1 ? '' : 's')) + '</span>'
-        + (capped ? '<span class="bd-lin-cap">capped'
-            + (d.per_source_cap ? ' at ' + esc(String(d.per_source_cap)) : '') + '</span>' : '')
-        + (s.query ? '<span class="bd-lin-dim">' + esc(String(s.query)) + '</span>' : '')
-        // The endpoint attaches a `note` to a source whenever the row count
-        // alone would mislead — a reaped journal whose floor postdates the card,
-        // events that record THAT something changed but not into what, or the
-        // receipt that says a trail really is complete. Dropping it recreated
-        // the exact defect one layer up that the note exists to prevent: the
-        // panel looked careful and printed a number with no caveat attached.
-        + (s.note ? '<div class="bd-lin-srcnote">' + esc(String(s.note)) + '</div>' : '')
-        + '</div>';
-    });
-    h += '</div>';
-  }
-
-  // 4. THE TRAIL. Every line carries where it came from, so any claim here is
-  //    one SELECT away from being re-checked.
-  const tl = Array.isArray(d.timeline) ? d.timeline : [];
-  h += '<div class="bd-lin-h">Trail (' + tl.length + ')</div>';
-  if (!tl.length) {
-    h += '<div class="bd-lin-note">No trail lines. The sources above name what was searched'
-      + ' and with which predicate.</div>';
-  } else {
-    h += '<div class="bd-lin-tl">' + tl.map(t => {
-      const src = t.source || {};
-      const where = [src.table, src.column].filter(Boolean).join('.');
-      // `ordering` distinguishes a line PLACED BY TIME from one appended in
-      // source order because its record carries no date (issues.log is HH:MM
-      // only). Rendering them identically would invent a chronology.
-      const untimed = t.ordering && t.ordering !== 'timestamped';
-      return '<div class="bd-lin-line' + (untimed ? ' bd-lin-untimed' : '') + '">'
-        + '<div class="bd-lin-when">' + esc(t.at ? String(t.at).replace('T', ' ').replace(/\+.*$/, '') : '—')
-        + (untimed ? '<span class="bd-lin-badge" title="This record carries no date; placed in source order, not by time">order</span>' : '')
-        + '</div>'
-        + '<div class="bd-lin-what">'
-        + '<span class="bd-lin-sum">' + esc(String(t.summary || t.kind || '(no summary)')) + '</span>'
-        + (t.actor ? '<span class="bd-lin-actor">' + esc(String(t.actor)) + '</span>' : '')
-        + (where ? '<span class="bd-lin-dim">' + esc(where) + '</span>' : '')
-        + '</div></div>';
-    }).join('') + '</div>';
-  }
-
-  // 5. PART 3 OF THE REQUIREMENT IS NOT BUILT, AND SAYS SO HERE.
-  //    "granular control level based on action" — which permission scope
-  //    authorised each action, with global/worker/group layers individually
-  //    logged. The per-layer resolution exists at READ time (_gate_layers and
-  //    the scope/env/memory resolvers all return every layer with an `applied`
-  //    flag) but is not PERSISTED with the action, so no trail can answer it
-  //    yet. Stating that in the view is the point: a lineage panel that simply
-  //    omitted authorisation would read as though authorisation were covered.
-  // AMUX-3607 landed the board-transition half of part 3, so this notice no
-  // longer says "not covered" — it says WHAT is covered. Deleting it outright
-  // would have been the over-claim: the directive is "every action a worker
-  // takes" and only board transitions carry a trail today, so a reader seeing
-  // authz lines on a card would reasonably assume the same holds for scope
-  // writes and messages. Naming the boundary is the honest version, and it is
-  // worded to name the card so it cannot outlive the remaining gap.
-  h += '<div class="bd-lin-note bd-lin-todo">Authorisation trail: board status'
-    + ' transitions record which permission layer allowed them, every tier, on'
-    + ' the card log (look for <code>authz:</code> lines above &mdash;'
-    + ' <code>outranked</code> means a rule existed at that tier and lost).'
-    + ' Other actions a worker takes (scope writes, messages, session starts) do'
-    + ' NOT carry one yet, so their absence here is unrecorded rather than'
-    + ' unrestricted (AMUX-3607).</div>';
-  return h;
 }
 
 function _renderDetailStatusBtns() {
@@ -26303,7 +26420,7 @@ async function boardDetailSave() {
   document.getElementById('bd-save-status').textContent = 'Saving...';
   const dueInput = document.getElementById('bd-due');
   const dueTimeInput = document.getElementById('bd-due-time');
-  const changes = { title, desc, status: boardDetailStatus, due: dueInput ? dueInput.value : '', due_time: dueTimeInput ? dueTimeInput.value : '', groups: [..._tagState['bd']], gate };
+  const changes = { title, desc, status: boardDetailStatus, due: dueInput ? dueInput.value : '', due_time: dueTimeInput ? dueTimeInput.value : '', tags: [..._tagState['bd']], gate };
   if (worker !== undefined) changes.session = worker;
   // The server enforces status gates: forward acknowledgement from _gateConfirm.
   if (_gateAck) { changes.gate_ack = true; if (Array.isArray(_gateAck)) changes.gate_checked = _gateAck; }
@@ -26342,13 +26459,13 @@ async function addBoardItem(title, desc, status, worker, groups, due, ownerType,
   gate = gate || [];
   const tempId = Math.random().toString(16).slice(2, 8);
   const now = Math.floor(Date.now() / 1000);
-  const tempItem = { id: tempId, title, desc, status, worker: worker || '', groups: groups || [], due: due || '', due_time: dueTime || '', gate: gate, creator: _getDeviceName(), owner_type: ownerType, created: now, updated: now, _pending: true };
+  const tempItem = { id: tempId, title, desc, status, session: worker || '', tags: groups || [], due: due || '', due_time: dueTime || '', gate: gate, creator: _getDeviceName(), owner_type: ownerType, created: now, updated: now, _pending: true };
   boardItems.push(tempItem);
   saveBoardCache();
   renderBoard();
   const r = await apiCall(API + '/api/board', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ title, desc, status, worker: worker || '', groups: groups || [], due: due || '', due_time: dueTime || '', gate: gate, creator: _getDeviceName(), owner_type: ownerType })
+    body: JSON.stringify({ title, desc, status, session: worker || '', tags: groups || [], due: due || '', due_time: dueTime || '', gate: gate, creator: _getDeviceName(), owner_type: ownerType })
   });
   if (r) {
     const item = await r.json();
@@ -30614,21 +30731,18 @@ async function _handleDeeplink(hash) {
   // #issue=<id> — open a board card directly from anywhere (AMUX-2165), the
   // shareable twin of the task-label id chip.
   if (hash && hash.startsWith('#issue=')) {
-    // Optional `:<tab>` suffix — `#issue=AMUX-1:lineage` opens the card ON that
-    // tab. Two reasons, and the second is why it is here rather than in a
-    // backlog: a card's lineage is the thing you want to SEND someone ("look at
-    // how this card got here"), and a tab reachable only by tapping cannot be
-    // linked, screenshotted by the simulator rig, or deep-linked from a nudge.
-    // The rig drives UI states by deeplink because simctl has no tap primitive,
-    // so an untargetable tab is also an unverifiable one.
+    // Optional `:<tab>` suffix opens the card on Details, Worker actions or
+    // Edit. `lineage` used to be a fourth tab; keep it as an alias for Details
+    // so links already pasted into messages still open the card instead of
+    // treating the suffix as part of its id.
     const raw = decodeURIComponent(hash.slice(7));
     const cut = raw.lastIndexOf(':');
     // Card ids contain no colon, so a colon can only be the tab separator — but
     // validate against the known tabs anyway rather than trusting position, or a
     // future id format silently loses everything after its last colon.
-    const TABS = ['edit', 'preview', 'history', 'lineage'];
+    const TABS = ['edit', 'preview', 'history'];
     const maybeTab = cut > 0 ? raw.slice(cut + 1) : '';
-    const tab = TABS.includes(maybeTab) ? maybeTab : '';
+    const tab = TABS.includes(maybeTab) ? maybeTab : (maybeTab === 'lineage' ? 'preview' : '');
     const id = tab ? raw.slice(0, cut) : raw;
     const tryOpen = (attempt) => {
       if (typeof boardItems !== 'undefined' && boardItems.some(i => i.id === id)) {
@@ -33459,7 +33573,9 @@ function _messagesRender() {
   // is 500 rows OF THAT KIND rather than 500 mixed rows filtered down to a
   // handful — the same crowding that showed 48 human messages out of 6547.
   if (_msgsKind !== 'all') rows = rows.filter(m => _msgKind(m) === _msgsKind);
-  if (q) rows = rows.filter(m => (m.text || '').toLowerCase().includes(q) || (m.session || '').toLowerCase().includes(q));
+  if (q) rows = rows.filter(m => (m.text || '').toLowerCase().includes(q)
+    || (m.session || '').toLowerCase().includes(q)
+    || ('msg-' + String(m.id || '')).toLowerCase() === q);
   // Selection toolbar (AMUX-2318). Only rendered when something is selected,
   // so the default view is unchanged - a persistent bar for a rare action is
   // clutter, and this list is read far more often than it is acted on.

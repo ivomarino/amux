@@ -1195,6 +1195,46 @@ pub fn title_from_prompt(text: &str) -> Option<String> {
     Some(out)
 }
 
+const CAPTURE_TASK_VERBS: &[&str] = &[
+    "add ", "audit ", "build ", "change ", "check ", "clean ", "close ", "commit ",
+    "configure ", "create ", "delete ", "deploy ", "diagnose ", "document ", "edit ",
+    "find ", "fix ", "generate ", "implement ", "install ", "investigate ", "make ",
+    "move ", "open ", "push ", "refactor ", "remove ", "reproduce ", "research ",
+    "run ", "ship ", "submit ", "take ", "test ", "try ", "update ", "verify ",
+    "write ",
+];
+
+fn capture_clause_starts_task(raw: &str) -> bool {
+    let clause = raw
+        .trim()
+        .trim_start_matches("please ")
+        .trim_start_matches("then ")
+        .trim_start_matches("also ")
+        .trim_start_matches("and ")
+        .trim_start_matches("can you ")
+        .trim_start_matches("could you ")
+        .trim_start_matches("if not, ");
+    CAPTURE_TASK_VERBS.iter().any(|verb| clause.starts_with(verb))
+}
+
+fn capture_has_task_followup(lower: &str) -> bool {
+    [
+        ";",
+        " — ",
+        " -- ",
+        ". ",
+        "! ",
+        "? ",
+        " and then ",
+        " and please ",
+        " and can you ",
+        " and could you ",
+        " if not,",
+    ]
+        .iter()
+        .any(|marker| lower.split(marker).skip(1).any(capture_clause_starts_task))
+}
+
 /// A pure status / information query about existing work: "status on MSG-29602?",
 /// "any update on the deploy?". These are answered inline and produce no
 /// deliverable, yet capture minted them as type=code/doing — which a question can
@@ -1250,7 +1290,114 @@ pub fn is_status_query(text: &str) -> bool {
         // follow-up prompt that asks for the work.
         "why is ", "why are ", "why does ", "why did ", "why was ", "why were ",
     ];
-    STATUS_OPENERS.iter().any(|o| lower.starts_with(o))
+    STATUS_OPENERS.iter().any(|o| lower.starts_with(o)) && !capture_has_task_followup(&lower)
+}
+
+/// A prompt whose requested outcome is an answer in the conversation, not a
+/// durable unit of work. It remains in Messages but should not consume a board
+/// id, a WIP slot, or the decomposition/drive loop.
+///
+/// This is intentionally a small, auditable intent boundary rather than a
+/// model call. Question words and explicit answer-only commands are message
+/// only; imperative follow-ups ("what broke; fix it?") and operational checks
+/// that require running work ("does this build?") remain cardable. Unknown
+/// shapes fail open to a card so the classifier can never silently lose work.
+pub fn is_informational_query(text: &str) -> bool {
+    let mut t = text.trim();
+    while t.starts_with('[') {
+        match t.find(']') {
+            Some(i) => t = t[i + 1..].trim_start(),
+            None => break,
+        }
+    }
+    let collapsed = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return false;
+    }
+    let lower = collapsed.to_lowercase();
+    if capture_has_task_followup(&lower) {
+        return false;
+    }
+    if is_status_query(text) {
+        return true;
+    }
+
+    let polite = lower.strip_prefix("please ").unwrap_or(&lower);
+    const ANSWER_ONLY_COMMANDS: &[&str] = &[
+        "answer ", "compare ", "clarify ", "describe ", "explain ", "recap ",
+        "summarize ", "tell me ", "give me a summary ", "help me understand ",
+    ];
+    if !lower.contains('?') {
+        return ANSWER_ONLY_COMMANDS.iter().any(|p| polite.starts_with(p));
+    }
+
+    let question_end = lower.find('?').unwrap_or(lower.len());
+    let question = &lower[..question_end];
+    let tail = lower[question_end.saturating_add(1)..]
+        .trim()
+        .trim_end_matches(['.', '!', ';', ' ']);
+    // A second clause normally means the prompt has work after the question.
+    // Preserve the explicit non-mutating tails people naturally add when they
+    // want only an answer.
+    if !tail.is_empty() {
+        const ANSWER_ONLY_TAILS: &[&str] = &[
+            "answer only", "just answer", "please answer only", "no changes",
+            "do not change anything", "don't change anything", "do not make changes",
+            "don't make changes", "please answer only; do not change anything",
+            "please answer only; don't change anything",
+        ];
+        const QUESTION_TAILS: &[&str] = &[
+            "are ", "can ", "could ", "did ", "do ", "does ", "has ", "have ", "how ",
+            "is ", "should ", "was ", "were ", "what ", "when ", "where ", "which ",
+            "who ", "why ", "will ", "would ",
+        ];
+        if !ANSWER_ONLY_TAILS.contains(&tail)
+            && !(tail.ends_with('?') && QUESTION_TAILS.iter().any(|p| tail.starts_with(p)))
+        {
+            return false;
+        }
+    }
+
+    const QUESTION_WORDS: &[&str] = &[
+        "how ", "how's ", "hows ", "what ", "what's ", "whats ", "when ", "where ",
+        "which ", "who ", "who's ", "whos ", "why ",
+    ];
+    if QUESTION_WORDS.iter().any(|p| question.starts_with(p)) {
+        return true;
+    }
+
+    const ANSWER_REQUESTS: &[&str] = &[
+        "can you answer ", "can you compare ", "can you describe ", "can you explain ",
+        "can you help me understand ", "can you please explain ", "can you summarize ",
+        "can you tell me ", "could you answer ", "could you compare ",
+        "could you describe ", "could you explain ", "could you help me understand ",
+        "could you please explain ", "could you summarize ", "could you tell me ",
+        "would you explain ", "would you tell me ",
+    ];
+    if ANSWER_REQUESTS.iter().any(|p| question.starts_with(p)) {
+        return true;
+    }
+    // Preserve the existing operational-check contract. Answering these means
+    // running the build/test/deploy, so they are work even though grammatical
+    // questions surround them.
+    const OPERATIONAL_CHECKS: &[&str] = &[
+        "does this build", "does it build", "do the tests pass", "does the test pass",
+        "did the tests pass", "can this compile", "will this deploy",
+    ];
+    if OPERATIONAL_CHECKS.iter().any(|p| question.starts_with(p)) {
+        return false;
+    }
+    // Plain yes/no or advice questions are message-only. "Can you …" and
+    // "Could you …" reach here only when they did not use an answer verb, so
+    // they remain cardable requests such as "can you fix the redirect?".
+    if question.starts_with("can you ") || question.starts_with("could you ") {
+        return false;
+    }
+    const YES_NO_QUESTIONS: &[&str] = &[
+        "are ", "can ", "could ", "did ", "do ", "does ", "has ", "have ", "is ",
+        "should ", "was ", "were ", "will ", "would ",
+    ];
+    YES_NO_QUESTIONS.iter().any(|p| question.starts_with(p))
 }
 
 /// Bare demonstratives/pronouns: words whose referent lives OUTSIDE the title.
@@ -1461,6 +1608,40 @@ mod capture_tests {
             "why is the deploy pipeline failing on the third stage after the cache restore step when the lockfile has not changed at all?",
         ] {
             assert!(!is_status_query(s), "{s:?} is real work, must still card");
+        }
+    }
+
+    #[test]
+    fn informational_questions_are_message_only_but_work_requests_still_card() {
+        for s in [
+            "What is the difference between todo and backlog on this board?",
+            "What is the difference between todo and backlog? Please answer only; do not change anything.",
+            "How does the Done gate work?",
+            "Can you explain why ATE-10 is linked to ATE-11?",
+            "Is the board source of truth the issue row or the message?",
+            "Compare Claude Code and Codex",
+            "Please explain why the gate is required",
+            "Could you please explain what a gate does?",
+            "Tell me what the worker status colors mean",
+            "What is backlog? How is todo different?",
+            "[amux-origin: dashboard]   WHAT is backlog?",
+            &format!("Why does this happen {}?", "in this particular configuration ".repeat(20)),
+        ] {
+            assert!(is_informational_query(s), "{s:?} should remain message-only");
+        }
+        for s in [
+            "can you fix the OAuth redirect?",
+            "does this build?",
+            "what broke; fix the failing test?",
+            "why is the build red — investigate the failure?",
+            "what broke? please diagnose it",
+            "why did this fail and can you reproduce it?",
+            "is it done? if not, add a retry to the fetch",
+            "write an explanation to docs/status.md",
+            "",
+            "[broken stamp",
+        ] {
+            assert!(!is_informational_query(s), "{s:?} produces work and needs a card");
         }
     }
 

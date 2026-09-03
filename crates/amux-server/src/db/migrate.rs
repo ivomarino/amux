@@ -298,18 +298,25 @@ const MIGRATIONS: &[Migration] = &[
         name: "0053_telegram_relay_dedup",
         sql: include_str!("../../migrations/0053_telegram_relay_dedup.sql"),
     },
-    // Renumbered from 49 (collision with main's own 0049_email_annotations,
-    // then again with 0050-0053's telegram migrations, both merged
-    // independently while this branch also claimed the 49 slot) — same
-    // contributor-collision case documented on the entries above. This
-    // branch's own gcal migration is the losing side, renumbered to the
-    // next free slot after main's 53. 0050_gcal_event_details (a second
-    // migration adding columns to a local event-mirror table) was dropped
-    // entirely along with that mirror — see the gcal re-scope commit.
     Migration {
         version: 54,
-        name: "0054_google_calendar_sync",
-        sql: include_str!("../../migrations/0054_google_calendar_sync.sql"),
+        name: "0054_telegram_chat_type",
+        sql: include_str!("../../migrations/0054_telegram_chat_type.sql"),
+    },
+    // Renumbered from 49, then 54 (collision with main's own
+    // 0049_email_annotations, then 0050-0053's telegram migrations, then
+    // 0054_telegram_chat_type — the group-chat feature — all merged
+    // independently while this branch also claimed each slot in turn) —
+    // same contributor-collision case documented on the entries above.
+    // This branch's own gcal migration is the losing side again, renumbered
+    // to the next free slot after main's 54. 0050_gcal_event_details (a
+    // second migration adding columns to a local event-mirror table) was
+    // dropped entirely along with that mirror — see the gcal re-scope
+    // commit.
+    Migration {
+        version: 55,
+        name: "0055_google_calendar_sync",
+        sql: include_str!("../../migrations/0055_google_calendar_sync.sql"),
     },
 ];
 
