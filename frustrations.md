@@ -2899,3 +2899,62 @@ NOTE: this is AF-368's mechanism ("editing a running .sh corrupts it mid-run, an
   mutation safe. The generalisable half is the second clause of that title, and it is why
   this took two occurrences to notice: an instrument that edits files cannot be trusted to
   report an edit to ITSELF, so its error messages are precisely the ones that will mislead.
+
+---
+
+## A correct answer makes a wrong reason feel checked, and the reason is what gets generalised into a rule
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-03
+SESSION: amux-frustrations
+CARD: AF-445
+SYMPTOM: Named by mixpeek-cicd, 2026-09-03, about their own near-miss, and it applies to two
+  of mine from the same day. Three instances, all with the same shape: a TRUE sub-fact made a
+  FALSE conclusion feel established, and in every case the conclusion was about to become a
+  rule rather than a one-off answer.
+    1. (mixpeek-cicd) They cleared three staged-guard notices correctly and generalised the
+       reason into a proposed guard change: downgrade when provenance is `observed`, because
+       observed means no recorded edit. What actually settled their three cases was different
+       and per-instance — the trailer named a peer, their own commits on that path were days
+       old, and they knew from memory they had not opened it. Their words, which are the
+       entry: "I picked `observed` as the safety discriminator while producing nothing but
+       `observed` records all night, which is a fair definition of not having checked." Every
+       file they shipped that day was a heredoc write, i.e. exactly the record their rule
+       would have dismissed. Three right answers, one wrong rule, aimed at a guard every lane
+       reads.
+    2. (mine, AF-290) The card said seven session verbs are duplicates "another route already
+       expresses", and a `mutate.sh` run had PASSED — route.callers_have_routes did not fire
+       when the routes were deleted. Both true. The conclusion was false: `/api/workers/{id}`
+       is mounted and resolves NOTHING (0 of 12 fleet lanes, 0 workers against 129 sessions),
+       so migrating would have handed the dashboard "worker not found" on every destructive
+       path. The passing mutation is what made the premise feel verified; it asks whether a
+       route EXISTS, not whether it ANSWERS.
+    3. (mine, AF-346) The card said the slim board serializer "drops desc and log, which is
+       why the response carries none". The response does carry none — true, and checkable in
+       one curl. The conclusion, that hydration can stop selecting them, was false: the slim
+       branch makes five derivations over those columns. The correct observation is what made
+       the plan look established.
+COST: none shipped, in all three, and that is the problem with counting it. Instance 1 was
+  caught because the recipient of the proposal had spent the day writing heredocs and
+  recognised the record; instance 2 because I probed a running server instead of reading the
+  card; instance 3 because I read the serializer instead of the card's summary of it. Each
+  catch was a coincidence of what the reader happened to have in hand that hour. The rate at
+  which this class is CAUGHT is not evidence about the rate at which it OCCURS, and all three
+  were one review-pass away from becoming a rule other people would follow.
+FIX: no tooling proposed, deliberately. `mutate.sh seams` and `survey` both answer "is this
+  held?"; neither can answer "is the reason for this the reason it is true?", which needs a
+  second derivation rather than a second run — and instance 2 is the proof, because a
+  mutation PASSED and that pass is what did the damage.
+  mixpeek-cicd's sentence is the whole of it and is worth quoting rather than paraphrasing:
+  the answer being right is what makes the reason feel checked. The practical form, which is
+  the only part that has ever worked for me: when a correct answer is about to become a RULE,
+  re-derive it from a different starting point than the one that produced it. Instance 2 took
+  a live probe against a running server, instance 3 took reading the code rather than the
+  card, and instance 1 took a reader with different recent history. None took more than
+  minutes; all three took a DIFFERENT SOURCE, not more care with the same one.
+  Logged rather than built because I do not have a mechanism and would rather say so than
+  ship a checklist item that joins the prose nobody enforces.
+NOTE: distinct from AF-435 (checks that ran, passed and could not have failed). That one is
+  about an instrument with no discriminating power. This is about an instrument that
+  discriminated CORRECTLY and a human generalising the wrong invariant from the result.
