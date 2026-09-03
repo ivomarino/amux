@@ -307,12 +307,17 @@ jobs:
       # Its control (nothing cleared above the floor) and its last-resort case
       # (the shared dir must STILL be reachable) are what stop the fix becoming
       # either a no-op or a reintroduction of the disk-full outage.
-      - name: SessionStart freshness hook (AEAB-18) + build provenance (AEAB-12) + disk clear (AEAB-34)
+      - name: SessionStart freshness + deployment and watchdog recovery
         run: |
           set -uo pipefail
           ./scripts/test-session-freshness.sh
           ./scripts/test-build-provenance.sh
           ./scripts/test-build-disk-clear.sh
+          # A replacement is complete and signed before its one visible rename;
+          # persistent listener loss makes the external watchdog reload only the
+          # exact configured launch agent.
+          ./scripts/test-build-atomic-install.sh
+          python3 ./scripts/test-watchdog-recovery.py
           # AEAB-36: a board write that never reached the server must say so,
           # and must never be confused with one the server refused. Its (c)/(d)
           # controls are the load-bearing half — a CLI that shouted "cannot
