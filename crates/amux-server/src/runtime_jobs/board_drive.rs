@@ -1529,19 +1529,17 @@ fn reclaim_stale_doing(
     None
 }
 
-/// Scope key for the opt-in backlog dispatch (AMUX-4055).
+/// Scope key for backlog dispatch (AMUX-4055).
 pub const DISPATCH_BACKLOG_KEY: &str = "AMUX_DISPATCH_BACKLOG_WHEN_IDLE";
 
 /// May this lane pull from `backlog` when it has no `todo` left?
 ///
-/// DEFAULT OFF, which is the opposite of the other scoped gates in this
-/// codebase and is deliberate. `done_link_required` and
-/// `done_evidence_required` default ON because they are constraints, and ethos
-/// rule 1 asks for opt-out there. This is not a constraint, it is a lane
-/// deciding that its backlog is a work queue rather than a parking lot. Those
-/// are different claims and only the owner knows which their backlog is:
-/// turning it on globally would start dispatching 489 parked cards across the
-/// fleet. Ethan asked for opt-in for exactly that reason.
+/// DEFAULT ON. A worker with actionable backlog and an empty To Do column is a
+/// stalled queue, not an idle worker; every new and existing worker therefore
+/// drains by default. The eligibility query still excludes human-owned cards,
+/// `needs:you`, live triggers, epics, watches, tripwires, and already-claimed
+/// work, so default-on does not turn parked coordination state into executable
+/// work. A worker/group/global layer may explicitly opt out.
 ///
 /// Same resolver shape as the gates above, so the override ladder is one thing:
 /// process env wins (the operator switch in `~/.amux/server.env`), then the
@@ -1565,7 +1563,7 @@ pub fn dispatch_backlog_when_idle(session: &str) -> bool {
     )
     .as_deref()
     .map(is_on)
-    .unwrap_or(false)
+    .unwrap_or(true)
 }
 
 /// Backlog cards of a workable TYPE, before the parked/claimed exclusions.
@@ -7909,17 +7907,16 @@ mod tests {
     /// not a reason to leave the queue broken. The control below is the half
     /// that keeps this a repair rather than a hole: with nothing promotable, a
     /// capped lane must still be told `wip-cap` and handed no work.
-    /// AMUX-4055. Ethan, after tubescience stopped over 21 backlog cards with an
-    /// empty todo queue and a free WIP cap: "it should dispatch backlog when
-    /// todo is empty (opt in)".
-    ///
-    /// OPT-IN IS THE PROPERTY UNDER TEST, not a detail. A backlog is a parking
-    /// lot for some lanes and a work queue for others, and only the owner knows
-    /// which. Defaulting this on would have started dispatching hundreds of
-    /// deliberately parked cards across the fleet, so the first cell here is the
-    /// one that must never regress.
+    /// AMUX-4055. An empty To Do column with actionable backlog is work the
+    /// worker is expected to keep driving. Default-on is safe because the drain
+    /// query excludes every parked/human/trigger shape; an explicit 0 remains
+    /// the worker/group/global opt-out.
     #[test]
-    fn backlog_dispatch_is_off_by_default_and_drains_one_card_when_enabled() {
+    fn backlog_dispatch_is_on_by_default_and_supports_an_explicit_opt_out() {
+        // The default must be tested against an actually empty scope chain,
+        // not the developer machine's ~/.amux global configuration.
+        let home = tempfile::tempdir().expect("temp home");
+        let _home = crate::api::settings::test_env::set_home(home.path());
         let build = || {
             let conn = board_db();
             // No todo at all: the only state where this may fire.
@@ -7930,24 +7927,22 @@ mod tests {
             conn
         };
 
-        // DEFAULT OFF. Nothing enabled it, so the lane reports an empty queue.
+        // DEFAULT ON: the oldest eligible card drains without every worker
+        // needing a redundant opt-in key.
         std::env::remove_var(DISPATCH_BACKLOG_KEY);
-        match select_pickup_with(&build(), "lane", now_f64(), false) {
-            Pickup::None { reason, .. } => assert_eq!(
-                reason, "no-eligible-card",
-                "a lane that did not opt in must NOT have its backlog dispatched"
-            ),
-            other => panic!("backlog dispatch must be opt-in: {other:?}"),
-        }
-
-        // OPTED IN: the OLDEST drainable card, one at a time.
-        std::env::set_var(DISPATCH_BACKLOG_KEY, "1");
         match select_pickup_with(&build(), "lane", now_f64(), false) {
             Pickup::DrainBacklog { card, backlog_left } => {
                 assert_eq!(card, "B-1", "oldest first, so a starved card is not starved further");
                 assert_eq!(backlog_left, 2, "the count reports what is drainable, before the move");
             }
-            other => panic!("an opted-in lane with no todo must drain its backlog: {other:?}"),
+            other => panic!("default-on backlog dispatch did not run: {other:?}"),
+        }
+
+        // EXPLICIT OPT-OUT: no backlog card moves.
+        std::env::set_var(DISPATCH_BACKLOG_KEY, "0");
+        match select_pickup_with(&build(), "lane", now_f64(), false) {
+            Pickup::None { reason, .. } => assert_eq!(reason, "no-eligible-card"),
+            other => panic!("an opted-out lane must not drain backlog: {other:?}"),
         }
         std::env::remove_var(DISPATCH_BACKLOG_KEY);
     }
@@ -7981,9 +7976,9 @@ mod tests {
             other => panic!("a fully parked backlog must not drain: {other:?}"),
         }
 
-        // NOT opted in: say so, and say how to turn it on. An absent note and a
-        // lane with no backlog are otherwise the same silence.
-        std::env::remove_var(DISPATCH_BACKLOG_KEY);
+        // EXPLICITLY opted out: say so and name the control. An absent note and
+        // a lane with no backlog are otherwise the same silence.
+        std::env::set_var(DISPATCH_BACKLOG_KEY, "0");
         match select_pickup_with(&conn, "lane", now_f64(), false) {
             Pickup::None { detail, .. } => assert!(
                 detail.contains("drain: OFF"),
@@ -7991,6 +7986,7 @@ mod tests {
             ),
             other => panic!("expected no-eligible-card: {other:?}"),
         }
+        std::env::remove_var(DISPATCH_BACKLOG_KEY);
     }
 
     /// The two cards this must never touch, even when opted in.

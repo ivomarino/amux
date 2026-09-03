@@ -180,7 +180,10 @@
   .card-menu {
     display: none; position: fixed;
     background: var(--card); border: 1px solid var(--border);
-    border-radius: 10px; min-width: 200px; z-index: 50;
+    /* Menus can open upward into the global approval strip. Keep them above
+       that in-flow strip (90), but below full-screen overlays (100+), so a
+       pending permission request never makes worker actions unclickable. */
+    border-radius: 10px; min-width: 200px; z-index: 95;
     box-shadow: 0 8px 24px rgba(0,0,0,0.4);
     overflow-x: hidden; overflow-y: auto; max-height: 500px;
   }
@@ -2108,10 +2111,10 @@
   /* In-progress board issues for this worker: informational, so accent rather
      than a success/failure colour — it is a count, not a verdict. */
   .meta-count .mc-doing { color: var(--accent); font-weight: 700; }
-  /* Total board items: deliberately DIMMER than .mc-doing. Both sit in the same
-     bare-number row, and if the larger number (total is always >= doing) were
-     the brighter one it would read as the more urgent figure. Doing is what
-     wants attention. */
+  /* Todo is actionable but not running; later lifecycle states stay dimmer
+     than .mc-doing so the running count remains the most urgent figure. The
+     legacy class names remain for compatible themes; renderer-specific
+     mc-todo/mc-backlog classes make the status semantics explicit. */
   .meta-count .mc-active { color: var(--green, #4ade80); font-weight: 700; }
   .meta-count .mc-total { color: var(--dim); font-weight: 600; }
   /* Session card: scrollback cached on this device (readable with no signal). */

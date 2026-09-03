@@ -98,6 +98,76 @@ fn app_ver_and_the_sw_cache_version_agree() {
     );
 }
 
+#[test]
+fn board_worker_actions_group_wrapped_lines_under_their_timestamp() {
+    let app = asset("app.js");
+    let start = app
+        .find("function _bdParseHistory(log)")
+        .expect("board history parser must exist");
+    let rest = &app[start..];
+    let end = rest
+        .find("function _bdWorkerActivity(item)")
+        .expect("worker activity parser must follow history parser");
+    let parser = &rest[..end];
+    assert!(parser.contains("const grouped = []"), "parser no longer groups physical lines");
+    assert!(
+        parser.contains("grouped[grouped.length - 1].body += '\\n' + body.trim()"),
+        "an untimestamped continuation must append to the preceding timestamped action"
+    );
+    assert!(
+        !parser.contains("split('\\n').filter(l => l.trim()).map(line =>"),
+        "the old one-physical-line-equals-one-action parser returned"
+    );
+}
+
+#[test]
+fn messages_link_schedule_ids_to_the_scheduler() {
+    let app = asset("app.js");
+    let start = app
+        .find("async function _openScheduleFromMessage(id)")
+        .expect("Messages must expose schedule navigation");
+    let tail = &app[start..];
+    let end = tail
+        .find("function _linkifyUrls")
+        .expect("schedule linkifier must precede URL linkification");
+    let body = &tail[..end];
+    for needle in [
+        "switchView('scheduler')",
+        "fetchSchedules()",
+        "fetchSchedulerRuns()",
+        "fetchSchedulerAudit()",
+        "openSchedModal(sid)",
+        "function _linkifyScheduleIds(safeHtml)",
+    ] {
+        assert!(body.contains(needle), "schedule navigation lost `{needle}`");
+    }
+    assert!(
+        app.contains("_linkifyScheduleIds(_linkifyCardIds(safe))"),
+        "the shared message-row renderer must link schedule ids in message text"
+    );
+    assert!(
+        app.contains("_linkifyScheduleIds(origin.replace"),
+        "scheduled-message origin is where the canonical SCHED-N token lives"
+    );
+}
+
+#[test]
+fn sse_message_invalidation_refreshes_each_visible_message_surface() {
+    let app = asset("app.js");
+    let start = app
+        .find("if (key === 'messages')")
+        .expect("SSE invalidation must recognize committed Messages writes");
+    let body = &app[start..start + 1100.min(app.len() - start)];
+    for needle in [
+        "_messagesLoad(true)",
+        "_peekMessagesLoad()",
+        "_loadCmdHistoryFromServer()",
+        "_renderCmdHistoryList()",
+    ] {
+        assert!(body.contains(needle), "message invalidation no longer refreshes `{needle}`");
+    }
+}
+
 /// The parser above must be able to FAIL, or the test above it is theatre —
 /// a `const_str` that always returned None would make both sides `expect`-panic,
 /// but one that silently returned the same string for everything would make the
@@ -299,6 +369,9 @@ fn board_detail_leads_with_actionable_task_context() {
         "item.gate_requirements",
         "item.asset_links",
         "a.resolved_ref",
+        "const explicitPath =",
+        "const serverResolvedPath =",
+        "targetPath = target.replace(/#.*$/",
         "Produced assets (",
         "Source message",
         "_bdOpenMessage(",
@@ -325,4 +398,81 @@ fn group_suggestions_are_autocomplete_not_an_unprompted_wall() {
     let empty = body.find("if (!q) { el.innerHTML = ''; return; }").expect("empty-query guard");
     let suggest = body.find("_tagSuggestions(prefix, q)").expect("typed suggestions remain");
     assert!(empty < suggest, "the empty query must stop before fleet groups are suggested");
+}
+
+#[test]
+fn worker_cards_do_not_call_parked_work_active() {
+    let app = asset("app.js");
+    let start = app
+        .find("const byStatus = _cardBoardStatusCounts(s.name)")
+        .expect("worker card status breakdown exists");
+    let body = &app[start..start + 1800.min(app.len() - start)];
+    for label in ["backlog", "needs you", "review", "done"] {
+        assert!(body.contains(label), "worker card omitted `{label}` count");
+    }
+    assert!(
+        !body.contains("${active}</span> active"),
+        "parked and done cards must not be collapsed into a misleading active count"
+    );
+}
+
+#[test]
+fn worker_configurations_are_editable_from_backlog_through_terminal_states() {
+    let html = asset("index.html");
+    assert!(
+        html.contains("<span class=\"tab-lbl\">Configurations</span>"),
+        "the worker surface must be named for what a user can do there"
+    );
+
+    let app = asset("app.js");
+    assert!(
+        app.contains("const _visCaps = (lvl === 'worker') ? d.capabilities"),
+        "worker Configurations must show every capability returned by the server"
+    );
+    assert!(
+        !app.contains("Edited where it lives"),
+        "a writable worker configuration must not send the user to an unnamed second UI"
+    );
+    for needle in [
+        "Worker settings",
+        "Every durable worker setting exposed by the worker API",
+        "_workerConfigurationRow('name'",
+        "_workerConfigurationRow('provider'",
+        "_workerConfigurationRow('model'",
+        "_workerConfigurationRow('mcp'",
+        "_workerConfigurationRow('cross_group'",
+        "_workerConfigurationRow('advanced_environment'",
+        "_scopeEditOpen(\\'",
+        "skin: 'JSON object",
+        "connectors: 'JSON object",
+        "Backlog → To Do",
+        "To Do → In Progress",
+        "Continue non-terminal work",
+        "Pickup / continue master",
+        "On by default; parked and human-owned cards stay put",
+        "Status availability and Board gates below configure the remaining transitions and terminal states",
+    ] {
+        assert!(app.contains(needle), "Configurations omitted `{needle}`");
+    }
+    for field in [
+        "auto_drain_backlog",
+        "board_auto_pickup",
+        "board_auto_continue",
+        "board_standing_orders",
+    ] {
+        assert!(app.contains(&format!("field: '{field}'")), "missing runtime control for {field}");
+    }
+    assert!(
+        app.contains("if (!present.has(k)) out[k] = null"),
+        "removing a masked environment row must delete that worker-level key"
+    );
+    assert!(
+        app.contains("if (z && typeof z === 'object') return Object.keys(z).length > 0"),
+        "nested skin/connector settings must not render as an unset configuration"
+    );
+    assert!(
+        app.contains("_workerBoardConfigurationSet(\\'")
+            && app.contains("\\',null)\">Inherit</button>"),
+        "worker overrides need an explicit path back to inherited configuration"
+    );
 }
