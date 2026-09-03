@@ -3041,3 +3041,27 @@ NOTE: distinct from AF-435 (checks that ran, passed and could not have failed). 
   Instances 4 and 5 are the bridge between them: a check with real discriminating power, at
   the wrong granularity or over the wrong property, produces a TRUE result that supports a
   false conclusion — and a mutation drawn from the same understanding confirms it.
+
+## An answer-only prompt still cards when its no-op tail isn't one of ten hardcoded literal strings
+AREA: harness
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-03
+SESSION: amux-testing-e2e
+CARD: ATE-17
+SYMPTOM: Yesterday's fix (53b3e952, archived from frustrations.md 2026-09-02, validated
+  against the literal specimen "...? Please answer only; do not change anything.") stops
+  carding THAT exact string. A same-session E2E rerun today sent the same question with a
+  differently-worded but equally answer-only tail: "...? Answer only; do not change files
+  or create board work." is_informational_query()'s ANSWER_ONLY_TAILS list in
+  crates/amux-core/src/board.rs matches ~10 hardcoded literal tail strings, not a
+  structural "no imperative here" signal; this tail isn't one of them, so the tail-check
+  fails closed and the question-word branch never fires. Two cards (ATE-15, ATE-16) minted
+  for two paraphrased answer-only questions in one E2E run.
+COST: The exact friction the archived entry described recurred one day later under a
+  paraphrase, consuming two board ids and two WIP-adjacent doing slots for pure Q&A that
+  was already answered inline both times.
+FIX: Replace literal ANSWER_ONLY_TAILS matching with a structural check — e.g. the tail
+  contains no CAPTURE_TASK_VERBS and no additional imperative clause, mirroring what
+  capture_has_task_followup already does for the pre-question clause — instead of an
+  enumerable list of exact phrasings. Not done here; filed as ATE-17.
