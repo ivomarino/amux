@@ -1568,6 +1568,24 @@ pub fn dispatch_backlog_when_idle(session: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// Backlog cards of a workable TYPE, before the parked/claimed exclusions.
+/// The denominator for the drain note: without it, "0 drainable" cannot be told
+/// apart from "no backlog at all".
+fn backlog_by_type_count(conn: &Connection, session: &str) -> usize {
+    conn.query_row(
+        "SELECT COUNT(*) FROM issues i WHERE i.session=?1 AND i.status='backlog' \
+           AND i.owner_type='agent' AND i.deleted IS NULL AND COALESCE(i.archived,0)=0 \
+           AND COALESCE(i.type,'') NOT IN ('tripwire','watch','epic')",
+        rusqlite::params![session],
+        |r| r.get::<_, i64>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .unwrap_or(0)
+    .max(0) as usize
+}
+
 /// How many drainable backlog cards remain. Reported beside the promotion so
 /// the trace answers "is this lane about to run dry" without a second query.
 fn drainable_backlog_count(conn: &Connection, session: &str, now: f64) -> usize {
@@ -2771,17 +2789,49 @@ pub fn select_pickup_with(
         // WIP cap, and `backlog.drain_nudge` fired three times without the lane
         // acting on it. The nudge is advisory by design; this is the arm for an
         // owner who would rather it just happen.
-        if dispatch_backlog_when_idle(session) {
+        let drain_on = dispatch_backlog_when_idle(session);
+        if drain_on {
             if let Some(card) = oldest_drainable_backlog(conn, session, now) {
                 let left = drainable_backlog_count(conn, session, now);
                 return Pickup::DrainBacklog { card, backlog_left: left };
             }
         }
+        // SAY WHY THE DRAIN DID NOT FIRE, in the line someone already reads.
+        //
+        // Without this the trace says `no-eligible-card` and never mentions that
+        // a drain was considered and declined, so "I turned auto-drain on and
+        // nothing happened" has no answer anywhere in the product. Ethan asked
+        // three times in one morning; the third time the answer was that all 20
+        // of tubescience's backlog cards sat inside the 24h parked-trigger
+        // window, the oldest by 2.3 hours. That is a fine answer and it was
+        // nowhere to be found (ethos rule 4).
+        //
+        // Reports the SPLIT, not a total: "20 backlog" reads as work being
+        // ignored, while "20 backlog, 20 parked on a live trigger" reads as a
+        // lane whose queue is genuinely waiting, and those call for opposite
+        // responses.
+        let drain_note = {
+            let parked_total = backlog_by_type_count(conn, session);
+            if parked_total == 0 {
+                String::new()
+            } else if !drain_on {
+                format!(
+                    " | drain: OFF ({parked_total} backlog card(s); enable with                      AMUX_DISPATCH_BACKLOG_WHEN_IDLE=1 on this worker, or the                      Auto-drain backlog toggle)"
+                )
+            } else {
+                let free = drainable_backlog_count(conn, session, now);
+                let parked = parked_total.saturating_sub(free);
+                format!(
+                    " | drain: ON but nothing drainable — {parked_total} backlog card(s),                      {parked} parked on a human or a live trigger (a source_ref re-verified                      inside {}h), {free} free",
+                    SOURCE_REF_STALE_S / 3600
+                )
+            }
+        };
         return Pickup::None {
             reason: "no-eligible-card",
             detail: format!(
                 "queue holds nothing dispatchable (needs:you, archived, dormant, \
-                 stale >{days}d and cards claimed in the last {}h are all exempt){aged_note}",
+                 stale >{days}d and cards claimed in the last {}h are all exempt){aged_note}{drain_note}",
                 (reclaim_cooldown_s() / 3600.0).round() as i64
             ),
         };
@@ -7900,6 +7950,47 @@ mod tests {
             other => panic!("an opted-in lane with no todo must drain its backlog: {other:?}"),
         }
         std::env::remove_var(DISPATCH_BACKLOG_KEY);
+    }
+
+    /// The trace must SAY why a drain declined (AMUX-4055 follow-up).
+    ///
+    /// Ethan asked "why hasn't it drained" three times in one morning. The
+    /// answer was good — all 20 of tubescience's backlog cards sat inside the
+    /// 24h parked-trigger window, the oldest by 2.3 hours — and it existed
+    /// nowhere in the product. The trace said `no-eligible-card` and never
+    /// mentioned that a drain had been considered and declined.
+    #[test]
+    fn the_trace_says_why_a_drain_declined() {
+        let conn = board_db();
+        add_card(&conn, "P-1", "lane", "backlog", "parked on a trigger", "SCOPE: x");
+        conn.execute(
+            "UPDATE issues SET source_ref='watch:thing', last_verified_at=?1 WHERE id='P-1'",
+            rusqlite::params![now_f64() as i64],
+        )
+        .unwrap();
+
+        // OPTED IN, nothing drainable: the note must name the split, because
+        // "1 backlog" reads as ignored work and "1 backlog, 1 parked" reads as
+        // a lane correctly waiting.
+        std::env::set_var(DISPATCH_BACKLOG_KEY, "1");
+        match select_pickup_with(&conn, "lane", now_f64(), false) {
+            Pickup::None { detail, .. } => {
+                assert!(detail.contains("drain: ON"), "the note must say the drain ran: {detail}");
+                assert!(detail.contains("parked"), "...and that the cards are parked: {detail}");
+            }
+            other => panic!("a fully parked backlog must not drain: {other:?}"),
+        }
+
+        // NOT opted in: say so, and say how to turn it on. An absent note and a
+        // lane with no backlog are otherwise the same silence.
+        std::env::remove_var(DISPATCH_BACKLOG_KEY);
+        match select_pickup_with(&conn, "lane", now_f64(), false) {
+            Pickup::None { detail, .. } => assert!(
+                detail.contains("drain: OFF"),
+                "a lane with backlog and the switch off must say so: {detail}"
+            ),
+            other => panic!("expected no-eligible-card: {other:?}"),
+        }
     }
 
     /// The two cards this must never touch, even when opted in.

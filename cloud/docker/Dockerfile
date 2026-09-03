@@ -70,6 +70,12 @@ COPY scripts scripts
 # deploy. One 200KB text file in the build stage only, which the runtime stage
 # does not receive.
 COPY frustrations.md frustrations.md
+# ...and its ARCHIVE, for exactly the same reason and by the same guard. AF-430
+# added an include_str! of frustrations-archive.md in monitor.rs (the ledger
+# check reads BOTH files, since a title in one and not the other is the fault it
+# looks for) without adding this line, so the guard went red on origin/main.
+# Fourth recurrence of the class the comment above already numbers three.
+COPY frustrations-archive.md frustrations-archive.md
 
 # --release is REQUIRED, not a preference. `rust-embed` is built without the
 # `debug-embed` feature, so a DEBUG binary reads the dashboard from

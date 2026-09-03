@@ -16271,6 +16271,39 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
     // WRITES THE WORKER LAYER ONLY. Group and global layers are the Scope tab's
     // to set, and silently writing one from a per-worker menu would change every
     // lane in that group from a control labelled with one worker's name.
+    // AUTO-DRAIN BACKLOG (AMUX-4055 follow-up). Ethan: "the configuration needs
+    // to be a button/toggle too". Writes the SAME worker-scope key the Scope tab
+    // and `dispatch_backlog_when_idle` already use, so the toggle and the text
+    // box are two views of one setting rather than two settings.
+    //
+    // Reports the RESOLVED value after the write, not the value just typed. A
+    // group or global layer can supply this, so echoing back what was sent
+    // would claim an "off" the next drive tick disproves — the same reason the
+    // spans_groups branch below re-resolves.
+    if let Some(v) = body.get("auto_drain_backlog") {
+        let on = py_truthy(v);
+        cfg.set(
+            crate::runtime_jobs::board_drive::DISPATCH_BACKLOG_KEY,
+            if on { "1" } else { "0" },
+        );
+        if cfg.write(&f).is_err() {
+            return jresp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": "could not write session env"}),
+            );
+        }
+        let effective = crate::runtime_jobs::board_drive::dispatch_backlog_when_idle(name);
+        return j200(json!({
+            "ok": true,
+            "auto_drain_backlog": effective,
+            "message": if effective {
+                "Auto-drain on: when this worker runs out of todo it pulls its oldest \
+                 backlog card. Cards parked on a human or on a live trigger are skipped."
+            } else {
+                "Auto-drain off: this worker's backlog stays parked."
+            },
+        }));
+    }
     if body.get("spans_groups").is_some() || body.get("send_allow").is_some() {
         let value = if let Some(sv) = body.get("send_allow").and_then(Value::as_str) {
             sv.trim().to_string()

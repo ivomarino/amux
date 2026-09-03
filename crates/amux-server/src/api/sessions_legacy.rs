@@ -2678,6 +2678,10 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             "composer_stuck_since": meta["composer_stuck_since"].as_i64().unwrap_or(0),
             "composer_preview": meta["composer_preview"].as_str().unwrap_or(""),
             "agents_working": signals.subagents_working(&name),
+            // Published so the toggle can render its CURRENT state instead of
+            // guessing, and so a value supplied by a group or global layer shows
+            // as on rather than as an unset worker key (AMUX-4055).
+            "auto_drain_backlog": crate::runtime_jobs::board_drive::dispatch_backlog_when_idle(&name),
             // AMUX-3048: the raw event-driven count behind agents_working, so a
             // LEAKED count (a lost SubagentStop pinning a lane "working") is
             // diagnosable rather than hidden — null on a hookless/mtime-only lane.

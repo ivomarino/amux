@@ -3294,6 +3294,7 @@ function render() {
                (AMUX-2559, "I cant add a worker to a group"). The label is the
                vocab; the field is the contract. */ ''}
           <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','tags','${escJs(s.tags.join(", "))}')"><span class="mi">&#x1F3F7;</span> Groups</div>
+          <div class="card-menu-item" onclick="event.stopPropagation();toggleAutoDrain('${s.name}')" title="When this worker runs out of todo cards, pull its oldest backlog card into todo automatically. Cards parked on a human (needs:you) or on a live trigger are always skipped. Off by default; a group or global layer can also set it from the Scope tab."><span class="mi">${s.auto_drain_backlog?'&#x2611;':'&#x2610;'}</span> Auto-drain backlog</div>
           <div class="card-menu-item" onclick="event.stopPropagation();toggleSpansGroups('${s.name}')" title="Let this worker message workers in OTHER groups with no per-message approval. Writes CC_SEND_ALLOW on this worker; a group or global layer can also grant it from the Scope tab."><span class="mi">${s.spans_groups?'&#x2611;':'&#x2610;'}</span> Spans groups${_spansLabel(s)}</div>
           <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','dir','${esc(s.dir)}')"><span class="mi">&#x1F4C1;</span> Directory</div>
           ${s.running ? `<div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();doRestart('${s.name}')"><span class="mi">&#x21BB;</span> Restart</div>` : ''}
@@ -5466,6 +5467,34 @@ function _spansLabel(s) {
   const v = s.spans_groups_value || '';
   const scope = v === '*' ? 'all' : v;
   return s.spans_groups_own ? ': ' + esc(scope) : ': ' + esc(scope) + ' (inherited)';
+}
+
+// AUTO-DRAIN BACKLOG (AMUX-4055). Ethan: "the configuration needs to be a
+// button/toggle too". Same worker-scope key the Scope tab writes, so the toggle
+// and the env box are two views of one setting.
+//
+// The toast says what it will and will NOT do, because the honest answer to
+// "why is nothing draining" is usually the skip rule rather than the switch:
+// tubescience had this ON with 20 backlog cards and drained none, every one of
+// them re-confirmed as waiting on an external condition within the last day.
+async function toggleAutoDrain(session) {
+  closeAllMenus();
+  const s = sessions.find(x => x.name === session);
+  const was = s ? !!s.auto_drain_backlog : false;
+  const next = !was;
+  if (s) { s.auto_drain_backlog = next; lastSessionsJSON = ''; render(); }
+  const r = await apiCall(API + '/api/sessions/' + session + '/config', {
+    method: 'PATCH', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ auto_drain_backlog: next })
+  });
+  if (!r && s) { s.auto_drain_backlog = was; lastSessionsJSON = ''; render(); }
+  else if (r) {
+    // Report the RESOLVED value, not the click. A group or global layer can
+    // supply this, so "turned off" can be false the moment it is said.
+    if (s && typeof r.auto_drain_backlog === 'boolean') s.auto_drain_backlog = r.auto_drain_backlog;
+    showToast(r.message || (next ? 'Auto-drain on' : 'Auto-drain off'));
+  }
+  await fetchSessions();
 }
 
 async function toggleSpansGroups(session) {
@@ -8451,7 +8480,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.781';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.782';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
