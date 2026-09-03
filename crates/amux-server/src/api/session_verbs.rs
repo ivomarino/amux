@@ -18923,7 +18923,7 @@ mod tests {
         cmd_hist_record_full(
             &st,
             "lane-info",
-            "What is the difference between todo and backlog? Please answer only; do not change anything.",
+            "Acceptance check only: what provider and model are you currently running? Answer in one sentence. Do not create or modify any board task.",
             "user",
             "",
             false,

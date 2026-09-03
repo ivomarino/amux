@@ -1320,25 +1320,41 @@ pub fn is_informational_query(text: &str) -> bool {
         return false;
     }
     let lower = collapsed.to_lowercase();
-    if capture_has_task_followup(&lower) {
+    // A human doing an acceptance/smoke check will often qualify the question
+    // before asking it.  Treat only explicit answer-only preambles as syntax;
+    // the question that follows still has to pass every normal safeguard below
+    // (so, for example, "acceptance check only: does this build?" remains work).
+    const INFORMATIONAL_PREAMBLES: &[&str] = &[
+        "acceptance check only: ",
+        "informational check only: ",
+        "information only: ",
+        "informational only: ",
+        "question only: ",
+        "answer only: ",
+    ];
+    let intent = INFORMATIONAL_PREAMBLES
+        .iter()
+        .find_map(|prefix| lower.strip_prefix(prefix))
+        .unwrap_or(&lower);
+    if capture_has_task_followup(intent) {
         return false;
     }
-    if is_status_query(text) {
+    if is_status_query(intent) {
         return true;
     }
 
-    let polite = lower.strip_prefix("please ").unwrap_or(&lower);
+    let polite = intent.strip_prefix("please ").unwrap_or(intent);
     const ANSWER_ONLY_COMMANDS: &[&str] = &[
         "answer ", "compare ", "clarify ", "describe ", "explain ", "recap ",
         "summarize ", "tell me ", "give me a summary ", "help me understand ",
     ];
-    if !lower.contains('?') {
+    if !intent.contains('?') {
         return ANSWER_ONLY_COMMANDS.iter().any(|p| polite.starts_with(p));
     }
 
-    let question_end = lower.find('?').unwrap_or(lower.len());
-    let question = &lower[..question_end];
-    let tail = lower[question_end.saturating_add(1)..]
+    let question_end = intent.find('?').unwrap_or(intent.len());
+    let question = &intent[..question_end];
+    let tail = intent[question_end.saturating_add(1)..]
         .trim()
         .trim_end_matches(['.', '!', ';', ' ']);
     // A second clause normally means the prompt has work after the question.
@@ -1407,6 +1423,12 @@ pub fn is_informational_query(text: &str) -> bool {
 /// silently swallow an imperative.
 fn is_non_mutating_answer_tail(tail: &str) -> bool {
     const ANSWER_ONLY: &[&str] = &["answer only", "just answer", "please answer only"];
+    const ANSWER_FORMAT_PREFIXES: &[&str] = &["answer in ", "reply in ", "respond in "];
+    const ANSWER_FORMAT_WORDS: &[&str] = &[
+        "a", "one", "two", "three", "single", "short", "brief", "concise",
+        "word", "words", "line", "lines", "sentence", "sentences", "paragraph",
+        "paragraphs",
+    ];
     const MUTATION_WORDS: &[&str] = &[
         "change", "changes", "edit", "modify", "write", "create", "delete", "run",
         "build", "fix", "make", "file", "files", "commit", "push", "deploy", "board",
@@ -1414,7 +1436,12 @@ fn is_non_mutating_answer_tail(tail: &str) -> bool {
     ];
 
     let mut saw_clause = false;
-    for raw in tail.split(';') {
+    // Sentence punctuation is as natural here as a semicolon ("Answer in one
+    // sentence. Do not create a task."). Normalize it before applying the same
+    // per-clause proof; otherwise a negated mutation word in the second
+    // sentence makes the whole answer-only tail look like work.
+    let normalized = tail.replace(". ", ";").replace("! ", ";");
+    for raw in normalized.split(';') {
         let clause = raw.trim().trim_end_matches(['.', '!', ' ']);
         if clause.is_empty() {
             continue;
@@ -1422,6 +1449,17 @@ fn is_non_mutating_answer_tail(tail: &str) -> bool {
         saw_clause = true;
         if ANSWER_ONLY.contains(&clause) || matches!(clause, "no changes" | "make no changes") {
             continue;
+        }
+        if let Some(format) = ANSWER_FORMAT_PREFIXES
+            .iter()
+            .find_map(|prefix| clause.strip_prefix(prefix))
+        {
+            let words = format.split_whitespace().map(|word| {
+                word.trim_matches(|c: char| !c.is_ascii_alphanumeric())
+            });
+            if !format.is_empty() && words.clone().all(|word| ANSWER_FORMAT_WORDS.contains(&word)) {
+                continue;
+            }
         }
         let negated = clause
             .strip_prefix("please do not ")
@@ -1684,6 +1722,7 @@ mod capture_tests {
             // that list only had "please answer only; do not change anything.".
             "What is the difference between todo and backlog on this board? Answer only; do not change files or create board work.",
             "[08:24 AM] What is the difference between todo and backlog in this September 3 rerun? Answer only; do not change files or create board work.",
+            "Acceptance check only: what provider and model are you currently running? Answer in one sentence. Do not create or modify any board task.",
         ] {
             assert!(is_informational_query(s), "{s:?} should remain message-only");
         }
@@ -1704,6 +1743,8 @@ mod capture_tests {
             // the ATE-17 fix, so broadening the match cannot silently swallow
             // real work stacked onto an answer-only opener).
             "What is the difference between todo and backlog? Answer only, then update the docs.",
+            "Acceptance check only: does this build? Answer in one sentence. Do not create a board task.",
+            "Acceptance check only: what provider is active? Answer in one sentence. Do not create a board task, then update the docs.",
         ] {
             assert!(!is_informational_query(s), "{s:?} produces work and needs a card");
         }
