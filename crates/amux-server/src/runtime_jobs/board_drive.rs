@@ -3055,8 +3055,12 @@ fn verify_nudge_text(cards: &[(String, String, String)], total: i64) -> String {
          (GET /api/board/<id>) or with the scoped query above, not the capped default \
          (this is the exact trap that read as 'these cards do not exist', 2026-08-13).\n\n\
          Cards that genuinely cannot be verified by you (e.g., they require a human \
-         decision or access you lack) should be tagged `needs:you` so they surface \
-         in the owner digest rather than sitting here indefinitely."
+         decision or access you lack) should be tagged `needs:you` — with the ask and \
+         what unblocks it — to mark them human-blocked. Be honest about what that does \
+         today: it moves the card into the dashboard needs:you view, and NOTHING pushes \
+         it to the owner (there is no digest/alert/email path for needs:you as of \
+         2026-09-03, AC-413). So tag it only when a human genuinely owes the next step; \
+         it is not an escape hatch that makes the card someone else's problem."
     )
 }
 
