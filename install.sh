@@ -17,6 +17,9 @@
 #
 # IDEMPOTENT: re-running rebuilds and upgrades the binaries + agents in
 # place. It NEVER writes into existing ~/.amux data (DB, sessions, tokens).
+# It also merges amux's five Claude lifecycle hooks into ~/.claude/settings.json,
+# preserving unrelated settings and hooks, so status reporting is actually
+# connected rather than merely copied to disk.
 #
 # Overridable (used by the e2e self-test to install against a throwaway
 # prefix without touching the live service — and handy for parallel installs):
@@ -288,6 +291,23 @@ if [[ -f "$SCRIPT_DIR/scripts/hooks/hook-report.sh" ]]; then
   _rep_sha="$(shasum -a 256 "$AMUX_HOME/hook-report.sh" | cut -d' ' -f1)"
   printf '%s  hook-report.sh\n' "$_rep_sha" > "$AMUX_HOME/hook-report.sh.sha256"
   say "report hook: $AMUX_HOME/hook-report.sh (sha ${_rep_sha:0:12})"
+
+  # Copying a hook that settings.json never invokes is an inert installation.
+  # Wire the real lifecycle: prompt -> active, tool -> heartbeat, stop -> idle,
+  # and explicit subagent start/stop counts. Do this only for the canonical
+  # AMUX_HOME; hermetic/test installs deliberately must not mutate the operator's
+  # real Claude settings. AMUX_CLAUDE_SETTINGS is the explicit test/custom escape.
+  if [[ "$AMUX_HOME" == "$HOME/.amux" || -n "${AMUX_CLAUDE_SETTINGS:-}" ]]; then
+    _claude_settings="${AMUX_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
+    if /usr/bin/python3 "$SCRIPT_DIR/scripts/hooks/install-claude-status-hooks.py" \
+      --settings "$_claude_settings" --hook-path '$HOME/.amux/hook-report.sh'; then
+      say "Claude status hooks: $_claude_settings"
+    else
+      warn "could not wire Claude status hooks; the report-hook invariant will remain unhealthy"
+    fi
+  else
+    say "Claude status hooks: skipped for non-default AMUX_HOME"
+  fi
 fi
 
 # ── 5. Service ──────────────────────────────────────────────────────────────

@@ -312,32 +312,55 @@ let _yoloDefault = false;
 // No X-Amux-Session header: the server refuses this write from a worker origin,
 // because a session that could set it would be granting itself and every peer a
 // standing cross-group channel.
+async function readCrossGroupDefault() {
+  const r = await fetch(API + '/api/config/cross-group', { headers: _authHeaders() });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok || d.error) throw new Error(d.error || 'could not read saved setting');
+  return d;
+}
+
 async function toggleCrossGroupDefault(checked) {
   const note = document.getElementById('crossgroup-default-note');
+  const cb = document.getElementById('crossgroup-default-checkbox');
+  const rollback = () => { if (cb) cb.checked = !checked; };
   try {
     const r = await fetch(API + '/api/config/cross-group', {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: _authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ allow: checked ? '*' : '' }),
     });
     const d = await r.json().catch(() => ({}));
-    if (!r.ok || d.error) {
+    // This setting is a capability grant. A synthetic offline-outbox 202 says
+    // only "saved in this browser", not "persisted in amux.env". Treating it
+    // as success made the switch look saved until the next GET reset it.
+    if (_isLocallyQueued(r) || !r.ok || d.error) {
       showToast(d.error || 'could not save');
-      const cb = document.getElementById('crossgroup-default-checkbox');
-      if (cb) cb.checked = !checked;      // put the switch back
+      rollback();
       return;
     }
+    // Read after write. The response echoes the intended value; only a fresh
+    // GET proves the global env layer now resolves to it. Keep the visible
+    // switch only when the authoritative reader agrees.
+    const saved = await readCrossGroupDefault();
+    if (!!saved.enabled !== !!checked) {
+      rollback();
+      showToast('setting was not persisted; please try again');
+      return;
+    }
+    if (cb) cb.checked = !!saved.enabled;
     showToast(d.message || (checked ? 'Cross-group messaging on' : 'Cross-group messaging off'));
-    if (note && d.gate_enforcing === false) {
+    if (note && saved.gate_enforcing === false) {
       note.textContent = 'Note: AMUX_GROUP_SEND_ENFORCE is off, so all cross-group sends pass regardless of this switch.';
     }
-  } catch (e) { showToast('failed: ' + String(e)); }
+  } catch (e) {
+    rollback();
+    showToast('failed: ' + String(e));
+  }
 }
 
 (async function initCrossGroupDefault() {
   try {
-    const r = await fetch(API + '/api/config/cross-group', { headers: _authHeaders() });
-    const d = await r.json();
+    const d = await readCrossGroupDefault();
     const cb = document.getElementById('crossgroup-default-checkbox');
     if (cb) cb.checked = !!d.enabled;
     // SAY IT OUT LOUD when the gate is not enforcing at all. Otherwise an
@@ -2237,7 +2260,7 @@ const _origFetch = window.fetch.bind(window);
 // deploy has its fetch fail, get queued, and report success. Ethan saw the two
 // halves separately — "mdai files are stuck at running", and a banner reading
 // `Syncing 0/1 · POST /api/files/mdai/run` that never cleared.
-const _OUTBOX_SKIP = /\/api\/(client-debug|speedtest|tts|lookup|sql|suggest-branch|terminal\/|upload|fs\/upload|sessions\/login\/|tunnel\/|push\/test|browser|files\/mdai\/run)/;
+const _OUTBOX_SKIP = /\/api\/(client-debug|speedtest|tts|lookup|sql|suggest-branch|terminal\/|upload|fs\/upload|sessions\/login\/|tunnel\/|push\/test|browser|files\/mdai\/run|config\/cross-group)/;
 const _OUTBOX_METHODS = { POST: 1, PATCH: 1, PUT: 1, DELETE: 1 };
 function _outboxQueueable(url, init) {
   if (!url || typeof url !== 'string') return false;
@@ -8372,7 +8395,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.773';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.777';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -23031,6 +23054,7 @@ const _SYSJOB_STATUS = {
   disabled:    { cls: 'idle',  label: 'off',      hint: 'switched off by configuration' },
   stalled:     { cls: 'bad',   label: 'STALLED',  hint: 'last tick is far older than this job’s interval' },
   hung:        { cls: 'bad',   label: 'HUNG',     hint: 'a tick started and never finished' },
+  slow:        { cls: 'bad',   label: 'SLOW',     hint: 'the last completed tick exceeded this job’s liveness budget' },
   dead:        { cls: 'bad',   label: 'DEAD',     hint: 'the task exited — it panicked or was aborted' },
   not_spawned: { cls: 'bad',   label: 'NOT RUNNING', hint: 'nothing started this job — the failure that cost hours' },
 };
@@ -23045,7 +23069,7 @@ function renderSystemJobs() {
     return;
   }
   const jobs = _systemJobs.jobs.slice();
-  const bad = jobs.filter(j => ['stalled', 'hung', 'dead', 'not_spawned'].includes(j.status));
+  const bad = jobs.filter(j => ['stalled', 'hung', 'slow', 'dead', 'not_spawned'].includes(j.status));
   if (head) {
     head.innerHTML = bad.length
       ? `<span class="sysjob-alarm">${bad.length} need${bad.length === 1 ? 's' : ''} attention</span>`
@@ -23053,7 +23077,7 @@ function renderSystemJobs() {
   }
   // Broken first — the whole point of the section is that a dead loop is not
   // something you have to scroll for.
-  const rank = j => (['stalled','hung','dead','not_spawned'].includes(j.status) ? 0
+  const rank = j => (['stalled','hung','slow','dead','not_spawned'].includes(j.status) ? 0
                    : j.status === 'alive' ? 1 : j.status === 'disabled' ? 3 : 2);
   jobs.sort((a, b) => rank(a) - rank(b) || String(a.name).localeCompare(String(b.name)));
 
@@ -23077,7 +23101,7 @@ function renderSystemJobs() {
     const tick = j.last_tick_at
       ? `<span title="last tick">✓ ${_sysAge(j.last_tick_age_s)} ago</span>`
       : (j.spawned ? `<span title="no tick recorded yet">no tick yet</span>` : '');
-    const budget = (j.stale_after_s != null && ['stalled','hung'].includes(j.status))
+    const budget = (j.stale_after_s != null && ['stalled','hung','slow'].includes(j.status))
       ? `<span class="sysjob-budget">budget ${_sysAge(j.stale_after_s)}</span>` : '';
     return `<div class="sysjob ${st.cls}">
       <div class="sysjob-top">
@@ -23688,11 +23712,16 @@ function _tagSuggestions(prefix, q) {
 
 function _beTagInputUpdate(prefix) {
   const inp = document.getElementById(prefix + '-tag-input');
-  const q = inp ? inp.value.toLowerCase() : '';
-  _themesRefresh(prefix);   // once per TTL; re-renders itself when it lands
-  const suggestions = _tagSuggestions(prefix, q);
   const el = document.getElementById(prefix + '-tag-suggestions');
   if (!el) return;
+  const q = inp ? inp.value.trim().toLowerCase() : '';
+  // Groups are card metadata, not a recommended taxonomy. An empty input used
+  // to dump twelve fleet-wide suggestions into every card and visually bury
+  // its source message, epic, gate and output. Suggestions are autocomplete:
+  // they exist only after the user asks by typing.
+  if (!q) { el.innerHTML = ''; return; }
+  _themesRefresh(prefix);   // once per TTL; re-renders itself when it lands
+  const suggestions = _tagSuggestions(prefix, q);
   // Data attributes + a delegated listener, NOT an inline onclick.
   //
   // The inline version was silently dead. `JSON.stringify(t)` emits DOUBLE
@@ -25856,14 +25885,30 @@ function _bdConfigureGo(item) {
 
 function _bdArtifactRef(a) {
   const ref = String((a && a.ref) || '');
-  if (/^https?:\/\//i.test(ref)) {
-    return '<a href="' + esc(ref) + '" target="_blank" rel="noopener noreferrer">' + esc(ref) + '</a>';
+  const target = String((a && a.resolved_ref) || ref);
+  if (/^https?:\/\//i.test(target)) {
+    return '<a href="' + esc(target) + '" target="_blank" rel="noopener noreferrer">' + esc(ref) + '</a>';
   }
-  if (/^(?:\/|\.\.?\/)/.test(ref)) {
+  if (/^(?:\/|\.\.?\/)/.test(target) || /(?:^|\/)\S+\.[a-z0-9]{1,12}$/i.test(ref)) {
     return '<span class="file-link" onclick="event.stopPropagation();openFilePreview(\''
-      + escJs(ref) + '\')">' + esc(ref) + '</span>';
+      + escJs(target) + '\')" title="Open ' + esc(target) + '">' + esc(ref) + '</span>';
   }
   return '<code>' + esc(ref) + '</code>';
+}
+
+function _bdOpenMessage(id) {
+  const displayId = 'MSG-' + String(id || '').replace(/^MSG-/i, '');
+  closeBoardDetail();
+  _msgsKind = 'all';
+  _msgsDeepQ = displayId;
+  _msgsGroup = '';
+  _msgsCounts = null;
+  const search = document.getElementById('msgs-search');
+  if (search) search.value = displayId;
+  const worker = document.getElementById('msgs-session-filter');
+  if (worker) worker.value = '';
+  if (typeof _msgSetMode === 'function') _msgSetMode('messages');
+  switchView('messages');
 }
 
 // One renderer for cached open and authoritative hydration. Keeping relation
@@ -25886,30 +25931,33 @@ function _bdRenderMeta(item) {
       + (lv ? (' · source re-checked ' + ageH + 'h ago') : ' · never re-verified')
       + (stale ? ' <span style="color:var(--red);font-weight:600;">STALE — re-check the source before acting</span>' : ''));
   }
-  let html = parts.map(p => '<div class="board-detail-meta-row">' + p + '</div>').join('');
+  let html = parts.length ? '<div class="bd-card-facts">'
+    + parts.map(p => '<span>' + p + '</span>').join('') + '</div>' : '';
+
+  const messages = Array.isArray(item.messages) ? item.messages : [];
+  if (messages.length) {
+    html += '<section class="bd-card-section"><h4>Source message' + (messages.length === 1 ? '' : 's') + '</h4>'
+      + messages.map(m => {
+        const ts = Number(m.ts || 0); const sec = ts > 100000000000 ? Math.floor(ts / 1000) : ts;
+        return '<div class="board-detail-meta-row"><button class="task-id-chip bd-link-chip" onclick="_bdOpenMessage('
+          + Number(m.id || 0) + ')" title="Open this exact message in Messages">MSG-' + esc(String(m.id)) + '</button> '
+          + '<span>' + (m.session ? esc(m.session) + ' · ' : '') + (sec ? timeAgo(sec) + ' · ' : '')
+          + esc(String(m.text || '').slice(0,220)) + '</span></div>';
+      }).join('') + '</section>';
+  }
+
+  let relationHtml = '';
   if (item.epic) {
-    html += '<div class="board-detail-meta-row"><b>Epic</b> <span class="task-id-chip" onclick="_openIssue(\''
+    relationHtml += '<div class="board-detail-meta-row"><b>Epic</b> <span class="task-id-chip" onclick="_openIssue(\''
       + escJs(item.epic) + '\')">' + esc(item.epic) + '</span></div>';
   }
   const deps = Array.isArray(item.depends_on) ? item.depends_on : [];
-  if (deps.length) html += '<div class="board-detail-meta-row"><b>Blocked by</b> ' + deps.map(d =>
+  if (deps.length) relationHtml += '<div class="board-detail-meta-row"><b>Blocked by</b> ' + deps.map(d =>
     '<span class="task-id-chip" onclick="_openIssue(\'' + escJs(d) + '\')">' + esc(d) + '</span>').join(' ') + '</div>';
-
-  const summary = [
-    ['Next action', item.next_action],
-    ['Last result', item.last_result],
-    ['Unresolved', item.unresolved],
-    ['Evidence', item.evidence]
-  ].filter(x => x[1]);
-  if (summary.length) {
-    html += '<div class="board-detail-meta-row"><b>Work summary</b></div>'
-      + summary.map(x => '<div class="board-detail-meta-row"><span style="color:var(--dim)">'
-        + esc(x[0]) + ':</span> ' + _linkifyUrls(_linkifyCardIds(esc(String(x[1])))) + '</div>').join('');
-  }
 
   const children = Array.isArray(item.children) ? item.children : [];
   if (children.length) {
-    html += '<div class="board-detail-meta-row"><b>Child tasks (' + children.length + ')</b></div>'
+    relationHtml += '<div class="board-detail-meta-row"><b>Child tasks (' + children.length + ')</b></div>'
       + children.map(c => {
         const sty = statusStyle(c.status || 'todo');
         const pri = c.priority ? ' · ' + esc(c.priority) : '';
@@ -25919,24 +25967,58 @@ function _bdRenderMeta(item) {
           + '<span>' + esc(c.title || '') + pri + '</span></div>';
       }).join('');
   }
+  if (relationHtml) html += '<section class="bd-card-section"><h4>Task relationships</h4>' + relationHtml + '</section>';
 
-  const messages = Array.isArray(item.messages) ? item.messages : [];
-  if (messages.length) {
-    html += '<div class="board-detail-meta-row"><b>Source message' + (messages.length === 1 ? '' : 's') + '</b></div>'
-      + messages.map(m => {
-        const ts = Number(m.ts || 0); const sec = ts > 100000000000 ? Math.floor(ts / 1000) : ts;
-        return '<div class="board-detail-meta-row"><span class="task-id-chip">MSG-' + esc(String(m.id)) + '</span> '
-          + (m.session ? esc(m.session) + ' · ' : '') + (sec ? timeAgo(sec) + ' · ' : '')
-          + esc(String(m.text || '').slice(0,220)) + '</div>';
-      }).join('');
+  const gates = (Array.isArray(item.gate_requirements) ? item.gate_requirements : [])
+    .filter(g => Array.isArray(g.criteria) && g.criteria.length);
+  if (gates.length) {
+    html += '<section class="bd-card-section"><h4>Column gate requirements</h4>'
+      + gates.map(g => {
+        const src = String(g.source || 'type') + (g.scope ? ' · ' + String(g.scope) : '');
+        return '<div class="bd-gate"><div class="bd-gate-head"><span class="status-badge">'
+          + esc(String(g.status || '')) + '</span><span>' + esc(src) + '</span></div><ul>'
+          + g.criteria.map(c => '<li>' + esc(String(c)) + '</li>').join('') + '</ul></div>';
+      }).join('') + '</section>';
   }
 
-  const artifacts = Array.isArray(item.artifacts) ? item.artifacts : [];
+  const summary = [
+    ['Next action', item.next_action],
+    ['Last result', item.last_result],
+    ['Unresolved', item.unresolved]
+  ].filter(x => x[1]);
+  if (summary.length) {
+    html += '<section class="bd-card-section"><h4>Work summary</h4>'
+      + summary.map(x => '<div class="board-detail-meta-row"><span style="color:var(--dim)">'
+        + esc(x[0]) + ':</span> ' + _linkifyUrls(_linkifyCardIds(esc(String(x[1])))) + '</div>').join('')
+      + '</section>';
+  }
+
+  const artifacts = [];
+  const artifactSeen = new Set();
+  (Array.isArray(item.artifacts) ? item.artifacts : [])
+    .concat(Array.isArray(item.asset_links) ? item.asset_links : [])
+    .forEach(a => {
+      const key = String((a && a.ref) || '');
+      if (key && !artifactSeen.has(key)) { artifactSeen.add(key); artifacts.push(a); }
+    });
   if (artifacts.length) {
-    html += '<div class="board-detail-meta-row"><b>Artifacts (' + artifacts.length + ')</b></div>'
+    html += '<section class="bd-card-section"><h4>Produced assets (' + artifacts.length + ')</h4>'
       + artifacts.map(a => '<div class="board-detail-meta-row">' + _bdArtifactRef(a)
-        + ' <span style="color:var(--dim)">· ' + esc(a.kind || 'artifact') + ' · ' + esc(a.state || 'created') + '</span>'
+        + ' <span style="color:var(--dim)">· ' + esc(a.kind || a.source || 'artifact')
+        + (a.state ? ' · ' + esc(a.state) : '') + '</span>'
         + (a.description ? '<div style="color:var(--dim)">' + esc(a.description) + '</div>' : '') + '</div>').join('');
+    html += '</section>';
+  }
+
+  const activity = _bdWorkerActivity(item);
+  if (activity.length) {
+    html += '<section class="bd-card-section"><h4>Worker actions</h4>'
+      + activity.slice(-8).reverse().map(e => '<div class="board-detail-meta-row"><span class="bd-hist-ic" style="color:'
+        + (_BD_KIND_COL[e.kind] || 'var(--dim)') + '">' + (_BD_KIND_ICON[e.kind] || '\u00B7') + '</span><span>'
+        + _linkifyUrls(_linkifyCardIds(esc(e.body))) + '</span>'
+        + (e.ts ? '<span class="bd-hist-ts">' + esc(e.ts) + '</span>' : '') + '</div>').join('')
+      + (activity.length > 8 ? '<button class="bd-activity-all" onclick="boardDetailTab(\'history\')">View all '
+        + activity.length + ' worker actions</button>' : '') + '</section>';
   }
   meta.innerHTML = html;
 }
@@ -25958,9 +26040,9 @@ async function _bdHydrate(id) {
     const idx = boardItems.findIndex(i => i.id === id);
     const cached = idx >= 0 ? { ...boardItems[idx] } : {};
     if (idx >= 0) boardItems[idx] = Object.assign({}, boardItems[idx], full);
-      const merged = idx >= 0 ? boardItems[idx] : full;
-      _bdRenderHistory(merged);
-      if (typeof _bdRenderStatusBanner === 'function') _bdRenderStatusBanner(merged);
+    const merged = idx >= 0 ? boardItems[idx] : full;
+    _bdRenderHistory(merged);
+    if (typeof _bdRenderStatusBanner === 'function') _bdRenderStatusBanner(merged);
     _bdRenderMeta(merged);
     if (_boardDrafts[id]) { _bdHydrated = true; return; }  // user's draft wins
     const title = document.getElementById('bd-title');
@@ -25970,7 +26052,18 @@ async function _bdHydrate(id) {
     }
     const d = document.getElementById('bd-desc');
     // Only fill if the user has not started typing into it.
-    if (d && d.value === (cached.desc || '')) d.value = full.desc || '';
+    if (d && d.value === (cached.desc || '')) {
+      d.value = full.desc || '';
+      // The board list is intentionally slim, so Details first opens without
+      // `desc`. Hydration must repaint the VISIBLE rendered copy as well as the
+      // hidden edit textarea; otherwise the task context stays blank until the
+      // user switches tabs even though the authoritative response arrived.
+      const previewTab = document.getElementById('bd-tab-preview');
+      const preview = document.getElementById('bd-preview');
+      if (previewTab && previewTab.classList.contains('active') && preview) {
+        preview.innerHTML = d.value.trim() ? renderMarkdown(d.value) : '';
+      }
+    }
     if (boardDetailStatus === (cached.status || 'todo')) {
       boardDetailStatus = full.status || 'todo';
       _renderDetailStatusBtns();
@@ -26034,7 +26127,6 @@ function openBoardDetail(id) {
   _bdRenderMeta(item);
   document.getElementById('bd-save-status').textContent = '';
   document.getElementById('board-detail-overlay').classList.add('active');
-  setTimeout(() => document.getElementById('bd-title').focus(), 100);
 }
 
 // ── Improved detail: status banner, typed History, permalink (AMUX-2178) ───
@@ -26055,6 +26147,20 @@ function _bdParseHistory(log) {
     return { ts, body, kind };
   });
 }
+function _bdWorkerActivity(item) {
+  return _bdParseHistory((item && item.log) || '').filter(e => {
+    const body = String(e.body || '').trim();
+    // The complete mutation/audit trail remains on the server. This card view
+    // is the worker record, so suppress storage plumbing that buried every
+    // useful action in the old History screenshot.
+    if (/^authz:/i.test(body)) return false;
+    if (/^[^:]+:\s*(?:backlog|todo|doing|review|done|verified|discarded)\s*->/i.test(body)) return false;
+    if (/gate satisfied via|gate_checked/i.test(body)) return false;
+    if (/^[^:]+:\s*(?:desc\s+[+-]\d+\s+chars|evidence|last_result|next_action|unresolved)$/i.test(body)) return false;
+    if (/^capture:\s/i.test(body)) return false;
+    return true;
+  });
+}
 const _BD_KIND_ICON = { status:'\uD83D\uDCCD', transition:'\u2192', commit:'\u2318', claim:'\u270B',
   request:'\uD83D\uDCAC', decision:'\u2713', warn:'\u26A0', note:'\u00B7' };
 const _BD_KIND_COL = { status:'var(--accent)', transition:'var(--fg)', commit:'var(--green)',
@@ -26062,7 +26168,7 @@ const _BD_KIND_COL = { status:'var(--accent)', transition:'var(--fg)', commit:'v
 function _bdRenderHistory(item) {
   const el = document.getElementById('bd-log');
   const nb = document.getElementById('bd-hist-n');
-  const evs = _bdParseHistory(item.log);
+  const evs = _bdWorkerActivity(item);
   if (nb) nb.textContent = evs.length ? ' ' + evs.length : '';
   if (!el) return;
   el.innerHTML = evs.length
@@ -26072,7 +26178,7 @@ function _bdRenderHistory(item) {
         + '<div class="bd-hist-b"><span class="bd-hist-txt">' + _linkifyUrls(_linkifyCardIds(esc(e.body))) + '</span>'
         + (e.ts ? '<span class="bd-hist-ts">' + esc(e.ts) + '</span>' : '') + '</div></div>').join('')
       + '</div>'
-    : '<div style="color:var(--dim);font-size:0.85rem;padding:18px;text-align:center;">No activity recorded yet.</div>';
+    : '<div style="color:var(--dim);font-size:0.85rem;padding:18px;text-align:center;">No worker actions recorded yet.</div>';
 }
 function _bdRenderStatusBanner(item) {
   const el = document.getElementById('bd-status-banner');
@@ -26086,7 +26192,7 @@ function _bdRenderStatusBanner(item) {
       + (last.ts ? ' \u00B7 ' + esc(last.ts) : '') + '</div>'
       + '<div class="bd-sb-text">' + _linkifyUrls(_linkifyCardIds(esc(last.body.replace(/^STATUS\s*\([^)]*\):\s*/i, '')))) + '</div>'
       + (sess ? '<button class="btn" style="margin-top:8px;font-size:0.74rem;min-height:36px;" onclick="_askCardStatus(\'' + escJs(item.id) + '\',\'' + escJs(sess) + '\')">\uD83D\uDD04 Refresh from ' + esc(sess) + '</button>' : '');
-  } else if (sess) {
+  } else if (sess && !/^(done|verified|discarded)$/i.test(String(item.status || ''))) {
     el.style.display = '';
     el.innerHTML = '<div class="bd-sb-empty">No status posted yet.'
       + ' <button class="btn" style="font-size:0.74rem;min-height:36px;margin-left:6px;" onclick="_askCardStatus(\'' + escJs(item.id) + '\',\'' + escJs(sess) + '\')">\uD83D\uDCAC Ask ' + esc(sess) + '</button></div>';
@@ -26103,21 +26209,22 @@ function boardDetailTab(tab) {
   const editBtn = document.getElementById('bd-tab-edit');
   const previewBtn = document.getElementById('bd-tab-preview');
   const histBtn = document.getElementById('bd-tab-history');
-  const linBtn = document.getElementById('bd-tab-lineage');
   const desc = document.getElementById('bd-desc');
   const preview = document.getElementById('bd-preview');
   const log = document.getElementById('bd-log');
-  const lin = document.getElementById('bd-lineage');
+  const meta = document.getElementById('bd-meta');
+  const editFields = document.getElementById('bd-edit-fields');
+  const editFooter = document.getElementById('bd-edit-footer');
+  const deleteBtn = document.getElementById('bd-delete');
+  const title = document.getElementById('bd-title');
   if (!editBtn || !previewBtn || !desc || !preview) return;
-  [editBtn, previewBtn, histBtn, linBtn].forEach(bt => bt && bt.classList.remove('active'));
-  if (lin) lin.style.display = 'none';
-  if (tab === 'lineage') {
-    if (linBtn) linBtn.classList.add('active');
-    desc.style.display = 'none'; preview.style.display = 'none';
-    if (log) log.style.display = 'none';
-    if (lin) { lin.style.display = ''; _bdRenderLineage(boardDetailId); }
-    return;
-  }
+  [editBtn, previewBtn, histBtn].forEach(bt => bt && bt.classList.remove('active'));
+  const editing = tab === 'edit';
+  if (editFields) editFields.style.display = editing ? '' : 'none';
+  if (editFooter) editFooter.style.display = editing ? '' : 'none';
+  if (deleteBtn) deleteBtn.style.display = editing ? '' : 'none';
+  if (title) title.readOnly = !editing;
+  if (meta) meta.style.display = tab === 'preview' ? '' : 'none';
   if (tab === 'history') {
     if (histBtn) histBtn.classList.add('active');
     desc.style.display = 'none'; preview.style.display = 'none';
@@ -26130,180 +26237,13 @@ function boardDetailTab(tab) {
     previewBtn.classList.add('active');
     desc.style.display = 'none';
     preview.style.display = '';
-    preview.innerHTML = renderMarkdown(desc.value);
+    preview.innerHTML = desc.value.trim() ? renderMarkdown(desc.value) : '';
   } else {
     editBtn.classList.add('active');
     previewBtn.classList.remove('active');
     desc.style.display = '';
     preview.style.display = 'none';
   }
-}
-
-// ── LINEAGE TAB (AMUX-2393) ────────────────────────────────────────────────
-//
-// Ethan: "we need more robust history so we have a full lineage trail — note it
-// should all come from logs which have request responses with the granular
-// control level based on action."
-//
-// The trail itself was already BUILT and unreachable. `GET /api/why/{kind}/{id}`
-// (RR-0109) correlates the durable trails — issues, issues.log, the state-event
-// journal, the structured request log, the turn ledger, interaction_log — and it
-// is good: it cites a table and row for every line and refuses to narrate when
-// the evidence does not support a story. It had 4 requests in 168 hours from one
-// client, its only consumer being `amux-rs why`, and ZERO call sites in this SPA.
-// So the work here is surfacing, not building: ethos rule 1, the mcp.json shape.
-// Nothing below re-implements any correlation — one place to be wrong is enough,
-// which the endpoint's own docstring says about its CLI printer.
-//
-// THIS RENDERER'S ONE JOB IS NOT TO UPGRADE A WEAK ANSWER. An explainer's
-// failure mode is confident narration from whatever it happened to find, and a
-// printer is exactly where that gets reintroduced after the API carefully avoided
-// it. So three things are non-negotiable here, each mirroring a guarantee the
-// endpoint makes:
-//
-//   - `verdict` and `verdict_reason` lead, never the timeline. `partial` and
-//     `cannot_tell` are answers, not degraded successes.
-//   - `gaps` are rendered in full. Dropping them turns "no turn ledger covers
-//     this card" into an apparently complete story with a quiet hole.
-//   - Sources that returned ZERO are shown WITH their predicate, because a zero
-//     from a probe that could have matched and a zero from a probe that never
-//     could look identical otherwise — and only the second is a gap.
-//
-// Truncation is surfaced too: the payload carries `rows` vs `rows_total` per
-// source and a `per_source_cap`, so a capped source says so rather than reading
-// as complete coverage.
-let _bdLineageFor = null;
-
-function _bdRenderLineage(id) {
-  const el = document.getElementById('bd-lineage');
-  if (!el || !id) return;
-  // Re-fetch per open: a card's trail changes as work happens, and this tab is
-  // opened deliberately rather than on every card open, so it is never on the
-  // hot path.
-  el.innerHTML = '<div class="bd-lin-note">Loading lineage for ' + esc(id) + '…</div>';
-  _bdLineageFor = id;
-  const path = '/api/why/task/' + encodeURIComponent(id);
-  // Plain fetch, NOT apiCall: apiCall is the MUTATION path — it returns null on
-  // failure after a toast, and queues to the offline outbox. Both are wrong
-  // here. A toast vanishes, and this panel's entire purpose is to state what it
-  // could and could not establish, so a failure has to render INTO the panel
-  // where the answer would have been. Returning null would have left the
-  // loading line up forever, which reads as a hang rather than an error.
-  fetch(API + path, { headers: _authHeaders({}) })
-    .then(r => r.ok ? r.json() : r.text().then(t => { throw new Error('HTTP ' + r.status + (t ? ': ' + t.slice(0, 200) : '')); }))
-    .then(d => {
-      if (_bdLineageFor !== id) return;   // a different card was opened meanwhile
-      el.innerHTML = _bdLineageHtml(d, id);
-    })
-    .catch(e => {
-      if (_bdLineageFor !== id) return;
-      // Name the endpoint. "Could not load" sends the next person grepping the
-      // SPA for a view that was never the problem.
-      el.innerHTML = '<div class="bd-lin-note bd-lin-bad">Could not read the lineage trail: '
-        + esc(String(e && e.message ? e.message : e))
-        + '<br><span class="bd-lin-dim">GET ' + esc(path) + '</span></div>';
-    });
-}
-
-function _bdLineageHtml(d, id) {
-  if (!d || typeof d !== 'object') return '<div class="bd-lin-note bd-lin-bad">Empty response.</div>';
-  const verdict = d.verdict || 'unknown';
-  const cls = verdict === 'ok' ? 'ok' : (verdict === 'partial' ? 'warn' : 'bad');
-  let h = '';
-
-  // 1. THE VERDICT LEADS. Not the timeline — a reader who scrolls a plausible
-  //    timeline and never reaches a caveat has been misled by layout alone.
-  h += '<div class="bd-lin-verdict bd-lin-' + cls + '">'
-    + '<span class="bd-lin-vlabel">' + esc(verdict) + '</span>'
-    + (d.verdict_reason ? '<span class="bd-lin-vwhy">' + esc(d.verdict_reason) + '</span>' : '')
-    + '</div>';
-
-  // 2. GAPS, IN FULL, ABOVE the trail. What the trail cannot tell you outranks
-  //    what it can.
-  const gaps = Array.isArray(d.gaps) ? d.gaps : [];
-  if (gaps.length) {
-    h += '<div class="bd-lin-gaps"><div class="bd-lin-h">What this trail cannot tell you ('
-      + gaps.length + ')</div><ul>'
-      + gaps.map(g => '<li>' + esc(String(g)) + '</li>').join('')
-      + '</ul></div>';
-  }
-
-  // 3. SOURCES, INCLUDING THE ZEROS, each with the predicate it ran.
-  const srcs = Array.isArray(d.sources) ? d.sources : [];
-  if (srcs.length) {
-    h += '<div class="bd-lin-h">Sources consulted (' + srcs.length + ')</div><div class="bd-lin-srcs">';
-    srcs.forEach(s => {
-      const rows = Number(s.rows || 0);
-      const total = (s.rows_total === undefined || s.rows_total === null) ? rows : Number(s.rows_total);
-      const capped = total > rows;
-      h += '<div class="bd-lin-src' + (rows === 0 ? ' bd-lin-zero' : '') + '">'
-        + '<code>' + esc(String(s.table || '?')) + '</code>'
-        + '<span class="bd-lin-rows">' + rows + (capped ? ' of ' + total + ' shown' : ' row' + (rows === 1 ? '' : 's')) + '</span>'
-        + (capped ? '<span class="bd-lin-cap">capped'
-            + (d.per_source_cap ? ' at ' + esc(String(d.per_source_cap)) : '') + '</span>' : '')
-        + (s.query ? '<span class="bd-lin-dim">' + esc(String(s.query)) + '</span>' : '')
-        // The endpoint attaches a `note` to a source whenever the row count
-        // alone would mislead — a reaped journal whose floor postdates the card,
-        // events that record THAT something changed but not into what, or the
-        // receipt that says a trail really is complete. Dropping it recreated
-        // the exact defect one layer up that the note exists to prevent: the
-        // panel looked careful and printed a number with no caveat attached.
-        + (s.note ? '<div class="bd-lin-srcnote">' + esc(String(s.note)) + '</div>' : '')
-        + '</div>';
-    });
-    h += '</div>';
-  }
-
-  // 4. THE TRAIL. Every line carries where it came from, so any claim here is
-  //    one SELECT away from being re-checked.
-  const tl = Array.isArray(d.timeline) ? d.timeline : [];
-  h += '<div class="bd-lin-h">Trail (' + tl.length + ')</div>';
-  if (!tl.length) {
-    h += '<div class="bd-lin-note">No trail lines. The sources above name what was searched'
-      + ' and with which predicate.</div>';
-  } else {
-    h += '<div class="bd-lin-tl">' + tl.map(t => {
-      const src = t.source || {};
-      const where = [src.table, src.column].filter(Boolean).join('.');
-      // `ordering` distinguishes a line PLACED BY TIME from one appended in
-      // source order because its record carries no date (issues.log is HH:MM
-      // only). Rendering them identically would invent a chronology.
-      const untimed = t.ordering && t.ordering !== 'timestamped';
-      return '<div class="bd-lin-line' + (untimed ? ' bd-lin-untimed' : '') + '">'
-        + '<div class="bd-lin-when">' + esc(t.at ? String(t.at).replace('T', ' ').replace(/\+.*$/, '') : '—')
-        + (untimed ? '<span class="bd-lin-badge" title="This record carries no date; placed in source order, not by time">order</span>' : '')
-        + '</div>'
-        + '<div class="bd-lin-what">'
-        + '<span class="bd-lin-sum">' + esc(String(t.summary || t.kind || '(no summary)')) + '</span>'
-        + (t.actor ? '<span class="bd-lin-actor">' + esc(String(t.actor)) + '</span>' : '')
-        + (where ? '<span class="bd-lin-dim">' + esc(where) + '</span>' : '')
-        + '</div></div>';
-    }).join('') + '</div>';
-  }
-
-  // 5. PART 3 OF THE REQUIREMENT IS NOT BUILT, AND SAYS SO HERE.
-  //    "granular control level based on action" — which permission scope
-  //    authorised each action, with global/worker/group layers individually
-  //    logged. The per-layer resolution exists at READ time (_gate_layers and
-  //    the scope/env/memory resolvers all return every layer with an `applied`
-  //    flag) but is not PERSISTED with the action, so no trail can answer it
-  //    yet. Stating that in the view is the point: a lineage panel that simply
-  //    omitted authorisation would read as though authorisation were covered.
-  // AMUX-3607 landed the board-transition half of part 3, so this notice no
-  // longer says "not covered" — it says WHAT is covered. Deleting it outright
-  // would have been the over-claim: the directive is "every action a worker
-  // takes" and only board transitions carry a trail today, so a reader seeing
-  // authz lines on a card would reasonably assume the same holds for scope
-  // writes and messages. Naming the boundary is the honest version, and it is
-  // worded to name the card so it cannot outlive the remaining gap.
-  h += '<div class="bd-lin-note bd-lin-todo">Authorisation trail: board status'
-    + ' transitions record which permission layer allowed them, every tier, on'
-    + ' the card log (look for <code>authz:</code> lines above &mdash;'
-    + ' <code>outranked</code> means a rule existed at that tier and lost).'
-    + ' Other actions a worker takes (scope writes, messages, session starts) do'
-    + ' NOT carry one yet, so their absence here is unrecorded rather than'
-    + ' unrestricted (AMUX-3607).</div>';
-  return h;
 }
 
 function _renderDetailStatusBtns() {
@@ -30630,21 +30570,18 @@ async function _handleDeeplink(hash) {
   // #issue=<id> — open a board card directly from anywhere (AMUX-2165), the
   // shareable twin of the task-label id chip.
   if (hash && hash.startsWith('#issue=')) {
-    // Optional `:<tab>` suffix — `#issue=AMUX-1:lineage` opens the card ON that
-    // tab. Two reasons, and the second is why it is here rather than in a
-    // backlog: a card's lineage is the thing you want to SEND someone ("look at
-    // how this card got here"), and a tab reachable only by tapping cannot be
-    // linked, screenshotted by the simulator rig, or deep-linked from a nudge.
-    // The rig drives UI states by deeplink because simctl has no tap primitive,
-    // so an untargetable tab is also an unverifiable one.
+    // Optional `:<tab>` suffix opens the card on Details, Worker actions or
+    // Edit. `lineage` used to be a fourth tab; keep it as an alias for Details
+    // so links already pasted into messages still open the card instead of
+    // treating the suffix as part of its id.
     const raw = decodeURIComponent(hash.slice(7));
     const cut = raw.lastIndexOf(':');
     // Card ids contain no colon, so a colon can only be the tab separator — but
     // validate against the known tabs anyway rather than trusting position, or a
     // future id format silently loses everything after its last colon.
-    const TABS = ['edit', 'preview', 'history', 'lineage'];
+    const TABS = ['edit', 'preview', 'history'];
     const maybeTab = cut > 0 ? raw.slice(cut + 1) : '';
-    const tab = TABS.includes(maybeTab) ? maybeTab : '';
+    const tab = TABS.includes(maybeTab) ? maybeTab : (maybeTab === 'lineage' ? 'preview' : '');
     const id = tab ? raw.slice(0, cut) : raw;
     const tryOpen = (attempt) => {
       if (typeof boardItems !== 'undefined' && boardItems.some(i => i.id === id)) {
@@ -33475,7 +33412,9 @@ function _messagesRender() {
   // is 500 rows OF THAT KIND rather than 500 mixed rows filtered down to a
   // handful — the same crowding that showed 48 human messages out of 6547.
   if (_msgsKind !== 'all') rows = rows.filter(m => _msgKind(m) === _msgsKind);
-  if (q) rows = rows.filter(m => (m.text || '').toLowerCase().includes(q) || (m.session || '').toLowerCase().includes(q));
+  if (q) rows = rows.filter(m => (m.text || '').toLowerCase().includes(q)
+    || (m.session || '').toLowerCase().includes(q)
+    || ('msg-' + String(m.id || '')).toLowerCase() === q);
   // Selection toolbar (AMUX-2318). Only rendered when something is selected,
   // so the default view is unchanged - a persistent bar for a rare action is
   // clutter, and this list is read far more often than it is acted on.

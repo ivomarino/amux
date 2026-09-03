@@ -1375,6 +1375,18 @@ pub fn delivered_text(command: &str, source: &str) -> String {
     format!("{why}\n\n{command}")
 }
 
+/// Messages origin for a confirmed schedule delivery. The id is always
+/// present even when titles collide, and remains a plain `SCHED-N` token that
+/// the dashboard linkifier can open.
+pub fn schedule_message_origin(title: &str, id: &str, source: &str) -> String {
+    let title = if title.is_empty() { id } else { title };
+    if source == "cron-rs" {
+        format!("[{id}] {title}")
+    } else {
+        format!("[{id}] [{source}] {title}")
+    }
+}
+
 /// Does the background reserve gate a fire from this `source`?
 ///
 /// Extracted so the rule is testable without a live usage probe — `deliver`
@@ -1472,12 +1484,15 @@ impl Deliverer for LiveDeliverer {
             Some(false) => RunOutcome::Failed { reason: d.message },
             _ => {
                 // Record it in Messages history so a peek shows scheduled
-                // commands distinctly, origin = the schedule's title.
-                let origin = {
-                    let t = sched.str_field("title");
-                    let t = if t.is_empty() { sched.id() } else { t };
-                    if source == "cron-rs" { t.to_string() } else { format!("{t} [{source}]") }
-                };
+                // commands distinctly. The exact schedule id is part of the
+                // origin so the row is clickable and the health audit can
+                // prove this specific delivered run produced a message rather
+                // than guessing from a possibly-duplicated title.
+                let origin = schedule_message_origin(
+                    sched.str_field("title"),
+                    sched.id(),
+                    source,
+                );
                 crate::api::session_verbs::cmd_hist_record_schedule(
                     &self.state,
                     &session,
@@ -2653,6 +2668,22 @@ mod tests {
         assert!(manual.ends_with("do the thing"), "{manual}");
         let trig = delivered_text("do the thing", "trigger:board");
         assert!(trig.contains("Off-cadence fire (trigger:board)"), "{trig}");
+    }
+
+    #[test]
+    fn schedule_message_origin_always_names_the_exact_schedule() {
+        assert_eq!(
+            schedule_message_origin("Nightly sync", "SCHED-9", "cron-rs"),
+            "[SCHED-9] Nightly sync"
+        );
+        assert_eq!(
+            schedule_message_origin("Nightly sync", "SCHED-9", "manual:ethan"),
+            "[SCHED-9] [manual:ethan] Nightly sync"
+        );
+        assert_eq!(
+            schedule_message_origin("", "SCHED-9", "cron-rs"),
+            "[SCHED-9] SCHED-9"
+        );
     }
 
     // ---- AMUX-2679: skip one occurrence ----------------------------------

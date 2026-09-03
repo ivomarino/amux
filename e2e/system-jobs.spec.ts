@@ -82,6 +82,16 @@ test('system jobs render with real data, separated from user schedules', async (
     expect(j.purpose, `${id} has no purpose text`).toBeTruthy();
   }
 
+  // This harness has a throwaway AMUX_HOME but shares the host's tmux socket,
+  // process table and hook files. Every internal loop is therefore registered
+  // inert under the process-wide isolation switch. Visibility is preserved;
+  // host-wide effects are not.
+  const isolated = jobs.jobs.filter((x: any) => x.disabled_reason === 'AMUX_ISOLATED=1');
+  expect(isolated.length, 'test-server jobs must be visibly fleet-isolated').toBeGreaterThanOrEqual(10);
+  const selfAdopt = jobs.jobs.find((x: any) => x.id === 'self-adoption');
+  expect(selfAdopt?.status).toBe('disabled');
+  expect(selfAdopt?.disabled_reason).toBe('AMUX_NO_SELF_ADOPT');
+
   // No mutation affordances: these are machinery, not user data.
   // Asserted on BUTTONS, not on the word: `getByText('Delete')` matched the
   // section's own note ("you cannot edit or delete them"), which would have

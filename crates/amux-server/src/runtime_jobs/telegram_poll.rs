@@ -67,6 +67,18 @@ const JOB: &str = registry::ids::TELEGRAM_POLL;
 /// while staying responsive for real-time work interaction.
 /// The HTTP client timeout below must exceed this or every poll looks like a network failure.
 const POLL_TIMEOUT_SECS: u64 = 45;
+/// A connector without a token is healthy-but-idle. Its registry cadence must
+/// match this sleep or the shared scheduler-health predicate reports a stall
+/// before the loop is supposed to wake.
+const NO_TOKEN_SLEEP_SECS: u64 = 300;
+
+fn poll_cadence(token_present: bool) -> Duration {
+    Duration::from_secs(if token_present {
+        POLL_TIMEOUT_SECS
+    } else {
+        NO_TOKEN_SLEEP_SECS
+    })
+}
 
 fn bot_token() -> Option<String> {
     std::env::var("TELEGRAM_BOT_TOKEN").ok().filter(|s| !s.trim().is_empty())
@@ -136,8 +148,9 @@ pub async fn run(state: AppState) {
 
     let mut warned_no_token = false;
     loop {
-        registry::tick(JOB);
-        let Some(token) = bot_token() else {
+        let token = bot_token();
+        registry::tick_every(JOB, poll_cadence(token.is_some()));
+        let Some(token) = token else {
             if !warned_no_token {
                 tracing::info!(
                     "telegram_poll: TELEGRAM_BOT_TOKEN not set — idling until a token is pasted \
@@ -145,7 +158,7 @@ pub async fn run(state: AppState) {
                 );
                 warned_no_token = true;
             }
-            tokio::time::sleep(Duration::from_secs(300)).await;
+            tokio::time::sleep(Duration::from_secs(NO_TOKEN_SLEEP_SECS)).await;
             continue;
         };
         warned_no_token = false;
@@ -548,5 +561,21 @@ pub(crate) async fn send_message(
 }
 
 pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
-    registry::spawn_loop(JOB, Some(Duration::from_secs(POLL_TIMEOUT_SECS)), run(state))
+    // Register the conservative idle cadence first. If a token exists the
+    // loop's first `tick_every` tightens this to the long-poll interval. This
+    // also stays correct if the spawned task reaches its first tick before
+    // `spawn_loop` has inserted the registry row.
+    registry::spawn_loop(JOB, Some(poll_cadence(false)), run(state))
+}
+
+#[cfg(test)]
+mod cadence_tests {
+    use super::*;
+
+    #[test]
+    fn registry_cadence_matches_configured_and_idle_loops() {
+        assert_eq!(poll_cadence(true), Duration::from_secs(POLL_TIMEOUT_SECS));
+        assert_eq!(poll_cadence(false), Duration::from_secs(NO_TOKEN_SLEEP_SECS));
+        assert!(poll_cadence(false) > poll_cadence(true));
+    }
 }

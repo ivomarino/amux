@@ -40,7 +40,7 @@ use crate::db::board_store as bs;
 use serde_json::json;
 
 /// Registry id. `spawn_periodic` derives this job's kill switch from the name.
-const JOB: &str = "disk-watch";
+const JOB: &str = super::registry::ids::DISK_WATCH;
 
 /// How often the job wakes. Not how often it scans — see the module docs.
 const TICK_SECS: u64 = 3600;

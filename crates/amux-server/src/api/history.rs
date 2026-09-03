@@ -379,6 +379,16 @@ fn flag(v: &Option<String>) -> bool {
     v.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
 }
 
+/// The UI's durable display id for a command-history row. A prefixed query is
+/// an identity lookup, not prose search: clicking `MSG-123` must still find the
+/// row when neither its body nor its worker happens to contain "MSG-123".
+fn prefixed_message_id(raw: &str) -> Option<i64> {
+    raw.trim()
+        .strip_prefix("MSG-")
+        .or_else(|| raw.trim().strip_prefix("msg-"))
+        .and_then(|n| n.parse::<i64>().ok())
+}
+
 /// Default page, and the CEILING no caller can exceed (AF-213).
 ///
 /// `limit` was unclamped: `?limit=100000` served all 8,920 rows at 19 MB, and
@@ -488,9 +498,14 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
         }
         let q = p.q.as_deref().unwrap_or("").trim().to_string();
         if !q.is_empty() {
-            where_cl.push("text LIKE ? ESCAPE '\\'".into());
-            let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
-            params.push(rusqlite::types::Value::Text(format!("%{escaped}%")));
+            if let Some(message_id) = prefixed_message_id(&q) {
+                where_cl.push("id=?".into());
+                params.push(rusqlite::types::Value::Integer(message_id));
+            } else {
+                where_cl.push("text LIKE ? ESCAPE '\\'".into());
+                let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+                params.push(rusqlite::types::Value::Text(format!("%{escaped}%")));
+            }
         }
         let want: Vec<String> = p
             .kind
@@ -1059,6 +1074,13 @@ mod tests {
         let (_, hits) = send(&app, "GET", "/api/history?q=steer", None).await;
         assert_eq!(hits.as_array().unwrap().len(), 1);
         assert_eq!(hits[0]["text"], json!("queued steer"));
+
+        // A displayed message id is an exact, stable identity. It must not be
+        // treated as prose (the body does not contain its own database id).
+        let (_, by_id) = send(&app, "GET", "/api/history?q=MSG-2", None).await;
+        assert_eq!(by_id.as_array().unwrap().len(), 1);
+        assert_eq!(by_id[0]["id"], json!(2));
+        assert_eq!(by_id[0]["text"], json!("queued steer"));
 
         // limit/offset window.
         let (_, page) = send(&app, "GET", "/api/history?limit=2&offset=1", None).await;
