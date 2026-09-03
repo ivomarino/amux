@@ -3839,13 +3839,29 @@ pub(crate) async fn cmd_hist_record_full(
                     delivery, queued_at_ms, delivered_at_ms, submit_verdict
                 ],
             )?;
-            msg_row_id_w.store(conn.last_insert_rowid(), std::sync::atomic::Ordering::SeqCst);
+            let row_id = conn.last_insert_rowid();
+            msg_row_id_w.store(row_id, std::sync::atomic::Ordering::SeqCst);
             conn.execute(
                 "DELETE FROM cmd_history WHERE session=?1 AND id NOT IN \
                  (SELECT id FROM cmd_history WHERE session=?1 ORDER BY ts DESC LIMIT ?2)",
                 rusqlite::params![session, CMD_HIST_KEEP],
             )?;
-            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            // cmd_history is the durable Messages ledger, but this write used
+            // to publish no StateEvent. A healthy SSE client therefore had no
+            // reason to refetch Messages: the row appeared only after a manual
+            // reload, while the less-healthy polling fallback happened to look
+            // current. Publish the committed fact without its text payload;
+            // SSE turns Message into a coalesced `messages` invalidation and
+            // the authenticated history endpoint remains the data plane.
+            Ok(crate::db::WriteOutcome {
+                applied: true,
+                events: vec![crate::db::PendingEvent {
+                    entity_type: amux_core::revision::EntityType::Message,
+                    entity_id: format!("MSG-{row_id}"),
+                    mutation: amux_core::revision::MutationKind::Created,
+                    payload: None,
+                }],
+            })
         })
         .await;
 
@@ -17964,6 +17980,34 @@ mod tests {
             "a DIRECT send really was delivered when it was recorded — blanking this too \
              would throw away true information instead of removing false information"
         );
+    }
+
+    /// A healthy SSE connection used to make Messages LESS live than the 5s
+    /// polling fallback: cmd_history committed silently, so no client refetched
+    /// until a reload or an unrelated board/session event. The ledger write is
+    /// now itself a revisioned Message event. `skip_board=true` isolates this
+    /// assertion from auto-capture's separate Task event.
+    #[tokio::test]
+    async fn a_recorded_message_publishes_the_event_that_refreshes_messages() {
+        let (st, _dir) = state();
+        let mut events = st.store.subscribe();
+        cmd_hist_record_full(
+            &st,
+            "lane-live",
+            "answer this without creating work",
+            "user",
+            "",
+            true,
+            DeliveryMeta::direct(),
+        )
+        .await;
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("message write must wake an SSE subscriber")
+            .expect("event channel remains open");
+        assert_eq!(event.entity_type, amux_core::revision::EntityType::Message);
+        assert!(event.entity_id.starts_with("MSG-"), "the invalidation names the durable row");
+        assert_eq!(event.mutation, amux_core::revision::MutationKind::Created);
     }
 
     // ── AMUX-3903: a failed send is a fact worth keeping ────────────────────

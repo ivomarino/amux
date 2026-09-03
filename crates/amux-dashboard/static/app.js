@@ -8480,7 +8480,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.783';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.784';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -13655,6 +13655,28 @@ function _linkifyCardIds(safeHtml) {
         : m);
   } catch (e) { return safeHtml; }
 }
+
+// Schedule ids in Messages are navigation, not inert provenance. Scheduler
+// deliveries already stamp `[SCHED-N]` into origin; leaving that token as plain
+// text forced the reader to copy it, change tabs, and search manually. Load the
+// current schedule set before opening so a Messages-only visit is not dependent
+// on whether the Scheduler tab happened to be opened earlier.
+async function _openScheduleFromMessage(id) {
+  const sid = String(id || '');
+  if (!/^SCHED-\d+$/.test(sid)) return;
+  switchView('scheduler');
+  await Promise.all([fetchSchedules(), fetchSchedulerRuns(), fetchSchedulerAudit()]);
+  renderScheduler();
+  if ((schedules || []).some(s => s.id === sid && !s.deleted)) openSchedModal(sid);
+  else showToast(sid + ' is no longer active — see scheduler audit');
+}
+function _linkifyScheduleIds(safeHtml) {
+  try {
+    return String(safeHtml).replace(/\b(SCHED-\d+)\b/g, (m, id) =>
+      '<a href="javascript:void(0)" onclick="event.stopPropagation();_openScheduleFromMessage(\''
+      + id + '\')" style="color:var(--accent);text-decoration:underline dotted;">' + id + '</a>');
+  } catch (e) { return safeHtml; }
+}
 // Turn bare http(s) URLs in ALREADY-escaped HTML into clickable links, so a
 // resume / sign-in deep link an agent drops in a needs-you ask (AMUX-3073) is
 // clickable rather than dead plain text — the card's whole premise is a
@@ -13774,7 +13796,7 @@ function _cmdHistItemHTML(e, ctx) {
   // path — "Human · queued" vs plain "Human".
   const originTxt = kind === 'human'
     ? ''   // delivery chip below carries direct/queued for every kind now
-    : (origin ? ' &middot; ' + origin.replace(/&/g,'&amp;').replace(/</g,'&lt;').slice(0,32) : '');
+    : (origin ? ' &middot; ' + _linkifyScheduleIds(origin.replace(/&/g,'&amp;').replace(/</g,'&lt;').slice(0,32)) : '');
   const tag = `<span style="display:inline-block;font-size:0.7rem;font-weight:600;padding:1px 7px;border-radius:3px;background:${km.bg};color:${km.color};margin-right:6px;">${km.label}${originTxt}</span>`;
   const sessTag = session ? `<span style="color:var(--dim);font-size:0.7rem;margin-right:6px;">${session.replace(/&/g,'&amp;').replace(/</g,'&lt;')}</span>` : '';
   const tsTag = ts ? `<span style="color:var(--dim);font-size:0.7rem;">${ts}</span>` : '';
@@ -13797,7 +13819,7 @@ function _cmdHistItemHTML(e, ctx) {
   const _matches = _mq && safe.toLowerCase().includes(_mq.trim().toLowerCase());
   const _collapsed = _msgCollapsed.has(_pk) && !_matches;
   const caret = `<button class="msg-caret" aria-expanded="${!_collapsed}" title="${_collapsed ? 'Expand message' : 'Collapse message'}" onclick="_msgToggleCollapse(this,&#39;${escJs(_pk)}&#39;,event)">${_collapsed ? '&#9656;' : '&#9662;'}</button>`;
-  return `<div class="${ctx.rowClass||''}" data-msg-key="${esc(_pk)}" onclick="${ctx.onOpen ? ctx.onOpen(e, enc) : `_pickCmdHistory(decodeURIComponent('${enc}'))`}" title="Click to insert into the composer" style="cursor:pointer;padding:8px 12px;background:${km.bg};border:1px solid var(--border);border-left:3px solid ${km.color};border-radius:6px;font-size:0.85rem;color:var(--text);transition:border-color 0.15s;display:flex;gap:6px;align-items:flex-start;position:relative;" onmouseenter="this.style.borderColor='${km.color}'" onmouseleave="this.style.borderColor='var(--border)'"><input type="checkbox" class="pm-check" ${_psel?"checked":""} onclick="${ctx.toggle}(&#39;${escJs(_pk)}&#39;,event)" title="Select for bulk resend">${caret}<div style="flex:1;min-width:0;">${meta?`<div style="margin-bottom:4px;">${meta}</div>`:''}<div class="msg-body${_collapsed?' collapsed':''}" style="white-space:pre-wrap;word-break:break-word;line-height:1.45;">${_hlSearch(_linkifyCardIds(safe), _mq)}</div></div><div class="pm-actions"><button class="btn pm-dots" onclick="_msgMenu(this,event)" title="Actions">&#x22ef;</button><div class="msg-menu"><button onclick="event.stopPropagation();${ctx.resend}([&#39;${escJs(_pk)}&#39;])">Resend to ${esc(_target || 'session')}</button><button onclick="event.stopPropagation();_msgCopyBtn(this,&#39;${enc}&#39;)">Copy text</button><button onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent(&#39;${enc}&#39;),this)">Read aloud</button>${locSess ? `<button onclick="event.stopPropagation();_msgLocate(&#39;${escJs(locSess)}&#39;,&#39;${enc}&#39;)" title="Open that worker's peek and scroll to where this was sent">Find in ${esc(locSess)}</button>` : ''}</div></div></div>`;
+  return `<div class="${ctx.rowClass||''}" data-msg-key="${esc(_pk)}" onclick="${ctx.onOpen ? ctx.onOpen(e, enc) : `_pickCmdHistory(decodeURIComponent('${enc}'))`}" title="Click to insert into the composer" style="cursor:pointer;padding:8px 12px;background:${km.bg};border:1px solid var(--border);border-left:3px solid ${km.color};border-radius:6px;font-size:0.85rem;color:var(--text);transition:border-color 0.15s;display:flex;gap:6px;align-items:flex-start;position:relative;" onmouseenter="this.style.borderColor='${km.color}'" onmouseleave="this.style.borderColor='var(--border)'"><input type="checkbox" class="pm-check" ${_psel?"checked":""} onclick="${ctx.toggle}(&#39;${escJs(_pk)}&#39;,event)" title="Select for bulk resend">${caret}<div style="flex:1;min-width:0;">${meta?`<div style="margin-bottom:4px;">${meta}</div>`:''}<div class="msg-body${_collapsed?' collapsed':''}" style="white-space:pre-wrap;word-break:break-word;line-height:1.45;">${_hlSearch(_linkifyScheduleIds(_linkifyCardIds(safe)), _mq)}</div></div><div class="pm-actions"><button class="btn pm-dots" onclick="_msgMenu(this,event)" title="Actions">&#x22ef;</button><div class="msg-menu"><button onclick="event.stopPropagation();${ctx.resend}([&#39;${escJs(_pk)}&#39;])">Resend to ${esc(_target || 'session')}</button><button onclick="event.stopPropagation();_msgCopyBtn(this,&#39;${enc}&#39;)">Copy text</button><button onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent(&#39;${enc}&#39;),this)">Read aloud</button>${locSess ? `<button onclick="event.stopPropagation();_msgLocate(&#39;${escJs(locSess)}&#39;,&#39;${enc}&#39;)" title="Open that worker's peek and scroll to where this was sent">Find in ${esc(locSess)}</button>` : ''}</div></div></div>`;
 }
 function _peekMessagesFor() {
   if (!peekSession) return [];
@@ -28814,6 +28836,7 @@ let _pollTimer = null;
 
 let _invBoardTimer = null;
 let _invSessTimer = null;
+let _invMessagesTimer = null;
 function connectSSE() {
   if (_sseFallback || _sse) return;
   _sse = new EventSource(_authUrl(API + '/api/events'));
@@ -28927,6 +28950,23 @@ function connectSSE() {
           if (key === 'sessions') {
             clearTimeout(_invSessTimer);
             _invSessTimer = setTimeout(fetchSessions, 400);
+          }
+          if (key === 'messages') {
+            clearTimeout(_invMessagesTimer);
+            _invMessagesTimer = setTimeout(() => {
+              // Refresh only visible message surfaces. The event is fleet-wide;
+              // fetching history in every background tab on every scheduler or
+              // worker send would turn correctness into avoidable load.
+              if (activeView === 'messages') _messagesLoad(true);
+              if (typeof peekSession !== 'undefined' && peekSession
+                  && typeof _peekTab !== 'undefined' && _peekTab === 'messages') {
+                _peekMessagesLoad();
+              }
+              const hist = document.getElementById('cmd-history-modal');
+              if (hist && hist.classList.contains('active')) {
+                _loadCmdHistoryFromServer().then(() => _renderCmdHistoryList());
+              }
+            }, 400);
           }
         }
       } else if (msg.type === 'ping') {

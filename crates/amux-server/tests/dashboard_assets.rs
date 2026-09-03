@@ -120,6 +120,54 @@ fn board_worker_actions_group_wrapped_lines_under_their_timestamp() {
     );
 }
 
+#[test]
+fn messages_link_schedule_ids_to_the_scheduler() {
+    let app = asset("app.js");
+    let start = app
+        .find("async function _openScheduleFromMessage(id)")
+        .expect("Messages must expose schedule navigation");
+    let tail = &app[start..];
+    let end = tail
+        .find("function _linkifyUrls")
+        .expect("schedule linkifier must precede URL linkification");
+    let body = &tail[..end];
+    for needle in [
+        "switchView('scheduler')",
+        "fetchSchedules()",
+        "fetchSchedulerRuns()",
+        "fetchSchedulerAudit()",
+        "openSchedModal(sid)",
+        "function _linkifyScheduleIds(safeHtml)",
+    ] {
+        assert!(body.contains(needle), "schedule navigation lost `{needle}`");
+    }
+    assert!(
+        app.contains("_linkifyScheduleIds(_linkifyCardIds(safe))"),
+        "the shared message-row renderer must link schedule ids in message text"
+    );
+    assert!(
+        app.contains("_linkifyScheduleIds(origin.replace"),
+        "scheduled-message origin is where the canonical SCHED-N token lives"
+    );
+}
+
+#[test]
+fn sse_message_invalidation_refreshes_each_visible_message_surface() {
+    let app = asset("app.js");
+    let start = app
+        .find("if (key === 'messages')")
+        .expect("SSE invalidation must recognize committed Messages writes");
+    let body = &app[start..start + 1100.min(app.len() - start)];
+    for needle in [
+        "_messagesLoad(true)",
+        "_peekMessagesLoad()",
+        "_loadCmdHistoryFromServer()",
+        "_renderCmdHistoryList()",
+    ] {
+        assert!(body.contains(needle), "message invalidation no longer refreshes `{needle}`");
+    }
+}
+
 /// The parser above must be able to FAIL, or the test above it is theatre —
 /// a `const_str` that always returned None would make both sides `expect`-panic,
 /// but one that silently returned the same string for everything would make the
