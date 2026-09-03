@@ -7441,7 +7441,7 @@ fn structured_resume_prompt(name: &str, reason: &str) -> String {
     let reason_text = if reason.is_empty() { "session swap" } else { reason };
     format!(
         "Continue this worker after a {reason_text} using durable amux state, not terminal \
-         replay. Run `amux board list --session {name}` and inspect every non-terminal card \
+         replay. Run `amux board ls --session {name}` and inspect every non-terminal card \
          assigned to this worker with `amux board show <ID>`. Treat each card's source message, \
          epic, dependencies, priority, next action, gates, worker actions, and produced assets \
          as the source of truth. Resume the highest-priority actionable card and keep driving \
@@ -19299,7 +19299,7 @@ mod tests {
     #[test]
     fn provider_resume_uses_structured_state_not_terminal_replay() {
         let prompt = structured_resume_prompt("lane-a", "provider swap");
-        assert!(prompt.contains("amux board list --session lane-a"), "{prompt}");
+        assert!(prompt.contains("amux board ls --session lane-a"), "{prompt}");
         assert!(prompt.contains("amux board show <ID>"), "{prompt}");
         assert!(prompt.contains("source message") && prompt.contains("dependencies"), "{prompt}");
         assert!(!prompt.contains(".amux/logs"), "{prompt}");
