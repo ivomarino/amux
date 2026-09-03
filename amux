@@ -2929,7 +2929,17 @@ status-CHANGE verbs (done, verified, review, backlog), not on this one." ;;
       # Same shape as the needsyou path: posting a status-UPDATE does not move
       # the card, so printing its current status behind an arrow invites the
       # same misread (AC-222).
-      echo "$result" | _board_outcome "$id" "" "status update posted"; return $?
+      # NAME THE FIELD, not just the fact (AF-462). This verb writes to the
+      # card LOG; its sibling `progress` appends to DESC. Both read as "add a
+      # note to the card", and "status update posted" says neither. gtm-engine
+      # posted a settlement to GE-761, re-read the card, saw desc unchanged and
+      # briefly concluded the write was swallowed; it was in `log` in full.
+      # They were FOLLOWING the standing advice to verify append-shaped writes
+      # at the field, and it still cost them, because the advice cannot say
+      # which field and the verb's output did not either. Same argument as
+      # AVE-36 one field over: say WHERE the bytes landed, not only that they
+      # did.
+      echo "$result" | _board_outcome "$id" "" "status update posted to the card LOG (\`board progress\` is the one that appends to desc)"; return $?
       ;;
     claim)
       # Atomic claim (the assignment notifications tell every session to run
@@ -3203,11 +3213,11 @@ if 'id' not in d:
 # card its owner was actively working.
 n = d.get('owner_notified')
 if n is True:
-    print(d['id'], \"— progress noted; owner '%s' notified at their next turn\" % d.get('session', '?'))
+    print(d['id'], \"— progress appended to DESC; owner '%s' notified at their next turn\" % d.get('session', '?'))
 elif n is False:
-    print(d['id'], '— progress noted, but OWNER NOT NOTIFIED: %s' % d.get('owner_notify_reason', 'no reason given'))
+    print(d['id'], '— progress appended to DESC, but OWNER NOT NOTIFIED: %s' % d.get('owner_notify_reason', 'no reason given'))
 else:
-    print(d['id'], '— progress noted (own card or no owner: no cross-owner notice due)')
+    print(d['id'], '— progress appended to DESC (own card or no owner: no cross-owner notice due)')
 "
       # Check if task has a gh: tag — if so, post comment to GH issue
       local task_json
