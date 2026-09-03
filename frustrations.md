@@ -2523,3 +2523,51 @@ FIX: the whole READ arm is unreachable for its stated meaning — `first_blockin
  FIRST and named it, so the log stops claiming a specimen: git_guard.rs
  `inferred_edit_verdict`, extracted from the log site so the arms are testable at all.
  Whether the READ arm should exist is AMUX-3822's author's call, recorded on AF-452.
+
+---
+
+## staged-guard blocks on an edit-ownership record that a plain `git diff` is enough to create
+AREA: attribution
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-03
+SESSION: amux
+CARD: AMUX-4083
+SYMPTOM: Two independent blocks in one hour, both false, both naming a session
+  that had only READ the file.
+  (1) mixpeek-oss went to commit two browser.rs paths and staged-guard refused,
+  reporting that session `amux` had an edit record on both files 3 minutes
+  prior. What `amux` had actually done in that window was `git diff` and
+  `grep` on those paths, to describe them accurately in a message ASKING
+  mixpeek-oss to commit them. No write. They cleared it with
+  AMUX_VERIFIED_SOLO=1 after checking the diff content and line counts were
+  identical before and after.
+  (2) Fifteen minutes later the guard blocked `amux` from running
+  `git checkout --theirs` on app.css and sw.js to resolve a MERGE CONFLICT,
+  naming amux-homepage: "discarding a file ANOTHER SESSION HAS ALSO EDITED ...
+  UNRECOVERABLE". Reconstructing the ours-side of the conflict and diffing it
+  against HEAD gave 0 differing lines for sw.js, and every app.css difference
+  traced to #184's own auto-merged hunks. No peer content existed in either file.
+COST: About 25 minutes across two sessions, and a cross-session round trip that
+  existed only to clear the first block. The second one is worse than the time:
+  the refusal text says UNRECOVERABLE and instructs you to stash or ask the named
+  peer, so the honest response to a false positive is to stop and ask a session
+  that has nothing to do with the file. It also teaches the wrong lesson, since
+  the way past it is an override flag, and a guard whose normal resolution is its
+  own bypass stops being read.
+FIX: Do not derive edit ownership from mtime alone. CLAUDE.md already states the
+  rule the guard violates: "An owner derived from mtime is not evidence ...
+  reports whoever was ACTIVE, not whoever WROTE, because every lane shares the
+  cwd." Record ownership from an actual WRITE — the PostToolUse hook already sees
+  Edit/Write tool calls and could stamp content identity (a hash of the file
+  before and after) instead of a timestamp. AMUX-3954 is the same defect stated
+  as "an observed co-edit record carries no content identity, so it names a
+  session for a write it did not make"; this entry is two measured specimens of
+  it, one of which blocked a peer rather than the recorder. Second, a file in
+  CONFLICTED state is a distinct case the guard does not model: its content is
+  git-generated, so "another session also edited it" cannot be inferred from the
+  working copy at all.
+CO-SIGNED: mixpeek-oss, who hit specimen (1) from the blocked side and
+  independently verified it the same way ("read-only git diff/grep during
+  message composition, flagged as an edit ... a signal with no way to
+  distinguish read from write").
