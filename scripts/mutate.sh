@@ -33,6 +33,7 @@ set -uo pipefail
 usage() {
   echo "usage: $0 <apply|revert> <file> <old-string> <new-string>" >&2
   echo "       $0 run <file> <old-string> <new-string> -- <command...>" >&2
+  echo "       $0 survey <file> [--limit N] [--stop-at REGEX] -- <command...>" >&2
   exit 2
 }
 
@@ -53,6 +54,150 @@ usage() {
 #
 # The command's exit status is preserved and returned, because the whole point is
 # to read the suite's colour under the mutation.
+# ── `survey`: WHICH LINES DOES THIS COMMAND ACTUALLY DEPEND ON? (AF-422) ─────
+#
+# `run` answers "can THIS check fail", one mutation at a time, and it only gets
+# used when you already suspect the answer. The eight-instance cluster on AF-422
+# is what happens when you do not suspect it: six of the eight were caught by a
+# compiler, a peer, or an unrelated second look, on checks their authors had
+# just written and believed. Rule 7 already names the class and names this
+# script. The gap was never the knowledge, it was that running it cost enough
+# thought to skip.
+#
+# So: point it at a file and a command, and it tells you which lines the
+# command's outcome does not depend on.
+#
+#   scripts/mutate.sh survey <file> [--limit N] [--stop-at REGEX] -- <command...>
+#
+# A SURVIVOR IS NOT AUTOMATICALLY A BUG. Log strings, error messages and
+# defensive branches survive honestly, and a survey that demanded zero survivors
+# would be the gate with no truthful path that ethos rule 3 forbids. It is a
+# reading list: for each survivor, either the check does not cover it or it did
+# not need covering, and only you can say which.
+#
+# Mutations are line-scoped and syntax-preserving, chosen so the file still
+# compiles: comparison and boolean operators flip, boolean literals flip, shell
+# emptiness tests invert. Each one goes through the same apply/trap-revert path
+# as `run`, so the blast radius and the duration bound are identical.
+#
+# It SKIPS what it cannot do safely and says how many, because a survey that
+# silently examined 9 of 30 lines and reported "all killed" is the exact shape
+# this file exists to stop. Non-unique lines are skipped (mutate needs exactly
+# one occurrence) and so is everything at or after `--stop-at`, which defaults
+# to the first `#[cfg(test)]`: mutating the tests instead of the code under test
+# measures nothing.
+if [[ "${1:-}" == "survey" ]]; then
+  shift
+  file="${1:-}"; shift || usage
+  [[ -f "$file" ]] || { echo "mutate: no such file: $file" >&2; exit 1; }
+  limit=20; stop_at='^#\[cfg\(test\)\]'
+  while [[ $# -gt 0 && "${1:-}" != "--" ]]; do
+    case "$1" in
+      --limit)   limit="${2:-20}"; shift 2 ;;
+      --stop-at) stop_at="${2:-}"; shift 2 ;;
+      *) usage ;;
+    esac
+  done
+  [[ "${1:-}" == "--" ]] || usage
+  shift
+  [[ $# -ge 1 ]] || usage
+  self="${BASH_SOURCE[0]}"
+  before=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$file")
+
+  cands=$(python3 - "$file" "$stop_at" "$limit" <<'PY'
+import re, sys
+path, stop_at, limit = sys.argv[1], sys.argv[2], int(sys.argv[3])
+lines = open(path, encoding='utf-8').read().split('\n')
+stop = len(lines)
+if stop_at:
+    for i, l in enumerate(lines):
+        if re.search(stop_at, l):
+            stop = i
+            break
+# (pattern, replacement) applied to the FIRST occurrence in a line. Ordered so
+# the more meaningful flips are tried first when a line admits several.
+RULES = [
+    (' == ', ' != '), (' != ', ' == '),
+    (' && ', ' || '), (' || ', ' && '),
+    (' < ', ' <= '), (' > ', ' >= '),
+    ('-lt ', '-le '), ('-gt ', '-ge '),
+    ('-ne ', '-eq '), ('-eq ', '-ne '),
+    ('[ -n ', '[ -z '), ('[ -z ', '[ -n '),
+    ('true', 'false'), ('false', 'true'),
+]
+counts = {}
+for l in lines:
+    counts[l] = counts.get(l, 0) + 1
+out, skipped_dup, skipped_nomut = [], 0, 0
+for i, l in enumerate(lines[:stop]):
+    st = l.strip()
+    if not st or st.startswith(('//', '#', '*', '/*')):
+        continue
+    hit = None
+    for a, b in RULES:
+        if a in l:
+            hit = (a, b)
+            break
+    if hit is None:
+        skipped_nomut += 1
+        continue
+    if counts[l] != 1:
+        skipped_dup += 1
+        continue
+    a, b = hit
+    out.append((i + 1, l, l.replace(a, b, 1), f"{a.strip()} -> {b.strip()}"))
+print(f"#META\t{len(out)}\t{skipped_dup}\t{stop}\t{len(lines)}")
+for ln, old, new, label in out[:limit]:
+    print(f"{ln}\t{old}\t{new}\t{label}")
+PY
+  ) || { echo "mutate survey: could not enumerate candidates" >&2; exit 1; }
+
+  meta=$(printf '%s\n' "$cands" | head -1)
+  n_all=$(printf '%s' "$meta" | cut -f2)
+  n_dup=$(printf '%s' "$meta" | cut -f3)
+  stop_line=$(printf '%s' "$meta" | cut -f4)
+  n_lines=$(printf '%s' "$meta" | cut -f5)
+  body=$(printf '%s\n' "$cands" | tail -n +2)
+  n_run=$(printf '%s\n' "$body" | grep -c . || true)
+  echo "mutate survey: $file — $n_all mutable line(s) found, running $n_run (limit $limit)."
+  echo "mutate survey: scope: lines 1-$stop_line of $n_lines (--stop-at '$stop_at'); $n_dup skipped as non-unique."
+  echo ""
+  killed=0; survived=0; survivors=""
+  while IFS=$'\t' read -r ln old new label; do
+    [ -n "$ln" ] || continue
+    if "$self" run "$file" "$old" "$new" -- "$@" >/dev/null 2>&1; then
+      survived=$((survived + 1))
+      survivors="$survivors
+  SURVIVED L$ln  ($label)  $(printf '%s' "$old" | sed 's/^[[:space:]]*//' | cut -c1-72)"
+      printf '  SURVIVED L%-5s %-14s %s\n' "$ln" "$label" "$(printf '%s' "$old" | sed 's/^[[:space:]]*//' | cut -c1-64)"
+    else
+      killed=$((killed + 1))
+      printf '  killed   L%-5s %-14s %s\n' "$ln" "$label" "$(printf '%s' "$old" | sed 's/^[[:space:]]*//' | cut -c1-64)"
+    fi
+    now=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$file")
+    if [ "$now" != "$before" ]; then
+      echo "" >&2
+      echo "mutate survey: ABORTING — $file did not return to its starting bytes after L$ln." >&2
+      echo "mutate survey: A survey that keeps going from here mutates a file it no longer" >&2
+      echo "mutate survey: understands, on a shared checkout. Inspect with: git diff -- $file" >&2
+      exit 3
+    fi
+  done <<< "$body"
+  echo ""
+  echo "mutate survey: $killed killed, $survived SURVIVED."
+  if [ "$survived" -gt 0 ]; then
+    echo "mutate survey: a survivor is a line whose value the command's outcome does not"
+    echo "mutate survey: depend on. Some are honest — log strings, error text, defensive"
+    echo "mutate survey: branches. Each one is a question, not a verdict: is this uncovered,"
+    echo "mutate survey: or did it not need covering? Only you can answer that."
+  fi
+  if [ "$n_all" -gt "$n_run" ]; then
+    echo "mutate survey: $((n_all - n_run)) mutable line(s) were NOT run (--limit $limit). This"
+    echo "mutate survey: result describes the $n_run that were, and says nothing about the rest."
+  fi
+  exit 0
+fi
+
 if [[ "${1:-}" == "run" ]]; then
   shift
   [[ $# -ge 5 ]] || usage

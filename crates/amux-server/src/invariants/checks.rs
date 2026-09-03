@@ -3745,6 +3745,36 @@ mod negative_controls {
         );
     }
 
+    /// A `{*rest}` wildcard must CONSUME at least one segment, which is axum's
+    /// own rule and what `segments_match`'s comment already claims ("must have
+    /// at least one segment left to consume").
+    ///
+    /// Found by `scripts/mutate.sh survey` on its first real run, not by
+    /// reading: `return want.len() > i` flipped to `>=` and the entire
+    /// negative_controls suite stayed green. So the arm that decides whether a
+    /// wildcard route swallows its own prefix had a documented invariant, a
+    /// comment explaining it, and nothing holding it. With `>=`,
+    /// `/api/logs/{*rest}` would report `/api/logs` as mounted, which is the
+    /// prefix-matching false pass the neighbouring cell exists to prevent,
+    /// arriving through the one arm that cell does not reach.
+    #[test]
+    fn a_wildcard_tail_does_not_match_with_nothing_left_to_consume() {
+        let pat = ["api", "logs", "{*rest}"];
+        assert!(
+            segments_match(&pat, &["api", "logs", "x"]),
+            "a wildcard must match when there IS a segment to consume"
+        );
+        assert!(
+            segments_match(&pat, &["api", "logs", "x", "y"]),
+            "a wildcard must match a multi-segment tail"
+        );
+        assert!(
+            !segments_match(&pat, &["api", "logs"]),
+            "a wildcard tail must NOT match with zero segments left — that is the \
+             prefix false-pass, one arm over"
+        );
+    }
+
     /// An extractor that found nothing must report Unknown, never a clean pass.
     /// The empty-grep trap: silence from a broken probe is indistinguishable
     /// from silence from a healthy system unless it is typed differently.

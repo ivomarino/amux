@@ -460,6 +460,34 @@ pub(crate) fn victim_verdict(all_settled: bool, all_mine: bool) -> &'static str 
 /// authored content — "your WORK is at risk" plus "record your reasoning"
 /// operated on an empty set, and the reader had to disprove the warning by
 /// hand. Say what the record actually was.
+/// The two flags the mirror notice's footer rests on, derived from the fates
+/// and nothing else.
+///
+/// EXTRACTED SO THEY CAN BE PINNED (AF-422). Both lived inline at the emitter,
+/// and `scripts/mutate.sh survey` found both SURVIVING the whole `git_guard`
+/// suite: `n_at_risk == 0` flipped to `>= 0` (so every notice claims everything
+/// is settled, deleting the loud arm entirely) and `all_mine`'s `.all()` flipped
+/// to `.any()` (so one settled path among ten absorbed ones restores the exact
+/// possessive this card was filed to remove). The card's own acceptance
+/// criterion asked for both arms, and only the quiet one was held.
+///
+/// `all_settled` and `all_mine` are DIFFERENT CLAIMS and the footer conflated
+/// them once already: AbsorbedBy, LandedOnOrigin and NotTheirWork all satisfy
+/// "nothing at risk" and every one of them means committed by somebody else, or
+/// not yours at all. Only SettledByOwner supports the possessive.
+///
+/// Takes the per-path `at_risk` flags the emitter already computed rather than
+/// re-deriving them: `victim_path_line` decides at-risk from the fate AND the
+/// provenance (a `restore` touch is downgraded), so recomputing it here from
+/// the fate alone would be a second, quietly different implementation of the
+/// question — which is the drift this card is about, one layer down.
+pub(crate) fn victim_flags(fates: &[PathFate], at_risk: &[bool]) -> (bool, bool) {
+    let all_settled = !at_risk.iter().any(|r| *r);
+    let all_mine = !fates.is_empty()
+        && fates.iter().all(|f| matches!(f, PathFate::SettledByOwner(_)));
+    (all_settled, all_mine)
+}
+
 pub(crate) fn victim_path_line(pth: &str, fate: &PathFate, provenance: &str) -> (String, bool) {
     match fate {
         PathFate::SettledByOwner(sha) => {
@@ -3178,16 +3206,21 @@ pub async fn staged_guard_inner(
                 let mut lines: Vec<String> = Vec::new();
                 let mut fates: Vec<PathFate> = Vec::new();
                 let mut n_at_risk = 0usize;
+                let mut risk_flags: Vec<bool> = Vec::new();
                 for (pth, age, prov) in paths.iter().take(10) {
                     let fate = path_fate(&wd, pth, &owner, *age, prov).await;
                     let (line, at_risk) = victim_path_line(pth, &fate, prov);
                     if at_risk {
                         n_at_risk += 1;
                     }
+                    risk_flags.push(at_risk);
                     lines.push(line);
                     fates.push(fate);
                 }
-                let all_settled = n_at_risk == 0;
+                // AF-422: derived by `victim_flags` so the two claims are
+                // testable apart from the async emitter. `n_at_risk` stays as
+                // the LOGGED count; the verdict reads the pure function.
+                let _ = n_at_risk;
                 // AF-422: "COMMITTED BY YOU" IS A DIFFERENT CLAIM FROM "NOT AT
                 // RISK", and this footer conflated them. `all_settled` is
                 // `n_at_risk == 0`, which AbsorbedBy, LandedOnOrigin and
@@ -3200,7 +3233,7 @@ pub async fn staged_guard_inner(
                 // holds zero of their commits.
                 //
                 // Only SettledByOwner supports the possessive.
-                let all_mine = fates.iter().all(|f| matches!(f, PathFate::SettledByOwner(_)));
+                let (all_settled, all_mine) = victim_flags(&fates, &risk_flags);
                 // AF-130: the victim notice was delivered as a session message
                 // and NEVER logged, so `grep -c 'WORK ITSELF is at risk'`
                 // returned 0 across the whole retained window — nobody could
@@ -3781,6 +3814,66 @@ mod tests {
     /// AF-420, mixpeek-general: the mirror told them their WORK was at risk about
     /// a tubescience iconik daily tick they had never opened. The local hook has
     /// asked "has this session ever written this path" since MC-1561; the mirror
+    /// AF-422's OTHER ARM, which the card asked for and nothing held.
+    ///
+    /// `scripts/mutate.sh survey` found both of these surviving the whole
+    /// git_guard suite: `n_at_risk == 0` flipped to `>= 0`, and `all_mine`'s
+    /// `.all()` flipped to `.any()`. The first deletes the loud notice
+    /// entirely; the second restores the exact possessive
+    /// ("EVERY path above is already committed by you") that this card exists
+    /// to remove. Both passed, on a fix whose quiet arm was carefully pinned.
+    #[test]
+    fn the_loud_mirror_notice_stays_loud_when_any_path_is_at_risk() {
+        let fates = vec![
+            PathFate::SettledByOwner("abc1234".into()),
+            PathFate::AtRisk,
+        ];
+        let (all_settled, all_mine) = victim_flags(&fates, &[false, true]);
+        assert!(!all_settled, "one at-risk path must defeat the settled verdict");
+        assert!(!all_mine, "a set containing AtRisk is not all the reader's own work");
+        // And the control: with nothing at risk it IS the quiet form, or the
+        // assertion above would pass on a function that always says "loud".
+        let (settled2, _) = victim_flags(&fates, &[false, false]);
+        assert!(settled2, "with no at-risk flags the verdict must go quiet");
+    }
+
+    /// The possessive needs EVERY path to be the reader's own commit. One
+    /// settled path among absorbed ones must not license "committed by you" —
+    /// AbsorbedBy, LandedOnOrigin and NotTheirWork all mean committed by
+    /// somebody else, or not the reader's at all.
+    #[test]
+    fn one_settled_path_among_absorbed_ones_does_not_license_the_possessive() {
+        let mixed = vec![
+            PathFate::SettledByOwner("abc1234".into()),
+            PathFate::AbsorbedBy("def5678".into(), "byo-ray".into()),
+            PathFate::NotTheirWork(vec!["ts-gke".into()]),
+        ];
+        let (all_settled, all_mine) = victim_flags(&mixed, &[false, false, false]);
+        assert!(all_settled, "none of these three is at risk");
+        assert!(
+            !all_mine,
+            "only SettledByOwner supports the possessive — this is the mixpeek-general \
+             report, where the file's history held zero of their commits"
+        );
+        // The control: all-settled DOES license it, or the assertion is vacuous.
+        let mine = vec![
+            PathFate::SettledByOwner("abc1234".into()),
+            PathFate::SettledByOwner("def5678".into()),
+        ];
+        assert!(victim_flags(&mine, &[false, false]).1, "all-SettledByOwner is the reader's own");
+    }
+
+    /// An EMPTY fate list must not read as "everything above is yours". `all()`
+    /// on an empty iterator is true, which is the vacuous-pass shape this
+    /// module keeps filing, and here it would put a possessive claim under a
+    /// notice listing no paths at all.
+    #[test]
+    fn no_paths_is_not_a_possessive_claim() {
+        let (all_settled, all_mine) = victim_flags(&[], &[]);
+        assert!(all_settled, "nothing listed is nothing at risk");
+        assert!(!all_mine, "nothing listed is not 'every path above is yours'");
+    }
+
     /// never learned it.
     #[tokio::test]
     async fn a_path_this_lane_never_wrote_is_not_their_work_to_lose() {
