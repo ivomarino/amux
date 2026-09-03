@@ -509,7 +509,12 @@ pub(crate) fn victim_flags(fates: &[PathFate], at_risk: &[bool]) -> (bool, bool)
     (all_settled, all_mine)
 }
 
-pub(crate) fn victim_path_line(pth: &str, fate: &PathFate, provenance: &str) -> (String, bool) {
+pub(crate) fn victim_path_line(
+    pth: &str,
+    fate: &PathFate,
+    provenance: &str,
+    owner: &str,
+) -> (String, bool) {
     match fate {
         PathFate::SettledByOwner(sha) => {
             (format!("  {pth}  — already committed by you in {sha}; nothing at risk"), false)
@@ -556,6 +561,51 @@ pub(crate) fn victim_path_line(pth: &str, fate: &PathFate, provenance: &str) -> 
             ),
             false,
         ),
+        // ANSWER THE QUESTION INSTEAD OF ASSIGNING IT (mixpeek-cicd, 2026-09-03).
+        //
+        // They received this three times in one day, on three different shas,
+        // all peers' one-line appends to FRUSTRATIONS.md, and resolved every
+        // one the same way: run `git log`, read the Amux-Session trailer, see a
+        // peer's name, conclude not mine. Zero reconciled. Their point is that
+        // the notice ALREADY HAS that answer — `who` is read from the commit's
+        // Amux-Session trailer in `path_fate` (:793), not from the mtime that
+        // produced the claim — so it was asking the reader to re-derive
+        // something it had already computed. A true-negative that still costs a
+        // command is one people learn to skim, and skimming is what breaks it on
+        // the day the answer is different.
+        //
+        // I DID NOT TAKE THEIR PROPOSED WORDING. They suggested "almost
+        // certainly not yours; nothing to do", and flagged the case it must not
+        // swallow: a genuine absorption where a peer's `git add` sweeps in a
+        // file the recipient actually wrote. They reasoned that `observed`
+        // provenance excludes it, because observed means no recorded edit.
+        //
+        // It does not exclude it. `observed` is exactly what a Bash-authored
+        // edit produces — the AF-123 hook pair exists to catch writes that never
+        // go through the Edit tool — and `cat >> FRUSTRATIONS.md <<EOF` is the
+        // NORMAL way that particular file gets written on this fleet. So for the
+        // very file that prompted the report, "observed" is as consistent with
+        // "you wrote it in a shell" as with "a peer wrote it under your cwd".
+        //
+        // So: state both facts and name the ONE condition that separates them,
+        // which the reader can answer from memory in a beat rather than from
+        // `git log`. That keeps the cost at zero in the common case without
+        // asserting a conclusion the evidence does not carry.
+        PathFate::AbsorbedBy(sha, who)
+            if provenance == "observed" && who != owner && who != "(untrailered)" =>
+        {
+            (
+                format!(
+                    "  {pth}  — committed by `{who}`, per the Amux-Session trailer on {sha}, not \
+                     by you. Your only claim on this path is an OBSERVED mtime, which a peer \
+                     writing under your cwd produces identically. NOT YOURS unless you wrote it \
+                     through a shell command (a heredoc append leaves exactly this record) — if \
+                     you did, your content is in {sha} under their name and the reasoning is \
+                     worth putting on the card. If you did not, there is nothing to do here."
+                ),
+                false,
+            )
+        }
         PathFate::AbsorbedBy(sha, who) if provenance == "observed" => (
             format!(
                 "  {pth}  — absorbed into {sha} under `{who}`; your CODE is safe. NOTE: your \
@@ -3230,7 +3280,7 @@ pub async fn staged_guard_inner(
                 let mut risk_flags: Vec<bool> = Vec::new();
                 for (pth, age, prov) in paths.iter().take(10) {
                     let fate = path_fate(&wd, pth, &owner, *age, prov).await;
-                    let (line, at_risk) = victim_path_line(pth, &fate, prov);
+                    let (line, at_risk) = victim_path_line(pth, &fate, prov, &owner);
                     if at_risk {
                         n_at_risk += 1;
                     }
@@ -3757,6 +3807,73 @@ mod tests {
         assert_eq!(path_fate(&d, "grafted.txt", "backend", 0, "firsthand").await, PathFate::AtRisk);
     }
 
+    /// AF-444, reported by mixpeek-cicd: answer the question instead of
+    /// assigning it.
+    ///
+    /// They got the hedged absorption notice three times in one day on three
+    /// different shas, all peers' appends to FRUSTRATIONS.md, and cleared each
+    /// one by running `git log`, reading the Amux-Session trailer, and seeing a
+    /// peer's name. The notice already HAD that name — `who` comes from the
+    /// trailer, not from the mtime — so it was asking readers to re-derive its
+    /// own input.
+    #[test]
+    fn an_absorption_whose_trailer_names_a_peer_says_so_instead_of_asking() {
+        let fate = PathFate::AbsorbedBy("9394ee7".into(), "mixpeek-funnel".into());
+        let (line, at_risk) = victim_path_line("FRUSTRATIONS.md", &fate, "observed", "mixpeek-cicd");
+        assert!(!at_risk, "an absorption is never lost work: {line}");
+        assert!(line.contains("mixpeek-funnel"), "name the real author: {line}");
+        assert!(line.contains("Amux-Session trailer"), "say WHERE that name came from: {line}");
+        assert!(line.contains("9394ee7"), "name the commit: {line}");
+        assert!(line.contains("not by you"), "state the conclusion the reader was deriving: {line}");
+        assert!(
+            !line.contains("Check whether you actually wrote this"),
+            "the whole point is that it no longer assigns that check: {line}"
+        );
+
+        // THE CASE IT MUST NOT SWALLOW, which mixpeek-cicd raised and their own
+        // proposed wording ("almost certainly not yours; nothing to do") would
+        // have. `observed` does NOT mean "you did not write it": it is exactly
+        // what a Bash-authored edit produces, and `cat >> FRUSTRATIONS.md` is
+        // how that file is normally written here. So the line must still name
+        // the one condition under which it IS theirs.
+        assert!(
+            line.contains("shell command"),
+            "must name the condition that makes it theirs after all: {line}"
+        );
+        assert!(
+            line.contains("worth putting on the card"),
+            "and say what to do in that case: {line}"
+        );
+
+        // CONTROL 1: the trailer AGREES with the recipient. Nothing can be
+        // ruled out, so the hedged form must survive — a downgrade here would
+        // tell someone their own absorbed work was not theirs.
+        let (same, _) = victim_path_line("FRUSTRATIONS.md", &fate, "observed", "mixpeek-funnel");
+        assert!(
+            same.contains("Check whether you actually wrote this"),
+            "trailer == recipient cannot be downgraded: {same}"
+        );
+
+        // CONTROL 2: an UNTRAILERED commit names nobody, so there is no
+        // disagreement to report and the hedged form must survive.
+        let untrailered = PathFate::AbsorbedBy("9394ee7".into(), "(untrailered)".into());
+        let (unt, _) =
+            victim_path_line("FRUSTRATIONS.md", &untrailered, "observed", "mixpeek-cicd");
+        assert!(
+            unt.contains("Check whether you actually wrote this"),
+            "an untrailered commit proves nothing about authorship: {unt}"
+        );
+
+        // CONTROL 3: a FIRSTHAND claim is a recorded edit, not an mtime, so the
+        // reasoning genuinely is the reader's to record and this must not fire.
+        let (first, _) =
+            victim_path_line("FRUSTRATIONS.md", &fate, "firsthand", "mixpeek-cicd");
+        assert!(
+            first.contains("record the REASONING"),
+            "a recorded edit keeps the original prompt: {first}"
+        );
+    }
+
     /// AF-422: the ABSORPTION arm reads provenance, like the at-risk arms have
     /// since AMUX-3778.
     ///
@@ -3772,7 +3889,11 @@ mod tests {
 
         // THE SPECIMEN: an mtime claim. Still absorbed, still not at risk, but
         // it must not send the reader to document work they may not have done.
-        let (line, at_risk) = victim_path_line("_helpers.tpl", &fate, "observed");
+        // owner == the trailer's name, so the AF-439 disagreement arm below does
+        // NOT fire and this keeps exercising the arm it was written for: when
+        // the trailer agrees with the recipient, nothing can be ruled out and
+        // the hedged text is the honest one.
+        let (line, at_risk) = victim_path_line("_helpers.tpl", &fate, "observed", "byo-ray");
         assert!(!at_risk, "absorption is not lost work, in any arm: {line}");
         assert!(line.contains("absorbed into 3cb19fd"), "still says what happened: {line}");
         assert!(
@@ -3783,7 +3904,7 @@ mod tests {
 
         // A RESTORE carries no authored content at all (MG-1484), so it is even
         // more certain there is nothing to record.
-        let (line, at_risk) = victim_path_line("_helpers.tpl", &fate, "restore");
+        let (line, at_risk) = victim_path_line("_helpers.tpl", &fate, "restore", "me");
         assert!(!at_risk);
         assert!(line.contains("RESTORE"), "{line}");
         assert!(!line.contains("record the REASONING"), "{line}");
@@ -3793,7 +3914,7 @@ mod tests {
         // bytes and a peer committed them — and it must still say so. This is
         // also why AF-420's `owner_never_wrote` is the WRONG gate here: a real
         // absorption has no commit of theirs either, by definition.
-        let (line, at_risk) = victim_path_line("_helpers.tpl", &fate, "firsthand");
+        let (line, at_risk) = victim_path_line("_helpers.tpl", &fate, "firsthand", "me");
         assert!(!at_risk);
         assert!(
             line.contains("record the REASONING on the card"),
@@ -5253,22 +5374,22 @@ mod tests {
     /// risk" — the remedy that line prescribes operates on an empty set.
     #[test]
     fn a_restore_only_touch_is_never_reported_as_work_at_risk() {
-        let (line, at_risk) = victim_path_line("docs/openapi.json", &PathFate::AtRisk, "restore");
+        let (line, at_risk) = victim_path_line("docs/openapi.json", &PathFate::AtRisk, "restore", "me");
         assert!(!at_risk, "a restore carries no authored content");
         assert!(line.contains("RESTORE"), "{line}");
         assert!(!line.contains("CHECK THIS ONE"), "{line}");
         // Authored content stays the loud case.
-        let (line, at_risk) = victim_path_line("src/lib.rs", &PathFate::AtRisk, "firsthand");
+        let (line, at_risk) = victim_path_line("src/lib.rs", &PathFate::AtRisk, "firsthand", "me");
         assert!(at_risk);
         assert!(line.contains("CHECK THIS ONE"), "{line}");
         // Settled and absorbed keep their calm wording regardless.
         let (line, at_risk) =
-            victim_path_line("a.rs", &PathFate::SettledByOwner("abc123".into()), "restore");
+            victim_path_line("a.rs", &PathFate::SettledByOwner("abc123".into()), "restore", "me");
         assert!(!at_risk);
         assert!(line.contains("nothing at risk"), "{line}");
         // AMUX-3445: landed-on-origin is a receipt, never a warning.
         let (line, at_risk) =
-            victim_path_line("g.rs", &PathFate::LandedOnOrigin("def456".into()), "firsthand");
+            victim_path_line("g.rs", &PathFate::LandedOnOrigin("def456".into()), "firsthand", "me");
         assert!(!at_risk, "identical-to-origin cannot be at risk");
         assert!(line.contains("origin/main") && line.contains("def456"), "{line}");
     }
@@ -5302,7 +5423,7 @@ mod tests {
             "an observed row is ranked with firsthand but is not firsthand EVIDENCE"
         );
 
-        let (line, at_risk) = victim_path_line("s04_faces.py", &PathFate::AtRisk, "observed");
+        let (line, at_risk) = victim_path_line("s04_faces.py", &PathFate::AtRisk, "observed", "me");
         assert!(at_risk, "it is still flagged — under-warning is the expensive direction");
         assert!(
             line.contains("OBSERVED"),
@@ -5320,7 +5441,7 @@ mod tests {
         let mut inp2 = GuardInputs::default();
         inp2.theirs_firsthand.insert(p.clone());
         assert_eq!(provenance_of(&inp2, &p), "firsthand");
-        let (line2, at_risk2) = victim_path_line("s04_faces.py", &PathFate::AtRisk, "firsthand");
+        let (line2, at_risk2) = victim_path_line("s04_faces.py", &PathFate::AtRisk, "firsthand", "me");
         assert!(at_risk2);
         assert!(
             line2.contains("the WORK ITSELF is at risk"),
