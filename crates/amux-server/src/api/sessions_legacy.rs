@@ -2739,6 +2739,13 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             "auto_pickup_own": env.contains_key("CC_AUTO_PICKUP"),
             "standing_orders": crate::api::session_verbs::standing_orders_on(&name, "CC_STANDING_ORDERS"),
             "standing_orders_own": env.contains_key("CC_STANDING_ORDERS"),
+            // Standing authorization for worker-originated external email.
+            // This uses the SAME scoped predicate the send/reply gate reads, so
+            // the Configurations control cannot disagree with the next send.
+            "external_email_allowed": crate::api::email_approval::external_email_allowed(
+                &crate::config::amux_home(), &name,
+            ),
+            "external_email_allowed_own": env.contains_key("AMUX_EMAIL_EXTERNAL_ALLOW"),
             "worktree": env.get("CC_WORKTREE").cloned().unwrap_or_default(),
             "worktree_repo": env.get("CC_WORKTREE_REPO").cloned().unwrap_or_default(),
             "mcp": env.get("CC_MCP").cloned().unwrap_or_default(),

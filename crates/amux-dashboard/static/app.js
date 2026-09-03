@@ -6677,12 +6677,19 @@ const _WORKER_BOARD_CONFIGS = [
 ];
 
 function _workerConfigurationRow(key, label, value, note, controls) {
-  return '<div data-worker-config="' + esc(key) + '" style="display:flex;align-items:center;gap:8px;padding:7px 0;border-top:1px solid var(--border);">'
-    + '<div style="min-width:0;flex:1;"><div style="font-size:0.74rem;color:var(--text);font-weight:600;">'
-    + esc(label) + '</div><div style="font-size:0.68rem;color:var(--dim);overflow-wrap:anywhere;">'
+  return '<div class="worker-config-row" data-worker-config="' + esc(key) + '">'
+    + '<div class="worker-config-copy"><div class="worker-config-label">'
+    + esc(label) + '</div><div class="worker-config-note">'
     + (value ? '<span style="color:var(--text);">' + esc(value) + '</span>' + (note ? ' · ' : '') : '')
-    + esc(note || '') + '</div></div><div style="display:flex;gap:5px;flex:0 0 auto;">'
+    + esc(note || '') + '</div></div><div class="worker-config-actions">'
     + controls + '</div></div>';
+}
+
+function _workerConfigurationSection(key, title, note, rows) {
+  return '<section class="worker-config-section" data-config-section="' + esc(key) + '">'
+    + '<div class="worker-config-section-head"><div class="worker-config-section-title">' + esc(title) + '</div>'
+    + '<div class="worker-config-section-note">' + esc(note || '') + '</div></div>'
+    + '<div class="worker-config-section-rows">' + rows.join('') + '</div></section>';
 }
 
 // Complete inventory of the durable PATCH /config surface. Commands that do
@@ -6704,26 +6711,61 @@ function _workerPrimaryConfigurationsHTML(name) {
     + !!on + '" style="font-size:0.68rem;min-height:32px;min-width:48px;padding:4px 8px;"'
     + ' onclick="event.stopPropagation();' + fn + '(\'' + q + '\')" aria-label="' + esc(label) + '">'
     + (on ? 'On' : 'Off') + '</button>';
-  let rows = '';
-  rows += _workerConfigurationRow('name', 'Name', s.name || name, 'Renaming preserves tasks, messages, memory, and worker identity.', edit('name', s.name || name));
-  rows += _workerConfigurationRow('description', 'Description', s.desc || '', 'Used by people and peer-worker discovery.', edit('desc', s.desc || ''));
-  rows += _workerConfigurationRow('task_label', 'Task label override', s.task_override || '', 'Blank returns the card to its board/source-derived label.', edit('task', s.task_override || ''));
-  rows += _workerConfigurationRow('groups', 'Groups', (s.tags || []).join(', '), 'Controls membership, inherited configuration, and default message reach.', edit('tags', (s.tags || []).join(', ')));
-  rows += _workerConfigurationRow('directory', 'Working directory', s.dir || '', 'Changing it restarts a running worker in the new directory.', edit('dir', s.dir || ''));
-  rows += _workerConfigurationRow('branch', 'Git branch', s.branch || '', 'Blank follows the detected branch; “none” explicitly uses the main checkout.', edit('branch', s.branch || ''));
-  rows += _workerConfigurationRow('provider', 'Model provider', providerLabel(provider), 'Provider swaps preserve durable board state and restart only when required.', edit('provider', provider));
-  rows += _workerConfigurationRow('model', 'Model version', model || 'Provider default', 'A supported live switch keeps the conversation; restart fallback rehydrates from board state.', edit('model', model || '', provider));
-  rows += _workerConfigurationRow('effort', 'Reasoning effort', effort || 'Provider default', provider === 'claude' ? 'Can be changed independently or together with the model.' : 'This provider does not expose the effort picker.', provider === 'claude' ? edit('effort', effort || '', provider) : '');
-  rows += _workerConfigurationRow('mcp', 'Browser tooling', s.mcp === 'chrome' ? 'Chrome enabled' : 'Disabled', 'Applied on the next worker start.', edit('mcp', s.mcp || ''));
-  rows += _workerConfigurationRow('yolo', 'Approval bypass (YOLO)', s.yolo ? 'Enabled' : 'Disabled', 'Uses the selected provider’s native permission flag.', sw(!!s.yolo, 'toggleYolo', 'Toggle approval bypass'));
-  rows += _workerConfigurationRow('isolated', 'Isolated raw agent', s.isolated ? 'Enabled' : 'Disabled', 'No amux harness, hooks, MCP config, or peer discovery; restart to apply.', sw(!!s.isolated, 'toggleIsolated', 'Toggle isolated mode'));
-  rows += _workerConfigurationRow('cross_group', 'Cross-group messaging', s.spans_groups_value || 'Refused', s.spans_groups_own ? 'Worker override.' : (s.spans_groups ? 'Inherited from a group/global layer.' : 'No standing allowance.'), edit('send_allow', s.spans_groups_own ? (s.spans_groups_value || '') : ''));
-  rows += _workerConfigurationRow('pinned', 'Pinned in worker list', s.pinned ? 'Pinned' : 'Not pinned', 'Presentation preference; does not change execution priority.', sw(!!s.pinned, 'togglePin', 'Toggle pinned state'));
-  rows += _workerConfigurationRow('advanced_environment', 'Advanced startup environment', 'backend: ' + (s.backend || 'tmux') + (s.creator ? ' · creator: ' + s.creator : ''), 'Edit arbitrary worker-level environment, including backend, creator, and startup flags. Process-scoped changes apply on restart.', '<button class="btn" style="font-size:0.68rem;min-height:32px;padding:4px 8px;" onclick="event.stopPropagation();_scopeEditOpen(\'worker\',\'' + q + '\',\'env\')">Edit environment</button>');
-  return '<div class="scope-detail" style="margin-bottom:10px;">'
-    + '<div style="font-size:0.8rem;font-weight:700;color:var(--text);margin-bottom:2px;">Worker settings</div>'
-    + '<div style="font-size:0.67rem;color:var(--dim);margin-bottom:5px;">Every durable worker setting exposed by the worker API, in one place. Lifecycle commands remain in the worker menu.</div>'
-    + rows + '</div>';
+  const identity = [
+    _workerConfigurationRow('name', 'Name', s.name || name, 'Renaming preserves tasks, messages, memory, and worker identity.', edit('name', s.name || name)),
+    _workerConfigurationRow('description', 'Description', s.desc || '', 'Used by people and peer-worker discovery.', edit('desc', s.desc || '')),
+    _workerConfigurationRow('task_label', 'Task label override', s.task_override || '', 'Blank returns the card to its board/source-derived label.', edit('task', s.task_override || '')),
+    _workerConfigurationRow('groups', 'Groups', (s.tags || []).join(', '), 'Controls membership, inherited configuration, and default message reach.', edit('tags', (s.tags || []).join(', '))),
+  ];
+  const runtime = [
+    _workerConfigurationRow('directory', 'Working directory', s.dir || '', 'Changing it restarts a running worker in the new directory.', edit('dir', s.dir || '')),
+    _workerConfigurationRow('branch', 'Git branch', s.branch || '', 'Blank follows the detected branch; “none” explicitly uses the main checkout.', edit('branch', s.branch || '')),
+    _workerConfigurationRow('provider', 'Model provider', providerLabel(provider), 'Provider swaps preserve durable board state and restart only when required.', edit('provider', provider)),
+    _workerConfigurationRow('model', 'Model version', model || 'Provider default', 'A supported live switch keeps the conversation; restart fallback rehydrates from board state.', edit('model', model || '', provider)),
+    _workerConfigurationRow('effort', 'Reasoning effort', effort || 'Provider default', provider === 'claude' ? 'Can be changed independently or together with the model.' : 'This provider does not expose the effort picker.', provider === 'claude' ? edit('effort', effort || '', provider) : ''),
+    _workerConfigurationRow('mcp', 'Browser tooling', s.mcp === 'chrome' ? 'Chrome enabled' : 'Disabled', 'Applied on the next worker start.', edit('mcp', s.mcp || '')),
+  ];
+  const permissions = [
+    _workerConfigurationRow('yolo', 'Model tool approval bypass (YOLO)', s.yolo ? 'Enabled' : 'Disabled', 'Uses the selected provider’s native tool-permission flag.', sw(!!s.yolo, 'toggleYolo', 'Toggle model tool approval bypass')),
+    _workerConfigurationRow('isolated', 'Isolated raw agent', s.isolated ? 'Enabled' : 'Disabled', 'No amux harness, hooks, MCP config, or peer discovery; restart to apply.', sw(!!s.isolated, 'toggleIsolated', 'Toggle isolated mode')),
+    _workerConfigurationRow('cross_group', 'Cross-group messaging', s.spans_groups_value || 'Refused', s.spans_groups_own ? 'Worker override.' : (s.spans_groups ? 'Inherited from a group/global layer.' : 'No standing allowance.'), edit('send_allow', s.spans_groups_own ? (s.spans_groups_value || '') : '')),
+    _workerConfigurationRow('external_email', 'Send external email without approval', s.external_email_allowed ? 'Allowed' : 'Approval required', s.external_email_allowed_own ? 'Worker override; applies immediately.' : 'Inherited/default; disabled by default.', _workerEmailPermissionControls(name, s)),
+  ];
+  const advanced = [
+    _workerConfigurationRow('pinned', 'Pinned in worker list', s.pinned ? 'Pinned' : 'Not pinned', 'Presentation preference; does not change execution priority.', sw(!!s.pinned, 'togglePin', 'Toggle pinned state')),
+    _workerConfigurationRow('advanced_environment', 'Advanced environment', 'backend: ' + (s.backend || 'tmux') + (s.creator ? ' · creator: ' + s.creator : ''), 'Edit arbitrary worker-level keys. Startup-only values apply on restart.', '<button class="btn" style="font-size:0.68rem;min-height:32px;padding:4px 8px;" onclick="event.stopPropagation();_scopeEditOpen(\'worker\',\'' + q + '\',\'env\')">Edit environment</button>'),
+  ];
+  return '<div class="worker-config-intro">Every durable worker setting, grouped by what it changes. Lifecycle commands remain in the worker menu.</div>'
+    + '<div class="worker-config-grid">'
+    + _workerConfigurationSection('identity', 'Identity & organization', 'How this worker is named, described, and grouped.', identity)
+    + _workerConfigurationSection('runtime', 'Runtime & model', 'Where it runs and which model/tooling it uses.', runtime)
+    + _workerConfigurationSection('permissions', 'Permissions & communication', 'Standing authority for tools, peers, and external email.', permissions)
+    + _workerConfigurationSection('advanced', 'Display & advanced', 'Presentation and lower-level environment controls.', advanced)
+    + '</div>';
+}
+
+function _workerEmailPermissionControls(name, s) {
+  const on = !!s.external_email_allowed;
+  const own = !!s.external_email_allowed_own;
+  const set = '<button class="btn' + (on ? ' primary' : '') + '" role="switch" aria-checked="' + on + '"'
+    + ' style="font-size:0.68rem;min-height:32px;min-width:48px;padding:4px 8px;"'
+    + ' onclick="event.stopPropagation();_workerExternalEmailSet(\'' + escJs(name) + '\',' + (!on) + ')">' + (on ? 'On' : 'Off') + '</button>';
+  const inherit = own ? '<button class="btn" style="font-size:0.65rem;min-height:32px;padding:4px 7px;"'
+    + ' onclick="event.stopPropagation();_workerExternalEmailSet(\'' + escJs(name) + '\',null)">Inherit</button>' : '';
+  return set + inherit;
+}
+
+async function _workerExternalEmailSet(name, value) {
+  const r = await apiCall(API + '/api/sessions/' + encodeURIComponent(name) + '/config', {
+    method: 'PATCH', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ external_email_allowed: value }),
+  });
+  if (!r) return;
+  showToast(r.message || 'External email authorization saved');
+  await fetchSessions();
+  if (peekSession === name && _peekTab === 'scope') {
+    _scopeLoad({ level: 'worker', name: name }, 'peek-scope-body');
+  }
 }
 
 function _workerBoardConfigurationsHTML(name) {
@@ -6731,11 +6773,11 @@ function _workerBoardConfigurationsHTML(name) {
   const rows = _WORKER_BOARD_CONFIGS.map(c => {
     const on = s[c.value] !== false;
     const own = !!s[c.own];
-    return '<div style="display:flex;align-items:center;gap:8px;padding:7px 0;border-top:1px solid var(--border);">'
-      + '<div style="min-width:0;flex:1;"><div style="font-size:0.74rem;color:var(--text);font-weight:600;">'
+    return '<div class="worker-config-row">'
+      + '<div class="worker-config-copy"><div class="worker-config-label">'
       + esc(c.label) + (own ? ' <span style="font-size:0.62rem;color:var(--accent);">worker override</span>'
                               : ' <span style="font-size:0.62rem;color:var(--dim);">inherited/default</span>')
-      + '</div><div style="font-size:0.65rem;color:var(--dim);">' + esc(c.note) + '</div></div>'
+      + '</div><div class="worker-config-note">' + esc(c.note) + '</div></div><div class="worker-config-actions">'
       + '<button class="btn' + (on ? ' primary' : '') + '" role="switch" aria-checked="' + on + '"'
       + ' style="font-size:0.68rem;min-height:32px;min-width:48px;padding:4px 8px;"'
       + ' onclick="event.stopPropagation();_workerBoardConfigurationSet(\'' + escJs(name) + '\',\''
@@ -6743,13 +6785,11 @@ function _workerBoardConfigurationsHTML(name) {
       + (own ? '<button class="btn" style="font-size:0.65rem;min-height:32px;padding:4px 7px;"'
           + ' onclick="event.stopPropagation();_workerBoardConfigurationSet(\'' + escJs(name) + '\',\''
           + escJs(c.field) + '\',null)">Inherit</button>' : '')
-      + '</div>';
+      + '</div></div>';
   }).join('');
-  return '<div class="scope-detail" style="margin-bottom:10px;">'
-    + '<div style="font-size:0.8rem;font-weight:700;color:var(--text);margin-bottom:2px;">Board automation</div>'
-    + '<div style="font-size:0.67rem;color:var(--dim);margin-bottom:5px;">'
-    + 'Controls dispatch from backlog through active work. Status availability and Board gates below configure the remaining transitions and terminal states.'
-    + '</div>' + rows + '</div>';
+  return '<div class="worker-config-grid worker-config-grid-board">'
+    + _workerConfigurationSection('task-lifecycle', 'Task lifecycle', 'Controls automatic backlog → To Do → In Progress and continuation until terminal. Status availability and Board gates below define transition requirements.', [rows])
+    + '</div>';
 }
 
 async function _workerBoardConfigurationSet(name, field, value) {
@@ -8655,7 +8695,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.792';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.793';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").

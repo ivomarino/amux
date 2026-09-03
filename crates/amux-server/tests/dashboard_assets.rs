@@ -544,13 +544,18 @@ fn worker_configurations_are_editable_from_backlog_through_terminal_states() {
         "a writable worker configuration must not send the user to an unnamed second UI"
     );
     for needle in [
-        "Worker settings",
-        "Every durable worker setting exposed by the worker API",
+        "Every durable worker setting, grouped by what it changes",
+        "Identity & organization",
+        "Runtime & model",
+        "Permissions & communication",
+        "Display & advanced",
+        "Task lifecycle",
         "_workerConfigurationRow('name'",
         "_workerConfigurationRow('provider'",
         "_workerConfigurationRow('model'",
         "_workerConfigurationRow('mcp'",
         "_workerConfigurationRow('cross_group'",
+        "_workerConfigurationRow('external_email'",
         "_workerConfigurationRow('advanced_environment'",
         "_scopeEditOpen(\\'",
         "skin: 'JSON object",
@@ -560,7 +565,9 @@ fn worker_configurations_are_editable_from_backlog_through_terminal_states() {
         "Continue non-terminal work",
         "Pickup / continue master",
         "On by default; parked and human-owned cards stay put",
-        "Status availability and Board gates below configure the remaining transitions and terminal states",
+        "Status availability and Board gates below define transition requirements",
+        "external_email_allowed",
+        "Send external email without approval",
     ] {
         assert!(app.contains(needle), "Configurations omitted `{needle}`");
     }
@@ -585,4 +592,13 @@ fn worker_configurations_are_editable_from_backlog_through_terminal_states() {
             && app.contains("\\',null)\">Inherit</button>"),
         "worker overrides need an explicit path back to inherited configuration"
     );
+    let css = asset("app.css");
+    for needle in [
+        ".worker-config-grid",
+        ".worker-config-section",
+        ".worker-config-row",
+        "grid-template-columns:repeat(2,minmax(0,1fr))",
+    ] {
+        assert!(css.contains(needle), "Configurations layout lost `{needle}`");
+    }
 }
