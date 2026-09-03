@@ -188,6 +188,24 @@ const LONG_BY_DESIGN: &[(&str, f64)] = &[
     // design bound (40s), which is the threshold-below-baseline defect the
     // card's own closing line names.
     ("/api/browser/navigate", 40_000.0),
+    // POST /api/browser/start (AMUX-97). The wait is a real Chrome launch: the
+    // handler polls CDP's HTTP port for up to 30s before giving up
+    // (integrations/browser.rs `start`, `deadline = now + 30s`), and that
+    // window is deliberately wide rather than the old 12s — the comment right
+    // above it says why: "a real logged-in profile on a busy machine (a
+    // 50-lane fleet) routinely takes longer than the old 12s to open the
+    // debugging port". So the endpoint's own designed bound is 30s, not the
+    // 10s floor this detector applies to every route.
+    //
+    // AMUX-97's own filing was a single 10.3s call, its only sample in 7 days
+    // (n=1, no baseline to compare against), arriving while this box's
+    // 1-minute load was 1.96x on 4 cores (compiling/testing amux
+    // concurrently, per the card's own host_load_at_worst) — comfortably
+    // inside the 30s launch budget the code already documents, not a hang.
+    // 30s, matching the deadline directly rather than padding it: this route
+    // (unlike navigate) has nothing running AFTER the CDP wait that a wider
+    // budget would need to cover.
+    ("/api/browser/start", 30_000.0),
     // GET /api/email/inbox (AMUX-3519, third filing in one day on the same
     // residual): a count=480 metadata fetch is quota-bound at ~12-15s — the
     // 8-wide concurrency sits deliberately under Gmail's 250 units/s budget
@@ -375,6 +393,20 @@ fn dead_route_min_hits() -> i64 {
 /// not firing.
 fn schedule_overdue_min() -> f64 {
     env_f64("AMUX_AUTOFIX_SCHEDULE_OVERDUE_MIN", 45.0).max(5.0)
+}
+/// Consecutive error runs required before one schedule becomes an incident.
+/// Refused and queued runs are honest non-errors and break the streak.
+fn schedule_error_streak() -> usize {
+    env_i64("AMUX_AUTOFIX_SCHEDULE_ERROR_STREAK", 3).clamp(2, 100) as usize
+}
+/// Duplicate scheduled-message warnings needed before one pattern becomes work.
+fn schedule_duplicate_streak() -> usize {
+    env_i64("AMUX_AUTOFIX_SCHEDULE_DUPLICATE_STREAK", 3).clamp(2, 100) as usize
+}
+/// Allow the Messages write and run-history write to settle before declaring
+/// that a delivered run has no corresponding message artifact.
+fn schedule_message_grace_s() -> f64 {
+    env_f64("AMUX_AUTOFIX_SCHEDULE_MESSAGE_GRACE_S", 300.0).clamp(30.0, 3600.0)
 }
 /// Oldest steering row older than this means the queue is not draining.
 fn steering_stale_min() -> f64 {
@@ -2687,6 +2719,309 @@ fn drain_loop_quiet_s() -> f64 {
         .unwrap_or(900.0)
 }
 
+#[derive(Debug)]
+struct ScheduleRunObservation {
+    id: String,
+    title: String,
+    session: String,
+    ran_at: i64,
+    status: String,
+    note: String,
+    source: String,
+}
+
+/// Collapse occurrence-specific numbers and whitespace so a repeated traceback
+/// or timeout reads as one pattern in the card rather than N unrelated strings.
+fn schedule_error_pattern(note: &str) -> String {
+    let mut out = String::new();
+    let mut in_digits = false;
+    for ch in note.chars().take(400) {
+        if ch.is_ascii_digit() {
+            if !in_digits {
+                out.push('#');
+                in_digits = true;
+            }
+        } else {
+            in_digits = false;
+            if ch.is_whitespace() {
+                if !out.ends_with(' ') {
+                    out.push(' ');
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+    }
+    let out = out.trim();
+    if out.is_empty() { "(empty error note)".into() } else { out.into() }
+}
+
+fn schedule_id_from_origin(origin: &str) -> Option<String> {
+    let start = origin.find("[SCHED-")? + 1;
+    let tail = &origin[start..];
+    let end = tail.find(']')?;
+    let id = &tail[..end];
+    (!id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        .then(|| id.to_string())
+}
+
+/// Repeated run errors and the cross-surface invariant for a delivered tmux
+/// run: there must be a corresponding row in Messages. These are scheduler
+/// failures even when the firing loop itself is ticking normally.
+fn detect_schedule_run_health(
+    conn: &Connection,
+    now: f64,
+) -> (Vec<Finding>, Vec<Suppressed>) {
+    let mut findings = Vec::new();
+    let mut suppressed = Vec::new();
+    let cutoff = (now - window_h() * 3600.0) as i64;
+    let mut stmt = match conn.prepare(
+        "SELECT s.id, s.title, s.session, r.ran_at, r.status, COALESCE(r.note,''), r.source \
+         FROM schedules s JOIN schedule_runs r ON r.schedule_id=s.id \
+         WHERE s.deleted IS NULL AND s.enabled=1 AND r.ran_at>=?1 \
+         ORDER BY s.id, r.ran_at DESC, r.id DESC",
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            suppressed.push(sup(
+                DetectorKind::SilentSubsystem,
+                "silent|schedule-runs|<query failed>",
+                &format!(
+                    "schedule run-health query did not prepare ({e}); recurring errors and \
+                     Messages delivery proof were not checked on this tick"
+                ),
+            ));
+            return (findings, suppressed);
+        }
+    };
+    let rows = match stmt.query_map([cutoff], |r| {
+        Ok(ScheduleRunObservation {
+            id: r.get(0)?,
+            title: r.get(1)?,
+            session: r.get(2)?,
+            ran_at: r.get(3)?,
+            status: r.get(4)?,
+            note: r.get(5)?,
+            source: r.get(6)?,
+        })
+    }) {
+        Ok(rows) => rows.filter_map(Result::ok).collect::<Vec<_>>(),
+        Err(e) => {
+            suppressed.push(sup(
+                DetectorKind::SilentSubsystem,
+                "silent|schedule-runs|<read failed>",
+                &format!(
+                    "schedule run-health rows could not be read ({e}); this is unmeasured, not healthy"
+                ),
+            ));
+            return (findings, suppressed);
+        }
+    };
+
+    let mut by_schedule: BTreeMap<&str, Vec<&ScheduleRunObservation>> = BTreeMap::new();
+    for row in &rows {
+        by_schedule.entry(&row.id).or_default().push(row);
+    }
+    for (id, runs) in by_schedule {
+        let streak: Vec<&ScheduleRunObservation> =
+            runs.iter().copied().take_while(|r| r.status == "error").collect();
+        if streak.len() >= schedule_error_streak() {
+            let newest = streak[0];
+            let oldest = streak[streak.len() - 1];
+            let mut patterns: BTreeMap<String, usize> = BTreeMap::new();
+            for run in &streak {
+                *patterns.entry(schedule_error_pattern(&run.note)).or_default() += 1;
+            }
+            let pattern_text = patterns
+                .into_iter()
+                .map(|(p, n)| format!("{n}x {p}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            tracing::warn!(
+                schedule = id,
+                streak = streak.len(),
+                latest_error = %newest.note,
+                "schedule has a recurring error pattern; autofix will dedupe it to one card"
+            );
+            findings.push(Finding {
+                kind: DetectorKind::SilentSubsystem,
+                signature: format!("silent|schedule-errors|{id}"),
+                title: format!("Schedule {id} has failed {} times in a row", streak.len()),
+                evidence: vec![
+                    ("schedule".into(), format!("{} ({id})", newest.title)),
+                    ("worker".into(), newest.session.clone()),
+                    ("consecutive_errors".into(), streak.len().to_string()),
+                    ("first_error_at".into(), rl::local_when(oldest.ran_at as f64)),
+                    ("latest_error_at".into(), rl::local_when(newest.ran_at as f64)),
+                    ("latest_source".into(), newest.source.clone()),
+                    ("patterns".into(), format!("\n{pattern_text}")),
+                ],
+                recheck: format!(
+                    "sqlite3 ~/.amux/amux.db \"SELECT ran_at,status,note,source FROM schedule_runs WHERE schedule_id='{id}' ORDER BY id DESC LIMIT 20;\""
+                ),
+                owner: Some(newest.session.clone()).filter(|s| !s.is_empty()),
+                count: streak.len() as u64,
+                last_ts: newest.ran_at as f64,
+                parked_until: None,
+            });
+        }
+    }
+
+    let grace_before = now - schedule_message_grace_s();
+    let mut missing_messages: BTreeMap<&str, Vec<&ScheduleRunObservation>> = BTreeMap::new();
+    for run in rows
+        .iter()
+        .filter(|r| r.status == "delivered" && (r.ran_at as f64) <= grace_before)
+    {
+        let expected_id = format!("%[{}]%", run.id);
+        let legacy_title = if run.title.is_empty() { run.id.as_str() } else { run.title.as_str() };
+        let from_ms = run.ran_at.saturating_sub(60) * 1000;
+        let to_ms = run.ran_at.saturating_add(120) * 1000;
+        let message_exists = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM cmd_history \
+                 WHERE type='schedule' AND session=?1 AND ts BETWEEN ?2 AND ?3 \
+                   AND (origin LIKE ?4 OR origin=?5 OR origin LIKE ?6))",
+                rusqlite::params![
+                    run.session,
+                    from_ms,
+                    to_ms,
+                    expected_id,
+                    legacy_title,
+                    format!("{legacy_title} [%")
+                ],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap_or(false);
+        if message_exists {
+            continue;
+        }
+        missing_messages.entry(&run.id).or_default().push(run);
+    }
+    for (id, missing) in missing_messages {
+        let newest = missing[0];
+        let oldest = missing[missing.len() - 1];
+        findings.push(Finding {
+            kind: DetectorKind::SilentSubsystem,
+            signature: format!("silent|schedule-message-missing|{id}"),
+            title: format!(
+                "Schedule {id} has {} delivered run(s) missing from Messages",
+                missing.len()
+            ),
+            evidence: vec![
+                ("schedule".into(), format!("{} ({id})", newest.title)),
+                ("worker".into(), newest.session.clone()),
+                ("missing_runs".into(), missing.len().to_string()),
+                ("first_missing_at".into(), rl::local_when(oldest.ran_at as f64)),
+                ("latest_missing_at".into(), rl::local_when(newest.ran_at as f64)),
+                ("latest_source".into(), newest.source.clone()),
+                (
+                    "missing_artifact".into(),
+                    format!(
+                        "No cmd_history row type=schedule for this worker within -60s/+120s whose origin names [{}] (or its legacy title).",
+                        newest.id
+                    ),
+                ),
+            ],
+            recheck: format!(
+                "sqlite3 ~/.amux/amux.db \"SELECT ts,session,origin,text FROM cmd_history WHERE type='schedule' AND session='{}' ORDER BY id DESC LIMIT 20;\"",
+                newest.session.replace('\'', "''")
+            ),
+            owner: Some(newest.session.clone()).filter(|s| !s.is_empty()),
+            count: missing.len() as u64,
+            last_ts: newest.ran_at as f64,
+            parked_until: None,
+        });
+    }
+
+    let duplicate_rows = conn.prepare(
+        "SELECT session, ts, COALESCE(json_extract(data,'$.origin'),''), \
+                COALESCE(json_extract(data,'$.preview'),'') \
+         FROM session_events WHERE type='message.duplicate' AND ts>=?1 \
+           AND json_extract(data,'$.type')='schedule' ORDER BY ts DESC",
+    );
+    match duplicate_rows {
+        Err(e) => suppressed.push(sup(
+            DetectorKind::SilentSubsystem,
+            "silent|schedule-duplicates|<query failed>",
+            &format!(
+                "scheduled-message duplicate query did not prepare ({e}); recurring message patterns were not checked"
+            ),
+        )),
+        Ok(mut stmt) => {
+            let events = stmt
+                .query_map([cutoff as f64], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, f64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                })
+                .map(|rows| rows.filter_map(Result::ok).collect::<Vec<_>>());
+            match events {
+                Err(e) => suppressed.push(sup(
+                    DetectorKind::SilentSubsystem,
+                    "silent|schedule-duplicates|<read failed>",
+                    &format!(
+                        "scheduled-message duplicate rows could not be read ({e}); this is unmeasured, not healthy"
+                    ),
+                )),
+                Ok(events) => {
+                    let mut grouped: BTreeMap<String, Vec<(String, f64, String)>> =
+                        BTreeMap::new();
+                    for (session, ts, origin, preview) in events {
+                        if let Some(id) = schedule_id_from_origin(&origin) {
+                            grouped.entry(id).or_default().push((session, ts, preview));
+                        }
+                    }
+                    for (id, events) in grouped {
+                        if events.len() < schedule_duplicate_streak() {
+                            continue;
+                        }
+                        let newest = &events[0];
+                        let oldest = &events[events.len() - 1];
+                        tracing::warn!(
+                            schedule = %id,
+                            duplicates = events.len(),
+                            "recurring scheduled-message duplicate pattern detected"
+                        );
+                        findings.push(Finding {
+                            kind: DetectorKind::SilentSubsystem,
+                            signature: format!("silent|schedule-duplicate-messages|{id}"),
+                            title: format!(
+                                "Schedule {id} produced {} duplicate-message warnings",
+                                events.len()
+                            ),
+                            evidence: vec![
+                                ("schedule".into(), id.clone()),
+                                ("worker".into(), newest.0.clone()),
+                                ("duplicates".into(), events.len().to_string()),
+                                ("first_seen".into(), rl::local_when(oldest.1)),
+                                ("latest_seen".into(), rl::local_when(newest.1)),
+                                ("message_preview".into(), newest.2.clone()),
+                                (
+                                    "meaning".into(),
+                                    "Each event means an identical command was recorded for the same worker within two minutes. Three in the autofix window is treated as a recurring delivery pattern, not a one-off retry.".into(),
+                                ),
+                            ],
+                            recheck: format!(
+                                "sqlite3 ~/.amux/amux.db \"SELECT ts,session,data FROM session_events WHERE type='message.duplicate' AND data LIKE '%[{id}]%' ORDER BY id DESC LIMIT 20;\""
+                            ),
+                            owner: Some(newest.0.clone()).filter(|s| !s.is_empty()),
+                            count: events.len() as u64,
+                            last_ts: newest.1,
+                            parked_until: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    (findings, suppressed)
+}
+
 pub fn detect_silent(
     conn: &Connection,
     now: f64,
@@ -2710,6 +3045,10 @@ pub fn detect_silent(
 ) -> (Vec<Finding>, Vec<Suppressed>) {
     let mut out = Vec::new();
     let mut suppressed = Vec::new();
+
+    let (schedule_findings, schedule_suppressions) = detect_schedule_run_health(conn, now);
+    out.extend(schedule_findings);
+    suppressed.extend(schedule_suppressions);
 
     // (a) Schedules whose next_run has passed with no run recorded since.
     let overdue_s = schedule_overdue_min() * 60.0;
@@ -3275,6 +3614,67 @@ pub fn detect_silent(
         steering_fan_out(steer_rows, now, &mut out, &mut suppressed);
     }
     (out, suppressed)
+}
+
+/// Turn the System Jobs registry's own unhealthy rows into durable, deduped
+/// work. This function deliberately does not classify jobs itself: the
+/// Scheduler UI and autofix must consume the same verdict, including `slow`.
+fn system_job_findings(
+    issues: &[crate::runtime_jobs::registry::HealthIssue],
+    now: f64,
+) -> Vec<Finding> {
+    issues
+        .iter()
+        .map(|issue| {
+            tracing::warn!(
+                job = %issue.id,
+                status = issue.status,
+                ticks = issue.ticks,
+                last_tick_age_s = issue.last_tick_age_s,
+                last_tick_ms = issue.last_tick_ms,
+                "system job health failure detected; autofix will dedupe it to one board card"
+            );
+            Finding {
+                kind: DetectorKind::SilentSubsystem,
+                signature: format!("silent|system-job|{}", issue.id),
+                title: format!("System job {} is {}", issue.id, issue.status),
+                evidence: vec![
+                    ("job".into(), format!("{} ({})", issue.name, issue.id)),
+                    ("status".into(), issue.status.to_string()),
+                    ("ticks".into(), issue.ticks.to_string()),
+                    (
+                        "interval_s".into(),
+                        issue.interval_s.map(|v| format!("{v:.1}")).unwrap_or_else(|| "unmeasured".into()),
+                    ),
+                    (
+                        "last_tick_age_s".into(),
+                        issue.last_tick_age_s.map(|v| format!("{v:.1}")).unwrap_or_else(|| "never".into()),
+                    ),
+                    (
+                        "last_tick_ms".into(),
+                        issue.last_tick_ms.map(|v| format!("{v:.1}")).unwrap_or_else(|| "never".into()),
+                    ),
+                    (
+                        "in_flight_age_s".into(),
+                        issue.in_flight_age_s.map(|v| format!("{v:.1}")).unwrap_or_else(|| "not in flight".into()),
+                    ),
+                    ("documented".into(), issue.documented.to_string()),
+                    (
+                        "verdict_source".into(),
+                        "The same runtime registry facts and classify_observed predicate shown by GET /api/system-jobs; autofix does not re-derive health.".into(),
+                    ),
+                ],
+                recheck: format!(
+                    "curl -sk \"$AMUX_URL/api/system-jobs\" | jq '.jobs[] | select(.id==\"{}\")'",
+                    issue.id
+                ),
+                owner: None,
+                count: 1,
+                last_ts: now,
+                parked_until: None,
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -5748,6 +6148,20 @@ pub async fn autofix_tick_with_ci(
     ci_runs: &[CiRun],
     ci_sup: Vec<Suppressed>,
 ) -> AutofixReport {
+    autofix_tick_with_inputs(state, home, ci_runs, ci_sup, &[]).await
+}
+
+/// Live tick with runtime-only instruments supplied by the spawner. Keeping
+/// these inputs explicit means a unit test over a temporary database cannot
+/// accidentally file thirty "not spawned" cards about jobs that were never
+/// meant to exist in that synthetic process.
+async fn autofix_tick_with_inputs(
+    state: &AppState,
+    home: &std::path::Path,
+    ci_runs: &[CiRun],
+    ci_sup: Vec<Suppressed>,
+    system_issues: &[crate::runtime_jobs::registry::HealthIssue],
+) -> AutofixReport {
     let t0 = std::time::Instant::now();
     let now = unix_now();
     let mut rep = AutofixReport {
@@ -5891,7 +6305,7 @@ pub async fn autofix_tick_with_ci(
             }
         };
         let on = enabled(&conn);
-        let mut findings = Vec::new();
+        let mut findings = system_job_findings(system_issues, now);
         let mut suppressed = ci_sup;
         for kind in DetectorKind::all() {
             let (f, s) = match kind {
@@ -6915,7 +7329,15 @@ pub fn spawn(state: AppState) -> Option<super::PeriodicTask> {
             // an HTTP request it did not ask for. Cached behind
             // `AMUX_CI_POLL_MIN`, so a 120s tick is not 720 API calls a day.
             let (ci_runs, ci_sup) = fetch_ci_runs(unix_now()).await;
-            let r = autofix_tick_with_ci(&state, &home, &ci_runs, ci_sup).await;
+            let system_issues = crate::runtime_jobs::registry::health_issues(unix_now());
+            let r = autofix_tick_with_inputs(
+                &state,
+                &home,
+                &ci_runs,
+                ci_sup,
+                &system_issues,
+            )
+            .await;
             if !r.filed.is_empty() || !r.errors.is_empty() {
                 tracing::info!(
                     filed = r.filed.len(),
@@ -6956,6 +7378,9 @@ async fn debug_autofix(
             "outlier_ms": outlier_ms(),
             "dead_route_min_hits": dead_route_min_hits(),
             "schedule_overdue_min": schedule_overdue_min(),
+            "schedule_error_streak": schedule_error_streak(),
+            "schedule_duplicate_streak": schedule_duplicate_streak(),
+            "schedule_message_grace_s": schedule_message_grace_s(),
             "steering_stale_min": steering_stale_min(),
             "invariant_min_occurrences": invariant_min_occurrences(),
             "build_stale_h": build_stale_h(),
@@ -7058,6 +7483,172 @@ fn parse_ts(s: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+
+    fn schedule_health_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schedules (
+                id TEXT PRIMARY KEY, title TEXT NOT NULL, session TEXT NOT NULL,
+                enabled INTEGER NOT NULL, deleted INTEGER
+             );
+             CREATE TABLE schedule_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, schedule_id TEXT NOT NULL,
+                ran_at INTEGER NOT NULL, status TEXT NOT NULL, note TEXT, source TEXT NOT NULL
+             );
+             CREATE TABLE cmd_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL DEFAULT '',
+                type TEXT NOT NULL, session TEXT NOT NULL, ts INTEGER NOT NULL,
+                origin TEXT NOT NULL DEFAULT ''
+             );
+             CREATE TABLE session_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, session TEXT NOT NULL,
+                ts REAL NOT NULL, type TEXT NOT NULL, data TEXT
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO schedules VALUES ('SCHED-9','Nightly sync','worker-a',1,NULL)",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn recurring_schedule_errors_file_only_after_a_real_streak() {
+        let conn = schedule_health_conn();
+        let now = 1_788_000_000i64;
+        for (at, status, note) in [
+            (now - 180, "ok", "completed"),
+            (now - 120, "error", "Traceback line 41"),
+            (now - 60, "error", "Traceback line 42"),
+        ] {
+            conn.execute(
+                "INSERT INTO schedule_runs(schedule_id,ran_at,status,note,source) VALUES('SCHED-9',?1,?2,?3,'cron-rs')",
+                rusqlite::params![at, status, note],
+            )
+            .unwrap();
+        }
+        let (two, _) = super::detect_schedule_run_health(&conn, now as f64);
+        assert!(!two.iter().any(|f| f.signature == "silent|schedule-errors|SCHED-9"));
+
+        conn.execute(
+            "INSERT INTO schedule_runs(schedule_id,ran_at,status,note,source) VALUES('SCHED-9',?1,'error','Traceback line 43','cron-rs')",
+            [now - 10],
+        )
+        .unwrap();
+        let (three, _) = super::detect_schedule_run_health(&conn, now as f64);
+        let f = three
+            .iter()
+            .find(|f| f.signature == "silent|schedule-errors|SCHED-9")
+            .expect("third consecutive error must become one stable incident");
+        assert_eq!(f.count, 3);
+        assert!(f.evidence.iter().any(|(k, v)| k == "patterns" && v.contains("#")));
+
+        conn.execute(
+            "INSERT INTO schedule_runs(schedule_id,ran_at,status,note,source) VALUES('SCHED-9',?1,'refused','account reserve','cron-rs')",
+            [now - 1],
+        )
+        .unwrap();
+        let (broken, _) = super::detect_schedule_run_health(&conn, now as f64);
+        assert!(
+            !broken.iter().any(|f| f.signature == "silent|schedule-errors|SCHED-9"),
+            "an honest refused outcome is not an error and must break the streak"
+        );
+    }
+
+    #[test]
+    fn delivered_schedule_requires_a_messages_artifact() {
+        let conn = schedule_health_conn();
+        let now = 1_788_000_000i64;
+        conn.execute(
+            "INSERT INTO schedule_runs(schedule_id,ran_at,status,note,source) VALUES('SCHED-9',?1,'delivered','confirmed','cron-rs')",
+            [now - 600],
+        )
+        .unwrap();
+        let (missing, _) = super::detect_schedule_run_health(&conn, now as f64);
+        assert!(missing
+            .iter()
+            .any(|f| f.signature == "silent|schedule-message-missing|SCHED-9"));
+
+        conn.execute(
+            "INSERT INTO cmd_history(text,type,session,ts,origin) VALUES('sync','schedule','worker-a',?1,'[SCHED-9] Nightly sync')",
+            [(now - 600) * 1000],
+        )
+        .unwrap();
+        let (linked, _) = super::detect_schedule_run_health(&conn, now as f64);
+        assert!(
+            !linked
+                .iter()
+                .any(|f| f.signature == "silent|schedule-message-missing|SCHED-9"),
+            "the exact Messages link is the negative control"
+        );
+    }
+
+    #[test]
+    fn recurring_scheduled_message_duplicates_are_patterned_not_spammed() {
+        let conn = schedule_health_conn();
+        let now = 1_788_000_000.0;
+        for n in 0..2 {
+            conn.execute(
+                "INSERT INTO session_events(session,ts,type,data) VALUES('worker-a',?1,'message.duplicate',?2)",
+                rusqlite::params![
+                    now - 60.0 + n as f64,
+                    serde_json::json!({
+                        "type": "schedule",
+                        "origin": "[SCHED-9] Nightly sync",
+                        "preview": "sync now"
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+        }
+        let (two, _) = super::detect_schedule_run_health(&conn, now);
+        assert!(!two
+            .iter()
+            .any(|f| f.signature == "silent|schedule-duplicate-messages|SCHED-9"));
+
+        conn.execute(
+            "INSERT INTO session_events(session,ts,type,data) VALUES('worker-a',?1,'message.duplicate',?2)",
+            rusqlite::params![
+                now - 1.0,
+                serde_json::json!({
+                    "type": "schedule",
+                    "origin": "[SCHED-9] Nightly sync",
+                    "preview": "sync now"
+                })
+                .to_string()
+            ],
+        )
+        .unwrap();
+        let (three, _) = super::detect_schedule_run_health(&conn, now);
+        let f = three
+            .iter()
+            .find(|f| f.signature == "silent|schedule-duplicate-messages|SCHED-9")
+            .expect("third duplicate warning must become one stable pattern incident");
+        assert_eq!(f.count, 3);
+    }
+
+    #[test]
+    fn system_job_health_uses_one_stable_incident_per_job() {
+        let issue = crate::runtime_jobs::registry::HealthIssue {
+            id: "scheduler".into(),
+            name: "Schedule firing".into(),
+            status: "hung",
+            interval_s: Some(15.0),
+            ticks: 42,
+            last_tick_age_s: Some(81.0),
+            last_tick_ms: Some(80_000.0),
+            in_flight_age_s: Some(81.0),
+            documented: true,
+        };
+        let f = super::system_job_findings(&[issue], 1_788_000_000.0);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].signature, "silent|system-job|scheduler");
+        assert_eq!(f[0].title, "System job scheduler is hung");
+        assert!(f[0].recheck.contains("/api/system-jobs"));
+    }
 
     // ── AMUX-3885: the stuck-composer detector ──────────────────────────────
     //
@@ -11415,6 +12006,66 @@ mod tests {
             f2.iter()
                 .any(|x| x.signature.contains("/api/browser/navigate")),
             "past its own timeouts, a navigate is a hang and must file: {f2:?}"
+        );
+    }
+
+    /// AMUX-97. `POST /api/browser/start` polls Chrome's CDP port for up to
+    /// 30s before giving up (integrations/browser.rs `start`), deliberately
+    /// widened past the old 12s for a real logged-in profile on a busy
+    /// machine — so a launch inside that window is the design, not a fault.
+    ///
+    /// PIN THE LOOKUP, NOT JUST THE TABLE (same reasoning as the archive
+    /// budget cell above): a constant nothing consults would be exactly as
+    /// green whether or not the detector can actually reach it.
+    #[tokio::test]
+    async fn a_browser_start_is_judged_against_its_own_cdp_wait() {
+        let (st, _d) = state();
+        let now = unix_now();
+        // The filing itself: one 10.3s launch, comfortably inside the 30s CDP
+        // wait — this is what AMUX-97 actually measured.
+        log_row(
+            &st,
+            Row {
+                ts: now - 500.0,
+                method: "POST",
+                path: "/api/browser/start",
+                family: "/api/browser",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 10_308.0,
+            },
+        );
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        assert!(
+            !f.iter()
+                .any(|x| x.signature.contains("/api/browser/start")),
+            "a launch inside its own 30s CDP-wait bound is designed behaviour: {f:?}"
+        );
+
+        // PAST the budget: the CDP wait failed to bound it, which is a real
+        // hang and must still file.
+        let (st2, _d2) = state();
+        log_row(
+            &st2,
+            Row {
+                ts: now - 500.0,
+                method: "POST",
+                path: "/api/browser/start",
+                family: "/api/browser",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 31_000.0,
+            },
+        );
+        let (f2, _) = detect_latency(&st2.store.read().unwrap(), now);
+        assert!(
+            f2.iter()
+                .any(|x| x.signature.contains("/api/browser/start")),
+            "past its own CDP-wait timeout, a start is a hang and must file: {f2:?}"
         );
     }
 

@@ -541,7 +541,6 @@ fn capture_pipeline_check(state: &AppState) -> Vec<InvariantResult> {
     // (2026-08-15). Default dropped 24h -> 6h so a long-lived build still reflects
     // RECENT health.
     let ceiling_h = env_i("AMUX_CAPTURE_INVARIANT_WINDOW_H", 6);
-    let dedup_window_s = env_i("AMUX_CAPTURE_DEDUP_WINDOW_S", 45);
     let min_cardable = env_i("AMUX_CAPTURE_INVARIANT_MIN", 3);
     let uptime_s = state.started.elapsed().as_secs() as i64;
     let lookback_s = checks::capture_lookback_s(uptime_s, ceiling_h * 3600);
@@ -589,6 +588,7 @@ fn capture_pipeline_check(state: &AppState) -> Vec<InvariantResult> {
     struct Acc {
         cardable: i64,
         carded: i64,
+        distinct: std::collections::BTreeSet<String>,
         min_ts: i64,
         max_ts: i64,
     }
@@ -601,7 +601,10 @@ fn capture_pipeline_check(state: &AppState) -> Vec<InvariantResult> {
     // (ethos rule 4). An isolated lane is a PASS with a reason, not a silence.
     let mut isolated_seen: std::collections::BTreeSet<String> = Default::default();
     for (session, text, carded, ts) in rows {
-        if session.is_empty() || amux_core::board::title_from_prompt(&text).is_none() {
+        if session.is_empty()
+            || amux_core::board::title_from_prompt(&text).is_none()
+            || amux_core::board::is_informational_query(&text)
+        {
             continue;
         }
         // AN ISOLATED LANE IS NOT CARDED BY DESIGN (AMUX-3232, AMUX-3824).
@@ -626,10 +629,12 @@ fn capture_pipeline_check(state: &AppState) -> Vec<InvariantResult> {
         let e = map.entry(session).or_insert(Acc {
             cardable: 0,
             carded: 0,
+            distinct: Default::default(),
             min_ts: ts,
             max_ts: ts,
         });
         e.cardable += 1;
+        e.distinct.insert(text);
         if carded {
             e.carded += 1;
         }
@@ -642,10 +647,11 @@ fn capture_pipeline_check(state: &AppState) -> Vec<InvariantResult> {
             session,
             cardable: a.cardable,
             carded: a.carded,
+            distinct_cardable: a.distinct.len() as i64,
             span_s: (a.max_ts - a.min_ts) / 1000,
         })
         .collect();
-    let mut out = checks::user_prompts_produce_cards(&stats, min_cardable, dedup_window_s);
+    let mut out = checks::user_prompts_produce_cards(&stats, min_cardable);
     // An isolated lane PASSES, explicitly and by name, so its entity keeps
     // reporting. Appended rather than folded into `stats` because it is a
     // different claim: not "this lane carded its prompts" but "this lane is not
@@ -1091,11 +1097,17 @@ mod report_hook_wiring_tests {
         let wired = serde_json::json!({"hooks": {
             "Stop": [{"hooks": [{"type": "command",
                 "command": "bash \"$HOME/.amux/hook-report.sh\" idle stop-hook"}]}],
+            "UserPromptSubmit": [{"hooks": [{"type": "command",
+                "command": "bash \"$HOME/.amux/hook-report.sh\" active prompt-hook"}]}],
             "PostToolUse": [{"matcher": ".*", "hooks": [{"type": "command",
-                "command": "bash \"$HOME/.amux/hook-report.sh\" active tool-hook"}]}]
+                "command": "bash \"$HOME/.amux/hook-report.sh\" active tool-hook"}]}],
+            "SubagentStart": [{"hooks": [{"type": "command",
+                "command": "bash \"$HOME/.amux/hook-report.sh\" subagent-start subagent-start-hook"}]}],
+            "SubagentStop": [{"hooks": [{"type": "command",
+                "command": "bash \"$HOME/.amux/hook-report.sh\" subagent-stop subagent-stop-hook"}]}]
         }});
         let got = extract_report_hooks(&wired);
-        assert_eq!(got.len(), 2, "both report hooks must be selected");
+        assert_eq!(got.len(), 5, "all five report hooks must be selected");
         assert_eq!(
             got.iter().find(|e| e.event == "PostToolUse").unwrap().matcher.as_deref(),
             Some(".*"),

@@ -771,12 +771,16 @@ pub(crate) async fn accountability_tick(state: &AppState) {
 /// (24h) is what actually bounds how often any one lane hears from it.
 pub fn accountability_spawn(state: AppState) -> crate::runtime_jobs::PeriodicTask {
     let secs = env_u64("AMUX_ACCOUNTABILITY_SWEEP_SECS", 1800);
-    crate::runtime_jobs::spawn_periodic("accountability-nudge", secs, move || {
-        let state = state.clone();
-        async move {
-            accountability_tick(&state).await;
-        }
-    })
+    crate::runtime_jobs::spawn_periodic(
+        crate::runtime_jobs::registry::ids::ACCOUNTABILITY_NUDGE,
+        secs,
+        move || {
+            let state = state.clone();
+            async move {
+                accountability_tick(&state).await;
+            }
+        },
+    )
 }
 
 // ---- GET /api/messages/{id} -----------------------------------------------

@@ -298,15 +298,20 @@ const MIGRATIONS: &[Migration] = &[
         name: "0053_telegram_relay_dedup",
         sql: include_str!("../../migrations/0053_telegram_relay_dedup.sql"),
     },
-    // Renumbered from 0033/0035/0049/0050 across successive rebases onto
-    // main (last: 2026-09-02): main's own migrations kept claiming those
-    // slots first (most recently the telegram connector's own 50-53), so
-    // this PR's secret_metadata migration keeps moving to the next free
-    // version.
     Migration {
         version: 54,
-        name: "0054_secret_metadata",
-        sql: include_str!("../../migrations/0054_secret_metadata.sql"),
+        name: "0054_telegram_chat_type",
+        sql: include_str!("../../migrations/0054_telegram_chat_type.sql"),
+    },
+    // Renumbered from 0033/0035/0049/0050/0054 across successive rebases
+    // onto main (last: 2026-09-03): main's own migrations kept claiming
+    // those slots first (most recently the telegram group-chat feature's
+    // own 0054_telegram_chat_type), so this PR's secret_metadata migration
+    // keeps moving to the next free version.
+    Migration {
+        version: 55,
+        name: "0055_secret_metadata",
+        sql: include_str!("../../migrations/0055_secret_metadata.sql"),
     },
 ];
 

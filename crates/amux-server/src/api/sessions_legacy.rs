@@ -663,6 +663,10 @@ pub struct FleetSignals {
     pub transitions: BTreeMap<String, (String, f64)>,
     /// session -> ts of its latest `session.started` event.
     pub started: BTreeMap<String, f64>,
+    /// Codex/ollama worker -> latest structured rollout turn boundary. This is
+    /// the hook-equivalent signal for providers whose terminal UI can redraw
+    /// without advancing tmux's activity timestamp.
+    pub(crate) codex_turns: BTreeMap<String, crate::api::session_verbs::CodexTurnSignal>,
     /// session name -> raw pane capture, for lanes that PAINTED recently.
     ///
     /// The only physical evidence in this struct: everything else is a claim
@@ -995,6 +999,13 @@ impl FleetSignals {
                 }
             }
         }
+        let codex_turns = running.iter()
+            .filter_map(|tmux| tmux.strip_prefix("amux-"))
+            .filter_map(|name| {
+                crate::api::session_verbs::codex_rollout_turn_signal(name)
+                    .map(|signal| (name.to_string(), signal))
+            })
+            .collect();
         FleetSignals {
             activity,
             created,
@@ -1003,6 +1014,7 @@ impl FleetSignals {
             reports,
             transitions,
             started,
+            codex_turns,
             panes: BTreeMap::new(),
             subagent_activity: scan_subagent_activity(),
             now: chrono::Utc::now().timestamp() as f64,
@@ -1117,7 +1129,7 @@ impl FleetSignals {
         // AMUX-3048: an EVENT-DRIVEN live count, when the lane reports one, is the
         // durable answer the mtime window could not give. A subagent transcript's
         // mtime cannot tell "thinking, will write in 90s" from "finished 30s ago";
-        // a start (PreToolUse:Task) / stop (SubagentStop) event pair can. A
+        // a start (SubagentStart) / stop (SubagentStop) event pair can. A
         // positive reported count means a subagent is live RIGHT NOW even while
         // its transcript sits silent (the xhigh-thinking case, AMUX-3030), so it
         // flips the lane working where the mtime window read it idle.
@@ -1569,6 +1581,38 @@ impl FleetSignals {
         if status == "idle" && idle_gate_open && self.subagents_working(name) {
             status = "active".into();
             decided = "contradiction_subagents_working";
+        }
+        // CODEX'S STRUCTURED TURN BOUNDARY IS ITS HOOK (AMUX-4051 E2E).
+        // tmux's activity clock stayed 41 minutes old while a Codex worker's
+        // terminal visibly showed `Working (5m … esc to interrupt)`, so the
+        // pane was rejected before the existing Codex-aware scraper could read
+        // it. The rollout is append-only and emits task_started/task_complete;
+        // honour that direct provider signal after scrape-based contradictions.
+        //
+        // A signal from before the latest worker restart is a previous life and
+        // cannot vote. A visible selector still wins as `waiting`: an open turn
+        // says work is unfinished, not that it is safe to type into the picker.
+        if let Some(signal) = self.codex_turns.get(name) {
+            let started = self.started.get(name).copied().unwrap_or(0.0);
+            let from_this_life = started > 0.0 && signal.ts >= started;
+            let pane_waiting = self.pane_of(name)
+                .map(crate::api::session_verbs::detect_claude_status)
+                .as_deref() == Some("waiting");
+            ex.insert("codex_rollout".into(), json!({
+                "state": signal.state,
+                "age_s": (self.now - signal.ts).max(0.0),
+                "from_this_life": from_this_life,
+                "applied": from_this_life,
+            }));
+            if from_this_life {
+                if signal.state == "active" && pane_waiting {
+                    status = "waiting".into();
+                    decided = "codex_rollout_with_picker";
+                } else {
+                    status = signal.state.clone();
+                    decided = "codex_rollout";
+                }
+            }
         }
         // API-ERROR (5xx / Overloaded) is its own status (Ethan 2026-08-18).
         // Claude Code ENDS the turn on a 529 and returns to the prompt, so its
@@ -3621,6 +3665,7 @@ mod tests {
             subagent_activity: BTreeMap::new(),
             transitions: BTreeMap::new(),
             started: BTreeMap::new(),
+            codex_turns: BTreeMap::new(),
             panes: BTreeMap::new(),
             now: 1_000_000.0,
         }
@@ -4163,6 +4208,39 @@ Claude usage limit reached. Your limit will reset at 3pm.
         let (status, ex) = s.derive_status_explain("x", false);
         assert_eq!(status, "");
         assert_eq!(ex["decided_by"], json!("not_running"));
+    }
+
+    #[test]
+    fn codex_rollout_lifecycle_overrides_stale_tmux_activity() {
+        let mut s = signals();
+        s.running.insert("amux-codex-lane".into());
+        s.activity.insert("amux-codex-lane".into(), (s.now - 2_500.0) as i64);
+        s.started.insert("codex-lane".into(), s.now - 300.0);
+        s.codex_turns.insert(
+            "codex-lane".into(),
+            crate::api::session_verbs::CodexTurnSignal {
+                state: "active".into(),
+                ts: s.now - 120.0,
+            },
+        );
+        let (status, ex) = s.derive_status_explain("codex-lane", true);
+        assert_eq!(
+            status, "active",
+            "structured turn-start must beat a 41-minute-old tmux clock: {ex}"
+        );
+        assert_eq!(ex["decided_by"], json!("codex_rollout"));
+        assert_eq!(ex["codex_rollout"]["applied"], json!(true));
+
+        s.codex_turns.get_mut("codex-lane").unwrap().state = "idle".into();
+        let (status, ex) = s.derive_status_explain("codex-lane", true);
+        assert_eq!(status, "idle", "task-complete is the provider's terminal truth: {ex}");
+        assert_eq!(ex["decided_by"], json!("codex_rollout"));
+
+        s.started.insert("codex-lane".into(), s.now - 10.0);
+        let (status, ex) = s.derive_status_explain("codex-lane", true);
+        assert_eq!(status, "idle", "pre-restart rollout evidence must be ignored: {ex}");
+        assert_eq!(ex["codex_rollout"]["applied"], json!(false));
+        assert_ne!(ex["decided_by"], json!("codex_rollout"));
     }
 
     // ── AMUX-3896: a FRESH idle claim is falsifiable too ────────────────────

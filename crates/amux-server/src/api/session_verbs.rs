@@ -2273,6 +2273,54 @@ pub(crate) fn codex_rollout_path(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// The latest structured Codex turn boundary recorded in a rollout file.
+///
+/// Codex does not expose Claude-style start/stop hooks, but its rollout is an
+/// append-only event stream with the same semantics: `task_started` opens a
+/// turn and `task_complete` closes it. This is stronger evidence than tmux's
+/// `window_activity`, which does not advance for Codex's alternate-screen TUI
+/// on some tmux builds (the live `amux-testing-e2e` specimen stayed `idle` for
+/// an entire multi-minute turn while the pane visibly said `Working`).
+#[derive(Clone, Debug)]
+pub(crate) struct CodexTurnSignal {
+    pub state: String,
+    pub ts: f64,
+}
+
+fn codex_turn_signal_from_events(lines: &[Value]) -> Option<CodexTurnSignal> {
+    let mut latest = None;
+    for event in lines {
+        let top = event.get("type").and_then(Value::as_str).unwrap_or("");
+        let nested = event.pointer("/payload/type").and_then(Value::as_str).unwrap_or("");
+        let state = match (top, nested) {
+            ("turn.started", _) | ("event_msg", "task_started") => "active",
+            ("turn.completed", _) | ("event_msg", "task_complete") => "idle",
+            _ => continue,
+        };
+        let ts = event.get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.timestamp_millis() as f64 / 1000.0)?;
+        latest = Some(CodexTurnSignal { state: state.into(), ts });
+    }
+    latest
+}
+
+/// Resolve one Codex/ollama worker's latest structured turn state.
+///
+/// A bounded tail keeps the fleet poll cheap. Turn-complete is always the
+/// final lifecycle event of an idle rollout; while a very long live turn can
+/// push its start outside the tail, its continuing event writes still leave
+/// the pane/activity fallback available rather than inventing an idle claim.
+pub(crate) fn codex_rollout_turn_signal(name: &str) -> Option<CodexTurnSignal> {
+    let provider = provider_of(&parse_env(name));
+    if !matches!(provider.as_str(), "codex" | "ollama") {
+        return None;
+    }
+    let path = codex_rollout_path(name)?;
+    codex_turn_signal_from_events(&iter_jsonl_tail(&path, 32_000_000))
+}
+
 /// A codex/ollama worker's transcript as the uniform [`TranscriptEvent`] model
 /// (AMUX-3201 slice 1). Reads a bounded tail of the rollout so a long session
 /// stays cheap, parses it via the shared `opencode::events` projection, and
@@ -3267,8 +3315,8 @@ impl Delivery {
 // point: there is no longer a spelling of "record this" that quietly asserts
 // direct delivery.
 
-/// A scheduled command that was DELIVERED (py parity: origin = the schedule's
-/// title, so a peek shows scheduled commands distinctly from a human's). Only
+/// A scheduled command that was DELIVERED (origin includes the exact schedule
+/// id, so the row is clickable and can be joined back to its run). Only
 /// called once delivery is confirmed — recording history for a command that
 /// never landed is how the Messages tab starts disagreeing with the run log.
 pub(crate) async fn cmd_hist_record_schedule(
@@ -3350,9 +3398,8 @@ const DUP_DELIVERY_WINDOW_MS: i64 = 120_000;
 
 /// Mint a ledger card for a HUMAN prompt delivered via the send path and return
 /// its row, or None when the prompt is steering/control (`title_from_prompt`
-/// None: `[no-board]`, control words, bare slash commands, <12 chars) or the
-/// worker already holds an open agent card (the prompt is steering work in
-/// flight, not a new task).
+/// None: `[no-board]`, control words, bare slash commands, <12 chars) or an
+/// identical prompt was just retried.
 ///
 /// WHY THIS EXISTS (AMUX-3071): the Python server's `_autotask_from_command`
 /// carded every human command and stamped `cmd_history.card_id`. That path was
@@ -3456,10 +3503,10 @@ fn mint_capture_card(
     // already declines. Surface it (two-fixes rule): grep
     // "ledger: status-query not carded" to audit the detector, so a wrong
     // suppression of a REAL task is findable in the logs rather than silent.
-    if amux_core::board::is_status_query(body) {
+    if amux_core::board::is_informational_query(body) {
         tracing::info!(
             session = %session_name,
-            "ledger: status-query not carded (recorded in cmd_history only) — AMUX-3330"
+            "ledger: informational prompt not carded (recorded in cmd_history only) — AMUX-3330"
         );
         return Ok(None);
     }
@@ -3471,11 +3518,11 @@ fn mint_capture_card(
     // arrive via the delivered path, not here). Manual work cards also counted, so
     // being mid-work on ANY card blanked the ledger entirely.
     //
-    // Narrowed to the guard's real purpose: don't double-card a RAPID re-send of
-    // one thought (the user pastes a spec across two sends). Skip ONLY when THIS
-    // mechanism minted a capture card (`desc` starts with the `**Prompt:**`
-    // marker) for this session within the window; a distinct task seconds+ later
-    // still cards, and a manual work card never blocks a capture. Captures mint
+    // Narrowed to the guard's real purpose: don't double-card an IDENTICAL retry.
+    // The former time-only test swallowed every distinct command sent within 45s,
+    // preventing the model from ever seeing or decomposing that work. Equality is
+    // checked against the exact captured description; a distinct follow-up cards
+    // immediately, and a manual work card never blocks a capture. Captures mint
     // `doing` (never re-dispatched), so an extra card cannot re-run work — the
     // AMUX-2613 double-run the old dedup was conflated with stays fixed by the
     // `doing` mint, not by this skip.
@@ -3484,11 +3531,12 @@ fn mint_capture_card(
         .and_then(|v| v.parse().ok())
         .unwrap_or(45);
     let cutoff = (now_ms / 1000) - window_s;
+    let desc_body: String = body.chars().take(300).collect();
+    let captured_desc = format!("**Prompt:** {desc_body}");
     let recent_capture: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM issues WHERE session = ?1 AND deleted IS NULL \
-         AND owner_type = 'agent' AND creator = 'amux' AND status = 'doing' \
-         AND substr(desc, 1, 11) = '**Prompt:**' AND created > ?2",
-        rusqlite::params![session_name, cutoff],
+        "SELECT COUNT(*) FROM cmd_history WHERE session=?1 AND type='user' \
+         AND text=?2 AND card_id IS NOT NULL AND ts>?3",
+        rusqlite::params![session_name, body, cutoff * 1000],
         |r| r.get(0),
     )?;
     if recent_capture > 0 {
@@ -3497,17 +3545,16 @@ fn mint_capture_card(
         tracing::info!(
             session = %session_name,
             window_s,
-            "ledger: capture deduped — a capture card was minted <{window_s}s ago (rapid re-send guard)"
+            "ledger: identical capture retry deduped within {window_s}s"
         );
         return Ok(None);
     }
     let needs_self = amux_core::board::title_needs_self_description(&title);
-    let desc_body: String = body.chars().take(300).collect();
     let mut row = crate::db::board_store::create_issue(
         conn,
         &crate::db::board_store::NewIssue {
             title,
-            desc: format!("**Prompt:** {desc_body}"),
+            desc: captured_desc,
             // `doing`, NOT `todo`: an owned `todo` ledger card is Runnable to the
             // planner and its prompt was re-dispatched, double-running every
             // direct prompt (AMUX-2613). `doing` + agent owner is Assigned, never
@@ -3641,6 +3688,7 @@ pub(crate) async fn cmd_hist_record_full(
             "message.duplicate",
             Some(json!({
                 "prior_id": prior_id, "age_s": age_s, "type": ctype,
+                "origin": origin.clone(),
                 "chars": text.chars().count(),
                 "preview": chars_truncate(&text, 120),
             })),
@@ -10075,6 +10123,7 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         if guard.is_empty()
             && sender.is_empty()
             && amux_core::board::title_from_prompt(&text).is_some()
+            && !amux_core::board::is_informational_query(&text)
         {
             let (sess3, text3) = (session.clone(), text.clone());
             let now_ms = (now_f64() * 1000.0) as i64;
@@ -10085,11 +10134,17 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                 .store
                 .write_async(move |conn| {
                     // Already carded (enqueue-time direct mint)? Never double-card.
+                    let retry_cutoff_ms = now_ms
+                        - std::env::var("AMUX_CAPTURE_DEDUP_WINDOW_S")
+                            .ok()
+                            .and_then(|v| v.parse::<i64>().ok())
+                            .unwrap_or(45)
+                            * 1000;
                     let already: i64 = conn
                         .query_row(
                             "SELECT COUNT(*) FROM cmd_history \
-                             WHERE session = ?1 AND text = ?2 AND card_id IS NOT NULL",
-                            rusqlite::params![sess3, text3],
+                             WHERE session = ?1 AND text = ?2 AND card_id IS NOT NULL AND ts>?3",
+                            rusqlite::params![sess3, text3, retry_cutoff_ms],
                             |r| r.get(0),
                         )
                         .unwrap_or(0);
@@ -14362,6 +14417,9 @@ async fn subagent_event_post(state: &AppState, name: &str, ev: &str) -> Response
                 .unwrap_or_else(|| json!({}));
             let prev = reports[&name_s]["subagents"]["count"].as_i64().unwrap_or(0);
             let next = (prev + delta).max(0);
+            if next == prev {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            }
             if !reports[&name_s].is_object() {
                 reports[&name_s] = json!({});
             }
@@ -14371,7 +14429,19 @@ async fn subagent_event_post(state: &AppState, name: &str, ev: &str) -> Response
                  ON CONFLICT(key) DO UPDATE SET value=?1",
                 [reports.to_string()],
             )?;
-            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            // Clear BEFORE returning the event: the store broadcasts only after
+            // this transaction commits, so the SSE-driven GET cannot race ahead
+            // of cache invalidation and render the old count for another 2s.
+            crate::api::sessions_legacy::invalidate_sessions_cache();
+            Ok(crate::db::WriteOutcome {
+                applied: true,
+                events: vec![crate::db::PendingEvent {
+                    entity_type: amux_core::revision::EntityType::Session,
+                    entity_id: name_s.clone(),
+                    mutation: amux_core::revision::MutationKind::Updated,
+                    payload: None,
+                }],
+            })
         })
         .await;
     match reply {
@@ -14434,7 +14504,7 @@ pub(crate) async fn report_post(state: &AppState, name: &str, headers: &HeaderMa
     }
     // SELF-REPORTED CONVERSATION ID (AMUX-2936). Handled here, above the
     // subagent early-return, so EVERY report shape carries it — a lane that only
-    // ever fires PreToolUse:Task would otherwise never heal.
+    // ever fires SubagentStart would otherwise never heal.
     //
     // Three spellings accepted because three producers exist: `conv_id` (amux's
     // own callers), `session_id` (Claude Code's hook payload field verbatim, so
@@ -14469,7 +14539,7 @@ pub(crate) async fn report_post(state: &AppState, name: &str, headers: &HeaderMa
     // the durable exit for the mtime-window instruments cluster (AMUX-2646/2904/
     // 2959/2952/3022/3030/3047). A subagent transcript's mtime cannot tell
     // "finished 30s ago" from "thinking, will write in 90s"; a start/stop event
-    // pair can. `{"subagent":"start"}` (PreToolUse:Task) increments, `"stop"`
+    // pair can. `{"subagent":"start"}` (SubagentStart) increments, `"stop"`
     // (SubagentStop) decrements. Handled BEFORE the main-state parse below so it
     // never touches state/model/tokens — it is orthogonal to the main turn.
     // Attribution (the origin==name check above) applies here too: a subagent
@@ -14587,20 +14657,33 @@ pub(crate) async fn report_post(state: &AppState, name: &str, headers: &HeaderMa
             // ABSENT != EMPTY above): the model does not change per tool call.
             let prev_model = reports[&name_s]["model"].clone();
             let prev_tokens = reports[&name_s]["tokens"].clone();
+            // Main-turn reports and subagent lifecycle reports share this one
+            // object. Replacing it without carrying `subagents` erased the live
+            // count on every prompt/tool/stop event, so the card could flip idle
+            // while children were still running.
+            let prev_subagents = reports[&name_s]["subagents"].clone();
             // Did the STATUS actually change? Only then is an SSE push worth it.
             let status_changed = prev_state != st2;
             let new_state = st2.clone();
-            reports[&name_s] = json!({
+            let mut next_report = json!({
                 "model": model_opt.clone().map(Value::from).unwrap_or(prev_model),
                 "tokens": tokens_opt.clone().unwrap_or(prev_tokens),
                 "state": st2, "detail": detail, "source": src2,
                 "origin": origin2, "ts": now_f64(),
             });
+            if !prev_subagents.is_null() {
+                next_report["subagents"] = prev_subagents;
+            }
+            reports[&name_s] = next_report;
             conn.execute(
                 "INSERT INTO prefs(key, value) VALUES('session_reports', ?1) \
                  ON CONFLICT(key) DO UPDATE SET value=?1",
                 [reports.to_string()],
             )?;
+            // See subagent_event_post: invalidate inside the writer, before its
+            // committed Session event is broadcast, so the reactive GET sees
+            // this exact state rather than the preceding cache entry.
+            crate::api::sessions_legacy::invalidate_sessions_cache();
             // SNAPPY STATUS (Ethan, 2026-08-16). A self-report is the fast, exact
             // signal for active/idle/needs-input (the D1 exit), but this write used
             // events:vec![], so a hook state change pushed NO SSE and the dashboard
@@ -18013,8 +18096,9 @@ mod tests {
         assert_eq!(sess, "lane-cap");
         assert_eq!(status, "doing", "capture mints in doing, not todo (AMUX-2613)");
 
-        // 2. A SECOND prompt to a lane that now holds an open card is STEERING,
-        //    not a new task: no card, card_id stays NULL, still exactly one card.
+        // 2. A distinct SECOND prompt is still work even while a card is open.
+        //    The model gets both durable commands and decides whether to relate,
+        //    merge, order, or decompose them; the harness must not erase one.
         cmd_hist_record_full(
             &st, "lane-cap", "Also make the tabs keyboard-navigable please",
             "user", "", false, DeliveryMeta::direct(),
@@ -18022,8 +18106,8 @@ mod tests {
         .await;
         assert!(
             q("SELECT card_id FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1", "lane-cap")
-                .is_none(),
-            "a lane with an open card is steered, not re-carded"
+                .is_some(),
+            "distinct work is carded even while another card is open"
         );
         let n: i64 = st
             .store
@@ -18031,7 +18115,7 @@ mod tests {
             .unwrap()
             .query_row("SELECT COUNT(*) FROM issues WHERE session='lane-cap'", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n, 1, "exactly one card for the lane");
+        assert_eq!(n, 2, "each distinct durable command reaches the work ledger");
 
         // 3. [no-board] (skip_board=true) mints nothing.
         cmd_hist_record_full(
@@ -18097,6 +18181,41 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM cmd_history WHERE session='lane-sq'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(msgs, 1, "the prompt is still recorded in cmd_history (Messages ledger)");
+    }
+
+    #[tokio::test]
+    async fn an_informational_question_records_in_messages_without_a_board_card() {
+        let (st, _dir) = state();
+        cmd_hist_record_full(
+            &st,
+            "lane-info",
+            "What is the difference between todo and backlog? Please answer only; do not change anything.",
+            "user",
+            "",
+            false,
+            DeliveryMeta::direct(),
+        )
+        .await;
+        let (card_id, messages): (Option<String>, i64) = st
+            .store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT card_id, (SELECT COUNT(*) FROM cmd_history WHERE session='lane-info') \
+                 FROM cmd_history WHERE session='lane-info' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(card_id.is_none(), "answer-only question must not mint a work card");
+        assert_eq!(messages, 1, "the question still belongs in Messages");
+        let cards: i64 = st
+            .store
+            .read()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM issues WHERE session='lane-info'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cards, 0);
     }
 
     // The stale-pickup guard (AMUX-3052) reads the card id out of the prompt
@@ -18671,6 +18790,35 @@ mod tests {
         // Resume picker needs the ⌕ search glyph.
         assert!(at_resume_picker("Resume Session \u{2315}\nEnter to select"));
         assert!(!at_resume_picker("Enter to select"));
+    }
+
+    #[test]
+    fn codex_rollout_boundaries_are_a_structured_live_state() {
+        let events = vec![
+            json!({
+                "timestamp": "2026-09-02T21:36:17.348Z",
+                "type": "event_msg",
+                "payload": {"type": "task_started"}
+            }),
+            json!({"timestamp": "2026-09-02T21:36:18Z", "type": "response_item"}),
+        ];
+        let active = codex_turn_signal_from_events(&events).unwrap();
+        assert_eq!(active.state, "active");
+        assert!(active.ts > 1_700_000_000.0);
+
+        let mut completed = events;
+        completed.push(json!({
+            "timestamp": "2026-09-02T21:40:00Z",
+            "type": "event_msg",
+            "payload": {"type": "task_complete"}
+        }));
+        assert_eq!(codex_turn_signal_from_events(&completed).unwrap().state, "idle");
+
+        let exec_json = vec![json!({
+            "timestamp": "2026-09-02T21:41:00Z",
+            "type": "turn.started"
+        })];
+        assert_eq!(codex_turn_signal_from_events(&exec_json).unwrap().state, "active");
     }
 
     /// Codex's trust-directory picker, byte shape captured live 2026-08-11
@@ -19672,7 +19820,7 @@ mod tests {
 
         // 6. A SUBAGENT-ONLY report still heals. It returns early, before the
         //    state parse, so adoption had to be hoisted above that branch — a
-        //    lane whose only hook is PreToolUse:Task would otherwise stay blind
+        //    lane whose only hook is SubagentStart would otherwise stay blind
         //    forever.
         const CONV3: &str = "5f6e7d8c-9b0a-4123-8456-789abcdef012";
         std::fs::write(env_path("subby"), "CC_DIR=\"/tmp\"\n").unwrap();
@@ -19808,10 +19956,11 @@ mod steer_boundary_tests {
 
     /// AMUX-3147: a new user prompt must card even while the session holds an open
     /// MANUAL card — that was the "none of these have board items" bug, the old
-    /// dedup skipping on ANY open agent card. Only a RAPID re-send within the
-    /// window is deduped; a distinct task past the window cards again.
+    /// dedup skipping on ANY open agent card. Only an IDENTICAL retry within the
+    /// window is deduped; a distinct task cards immediately so the model can
+    /// decide whether it is a sibling, dependency, or follow-up.
     #[tokio::test]
-    async fn capture_cards_new_tasks_past_a_manual_card_but_dedups_a_rapid_resend() {
+    async fn capture_cards_distinct_rapid_tasks_but_dedups_an_identical_retry() {
         use crate::db::board_store::{create_issue, NewIssue};
         let (state, _tmp) = tstate();
         let now_ms = 1_700_000_000_000i64;
@@ -19847,12 +19996,25 @@ mod steer_boundary_tests {
                 // The open manual card must NOT block a new user task.
                 let first = super::mint_capture_card(conn, "s", "build the connectors tab", now_ms)?;
                 assert!(first.is_some(), "a new task must card even with an open manual card");
-                // A rapid re-send within the window IS deduped.
+                // In production the recorder atomically attaches the minted id
+                // to this exact cmd_history row; the retry predicate reads that
+                // durable link rather than comparing truncated card prose.
+                conn.execute(
+                    "INSERT INTO cmd_history(text,type,session,ts,origin,card_id) VALUES(?1,'user','s',?2,'test',?3)",
+                    rusqlite::params![
+                        "build the connectors tab",
+                        now_ms,
+                        first.as_ref().unwrap().id
+                    ],
+                )?;
+                // An identical transport retry within the window IS deduped.
+                let retry = super::mint_capture_card(conn, "s", "build the connectors tab", now_ms + 1_000)?;
+                assert!(retry.is_none(), "an identical retry within the window must dedup");
+                // A different task two seconds later is not a retry. The old
+                // time-only shim silently swallowed it before any model could
+                // classify or decompose it.
                 let rapid = super::mint_capture_card(conn, "s", "also wire slack", now_ms + 2_000)?;
-                assert!(rapid.is_none(), "a rapid re-send within the window must dedup");
-                // A distinct task past the window cards again.
-                let later = super::mint_capture_card(conn, "s", "now add gmail", now_ms + 60_000)?;
-                assert!(later.is_some(), "a distinct task past the dedup window must card");
+                assert!(rapid.is_some(), "a distinct rapid task must card immediately");
                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
             })
             .await
@@ -20068,6 +20230,7 @@ mod steer_boundary_tests {
         let (state, _d) = tstate();
         // A prior main-state report must survive the subagent events untouched.
         set_report(&state, "probe", "active").await;
+        let mut events = state.store.subscribe();
 
         let read = |state: &AppState| -> Value {
             state
@@ -20083,6 +20246,13 @@ mod steer_boundary_tests {
         };
 
         subagent_event_post(&state, "probe", "start").await;
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("subagent start must push a real-time session event")
+            .expect("event channel open");
+        assert_eq!(event.entity_type, amux_core::revision::EntityType::Session);
+        assert_eq!(event.entity_id, "probe");
+        assert_eq!(event.mutation, amux_core::revision::MutationKind::Updated);
         subagent_event_post(&state, "probe", "start").await;
         let v = read(&state);
         assert_eq!(v["probe"]["subagents"]["count"].as_i64(), Some(2), "two starts -> 2");
@@ -20090,6 +20260,22 @@ mod steer_boundary_tests {
             v["probe"]["state"].as_str(),
             Some("active"),
             "subagent events must not touch the main state"
+        );
+
+        // THE LIVE FAILURE: any main report used to replace this whole object,
+        // deleting `subagents` while both children were still running.
+        let headers = HeaderMap::new();
+        report_post(
+            &state,
+            "probe",
+            &headers,
+            &json!({"state": "active", "source": "prompt-hook"}),
+        )
+        .await;
+        assert_eq!(
+            read(&state)["probe"]["subagents"]["count"].as_i64(),
+            Some(2),
+            "main-turn reports must preserve the live subagent count"
         );
 
         subagent_event_post(&state, "probe", "stop").await;

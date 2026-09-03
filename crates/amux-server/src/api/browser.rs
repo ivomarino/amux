@@ -616,21 +616,30 @@ fn driver_err(e: chrome::DriverError) -> Response {
     }
 }
 
-/// 504 for a CDP call that never answered, 502 for one that failed (AMUX-3672).
+/// 504 for a CDP call that never answered, 400 for a page-side exception
+/// (AMUX-98), 502 for everything else — a real transport/protocol failure
+/// (AMUX-3672).
 ///
-/// Both were 502, and `/api/logs/analyze` groups by (status, method, target) —
-/// so "the browser is WEDGED" and "the browser REJECTED our call" landed in the
-/// same row and only the error body separated them. A wedged browser is the one
-/// that means something else is wrong (a contended profile, a hung tab); a
-/// protocol error usually means the caller asked for something impossible.
-/// Making them different status codes makes them different groups in every log
-/// view, for free.
+/// All three used to be 502, and `/api/logs/analyze` groups by (status,
+/// method, target) — so "the browser is WEDGED", "the browser REJECTED our
+/// call", and "the CALLER'S OWN SELECTOR was malformed" landed in the same
+/// row and only the error body separated them. A wedged browser means
+/// something else is wrong (a contended profile, a hung tab); a protocol
+/// error usually means the caller asked for something impossible; a page
+/// exception from a bad selector (e.g. Playwright-style `text=...` syntax
+/// reaching a native `querySelector`) is a plain caller mistake — the same
+/// class `click_outcome`'s NOELEMENT/NOTVISIBLE/STALE sentinels already
+/// answer 400 for, just arriving as an exception instead of a string.
+/// Splitting all three into different status codes makes them different
+/// groups in every log view, for free.
 ///
 /// Decided on the TYPE, never by matching the message: a status code that
 /// depends on error wording breaks the first time someone rephrases it.
 fn cdp_status(e: &anyhow::Error) -> StatusCode {
     if e.downcast_ref::<chrome::CdpTimeout>().is_some() {
         StatusCode::GATEWAY_TIMEOUT
+    } else if e.downcast_ref::<chrome::PageException>().is_some() {
+        StatusCode::BAD_REQUEST
     } else {
         StatusCode::BAD_GATEWAY
     }
@@ -1613,7 +1622,14 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
             match out {
                 Ok(v) if v.get("error").is_some() => err(StatusCode::BAD_REQUEST, v),
                 Ok(v) => Json(v).into_response(),
-                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
+                // AMUX-98: a malformed selector (e.g. Playwright-style
+                // `text=...` reaching a native `querySelector`) throws
+                // INSIDE click_selector's own eval, before click_outcome
+                // ever sees a NOELEMENT/NOTVISIBLE/STALE string to classify
+                // — so this arm used to blanket-502 the caller's own typo.
+                // cdp_status now tells that PageException apart from a real
+                // transport failure by TYPE.
+                Err(e) => err(cdp_status(&e), json!({ "error": with_cause(&e) })),
             }
         }
         "type" => {
@@ -1621,7 +1637,7 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
             match cdp.call("Input.insertText", json!({ "text": text }), ten).await {
                 Ok(_) => Json(json!({ "ok": true, "typed": text.chars().count(), "backend": "native" }))
                     .into_response(),
-                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
+                Err(e) => err(cdp_status(&e), json!({ "error": with_cause(&e) })),
             }
         }
         "input" => {
@@ -1636,7 +1652,7 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
             );
             let raw = match cdp.eval(&js, 20).await {
                 Ok(r) => r,
-                Err(e) => return err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
+                Err(e) => return err(cdp_status(&e), json!({ "error": with_cause(&e) })),
             };
             if raw.as_str() != Some("FOCUSED") {
                 let v = chrome::click_outcome(
@@ -1649,21 +1665,21 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
             match cdp.call("Input.insertText", json!({ "text": text }), ten).await {
                 Ok(_) => Json(json!({ "ok": true, "index": idx, "typed": text.chars().count() }))
                     .into_response(),
-                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
+                Err(e) => err(cdp_status(&e), json!({ "error": with_cause(&e) })),
             }
         }
         "key" => {
             let k = get_str("key").unwrap_or_default();
             match chrome::dispatch_key(&mut cdp, &k).await {
                 Ok(()) => Json(json!({ "ok": true, "key": k })).into_response(),
-                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
+                Err(e) => err(cdp_status(&e), json!({ "error": with_cause(&e) })),
             }
         }
         "scroll" => {
             let dy = body.get("dy").and_then(Value::as_i64).unwrap_or(500);
             match cdp.eval(&format!("window.scrollBy(0,{dy})"), 10).await {
                 Ok(_) => Json(json!({ "ok": true, "dy": dy })).into_response(),
-                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
+                Err(e) => err(cdp_status(&e), json!({ "error": with_cause(&e) })),
             }
         }
         "eval" => {
@@ -1736,12 +1752,15 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
             match chrome::set_input_files(&mut cdp, &selector, &files).await {
                 Ok(v) if v.get("error").is_some() => err(StatusCode::BAD_REQUEST, v),
                 Ok(v) => Json(v).into_response(),
-                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
+                // Same AMUX-98 class as "click": set_input_files' own probe
+                // interpolates the caller's selector into a querySelector
+                // eval, so a malformed one throws here too.
+                Err(e) => err(cdp_status(&e), json!({ "error": with_cause(&e) })),
             }
         }
         "back" => match cdp.eval("history.back()", 10).await {
             Ok(_) => Json(json!({ "ok": true })).into_response(),
-            Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
+            Err(e) => err(cdp_status(&e), json!({ "error": with_cause(&e) })),
         },
         "extract" => match state_payload(&mut cdp, &session).await {
             Ok(v) => Json(v).into_response(),
@@ -1784,9 +1803,11 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
                             .into_response();
                     }
                     Ok(_) => {}
-                    Err(e) => {
-                        return err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) }))
-                    }
+                    // AMUX-98: `probe` interpolates the caller's own
+                    // selector when one was given (the text-search branch
+                    // above has no selector to be malformed), so this is
+                    // the same class of caller mistake as "click".
+                    Err(e) => return err(cdp_status(&e), json!({ "error": with_cause(&e) })),
                 }
                 if std::time::Instant::now() >= deadline {
                     // A timeout is an OUTCOME, not a malformed request: 200
@@ -1823,7 +1844,7 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
                     Json(json!({ "ok": true, "viewport": { "w": w, "h": h }, "measured": seen }))
                         .into_response()
                 }
-                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
+                Err(e) => err(cdp_status(&e), json!({ "error": with_cause(&e) })),
             }
         }
         _ => unreachable!("validated above"),
@@ -2210,6 +2231,40 @@ mod tests {
         let wrapped = anyhow::Error::new(chrome::CdpTimeout { method: "X".into(), secs: 1 })
             .context("while resizing the viewport");
         assert_eq!(cdp_status(&wrapped), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    /// AMUX-98. A malformed selector (Playwright-style `text=...` syntax
+    /// reaching a native `document.querySelector`) throws INSIDE the page,
+    /// which `CdpClient::eval` now carries as a `PageException` rather than
+    /// a bare anyhow message — the caller's own mistake, same class as the
+    /// NOELEMENT/NOTVISIBLE/STALE sentinels `click_outcome` already answers
+    /// 400 for, not amux's infrastructure failing (502).
+    #[test]
+    fn a_page_exception_is_400_not_502() {
+        let page_ex = anyhow::Error::new(chrome::PageException(
+            "SyntaxError: Failed to execute 'querySelector' on 'Document': \
+             'text=Create credentials' is not a valid selector."
+                .into(),
+        ));
+        assert_eq!(cdp_status(&page_ex), StatusCode::BAD_REQUEST);
+        // Message text is unchanged from the old bail!("eval: {desc}") this
+        // replaced, so nothing reading the error body sees a diff.
+        assert!(page_ex.to_string().starts_with("eval: SyntaxError"));
+
+        // CONTROL: a real transport failure is untouched by this change —
+        // still 502, not folded into the new 400 case.
+        let protocol = anyhow::anyhow!("CDP websocket closed during Page.navigate");
+        assert_eq!(cdp_status(&protocol), StatusCode::BAD_GATEWAY);
+
+        // CONTROL: a timeout still wins over both of the above.
+        let timeout = anyhow::Error::new(chrome::CdpTimeout { method: "Y".into(), secs: 2 });
+        assert_eq!(cdp_status(&timeout), StatusCode::GATEWAY_TIMEOUT);
+
+        // CONTROL: a PageException wrapped in CONTEXT is still a
+        // PageException — same reasoning as the CdpTimeout control above.
+        let wrapped = anyhow::Error::new(chrome::PageException("boom".into()))
+            .context("while clicking a selector");
+        assert_eq!(cdp_status(&wrapped), StatusCode::BAD_REQUEST);
     }
 
     /// AMUX-3403: an unknown field posted to start is CAPTURED, not silently

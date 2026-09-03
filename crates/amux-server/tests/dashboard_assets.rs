@@ -216,3 +216,113 @@ fn the_auto_compact_copy_states_the_threshold_the_server_actually_uses() {
         "copy still names 50% while the constant is {pct}: {line}"
     );
 }
+
+#[test]
+fn board_create_uses_the_server_field_names() {
+    let app = asset("app.js");
+    let start = app
+        .find("async function addBoardItem(")
+        .expect("addBoardItem exists");
+    let tail = &app[start..];
+    let end = tail.find("\n}\n").expect("addBoardItem closes") + 3;
+    let body = &tail[..end];
+    assert!(
+        body.contains("session: worker || ''"),
+        "board create must send `session`: {body}"
+    );
+    assert!(
+        body.contains("tags: groups || []"),
+        "board create must send `tags`: {body}"
+    );
+    assert!(
+        !body.contains("worker: worker || ''") && !body.contains("groups: groups || []"),
+        "`worker`/`groups` are UI names, not POST /api/board fields; the server reports them ignored"
+    );
+}
+
+#[test]
+fn board_detail_hydration_refreshes_authoritative_state_and_relations() {
+    let app = asset("app.js");
+    let start = app
+        .find("async function _bdHydrate(")
+        .expect("_bdHydrate exists");
+    let tail = &app[start..];
+    let end = tail
+        .find("\n}\n\nfunction openBoardDetail")
+        .expect("_bdHydrate closes");
+    let body = &tail[..end];
+    for needle in [
+        "boardDetailStatus = full.status",
+        "_populateSessionSelect('bd-session', full.session",
+        "_bdRenderMeta(merged)",
+        "previewTab.classList.contains('active')",
+        "renderMarkdown(d.value)",
+        "full.due_time",
+        "full.tags",
+    ] {
+        assert!(
+            body.contains(needle),
+            "hydration still leaves `{needle}` stale"
+        );
+    }
+}
+
+#[test]
+fn board_detail_leads_with_actionable_task_context() {
+    let html = asset("index.html");
+    let meta = html.find("id=\"bd-meta\"").expect("task context container");
+    let tabs = html.find("class=\"board-detail-tabs\"").expect("detail tabs");
+    let edit = html.find("id=\"bd-edit-fields\"").expect("edit-only fields");
+    assert!(
+        tabs < meta && meta < edit,
+        "Details must lead with source, epic, gates and assets before edit-only controls"
+    );
+    assert!(html.contains(">Details</button>"));
+    assert!(html.contains(">Worker actions<span id=\"bd-hist-n\""));
+    assert!(html.contains("id=\"bd-edit-fields\" style=\"display:none;\""));
+    assert!(html.contains("id=\"bd-edit-footer\"") && html.contains("id=\"bd-delete\""));
+    assert!(
+        !html.contains("id=\"bd-tab-lineage\""),
+        "database lineage is not the task card's primary content"
+    );
+
+    let app = asset("app.js");
+    assert!(
+        !app.contains("_bdRenderLineage") && !app.contains("_bdLineageHtml"),
+        "the retired Lineage tab must not leave a hidden renderer or network path"
+    );
+    assert!(
+        app.contains("maybeTab === 'lineage' ? 'preview'"),
+        "old Lineage deep links must still resolve to the card's Details view"
+    );
+    for needle in [
+        "item.gate_requirements",
+        "item.asset_links",
+        "a.resolved_ref",
+        "Produced assets (",
+        "Source message",
+        "_bdOpenMessage(",
+        "_bdWorkerActivity(",
+        "Worker actions",
+    ] {
+        assert!(app.contains(needle), "card detail omitted `{needle}`");
+    }
+    let summary = app.find("const summary = [").expect("work summary");
+    let assets = app[summary..].find("const artifacts = []").expect("asset section") + summary;
+    assert!(
+        !app[summary..assets].contains("['Evidence', item.evidence]"),
+        "raw shell evidence must not dominate the default card"
+    );
+}
+
+#[test]
+fn group_suggestions_are_autocomplete_not_an_unprompted_wall() {
+    let app = asset("app.js");
+    let start = app
+        .find("function _beTagInputUpdate(prefix)")
+        .expect("tag autocomplete exists");
+    let body = &app[start..start + 900.min(app.len() - start)];
+    let empty = body.find("if (!q) { el.innerHTML = ''; return; }").expect("empty-query guard");
+    let suggest = body.find("_tagSuggestions(prefix, q)").expect("typed suggestions remain");
+    assert!(empty < suggest, "the empty query must stop before fleet groups are suggested");
+}
