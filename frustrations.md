@@ -2467,7 +2467,7 @@ NOTE: distinct from AF-435 (checks that ran, passed and could not have failed). 
 ## An answer-only prompt still cards when its no-op tail isn't one of ten hardcoded literal strings
 AREA: harness
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-09-03
 SESSION: amux-testing-e2e
 CARD: ATE-17
@@ -2483,7 +2483,12 @@ SYMPTOM: Yesterday's fix (53b3e952, archived from frustrations.md 2026-09-02, va
 COST: The exact friction the archived entry described recurred one day later under a
   paraphrase, consuming two board ids and two WIP-adjacent doing slots for pure Q&A that
   was already answered inline both times.
-FIX: Replace literal ANSWER_ONLY_TAILS matching with a structural check — e.g. the tail
-  contains no CAPTURE_TASK_VERBS and no additional imperative clause, mirroring what
-  capture_has_task_followup already does for the pre-question clause — instead of an
-  enumerable list of exact phrasings. Not done here; filed as ATE-17.
+FIX: f999caff replaces the literal ANSWER_ONLY_TAILS list with `tail_is_answer_only()`,
+  which splits the tail on the same connectors `capture_has_task_followup` already uses
+  for the pre-question clause and requires no resulting clause starts a task per the
+  existing `capture_clause_starts_task` verb check — reusing the mechanism already
+  trusted for the rest of the function instead of an enumerable list. Pinned the ATE-17
+  specimen plus a negative control (a real task stacked after an answer-only opener must
+  still card); `scripts/mutate.sh` confirms the negative control can actually fail.
+  NOT YET independently re-validated against the running server build — see AF-433's
+  discipline for what that validation should check before this entry is archived.
