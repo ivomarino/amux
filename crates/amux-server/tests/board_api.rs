@@ -3254,6 +3254,119 @@ async fn the_contract_names_a_worker_scoped_gate_before_you_trip_it() {
 
 // ---- AMUX-3686: a --trigger must not eat an autofix dedupe signature -------
 //
+// AF-459. A trigger replacing a trigger is ALLOWED (the test below this one
+// pins that, and it is correct). What was missing is that it left no record of
+// what it destroyed: the PATCH log builds one line per patch out of a Vec of
+// FIELD NAMES, so an overwrite rendered as the bare word "source_ref".
+//
+// gtm-engine lost a five-item inventory from 2026-08-09 that way, probing
+// whether --trigger works on an archived card. It does. They recovered four
+// items from a prefix they happened to have printed earlier in their own
+// transcript; the fifth is gone. /api/history carries no row with the value
+// either, so the column that got written was the only copy that existed.
+//
+// Driven through the real router for the same reason as the test below: the
+// decision lives in the handler.
+#[tokio::test]
+async fn overwriting_a_trigger_records_the_value_it_destroyed() {
+    let (app, _dir) = app();
+
+    let (_s, _h, created) = send_with(
+        &app,
+        "POST",
+        "/api/board",
+        Some(json!({"title": "parked card", "status": "todo", "session": "amux"})),
+        &[("X-Amux-Session", "amux")],
+    )
+    .await;
+    let id = created["id"].as_str().unwrap().to_string();
+
+    // The value that must survive its own replacement. Long on purpose: it is
+    // an inventory, which is what the real loss was.
+    let original = "inventory 2026-08-09: (1) shard roll evidence (2) warm-search p50 \
+                    (3) tenant caps (4) scheduler breach counts (5) eviction gap notes";
+    let (st, _h, _b) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({"source_ref": original})),
+        &[("X-Amux-Session", "amux")],
+    )
+    .await;
+    assert!(st.is_success());
+
+    // THE SPECIMEN: a second trigger replaces the first. Allowed, and it must
+    // not be silent.
+    let replacement = "the next ts-engine roll";
+    let (st, _h, _b) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({"source_ref": replacement})),
+        &[("X-Amux-Session", "amux")],
+    )
+    .await;
+    assert!(st.is_success(), "replacing a trigger with a trigger stays allowed");
+
+    let (_s, _h, detail) = send_with(&app, "GET", &format!("/api/board/{id}"), None, &[]).await;
+    let log = detail["log"].as_str().unwrap_or("");
+
+    // 1. THE DESTROYED VALUE IS RECOVERABLE FROM THE CARD. This is the whole
+    //    card: not that the field moved, but what it moved FROM.
+    assert!(
+        log.contains("eviction gap notes"),
+        "the overwritten trigger must be recoverable from the card log, \
+         otherwise the write is the only copy and it is gone: {log}"
+    );
+    // 2. Kept LONG. A truncated sole copy reproduces the exact partial recovery
+    //    gtm-engine got by accident — they retrieved a prefix and lost the tail.
+    //    The fifth item is the tail, which is why it is the one asserted above.
+    assert!(
+        log.contains("shard roll evidence") && log.contains("scheduler breach"),
+        "head AND tail of the destroyed value must survive, not just a prefix: {log}"
+    );
+    // 3. It says WAS, so a reader can tell the old value from the new one.
+    assert!(
+        log.contains("source_ref: WAS"),
+        "the log must mark which side is the destroyed value: {log}"
+    );
+    assert!(
+        log.contains(replacement),
+        "the arriving value is still named: {log}"
+    );
+
+    // 4. NEGATIVE ARM: a FIRST write destroys nothing, so it must not claim to.
+    //    Without this the check would pass on an implementation that printed
+    //    "WAS" unconditionally, which would read as data loss on every create.
+    let (_s, _h, c2) = send_with(
+        &app,
+        "POST",
+        "/api/board",
+        Some(json!({"title": "fresh card", "status": "todo", "session": "amux"})),
+        &[("X-Amux-Session", "amux")],
+    )
+    .await;
+    let id2 = c2["id"].as_str().unwrap().to_string();
+    let (_s, _h, _b) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id2}"),
+        Some(json!({"source_ref": "first trigger ever"})),
+        &[("X-Amux-Session", "amux")],
+    )
+    .await;
+    let (_s, _h, d2) = send_with(&app, "GET", &format!("/api/board/{id2}"), None, &[]).await;
+    let log2 = d2["log"].as_str().unwrap_or("");
+    assert!(
+        !log2.contains("WAS"),
+        "a first write overwrote nothing and must not imply it did: {log2}"
+    );
+    assert!(
+        log2.contains("first trigger ever"),
+        "a first write still names the value it set: {log2}"
+    );
+}
+
 // `source_ref` has two owners. autofix stores its fault signature there and
 // `open_card_for_fault` reads it to suppress a duplicate filing; `amux board
 // backlog --trigger` writes the external condition a parked card waits on, as

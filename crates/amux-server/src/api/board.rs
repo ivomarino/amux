@@ -6534,6 +6534,45 @@ pub async fn patch_item(
                             next.reviewer.as_deref().unwrap_or("(none)")
                         ),
                         "owner_type" => format!("owner_type -> {}", next.owner_type),
+                        // THE ONE FIELD WHERE THE LOG NAMES WHAT WAS DESTROYED
+                        // RATHER THAN WHAT ARRIVED (AF-459).
+                        //
+                        // The rule three comments up — "VALUES ARE SUMMARISED,
+                        // NOT COPIED ... the new value is already on the card" —
+                        // is right for every other field and inverts for this
+                        // one. `--trigger` is a plain overwrite; only an
+                        // `autofix:` prefix is protected (AMUX-3686 above), and
+                        // that narrowness is deliberate. So when a trigger
+                        // replaces a trigger, the OLD value exists nowhere: not
+                        // on the card, not in /api/history, not in this log,
+                        // which recorded the bare word "source_ref". There is no
+                        // redundancy to trade against readability here, because
+                        // the column that just got written WAS the only copy.
+                        //
+                        // gtm-engine lost a five-item inventory from 2026-08-09
+                        // this way, probing whether --trigger works on an
+                        // archived card (it does). They recovered four items
+                        // from a prefix they had happened to print earlier in
+                        // their own transcript. The fifth is gone. Second known
+                        // clobber of this field on that board.
+                        //
+                        // The old value is kept LONG (200 vs the 60 used for
+                        // arrivals) for the same reason: a truncated sole copy
+                        // reproduces the exact partial-recovery they got by
+                        // accident.
+                        "source_ref" => {
+                            let before = row.source_ref.as_deref().unwrap_or("");
+                            let after = next.source_ref.as_deref().unwrap_or("(cleared)");
+                            if before.is_empty() {
+                                format!("source_ref -> {}", chars_truncate_log(after, 60))
+                            } else {
+                                format!(
+                                    "source_ref: WAS {} -> {}",
+                                    chars_truncate_log(before, 200),
+                                    chars_truncate_log(after, 60)
+                                )
+                            }
+                        }
                         "archived" => {
                             // ARCHIVING A TRIGGER-BEARING CARD DE-ARMS IT, SILENTLY
                             // (AMUX-3715, reported by tubescience). `archived`
