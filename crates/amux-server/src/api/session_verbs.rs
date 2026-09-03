@@ -7085,18 +7085,34 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
     if provider != "codex" && provider != "gemini" && provider != "ollama" && has_oauth {
         shell_rc.push_str("unset ANTHROPIC_API_KEY; ");
     }
+    // Settings writes provider keys to server.env at runtime. Reading that file
+    // here is what makes the next worker actually inherit a key saved through
+    // the UI; std::env still contains only the values captured at server boot.
+    // Keep the values out of shell_rc/logs and pass them straight to tmux's
+    // child environment.
+    let runtime_provider_env = super::settings::runtime_provider_env(&home());
+    let provider_value = |key: &str| {
+        runtime_provider_env
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.clone())
+    };
     let mut env_args: Vec<String> = Vec::new();
     if has_oauth {
         env_args.push("-e".into());
         env_args.push("ANTHROPIC_API_KEY=".into());
-    } else if let Ok(v) = std::env::var("ANTHROPIC_API_KEY") {
-        if !v.is_empty() {
+    } else if let Some(v) = provider_value("ANTHROPIC_API_KEY") {
+        env_args.push("-e".into());
+        env_args.push(format!("ANTHROPIC_API_KEY={v}"));
+    }
+    for k in ["OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"] {
+        if let Some(v) = provider_value(k) {
             env_args.push("-e".into());
-            env_args.push(format!("ANTHROPIC_API_KEY={v}"));
+            env_args.push(format!("{k}={v}"));
         }
     }
     for k in [
-        "ANTHROPIC_API_BASE", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY",
+        "ANTHROPIC_API_BASE",
         "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION",
     ] {
         if let Ok(v) = std::env::var(k) {
@@ -7109,6 +7125,37 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
 
     let tmux_sess = tmux_name(name);
     let tmux_exists = tmux_sessions_set().await.contains(&tmux_sess);
+    if tmux_exists {
+        // A stopped worker keeps its tmux session and shell. Updating
+        // server.env and pressing Start must not reuse the credentials that
+        // shell inherited before the PATCH. Refresh tmux's session environment
+        // now; the shell imports it below without ever printing a value.
+        // Bound as `st`, not `target`: tests/tmux_target_audit.rs whitelists the
+        // literal expressions ["st","pt","stq","ptq"] as a `-t` argument, so a
+        // correctly-derived target under any other name fails the audit. The
+        // VALUE was already exact here (st() is session_target(tmux_name(..)),
+        // i.e. "=amux-<n>"); only the binding's name was outside the list, and
+        // `let pt = pane_target(sess)` a few thousand lines down is the same
+        // convention.
+        let st = st(name);
+        for key in super::settings::PROVIDER_ENV_KEYS {
+            let value = if has_oauth && key == "ANTHROPIC_API_KEY" {
+                None
+            } else {
+                provider_value(key)
+            };
+            let refreshed = match value {
+                Some(value) => tmux(&["set-environment", "-t", &st, key, &value]).await,
+                None => tmux(&["set-environment", "-u", "-t", &st, key]).await,
+            };
+            if !refreshed.map(|out| out.status.success()).unwrap_or(false) {
+                return (
+                    false,
+                    format!("could not refresh {key} for the existing tmux session"),
+                );
+            }
+        }
+    }
     if tmux_exists {
         // Reuse the surviving tmux session (py:24589).
         let output = tmux_capture(name, 10).await;
@@ -7141,6 +7188,20 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
                 poll_shell_prompt(name, 3000).await;
             }
         }
+        // `tmux set-environment` changes what future pane processes inherit;
+        // this shell already exists. Import the session environment through
+        // tmux's shell-escaped output. The typed command contains no values,
+        // so provider keys cannot land in terminal history or pane logs.
+        let target = st(name);
+        type_line(
+            name,
+            &format!(
+                "eval \"$(tmux show-environment -s -t {})\"",
+                sh_quote(&target)
+            ),
+        )
+        .await;
+        poll_shell_prompt(name, 3000).await;
     } else {
         // Fresh tmux session hosting the user's login shell (py:24647).
         let cols = tmux_cols();
