@@ -678,6 +678,19 @@ pub fn build(
     if let Some(why) = &own.partial {
         msg.push_str(&format!("\n\nATTRIBUTION IS PARTIAL — {why}"));
     }
+    // AF-438, and it belongs HERE for the reason the block above states: it is
+    // a fact about the whole path list, so an arm-scoped copy would reach one
+    // reader in four. `git status --porcelain` emits root-relative paths, and
+    // git PATHSPECS are cwd-relative, so a reader in a subdirectory who follows
+    // any remedy verbatim runs it against the wrong path — silently, with every
+    // command exiting 0. mvs-pitr hit this: the notice named
+    // `.../mixpeek/server/mvs/ME` for a file at `.../mixpeek/ME`.
+    msg.push_str(&format!(
+        "\n\nPATHS ABOVE ARE REPO-ROOT-RELATIVE, and git pathspecs are CWD-relative — so \
+         run every remedy from {dir}, or prefix it: `git -C {dir} <remedy>`. From a \
+         subdirectory the same command resolves <path> against your cwd and silently \
+         targets a different file, or none, exiting 0 either way."
+    ));
     // AF-135 defect 1: the message timestamped origin's tip but never said
     // when it OBSERVED the tree, so a snapshot composed before a commit and
     // delivered at the next turn boundary read as live and named files
@@ -1214,6 +1227,31 @@ const MAX_UNTRACKED_DIR_EXPANSION: usize = 200;
 /// dirty; expanding only the directories actually reported pays for what is
 /// used. `--exclude-standard` keeps the expansion to exactly what `git status`
 /// would itself have shown, so an ignored tree cannot enter through this door.
+/// The repo root for `dir`, or `dir` when it is not in a repo.
+///
+/// AF-438, reported by mvs-pitr. `git status --porcelain` emits paths relative
+/// to the REPO ROOT regardless of the cwd it is run from, and every nudge
+/// labelled that list "under {dir}" using the lane's own `CC_DIR`. For a lane
+/// whose cwd is a subdirectory the two disagree, and the reader concatenates
+/// them into a path that does not exist: their notice named
+/// `.../mixpeek/server/mvs/ME` for a file sitting at `.../mixpeek/ME`.
+///
+/// That is worse than cosmetic, because git PATHSPECS are cwd-relative. An
+/// operator following the remedies from the directory the notice named runs
+/// `git checkout origin/main -- ME` against `server/mvs/ME`, which either does
+/// nothing or hits a different file, while every command appears to succeed.
+async fn repo_root_of(dir: &str) -> String {
+    tokio::process::Command::new("git")
+        .args(["-C", dir, "rev-parse", "--show-toplevel"])
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| dir.to_string())
+}
+
 async fn dirty_paths(dir: &str) -> Vec<String> {
     let out = tokio::process::Command::new("git")
         .args(["-C", dir, "status", "--porcelain", "--untracked-files=normal"])
@@ -1987,7 +2025,12 @@ pub async fn nudge_tick(state: &AppState, lanes: &[(String, String)], now: f64) 
         // in both states, "compared against a STALE origin/main" reads as a
         // difference. Printed only when degraded, it reads as ordinary prose and
         // gets skimmed exactly like the phantom paths it is warning about.
-        let Some(msg) = build(dir, &dirty, &own, &fresh, &provenance) else { continue };
+        // The ROOT for the label, not `dir` (AF-438). `dir` still keys the guard
+        // and every git call above, because `guard_verdicts` is keyed per-`dir`
+        // and re-keying it would orphan every checkout's history and the
+        // invariant that reads it. Only the human-facing path label moves.
+        let label = repo_root_of(dir).await;
+        let Some(msg) = build(&label, &dirty, &own, &fresh, &provenance) else { continue };
 
         // Cap AFTER deciding there is something to say, so a suppressed-by-cap
         // day does not also consume the "nothing to say" path.
@@ -3473,6 +3516,134 @@ mod tests {
                 "{arm}: the archive check is a property of the file, not of the arm: {m}"
             );
         }
+    }
+
+    /// AF-438, reported by mvs-pitr: the notice named a directory the paths are
+    /// not relative to.
+    ///
+    /// `git status --porcelain` emits ROOT-relative paths whatever cwd it runs
+    /// from, and the label was the lane's own `CC_DIR`. For a lane working in a
+    /// subdirectory the two disagree and the reader concatenates them into a
+    /// path that does not exist — theirs read `.../mixpeek/server/mvs/ME` for a
+    /// file at `.../mixpeek/ME`.
+    ///
+    /// Worse than cosmetic, because git pathspecs ARE cwd-relative: an operator
+    /// following the remedies from the named directory runs
+    /// `git checkout origin/main -- ME` against `server/mvs/ME`, hitting a
+    /// different file or none, with every command exiting 0.
+    #[test]
+    fn the_notice_says_what_its_paths_are_relative_to() {
+        let dirty = vec!["ME".to_string(), "server/mvs/shard.rs".to_string()];
+        for (label, own) in [
+            ("commit-worthy", Ownership::default()),
+            (
+                "unknown-ownership",
+                Ownership { unclaimed: dirty.clone(), ..Ownership::default() },
+            ),
+        ] {
+            let m = build("/repo/root", &dirty, &own, &Freshness::default(), "P")
+                .unwrap_or_else(|| panic!("{label} arm produced nothing"));
+            assert!(
+                m.contains("REPO-ROOT-RELATIVE"),
+                "{label}: a reader cannot resolve these paths without knowing that: {m}"
+            );
+            assert!(
+                m.contains("git -C /repo/root"),
+                "{label}: the runnable form must name the root, or the remedy is \
+                 cwd-relative and silently wrong: {m}"
+            );
+        }
+    }
+
+    /// THE WIRING, which is the half the other two cells cannot reach.
+    ///
+    /// `the_notice_says_what_its_paths_are_relative_to` calls `build` with a
+    /// root it hands over itself, and `repo_root_of_resolves_a_subdirectory_to_
+    /// the_root` exercises the resolver alone. Both passed while `nudge_tick`
+    /// still passed the lane's `dir` — mutating the call site back to the
+    /// reported bug survived all 46 tests. A test per component and none over
+    /// the seam is the same shape as AF-429's producer and consumer.
+    ///
+    /// Reads the SOURCE, bounded to `nudge_tick`'s body, because the alternative
+    /// is standing up a lane, a repo and the guard API to observe one argument.
+    /// The bound matters: an unbounded `include_str!` search would be satisfied
+    /// by the `repo_root_of` definition itself, several hundred lines away, and
+    /// could not fail.
+    #[test]
+    fn the_sweep_labels_the_notice_with_the_repo_root_not_the_lane_directory() {
+        const SRC: &str = include_str!("commit_nudge.rs");
+        let start = SRC.find("pub async fn nudge_tick(").expect("nudge_tick is gone");
+        // To the next column-0 item, so the window is this function and no more.
+        let rest = &SRC[start..];
+        let end = rest[1..]
+            .find("\n}\n")
+            .map(|i| i + 3)
+            .expect("nudge_tick has no closing brace");
+        let body = &rest[..end];
+
+        assert!(
+            body.contains("repo_root_of(dir)"),
+            "nudge_tick must RESOLVE the root; it is the only place that knows the lane dir"
+        );
+        assert!(
+            body.contains("build(&label,"),
+            "nudge_tick must pass the resolved label to build, not the lane dir (AF-438)"
+        );
+        assert!(
+            !body.contains("build(dir,"),
+            "nudge_tick passes the lane directory to build — that is the reported bug"
+        );
+        // The control: the window really is nudge_tick and not the whole file,
+        // or every assertion above is satisfied by unrelated code elsewhere.
+        assert!(
+            body.len() < SRC.len() / 4,
+            "the window is {} of {} bytes — too wide to be one function",
+            body.len(),
+            SRC.len()
+        );
+        assert!(
+            !body.contains("async fn repo_root_of"),
+            "the window has swallowed the resolver's definition, so it cannot fail"
+        );
+    }
+
+    /// The CONTROL for the resolver, and the half that would otherwise be a
+    /// claim: `repo_root_of` must return the ROOT for a subdirectory, not the
+    /// subdirectory. Without this the fix above is a nicer sentence attached to
+    /// the same wrong path.
+    #[tokio::test]
+    async fn repo_root_of_resolves_a_subdirectory_to_the_root() {
+        let t = std::env::temp_dir().join(format!("af438-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(t.join("server/mvs")).unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", t.to_str().unwrap()])
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        run(&["init", "-q"]);
+        let sub = t.join("server/mvs");
+        let root = super::repo_root_of(sub.to_str().unwrap()).await;
+        // macOS temp dirs are symlinked (/var -> /private/var), so compare the
+        // resolved forms rather than the strings git and std happen to print.
+        assert_eq!(
+            std::fs::canonicalize(&root).unwrap(),
+            std::fs::canonicalize(&t).unwrap(),
+            "a subdirectory must resolve to the repo root, not to itself"
+        );
+        // And the fallback: a path in no repo at all returns itself rather than
+        // an empty string, or the label would silently become "".
+        let outside = std::env::temp_dir().join(format!("af438-norepo-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        assert_eq!(
+            super::repo_root_of(outside.to_str().unwrap()).await,
+            outside.to_str().unwrap(),
+            "outside a repo the label must fall back to the directory given"
+        );
+        let _ = std::fs::remove_dir_all(&t);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// THE DIFFERENTIAL FORM, WHICH NEEDS NO REGISTRY (AMUX-3718;
