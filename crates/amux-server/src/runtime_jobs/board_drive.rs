@@ -87,6 +87,7 @@ use amux_core::revision::{EntityType, MutationKind};
 /// fired immediately; with no edge, 300s would mean a lane finishing a turn
 /// waits up to five minutes for its next card. Volume is bounded by the
 /// cooldowns above, not by the tick, so the tick can be honest about latency.
+const JOB: &str = "board-drive";
 pub const BOARD_DRIVE_TICK_SECS: u64 = 60;
 
 /// Local alias for the steering guard these deliveries carry. The string
@@ -5686,11 +5687,16 @@ pub async fn claim_card_from(
 
 /// Background driver.
 pub fn spawn(state: AppState) -> super::PeriodicTask {
-    let secs = std::env::var("AMUX_BOARD_DRIVE_SECS")
+    // ONE SPELLING OF THE KNOB (AF-437). `spawn_periodic` derives this job's
+    // fleet-isolation gate from its NAME via `per_job_disable_var`, and this
+    // read used to hand-type the result. Same variable, two independent
+    // spellings, and a change to the convention would have moved the gate
+    // without moving the interval read.
+    let secs = std::env::var(super::per_job_disable_var(JOB))
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(BOARD_DRIVE_TICK_SECS);
-    super::spawn_periodic("board-drive", secs, move || {
+    super::spawn_periodic(JOB, secs, move || {
         let state = state.clone();
         async move {
             let fleet = LiveFleet { state: state.clone() };
@@ -5761,7 +5767,7 @@ pub async fn debug_board_drive(
                  was passed over. A skip that leaves no trace is indistinguishable from a loop \
                  that is not running.",
         "loop_running": report.is_some(),
-        "tick_secs": std::env::var("AMUX_BOARD_DRIVE_SECS").ok()
+        "tick_secs": std::env::var(super::per_job_disable_var(JOB)).ok()
             .and_then(|v| v.parse::<u64>().ok()).unwrap_or(BOARD_DRIVE_TICK_SECS),
         "wip_cap": wip_cap(),
         "advance_card_budget": advance_card_budget(),

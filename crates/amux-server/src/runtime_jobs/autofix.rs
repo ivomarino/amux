@@ -69,6 +69,8 @@
 //! `GET /api/debug/autofix`. A detector that silently declines is exactly the
 //! failure this whole subsystem exists to end: an absence nobody can see.
 
+const JOB: &str = "autofix";
+
 use crate::api::request_log as rl;
 use crate::api::AppState;
 use crate::db::board_store as bs;
@@ -7312,7 +7314,7 @@ async fn note_quiet_signatures(
 /// Note the difference from the Settings toggle: 0 stops the JOB, the toggle
 /// stops the WRITE and keeps the evidence.
 pub fn spawn(state: AppState) -> Option<super::PeriodicTask> {
-    let secs = std::env::var("AMUX_AUTOFIX_SECS")
+    let secs = std::env::var(super::per_job_disable_var(JOB))
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(AUTOFIX_TICK_SECS);
@@ -7321,7 +7323,7 @@ pub fn spawn(state: AppState) -> Option<super::PeriodicTask> {
         return None;
     }
     let home = crate::runtime_jobs::autofix::amux_home();
-    Some(super::spawn_periodic("autofix", secs, move || {
+    Some(super::spawn_periodic(JOB, secs, move || {
         let state = state.clone();
         let home = home.clone();
         async move {
@@ -7363,7 +7365,7 @@ async fn debug_autofix(
     use axum::response::IntoResponse;
     let r = last_report();
     let on = state.store.read().map(|c| enabled(&c)).unwrap_or(true);
-    let secs = std::env::var("AMUX_AUTOFIX_SECS")
+    let secs = std::env::var(super::per_job_disable_var(JOB))
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(AUTOFIX_TICK_SECS);
