@@ -2571,3 +2571,106 @@ CO-SIGNED: mixpeek-oss, who hit specimen (1) from the blocked side and
   independently verified it the same way ("read-only git diff/grep during
   message composition, flagged as an edit ... a signal with no way to
   distinguish read from write").
+
+## The fallback prints "no audit" one line after writing the audit row
+
+AREA: cli
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-03
+SESSION: amux-frustrations
+CARD: AF-454
+SYMPTOM: `amux send` falls back to raw tmux when the server is unreachable. The
+ fallback calls `_record_unstamped_send`, which writes the send to a local ledger
+ that reconciles into /api/history on the next successful send (AMUX-2670). The
+ VERY NEXT LINE printed "DELIVERY UNVERIFIED, no origin stamp, no audit". The stamp
+ half is true. The audit half contradicts the statement one line above it.
+COST: gtm-engine hit a real flap on 2026-09-03, read "no audit" literally, spent a
+ measurement pass on it (three probes of /api/sessions: DOWN, DOWN, UP), and routed
+ a provenance gap here as "during a flap every lane's messages become
+ unattributable". The mechanism had worked perfectly on that exact send: it was
+ sitting in the trail as MSG-40621, type `raw-tmux-fallback`, origin
+ "unstamped-fallback from gtm-engine". A peer lane re-derived a closed gap because
+ the tool said the opposite of what the tool did. Second cost in the same message:
+ the only verification offered was `curl "$AMUX_URL/api/sessions/<name>/peek"`, a
+ request to the server whose unreachability is the ONLY reason that branch runs
+ (ethos rule 3), and it named the FLEET name, so gtm-engine ran `tmux has-session
+ -t gtm-ticker` against a session actually called `amux-gtm-ticker`, found nothing,
+ and briefly read a DELIVERED message as lost. That is the 2026-07-27 shape
+ CLAUDE.md already warns about by name.
+FIX: bd5dc6c8. The message now says recorded-and-reconciles, and offers `tmux
+ capture-pane -p -S -200 -t "=$tname:"` first with the curl demoted below it and
+ labelled with the precondition it needs. The trailing colon is load-bearing:
+ `-t "=$tname"` answers "can't find pane", which was in the line until it was
+ tested. `-S -200` because a bare capture-pane returns the viewport, the exact trap
+ CLAUDE.md documents for peek. Five assertions in
+ scripts/test-unstamped-ledger.sh, all mutation-verified.
+
+## A test that extracts a function to avoid copying it inherits that function's dependencies
+
+AREA: tests
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-03
+SESSION: amux-frustrations
+CARD: AF-454
+SYMPTOM: scripts/test-unstamped-ledger.sh deliberately EXTRACTS the shipped ledger
+ functions instead of copying them, and says why in its own header: "A copy here
+ would pass forever while the real ones rot — the failure this file exists to
+ prevent, one level up." It extracted three functions by name and none of their
+ callees. AMUX-40 (978645c0) later swapped the bare `curl` inside
+ `_flush_unstamped_ledger` for the hang-guarded `_curl` helper. `_curl` was then an
+ undefined command in the test's shell, its rc-127 landed in the flush's own
+ "server went away mid-flush: KEEP the row" branch, and three assertions went red.
+COST: the failures read "the row never reached /api/history — every fallback send
+ would be lost" and "rows remain after flush — they would be re-sent forever",
+ against a live server, a POST verified working by hand, and a reconciled row
+ already in the trail. Every one of those sentences accuses the audit mechanism;
+ the defect was in the harness reading it. Anyone taking the output at face value
+ would have gone to debug AMUX-2670. Guarded against REIMPLEMENTATION drift and
+ bitten by DEPENDENCY drift, which the same argument covers and the implementation
+ did not.
+FIX: bd5dc6c8. Extraction walks the call graph (it now pulls `_curl` and
+ `_transport_breadcrumb`), and a helper that IS defined in ./amux but missing from
+ the harness is a named failure printed ABOVE the assertions it would otherwise
+ corrupt. Mutation M4 breaks the closure and confirms it names `_curl`.
+ Generalisable: a test that extracts a function to avoid copying it inherits that
+ function's dependencies, and nothing in "extract, do not copy" says so.
+
+## A process killed before it can log leaves the fleet no diagnostic surface for the failure that removes the diagnostic surface
+
+AREA: instruments
+SEVERITY: wrong-conclusion
+STATUS: open
+DATE: 2026-09-03
+SESSION: amux-frustrations
+CARD: AF-458
+SYMPTOM: the server is in a launchd crash loop and NOTHING in its own logs says so.
+ macOS SIGKILLs it at exec for `Code Signature Invalid` / `Launch Constraint
+ Violation`, so it dies before any of our code can write a shutdown line. Both
+ StandardOutPath and StandardErrorPath point at ~/.amux/logs/server-rs.log, and the
+ last line before each death is an ordinary WARN. The only honest record is
+ ~/Library/Logs/DiagnosticReports/*.ips plus `launchctl print`, where `runs` went
+ 10 -> 18 -> 23 in about two minutes and `properties` reads "needs LWCR update".
+COST: this is the flap the whole fleet is hitting, and it presents as five unrelated
+ problems. It forced gtm-engine's send onto the unstamped fallback (see the two
+ entries above), made `amux board retitle` exit 7 with no message, broke a `git
+ commit` with "unable to write new_index file", and made two /api/board reads
+ return empty. Each looks like its own bug. Worse, the log carries an ERROR-level
+ line 24 seconds before a death — "migration VERSION COLLISION at 35" — which is
+ loud, adjacent, and irrelevant: migrate.rs:636 documents it as deliberately
+ non-fatal ("this reports rather than refuses ... a gate with no truthful path,
+ ethos rule 3") and it appears identically on runs that stayed healthy. A wrong
+ cause was one step away and I nearly filed it. Fifth AF-445-shaped near-miss in
+ this session.
+FIX: not actioned — the remedy touches a launchd agent and ~/Dev/CLAUDE.md requires
+ explicit owner approval ("This machine runs 24/7. Do NOT restart launchd agents").
+ One-shot is `launchctl bootout gui/501/com.amux.server-rs` then `bootstrap`, since
+ the binary itself verifies clean on disk and it is launchd's cached Lightweight
+ Code Requirement that is stale. The durable fix is the builder re-bootstrapping the
+ agent after it swaps the binary; until then every deploy on this box reopens the
+ window. The INSTRUMENT half is the part that belongs here: a process killed before
+ it can log needs its death reported somewhere a lane already looks. /health going
+ unreachable and `/api/debug/*` being unreachable at the same moment means the fleet
+ has no diagnostic surface for exactly the failure that removes the diagnostic
+ surface.
