@@ -2877,6 +2877,7 @@ function _agentsChip(s) {
 // would cost 127 lanes' queries to answer a question about one.
 let _workFrontier = {};
 let _workFrontierBusy = {};
+let _workFrontierReported = {};
 function _workFrontierFor(name) {
   const c = _workFrontier[name];
   if (c && Date.now() - c.ts < 20000) return c;
@@ -2887,6 +2888,7 @@ function _workFrontierFor(name) {
       .then(d => {
         _workFrontier[name] = {
           ready: (d.ready || []).length,
+          readyCards: d.ready || [],
           claimable: d.claimable_now,
           holding: (d.wip || {}).holding || [],
           // `measured` decides whether this may render at all: an unmeasured
@@ -2901,18 +2903,52 @@ function _workFrontierFor(name) {
   }
   return c || null;
 }
-// The badge, or '' when the lane is not stalled. Same conjunction as the
-// server-side invariant `board.lane_idle_with_ready_work`: idle AND ready AND
-// nothing claimable. A busy lane holding its one card is working correctly and
-// must not be labelled.
+// One diagnostic per distinct frontier shape. Both verdicts are useful in a
+// sweep: `queued-behind-wip` explains a healthy wait; `stalled` says there is
+// ready work but no current work explaining why it cannot be claimed.
+function _reportWorkFrontier(s, w, verdict) {
+  const readyIds = (w.readyCards || []).map(c => c.id).filter(Boolean);
+  const key = [s.name, verdict, readyIds.join(','), w.claimable, w.holding.join(',')].join('|');
+  if (_workFrontierReported[key]) return;
+  _workFrontierReported[key] = true;
+  try {
+    fetch(API + '/api/client-debug', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
+      body: JSON.stringify({ kind: 'idle-ready-work', verdict, session: s.name,
+        ready: w.ready, ready_cards: readyIds, claimable: w.claimable,
+        holding: w.holding, ver: APP_VER }),
+    }).catch(() => {});
+  } catch (e) {}
+}
+
+// The badge, or '' when this lane is not idle with ready-but-unclaimable work.
+// Holding work is a queue explanation, not a stall: TubeScience's detached
+// import legitimately held TUBES-2418 while TUBES-2419 waited behind WIP-1.
+// With no holding work, preserve the alarming verdict because nothing in the
+// board explains why an idle lane cannot claim its ready card.
 function _stalledChip(s) {
   if (!s.running || s.status !== 'idle') return '';
   const w = _workFrontierFor(s.name);
   if (!w || !w.measured || !(w.ready > 0) || w.claimable !== 0) return '';
-  const held = w.holding.length ? w.holding.join(', ') : 'nothing';
+  if (w.holding.length) {
+    const first = w.holding[0];
+    const readyCard = ((w.readyCards || [])[0] || {}).id || (w.ready + ' ready');
+    const readyMore = w.ready > 1 ? ' +' + (w.ready - 1) : '';
+    const more = w.holding.length > 1 ? ' +' + (w.holding.length - 1) : '';
+    _reportWorkFrontier(s, w, 'queued-behind-wip');
+    return '<button type="button" class="status-badge waiting work-queued-chip" '
+      + 'onclick="event.stopPropagation();_openIssue(\'' + escJs(first) + '\')" '
+      + 'title="' + esc(readyCard) + readyMore + ' queued behind current work: '
+      + esc(w.holding.join(', ')) + '. Open ' + esc(first) + '." '
+      + 'aria-label="' + esc(readyCard) + readyMore + ' queued behind current work ' + esc(first) + '">'
+      + '<span class="work-queued-wide">' + esc(readyCard) + readyMore + ' queued behind ' + esc(first) + more + '</span>'
+      + '<span class="work-queued-short">' + esc(readyCard) + readyMore + ' behind ' + esc(first) + more + '</span>'
+      + '</button>';
+  }
+  _reportWorkFrontier(s, w, 'stalled');
   return '<span class="status-badge rate-limited" style="margin-left:6px;" title="'
-    + w.ready + ' card(s) ready, 0 claimable. The WIP cap is held by ' + esc(held)
-    + '. This lane is not out of work, it cannot claim the work it has.">stalled &middot; '
+    + w.ready + ' card(s) ready, 0 claimable, and no current work explains the block.'
+    + '">stalled &middot; '
     + w.ready + ' ready</span>';
 }
 
@@ -8752,7 +8788,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.800';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.801';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").

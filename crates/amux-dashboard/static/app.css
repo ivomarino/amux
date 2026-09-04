@@ -2449,6 +2449,17 @@
   .status-badge.idle { background: rgba(139,148,158,0.15); color: var(--dim); }
   .status-badge.steering { background: rgba(137,87,229,0.2); color: var(--purple,#8957e5); }
   .status-badge.rate-limited { background: rgba(248,81,73,0.18); color: #f85149; }
+  .status-badge.work-queued-chip {
+    border: 0; margin-left: 6px; cursor: pointer; font-family: inherit;
+    white-space: nowrap; max-width: min(260px, 42vw); overflow: hidden;
+    text-overflow: ellipsis; -webkit-tap-highlight-color: transparent;
+  }
+  .work-queued-short { display: none; }
+  @media (max-width: 600px) {
+    .work-queued-wide { display: none; }
+    .work-queued-short { display: inline; }
+    .status-badge.work-queued-chip { max-width: 170px; }
+  }
   .last-active { font-size: 0.7rem; color: var(--dim); flex-shrink: 0; }
   .token-count { font-size: 0.65rem; color: var(--dim); flex-shrink: 0; font-family: "SF Mono","Fira Code",monospace; opacity: 0.7; }
 
