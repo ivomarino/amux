@@ -8898,7 +8898,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.802';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.803';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -32344,7 +32344,7 @@ function _costBars(rows, labelKey, opts) {
 function _costRender(d, opts) {
   opts = opts || {};
   const cards = `<div class="cost-cards">
-    <div class="cost-card"><div class="cost-card-v">${_fmtUsd(d.total_cost)}</div><div class="cost-card-l">est. cost${opts.perSession?'':' \u00B7 on Max'}</div></div>
+    <div class="cost-card" title="What these tokens would cost at LIST PRICE with no plan. On a Claude plan this is not money you spend, it is the value of the usage. Doron read &quot;est. cost&quot; as a bill and changed what plan he was going to buy on the strength of it (AF-494)."><div class="cost-card-v">${_fmtUsd(d.total_cost)}</div><div class="cost-card-l">est. list price${opts.perSession?'':' \u00B7 on Max'}</div></div>
     <div class="cost-card"><div class="cost-card-v">${_fmtTok(d.total_tokens)}</div><div class="cost-card-l">tokens</div></div>
     <div class="cost-card"><div class="cost-card-v">${(d.total_turns||0).toLocaleString()}</div><div class="cost-card-l">turns</div></div>
     <div class="cost-card"><div class="cost-card-v">${d.cache_hit_pct||0}%</div><div class="cost-card-l">cache hit</div></div>
