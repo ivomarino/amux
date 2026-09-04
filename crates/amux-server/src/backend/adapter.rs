@@ -1907,6 +1907,21 @@ CLAUDE-POSTFIX-COMPLETE
 › Ask Codex to do anything
   gpt-5.6-sol xhigh · ~/Dev/amux";
 
+    // `amux-testing-e2e`, live 2026-09-04 after an interrupted ATE-45 turn.
+    // The interruption is a provider-owned terminal row and the prompt below
+    // it is ready input, not a quoted copy of either marker.
+    const FX_CODEX_INTERRUPTED_AT_PROMPT: &str = "\
+• Confirmed: b228d3dc is on origin/main, and live /health reports descendant commit b228d3dc1f03173fbccd07d7a36e0fbcdf10c5ef.
+
+• Ran amux board discard ATE-52 --outcome-stdin
+  └ ATE-52 → discarded
+
+■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol xhigh · ~/Dev/amux · Main [default]";
+
     #[test]
     fn codex_working_pane_is_generating() {
         assert!(
@@ -1934,6 +1949,13 @@ CLAUDE-POSTFIX-COMPLETE
             vec!["idle_prompt"]
         );
         assert!(!adapter("ollama").generating(FX_CODEX_COMPLETED));
+    }
+
+    #[test]
+    fn codex_interrupted_turn_above_the_prompt_shell_is_idle() {
+        assert!(!adapter("codex").generating(FX_CODEX_INTERRUPTED_AT_PROMPT));
+        // Ollama uses the same Codex TUI and must preserve the same edge.
+        assert!(!adapter("ollama").generating(FX_CODEX_INTERRUPTED_AT_PROMPT));
     }
 
     #[test]

@@ -2506,14 +2506,16 @@ pub(crate) fn codex_rollout_path(name: &str) -> Option<PathBuf> {
 ///
 /// Codex does not expose Claude-style start/stop hooks, but its rollout is an
 /// append-only event stream with the same semantics: `task_started` opens a
-/// turn and `task_complete` closes it. This is stronger evidence than tmux's
-/// `window_activity`, which does not advance for Codex's alternate-screen TUI
-/// on some tmux builds (the live `amux-testing-e2e` specimen stayed `idle` for
-/// an entire multi-minute turn while the pane visibly said `Working`).
+/// turn, while `task_complete` and `turn_aborted` close it. This is stronger
+/// evidence than tmux's `window_activity`, which does not advance for Codex's
+/// alternate-screen TUI on some tmux builds (the live `amux-testing-e2e`
+/// specimen stayed `idle` for an entire multi-minute turn while the pane
+/// visibly said `Working`).
 #[derive(Clone, Debug)]
 pub(crate) struct CodexTurnSignal {
     pub state: String,
     pub ts: f64,
+    pub boundary: String,
 }
 
 fn codex_turn_signal_from_events(lines: &[Value]) -> Option<CodexTurnSignal> {
@@ -2521,16 +2523,24 @@ fn codex_turn_signal_from_events(lines: &[Value]) -> Option<CodexTurnSignal> {
     for event in lines {
         let top = event.get("type").and_then(Value::as_str).unwrap_or("");
         let nested = event.pointer("/payload/type").and_then(Value::as_str).unwrap_or("");
-        let state = match (top, nested) {
-            ("turn.started", _) | ("event_msg", "task_started") => "active",
-            ("turn.completed", _) | ("event_msg", "task_complete") => "idle",
+        let (state, boundary) = match (top, nested) {
+            ("turn.started", _) => ("active", "turn.started"),
+            ("event_msg", "task_started") => ("active", "task_started"),
+            ("turn.completed", _) => ("idle", "turn.completed"),
+            ("event_msg", "task_complete") => ("idle", "task_complete"),
+            ("turn.aborted", _) => ("idle", "turn.aborted"),
+            ("event_msg", "turn_aborted") => ("idle", "turn_aborted"),
             _ => continue,
         };
         let ts = event.get("timestamp")
             .and_then(Value::as_str)
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|t| t.timestamp_millis() as f64 / 1000.0)?;
-        latest = Some(CodexTurnSignal { state: state.into(), ts });
+        latest = Some(CodexTurnSignal {
+            state: state.into(),
+            ts,
+            boundary: boundary.into(),
+        });
     }
     latest
 }
@@ -2547,7 +2557,23 @@ pub(crate) fn codex_rollout_turn_signal(name: &str) -> Option<CodexTurnSignal> {
         return None;
     }
     let path = codex_rollout_path(name)?;
-    codex_turn_signal_from_events(&iter_jsonl_tail(&path, 32_000_000))
+    let signal = codex_turn_signal_from_events(&iter_jsonl_tail(&path, 32_000_000))?;
+    if matches!(signal.boundary.as_str(), "turn_aborted" | "turn.aborted") {
+        let now = chrono::Utc::now().timestamp() as f64;
+        let key = format!("codex-turn-aborted:{name}:{}", signal.ts);
+        if crate::log_dedupe::first_this_bucket(&key, crate::log_dedupe::hour_bucket(now)) {
+            tracing::warn!(
+                target: "status_truth",
+                session = name,
+                rollout = %path.display(),
+                boundary = %signal.boundary,
+                boundary_ts = signal.ts,
+                verdict = "interrupted_turn_is_terminal",
+                "Codex rollout interruption closed the active turn; prompt is safe to report idle"
+            );
+        }
+    }
+    Some(signal)
 }
 
 /// A codex/ollama worker's transcript as the uniform [`TranscriptEvent`] model
@@ -20454,6 +20480,7 @@ CLAUDE-POSTFIX-COMPLETE
         ];
         let active = codex_turn_signal_from_events(&events).unwrap();
         assert_eq!(active.state, "active");
+        assert_eq!(active.boundary, "task_started");
         assert!(active.ts > 1_700_000_000.0);
 
         let mut completed = events;
@@ -20462,13 +20489,31 @@ CLAUDE-POSTFIX-COMPLETE
             "type": "event_msg",
             "payload": {"type": "task_complete"}
         }));
-        assert_eq!(codex_turn_signal_from_events(&completed).unwrap().state, "idle");
+        let completed = codex_turn_signal_from_events(&completed).unwrap();
+        assert_eq!(completed.state, "idle");
+        assert_eq!(completed.boundary, "task_complete");
 
         let exec_json = vec![json!({
             "timestamp": "2026-09-02T21:41:00Z",
             "type": "turn.started"
         })];
         assert_eq!(codex_turn_signal_from_events(&exec_json).unwrap().state, "active");
+
+        let interrupted = vec![
+            json!({
+                "timestamp": "2026-09-04T20:28:29.408Z",
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "01a06e1b"}
+            }),
+            json!({
+                "timestamp": "2026-09-04T20:28:54.769Z",
+                "type": "event_msg",
+                "payload": {"type": "turn_aborted", "turn_id": "01a06e1b"}
+            }),
+        ];
+        let interrupted = codex_turn_signal_from_events(&interrupted).unwrap();
+        assert_eq!(interrupted.state, "idle", "an interrupted turn is terminal, not active");
+        assert_eq!(interrupted.boundary, "turn_aborted");
     }
 
     /// ATE-42 live regression: `amux` and `amux-testing-e2e` shared one cwd.

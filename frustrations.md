@@ -3060,3 +3060,22 @@ FIX: ATE-45 lets a newly captured shell rejected by the shared pickup classifier
  and relies on the durable per-card `decompose:<id>` idem to close the exception.
  The bypass emits `capture_cleanup_bypassed_lane_cooldown`; a focused regression
  proves both the first nudge and duplicate suppression.
+
+## Codex `turn_aborted` left an interrupted turn structurally active
+AREA: status
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: After Codex displayed `Conversation interrupted` and returned to its
+ empty prompt, both Workers surfaces stayed WORKING. Status-explain chose a
+ fresh `codex_rollout` active vote even though the stop report was idle,
+ `subagents_live=0`, and `provider_background_working=false`. The rollout held
+ the exact missing edge: an `event_msg` whose payload type was `turn_aborted`.
+COST: An already terminal turn suppressed safe Board drive and contradicted the
+ provider UI until a later recognized lifecycle event replaced the stale vote.
+FIX: ATE-45 treats both top-level and nested Codex abort events as durable idle
+ boundaries, surfaces the chosen boundary in status-explain, and emits the
+ `interrupted_turn_is_terminal` status-truth verdict. Exact rollout and pane
+ regressions pin the interrupted-turn prompt frame for Codex and Ollama.

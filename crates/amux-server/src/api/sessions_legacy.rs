@@ -1735,6 +1735,7 @@ impl FleetSignals {
                 .as_deref() == Some("waiting");
             ex.insert("codex_rollout".into(), json!({
                 "state": signal.state,
+                "boundary": signal.boundary,
                 "age_s": (self.now - signal.ts).max(0.0),
                 "from_this_life": from_this_life,
                 "applied": from_this_life,
@@ -4390,6 +4391,7 @@ Claude usage limit reached. Your limit will reset at 3pm.
             crate::api::session_verbs::CodexTurnSignal {
                 state: "active".into(),
                 ts: s.now - 120.0,
+                boundary: "task_started".into(),
             },
         );
         let (status, ex) = s.derive_status_explain("codex-lane", true);
@@ -4400,7 +4402,9 @@ Claude usage limit reached. Your limit will reset at 3pm.
         assert_eq!(ex["decided_by"], json!("codex_rollout"));
         assert_eq!(ex["codex_rollout"]["applied"], json!(true));
 
-        s.codex_turns.get_mut("codex-lane").unwrap().state = "idle".into();
+        let signal = s.codex_turns.get_mut("codex-lane").unwrap();
+        signal.state = "idle".into();
+        signal.boundary = "task_complete".into();
         let (status, ex) = s.derive_status_explain("codex-lane", true);
         assert_eq!(status, "idle", "task-complete is the provider's terminal truth: {ex}");
         assert_eq!(ex["decided_by"], json!("codex_rollout"));
@@ -4410,6 +4414,52 @@ Claude usage limit reached. Your limit will reset at 3pm.
         assert_eq!(status, "idle", "pre-restart rollout evidence must be ignored: {ex}");
         assert_eq!(ex["codex_rollout"]["applied"], json!(false));
         assert_ne!(ex["decided_by"], json!("codex_rollout"));
+    }
+
+    #[test]
+    fn a_codex_interrupted_turn_is_a_durable_terminal_edge_at_the_prompt() {
+        // ATE-45 live frame, 2026-09-04 16:28. The pane had returned to the
+        // provider's empty prompt, but the rollout's latest recognized event
+        // was still task_started because the real `turn_aborted` edge was
+        // ignored. That pinned both Workers surfaces WORKING until another turn
+        // eventually completed. The rollout boundary, not an mtime grace, owns
+        // this answer.
+        let lane = "ate45-codex-interrupted";
+        let frame = "\
+• Confirmed: b228d3dc is on origin/main, and live /health reports descendant commit b228d3dc1f03173fbccd07d7a36e0fbcdf10c5ef (build 73beeb35e4a579e2). Awaiting your browser reruns.
+
+• Ran amux board discard ATE-52 --outcome-stdin
+  └ ATE-52 → discarded
+
+■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol xhigh · ~/Dev/amux · Main [default]";
+        let mut s = signals();
+        s.activity.insert(format!("amux-{lane}"), (s.now - 1.0) as i64);
+        s.running.insert(format!("amux-{lane}"));
+        s.started.insert(lane.into(), s.now - 300.0);
+        s.reports = json!({lane: {
+            "state": "idle", "ts": s.now - 1607.0, "source": "stop-hook"
+        }});
+        s.panes.insert(lane.into(), frame.into());
+        s.codex_turns.insert(
+            lane.into(),
+            crate::api::session_verbs::CodexTurnSignal {
+                state: "idle".into(),
+                ts: s.now - 1.0,
+                boundary: "turn_aborted".into(),
+            },
+        );
+
+        let (status, ex) = s.derive_status_explain(lane, true);
+        assert_eq!(status, "idle", "turn_aborted must close the live rollout: {ex}");
+        assert_eq!(ex["decided_by"], json!("codex_rollout"), "{ex}");
+        assert_eq!(ex["codex_rollout"]["boundary"], json!("turn_aborted"), "{ex}");
+        assert_eq!(ex["subagents_live"], serde_json::Value::Null, "{ex}");
+        assert_eq!(ex["provider_background_working"], json!(false), "{ex}");
+        assert_eq!(ex["subagents_working"], json!(false), "{ex}");
     }
 
     // ── AMUX-3896: a FRESH idle claim is falsifiable too ────────────────────
