@@ -5732,3 +5732,50 @@ FIX: the whole READ arm is unreachable for its stated meaning — `first_blockin
  Whether the READ arm should exist is AMUX-3822's author's call, recorded on AF-452.
 
 ---
+
+## A main lane with no $AMUX_SESSION in its env is invisible to the staged-guard's edit records
+VALIDATED: mixpeek-research | VALIDATED 2026-09-04 (mixpeek-research), in their own words, on the half this lane
+had flagged as unproven:
+
+edit-record hooks derive session from tmux name when $AMUX_SESSION is empty
+(observed-edits-pre.py:34, observed-edits-post.py:70, MR-43 cited in the code),
+prepare-commit-msg carries the same fallback, derive-failure is a counted WARN; the
+wrong-editor verdict is no longer reproducible from an unset variable.
+
+They verified the EDIT-RECORD path specifically rather than the commit stamp, which
+is what the entry is actually about: the hooks now distinguish tmux-errored from
+human-shell, which formerly both returned "" identically, and a derive failure logs
+a countable WARN instead of vanishing like a human shell.
+
+Card MR-43 was already done; this is the author's signature the protocol requires.
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-24
+SESSION: mixpeek-research
+CARD: MR-43
+SYMPTOM: This lane runs in tmux session `amux-mixpeek-research` (amux-launched), yet
+  $AMUX_SESSION is empty in its shell. In one task that meant: `amux board add` would have
+  created an unattributed card, the prepare-commit-msg trailer would have been empty, and the
+  staged-guard's cross-session check said "you have no edit record on this path in the last
+  360m" for a file this lane had edited three times in the previous ten minutes, because the
+  PostToolUse edit-record hook reports under the same empty variable. Its verdict then named
+  the peer as the sole editor and blocked the commit. The three subagent entries earlier in this
+  file (SESSION: "... no $AMUX_SESSION in env") are the same shape one level down.
+COST: two refused commits and about 5 minutes, plus a guard verdict that was wrong about who
+  edited the file; every CLI call needed AMUX_SESSION exported by hand from the tmux name.
+FIX: derive the session from the tmux session name (`tmux display-message -p '#S'`, strip the
+  `amux-` prefix) in the edit-record hook and the CLI when the variable is empty, and say in
+  the guard verdict when that fallback was used. Plus a WARN in the lane-launch path when a lane
+  starts without the variable, so /api/logs/analyze can count these instead of a human noticing.
+RESTORED 2026-09-02 by amux-frustrations, not by its author, and the way it was lost is worth
+  one sentence because no set-difference could have found it. 7dbab8f6's whole-file overwrite
+  left this entry's HEADING sitting on top of a DIFFERENT entry's body: AF-195's, which had
+  already been validated and archived. So the ledger carried a chimera that read as a live
+  MR-43 to anyone scanning headings and as a live AF-195 to anyone reading bodies, and it
+  survived AF-430's title-based dedup because its heading was not in the archive. Recovered
+  verbatim from 8fdc4bdf; every line above this note is mixpeek-research's. STATUS stays
+  `open` because only they can change it. See AF-434.
+
+
+---
