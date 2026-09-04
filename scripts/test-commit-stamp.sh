@@ -183,5 +183,60 @@ else
   no "model=argv-absent must not move with \$AMUX_SESSION" "aaa='$x' bbb='$y'"
 fi
 
+# A DECLARED TRAILER THAT DISAGREES WITH THE LANE (AF-479).
+#
+# `--if-exists doNothing` means a value already in the message wins over the one
+# the hook knows is true. Correct for a cherry-pick, and it also let a hand-typed
+# `Amux-Session: amux` land on ac550324 from a lane called amux-frustrations,
+# silently. These cells pin all three arms: disagreement is SAID and recorded,
+# agreement is silent, and a message with no declaration is untouched.
+declare_run(){ # declare_run <declared-or-empty> <session> ; sets $D_MSG and $D_ERR
+  if [ -n "$1" ]; then
+    printf 'subject\n\nbody\n\nAmux-Session: %s\n' "$1" > "$TMP/dmsg"
+  else
+    printf 'subject\n\nbody\n' > "$TMP/dmsg"
+  fi
+  AMUX_SESSION="$2" AMUX_HOME="$TMP/home" bash "$HOOK" "$TMP/dmsg" 2>"$TMP/derr" >/dev/null
+  D_MSG="$(grep '^Amux-' "$TMP/dmsg" 2>/dev/null)"
+  D_ERR="$(cat "$TMP/derr" 2>/dev/null)"
+}
+
+declare_run peer-lane my-lane
+case "$D_MSG" in
+  *"Amux-Session: peer-lane"*) ok "a declared session survives (a cherry-picked author is real provenance)" ;;
+  *) no "the declared trailer must be KEPT, never overwritten" "got '$D_MSG'" ;;
+esac
+case "$D_MSG" in
+  *"Amux-Committer: my-lane"*) ok "the committing lane is recorded beside it" ;;
+  *) no "a disagreeing stamp must add Amux-Committer" "got '$D_MSG'" ;;
+esac
+case "$D_ERR" in
+  *"peer-lane"*"my-lane"*) ok "the disagreement is SAID at commit time, naming both lanes" ;;
+  *) no "the mismatch must warn on stderr, naming both values" "got '$D_ERR'" ;;
+esac
+
+# NEGATIVE CONTROL, the one that decides whether the cells above test anything.
+# If Amux-Committer were stamped unconditionally, all three would still pass and
+# the field would carry no signal at all: its PRESENCE is what a reader and the
+# push guard key on.
+declare_run my-lane my-lane
+case "$D_MSG" in
+  *"Amux-Committer"*) no "an AGREEING stamp must not add Amux-Committer" "got '$D_MSG'" ;;
+  *) ok "no Amux-Committer when the declared stamp agrees (presence is the signal)" ;;
+esac
+if [ -z "$D_ERR" ]; then
+  ok "an agreeing stamp is silent"
+else
+  no "an agreeing stamp must not warn" "got '$D_ERR'"
+fi
+
+# NEGATIVE CONTROL 2: the ordinary path, which is every commit on this box.
+declare_run "" my-lane
+case "$D_MSG" in
+  *"Amux-Committer"*) no "an undeclared message must not grow Amux-Committer" "got '$D_MSG'" ;;
+  *"Amux-Session: my-lane"*) ok "an undeclared message is stamped exactly as before" ;;
+  *) no "the ordinary stamp path must be unchanged" "got '$D_MSG'" ;;
+esac
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
