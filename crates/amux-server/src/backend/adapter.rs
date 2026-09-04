@@ -964,12 +964,33 @@ fn scan_gemini(clean: &str, provider: &ProviderId) -> Vec<WorkerEvent> {
 /// single source of truth for the pattern, shared by `scan_codex` (to
 /// short-circuit idle/trust) and [`TerminalAdapter::generating`] (which the
 /// clock-holding caller uses to mint the turn that makes the worker Active).
+fn codex_model_bar(line: &str) -> bool {
+    let Some((identity, location)) = line.rsplit_once('\u{b7}') else {
+        return false;
+    };
+    let location = location.trim();
+    let identity_parts = identity.split_whitespace().count();
+    identity_parts >= 2
+        && (location == "~" || location.starts_with("~/") || location.starts_with('/'))
+}
+
 fn codex_generating(clean: &str) -> bool {
-    nonempty_trimmed(clean).iter().rev().take(12).any(|s| {
+    // Order is the state. While generating, Codex paints the working row below
+    // the submitted prompt. Once complete it redraws an empty prompt and model
+    // bar BELOW that row, but the row can remain in the captured tail. Reading
+    // these as an unordered set pinned completed workers Active (ATE-36).
+    for s in nonempty_trimmed(clean).iter().rev().take(12) {
+        if is_prompt_line(s) || codex_model_bar(s) {
+            return false;
+        }
         let sl = s.to_lowercase();
-        s.starts_with('•')
+        if s.starts_with('•')
             && (sl.contains("esc to interrupt") || sl.contains("working") || sl.contains("running"))
-    })
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn scan_codex(clean: &str, provider: &ProviderId) -> Vec<WorkerEvent> {
@@ -1011,26 +1032,14 @@ fn scan_codex(clean: &str, provider: &ProviderId) -> Vec<WorkerEvent> {
     }
 
     // Idle: › prompt or the model status line "gpt-5.5 xhigh · ~/path".
-    // The model bar format for ALL providers is "<model> <effort> · <path>".
-    // Original check only matched OpenAI model names; ollama workers show
-    // "qwen3.8:27b low · ~" which has the same structure but different prefix.
-    // Detect by presence of an effort word alongside the · separator so any
-    // model name (including future local ones) works. (py 18600-18606)
+    // The model bar format for ALL providers is "<model> <effort> · <path>";
+    // `codex_model_bar` deliberately does not enumerate model or effort names,
+    // so a stronger future model does not fall outside the harness.
     let ne = nonempty_trimmed(clean);
     for s in ne.iter().rev().take(5) {
         let sl = s.to_lowercase();
-        let has_effort = sl.contains(" low ")
-            || sl.contains(" medium ")
-            || sl.contains(" high ")
-            || sl.contains(" xhigh ")
-            || sl.contains(" default ");
-        let model_bar = s.contains('·')
-            && (has_effort
-                || sl.contains("gpt-")
-                || sl.contains("o3")
-                || sl.contains("o4"));
         let prompt = s.starts_with('›') && (sl.contains("implement") || *s == "›");
-        if model_bar || prompt {
+        if codex_model_bar(s) || prompt {
             events.push(WorkerEvent::Waiting(WaitReason {
                 reason: "idle_prompt".to_string(),
                 detail: Some(s.to_string()),
@@ -1703,6 +1712,14 @@ Running 1 shell command · 5s…
 
 • Working (12s • esc to interrupt)";
 
+    // `amux-testing-e2e`, live 2026-09-04 after Codex completed ATE-36.
+    // The final prompt and model bar are NEWER than the working row, but the
+    // old any-of-last-12 scan let that stale row pin the worker active.
+    const FX_CODEX_COMPLETED_AFTER_WORKING: &str = "\
+• Working (6m 26s • esc to interrupt)
+› Ask Codex to do anything
+  gpt-5.6-sol xhigh · ~/Dev/amux";
+
     #[test]
     fn codex_working_pane_is_generating() {
         assert!(
@@ -1711,6 +1728,20 @@ Running 1 shell command · 5s…
         );
         // ollama runs codex --oss, same pane format.
         assert!(adapter("ollama").generating(FX_CODEX_WORKING));
+    }
+
+    #[test]
+    fn a_newer_codex_prompt_ends_an_older_working_row() {
+        assert!(
+            !adapter("codex").generating(FX_CODEX_COMPLETED_AFTER_WORKING),
+            "the bottom-up NEWEST signal is the idle prompt/model bar, not the stale working row"
+        );
+        assert_eq!(
+            waiting_reasons(&adapter("codex").scan(FX_CODEX_COMPLETED_AFTER_WORKING)),
+            vec!["idle_prompt"]
+        );
+        // Ollama uses the same Codex TUI and must inherit the same ordering.
+        assert!(!adapter("ollama").generating(FX_CODEX_COMPLETED_AFTER_WORKING));
     }
 
     #[test]
