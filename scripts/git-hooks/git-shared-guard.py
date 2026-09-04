@@ -1176,7 +1176,29 @@ def main():
     cwd = data.get("cwd") or os.getcwd()
     shared = [os.path.realpath(os.path.expanduser(p)) for p in
               os.environ.get("AMUX_SHARED_CHECKOUTS", "~/Dev/mixpeek").split(":") if p.strip()]
-    mC = re.search(r'-C\s+(\S+)', scrubbed)
+    # `-C` IS TWO DIFFERENT FLAGS AND ONLY ONE OF THEM IS A DIRECTORY.
+    # `git -C <dir> <cmd>` changes directory; `git commit -C <commit>` reuses a
+    # commit message, and `git log -C` / `git diff -C` ask for copy detection.
+    # An unanchored search took the FIRST -C anywhere in the command, so
+    # `git commit --amend -C HEAD` resolved run_dir to <cwd>/HEAD, a path with
+    # no repo in it. `_amend_verdict` then ran `git -C <that> rev-parse HEAD`,
+    # got nothing, and hit its `if not head: return None` fail-open. The amend
+    # guard was therefore OFF for exactly the amend forms that name a commit,
+    # while every other form blocked correctly and made it look present.
+    #
+    # Measured 2026-09-04: two amends with `-C <sha>` rewrote a peer's unpushed
+    # commits on the mixpeek checkout, one of them replacing their message with
+    # a different commit's. Neither was blocked. `git commit --amend --no-edit`
+    # and `--reuse-message=HEAD` both blocked in the same session, which is what
+    # made the gap read as a considered scope rather than a hole.
+    #
+    # Git's grammar puts -C among the GLOBAL options, before the subcommand, so
+    # anchoring to `git` with only `-c <k=v>` allowed in between accepts every
+    # real `git -C` and rejects every subcommand `-C`. A global flag this does
+    # not list (`git --no-pager -C /x ...`) falls back to cwd inference, which
+    # is the safe direction: a false refusal naming the escape hatch, never a
+    # silent pass.
+    mC = re.search(r'\bgit\s+(?:-c\s+\S+\s+)*-C\s+(\S+)', scrubbed)
     # AMUX-3462 (MF-703): this hook reads the command TEXT, before the shell
     # expands it. A -C path spelled with a variable (`git -C $S/wipetest ...`)
     # therefore cannot be resolved here — the old code realpath'd the raw
