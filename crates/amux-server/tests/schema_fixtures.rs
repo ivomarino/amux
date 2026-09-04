@@ -140,7 +140,20 @@ fn the_migrated_test_db_carries_the_newest_columns() {
         .unwrap()
         .filter_map(Result::ok)
         .collect();
-    for newest in ["evidence", "ask_type", "ask_question", "ask_unblocks"] {
+    for newest in [
+        "evidence",
+        "ask_type",
+        "ask_question",
+        "ask_unblocks",
+        "ask_actor",
+        "requested_by",
+        "callback_session",
+        "callback_prompt",
+        "callback_state",
+        "callback_message_id",
+        "callback_fired_at",
+        "callback_error",
+    ] {
         assert!(cols.contains(&newest.to_string()), "{newest} missing from {cols:?}");
     }
     // And the constraints the old fixtures relaxed are really there, since that

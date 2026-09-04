@@ -1143,12 +1143,42 @@ impl FleetSignals {
         // wired here yet: it needs a leak-safe reset that does not zero a live
         // run_in_background agent (which outlives the main turn, AMUX-2904).
         // Tracked as the follow-up on AMUX-3048.
-        let reported_live = self.reported_subagent_count(name).is_some_and(|c| c > 0);
-        reported_live
-            || self
+        //
+        // AMUX-4024: THE COUNT IS NOW AUTHORITATIVE IN BOTH DIRECTIONS, because
+        // it finally exists. The paragraph above deferred the "off" direction
+        // for a good reason and a wrong one. The good reason: zeroing on a
+        // stale signal would kill a live `run_in_background` agent, which
+        // outlives the main turn (AMUX-2904). The wrong one: it assumed the
+        // count was being reported and only the rule was missing. It was not
+        // being reported by anybody — `subagents_live` was null for 125 of 125
+        // lanes on 2026-09-02, because no hook ever POSTed a lifecycle event
+        // (now fixed in `scripts/hooks/hook-report.sh`). So this OR was not a
+        // conservative choice between two signals; it was the mtime window
+        // alone, wearing a second name.
+        //
+        // With real start/stop events the deferral's own condition is met: a
+        // background agent's `stop` fires when IT finishes, not when the main
+        // turn does, so a count that is still positive is exactly the live
+        // background agent the comment was protecting. Preferring the count
+        // where we have one ends AMUX-3047's up-to-four-minute false WORKING —
+        // Ethan, 2026-09-02, mvs-pitr: header WORKING with an AGENTS badge over
+        // an empty composer, decided_by `contradiction_subagents_working`, on
+        // nothing but a warm transcript from agents that had already finished.
+        //
+        // `None` still means the mtime window, unchanged, and that is the whole
+        // blast radius for a lane amux cannot hook: gemini and codex send no
+        // events, have no `subagents` key, and read exactly as they did before.
+        // A LOST `stop` is the residual and it is one-directional (a lane stuck
+        // WORKING, never a lane stuck idle); `subagents_live` is published in
+        // the sessions payload and in every status-history row so the leak is
+        // countable rather than mysterious.
+        match self.reported_subagent_count(name) {
+            Some(c) => c > 0,
+            None => self
                 .subagent_activity
                 .get(name)
-                .is_some_and(|m| self.now - m < window)
+                .is_some_and(|m| self.now - m < window),
+        }
     }
 
     /// The raw event-driven live-subagent count a lane last reported (AMUX-3048),
@@ -1398,6 +1428,22 @@ impl FleetSignals {
                 "contradiction_window_s": self.contradiction_window(),
             }),
         );
+        // THE SUBAGENT COUNT, WHERE THE READERS ALREADY LOOK (AMUX-4024).
+        // `status_history.rs` has recorded `explain.subagents_live` in every row
+        // since it shipped, on the same "carry the EVIDENCE, not only the
+        // verdict" argument as the report and pane blocks beside it — and this
+        // key was never inserted here, so every stored row carried null. The
+        // field is now the deciding evidence for
+        // `contradiction_subagents_reported_live`, and it is the one place a
+        // LEAKED count (a lost SubagentStop pinning a lane WORKING) would be
+        // visible after the fact. `null` is a real answer and a different one
+        // from `0`: it means this lane reports no lifecycle events at all and is
+        // being judged on the mtime window instead.
+        ex.insert(
+            "subagents_live".into(),
+            self.reported_subagent_count(name).map(|c| json!(c)).unwrap_or(serde_json::Value::Null),
+        );
+        ex.insert("subagents_working".into(), json!(self.subagents_working(name)));
         // No transition: prefer the PANE over the activity timestamp when the
         // pane is admissible. A timestamp says something painted; the pane
         // says what. `detect_claude_status` returning "" is the documented
@@ -1578,9 +1624,45 @@ impl FleetSignals {
         // -> the flip still fires), and once a real idle report ages past the
         // window a still-writing subagent flips it active as the bounded late
         // correction the window was always documented to cost.
-        if status == "idle" && idle_gate_open && self.subagents_working(name) {
+        //
+        // AMUX-4024: A REPORTED LIVE COUNT DOES NOT WAIT FOR THAT GATE. Read the
+        // justification above one more time — "a stopped main turn means its
+        // FOREGROUND subagents have necessarily finished". True, and it is the
+        // whole argument, and BACKGROUND agents are the case it does not cover:
+        // they outlive the main turn by construction (AMUX-2904), so the stop
+        // hook fires, the report is fresh, and the gate holds the correction
+        // shut for a full minute while the lane sits there working.
+        //
+        // Ethan, 2026-08-30, tubescience: header IDLE over a pane reading
+        // "Waiting for 1 background agent to finish". Its status-explain history
+        // flapped idle -> active -> idle on a ~30s cycle, every idle row
+        // `decided_by: report`, because each new report restarted the window.
+        //
+        // The gate exists because an MTIME can be stale — it cannot tell
+        // "finished 30s ago" from "thinking, will write in 90s", so a fresh
+        // self-report is the better evidence and should win. An event-driven
+        // count has no such defect: it moves only when a subagent actually
+        // starts or stops, so a positive count is a statement about NOW, and
+        // there is nothing for the window to protect against. Gate the mtime,
+        // trust the count.
+        //
+        // Deliberately NOT the pane-churn leg, which stays gated: content churn
+        // is also what a human typing at the composer produces
+        // (`churn_without_a_spinner_does_not_falsify_a_fresh_idle_claim`), and
+        // flipping a lane to WORKING because someone is typing into it is the
+        // error the other half of this card is about. A subagent count cannot be
+        // typed.
+        let subagents_reported_live = self.reported_subagent_count(name).is_some_and(|c| c > 0);
+        if status == "idle" && (idle_gate_open || subagents_reported_live) && self.subagents_working(name)
+        {
             status = "active".into();
-            decided = "contradiction_subagents_working";
+            // Named apart from the aged path, same reason the pane rules are:
+            // one rests on a timestamp inside a window, the other on an event.
+            decided = if idle_gate_open {
+                "contradiction_subagents_working"
+            } else {
+                "contradiction_subagents_reported_live"
+            };
         }
         // CODEX'S STRUCTURED TURN BOUNDARY IS ITS HOOK (AMUX-4051 E2E).
         // tmux's activity clock stayed 41 minutes old while a Codex worker's
@@ -1957,6 +2039,17 @@ fn load_meta(name: &str) -> serde_json::Value {
         c.1.insert(name.to_string(), val.clone());
     }
     val
+}
+
+fn confirmed_active_model(meta: &serde_json::Value, provider: &str) -> String {
+    let same_provider = meta["active_model_provider"].as_str() == Some(provider);
+    let from_this_life = meta["active_model_confirmed_at"].as_i64().unwrap_or(0)
+        >= meta["last_started"].as_i64().unwrap_or(0);
+    if same_provider && from_this_life {
+        meta["active_model_confirmed"].as_str().unwrap_or("").to_string()
+    } else {
+        String::new()
+    }
 }
 
 /// Pick the worker's task label and its source from the freshness verdicts.
@@ -2558,6 +2651,15 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
         // activity, which updates every snapshot tick and made every lane
         // look equally busy.
         let meta = load_meta(&name);
+        let configured_provider = env
+            .get("CC_PROVIDER")
+            .cloned()
+            .unwrap_or_else(|| "claude".into());
+        // Written only after a restart/hot switch has positively applied. A
+        // provider tag prevents a manual/provider edit from reusing another
+        // runtime's model, and the start boundary rejects facts from a prior
+        // process life.
+        let confirmed_model = confirmed_active_model(&meta, &configured_provider);
         let last_activity = {
             let send = meta["last_send"].as_i64().unwrap_or(0);
             if send != 0 { send } else { meta["last_started"].as_i64().unwrap_or(0) }
@@ -2596,6 +2698,11 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             "composer_stuck_since": meta["composer_stuck_since"].as_i64().unwrap_or(0),
             "composer_preview": meta["composer_preview"].as_str().unwrap_or(""),
             "agents_working": signals.subagents_working(&name),
+            // Published so the toggle can render its CURRENT state instead of
+            // guessing, and so a value supplied by a group or global layer shows
+            // as on rather than as an unset worker key (AMUX-4055).
+            "auto_drain_backlog": crate::runtime_jobs::board_drive::dispatch_backlog_when_idle(&name),
+            "auto_drain_backlog_own": env.contains_key(crate::runtime_jobs::board_drive::DISPATCH_BACKLOG_KEY),
             // AMUX-3048: the raw event-driven count behind agents_working, so a
             // LEAKED count (a lost SubagentStop pinning a lane "working") is
             // diagnosable rather than hidden — null on a hookless/mtime-only lane.
@@ -2627,8 +2734,18 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             // state, exposed so the SPA can show WHY a lane is quiet without
             // re-deriving the layering.
             "auto_continue": crate::api::session_verbs::standing_orders_on(&name, "CC_AUTO_CONTINUE"),
+            "auto_continue_own": env.contains_key("CC_AUTO_CONTINUE"),
             "auto_pickup": crate::api::session_verbs::standing_orders_on(&name, "CC_AUTO_PICKUP"),
+            "auto_pickup_own": env.contains_key("CC_AUTO_PICKUP"),
             "standing_orders": crate::api::session_verbs::standing_orders_on(&name, "CC_STANDING_ORDERS"),
+            "standing_orders_own": env.contains_key("CC_STANDING_ORDERS"),
+            // Standing authorization for worker-originated external email.
+            // This uses the SAME scoped predicate the send/reply gate reads, so
+            // the Configurations control cannot disagree with the next send.
+            "external_email_allowed": crate::api::email_approval::external_email_allowed(
+                &crate::config::amux_home(), &name,
+            ),
+            "external_email_allowed_own": env.contains_key("AMUX_EMAIL_EXTERNAL_ALLOW"),
             "worktree": env.get("CC_WORKTREE").cloned().unwrap_or_default(),
             "worktree_repo": env.get("CC_WORKTREE_REPO").cloned().unwrap_or_default(),
             "mcp": env.get("CC_MCP").cloned().unwrap_or_default(),
@@ -2639,7 +2756,8 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             // correct-TYPED honest empty (Invariant 20: never invent). `status`
             // is no longer in that set — it derives above from stores the Python
             // scanner itself persists.
-            "active_model": "",
+            "active_model": confirmed_model,
+            "model_source": if confirmed_model.is_empty() { "" } else { "confirmed-switch" },
             // api_error IS computed now (Ethan 2026-08-18) — it is exactly the
             // `api_error` status derived above, exposed as a side boolean so a
             // log sweep / autofix can find a 5xx-stuck lane without re-deriving
@@ -2681,6 +2799,8 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             "tokens": {"input": 0, "output": 0, "total": 0},
             "preview_lines": [],
             "task_source": "",
+            "task_override": "",
+            "task_override_updated": 0,
             "task_time": 0,
             "task_updated": 0,
             "task_board_id": "",
@@ -2700,7 +2820,7 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
                 json!(status.clone())
             },
             "running": is_running,
-            "provider": env.get("CC_PROVIDER").cloned().unwrap_or_else(|| "claude".into()),
+            "provider": configured_provider,
             "model": env.get("CC_MODEL").cloned().unwrap_or_default(),
             "dir": env.get("CC_DIR").cloned().unwrap_or_default(),
             "preview": "",
@@ -2727,14 +2847,13 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             // `_own` says whether the WORKER's own file sets it, so the UI can
             // tell "this worker" from "inherited" and can refuse to offer a
             // local switch-off for something it did not set locally.
-            "spans_groups": crate::api::session_verbs::scoped_setting_in(
-                &crate::config::amux_home(), &name, "CC_SEND_ALLOW",
-            ).map(|v| !v.trim().trim_matches('"').is_empty()).unwrap_or(false),
-            "spans_groups_value": crate::api::session_verbs::scoped_setting_in(
-                &crate::config::amux_home(), &name, "CC_SEND_ALLOW",
-            ).map(|v| v.trim().trim_matches('"').to_string()).unwrap_or_default(),
-            "spans_groups_own": env.get("CC_SEND_ALLOW")
-                .map(|v| !v.trim().trim_matches('"').is_empty()).unwrap_or(false),
+            "spans_groups": crate::api::session_verbs::cross_group_allow_setting_in(
+                &crate::config::amux_home(), &name,
+            ).map(|v| !v.trim().trim_matches('"').is_empty()).unwrap_or(true),
+            "spans_groups_value": crate::api::session_verbs::cross_group_allow_setting_in(
+                &crate::config::amux_home(), &name,
+            ).map(|v| v.trim().trim_matches('"').to_string()).unwrap_or_else(|| "*".into()),
+            "spans_groups_own": env.contains_key("CC_SEND_ALLOW"),
             "steering_queue": [],
             "managed_by": "python",
         }));
@@ -2781,6 +2900,8 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
             "preview_lines": [],
             "task_name": "",
             "task_source": "",
+            "task_override": "",
+            "task_override_updated": 0,
             "task_board_id": "",
             "task_updated": 0,
             "task_board_age": 0,
@@ -2867,6 +2988,8 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
             );
             v["task_name"] = json!(tname);
             v["task_source"] = json!(tsrc);
+            v["task_override"] = json!(summary);
+            v["task_override_updated"] = json!(summary_ts);
             v["task_board_id"] =
                 json!(if tsrc == "board" { board.map(|(i, _, _)| i.clone()).unwrap_or_default() } else { String::new() });
             // A summary-sourced task now carries its own stamp (AMUX-2676);
@@ -2890,6 +3013,25 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
                     0
                 }
             );
+        }
+    }
+
+    if let Some(report) = crate::runtime_jobs::board_drive::last_report() {
+        let traces: BTreeMap<&str, &crate::runtime_jobs::board_drive::LaneTrace> =
+            report.lanes.iter().map(|trace| (trace.session.as_str(), trace)).collect();
+        for worker in out.iter_mut() {
+            let Some(name) = worker["name"].as_str() else { continue };
+            if let Some(trace) = traces.get(name) {
+                worker["board_drive"] = json!({
+                    "outcome": trace.outcome,
+                    "reason": trace.reason,
+                    "detail": trace.detail,
+                    "eligible_todos": trace.eligible_todos,
+                    "open_cards": trace.open_cards,
+                    "card": trace.card,
+                    "checked_at": report.finished_at,
+                });
+            }
         }
     }
 
@@ -2966,8 +3108,8 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
     // {state, age_s, source} card shape (py:20429).
     if signals.reports.is_object() {
         for v in out.iter_mut() {
-            if let Some(name) = v["name"].as_str() {
-                if let Some(rep) = signals.reports.get(name) {
+            if let Some(name) = v["name"].as_str().map(str::to_string) {
+                if let Some(rep) = signals.reports.get(&name) {
                     // ts is time.time() — a FLOAT; as_i64() read it as 0 and
                     // age_s came out as the whole epoch (found 2026-08-09).
                     let ts = rep["ts"].as_f64().unwrap_or(0.0);
@@ -2984,13 +3126,19 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
                         "ts": ts as i64,
                         "source": rep["source"].as_str().unwrap_or(""),
                     });
+                    let state = rep["state"].as_str().unwrap_or("");
+                    let started = signals.started.get(&name).copied().unwrap_or(0.0);
+                    let report_current = report_applies(state, ts, started, signals.now);
                     // AMUX-2676: a REPORTED model/token count replaces the
                     // honest-empty above. Still never invented — the empty
                     // stays empty unless the harness itself said otherwise,
                     // which is the whole point of preferring the report
                     // endpoint over a scraper.
-                    if let Some(m) = rep["model"].as_str().filter(|m| !m.is_empty()) {
-                        v["active_model"] = json!(m);
+                    if report_current {
+                        if let Some(m) = rep["model"].as_str().filter(|m| !m.is_empty()) {
+                            v["active_model"] = json!(m);
+                            v["model_source"] = json!("self-report");
+                        }
                     }
                     // Same over-window rejection the compaction path applies
                     // (a5b272e). Without it the two disagree about one fact:
@@ -3004,7 +3152,7 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
                         .as_u64()
                         .map(|t| t <= crate::api::session_verbs::context_window())
                         .unwrap_or(false);
-                    if rep["tokens"].is_object() && plausible {
+                    if report_current && rep["tokens"].is_object() && plausible {
                         v["tokens"] = rep["tokens"].clone();
                     }
                 }
@@ -3231,6 +3379,26 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confirmed_model_must_match_provider_and_current_process_life() {
+        let current = json!({
+            "active_model_confirmed": "gpt-5.6-sol",
+            "active_model_provider": "codex",
+            "active_model_confirmed_at": 200,
+            "last_started": 190,
+        });
+        assert_eq!(confirmed_active_model(&current, "codex"), "gpt-5.6-sol");
+        assert_eq!(confirmed_active_model(&current, "claude"), "");
+
+        let stale = json!({
+            "active_model_confirmed": "claude-sonnet-5",
+            "active_model_provider": "claude",
+            "active_model_confirmed_at": 100,
+            "last_started": 101,
+        });
+        assert_eq!(confirmed_active_model(&stale, "claude"), "");
+    }
 
     /// AMUX-3700: a pane capture that will not return is KILLED, and one that
     /// returns is not.
@@ -4236,6 +4404,72 @@ Claude usage limit reached. Your limit will reset at 3pm.
         assert_eq!(ex["idle_contradiction_gate_open"], json!(false), "the 60s gate is still shut: {ex}");
         assert_eq!(ex["fresh_idle_contradicted"], json!(true), "{ex}");
         assert!(ex["churn_since_claim"].as_u64().unwrap() >= 2, "{ex}");
+    }
+
+    /// AMUX-4024, THE FALSE IDLE. A lane blocked on a BACKGROUND agent, with a
+    /// fresh stop-hook `idle` — which is not a contradiction but the expected
+    /// pair, because yielding to a background agent ends the main turn and
+    /// fires the stop hook while the agent keeps running.
+    ///
+    /// Ethan, 2026-08-30: tubescience read IDLE with its pane on "Waiting for 1
+    /// background agent to finish". The pane is deliberately IDLE_WITH_AGENTS
+    /// here — no spinner, nothing for a string rule to find, which is what such
+    /// a lane actually looks like once the main loop stops generating. The
+    /// reported count is the only evidence, and it must not have to wait out
+    /// the 60s window.
+    #[test]
+    fn a_reported_live_subagent_beats_a_fresh_idle_claim() {
+        let lane = "t4024-bg";
+        let mut s = fresh_idle_lane(lane, 9.0);
+        s.panes.insert(lane.into(), IDLE_WITH_AGENTS.into());
+        s.reports[lane]["subagents"] = json!({"count": 1, "ts": s.now - 3.0});
+        let (status, ex) = s.derive_status_explain(lane, true);
+        assert_eq!(status, "active", "a lane waiting on a background agent is not idle: {ex}");
+        assert_eq!(ex["decided_by"], json!("contradiction_subagents_reported_live"), "{ex}");
+        assert_eq!(ex["idle_contradiction_gate_open"], json!(false), "the 60s gate is still shut: {ex}");
+        assert_eq!(ex["subagents_live"], json!(1), "the count is the evidence: {ex}");
+    }
+
+    /// AMUX-4024, THE FALSE WORKING — the same card's other direction, and the
+    /// reason the count has to be authoritative rather than OR'd.
+    ///
+    /// Ethan, 2026-09-02: mvs-pitr showed WORKING and an AGENTS badge over an
+    /// empty composer. Its agents had finished; their transcripts were merely
+    /// still inside the 240s mtime window, and `decided_by` was
+    /// `contradiction_subagents_working` on nothing else. A lane that REPORTS
+    /// zero live subagents is telling us the window is stale, so the window
+    /// must lose.
+    #[test]
+    fn a_reported_zero_count_beats_a_warm_subagent_mtime() {
+        let mut s = signals();
+        let lane = "t4024-finished";
+        s.activity.insert(format!("amux-{lane}"), (s.now - 1.0) as i64);
+        s.running.insert(format!("amux-{lane}"));
+        s.reports = json!({lane: {"state": "idle", "ts": s.now - 1076.0, "source": "stop-hook"}});
+        // A transcript written 20s ago — well inside the 240s window, and on its
+        // own enough to pin the lane WORKING for four minutes.
+        s.subagent_activity.insert(lane.into(), s.now - 20.0);
+        assert!(s.subagents_working(lane), "control: the warm mtime alone reads as working");
+
+        s.reports[lane]["subagents"] = json!({"count": 0, "ts": s.now - 5.0});
+        assert!(!s.subagents_working(lane), "a reported zero must override the warm mtime");
+        let (status, ex) = s.derive_status_explain(lane, true);
+        assert_eq!(status, "idle", "finished agents must not pin a lane WORKING: {ex}");
+        assert_eq!(ex["subagents_live"], json!(0), "{ex}");
+    }
+
+    /// The blast radius of making the count authoritative, stated as a test: a
+    /// lane that reports NO count at all (gemini, codex, any hookless runtime)
+    /// is pure mtime exactly as before. Without this, "authoritative" could
+    /// quietly mean "lanes we cannot hook always read idle".
+    #[test]
+    fn a_lane_that_reports_no_count_still_uses_the_mtime_window() {
+        let mut s = signals();
+        let lane = "t4024-hookless";
+        s.reports = json!({lane: {"state": "idle", "ts": s.now - 1076.0, "source": "stop-hook"}});
+        s.subagent_activity.insert(lane.into(), s.now - 90.0);
+        assert_eq!(s.reported_subagent_count(lane), None, "fixture: this lane reports no count");
+        assert!(s.subagents_working(lane), "a hookless lane must still read its mtime window");
     }
 
     /// THE RACE THE WINDOW EXISTS FOR, WHICH MUST KEEP WINNING. The live

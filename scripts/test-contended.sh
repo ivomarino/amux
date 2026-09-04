@@ -56,6 +56,12 @@ if [ -z "${_TC_SNAPSHOT:-}" ]; then
   _snap=$(mktemp) || exit 1
   cat "$0" > "$_snap" || { rm -f "$_snap"; exit 1; }
   export _TC_SNAPSHOT="$_snap"
+  # CARRY THE REAL PATH ACROSS THE RE-EXEC (AF-346). After this line `$0` is a
+  # temp file, so anything downstream that locates the repo from the running
+  # script's own path resolves to /var/folders and gets nothing. The target
+  # clause below did exactly that and failed SILENTLY, which is the same
+  # not-printing-is-not-passing shape it exists to announce.
+  export _TC_ORIGIN="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
   exec bash "$_snap" "$@"
 fi
 
@@ -112,6 +118,47 @@ sample & SAMPLER=$!
 dirty_now() { git status --porcelain --untracked-files=no 2>/dev/null | awk '{print $NF}' | sort; }
 DIRTY_BEFORE=$(dirty_now)
 
+# ── WHICH TARGETS DID THIS NOT RUN? (AF-346) ────────────────────────────────
+#
+# `cargo test -p amux-server --lib` reports "1827 passed" and SKIPS every
+# `tests/*.rs` target — 50 files here. That is not a footnote: the a99955f7
+# dashboard regression was caught by a guard that ALREADY EXISTED, was correct,
+# and would have blocked the commit. It did not run, because the author verified
+# with `--lib` and read a four-digit pass count as the suite.
+#
+# The number is the trap. A run that says "1827 passed" and a run that says
+# "1827 passed, and 50 integration targets were not built" are the same command
+# with the same exit status, and only the second one lets you decide whether you
+# care. This is the same rule the contention and worktree clauses below already
+# follow: say what was NOT measured, in the same breath as the result.
+#
+# Counted from disk rather than from a constant, so a new integration file is
+# included the day it lands rather than when someone remembers to bump a number.
+_skipped_targets=""
+case " $* " in
+  *" --lib "*|*" --bins "*|*" --bin "*|*" --doc "*)
+    # FROM GIT, NOT FROM BASH_SOURCE. This script snapshots itself to a temp
+    # file and re-execs (the AF-368 self-edit protection above), so inside the
+    # re-exec BASH_SOURCE is /var/folders/.../tmp.XXXX and `dirname/..` resolves
+    # to nothing. The first version of this block did that and the clause simply
+    # never printed — a missing warning is indistinguishable from nothing to
+    # warn about, which is the exact failure this clause exists to announce,
+    # committed inside the fix for it.
+    # THREE SOURCES, most reliable first, because each fails in a different
+    # place: _TC_ORIGIN survives the re-exec, git works from anywhere inside a
+    # checkout, and cwd is the last resort. The first version used only
+    # BASH_SOURCE (a temp file post-re-exec) and the second only git (empty when
+    # invoked from outside a repo) — both went silent rather than wrong, which
+    # is why a control cell that runs from another cwd is in the suite.
+    _root="${_TC_ORIGIN:+$(dirname "$(dirname "$_TC_ORIGIN")")}"
+    [ -n "$_root" ] || _root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+    _tdir="${_root:-.}/crates/amux-server/tests"
+    if [ -d "$_tdir" ]; then
+      _skipped_targets=$(find "$_tdir" -maxdepth 1 -name '*.rs' | wc -l | tr -d ' ')
+    fi
+    ;;
+esac
+
 cargo test "$@"
 RC=$?
 
@@ -165,6 +212,20 @@ else
   echo "contention: before reading a red as a regression."
 fi
 
+# THE TARGET CLAUSE (AF-346). Printed regardless of colour, for the same reason
+# the worktree clause below is: a caveat about what the RUN covered belongs beside
+# the result, not inside the failure branch.
+if [ -n "$_skipped_targets" ] && [ "$_skipped_targets" != "0" ]; then
+  echo ""
+  echo "targets:   this invocation selected a subset — $_skipped_targets integration target(s)"
+  echo "targets:   under crates/amux-server/tests/ were NOT built or run. Whatever number"
+  echo "targets:   cargo printed above counts the lib only."
+  echo "targets:   AF-346: the a99955f7 dashboard regression was caught by a guard that"
+  echo "targets:   already existed and was correct; it did not run because the author"
+  echo "targets:   verified with --lib and read the pass count as the suite."
+  echo "targets:   Drop the selector, or name the file:  scripts/test-contended.sh -p amux-server --test <name>"
+fi
+
 # THE WORKTREE CLAUSE — printed on BOTH arms, never only the clean one.
 #
 # A caveat that lives inside one branch is a caveat the other branch's reader
@@ -192,5 +253,50 @@ else
   echo "worktree:  clean at start and end, so no peer's uncommitted source was in this"
   echo "worktree:  build. Stated because a silent probe and a clean tree look identical."
 fi
+
+# THE RECEIPT (AF-195). A green result describes the bytes cargo compiled, and
+# the commit ships the bytes in the INDEX. On a shared checkout those come apart
+# between the end of this run and the `git commit` that cites it: a peer stages
+# a change to a file you tested, and your commit carries a version no test ever
+# saw. That is not hypothetical — c971756b shipped RED under a message asserting
+# the opposite of its own diff, and both the passing run and the failing rerun
+# were TRUE when taken.
+#
+# NOT a pre-commit test gate, which is what the entry originally proposed. The
+# pre-commit hook's own comments record why it compiles tests but does not run
+# them: ~40s on every commit across ~50 lanes, and a failing assertion blocks
+# only its author. That trade is measured and it stands. This costs nothing at
+# commit time — the hook compares two blob shas it already has.
+#
+# WHAT IS RECORDED: the blob sha of every tracked file under crates/ as cargo
+# saw it. Clean files come from HEAD in one `ls-tree` call; only the dirty ones
+# are hashed, so this is a handful of hashes rather than several hundred.
+{
+  receipt_dir="${AMUX_HOME:-$HOME/.amux}/test-receipts"
+  mkdir -p "$receipt_dir" 2>/dev/null || true
+  receipt="$receipt_dir/${AMUX_SESSION:-unknown}.tsv"
+  {
+    # Header carries what the body cannot: which run this was and how it ended.
+    # A receipt with no verdict would let a RED run vouch for a commit.
+    echo "# repo	$(git rev-parse --show-toplevel 2>/dev/null)"
+    echo "# head	$(git rev-parse HEAD 2>/dev/null)"
+    echo "# rc	$RC"
+    echo "# at	$(date -u +%s)"
+    echo "# args	$*"
+    # HEAD's blobs for every tracked file under crates/, then override with the
+    # worktree hash of each dirty one. Order matters: the second write wins.
+    git ls-tree -r HEAD --format='%(objectname)	%(path)' -- crates 2>/dev/null
+    # UNTRACKED FILES TOO. cargo compiles a new .rs the moment it exists, and
+    # `git diff` cannot see it, so omitting them made a brand-new module report
+    # "not in the tested set at all" on the very commit that adds it — a false
+    # alarm on the most ordinary case there is.
+    for f in $(git diff --name-only -- crates 2>/dev/null
+               git diff --cached --name-only -- crates 2>/dev/null
+               git ls-files --others --exclude-standard -- crates 2>/dev/null); do
+      [ -f "$f" ] || continue
+      printf '%s\t%s\n' "$(git hash-object "$f" 2>/dev/null)" "$f"
+    done
+  } > "$receipt.tmp" 2>/dev/null && mv "$receipt.tmp" "$receipt" 2>/dev/null
+} || true
 
 exit "$RC"

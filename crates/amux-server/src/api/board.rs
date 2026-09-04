@@ -56,6 +56,10 @@ pub fn routes() -> Router<AppState> {
         // Static /ready outranks /{id}. The read side of the dependency graph
         // (AMUX-3948) — READY is a query, never a stored status.
         .route("/ready", get(ready_frontier))
+        // Static /bulk-migrate outranks /{id}. Moving a whole column at once
+        // (AMUX-4044) — a single write transaction, because backlog alone
+        // holds 489 live cards and 489 sequential PATCHes is minutes of load.
+        .route("/bulk-migrate", axum::routing::post(bulk_migrate))
         // Static /needsyou outranks /{id}. The one owner view (AF-318).
         .route("/needsyou", get(needsyou_queue))
         // DELETE was never registered, so the SPA's own Delete button on a
@@ -151,7 +155,10 @@ async fn needsyou_queue(
         }
     };
     let now = crate::config::now_f64();
-    let mut scored: Vec<(f64, Value)> = rows
+    // One `today` for the whole pass: computing it per row could straddle
+    // midnight mid-sort and make two cards disagree about what "due today" is.
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let mut scored: Vec<(bool, f64, Value)> = rows
         .iter()
         .map(|r| {
             let age_days = ((now - r.created as f64) / 86_400.0).max(0.0);
@@ -159,6 +166,37 @@ async fn needsyou_queue(
             // radius + 1, so a card nobody depends on still ranks by age
             // instead of scoring zero and sinking below every card forever.
             let score = age_days * (radius + 1) as f64;
+            // AF-424: A PASSED DEADLINE OUTRANKS AN OLD CARD NOBODY DATED.
+            //
+            // Reported by gtm-engine (GE-769) and reproduced here. `due` is a
+            // signal the board HOLDS — a lane stated a date on purpose — and
+            // this ranking is justified in its own docstring as using "the only
+            // importance signal the board actually holds rather than infers".
+            // It was not using this one.
+            //
+            // The bias is structural, not incidental: stating a deadline
+            // correlates with being NEW, new means low `age_days`, and the
+            // formula rewards age. So dating a card pushed it DOWN. Measured
+            // live 2026-09-02: 119 of 404 rows carry a due date, their MEDIAN
+            // rank was 329 of 404, and 47 were due-today-or-overdue. AF-344,
+            // "scrub 646 leaked API-key occurrences", due that day, ranked 349.
+            //
+            // NO FREE PARAMETER, deliberately. A weight would make me decide how
+            // many days of age a deadline is worth, which is a judgement about
+            // someone else's queue. This is a yes/no instead: a card whose
+            // stated date has ARRIVED sorts above one whose has not, and within
+            // each group the existing score is unchanged. Nothing is reordered
+            // except across that one boundary, and turning it off is deleting
+            // this key.
+            //
+            // Dates are compared as ISO strings, which is what the column holds
+            // and what `is:overdue` in the dashboard already does.
+            let overdue = r
+                .due
+                .as_deref()
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .is_some_and(|d| d <= today.as_str());
             let mut v = list_body(r, true, false);
             if let Some(o) = v.as_object_mut() {
                 o.insert("age_days".into(), json!((age_days * 10.0).round() / 10.0));
@@ -168,21 +206,76 @@ async fn needsyou_queue(
                 // predates AF-318 is NULL here, which is a different thing from
                 // a card that answered the gate — and the owner triaging this
                 // list is exactly who needs to tell them apart.
-                o.insert("has_typed_ask".into(), json!(r.ask_type.is_some()));
+                o.insert(
+                    "has_typed_ask".into(),
+                    json!(bs::ask_verdict(
+                        r.ask_actor.as_deref().unwrap_or(""),
+                        r.ask_type.as_deref().unwrap_or(""),
+                        r.ask_question.as_deref().unwrap_or(""),
+                        r.ask_unblocks.as_deref().unwrap_or(""),
+                    ) == bs::AskVerdict::Ok),
+                );
             }
-            (score, v)
+            if let Some(o) = v.as_object_mut() {
+                // Say it in the payload, so a reader can see WHY a card is where
+                // it is rather than inferring it from the order (rule 4).
+                o.insert("overdue".into(), json!(overdue));
+            }
+            (overdue, score, v)
         })
         .collect();
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    // Overdue first, then the existing score within each group. `true > false`,
+    // so the natural descending compare puts a passed deadline on top. The
+    // stored creation time and id are deterministic tie-breakers; without
+    // them cards created within the same second inherited SQLite's incidental
+    // row order, which could put a new far-future item ahead of older work.
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| {
+                a.2["created"]
+                    .as_i64()
+                    .unwrap_or(i64::MAX)
+                    .cmp(&b.2["created"].as_i64().unwrap_or(i64::MAX))
+            })
+            .then_with(|| {
+                a.2["id"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(b.2["id"].as_str().unwrap_or(""))
+            })
+    });
 
     let total = scored.len();
+    let n_overdue = scored.iter().filter(|(o, ..)| *o).count();
     let shown: Vec<Value> = if want_all {
-        scored.into_iter().map(|(_, v)| v).collect()
+        scored.into_iter().map(|(_, _, v)| v).collect()
     } else {
-        scored.into_iter().take(cap).map(|(_, v)| v).collect()
+        scored.into_iter().take(cap).map(|(_, _, v)| v).collect()
     };
     let hidden = total.saturating_sub(shown.len());
-    let untyped = rows.iter().filter(|r| r.ask_type.is_none()).count();
+    let untyped = rows
+        .iter()
+        .filter(|r| {
+            bs::ask_verdict(
+                r.ask_actor.as_deref().unwrap_or(""),
+                r.ask_type.as_deref().unwrap_or(""),
+                r.ask_question.as_deref().unwrap_or(""),
+                r.ask_unblocks.as_deref().unwrap_or(""),
+            ) != bs::AskVerdict::Ok
+        })
+        .count();
+    // Counted from the store rather than from `rows`, which by construction
+    // holds only the active ones — a count derived from the filtered set could
+    // never be anything but zero, which is the check-that-cannot-fail shape.
+    let archived_excluded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM issues WHERE status='needsyou' \
+             AND NOT (COALESCE(archived,0)=0 AND deleted IS NULL)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(-1);
     Json(crate::api::measured::measured(
         json!({
             "queue": shown,
@@ -191,13 +284,29 @@ async fn needsyou_queue(
             "hidden": hidden,
             "cap": if want_all { Value::Null } else { json!(cap) },
             "untyped_legacy": untyped,
-            "ranked_by": "age_days * (blast_radius + 1), highest first",
+            // AF-424: NAME THE POPULATION THIS VIEW DOES NOT CONSIDER.
+            //
+            // `total` counts ACTIVE needsyou cards. A reader comparing it
+            // against a raw `/api/board?all=1` dump sees a much larger number
+            // and reasonably concludes the view is dropping live work — which
+            // is exactly what happened: gtm-engine measured 523 needsyou rows
+            // against this view's 404 and read the difference as 119 cards
+            // "outside it entirely". They are archived (121) and deleted (4),
+            // and excluding them is correct; an archived card is not
+            // outstanding owner-blocked work. But nothing here SAID so, and
+            // `hidden: 4` reads as the whole remainder when it is only the
+            // remainder past the cap.
+            "archived_excluded": archived_excluded,
+            "ranked_by": "overdue first (due <= today), then age_days * (blast_radius + 1), \
+                          highest first",
+            "overdue": n_overdue,
             "note": "THE owner view: the cards a human is actually blocking, capped so the \
                      list can be finished. `hidden` is the remainder, reachable with ?all=1 \
                      — the cap is a default, not a hiding place. `untyped_legacy` counts \
                      cards that predate the typed-ask gate (AF-318); they were never \
-                     required to name a human act, so a NULL ask_type there means \
-                     unrecorded, not junk.",
+                     required to name a routable actor, direct question, human act, \
+                     and exit condition, so an invalid/partial ask there means \
+                     unrecorded legacy state, not junk.",
         }),
         total,
     ))
@@ -282,8 +391,12 @@ mod frontier_exclusion_tests {
             ask_type: None,
             ask_question: None,
             ask_unblocks: None,
+            ask_actor: None,
             // AF-367: the HTTP create path: a real POST /api/board from a lane or a human.
             source: Some("agent".into()),
+            requested_by: None,
+            callback_session: None,
+            callback_prompt: None,
         };
         bs::create_issue(&conn, &new, 1000).expect("create")
     }
@@ -389,6 +502,255 @@ async fn ready_frontier(
         .into_response();
     };
 
+    let f = lane_frontier(&conn, &lane, limit);
+    let n_considered = f.n_considered;
+    let body = json!({
+        "session": lane,
+        // Cards that pass every computable precondition, oldest first. Capacity
+        // is reported BESIDE this rather than emptying it: "nothing is ready" and
+        // "you are at the cap holding something" are different answers and a
+        // caller that wants to know what is next while finishing a card deserves
+        // the real list.
+        "ready": f.ready,
+        "claimable_now": f.claimable_now,
+        "wip": {"doing": f.holding.len(), "cap": f.wip_cap, "available": f.wip_available,
+                "holding": f.holding},
+        "excluded": {
+            "blocked_by_deps": f.blocked_by_deps,
+            "blocked_by_parked_dep": f.blocked_by_parked_dep,
+            "missing_continuation": f.missing_continuation,
+            "continuation_gate_on": f.gate_on,
+        },
+    });
+    Json(crate::api::measured::measured(body, n_considered)).into_response()
+}
+
+/// (considered, moved, refused) carried out of the bulk-migrate write closure,
+/// which can only return a `WriteOutcome`. Per call, never a static: two
+/// concurrent migrations would clobber a global and each would report the
+/// other's numbers.
+type BulkOutcome = Arc<Mutex<Option<(usize, usize, Vec<Value>)>>>;
+
+/// Did EVERY card refuse for the same gate? (AMUX-4044)
+///
+/// THERE IS NO COLUMN-LEVEL GATE TO PRE-CHECK, and finding that out is the
+/// whole story of this function. The first draft queried a `board_statuses`
+/// table that does not exist, swallowed the error, read "ungated" and let a
+/// `todo -> done` request through. Pointing it at the real `statuses` table
+/// did not fix it either: a fresh schema has no gate stored on `done` at all,
+/// while the live refusals reported `source: "typed"`. Gates resolve through
+/// `effective_gate_trail`, which is per CARD — it reads the card's session and
+/// its lane's groups — so "is this column gated" has no single answer to look
+/// up. A pre-check could only ever have been a guess that disagreed with the
+/// authority.
+///
+/// So the authority decides, per card, and this reads the result. When every
+/// considered card refused with the SAME gate, the honest response is a 409
+/// naming it, not a 200 saying "moved 0" and leaving the caller to infer why.
+/// Measured live before this existed: `todo -> done` returned HTTP 200 with
+/// `considered: 147, moved: 0` and 147 identical `GateBlocked` refusals.
+fn unanimous_gate(considered: usize, moved: usize, refused: &[Value]) -> Option<String> {
+    if considered == 0 || moved > 0 || refused.len() != considered {
+        return None;
+    }
+    let first = refused.first()?.get("why")?.as_str()?.to_string();
+    if !first.starts_with("GateBlocked") {
+        return None;
+    }
+    // Every one, not just the first: a column where SOME cards are gated and
+    // others failed for their own reasons is a mixed result, and flattening
+    // that into one gate message would hide the rest.
+    refused
+        .iter()
+        .all(|r| r.get("why").and_then(Value::as_str) == Some(first.as_str()))
+        .then_some(first)
+}
+
+/// POST /api/board/bulk-migrate — move every live card out of one column.
+///
+/// Ethan, 2026-09-02: an ellipsis on a board column, "migrate all ... for
+/// example in backlog to discarded".
+///
+/// A GATED TARGET IS REFUSED OUTRIGHT, and that is the design rather than a
+/// limitation. `doing`, `review`, `done` and `verified` each carry a checklist
+/// a human is supposed to answer per card; one blanket acknowledgement across
+/// 489 backlog cards would assert all four of `verified`'s criteria about work
+/// nobody looked at, which is exactly the claim AF-321 exists to stop. The
+/// named use case, backlog to discarded, is ungated and unaffected.
+///
+/// `gate_ack` and `force` are deliberately NOT set below, so even if this
+/// somehow ran against a gated column every card would refuse individually
+/// rather than slip through. The upfront check is the honest error; the unset
+/// flags are the belt.
+///
+/// One transaction: a half-migrated column is a worse state than a refused
+/// one, and `advance` is the same transition primitive every other path uses,
+/// so a card that could not move for its own reason (archived, a stale CAS)
+/// is reported rather than silently skipped.
+async fn bulk_migrate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    let body = body.map(|Json(v)| v).unwrap_or(Value::Null);
+    let from = body.get("from").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let to = body.get("to").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    // Optional: restrict to one lane's board. Absent means the global column.
+    let lane = body
+        .get("session")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if from.is_empty() || to.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "from and to are required", "hint": "POST {\"from\":\"backlog\",\"to\":\"discarded\"}"}),
+        );
+    }
+    if from == to {
+        return err(StatusCode::BAD_REQUEST, json!({"error": "from and to are the same column"}));
+    }
+    let actor = actor_from_headers(&headers).1;
+
+    // THE GATE CHECK, once, up front, on a READ. Doing it inside the write
+    // closure meant smuggling the verdict out through a fake event; a column's
+    // gate is plain stored state and reading it is the honest way to ask.
+
+    // PER-CALL, not a static: two concurrent migrations would clobber a global
+    // and each would report the other's numbers. Same handle shape the rename
+    // cascade uses to carry its step list out of the write closure.
+    let out: BulkOutcome = Default::default();
+    let out_c = out.clone();
+    let (f3, t3, lane3, actor3) = (from.clone(), to.clone(), lane.clone(), actor.clone());
+    let result = state
+        .store
+        .write_async(move |conn| {
+            // AN EXPLICIT SELECTION WINS (AMUX-4058). The UI sends the ids it
+            // actually rendered, so a filtered column migrates what the human
+            // saw. Without this the server took a whole column and a filtered
+            // view would have moved ~500 cards while showing twelve.
+            //
+            // Still re-checked against status and lane below by `advance`'s
+            // `expected_from`, so a stale id from a view rendered minutes ago
+            // refuses rather than moving a card that has since left the column.
+            let explicit: Vec<String> = body
+                .get("ids")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            let ids: Vec<String> = if !explicit.is_empty() { explicit } else {
+                let (sql, params): (String, Vec<String>) = match &lane3 {
+                    Some(l) => (
+                        "SELECT id FROM issues WHERE status=?1 AND session=?2 \
+                         AND deleted IS NULL AND COALESCE(archived,0)=0 ORDER BY id"
+                            .into(),
+                        vec![f3.clone(), l.clone()],
+                    ),
+                    None => (
+                        "SELECT id FROM issues WHERE status=?1 \
+                         AND deleted IS NULL AND COALESCE(archived,0)=0 ORDER BY id"
+                            .into(),
+                        vec![f3.clone()],
+                    ),
+                };
+                let mut st = conn.prepare(&sql)?;
+                let rows = st.query_map(rusqlite::params_from_iter(params), |r| r.get::<_, String>(0))?;
+                rows.filter_map(Result::ok).collect()
+            };
+            let mut moved = 0usize;
+            let mut refused: Vec<Value> = Vec::new();
+            let mut events = Vec::new();
+            for id in &ids {
+                let opts = crate::db::advance::AdvanceOpts {
+                    expected_from: Some(f3.clone()),
+                    log_line: Some(format!("bulk-migrated {f3} -> {t3} by {actor3}")),
+                    ..Default::default()
+                };
+                match crate::db::advance::advance(conn, id, &t3, &actor3, &opts)? {
+                    Ok(o) => {
+                        moved += 1;
+                        events.extend(o.events);
+                    }
+                    Err(why) => refused.push(json!({"id": id, "why": format!("{why:?}")})),
+                }
+            }
+            conn.execute(
+                "INSERT INTO session_events (ts, session, type, data, source) VALUES (?1,?2,?3,?4,?5)",
+                rusqlite::params![
+                    crate::config::now_f64(),
+                    actor3,
+                    "board.bulk_migrated",
+                    json!({"from": f3, "to": t3, "session": lane3, "moved": moved,
+                           "refused": refused.len(), "considered": ids.len()})
+                    .to_string(),
+                    "board-api"
+                ],
+            )
+            .ok();
+            *out_c.lock().unwrap() = Some((ids.len(), moved, refused));
+            Ok(crate::db::WriteOutcome { applied: moved > 0, events })
+        })
+        .await;
+    match result {
+        Ok(_) => {
+            let (considered, moved, refused) =
+                out.lock().ok().and_then(|mut g| g.take()).unwrap_or((0, 0, Vec::new()));
+            if let Some(why) = unanimous_gate(considered, moved, &refused) {
+                return err(
+                    StatusCode::CONFLICT,
+                    json!({
+                        "error": format!("every card in '{from}' refused the move to '{to}'"),
+                        "gate": why,
+                        "why": "a gate is a per-card claim; one acknowledgement for a whole \
+                                column would assert it about cards nobody looked at",
+                        "hint": "move these individually, or pick an ungated column",
+                        "considered": considered,
+                    }),
+                );
+            }
+            Json(json!({
+                "ok": true, "from": from, "to": to, "session": lane,
+                "considered": considered, "moved": moved,
+                // Named, not just counted: a caller that moved 480 of 489 needs
+                // to know WHICH nine and why, or the number is a mystery.
+                "refused": refused,
+            }))
+            .into_response()
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
+    }
+}
+
+/// One lane's work frontier: what it could claim, and what is in the way.
+///
+/// EXTRACTED SO THERE IS ONE EVALUATOR (AMUX-4029). `/api/board/ready` was the
+/// only caller and the only place this reasoning existed, so anything else that
+/// wanted to know whether a lane had claimable work either re-derived it or did
+/// without. `board.lane_idle_with_ready_work` is the second caller, and the
+/// point of sharing the function rather than the shape is that a detector which
+/// disagreed with the endpoint would be reporting a stall the endpoint denies.
+pub(crate) struct LaneFrontier {
+    pub ready: Vec<Value>,
+    pub claimable_now: usize,
+    pub wip_cap: usize,
+    pub wip_available: usize,
+    pub holding: Vec<String>,
+    pub blocked_by_deps: usize,
+    /// Of `blocked_by_deps`, the ones whose blocker CANNOT clear on its own:
+    /// parked in `backlog`/`needsyou`, discarded, or resolving to no card.
+    /// These are deadlocked, not waiting.
+    pub blocked_by_parked_dep: usize,
+    pub missing_continuation: usize,
+    pub gate_on: bool,
+    pub n_considered: usize,
+}
+
+pub(crate) fn lane_frontier(
+    conn: &rusqlite::Connection,
+    lane: &str,
+    limit: usize,
+) -> LaneFrontier {
     // CAPACITY, from the same predicate the `doing` gate refuses on: same status,
     // same type exclusions, same archived/deleted filter. A frontier that
     // disagreed with the gate would offer cards the gate then refuses, which is
@@ -423,17 +785,38 @@ async fn ready_frontier(
         .unwrap_or_default();
     let n_considered = ids.len();
 
-    let gate_on = bs::continuation_required(Some(&lane));
+    let gate_on = bs::continuation_required(Some(lane));
     let (mut blocked_by_deps, mut missing_continuation) = (0usize, 0usize);
+    let mut blocked_by_parked_dep = 0usize;
     let mut ready: Vec<Value> = Vec::new();
     let now = crate::config::now_f64();
 
     for id in &ids {
-        let Ok(Some(row)) = bs::get_issue(&conn, id) else { continue };
+        let Ok(Some(row)) = bs::get_issue(conn, id) else { continue };
         // THE SHARED PREDICATE, not a second spelling of it (AMUX-3814).
-        let blockers = crate::runtime_jobs::board_drive::deps_blocking(&conn, &row);
+        let blockers = crate::runtime_jobs::board_drive::deps_blocking(conn, &row);
         if !blockers.is_empty() {
             blocked_by_deps += 1;
+            // WAITING AND DEADLOCKED ARE DIFFERENT ANSWERS (AMUX-4040), and one
+            // number could not tell them apart. A dependency that is `doing` or
+            // `todo` will clear on its own; one that is parked in `backlog` /
+            // `needsyou`, or that resolves to no card at all, will not clear
+            // ever, and the lane waiting on it is stuck rather than patient.
+            //
+            // rtsp-connection read `blocked_by_deps: 12` over 13 todo cards. The
+            // whole queue hung off ONE parked card, and nothing in the payload
+            // said which kind of blocked it was, so the honest reading was
+            // "busy waiting" when the truth was "will never move".
+            //
+            // Counted per CARD, not per edge: a card is deadlocked if ANY
+            // blocker cannot clear, because it only takes one.
+            if blockers.iter().any(|b| {
+                bs::get_issue(conn, b).ok().flatten().is_none_or(|d| {
+                    matches!(d.status.as_str(), "backlog" | "needsyou" | "discarded")
+                })
+            }) {
+                blocked_by_parked_dep += 1;
+            }
             continue;
         }
         match frontier_exclusion(&row, gate_on) {
@@ -463,23 +846,18 @@ async fn ready_frontier(
     }
     ready.truncate(limit);
 
-    let body = json!({
-        "session": lane,
-        // Cards that pass every computable precondition, oldest first. Capacity
-        // is reported BESIDE this rather than emptying it: "nothing is ready" and
-        // "you are at the cap holding something" are different answers and a
-        // caller that wants to know what is next while finishing a card deserves
-        // the real list.
-        "ready": ready,
-        "claimable_now": available.min(ready.len()),
-        "wip": {"doing": holding.len(), "cap": cap, "available": available, "holding": holding},
-        "excluded": {
-            "blocked_by_deps": blocked_by_deps,
-            "missing_continuation": missing_continuation,
-            "continuation_gate_on": gate_on,
-        },
-    });
-    Json(crate::api::measured::measured(body, n_considered)).into_response()
+    LaneFrontier {
+        claimable_now: available.min(ready.len()),
+        ready,
+        wip_cap: cap,
+        wip_available: available,
+        holding,
+        blocked_by_deps,
+        blocked_by_parked_dep,
+        missing_continuation,
+        gate_on,
+        n_considered,
+    }
 }
 
 /// GET /api/board/contract — the gate table, types, and CLI syntax.
@@ -618,7 +996,7 @@ async fn get_contract(
             "rule": bs::ASSET_LINK_CRITERION,
             "accepts": "a URL, a repo file path (a/b.ext), a commit sha, or a #PR/issue reference, in the card's desc or history",
             "enforced": "server-validated on any transition to done; force bypasses it (logged); gate_ack cannot",
-            "override": "set AMUX_DONE_LINK_REQUIRED=0 in a worker's / group's / global scope env (Scope tab) to opt that scope out",
+            "override": "set AMUX_DONE_LINK_REQUIRED=0 in a worker's / group's / global configuration to opt that level out",
         },
         // Global done constraint (AF-321). Sits IN FRONT of the asset-link rule
         // above, which it does not replace: that one is a shape check over the
@@ -631,18 +1009,18 @@ async fn get_contract(
             "accepts": "a command (backticked, or on a `$ ` line), a repo file path, a URL, a commit sha, a #PR — or `none: <reason>` (3+ words) when the card genuinely produced no artifact",
             "field": "`evidence`, writable on its own so it can be recorded BEFORE the transition that needs it",
             "enforced": "server-validated on any transition to done; force bypasses it (logged); gate_ack cannot",
-            "override": "set AMUX_DONE_EVIDENCE_REQUIRED=0 in a worker's / group's / global scope env (Scope tab) to opt that scope out",
+            "override": "set AMUX_DONE_EVIDENCE_REQUIRED=0 in a worker's / group's / global configuration to opt that level out",
             "what_to_run": "the repo's VERIFY.md names the proof for each surface",
         },
         // Global `needsyou` constraint (AF-318). Published for the AF-112
         // reason: a gate you can only learn by tripping it teaches nobody.
         "needsyou_requires_typed_ask": {
-            "rule": "a card entering needsyou must carry `ask_type`, `ask_question` and `ask_unblocks`",
+            "rule": "a card entering needsyou must name a specific `ask_actor`, a valid `ask_type`, a direct `ask_question` containing ?, and an observable `ask_unblocks` exit",
             "why": "389 live cards were parked here at a median age of 15 days and 51% of them were not blocked on a human at all — `needsyou` was the only status that cost a worker nothing and stopped the nudge, so the ~20 real asks became unfindable",
             "ask_types": bs::ASK_TYPE_HELP.iter().map(|(k, v)| json!({"type": k, "means": v})).collect::<Vec<_>>(),
-            "fields": "`ask_question` is what you are asking, `ask_unblocks` is what ends the block — both a sentence (3+ words). All three writable on their own, so a refused transition cannot discard them",
+            "fields": "`ask_actor` is the specific person or external actor, `ask_question` is the direct question, and `ask_unblocks` is what ends the block — the latter two are sentences (3+ words). All four are writable on their own, so a refused transition cannot discard them",
             "enforced": "server-validated on any transition to needsyou; force bypasses it (logged); gate_ack cannot",
-            "override": "set AMUX_NEEDSYOU_ASK_REQUIRED=0 in a worker's / group's / global scope env (Scope tab) to opt that scope out",
+            "override": "set AMUX_NEEDSYOU_ASK_REQUIRED=0 in a worker's / group's / global configuration to opt that level out",
             "not_retroactive": "the 445 existing cards are untouched — the gate is on the transition. They drain by being re-asked, not by a sweep guessing on their behalf",
             "owner_view": "GET /api/board/needsyou — ranked by age x blast radius, capped at 10, ?all=1 for the remainder",
         },
@@ -668,6 +1046,15 @@ async fn get_contract(
             // filed mistyped in one night by guessing the field name at CREATE,
             // where no refusal exists to correct you.
             "wrong_type": "If the item has no code, set its type first — the gate is DERIVED                            from the type. CLI: `amux board type <id> <type>`. API: PATCH                            /api/board/<id> with {\"type\": \"investigation\"} — the field is                            `type`, NOT `item_type` (that one is ignored and reported in                            `ignored_fields`). Settable at creation too: POST /api/board with                            {\"title\": ..., \"type\": ...}.",
+        },
+        "worker_requests": {
+            "cli": "amux board request <worker> <title> [--desc ...] [--callback-prompt ...] [--no-callback]",
+            "api": "POST /api/board with a different session plus callback:true, a prompt string, or {prompt}; X-Amux-Worker is the verified requester",
+            "lifecycle": "created in backlog, advanced by board-drive through the same dependencies, priorities, gates and terminal states as every other task",
+            "callback": "optional; request CLI arms it by default. It fires exactly when the card first enters done, verified, or discarded and queues a durable message to the verified requester",
+            "durability": "requested_by, callback target/prompt/state/message id/fired time/error live on the task. A stable steering id makes restart recovery idempotent; model/provider context is not involved",
+            "visibility": "the initial request and terminal callback are Messages rows linked to the same task id; the card carries requester, callback state, action log and produced assets",
+            "security": "a callback can return only to the server-verified requester; isolated raw workers remain outside harness delivery",
         },
         // AMUX-2933 (ts-gke). The list filters WORK and were documented
         // NOWHERE — "discoverable only by guessing", and the cap was worse than
@@ -1508,6 +1895,357 @@ fn detail_body(row: &IssueRow) -> Value {
         designate_owner_reach(obj, row);
     }
     v
+}
+
+/// Result of one durable callback outbox pass.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct CallbackDispatch {
+    pub attempted: usize,
+    pub queued: usize,
+    pub refused: usize,
+}
+
+/// Drain terminal task callbacks through the same durable steering path as all
+/// other harness messages. `only` is used by the interactive PATCH path for an
+/// immediate response; the board-drive tick passes None and recovers any item
+/// left pending by a crash or by a non-HTTP transition producer.
+pub(crate) async fn dispatch_pending_callbacks(
+    state: &AppState,
+    only: Option<&str>,
+) -> CallbackDispatch {
+    let ids: Vec<String> = match state.store.read() {
+        Ok(conn) => {
+            if let Some(id) = only {
+                conn.query_row(
+                    "SELECT id FROM issues WHERE id=?1 AND deleted IS NULL \
+                     AND callback_state IN ('pending','dispatching')",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .map(|id| vec![id])
+                .unwrap_or_default()
+            } else {
+                conn.prepare(
+                    "SELECT id FROM issues WHERE deleted IS NULL \
+                     AND callback_state IN ('pending','dispatching') ORDER BY updated LIMIT 100",
+                )
+                .and_then(|mut st| {
+                    st.query_map([], |r| r.get::<_, String>(0))
+                        .map(|rows| rows.flatten().collect())
+                })
+                .unwrap_or_default()
+            }
+        }
+        Err(_) => Vec::new(),
+    };
+    let mut report = CallbackDispatch::default();
+    for id in ids {
+        report.attempted += 1;
+        let stable_id = format!("task-callback-{id}");
+        let staged: Arc<Mutex<Option<IssueRow>>> = Arc::new(Mutex::new(None));
+        let staged_w = staged.clone();
+        let id_w = id.clone();
+        let stable_w = stable_id.clone();
+        let _ = state
+            .store
+            .write_async(move |conn| {
+                let Some(mut row) = bs::get_issue(conn, &id_w)? else {
+                    return Ok(no_write());
+                };
+                if !matches!(row.callback_state.as_deref(), Some("pending" | "dispatching")) {
+                    return Ok(no_write());
+                }
+                row.callback_state = Some("dispatching".into());
+                row.callback_message_id = Some(stable_w);
+                row.callback_error = None;
+                row.updated = now_secs();
+                row.rev += 1;
+                row.version += 1;
+                bs::save_patched(conn, &mut row)?;
+                *staged_w.lock().unwrap() = Some(row.clone());
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![ev_snap(&row, MutationKind::Updated)],
+                })
+            })
+            .await;
+        let Some(row) = staged.lock().ok().and_then(|mut g| g.take()) else {
+            continue;
+        };
+        let Some(target) = row.callback_session.clone() else {
+            continue;
+        };
+        let sender = row.session.clone().unwrap_or_else(|| "board".into());
+        let outcome = row
+            .last_result
+            .as_deref()
+            .or(row.evidence.as_deref())
+            .unwrap_or("The complete action log and produced assets are on the task card.");
+        let mut prompt = format!(
+            "[task callback {}: {}] {} finished the task you requested. \
+             Terminal state: {}.\nOutcome: {}\nOpen board card {} for gates, action history, \
+             source message, epic, and produced assets.",
+            row.id, row.title, sender, row.status, outcome, row.id
+        );
+        if let Some(instruction) = row.callback_prompt.as_deref().filter(|s| !s.trim().is_empty()) {
+            prompt.push_str("\nCallback instruction: ");
+            prompt.push_str(instruction.trim());
+        }
+        let guard = format!("task-callback:{}", row.id);
+        // Re-resolve policy at delivery time. The request was authorized when
+        // it was created, but a later explicit opt-out must not be bypassed by
+        // a callback that happens to have been armed earlier. A refusal remains
+        // visible on the card and can be retried only by an explicit re-arm.
+        let delivered: Result<String, String> =
+            match crate::api::session_verbs::cross_group_send_ok(&sender, &target) {
+                Err(reason) => Err(reason),
+                Ok(_) => crate::api::session_verbs::steer_enqueue_idempotent(
+                    state,
+                    &target,
+                    &prompt,
+                    &guard,
+                    &sender,
+                    &stable_id,
+                )
+                .await
+                .map_err(str::to_string),
+            };
+        let id_w = row.id.clone();
+        let target_w = target.clone();
+        let sender_w = sender.clone();
+        let prompt_w = prompt.clone();
+        let stable_w = stable_id.clone();
+        match delivered {
+            Ok(_) => {
+                report.queued += 1;
+                let _ = state.store.write_async(move |conn| {
+                    let Some(mut latest) = bs::get_issue(conn, &id_w)? else {
+                        return Ok(no_write());
+                    };
+                    if latest.callback_message_id.as_deref() != Some(stable_w.as_str()) {
+                        return Ok(no_write());
+                    }
+                    let now = now_secs();
+                    latest.callback_state = Some("queued".into());
+                    latest.callback_fired_at = Some(now);
+                    latest.callback_error = None;
+                    latest.updated = now;
+                    latest.rev += 1;
+                    latest.version += 1;
+                    latest.log = Some(bs::append_log(
+                        latest.log.as_deref(),
+                        &chrono::Local::now().format("%H:%M").to_string(),
+                        &format!("terminal callback queued to {target_w} as {stable_w}"),
+                    ));
+                    bs::save_patched(conn, &mut latest)?;
+                    let exists = conn.query_row(
+                        "SELECT 1 FROM cmd_history WHERE card_id=?1 AND type='task-callback' LIMIT 1",
+                        rusqlite::params![id_w], |_| Ok(true),
+                    ).unwrap_or(false);
+                    let mut events = vec![ev_snap(&latest, MutationKind::Updated)];
+                    if !exists {
+                        conn.execute(
+                            "INSERT INTO cmd_history \
+                             (text,type,session,ts,origin,card_id,delivery,queued_at) \
+                             VALUES (?1,'task-callback',?2,?3,?4,?5,'queued',?3)",
+                            rusqlite::params![prompt_w, target_w, now * 1000, sender_w, id_w],
+                        )?;
+                        let message_id = conn.last_insert_rowid();
+                        events.push(crate::db::PendingEvent {
+                            entity_type: amux_core::revision::EntityType::Message,
+                            entity_id: format!("MSG-{message_id}"),
+                            mutation: MutationKind::Created,
+                            payload: None,
+                        });
+                    }
+                    Ok(WriteOutcome { applied: true, events })
+                }).await;
+            }
+            Err(reason) => {
+                report.refused += 1;
+                let reason = reason.to_string();
+                let _ = state.store.write_async(move |conn| {
+                    let Some(mut latest) = bs::get_issue(conn, &id_w)? else {
+                        return Ok(no_write());
+                    };
+                    latest.callback_state = Some("refused".into());
+                    latest.callback_error = Some(reason.clone());
+                    latest.updated = now_secs();
+                    latest.rev += 1;
+                    latest.version += 1;
+                    latest.log = Some(bs::append_log(
+                        latest.log.as_deref(),
+                        &chrono::Local::now().format("%H:%M").to_string(),
+                        &format!("terminal callback to {target_w} refused: {reason}"),
+                    ));
+                    bs::save_patched(conn, &mut latest)?;
+                    Ok(WriteOutcome {
+                        applied: true,
+                        events: vec![ev_snap(&latest, MutationKind::Updated)],
+                    })
+                }).await;
+            }
+        }
+    }
+    report
+}
+
+#[cfg(test)]
+mod callback_dispatch_tests {
+    use super::*;
+
+    fn state(home: &std::path::Path) -> AppState {
+        let store = std::sync::Arc::new(
+            crate::db::Store::open(&home.join("callback-test.db")).expect("open store"),
+        );
+        AppState {
+            store,
+            started: std::time::Instant::now(),
+            build_hash: "callback-test".into(),
+            auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+
+    fn pending_request(state: &AppState) -> String {
+        let new = bs::NewIssue {
+            title: "Produce the launch report".into(),
+            desc: "Requested by another worker.".into(),
+            status: "todo".into(),
+            session: Some("worker-b".into()),
+            item_type: "code".into(),
+            creator: "worker-a".into(),
+            owner_type: "agent".into(),
+            due: None,
+            due_time: None,
+            reviewer: None,
+            shepherd: None,
+            gate: vec![],
+            depends_on: vec![],
+            tags: vec![],
+            ask_type: None,
+            ask_question: None,
+            ask_unblocks: None,
+            ask_actor: None,
+            source: Some("agent".into()),
+            requested_by: Some("worker-a".into()),
+            callback_session: Some("worker-a".into()),
+            callback_prompt: Some("Start the dependent launch step.".into()),
+        };
+        let id = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let id_w = id.clone();
+        state.store.write(move |conn| {
+            let mut row = bs::create_issue(conn, &new, 1000)?;
+            row.status = "done".into();
+            row.last_result = Some("Report written to /tmp/launch-report.md".into());
+            row.updated = 2000;
+            row.rev += 1;
+            row.version += 1;
+            bs::save_patched(conn, &mut row)?;
+            *id_w.lock().unwrap() = row.id;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).expect("create and complete request");
+        let created_id = id.lock().unwrap().clone();
+        created_id
+    }
+
+    /// Happy path plus the crash window: enqueue succeeds, but the process dies
+    /// before the card is marked queued. Retrying the `dispatching` row must
+    /// reuse the stable queue id and the one linked Messages record.
+    #[tokio::test(flavor = "current_thread")]
+    async fn callback_delivery_is_board_linked_and_crash_idempotent() {
+        let home = tempfile::tempdir().expect("home");
+        let _home_guard = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(home.path().join("sessions/worker-a.env"), "CC_TAGS=\"a\"\n").unwrap();
+        std::fs::write(home.path().join("sessions/worker-b.env"), "CC_TAGS=\"b\"\n").unwrap();
+        let state = state(home.path());
+        let id = pending_request(&state);
+
+        let first = dispatch_pending_callbacks(&state, Some(&id)).await;
+        assert_eq!((first.attempted, first.queued, first.refused), (1, 1, 0));
+        {
+            let conn = state.store.read().unwrap();
+            let row = bs::get_issue(&conn, &id).unwrap().unwrap();
+            assert_eq!(row.callback_state.as_deref(), Some("queued"));
+            assert_eq!(row.callback_message_id.as_deref(), Some(format!("task-callback-{id}").as_str()));
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM steering_queue WHERE id=?1",
+                    rusqlite::params![format!("task-callback-{id}")],
+                    |r| r.get::<_, i64>(0),
+                ).unwrap(),
+                1
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM cmd_history WHERE card_id=?1 AND type='task-callback'",
+                    rusqlite::params![id],
+                    |r| r.get::<_, i64>(0),
+                ).unwrap(),
+                1
+            );
+        }
+
+        // Simulate a crash after enqueue but before finalization. Mutations go
+        // through the one writer, just like production.
+        let id_w = id.clone();
+        state.store.write(move |conn| {
+            conn.execute(
+                "UPDATE issues SET callback_state='dispatching' WHERE id=?1",
+                rusqlite::params![id_w],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+
+        let recovered = dispatch_pending_callbacks(&state, Some(&id)).await;
+        assert_eq!((recovered.attempted, recovered.queued, recovered.refused), (1, 1, 0));
+        let conn = state.store.read().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM steering_queue WHERE id=?1",
+                rusqlite::params![format!("task-callback-{id}")],
+                |r| r.get::<_, i64>(0),
+            ).unwrap(),
+            1,
+            "recovery must refresh the stable row, never duplicate it"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM cmd_history WHERE card_id=?1 AND type='task-callback'",
+                rusqlite::params![id],
+                |r| r.get::<_, i64>(0),
+            ).unwrap(),
+            1,
+            "the Messages link is one callback, not one per retry"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn callback_to_an_isolated_worker_is_visibly_refused() {
+        let home = tempfile::tempdir().expect("home");
+        let _home_guard = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(
+            home.path().join("sessions/worker-a.env"),
+            "CC_TAGS=\"a\"\nCC_ISOLATED=1\n",
+        ).unwrap();
+        std::fs::write(home.path().join("sessions/worker-b.env"), "CC_TAGS=\"b\"\n").unwrap();
+        let state = state(home.path());
+        let id = pending_request(&state);
+
+        let report = dispatch_pending_callbacks(&state, Some(&id)).await;
+        assert_eq!((report.attempted, report.queued, report.refused), (1, 0, 1));
+        let conn = state.store.read().unwrap();
+        let row = bs::get_issue(&conn, &id).unwrap().unwrap();
+        assert_eq!(row.callback_state.as_deref(), Some("refused"));
+        assert!(row.callback_error.as_deref().unwrap_or("").contains("isolated"));
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM steering_queue", [], |r| r.get::<_, i64>(0)).unwrap(),
+            0,
+            "a refusal must not leave an immortal queued callback"
+        );
+    }
 }
 
 /// List body, Python-parity (AMUX-2586 fix #4). The plain list serves the
@@ -2510,9 +3248,17 @@ fn needsyou_ask_refusal(verdict: bs::AskVerdict, id: &str, session: Option<&str>
             "That is not one of the five kinds of human act. The vocabulary is closed on purpose: a block that fits none of them is not a block on a person.",
             "needsyou_ask_type_unknown",
         ),
+        bs::AskVerdict::NoActor => (
+            "`ask_actor` must name the specific person or external actor who can answer. Generic values such as human, user, owner, someone, or you are not a routing address.",
+            "needsyou_requires_specific_actor",
+        ),
         bs::AskVerdict::NoQuestion => (
             "`ask_question` has to be an actual question, in a sentence. \"Blocked on Ethan\" with no question is not an ask — that phrasing is most of what is sitting in this queue today.",
             "needsyou_ask_has_no_question",
+        ),
+        bs::AskVerdict::NotAQuestion => (
+            "`ask_question` must be an actual direct question ending in `?`, not a status note or an instruction the worker could keep doing itself.",
+            "needsyou_ask_is_not_a_question",
         ),
         bs::AskVerdict::NoUnblocks => (
             "`ask_unblocks` has to say what ENDS the block, in a sentence. Without it nobody but you can tell whether an answer has landed, so the card cannot leave this queue except by you noticing.",
@@ -2537,8 +3283,8 @@ fn needsyou_ask_refusal(verdict: bs::AskVerdict, id: &str, session: Option<&str>
             "why": why,
             "ask_types": bs::ASK_TYPES,
             "how_to_fix": {
-                "fields": "ask_type (one of the five), ask_question (the question, in a sentence), ask_unblocks (what ends the block).",
-                "cli": "amux board needsyou <ID> --ask-type <type> --ask-question \"...\" --ask-unblocks \"...\"",
+                "fields": "ask_actor (a named person/external actor), ask_type, ask_question (a direct question containing ?), and ask_unblocks (the observable exit).",
+                "cli": "amux board needsyou <ID> --actor <name> --ask <type> --question \"...?\" --unblocks \"...\"",
                 "not_an_ask": "If nobody is actually waiting on a person, this is not a needsyou card — put it back in todo/backlog, or discard it.",
             },
         }),
@@ -2592,6 +3338,7 @@ pub async fn create_item(
             .filter(|s| !s.trim().is_empty());
         if bs::needsyou_ask_required(session_for_gate.as_deref()) {
             let verdict = bs::ask_verdict(
+                body_str(&map, "ask_actor").unwrap_or_default().as_str(),
                 body_str(&map, "ask_type").unwrap_or_default().as_str(),
                 body_str(&map, "ask_question").unwrap_or_default().as_str(),
                 body_str(&map, "ask_unblocks").unwrap_or_default().as_str(),
@@ -2701,9 +3448,84 @@ pub async fn create_item(
         None => if session.is_empty() { "human" } else { "agent" }.to_string(),
     };
 
+    // A peer request is a BOARD CONTRACT, not an ordinary pane message. The
+    // requester comes only from the verified worker header; accepting a body
+    // field here would let a worker manufacture somebody else's return path.
+    let is_peer_request = !hdr_session.is_empty() && !session.is_empty() && hdr_session != session;
+    if is_peer_request {
+        if let Err(reason) =
+            crate::api::session_verbs::cross_group_send_ok(&hdr_session, &session)
+        {
+            return err(
+                StatusCode::FORBIDDEN,
+                json!({
+                    "error": reason,
+                    "code": "task_request_not_authorized",
+                    "requester": hdr_session,
+                    "target": session,
+                    "how_to_fix": "put both workers in a group, or enable the existing cross-group worker configuration; the board request and direct-send paths use the same policy",
+                }),
+            );
+        }
+    }
+    let requested_by = is_peer_request.then(|| hdr_session.clone());
+    let callback_specified = map.contains_key("callback");
+    let (callback_session, callback_prompt) = match map.get("callback") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => (None, None),
+        Some(Value::Bool(true)) => (Some(hdr_session.clone()), None),
+        Some(Value::String(prompt)) => (Some(hdr_session.clone()), Some(prompt.trim().to_string())),
+        Some(Value::Object(cb)) => {
+            let target = cb
+                .get("session")
+                .and_then(Value::as_str)
+                .unwrap_or(&hdr_session)
+                .trim()
+                .to_string();
+            let prompt = cb
+                .get("prompt")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            (Some(target), prompt)
+        }
+        Some(_) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "callback must be true, false, a prompt string, or {session?, prompt?}"}),
+            )
+        }
+    };
+    if callback_specified && hdr_session.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "a callback requires a verified X-Amux-Worker requester"}),
+        );
+    }
+    if callback_session.as_deref().is_some_and(|s| s.is_empty()) {
+        return err(StatusCode::BAD_REQUEST, json!({"error": "callback session is empty"}));
+    }
+    if callback_session.as_deref().is_some_and(|s| s != hdr_session) {
+        return err(
+            StatusCode::FORBIDDEN,
+            json!({
+                "error": "a task callback may return only to the verified requester",
+                "requester": hdr_session,
+                "callback_session": callback_session,
+            }),
+        );
+    }
+    if callback_session.is_some() && bs::is_terminal_status(&status_raw) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "cannot arm a completion callback on a task created terminal"}),
+        );
+    }
+
     let known_keys = [
         "title", "desc", "status", "session", "type", "depends_on", "tags", "creator",
-        "reviewer", "shepherd", "gate", "owner_type", "due", "due_time",
+        "reviewer", "shepherd", "gate", "owner_type", "due", "due_time", "callback",
+        "ask_actor", "ask_type", "ask_question", "ask_unblocks",
     ];
     let ignored: Vec<String> = map
         .keys()
@@ -2757,7 +3579,7 @@ pub async fn create_item(
                             })).collect::<Vec<_>>(),
                             "how_to_fix": {
                                 "file_it_anyway_but_not_as_next": "POST with {\"status\":\"backlog\"} — unbounded on purpose, and where a real card that is not NEXT belongs",
-                                "raise_it": "set AMUX_TODO_WIP_LIMIT=<n> in this worker's / group's / global scope env (Scope tab); 0 disables it"
+                                "raise_it": "set AMUX_TODO_WIP_LIMIT=<n> in this worker's / group's / global configuration; 0 disables it"
                             }
                         })),
                     )
@@ -2785,9 +3607,13 @@ pub async fn create_item(
         ask_type: body_str(&map, "ask_type"),
         ask_question: body_str(&map, "ask_question"),
         ask_unblocks: body_str(&map, "ask_unblocks"),
+        ask_actor: body_str(&map, "ask_actor"),
         // AF-367: the HTTP create path — a real POST /api/board from a lane or
         // a human, as opposed to a card a daemon filed.
         source: Some("agent".into()),
+        requested_by,
+        callback_session,
+        callback_prompt,
     };
 
     enum Out {
@@ -2814,6 +3640,30 @@ pub async fn create_item(
             }
             let row = bs::create_issue(conn, &new, now_secs())?;
             let mut events = vec![ev_snap(&row, MutationKind::Created)];
+            // The Messages ledger carries the SAME task id. Delivery is
+            // `board`, not `direct` or `queued`: the recipient consumes this
+            // request through board-drive and the card is the source of truth.
+            if let (Some(requester), Some(target)) =
+                (row.requested_by.as_deref(), row.session.as_deref())
+            {
+                let text = format!(
+                    "[board request {}] {} requested work from {}: {}",
+                    row.id, requester, target, row.title
+                );
+                conn.execute(
+                    "INSERT INTO cmd_history \
+                     (text,type,session,ts,origin,card_id,delivery,delivered_at,submit_verdict) \
+                     VALUES (?1,'session',?2,?3,?4,?5,'board',?3,'accepted')",
+                    rusqlite::params![text, target, now_secs() * 1000, requester, row.id],
+                )?;
+                let message_id = conn.last_insert_rowid();
+                events.push(crate::db::PendingEvent {
+                    entity_type: amux_core::revision::EntityType::Message,
+                    entity_id: format!("MSG-{message_id}"),
+                    mutation: MutationKind::Created,
+                    payload: None,
+                });
+            }
             // AMUX-3391: fold the silent auto-capture card into this worker card
             // (see fold_capture_for_worker_card). The window is env-tunable.
             let fold_window: i64 = std::env::var("AMUX_CAPTURE_FOLD_WINDOW_S")
@@ -2890,6 +3740,18 @@ pub async fn create_item(
                 owner_session = %row.session.as_deref().unwrap_or("(none)"),
                 "board card created"
             );
+            // A peer request should enter the same durable board-drive path
+            // immediately; waiting for the periodic sweep makes a successful
+            // request look lost for up to a minute.
+            if row.requested_by.is_some() {
+                if let Some(target) = row.session.clone() {
+                    let st = state.clone();
+                    tokio::spawn(async move {
+                        let _ = crate::runtime_jobs::board_drive::drive_session(&st, &target).await;
+                        crate::api::session_verbs::steer_deliver_for_session(&st, &target).await;
+                    });
+                }
+            }
             (StatusCode::CREATED, Json(v)).into_response()
         }
     }
@@ -2898,15 +3760,104 @@ pub async fn create_item(
 // ---- GET /api/board/{id} -------------------------------------------------
 
 fn resolve_task_asset(reference: &str, work_dir: &str) -> String {
+    let reference = reference.trim();
     let is_external = reference.starts_with("http://")
         || reference.starts_with("https://")
         || reference.starts_with('#')
         || ((7..=40).contains(&reference.len())
             && reference.bytes().all(|c| c.is_ascii_hexdigit()));
     if is_external || reference.starts_with('/') || work_dir.is_empty() {
+        return reference.to_string();
+    }
+
+    // A produced asset is not necessarily a file. Saved-retriever ids,
+    // namespace ids and prose such as `origin commit abc123` are legitimate
+    // references too. The old resolver joined EVERY non-URL value to the
+    // worker directory, so the card rendered those logical ids as clickable
+    // local files that could never open (observed on TUBES-2379). Resolve only
+    // values that actually have a path shape. A spaced relative path is still
+    // supported when it exists; otherwise whitespace means the worker put a
+    // description in `ref` instead of the artifact's description field and it
+    // must stay plain text rather than becoming a bogus path.
+    let (path_ref, fragment) = reference
+        .split_once('#')
+        .map(|(p, f)| (p, Some(f)))
+        .unwrap_or((reference, None));
+    let path = std::path::Path::new(path_ref);
+    let path_shaped = path_ref.starts_with("./")
+        || path_ref.starts_with("../")
+        || path_ref.contains('/')
+        || path.extension().is_some();
+    if !path_shaped {
+        return reference.to_string();
+    }
+
+    let append_fragment = |candidate: std::path::PathBuf| {
+        let mut out = candidate.to_string_lossy().into_owned();
+        if let Some(fragment) = fragment {
+            out.push('#');
+            out.push_str(fragment);
+        }
+        out
+    };
+    let direct = std::path::Path::new(work_dir).join(path);
+    if direct.exists() {
+        return append_fragment(direct);
+    }
+
+    // Workers commonly speak in repository-relative paths even when their
+    // configured cwd is a subdirectory of that repository. Prefer the nearest
+    // existing ancestor-relative match before manufacturing `a/b/a/b/file`.
+    for ancestor in std::path::Path::new(work_dir).ancestors().skip(1) {
+        let candidate = ancestor.join(path);
+        if candidate.exists() {
+            return append_fragment(candidate);
+        }
+    }
+
+    if path_ref.chars().any(char::is_whitespace) {
         reference.to_string()
     } else {
-        std::path::Path::new(work_dir).join(reference).to_string_lossy().into_owned()
+        append_fragment(direct)
+    }
+}
+
+#[cfg(test)]
+mod task_asset_resolution_tests {
+    use super::resolve_task_asset;
+
+    #[test]
+    fn logical_asset_ids_and_descriptions_do_not_become_fake_files() {
+        let cwd = "/tmp/amux-asset-resolution";
+        assert_eq!(resolve_task_asset("ret_8d00ed37a392f1", cwd), "ret_8d00ed37a392f1");
+        assert_eq!(resolve_task_asset("origin commit 3b398814dd", cwd), "origin commit 3b398814dd");
+        assert_eq!(resolve_task_asset("3b398814dd", cwd), "3b398814dd");
+        assert_eq!(
+            resolve_task_asset("migration/mxp.py (ts-parity-v2 sanction)", cwd),
+            "migration/mxp.py (ts-parity-v2 sanction)"
+        );
+    }
+
+    #[test]
+    fn file_shaped_assets_resolve_without_doubling_repo_relative_prefixes() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("mixpeek");
+        let cwd = repo.join("customers/tubescience");
+        let file = cwd.join("migration/mxp.py");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "# asset").unwrap();
+
+        assert_eq!(
+            resolve_task_asset("migration/mxp.py", cwd.to_str().unwrap()),
+            file.to_string_lossy()
+        );
+        assert_eq!(
+            resolve_task_asset(
+                "customers/tubescience/migration/mxp.py#contract",
+                cwd.to_str().unwrap()
+            ),
+            format!("{}#contract", file.to_string_lossy())
+        );
     }
 }
 
@@ -3241,7 +4192,11 @@ async fn decompose_item(
                     ask_type: None,
                     ask_question: None,
                     ask_unblocks: None,
+                    ask_actor: None,
                     source: Some("decomposition".into()),
+                    requested_by: None,
+                    callback_session: None,
+                    callback_prompt: None,
                 };
                 let mut child = bs::create_issue(conn, &new, now)?;
                 child.epic = Some(parent.id.clone());
@@ -3455,7 +4410,51 @@ fn chars_truncate_log(s: &str, n: usize) -> String {
     format!("{}…", s.chars().take(n).collect::<String>())
 }
 
-const PATCH_WRITABLE: [&str; 32] = [
+/// AF-413: which fields did a REFUSAL throw away?
+///
+/// A PATCH is atomic: when the status transition is refused, the whole body is
+/// discarded. That is the defensible choice and this does not change it. What
+/// was missing is that the refusal never SAID so — the response is a rich object
+/// (`blocked`, `error`, `gate`, `how_to_ack`, `why_blocked`) and every field in
+/// it describes the STATUS, so a caller cannot learn from it that an unrelated
+/// field went with it.
+///
+/// Measured three times in one session on 2026-09-02, on three different
+/// rejection reasons ("gate not acknowledged", "already holding doing", "done
+/// requires evidence of what was run"), one of which silently dropped a 4.2 KB
+/// card body that had just been composed. It is only cheap when the caller reads
+/// the card back out of habit; a script sending `{desc, status}` in one call
+/// loses every desc for every card whose gate is unmet and is told nothing.
+///
+/// `status` is excluded because the body already names it (`attempted_status`)
+/// and reporting it as discarded would bury the surprising fields in the
+/// unsurprising one.
+///
+/// UNKNOWN KEYS ARE NOT DISCARDED. A key outside `PATCH_WRITABLE` would not have
+/// been applied by a SUCCESSFUL patch either, so calling it a casualty of the
+/// refusal is a wrong answer, not a cautious one — it would send a caller
+/// hunting for work the refusal never destroyed. Those are `ignored_fields`, a
+/// different claim, reported on the paths that can compute it.
+///
+/// `desc_append` IS included despite being a control key rather than a writable
+/// one: it is the one control key that carries CONTENT, and it is the sanctioned
+/// way to add to a card somebody else is also writing. Dropping an append
+/// silently is the same loss as dropping a desc.
+fn discarded_by_refusal(map: &serde_json::Map<String, Value>) -> Vec<String> {
+    let mut out: Vec<String> = map
+        .keys()
+        .filter(|k| k.as_str() != "status")
+        .filter(|k| {
+            PATCH_WRITABLE.contains(&k.as_str())
+                || matches!(k.as_str(), "desc_append" | "callback")
+        })
+        .cloned()
+        .collect();
+    out.sort();
+    out
+}
+
+const PATCH_WRITABLE: [&str; 33] = [
     "title", "desc", "status", "session", "type", "depends_on", "tags", "reviewer", "shepherd",
     "epic", // AMUX-2992: assign/clear the epic a card rolls up under
     "due", "due_time", "owner_type", "pinned", "pos", "gate", "source_ref", "archived",
@@ -3479,6 +4478,7 @@ const PATCH_WRITABLE: [&str; 32] = [
     "ask_type",
     "ask_question",
     "ask_unblocks",
+    "ask_actor",
     // The continuation contract (AMUX-3946). Writable on their own for the same
     // reason the ask fields are: a lane can write the continuation first and
     // then move the card in a second call that cannot fail on content, so a
@@ -3503,7 +4503,74 @@ const PATCH_WRITABLE: [&str; 32] = [
 /// `desc_append` modifies how `desc` is written rather than naming a column,
 /// so it is control, not writable — but it MUST be listed, or it lands in
 /// `ignored_fields` and the append silently does nothing (AC-323).
-const PATCH_CONTROL: [&str; 9] = [
+#[cfg(test)]
+mod af413_discarded_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn keys(v: serde_json::Value) -> Vec<String> {
+        discarded_by_refusal(v.as_object().unwrap())
+    }
+
+    /// THE SPECIMEN. A 4.2 KB desc sent alongside a status that was gated.
+    #[test]
+    fn a_desc_sent_with_a_refused_status_is_named() {
+        assert_eq!(keys(json!({"desc": "4.2 KB of card body", "status": "doing"})), ["desc"]);
+    }
+
+    /// The other two rejection reasons hit the same day carried `type` too.
+    #[test]
+    fn every_writable_field_in_the_body_is_named_sorted() {
+        assert_eq!(
+            keys(json!({"status": "done", "desc": "x", "type": "code", "title": "t"})),
+            ["desc", "title", "type"]
+        );
+    }
+
+    /// `status` is excluded: the body already names it as `attempted_status`,
+    /// and listing it would bury the surprising fields in the unsurprising one.
+    #[test]
+    fn status_alone_discards_nothing_surprising() {
+        assert!(keys(json!({"status": "doing"})).is_empty());
+    }
+
+    /// CONTROL, and the one that keeps this honest. An unknown key would not
+    /// have been applied by a SUCCESSFUL patch either, so naming it as a
+    /// casualty of the refusal would send the caller hunting for work that was
+    /// never destroyed. Without this cell, "list every key" would pass every
+    /// other cell here.
+    #[test]
+    fn an_unknown_key_is_not_a_casualty_of_the_refusal() {
+        assert!(keys(json!({"status": "doing", "nonsense_field": 1})).is_empty());
+        assert_eq!(keys(json!({"status": "doing", "nonsense_field": 1, "desc": "x"})), ["desc"]);
+    }
+
+    /// Control keys steer the operation and carry no content, so they are not
+    /// losses. The exception is the next cell.
+    #[test]
+    fn steering_control_keys_are_not_losses() {
+        assert!(keys(json!({"status": "doing", "gate_ack": true, "expect_rev": 3,
+                            "force": true, "reason": "why"})).is_empty());
+    }
+
+    /// ...except `desc_append`, the one control key that carries CONTENT. It is
+    /// the sanctioned way to add to a card someone else is also writing, so
+    /// dropping an append silently is the same loss as dropping a desc.
+    #[test]
+    fn desc_append_is_content_and_is_reported_though_it_is_a_control_key() {
+        assert!(!PATCH_WRITABLE.contains(&"desc_append"), "premise: it is NOT a writable key");
+        assert!(PATCH_CONTROL.contains(&"desc_append"), "premise: it IS a control key");
+        assert_eq!(keys(json!({"status": "done", "desc_append": "a peer note"})), ["desc_append"]);
+    }
+
+    /// An empty body discards nothing, and must not panic.
+    #[test]
+    fn an_empty_body_names_nothing() {
+        assert!(keys(json!({})).is_empty());
+    }
+}
+
+const PATCH_CONTROL: [&str; 10] = [
     "expect_rev",
     "gate_ack",
     "gate_checked",
@@ -3516,6 +4583,9 @@ const PATCH_CONTROL: [&str; 9] = [
     // nothing — the caller then retries forever against a refusal it believes
     // it answered (the AC-323 shape this array's comment already records).
     "desc_shrink_ack",
+    // Structured write spanning the callback_* columns. Kept as one public
+    // contract so callers cannot manufacture half-armed callbacks.
+    "callback",
 ];
 
 /// One owner-notice per (owner, card, author, NOTE TEXT) per 10 minutes: a burst
@@ -3961,6 +5031,12 @@ pub async fn patch_item(
             json!({ "error": "body must be a JSON object" }),
         );
     };
+    // AF-413: computed HERE, before `map` moves into the write closure, because
+    // the refusal that needs it is built inside that closure and answered after
+    // it. Cheap (a key scan) and unconditional: a value only read on the refusal
+    // path is not worth a branch, and making it conditional would put the field
+    // behind the same reasoning that left it missing in the first place.
+    let discarded_on_refusal = discarded_by_refusal(&map);
     let (actor, actor_name) = actor_from_headers(&headers);
     // ATTRIBUTION IS REQUIRED FOR FORCE (ts-gke 2026-08-03; Python parity
     // amux-server.py ~70111). Fires on `force` ITSELF, never `eff_gate &&
@@ -4346,6 +5422,7 @@ pub async fn patch_item(
             set_opt("ask_type", &mut next.ask_type, &mut changed);
             set_opt("ask_question", &mut next.ask_question, &mut changed);
             set_opt("ask_unblocks", &mut next.ask_unblocks, &mut changed);
+            set_opt("ask_actor", &mut next.ask_actor, &mut changed);
             set_opt("next_action", &mut next.next_action, &mut changed);
             set_opt("last_result", &mut next.last_result, &mut changed);
             set_opt("unresolved", &mut next.unresolved, &mut changed);
@@ -4355,6 +5432,126 @@ pub async fn patch_item(
             set_opt("decision_rationale", &mut next.decision_rationale, &mut changed);
             set_opt("decision_supersedes", &mut next.decision_supersedes, &mut changed);
             set_opt("waiting_on", &mut next.waiting_on, &mut changed);
+            if let Some(spec) = map.get("callback") {
+                if caller_lane.is_empty() {
+                    return finish(
+                        &slot_w,
+                        PatchOut::Refused(
+                            StatusCode::BAD_REQUEST,
+                            json!({"error": "a callback requires a verified X-Amux-Worker requester"}),
+                        ),
+                        no_write(),
+                    );
+                }
+                // A delegated card's return contract belongs to its verified
+                // requester. The recipient may finish the work, but cannot
+                // silently disable the callback or redirect it to itself/a
+                // third worker. Standalone cards have no requester and may be
+                // armed by the verified worker editing them.
+                if let Some(requester) = next.requested_by.as_deref() {
+                    if requester != caller_lane {
+                        return finish(
+                            &slot_w,
+                            PatchOut::Refused(
+                                StatusCode::FORBIDDEN,
+                                json!({
+                                    "error": "only the verified requester may change this task callback",
+                                    "requester": requester,
+                                    "caller": caller_lane,
+                                }),
+                            ),
+                            no_write(),
+                        );
+                    }
+                }
+                if matches!(next.callback_state.as_deref(), Some("pending" | "dispatching" | "queued")) {
+                    return finish(
+                        &slot_w,
+                        PatchOut::Refused(
+                            StatusCode::CONFLICT,
+                            json!({
+                                "error": "this task callback has already fired or is being dispatched",
+                                "callback": next.snapshot()["callback"].clone(),
+                            }),
+                        ),
+                        no_write(),
+                    );
+                }
+                let disabling = matches!(spec, Value::Null | Value::Bool(false));
+                if !disabling && bs::is_terminal_status(&next.status) {
+                    return finish(
+                        &slot_w,
+                        PatchOut::Refused(
+                            StatusCode::CONFLICT,
+                            json!({"error": "cannot arm a completion callback after a task is already terminal"}),
+                        ),
+                        no_write(),
+                    );
+                }
+                let callback_owner = next
+                    .requested_by
+                    .clone()
+                    .unwrap_or_else(|| caller_lane.clone());
+                let (target, prompt) = match spec {
+                    Value::Null | Value::Bool(false) => (None, None),
+                    Value::Bool(true) => (Some(callback_owner.clone()), None),
+                    Value::String(s) => (
+                        Some(callback_owner.clone()),
+                        Some(s.trim().to_string()).filter(|s| !s.is_empty()),
+                    ),
+                    Value::Object(cb) => {
+                        let target = cb
+                            .get("session")
+                            .and_then(Value::as_str)
+                            .unwrap_or(&callback_owner)
+                            .trim()
+                            .to_string();
+                        let prompt = cb
+                            .get("prompt")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                        (Some(target), prompt)
+                    }
+                    _ => {
+                        return finish(
+                            &slot_w,
+                            PatchOut::Refused(
+                                StatusCode::BAD_REQUEST,
+                                json!({"error": "callback must be true, false, a prompt string, or {session?, prompt?}"}),
+                            ),
+                            no_write(),
+                        )
+                    }
+                };
+                if target.as_deref().is_some_and(|t| t != callback_owner) {
+                    return finish(
+                        &slot_w,
+                        PatchOut::Refused(
+                            StatusCode::FORBIDDEN,
+                            json!({
+                                "error": "a task callback may return only to the verified requester",
+                                "requester": callback_owner,
+                                "callback_session": target,
+                            }),
+                        ),
+                        no_write(),
+                    );
+                }
+                if next.callback_session != target || next.callback_prompt != prompt {
+                    next.callback_session = target;
+                    next.callback_prompt = prompt;
+                    next.callback_state = next.callback_session.as_ref().map(|_| "armed".into());
+                    next.callback_message_id = None;
+                    next.callback_fired_at = None;
+                    next.callback_error = None;
+                    if next.callback_session.is_some() && next.requested_by.is_none() {
+                        next.requested_by = Some(caller_lane.clone());
+                    }
+                    changed.push("callback".into());
+                }
+            }
             // A TRIGGER MUST NOT EAT AN AUTOFIX SIGNATURE (AMUX-3686).
             //
             // `source_ref` has two owners. autofix stores its fault signature
@@ -5021,25 +6218,29 @@ pub async fn patch_item(
                         // log, desc_len 0), and twice by amux, the second with a
                         // real commit sha sitting in --evidence.
                         //
-                        // Reuses `evidence_verdict` rather than testing the text
-                        // again here. That function already decides what counts
-                        // as an artifact — URL, path, sha, #N, a command, or
-                        // `none: <reason>` — and a second opinion in this file
-                        // would be the drift its own doc warns about. It also
-                        // means the DOCUMENTED escape finally works: CLAUDE.md
-                        // says `none: <reason>` "is stored and counted, not a
-                        // bypass", and until now this gate refused it, so an
-                        // honest close had to go through `--force` and was
-                        // logged as an override. That corrupted the override
-                        // signal itself — an audit of forced closes found two
-                        // that were the correct path.
-                        let evidence_names_artifact = next
-                            .evidence
-                            .as_deref()
-                            .is_some_and(|e| bs::evidence_verdict(e) == bs::EvidenceVerdict::Ok);
+                        // Evidence may satisfy the separate evidence gate with
+                        // a reproducible command, but a command is not a
+                        // produced asset. Keep the documented honest no-asset
+                        // escape, and otherwise require an actual pointer.
+                        let evidence_names_artifact = next.evidence.as_deref().is_some_and(|e| {
+                            bs::has_asset_link(e)
+                                || (e.trim().to_ascii_lowercase().starts_with("none:")
+                                    && bs::evidence_verdict(e) == bs::EvidenceVerdict::Ok)
+                        });
+                        // The explicit artifact registry is the canonical
+                        // structured path. Requiring its ref to be duplicated
+                        // in prose made a successful `amux board artifact`
+                        // write insufficient to close its own task.
+                        let registered_artifact = crate::db::artifact_store::list_for_task(
+                            conn,
+                            &next.id,
+                        )?
+                        .iter()
+                        .any(|a| !a.ref_value.trim().is_empty());
                         let has_link = bs::has_asset_link(&next.desc)
                             || next.log.as_deref().is_some_and(bs::has_asset_link)
-                            || evidence_names_artifact;
+                            || evidence_names_artifact
+                            || registered_artifact;
                         if !has_link {
                             // Surfaces so a sweep catches the next one without a
                             // human noticing (two-fixes rule): grep
@@ -5081,7 +6282,7 @@ pub async fn patch_item(
                                             // this only stops the message promising it.
                                             "or_evidence": "--evidence naming the artifact satisfies this gate too (a repo path, URL, sha or #PR). A bare command does NOT: it says how to reproduce the finding, not what the work created. This card's evidence is empty or has nothing checkable in it.",
                                             "no_artifact": "If the work genuinely produced none, say so: evidence starting `none: <reason>` (three words or more) is accepted and counted, not a bypass.",
-                                            "override_for_this_worker": "set AMUX_DONE_LINK_REQUIRED=0 in this worker's (or its group's, or the global) scope env — Scope tab.",
+                                            "override_for_this_worker": "set AMUX_DONE_LINK_REQUIRED=0 in this worker's (or its group's, or the global) configuration.",
                                             "force": "true (explicit bypass; logged)"
                                         }
                                     }),
@@ -5158,7 +6359,7 @@ pub async fn patch_item(
                                                 "`none: <reason>` when the card genuinely produced no artifact (stored and counted, not a bypass)"
                                             ],
                                             "what_to_run": "the repo's VERIFY.md names the proof for each surface",
-                                            "override_for_this_worker": "set AMUX_DONE_EVIDENCE_REQUIRED=0 in this worker's (or its group's, or the global) scope env — Scope tab.",
+                                            "override_for_this_worker": "set AMUX_DONE_EVIDENCE_REQUIRED=0 in this worker's (or its group's, or the global) configuration.",
                                             "force": "true (explicit bypass; logged)"
                                         }
                                     }),
@@ -5239,7 +6440,7 @@ pub async fn patch_item(
                                             "not_next": format!("amux board backlog <ID> --trigger \"<what re-arms it>\" — `backlog` is unbounded on purpose and is where a real card that is not NEXT belongs"),
                                             "not_a_unit_of_work": "amux board discard <ID>",
                                             "finish_one": "amux board done <ID> --evidence-stdin",
-                                            "raise_it": "set AMUX_TODO_WIP_LIMIT=<n> in this worker's / group's / global scope env (Scope tab); 0 disables it",
+                                            "raise_it": "set AMUX_TODO_WIP_LIMIT=<n> in this worker's / group's / global configuration; 0 disables it",
                                             "force": "true (explicit bypass; logged)"
                                         }
                                     }),
@@ -5289,7 +6490,7 @@ pub async fn patch_item(
                                             "on_another_card": "PATCH {\"depends_on\": [\"<ID>\"]} — the card that has to land first",
                                             "on_a_condition": "amux board backlog <ID> --trigger \"<the condition that re-arms it>\" — re-checked, so the card comes back on its own",
                                             "on_a_person": "amux board needsyou <ID> --ask <type> --question \"...\" --unblocks \"...\" (AF-318)",
-                                            "override_for_this_worker": "set AMUX_BLOCKED_NEEDS_WATCH=0 in this worker's / group's / global scope env (Scope tab).",
+                                            "override_for_this_worker": "set AMUX_BLOCKED_NEEDS_WATCH=0 in this worker's / group's / global configuration.",
                                             "force": "true (explicit bypass; logged)"
                                         }
                                     }),
@@ -5373,7 +6574,7 @@ pub async fn patch_item(
                                         "fields": "next_action is what to do next; last_result is what the previous attempt produced; unresolved is what is still open. Only next_action is gated — a card should not have to invent an open question to be claimable.",
                                         "escape": "amux board doing <ID> --force  (audited, and it is the honest move when the next action genuinely is not knowable yet)",
                                         "scope": "This gate is on `doing` only, and only for lanes that have opted in.",
-                                        "override_for_this_worker": "set AMUX_CONTINUATION_REQUIRED=0 in this worker's (or its group's, or the global) scope env — Scope tab.",
+                                        "override_for_this_worker": "set AMUX_CONTINUATION_REQUIRED=0 in this worker's (or its group's, or the global) configuration.",
                                     }),
                                 ),
                                 no_write(),
@@ -5385,6 +6586,7 @@ pub async fn patch_item(
                         && bs::needsyou_ask_required(next.session.as_deref());
                     if ask_required {
                         let verdict = bs::ask_verdict(
+                            next.ask_actor.as_deref().unwrap_or(""),
                             next.ask_type.as_deref().unwrap_or(""),
                             next.ask_question.as_deref().unwrap_or(""),
                             next.ask_unblocks.as_deref().unwrap_or(""),
@@ -5399,9 +6601,17 @@ pub async fn patch_item(
                                     "That is not one of the five kinds of human act. The vocabulary is closed on purpose: a block that fits none of them is not a block on a person.",
                                     "needsyou_ask_type_unknown",
                                 ),
+                                bs::AskVerdict::NoActor => (
+                                    "`ask_actor` must name the specific person or external actor who can answer. Generic placeholders are not routable and are how cards disappear into a human-shaped queue.",
+                                    "needsyou_requires_specific_actor",
+                                ),
                                 bs::AskVerdict::NoQuestion => (
                                     "`ask_question` has to be an actual question, in a sentence. \"Blocked on Ethan\" with no question is not an ask — that phrasing is most of what is sitting in this queue today.",
                                     "needsyou_ask_has_no_question",
+                                ),
+                                bs::AskVerdict::NotAQuestion => (
+                                    "`ask_question` must be an actual direct question containing `?`, not a status note or an instruction the worker could continue itself.",
+                                    "needsyou_ask_is_not_a_question",
                                 ),
                                 bs::AskVerdict::NoUnblocks => (
                                     "`ask_unblocks` has to say what ENDS the block, in a sentence. Without it nobody but you can tell whether an answer has landed, so the card cannot leave this queue except by you noticing.",
@@ -5432,6 +6642,7 @@ pub async fn patch_item(
                                         "why": why,
                                         "recorded_ask": {
                                             "ask_type": next.ask_type,
+                                            "ask_actor": next.ask_actor,
                                             "ask_question": next.ask_question,
                                             "ask_unblocks": next.ask_unblocks,
                                         },
@@ -5439,10 +6650,10 @@ pub async fn patch_item(
                                             .map(|(k, v)| json!({"type": k, "means": v}))
                                             .collect::<Vec<_>>(),
                                         "how_to_fix": {
-                                            "cli": format!("amux board needsyou {} --ask <type> --question-stdin --unblocks \"...\"", next.id),
-                                            "api": "PATCH /api/board/<id> with {\"ask_type\":\"...\",\"ask_question\":\"...\",\"ask_unblocks\":\"...\"} — all three writable on their own, so record them first and the transition cannot discard them",
+                                            "cli": format!("amux board needsyou {} --actor <name> --ask <type> --question \"...?\" --unblocks \"...\"", next.id),
+                                            "api": "PATCH /api/board/<id> with {\"ask_actor\":\"named person\",\"ask_type\":\"...\",\"ask_question\":\"...?\",\"ask_unblocks\":\"...\"} — record them before the transition",
                                             "if_it_is_not_human_blocked": "then it is not `needsyou`. Use `backlog --trigger \"<condition>\"` for an external wait that re-arms itself, or leave it in `doing` and work the blocker.",
-                                            "override_for_this_worker": "set AMUX_NEEDSYOU_ASK_REQUIRED=0 in this worker's (or its group's, or the global) scope env — Scope tab.",
+                                            "override_for_this_worker": "set AMUX_NEEDSYOU_ASK_REQUIRED=0 in this worker's (or its group's, or the global) configuration.",
                                             "force": "true (explicit bypass; logged)"
                                         }
                                     }),
@@ -5972,6 +7183,45 @@ pub async fn patch_item(
                             next.reviewer.as_deref().unwrap_or("(none)")
                         ),
                         "owner_type" => format!("owner_type -> {}", next.owner_type),
+                        // THE ONE FIELD WHERE THE LOG NAMES WHAT WAS DESTROYED
+                        // RATHER THAN WHAT ARRIVED (AF-459).
+                        //
+                        // The rule three comments up — "VALUES ARE SUMMARISED,
+                        // NOT COPIED ... the new value is already on the card" —
+                        // is right for every other field and inverts for this
+                        // one. `--trigger` is a plain overwrite; only an
+                        // `autofix:` prefix is protected (AMUX-3686 above), and
+                        // that narrowness is deliberate. So when a trigger
+                        // replaces a trigger, the OLD value exists nowhere: not
+                        // on the card, not in /api/history, not in this log,
+                        // which recorded the bare word "source_ref". There is no
+                        // redundancy to trade against readability here, because
+                        // the column that just got written WAS the only copy.
+                        //
+                        // gtm-engine lost a five-item inventory from 2026-08-09
+                        // this way, probing whether --trigger works on an
+                        // archived card (it does). They recovered four items
+                        // from a prefix they had happened to print earlier in
+                        // their own transcript. The fifth is gone. Second known
+                        // clobber of this field on that board.
+                        //
+                        // The old value is kept LONG (200 vs the 60 used for
+                        // arrivals) for the same reason: a truncated sole copy
+                        // reproduces the exact partial-recovery they got by
+                        // accident.
+                        "source_ref" => {
+                            let before = row.source_ref.as_deref().unwrap_or("");
+                            let after = next.source_ref.as_deref().unwrap_or("(cleared)");
+                            if before.is_empty() {
+                                format!("source_ref -> {}", chars_truncate_log(after, 60))
+                            } else {
+                                format!(
+                                    "source_ref: WAS {} -> {}",
+                                    chars_truncate_log(before, 200),
+                                    chars_truncate_log(after, 60)
+                                )
+                            }
+                        }
                         "archived" => {
                             // ARCHIVING A TRIGGER-BEARING CARD DE-ARMS IT, SILENTLY
                             // (AMUX-3715, reported by tubescience). `archived`
@@ -6283,7 +7533,27 @@ pub async fn patch_item(
     match outcome {
         None => internal("patch produced no outcome"),
         Some(PatchOut::NotFound) => not_found(&id),
-        Some(PatchOut::Refused(status, body)) => err(status, body),
+        Some(PatchOut::Refused(status, mut body)) => {
+            // AF-413: say what the refusal threw away, at the ONE place every
+            // refusal converges. There are 16 sites that build a refusal body;
+            // decorating each would cover today's and miss the next one, which
+            // is the rule-1 shape this card is an instance of.
+            //
+            // ALWAYS EMITTED, INCLUDING EMPTY. `discarded: []` means "nothing
+            // beyond the status was lost"; the key's ABSENCE would mean a server
+            // that does not compute this at all, and a caller cannot tell those
+            // apart if it is omitted when empty (ethos rule 4).
+            let dropped = discarded_on_refusal;
+            if !dropped.is_empty() {
+                body["discarded_note"] = json!(format!(
+                    "the transition was refused, so the WHOLE body was discarded — \
+                     {} was NOT applied and must be re-sent, separately from the status",
+                    dropped.join(", ")
+                ));
+            }
+            body["discarded"] = json!(dropped);
+            err(status, body)
+        }
         Some(PatchOut::Noop { mut body, ignored, all_ignored }) => {
             body["applied"] = json!(false);
             if !ignored.is_empty() {
@@ -6542,72 +7812,42 @@ pub async fn patch_item(
                     }
                 }
             }
-            // REACTIVE PICKUP: when a card transitions to a terminal state,
-            // immediately check if the lane has a next todo card and claim it.
-            // This removes the up-to-60s wait for the board-drive tick. The
-            // delivery still goes through steer_enqueue (turn-boundary gated),
-            // so this cannot interrupt a mid-turn session.
+            // Immediate path for an interactive terminal transition. The
+            // periodic board-drive pass is the crash/non-HTTP recovery path;
+            // doing both gives the caller real-time callback status without
+            // sacrificing durability.
+            let callback_pending = body
+                .pointer("/callback/state")
+                .and_then(Value::as_str)
+                .is_some_and(|s| matches!(s, "pending" | "dispatching"));
+            if callback_pending {
+                let dispatch = dispatch_pending_callbacks(&state, Some(&id)).await;
+                body["callback_dispatch"] = json!({
+                    "attempted": dispatch.attempted,
+                    "queued": dispatch.queued,
+                    "refused": dispatch.refused,
+                });
+                if let Ok(conn) = state.store.read() {
+                    if let Ok(Some(latest)) = bs::get_issue(&conn, &id) {
+                        body["callback"] = latest.snapshot()["callback"].clone();
+                        body["log"] = latest.snapshot()["log"].clone();
+                        body["rev"] = latest.snapshot()["rev"].clone();
+                    }
+                }
+            }
+            // REACTIVE DRIVE through the same gates as the periodic sweep.
             if let Some((session, _from, to)) = status_transition {
                 if matches!(to.as_str(), "done" | "verified" | "discarded")
                     && !session.is_empty()
                 {
                     let st = state.clone();
                     tokio::spawn(async move {
-                        reactive_pickup(&st, &session).await;
+                        let _ = crate::runtime_jobs::board_drive::drive_session(&st, &session).await;
+                        crate::api::session_verbs::steer_deliver_for_session(&st, &session).await;
                     });
                 }
             }
             (StatusCode::OK, Json(body)).into_response()
-        }
-    }
-}
-
-// ---- Reactive pickup (AMUX board-drive latency fix) -----------------------
-//
-// When a card transitions to done/verified/discarded, fire an immediate pickup
-// for the same session instead of waiting for the 60s board-drive tick. Uses the
-// SAME select_pickup + claim_card + deliver path as the drive loop, so every
-// guard (WIP cap, junk filter, freshness, cooldowns) applies identically.
-//
-// This is a SUPPLEMENT, not a replacement. The drive tick remains the backstop
-// (a crashed reactive path is invisible; the tick is visible in the trace). The
-// trace does NOT record reactive pickups — they are not part of the sweep — but
-// the `task.claimed` event they emit IS what the drive tick reads to avoid
-// re-claiming.
-
-async fn reactive_pickup(state: &AppState, session: &str) {
-    use crate::runtime_jobs::board_drive::{select_pickup, Pickup};
-
-    let conn = match state.store.read() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
-    let pickup = select_pickup(&conn, session, now);
-    drop(conn);
-
-    if let Pickup::Claim { card, prompt } = pickup {
-        // Same compare-and-swap guard as the drive loop (AMUX-2983): only
-        // dispatch if the atomic claim took. This reactive path has the exact
-        // race — select_pickup then drop(conn) then claim — so an unconditional
-        // claim+dispatch could re-open and re-run a card closed in the gap.
-        if crate::runtime_jobs::board_drive::claim_card(state, session, &card).await {
-            let _ = crate::api::session_verbs::steer_enqueue(
-                state,
-                session,
-                &prompt,
-                &format!("{}:reactive", crate::api::session_verbs::BOARD_DRIVE_GUARD),
-                "",
-            )
-            .await;
-            tracing::info!(
-                session,
-                card = card.as_str(),
-                "reactive pickup: claimed {card} immediately after status change"
-            );
         }
     }
 }
@@ -7994,8 +9234,12 @@ mod slim_tests {
             ask_type: None,
             ask_question: None,
             ask_unblocks: None,
+            ask_actor: None,
             // AF-367: the HTTP create path: a real POST /api/board from a lane or a human.
             source: Some("agent".into()),
+            requested_by: None,
+            callback_session: None,
+            callback_prompt: None,
         }
     }
 
@@ -8095,4 +9339,60 @@ mod slim_tests {
         );
         assert_eq!(bs::get_issue(&conn, &cap.id).unwrap().unwrap().status, "doing");
     }
+}
+
+#[cfg(test)]
+mod bulk_migrate_tests {
+    use super::*;
+
+    /// AMUX-4044. The safety property of bulk migrate is that a GATED column
+    /// cannot be filled in one click, so this is the cell that has to hold.
+    ///
+    /// Measured on the live board when this shipped: `doing`, `review`, `done`
+    /// and `verified` carry gates; `backlog`, `todo` and `discarded` do not.
+    /// One acknowledgement across 489 backlog cards would assert all four of
+    /// `verified`'s criteria about work nobody opened, which is the claim
+    /// AF-321 exists to refuse.
+    /// AMUX-4044. The response must say WHY a whole column refused.
+    ///
+    /// Built from the live specimen: `todo -> done` returned HTTP 200 with
+    /// `considered: 147, moved: 0` and 147 identical
+    /// `GateBlocked{criteria:["Implemented and merged","Tests / lint pass"]}`
+    /// refusals. Every card was correctly stopped by `advance` — the belt held
+    /// — but the caller got a success with a zero in it and had to infer the
+    /// reason from an array.
+    #[test]
+    fn a_column_that_unanimously_refuses_a_gate_is_reported_as_a_gate() {
+        let gb = |id: &str| {
+            json!({"id": id, "why": "GateBlocked { criteria: [\"Implemented and merged\"] }"})
+        };
+
+        // THE SPECIMEN, shrunk: every considered card refused the same gate.
+        let all = vec![gb("A-1"), gb("A-2"), gb("A-3")];
+        assert!(
+            unanimous_gate(3, 0, &all).is_some(),
+            "a column where every card refused one gate must be reported as gated"
+        );
+
+        // PARTIAL SUCCESS IS NOT A GATE. If anything moved, the operation did
+        // what it said and the refusals are per-card business.
+        assert_eq!(unanimous_gate(3, 1, &all[..2]), None, "a partial move is not a gate refusal");
+
+        // MIXED REASONS MUST NOT FLATTEN. One gate message over a column whose
+        // cards failed for different reasons hides everything but the first.
+        let mixed = vec![gb("A-1"), json!({"id": "A-2", "why": "Stale { actual: \"doing\" }"})];
+        assert_eq!(
+            unanimous_gate(2, 0, &mixed),
+            None,
+            "different refusals are a mixed result, not one gate"
+        );
+
+        // A non-gate unanimous refusal is also not a gate.
+        let stale = vec![json!({"id": "A-1", "why": "Stale { actual: \"doing\" }"})];
+        assert_eq!(unanimous_gate(1, 0, &stale), None, "only GateBlocked reads as a gate");
+
+        // Nothing considered is nothing to report.
+        assert_eq!(unanimous_gate(0, 0, &[]), None, "an empty column is not a gate refusal");
+    }
+
 }

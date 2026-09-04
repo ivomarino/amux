@@ -409,6 +409,55 @@ rm -f "$w/.git/hooks/pre-push"
 out=$(hooks_run "$w")
 says "MISSING" "$out"
 
+# ── AF-409: the PreToolUse guard, which no installer covered ─────────────────
+#
+# ~/.claude/settings.json invokes ~/.amux/hooks/git-shared-guard.py, outside any
+# checkout, so the loop above — keyed on `git rev-parse --git-path hooks` — is
+# structurally blind to it. It ran 148 lines and three days behind a
+# command-substitution BYPASS fix, and `echo "$(git add -A)"` was ALLOWED by the
+# copy that was live.
+#
+# The THIRD state is the one worth cells: an ABSENT destination means "not an amux
+# host", which is not drift. Reporting it as drift would make this line fire on
+# every machine that is not this one, and a warning that always fires is one people
+# stop reading — the same argument the silence cells above make.
+PGMARK="the PreToolUse shared-checkout guard differs from this checkout"
+
+# (p1) DRIFT: the two copies differ, so say so.
+w=$(hooks_repo pg_drift)
+mkdir -p "$w/scripts/git-hooks" "$TMP/pg_drift/dest"
+printf 'repo version\n'    > "$w/scripts/git-hooks/git-shared-guard.py"
+printf 'running version\n' > "$TMP/pg_drift/dest/git-shared-guard.py"
+out=$(cd "$w"; AMUX_SESSION="" AMUX_OBSERVED_EDITS_LOG="" \
+      AMUX_SHARED_GUARD_DEST="$TMP/pg_drift/dest/git-shared-guard.py" \
+      AMUX_RS_BUILD_PROVENANCE="$TMP/no-such-provenance.json" \
+      bash .claude/session-freshness.sh 2>&1)
+says "$PGMARK" "$out"
+says "install-hooks.sh" "$out"
+
+# (p2) IDENTICAL: silent. Without this, a version that warned unconditionally
+#      would pass (p1) while being pure noise on every correctly-installed host.
+w=$(hooks_repo pg_same)
+mkdir -p "$w/scripts/git-hooks" "$TMP/pg_same/dest"
+printf 'same bytes\n' > "$w/scripts/git-hooks/git-shared-guard.py"
+printf 'same bytes\n' > "$TMP/pg_same/dest/git-shared-guard.py"
+out=$(cd "$w"; AMUX_SESSION="" AMUX_OBSERVED_EDITS_LOG="" \
+      AMUX_SHARED_GUARD_DEST="$TMP/pg_same/dest/git-shared-guard.py" \
+      AMUX_RS_BUILD_PROVENANCE="$TMP/no-such-provenance.json" \
+      bash .claude/session-freshness.sh 2>&1)
+lacks "$PGMARK" "$out"
+
+# (p3) DESTINATION ABSENT: not an amux host, not drift. This is the arm that keeps
+#      the check from firing everywhere it does not apply.
+w=$(hooks_repo pg_nodest)
+mkdir -p "$w/scripts/git-hooks"
+printf 'repo version\n' > "$w/scripts/git-hooks/git-shared-guard.py"
+out=$(cd "$w"; AMUX_SESSION="" AMUX_OBSERVED_EDITS_LOG="" \
+      AMUX_SHARED_GUARD_DEST="$TMP/pg_nodest/definitely/not/here.py" \
+      AMUX_RS_BUILD_PROVENANCE="$TMP/no-such-provenance.json" \
+      bash .claude/session-freshness.sh 2>&1)
+lacks "$PGMARK" "$out"
+
 # ── AF-375: is one of the drifting hooks a file THIS session edited? ─────────
 #
 # The block above was already correct, already specific, and already printed at

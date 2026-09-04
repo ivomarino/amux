@@ -58,6 +58,9 @@ test('isolated worker stays off the board and out of peer discovery', async ({ p
     expect(relay.status()).toBe(403);
     const refusal = await relay.json();
     expect(refusal.error).toContain('isolated');
+    expect(refusal.blocked).toBe('isolated');
+    expect(refusal.code).toBe('isolated_target');
+    expect(refusal.grant_id, 'approval cannot make a raw isolated lane peer-reachable').toBeUndefined();
 
     const board = await request.get('/api/board?done_limit=0', { headers: auth });
     expect(board.status()).toBe(200);

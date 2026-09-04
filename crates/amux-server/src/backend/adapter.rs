@@ -313,6 +313,18 @@ impl TerminalAdapter {
         if clean.trim().is_empty() {
             return Vec::new();
         }
+        // Authentication failure outranks a provider's idle prompt. Codex
+        // renders both at once; allowing the provider-specific scan to fall
+        // through made an unusable isolated worker read IDLE for 49 minutes.
+        // A person must sign in, so this is intentionally non-retryable.
+        if matches!(self.provider.as_str(), "codex" | "ollama") {
+            if let Some(marker) = auth_failure_state(&clean) {
+                return vec![WorkerEvent::Failed(Failure {
+                    reason: format!("provider authentication required: {marker}"),
+                    retryable: false,
+                })];
+            }
+        }
         match self.provider.as_str() {
             "claude" | "claude-code" => scan_claude(&clean, &self.provider),
             "gemini" => scan_gemini(&clean, &self.provider),
@@ -404,6 +416,32 @@ fn is_prompt_line(s: &str) -> bool {
 
 fn is_dingbat_lead(s: &str) -> bool {
     matches!(s.chars().next(), Some(c) if ('\u{2700}'..='\u{27bf}').contains(&c) || c == '\u{b7}')
+}
+
+/// A provider authentication failure that leaves the CLI drawn at an input
+/// prompt but unable to accept work. The leading solid square is Codex's own
+/// error marker and is load-bearing: matching the sentence alone would flag a
+/// worker that is merely discussing an old auth incident in its transcript.
+///
+/// Live specimen (amux-codex, 2026-09-03):
+/// `■ Your access token could not be refreshed because you have since logged
+/// out or signed in to another account. Please sign in again.`
+fn auth_failure_state(clean: &str) -> Option<String> {
+    nonempty_trimmed(clean).iter().rev().take(12).find_map(|line| {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('■') {
+            return None;
+        }
+        let low = trimmed.to_ascii_lowercase();
+        let refresh_failed = low.contains("access token could not be refreshed")
+            || low.contains("authentication token could not be refreshed")
+            || low.contains("failed to refresh authentication token");
+        let login_required = low.contains("please sign in again")
+            || low.contains("please log in again")
+            || low.contains("signed out")
+            || low.contains("logged out");
+        (refresh_failed && login_required).then(|| trimmed.to_string())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1207,6 +1245,13 @@ gemini-2.5-pro";
     const FX_CODEX_IDLE: &str = "\
 › implement {feature}
   gpt-5.5 xhigh · ~/Dev/amux";
+    const FX_CODEX_AUTH: &str = "\
+› [09:04 AM] Reply only with isolated-ok.
+
+■ Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again.
+
+› Ask Codex to do anything
+  gpt-5.5 xhigh · ~/Dev/amux";
 
     const FX_OLLAMA_NO_DAEMON: &str = "Error: could not connect to ollama app, is it running?";
     const FX_OLLAMA_NO_MODEL: &str = "Error: model 'llama3:70b' not found, try pulling it first";
@@ -1449,8 +1494,10 @@ gemini-2.5-pro";
 
     #[test]
     fn unknown_provider_scans_empty_even_on_matching_text() {
-        let ev = adapter("a-provider-from-2031").scan(FX_WEEKLY);
-        assert!(ev.is_empty(), "{ev:?}");
+        for frame in [FX_WEEKLY, FX_CODEX_AUTH] {
+            let ev = adapter("a-provider-from-2031").scan(frame);
+            assert!(ev.is_empty(), "unknown providers need explicit pattern knowledge: {ev:?}");
+        }
     }
 
     // -- Gemini --------------------------------------------------------------
@@ -1489,6 +1536,27 @@ gemini-2.5-pro";
     fn codex_idle_prompt() {
         let ev = adapter("codex").scan(FX_CODEX_IDLE);
         assert_eq!(waiting_reasons(&ev), vec!["idle_prompt"], "{ev:?}");
+    }
+
+    #[test]
+    fn codex_auth_failure_is_failed_not_idle() {
+        let ev = adapter("codex").scan(FX_CODEX_AUTH);
+        let fs = failures(&ev);
+        assert_eq!(fs.len(), 1, "the live auth wall must produce one failure: {ev:?}");
+        assert!(!fs[0].retryable, "sign-in requires a person; retrying cannot repair it");
+        assert!(fs[0].reason.contains("Please sign in again"));
+        assert!(
+            waiting_reasons(&ev).is_empty(),
+            "the model bar below the auth wall must not overwrite failure with idle: {ev:?}"
+        );
+    }
+
+    #[test]
+    fn quoted_codex_auth_text_is_not_a_failure() {
+        let frame = "› Explain the sentence: Your access token could not be refreshed. Please sign in again.\n\n  gpt-5.5 xhigh · ~/Dev/amux";
+        let ev = adapter("codex").scan(frame);
+        assert!(failures(&ev).is_empty(), "a user prompt quoting the error is not UI chrome: {ev:?}");
+        assert_eq!(waiting_reasons(&ev), vec!["idle_prompt"]);
     }
 
     // -- Status detection regressions ----------------------------------------

@@ -8,17 +8,20 @@
 //! - `default` (or empty)  -> `<amux_home>/playwright-auth/profile`
 //! - named, legacy         -> `<amux_home>/playwright-auth/profiles/<name>`
 //!   when that directory exists (the 35+ real logged-in profiles are here)
-//! - named, otherwise      -> `<chrome-user-data-dir>/<name>` (a Chrome
-//!   `--profile-directory` inside the user's real Chrome data dir)
+//! - named, otherwise      -> imported on first use from
+//!   `<chrome-user-data-dir>/<name>` into the amux-owned location above
 //!
 //! NEW profiles are created under `playwright-auth/profiles/<name>` — the
 //! amux-owned location — because this launcher passes `--user-data-dir`
 //! straight at the profile dir. (Python's create targets the shared Chrome
 //! dir for browser-use interop; the native launcher IS the consumer here, so
 //! amux-owned is the location whose create-path == use-path.) Existing
-//! Chrome-dir profiles still resolve and launch via
-//! `--user-data-dir=<chrome dir> --profile-directory=<name>`, exactly like
-//! `_bu_profile_launch_target`.
+//! Chrome-dir profiles are never launched in place. Chrome locks its ENTIRE
+//! user-data-dir even when a different `--profile-directory` is selected, so
+//! doing that made automation require quitting every ordinary Chrome window.
+//! First use now takes an atomic, cache-free snapshot into an isolated amux
+//! user-data-dir and launches the snapshot. The user's browser can stay open,
+//! and its profile is never driven or mutated by amux.
 //!
 //! Lock-file hygiene: Chrome drops `SingletonLock`/`SingletonCookie`/
 //! `SingletonSocket` on a clean exit and leaves them when killed; a stale set
@@ -109,6 +112,177 @@ pub fn launch_target(home: &Path, chrome_dir: &Path, name: &str) -> LaunchTarget
     } else {
         LaunchTarget { user_data_dir: d, profile_directory: None }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedChromeProfile {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+    pub files: u64,
+    pub bytes: u64,
+}
+
+/// Import a human Chrome profile into an isolated amux user-data-dir.
+///
+/// Chrome's profile lock belongs to the whole user-data-dir, not the selected
+/// profile directory. Launching `--user-data-dir=<the human Chrome dir>` thus
+/// delegates to an already-running Chrome and exits before CDP binds. More
+/// importantly, deleting that lock to force the launch would risk the user's
+/// browser data. A point-in-time copy is the safe boundary: workers get the
+/// login state they selected while ordinary Chrome remains independent.
+///
+/// The copy is assembled under a unique sibling and renamed into place, so a
+/// crash never exposes a half-profile as runnable. Volatile caches and lock
+/// files are omitted; Chrome recreates them. Symlinks are skipped so a profile
+/// cannot make the importer escape either tree.
+pub fn import_chrome_profile(
+    home: &Path,
+    chrome_dir: &Path,
+    name: &str,
+) -> anyhow::Result<Option<ImportedChromeProfile>> {
+    let name = name.trim();
+    if name.is_empty() || name == "default" {
+        return Ok(None);
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
+        anyhow::bail!("Chrome profile name must be [A-Za-z0-9._-]+");
+    }
+    let destination = home.join("playwright-auth").join("profiles").join(name);
+    if destination.is_dir() {
+        return Ok(None);
+    }
+    let source = chrome_dir.join(name);
+    if !source.is_dir() {
+        anyhow::bail!(
+            "Chrome profile {name:?} does not exist at {}; create an amux profile with POST \
+             /api/browser/profile/create instead",
+            source.display()
+        );
+    }
+
+    let parent = destination
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("browser profile destination has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp = parent.join(format!(".import-{name}-{}-{stamp}", std::process::id()));
+    let copied = (|| -> anyhow::Result<(u64, u64)> {
+        std::fs::create_dir(&temp)?;
+        let profile_root = temp.join("Default");
+        let mut stats = (0u64, 0u64);
+        copy_profile_tree(&source, &profile_root, &mut stats)?;
+        copy_import_local_state(chrome_dir, name, &temp)?;
+        Ok(stats)
+    })();
+    let (files, bytes) = match copied {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&temp);
+            return Err(e);
+        }
+    };
+    match std::fs::rename(&temp, &destination) {
+        Ok(()) => {}
+        // A concurrent importer won the race. Its atomic destination is valid;
+        // discard our complete duplicate and let this start use the winner.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && destination.is_dir() => {
+            let _ = std::fs::remove_dir_all(&temp);
+            return Ok(None);
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&temp);
+            return Err(e.into());
+        }
+    }
+    // This is selected login state, not disposable scratch. Registering it
+    // exempts the isolated copy from the profile TTL reaper. A failed registry
+    // write rolls back only the destination we just created; the human source
+    // remains untouched throughout.
+    if let Err(e) = registry_register(home, name, "", "") {
+        let _ = std::fs::remove_dir_all(&destination);
+        return Err(e.context("register imported Chrome profile"));
+    }
+    Ok(Some(ImportedChromeProfile { source, destination, files, bytes }))
+}
+
+fn copy_profile_tree(src: &Path, dst: &Path, stats: &mut (u64, u64)) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = match entry {
+            Ok(v) => v,
+            // A live Chrome can rotate a transient entry between read_dir and
+            // inspection. A vanished cache is not an import failure.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let name = entry.file_name();
+        let label = name.to_string_lossy();
+        if import_entry_is_volatile(&label) {
+            continue;
+        }
+        let ty = match entry.file_type() {
+            Ok(v) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let to = dst.join(&name);
+        if ty.is_symlink() {
+            continue;
+        }
+        if ty.is_dir() {
+            copy_profile_tree(&entry.path(), &to, stats)?;
+        } else if ty.is_file() {
+            match std::fs::copy(entry.path(), &to) {
+                Ok(n) => {
+                    stats.0 += 1;
+                    stats.1 += n;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn import_entry_is_volatile(name: &str) -> bool {
+    name == "LOCK"
+        || name.starts_with("Singleton")
+        || matches!(
+            name,
+            "Cache"
+                | "Code Cache"
+                | "GPUCache"
+                | "DawnCache"
+                | "GrShaderCache"
+                | "GraphiteDawnCache"
+                | "ShaderCache"
+                | "Crashpad"
+        )
+}
+
+fn copy_import_local_state(chrome_dir: &Path, source_name: &str, dst: &Path) -> anyhow::Result<()> {
+    let path = chrome_dir.join("Local State");
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let mut value: serde_json::Value = serde_json::from_str(&raw)?;
+    if let Some(profile) = value.get_mut("profile").and_then(serde_json::Value::as_object_mut) {
+        let source_info = profile
+            .get("info_cache")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|m| m.get(source_name))
+            .cloned()
+            .unwrap_or_else(|| json!({ "name": source_name }));
+        profile.insert("last_used".into(), json!("Default"));
+        profile.insert("last_active_profiles".into(), json!(["Default"]));
+        profile.insert("info_cache".into(), json!({ "Default": source_info }));
+    }
+    std::fs::write(dst.join("Local State"), serde_json::to_vec(&value)?)?;
+    Ok(())
 }
 
 /// Is this dir one amux owns outright (safe to create, clean locks in,
@@ -257,6 +431,43 @@ pub fn clean_locks(dir: &Path) -> Vec<String> {
         }
     }
     removed
+}
+
+/// PID Chrome records in the `SingletonLock` symlink (`<host>-<pid>`).
+///
+/// Chrome places the lock at the USER-DATA-DIR level, not inside the selected
+/// `--profile-directory`. That distinction matters for profiles from the
+/// human's normal Chrome: launching `Profile 7` while `Default` is open still
+/// delegates the URL to the already-running Chrome process. Parsing from the
+/// right keeps hostnames containing dashes valid.
+fn singleton_lock_owner_pid(dir: &Path) -> Option<u32> {
+    let target = std::fs::read_link(dir.join("SingletonLock")).ok()?;
+    let target = target.to_string_lossy();
+    let (_, pid) = target.rsplit_once('-')?;
+    let pid = pid.parse::<u32>().ok()?;
+    (pid != 0).then_some(pid)
+}
+
+/// A live Chrome outside amux already owns this human user-data-dir.
+///
+/// Never infer this from lock PRESENCE alone: Chrome can leave stale locks
+/// after a crash. The PID recorded in `SingletonLock` must still be alive, and
+/// it must not be one of amux's registered browsers (a same-profile restart is
+/// allowed to reach the normal stop-and-replace path below).
+fn unmanaged_live_lock_owner(home: &Path, dir: &Path) -> Option<u32> {
+    if is_amux_owned(home, dir) {
+        return None;
+    }
+    let pid = singleton_lock_owner_pid(dir)?;
+    if !pid_alive(pid) {
+        return None;
+    }
+    let managed = RUNNING
+        .lock()
+        .expect("browser registry poisoned")
+        .values()
+        .any(|r| r.pid == pid);
+    (!managed).then_some(pid)
 }
 
 /// Startup reconcile: at boot no amux-launched Chrome exists, so any lock in
@@ -966,6 +1177,14 @@ fn amux_cert_spki_b64(home: &Path) -> Option<String> {
 #[derive(Debug, Clone, Serialize)]
 pub struct StartedBrowser {
     pub profile: String,
+    /// Present only on the first start of a profile selected from ordinary
+    /// Chrome. The browser runs from `user_data_dir`, never from this source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_imported_from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_imported_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_imported_bytes: Option<u64>,
     pub pid: Option<u32>,
     pub cdp_port: u16,
     pub cdp_http: String,
@@ -1180,10 +1399,6 @@ pub async fn start(
     started_by: &str,
     headless: bool,
 ) -> anyhow::Result<StartedBrowser> {
-    let binary = chrome_binary().ok_or_else(|| {
-        anyhow::anyhow!("no Chrome/Chromium binary found (looked in /Applications and PATH)")
-    })?;
-
     // A Chrome from a PREVIOUS server process may still hold this profile. The
     // RUNNING registry is in-memory and does not survive the builder's constant
     // re-exec, so start() used to be blind to that orphan: it checked only
@@ -1193,8 +1408,77 @@ pub async fn start(
     // before CDP came up", AMUX-3207). The driver-verb path already reconciles
     // via adopt_if_orphaned (connect_session); start() did not. Reconcile here,
     // before the replace-check, so the orphan is STOPPED rather than delegated to.
-    let target = launch_target(home, &chrome_user_data_dir(), profile);
+    let chrome_dir = chrome_user_data_dir();
+    let unresolved = launch_target(home, &chrome_dir, profile);
+    let imported = if is_amux_owned(home, &unresolved.user_data_dir) {
+        None
+    } else {
+        // Never launch automation against the human browser's user-data-dir.
+        // Besides risking profile corruption, Chrome delegates the launch to
+        // the already-running app and exits before CDP exists. Copying can be
+        // substantial, so keep it off the async runtime's worker threads.
+        let import_home = home.to_path_buf();
+        let import_chrome = chrome_dir.clone();
+        let import_name = profile.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            import_chrome_profile(&import_home, &import_chrome, &import_name)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Chrome profile import task failed: {e}"))??;
+        if let Some(i) = &result {
+            tracing::info!(
+                profile,
+                source = %i.source.display(),
+                destination = %i.destination.display(),
+                files = i.files,
+                bytes = i.bytes,
+                "browser: imported a human Chrome profile into an isolated amux profile"
+            );
+        }
+        result
+    };
+    let target = launch_target(home, &chrome_dir, profile);
+    if !is_amux_owned(home, &target.user_data_dir) {
+        anyhow::bail!(
+            "refusing to launch automation against the human Chrome user-data-dir {}; the \
+             isolated profile import did not produce a runnable destination",
+            target.user_data_dir.display()
+        );
+    }
     reconcile_orphan_before_launch(home, &target.user_data_dir).await;
+
+    // A profile inside the HUMAN'S Chrome directory shares one SingletonLock
+    // across every profile in that Chrome process. If the human Chrome is
+    // running, spawning another `Google Chrome` does not fail harmlessly: it
+    // hands the URL to the existing, non-debuggable process and exits 0. A
+    // retry loop therefore opens one real tab per retry (MO-3146: tubescience
+    // opened dozens before the user noticed).
+    //
+    // Fail BEFORE spawn. We neither stop the human's process nor remove its
+    // lock; both would mutate state amux does not own. The typed 409 tells an
+    // agent not to retry and gives both honest exits: fully quit Chrome once,
+    // or drive the live browser through /chrome-cdp after enabling remote
+    // debugging. The WARN is deliberately stable and carries a verdict so a
+    // log sweep sees prevented incidents rather than only the user's tab bar.
+    if let Some(owner_pid) = unmanaged_live_lock_owner(home, &target.user_data_dir) {
+        tracing::warn!(
+            profile,
+            owner_pid,
+            dir = %target.user_data_dir.display(),
+            verdict = "prevented_before_spawn",
+            retryable = false,
+            "browser: prevented launch into a live human Chrome — retrying would open another tab (MO-3146)"
+        );
+        return Err(anyhow::Error::new(ExternalProfileInUse {
+            profile: profile.to_string(),
+            user_data_dir: target.user_data_dir,
+            owner_pid,
+        }));
+    }
+
+    let binary = chrome_binary().ok_or_else(|| {
+        anyhow::anyhow!("no Chrome/Chromium binary found (looked in /Applications and PATH)")
+    })?;
 
     // ONE BROWSER PER PROFILE, and only this profile (AMUX-3828). This used to
     // stop whatever was running, which is what made the browser a machine
@@ -1202,7 +1486,14 @@ pub async fn start(
     // user_data_dir", because that is what corrupts. A browser on a DIFFERENT
     // profile is a legitimate neighbour and is left alone.
     if RUNNING.lock().expect("browser registry poisoned").contains_key(profile) {
-        let _ = stop_profile(home, profile).await;
+        // NAME THE DISPLACER AND SAY IT WAS A DISPLACEMENT (AF-378 follow-up).
+        // `started_by` is the resolved attribution of whoever asked for THIS
+        // start; it was already in hand here and was being dropped, so every
+        // browser replaced by a peer's start recorded `by: null`. The reason is
+        // "displaced by a new start" rather than "stopped" because nobody asked
+        // to stop it: naming the starter as the stopper would be a wrong
+        // attribution, which is the failure this record exists to prevent.
+        let _ = stop_profile_as_reason(home, profile, started_by, "displaced by a new start").await;
     }
 
     if is_amux_owned(home, &target.user_data_dir) {
@@ -1287,7 +1578,7 @@ pub async fn start(
             // it, so reaching here means an orphan slipped past reconciliation
             // (e.g. an untracked Chrome outside the running-file). Name the cause
             // and WARN so a log sweep catches the class, not just this instance.
-            let delegated = status.success();
+            let delegated = is_delegation_exit(&status);
             let hint = if delegated {
                 " — exit 0 is the delegation signature: another Chrome already holds this \
                  --user-data-dir. amux reconciles known orphans before launch (AMUX-3207); an \
@@ -1302,10 +1593,16 @@ pub async fn start(
                     "browser: launch delegated to an existing Chrome and exited 0 before CDP bound (AMUX-3207)"
                 );
             }
-            anyhow::bail!(
+            let msg = format!(
                 "Chrome (pid {pid:?}) exited {status} before CDP on port {port} came up{}{hint}",
                 chrome_stderr_tail(&stderr_path)
             );
+            // Same string either way; only the TYPE differs, and only when the
+            // caller can act (AF-381).
+            if delegated {
+                return Err(anyhow::Error::new(ProfileDelegated(msg)));
+            }
+            anyhow::bail!(msg);
         }
         attempts += 1;
         let outcome = probe
@@ -1407,6 +1704,9 @@ pub async fn start(
     let started_at = chrono::Utc::now().timestamp();
     let info = StartedBrowser {
         profile: profile.to_string(),
+        profile_imported_from: imported.as_ref().map(|i| i.source.display().to_string()),
+        profile_imported_files: imported.as_ref().map(|i| i.files),
+        profile_imported_bytes: imported.as_ref().map(|i| i.bytes),
         pid,
         cdp_port: port,
         cdp_http: http,
@@ -1481,19 +1781,68 @@ pub async fn stop_as(home: &Path, stopped_by: &str) -> StopReport {
 }
 
 /// [`stop_as`] for one named profile.
+/// The `last_exit` record, as a pure value so it can be asserted on.
+///
+/// Extracted because the behaviour worth pinning lives in two fields and the
+/// function that writes them early-returns when nothing is running, so there is
+/// no seam to test through. `by` is NULL rather than "" on purpose: an empty
+/// string and an unnamed actor read identically to a consumer, and telling them
+/// apart is the whole point of the record (AMUX-3063).
+fn exit_record(
+    reason: &str,
+    stopped_by: &str,
+    profile: &str,
+    pid: u32,
+    started_by: &str,
+    ts: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "ts": ts,
+        "reason": reason,
+        "by": if stopped_by.is_empty() { serde_json::Value::Null } else { serde_json::json!(stopped_by) },
+        "profile": profile,
+        "pid": pid,
+        "started_by": started_by,
+    })
+}
+
 pub async fn stop_profile_as(home: &Path, profile: &str, stopped_by: &str) -> StopReport {
+    stop_profile_as_reason(home, profile, stopped_by, "stopped").await
+}
+
+/// Stop, naming BOTH the actor and WHY (AF-378 follow-up).
+///
+/// `stop_profile_as` hardcoded `reason: "stopped"`, which is right for a `/stop`
+/// and wrong for the internal stop inside `start()`: there nobody asked for a
+/// stop, a peer asked for a START and the running browser was displaced to make
+/// room. Recording that as "stopped by <the new starter>" would name them as the
+/// stopper, which is a subtly wrong attribution of exactly the kind this record
+/// exists to prevent.
+///
+/// Found by reading a VALUE rather than a field's presence. amux-homepage
+/// verified AF-378 by checking `last_exit` was populated, and the value they
+/// pasted back was `{by: None, reason: stopped, started_by: mixpeek-cicd}` — the
+/// record survived, and the one field the card is about was null. The path that
+/// produced it was `start()` calling the actor-less `stop_profile`, while the
+/// actor sat in its own `started_by` parameter the whole time.
+pub async fn stop_profile_as_reason(
+    home: &Path,
+    profile: &str,
+    stopped_by: &str,
+    reason: &str,
+) -> StopReport {
     let running = RUNNING.lock().expect("browser registry poisoned").remove(profile);
     let Some(mut running) = running else {
         return StopReport { stopped: false, profile: None, clean_exit: None, locks_cleaned: vec![] };
     };
-    *LAST_EXIT.lock().expect("last-exit poisoned") = Some(serde_json::json!({
-        "ts": chrono::Utc::now().timestamp(),
-        "reason": "stopped",
-        "by": if stopped_by.is_empty() { serde_json::Value::Null } else { serde_json::json!(stopped_by) },
-        "profile": running.profile,
-        "pid": running.pid,
-        "started_by": running.started_by,
-    }));
+    *LAST_EXIT.lock().expect("last-exit poisoned") = Some(exit_record(
+        reason,
+        stopped_by,
+        &running.profile,
+        running.pid,
+        &running.started_by,
+        chrono::Utc::now().timestamp(),
+    ));
 
     // std/tokio only offer SIGKILL; /bin/kill sends the TERM we need.
     let _ = tokio::process::Command::new("kill")
@@ -1817,6 +2166,75 @@ impl std::fmt::Display for PageException {
 }
 
 impl std::error::Error for PageException {}
+
+/// The launch was DELEGATED, not broken: a Chrome already holding this
+/// `--user-data-dir` accepted the URL and the new process exited 0 before CDP
+/// bound. The caller can resolve it (stop the holder, or just retry), which is
+/// the same class `DriverError::NotRunning` already answers 409 for.
+///
+/// TYPED FOR THE SAME REASON `PageException` IS (AF-381). `api/browser.rs`'s
+/// `start` maps every `Err` to 502, so this arrived as "the upstream is broken,
+/// your request was fine" while its own hint told the caller to go and fix it —
+/// and a client that retries on 5xx retries a conflict that will not clear
+/// itself. `cdp_status`'s rule applies verbatim: decide on the TYPE, never by
+/// matching the message, or the status breaks the first time someone rephrases
+/// the hint.
+///
+/// Display reproduces the `bail!()` string it replaces EXACTLY, so nothing that
+/// quotes the message sees a difference; only the type is now inspectable.
+#[derive(Debug)]
+pub struct ProfileDelegated(pub String);
+
+impl std::fmt::Display for ProfileDelegated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for ProfileDelegated {}
+
+/// A live, non-amux Chrome owns the user-data-dir needed for this profile.
+///
+/// Typed so the API can return a structured, non-retryable 409 without
+/// message matching. Unlike [`ProfileDelegated`], this is detected BEFORE a
+/// Chrome process is spawned, so `spawned:false` is a fact the caller can use.
+#[derive(Debug)]
+pub struct ExternalProfileInUse {
+    pub profile: String,
+    pub user_data_dir: PathBuf,
+    pub owner_pid: u32,
+}
+
+impl std::fmt::Display for ExternalProfileInUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Chrome profile {:?} uses the human Chrome data directory {}, which is already \
+             locked by live process {}. amux did not launch Chrome: Chrome would hand the URL \
+             to that existing window, and every retry would open another tab. Do not retry \
+             while this 409 persists. Fully quit Chrome (all windows) and retry once, or \
+             enable remote debugging at chrome://inspect/#remote-debugging and use \
+             /chrome-cdp to drive the live browser.",
+            self.profile,
+            self.user_data_dir.display(),
+            self.owner_pid
+        )
+    }
+}
+
+impl std::error::Error for ExternalProfileInUse {}
+
+/// Is a Chrome that exited BEFORE CDP bound the delegation signature?
+///
+/// Exit 0 means it handed its URL to an instance already holding the profile
+/// and quit cleanly; any other code means the launch genuinely failed. One line,
+/// extracted only so it can be PINNED: mutating the construction site to never
+/// build `ProfileDelegated` survived the whole suite, because the classifier had
+/// a test and the decision feeding it did not (AF-381, and the same seam class
+/// as AF-438). The launch loop needs a real Chrome to exercise; this does not.
+pub fn is_delegation_exit(status: &std::process::ExitStatus) -> bool {
+    status.success()
+}
 
 impl From<anyhow::Error> for DriverError {
     fn from(e: anyhow::Error) -> Self {
@@ -3511,6 +3929,71 @@ mod tests {
     }
 
     #[test]
+    fn chrome_profile_import_is_atomic_isolated_and_cache_free() {
+        let home = fake_home();
+        let chrome = home.path().join("fake-chrome-udd");
+        let source = chrome.join("ethan-tubescience");
+        std::fs::create_dir_all(source.join("Network")).unwrap();
+        std::fs::create_dir_all(source.join("Cache")).unwrap();
+        std::fs::write(source.join("Network/Cookies"), b"logged-in").unwrap();
+        std::fs::write(source.join("Preferences"), b"prefs").unwrap();
+        std::fs::write(source.join("Cache/disposable"), b"cache").unwrap();
+        std::fs::write(source.join("LOCK"), b"held").unwrap();
+        std::fs::write(
+            chrome.join("Local State"),
+            r#"{"os_crypt":{"encrypted_key":"keep-me"},"profile":{"last_used":"ethan-tubescience","last_active_profiles":["ethan-tubescience"],"info_cache":{"ethan-tubescience":{"name":"TubeScience"},"Other":{"name":"Other"}}}}"#,
+        )
+        .unwrap();
+
+        let imported = import_chrome_profile(home.path(), &chrome, "ethan-tubescience")
+            .unwrap()
+            .expect("first use imports the Chrome profile");
+        let dest = home.path().join("playwright-auth/profiles/ethan-tubescience");
+        assert_eq!(imported.source, source);
+        assert_eq!(imported.destination, dest);
+        assert_eq!(std::fs::read(dest.join("Default/Network/Cookies")).unwrap(), b"logged-in");
+        assert_eq!(std::fs::read(dest.join("Default/Preferences")).unwrap(), b"prefs");
+        assert!(!dest.join("Default/Cache").exists(), "cache is recreated, not imported");
+        assert!(!dest.join("Default/LOCK").exists(), "a live profile's lock must not cross over");
+
+        let state: Value =
+            serde_json::from_slice(&std::fs::read(dest.join("Local State")).unwrap()).unwrap();
+        assert_eq!(state["os_crypt"]["encrypted_key"], "keep-me");
+        assert_eq!(state["profile"]["last_used"], "Default");
+        assert_eq!(state["profile"]["last_active_profiles"], json!(["Default"]));
+        assert_eq!(state["profile"]["info_cache"]["Default"]["name"], "TubeScience");
+        assert!(state["profile"]["info_cache"].get("Other").is_none());
+
+        let target = launch_target(home.path(), &chrome, "ethan-tubescience");
+        assert_eq!(target.user_data_dir, dest);
+        assert!(is_amux_owned(home.path(), &target.user_data_dir));
+        assert_eq!(target.profile_directory, None);
+        let inventory = list_profiles(home.path(), false);
+        assert!(
+            inventory.iter().any(|p| p.name == "ethan-tubescience" && p.registered),
+            "imported login state must be exempt from scratch-profile TTL cleanup"
+        );
+        assert!(
+            import_chrome_profile(home.path(), &chrome, "ethan-tubescience")
+                .unwrap()
+                .is_none(),
+            "later starts reuse the durable isolated copy"
+        );
+    }
+
+    #[test]
+    fn chrome_profile_import_rejects_escape_and_missing_sources() {
+        let home = fake_home();
+        let chrome = home.path().join("fake-chrome-udd");
+        std::fs::create_dir_all(&chrome).unwrap();
+        let escape = import_chrome_profile(home.path(), &chrome, "../outside").unwrap_err();
+        assert!(escape.to_string().contains("[A-Za-z0-9._-]+"));
+        let missing = import_chrome_profile(home.path(), &chrome, "missing").unwrap_err();
+        assert!(missing.to_string().contains("does not exist"));
+        assert!(!home.path().join("playwright-auth/profiles/missing").exists());
+    }
+
+    #[test]
     fn inventory_lists_dirs_and_registry_metadata() {
         let home = fake_home();
         let profiles = home.path().join("playwright-auth/profiles");
@@ -3566,6 +4049,49 @@ mod tests {
         assert!(removed.contains(&"SingletonCookie".to_string()));
         assert!(locks_present(&prof).is_empty(), "locks actually gone");
         assert!(prof.join("Preferences").exists(), "profile CONTENTS untouched");
+    }
+
+    /// MO-3146: a live lock on the HUMAN Chrome dir must be detected before
+    /// spawn. Chrome's exit-0 delegation is not harmless — every attempted
+    /// launch opens one more tab in the existing browser.
+    #[cfg(unix)]
+    #[test]
+    fn live_human_chrome_lock_is_a_pre_spawn_conflict_but_a_stale_lock_is_not() {
+        let home = fake_home();
+        let human_chrome = home.path().join("human-chrome-data");
+        std::fs::create_dir_all(&human_chrome).unwrap();
+        let lock = human_chrome.join("SingletonLock");
+
+        // SPECIMEN: the real lock on the incident machine was
+        // `ethan-m1-4.local-97230`; dashes in the hostname must not confuse
+        // the pid parser.
+        let me = std::process::id();
+        std::os::unix::fs::symlink(format!("ethan-m1-4.local-{me}"), &lock).unwrap();
+        assert_eq!(singleton_lock_owner_pid(&human_chrome), Some(me));
+        assert_eq!(
+            unmanaged_live_lock_owner(home.path(), &human_chrome),
+            Some(me),
+            "a live non-amux owner must stop the launch before Chrome sees its URL"
+        );
+
+        // CONTROL 1: lock presence is not liveness. A crashed Chrome can leave
+        // this symlink behind; treating every leftover as live would wedge the
+        // human profile forever.
+        std::fs::remove_file(&lock).unwrap();
+        let mut exited = std::process::Command::new("true").spawn().unwrap();
+        let stale_pid = exited.id();
+        exited.wait().unwrap();
+        std::os::unix::fs::symlink(format!("host-{stale_pid}"), &lock).unwrap();
+        assert_eq!(unmanaged_live_lock_owner(home.path(), &human_chrome), None);
+
+        // CONTROL 2: amux-owned dirs use the existing stale-lock cleanup and
+        // tracked-browser replacement path. This guard must never turn that
+        // ordinary path into a human-Chrome refusal.
+        std::fs::remove_file(&lock).unwrap();
+        let owned = home.path().join("playwright-auth/profiles/x");
+        std::fs::create_dir_all(&owned).unwrap();
+        std::os::unix::fs::symlink(format!("host-{me}"), owned.join("SingletonLock")).unwrap();
+        assert_eq!(unmanaged_live_lock_owner(home.path(), &owned), None);
     }
 
     #[test]
@@ -4108,6 +4634,70 @@ mod last_exit_persistence_tests {
     /// tubescience: two browsers dying minutes apart, and all they saw was
     /// ConnectionRefusedError on the CDP socket, with `last_exit: null` by the
     /// time anyone looked.
+    /// The CALL SITE, not just the record shape (AF-161's rule).
+    ///
+    /// The test below pins what `exit_record` produces. It passed unchanged when
+    /// the displacement call site was mutated back to the actor-less
+    /// `stop_profile`, which is a check pinning the wrong layer: exactly as green
+    /// as one pinning the right layer, and worth nothing. This reads the source
+    /// and fails if `start()` goes back to dropping the actor.
+    ///
+    /// A source scan is the weaker kind of probe, so it is bounded to the one
+    /// window that matters and asserts the positive rather than the absence.
+    #[test]
+    fn starts_displacement_stop_names_the_actor_in_the_source() {
+        let src = include_str!("browser.rs");
+        let at = src
+            .find("// ONE BROWSER PER PROFILE, and only this profile (AMUX-3828)")
+            .expect("the displacement block's anchor comment must exist");
+        let window = &src[at..src.len().min(at + 1400)];
+        assert!(
+            window.contains("stop_profile_as_reason(home, profile, started_by,"),
+            "start()'s displacement stop must pass the actor; window was:\n{window}"
+        );
+        assert!(
+            !window.contains("stop_profile(home, profile)"),
+            "start() must not use the actor-less stop, which records by: null"
+        );
+    }
+
+    /// A DISPLACED browser names who displaced it, and does not call them the
+    /// stopper (AF-378 follow-up).
+    ///
+    /// Found by reading a value rather than a field's presence: amux-homepage
+    /// verified AF-378 by checking last_exit was populated, and the value they
+    /// pasted back was `{by: None, reason: stopped, started_by: mixpeek-cicd}`.
+    /// The record survived a restart, which is what AF-378 shipped, and the one
+    /// field the card is about was null. The path was `start()` calling the
+    /// actor-less `stop_profile` while the actor sat in its own `started_by`
+    /// parameter.
+    ///
+    /// Both halves are asserted because passing the actor alone would be a WRONG
+    /// attribution: nobody asked to stop that browser, somebody asked to start a
+    /// new one, and "stopped by X" reads as X having stopped it.
+    #[test]
+    fn a_displaced_browser_names_the_displacer_and_says_it_was_displaced() {
+        let v = super::exit_record(
+            "displaced by a new start", "lane-b", "default", 4242, "lane-a", 1000,
+        );
+        assert_eq!(v["by"], serde_json::json!("lane-b"), "the displacer must be named: {v}");
+        assert_eq!(v["started_by"], serde_json::json!("lane-a"), "the displaced owner must survive: {v}");
+        assert_eq!(
+            v["reason"], serde_json::json!("displaced by a new start"),
+            "a displacement must not be recorded as a plain stop: {v}"
+        );
+
+        // A REAL stop still reads as one, so this did not just rename everything.
+        let stopped = super::exit_record("stopped", "activity-reaper", "default", 1, "lane-a", 1000);
+        assert_eq!(stopped["reason"], serde_json::json!("stopped"));
+        assert_eq!(stopped["by"], serde_json::json!("activity-reaper"));
+
+        // AND AN UNNAMED ACTOR IS STILL NULL, NOT "". The two read identically to
+        // a consumer and telling them apart is what the record is for (AMUX-3063).
+        let anon = super::exit_record("stopped", "", "default", 1, "lane-a", 1000);
+        assert!(anon["by"].is_null(), "an unnamed actor must be null, not empty: {anon}");
+    }
+
     #[test]
     fn a_recorded_exit_outlives_the_process_that_recorded_it() {
         let dir = tempfile::tempdir().expect("tempdir");

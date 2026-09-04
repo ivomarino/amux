@@ -308,11 +308,19 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
           <div class="settings-row" style="justify-content:space-between;align-items:center;margin-top:10px;">
             <span style="font-size:0.85rem;">Workers may message across groups</span>
             <label class="theme-toggle">
-              <input type="checkbox" id="crossgroup-default-checkbox" onchange="toggleCrossGroupDefault(this.checked)">
+              <input type="checkbox" id="crossgroup-default-checkbox" onchange="toggleCrossGroupDefault(this.checked)" checked>
               <span class="theme-track"><span class="theme-thumb"></span></span>
             </label>
           </div>
-          <div style="font-size:0.68rem;color:var(--dim);margin-top:3px;" id="crossgroup-default-note">Default OFF: worker-to-worker messaging stays inside a group unless configured. ON grants every worker a standing allowance, with no per-message approval. A worker-level setting from its &#x22EF; menu still overrides this, and isolated workers stay unreachable either way.</div>
+          <div style="font-size:0.68rem;color:var(--dim);margin-top:3px;" id="crossgroup-default-note">Default ON: workers can discover and message every non-isolated peer without per-message approval. A worker/group/global configuration may opt out; isolated raw workers stay unreachable.</div>
+          <div class="settings-row" style="justify-content:space-between;align-items:center;margin-top:10px;">
+            <span style="font-size:0.85rem;">Auto-drain backlog for all workers</span>
+            <label class="theme-toggle">
+              <input type="checkbox" id="board-drain-default-checkbox" onchange="toggleBoardDrainDefault(this.checked)" checked>
+              <span class="theme-track"><span class="theme-thumb"></span></span>
+            </label>
+          </div>
+          <div style="font-size:0.68rem;color:var(--dim);margin-top:3px;">Default ON: when To Do is empty, promote the oldest eligible Backlog card and keep driving it. Human-owned, triggered, epic, watch, and tripwire cards remain parked; a group or worker configuration can opt out.</div>
           <div class="settings-row" style="justify-content:space-between;align-items:center;margin-top:10px;">
             <span style="font-size:0.85rem;">Auto-answer resume dialog</span>
             <label class="theme-toggle">
@@ -350,6 +358,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
             <option value="haiku">haiku</option>
             <option value="claude-opus-5">claude-opus-5</option>
             <option value="claude-opus-5[1m]">claude-opus-5 [1M]</option>
+            <option value="claude-fable-5-1">claude-fable-5-1</option>
             <option value="claude-fable-5">claude-fable-5</option>
             <option value="claude-opus-4-8">claude-opus-4-8</option>
             <option value="claude-opus-4-8[1m]">claude-opus-4-8 [1M]</option>
@@ -2200,7 +2209,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="peek-tab" id="peek-tab-simple" onclick="setPeekTab('simple')" title="Translate this worker's output — plain English by default, or your own prompt"><span class="tab-ico">◍</span><span class="tab-lbl">Translate</span></button>
     <button class="peek-tab" id="peek-tab-steering" onclick="setPeekTab('steering')"><span class="tab-ico">⇉</span><span class="tab-lbl">Steering</span><span class="peek-tab-count" id="peek-tab-steering-count"></span></button>
     <button class="peek-tab" id="peek-tab-schedules" onclick="setPeekTab('schedules')"><span class="tab-ico">⏱</span><span class="tab-lbl">Schedules</span><span class="peek-tab-count" id="peek-tab-schedules-count"></span></button>
-    <button class="peek-tab" id="peek-tab-scope" onclick="setPeekTab('scope')" title="What this worker operates under, and which scope layer set it"><span class="tab-ico">&#9707;</span><span class="tab-lbl">Scope</span></button>
+    <button class="peek-tab" id="peek-tab-scope" onclick="setPeekTab('scope')" title="Edit this worker's configuration and see which layer supplies each value"><span class="tab-ico">&#9707;</span><span class="tab-lbl">Configurations</span></button>
     <button class="peek-tab" id="peek-tab-messages" onclick="setPeekTab('messages')" title="Every message sent to this worker"><span class="tab-ico">✉</span><span class="tab-lbl">Messages</span><span class="peek-tab-count" id="peek-tab-messages-count"></span></button>
     <button class="peek-tab" id="peek-tab-dictation" onclick="setPeekTab('dictation')" title="Voice dictation — speak, get clean text"><span class="tab-ico">🎤</span><span class="tab-lbl">Dictation</span><span class="peek-tab-count" id="peek-tab-dictation-count"></span></button>
     <button class="peek-tab" id="peek-tab-readalouds" onclick="setPeekTab('readalouds')" title="Past read-alouds — replay any; auto-clears after 30 days"><span class="tab-ico">&#x1F50A;</span><span class="tab-lbl">Read alouds</span><span class="peek-tab-count" id="peek-tab-readalouds-count"></span></button>
@@ -2636,6 +2645,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <option value="haiku">haiku</option>
       <option value="claude-opus-5">claude-opus-5</option>
       <option value="claude-opus-5[1m]">claude-opus-5 [1M]</option>
+      <option value="claude-fable-5-1">claude-fable-5-1</option>
       <option value="claude-fable-5">claude-fable-5</option>
       <option value="claude-opus-4-8">claude-opus-4-8</option>
       <option value="claude-opus-4-8[1m]">claude-opus-4-8 [1M]</option>
@@ -2887,7 +2897,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 </div>
 
 <!-- Confirm / alert modal -->
-<!-- Scope editor: the REAL editor UX for a group/global capability (AMUX-2436).
+<!-- Configuration editor: one editor UX at global, group, and worker level (AMUX-2436).
      Same shape as the peek Memory panel — full-height textarea, Preview, Save —
      rather than the cramped inline box the tiles used to open. env and gates get
      a real editor here for the first time; before, the panel said "edited where

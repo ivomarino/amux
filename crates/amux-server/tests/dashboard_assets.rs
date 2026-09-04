@@ -98,6 +98,265 @@ fn app_ver_and_the_sw_cache_version_agree() {
     );
 }
 
+#[test]
+fn board_worker_actions_group_wrapped_lines_under_their_timestamp() {
+    let app = asset("app.js");
+    let start = app
+        .find("function _bdParseHistory(log)")
+        .expect("board history parser must exist");
+    let rest = &app[start..];
+    let end = rest
+        .find("function _bdWorkerActivity(item)")
+        .expect("worker activity parser must follow history parser");
+    let parser = &rest[..end];
+    assert!(parser.contains("const grouped = []"), "parser no longer groups physical lines");
+    assert!(
+        parser.contains("grouped[grouped.length - 1].body += '\\n' + body.trim()"),
+        "an untimestamped continuation must append to the preceding timestamped action"
+    );
+    assert!(
+        !parser.contains("split('\\n').filter(l => l.trim()).map(line =>"),
+        "the old one-physical-line-equals-one-action parser returned"
+    );
+}
+
+#[test]
+fn messages_link_schedule_ids_to_the_scheduler() {
+    let app = asset("app.js");
+    let start = app
+        .find("async function _openScheduleFromMessage(id)")
+        .expect("Messages must expose schedule navigation");
+    let tail = &app[start..];
+    let end = tail
+        .find("function _linkifyUrls")
+        .expect("schedule linkifier must precede URL linkification");
+    let body = &tail[..end];
+    for needle in [
+        "switchView('scheduler')",
+        "fetchSchedules()",
+        "fetchSchedulerRuns()",
+        "fetchSchedulerAudit()",
+        "openSchedModal(sid)",
+        "function _linkifyScheduleIds(safeHtml)",
+    ] {
+        assert!(body.contains(needle), "schedule navigation lost `{needle}`");
+    }
+    assert!(
+        app.contains("_linkifyScheduleIds(_linkifyCardIds(safe))"),
+        "the shared message-row renderer must link schedule ids in message text"
+    );
+    assert!(
+        app.contains("_linkifyScheduleIds(origin.replace"),
+        "scheduled-message origin is where the canonical SCHED-N token lives"
+    );
+}
+
+#[test]
+fn message_card_links_survive_the_capped_board_working_set() {
+    let app = asset("app.js");
+    let start = app
+        .find("function _msgCardChip(cardId, message)")
+        .expect("message card chip must accept authoritative card metadata");
+    let tail = &app[start..];
+    let end = tail
+        .find("function _msgCtxPeek")
+        .expect("message card chip must precede the shared message renderer");
+    let body = &tail[..end];
+    for needle in [
+        "message.card_title",
+        "message.card_status",
+        "message.card_archived",
+        "message.card_deleted",
+        "const c = live ||",
+    ] {
+        assert!(
+            body.contains(needle),
+            "message card chip lost authoritative history metadata `{needle}`"
+        );
+    }
+    assert!(
+        app.contains("_msgCardChip(typeof e === 'string' ? '' : (e.card_id || ''), e)"),
+        "the shared history row must pass its authoritative card metadata to the chip"
+    );
+    assert!(
+        app.contains("card_title: x.card_title, card_status: x.card_status"),
+        "normalizing history rows must preserve card metadata"
+    );
+    assert!(
+        app.contains("async function openBoardDetail(id)")
+            && app.contains("await apiCall(API + '/api/board/' + encodeURIComponent(id))"),
+        "clicking a message's older/terminal task must hydrate it even when the capped board list omitted it"
+    );
+}
+
+#[test]
+fn long_shell_runs_have_an_immediate_visible_state() {
+    let app = asset("app.js");
+    for needle in [
+        "case 'running':",
+        "Already running on the host",
+        "Started on the host",
+        "running: 'running'",
+        "_schedRunDotClass(r)",
+    ] {
+        assert!(
+            app.contains(needle),
+            "the scheduler UI lost its in-progress/overlap rendering `{needle}`"
+        );
+    }
+    let css = asset("app.css");
+    assert!(
+        css.contains(".sched-run-dot.running"),
+        "a durable running row must not render as the unknown grey dot"
+    );
+}
+
+#[test]
+fn cross_group_default_can_initialize_before_the_main_api_constant() {
+    let app = asset("app.js");
+    let read_start = app
+        .find("async function readCrossGroupDefault()")
+        .expect("cross-group settings need an authoritative reader");
+    let init_end = app[read_start..]
+        .find("async function toggleYoloDefault")
+        .map(|n| read_start + n)
+        .expect("cross-group initialization must precede the next settings helper");
+    let early_boot = &app[read_start..init_end];
+    let api_decl = app
+        .find("const API = ''")
+        .expect("the main API transport constant must still exist");
+
+    assert!(
+        init_end < api_decl,
+        "this regression guard is specifically about the early settings initializer"
+    );
+    assert!(
+        early_boot.contains("fetch('/api/config/cross-group'"),
+        "the early reader/writer must use the root-relative endpoint"
+    );
+    assert!(
+        !early_boot.contains("fetch(API + '/api/config/cross-group'"),
+        "referencing API before its declaration throws in the temporal dead zone and silently leaves the toggle off"
+    );
+}
+
+#[test]
+fn all_worker_backlog_drain_is_a_persistent_settings_control() {
+    let app = asset("app.js");
+    let html = asset("index.html");
+    for needle in [
+        "async function readBoardDrainDefault()",
+        "async function toggleBoardDrainDefault(checked)",
+        "fetch('/api/config/board-drain'",
+        "initBoardDrainDefault",
+    ] {
+        assert!(app.contains(needle), "board-drain settings lost `{needle}`");
+    }
+    for needle in [
+        "board-drain-default-checkbox",
+        "Auto-drain backlog for all workers",
+        "Default ON: when To Do is empty",
+    ] {
+        assert!(html.contains(needle), "worker settings lost `{needle}`");
+    }
+}
+
+#[test]
+fn sse_message_invalidation_refreshes_each_visible_message_surface() {
+    let app = asset("app.js");
+    let start = app
+        .find("if (key === 'messages')")
+        .expect("SSE invalidation must recognize committed Messages writes");
+    let body = &app[start..start + 1100.min(app.len() - start)];
+    for needle in [
+        "_messagesLoad(true)",
+        "_peekMessagesLoad()",
+        "_loadCmdHistoryFromServer()",
+        "_renderCmdHistoryList()",
+    ] {
+        assert!(body.contains(needle), "message invalidation no longer refreshes `{needle}`");
+    }
+}
+
+#[test]
+fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state() {
+    let app = asset("app.js");
+    let index = asset("index.html");
+    let helper_start = app
+        .find("function _cardDoingItem(name)")
+        .expect("dashboard must derive the live doing card from SSE-synced board data");
+    let helper_tail = &app[helper_start..];
+    let helper_end = helper_tail
+        .find("function _nudgeWorkersOnBoardChange()")
+        .expect("live-card helper must precede board-change invalidation");
+    let helper = &helper_tail[..helper_end];
+    for needle in [
+        "session.task_board_id",
+        "c.id === claimed",
+        "c.session === name",
+        "c.status === 'doing'",
+        "!c.deleted && !c.archived",
+    ] {
+        assert!(helper.contains(needle), "live-card selection lost `{needle}`");
+    }
+
+    let render_start = app
+        .find("function _renderSessionCard(s)")
+        .expect("session-card renderer must exist");
+    let render = &app[render_start..render_start + 16_000.min(app.len() - render_start)];
+    for needle in [
+        "const liveBoardTask = _cardDoingItem(s.name)",
+        "liveBoardTask ? (liveBoardTask.title || liveBoardTask.id)",
+        "liveBoardTask ? liveBoardTask.id : s.task_board_id",
+        "_taskIdChip({task_board_id: displayTaskBoardId})",
+    ] {
+        assert!(render.contains(needle), "session card lost live board linkage `{needle}`");
+    }
+    assert!(
+        app.contains("board-card-live-label\"><span class=\"board-live-dot\"></span>Working now"),
+        "a live board card needs an explicit visible label, not only a border or tooltip"
+    );
+    assert!(
+        app.contains("const _liveNow = !!(_liveCard && _liveCard.id === item.id)"),
+        "only the explicitly claimed card may say Working now"
+    );
+    for rejected in ["no board task claimed", "board-unclaimed-mount", "_activeWithoutClaim"] {
+        assert!(!app.contains(rejected), "runtime activity must not manufacture the board pseudo-state `{rejected}`");
+        assert!(!index.contains(rejected), "the removed pseudo-state must not retain a dead mount `{rejected}`");
+    }
+}
+
+#[test]
+fn idle_workers_explain_blocked_and_parked_board_work() {
+    let app = asset("app.js");
+    let start = app
+        .find("function _boardDriveCardReason(drive)")
+        .expect("worker cards need a board-drive explanation helper");
+    let helper = &app[start..start + 2200.min(app.len() - start)];
+    for needle in [
+        "all-candidates-refused",
+        "(dependency root)",
+        "backlog auto-drain off",
+        "backlog parked on human/trigger",
+        "missing next action",
+    ] {
+        assert!(helper.contains(needle), "board-drive explanation lost `{needle}`");
+    }
+
+    let render_start = app
+        .find("function _renderSessionCard(s)")
+        .expect("session-card renderer must exist");
+    let render = &app[render_start..render_start + 16_000.min(app.len() - render_start)];
+    assert!(
+        render.contains("(todo || backlog || d || review) && driveFresh"),
+        "the explanation must cover every non-terminal work column, including backlog-only lanes"
+    );
+    assert!(
+        render.contains("_boardDriveCardReason(drive)"),
+        "the card must render the mechanism's explanation"
+    );
+}
+
 /// The parser above must be able to FAIL, or the test above it is theatre —
 /// a `const_str` that always returned None would make both sides `expect`-panic,
 /// but one that silently returned the same string for everything would make the
@@ -247,10 +506,24 @@ fn board_detail_hydration_refreshes_authoritative_state_and_relations() {
         .find("async function _bdHydrate(")
         .expect("_bdHydrate exists");
     let tail = &app[start..];
-    let end = tail
-        .find("\n}\n\nfunction openBoardDetail")
-        .expect("_bdHydrate closes");
+    // END AT THIS FUNCTION'S OWN TOP-LEVEL CLOSE, not at the next function's
+    // declaration. This used to look for "\n}\n\nfunction openBoardDetail", so it
+    // pinned _bdHydrate's extent to the literal TEXT of an unrelated neighbour.
+    // c6fd9832 ("fix(ui): open terminal tasks from message history") made
+    // openBoardDetail `async`, and main went red with "_bdHydrate closes" — a
+    // correct production change failing a test about a function it did not touch.
+    // Nothing in _bdHydrate had changed, and the assertions below all still held.
+    //
+    // A check pinned to the wrong layer is exactly as green as one pinned to the
+    // right layer, until it is not (ethos rule 7). "\n}\n" is the function's own
+    // terminator: inner braces are indented, so a `}` at column 0 ends it whatever
+    // follows.
+    let end = tail.find("\n}\n").expect("_bdHydrate closes");
     let body = &tail[..end];
+    assert!(
+        !body.contains("function openBoardDetail"),
+        "the extent ran past _bdHydrate into its neighbour — the anchor is wrong again"
+    );
     for needle in [
         "boardDetailStatus = full.status",
         "_populateSessionSelect('bd-session', full.session",
@@ -299,8 +572,14 @@ fn board_detail_leads_with_actionable_task_context() {
         "item.gate_requirements",
         "item.asset_links",
         "a.resolved_ref",
+        "const explicitPath =",
+        "const serverResolvedPath =",
+        "targetPath = target.replace(/#.*$/",
         "Produced assets (",
         "Source message",
+        "Worker request",
+        "Terminal callback",
+        "item.requested_by",
         "_bdOpenMessage(",
         "_bdWorkerActivity(",
         "Worker actions",
@@ -325,4 +604,97 @@ fn group_suggestions_are_autocomplete_not_an_unprompted_wall() {
     let empty = body.find("if (!q) { el.innerHTML = ''; return; }").expect("empty-query guard");
     let suggest = body.find("_tagSuggestions(prefix, q)").expect("typed suggestions remain");
     assert!(empty < suggest, "the empty query must stop before fleet groups are suggested");
+}
+
+#[test]
+fn worker_cards_do_not_call_parked_work_active() {
+    let app = asset("app.js");
+    let start = app
+        .find("const byStatus = _cardBoardStatusCounts(s.name)")
+        .expect("worker card status breakdown exists");
+    let body = &app[start..start + 1800.min(app.len() - start)];
+    for label in ["backlog", "needs you", "review", "done"] {
+        assert!(body.contains(label), "worker card omitted `{label}` count");
+    }
+    assert!(
+        !body.contains("${active}</span> active"),
+        "parked and done cards must not be collapsed into a misleading active count"
+    );
+}
+
+#[test]
+fn worker_configurations_are_editable_from_backlog_through_terminal_states() {
+    let html = asset("index.html");
+    assert!(
+        html.contains("<span class=\"tab-lbl\">Configurations</span>"),
+        "the worker surface must be named for what a user can do there"
+    );
+
+    let app = asset("app.js");
+    assert!(
+        app.contains("const _visCaps = (lvl === 'worker') ? d.capabilities"),
+        "worker Configurations must show every capability returned by the server"
+    );
+    assert!(
+        !app.contains("Edited where it lives"),
+        "a writable worker configuration must not send the user to an unnamed second UI"
+    );
+    for needle in [
+        "Every durable worker setting, grouped by what it changes",
+        "Identity & organization",
+        "Runtime & model",
+        "Permissions & communication",
+        "Display & advanced",
+        "Task lifecycle",
+        "_workerConfigurationRow('name'",
+        "_workerConfigurationRow('provider'",
+        "_workerConfigurationRow('model'",
+        "_workerConfigurationRow('mcp'",
+        "_workerConfigurationRow('cross_group'",
+        "_workerConfigurationRow('external_email'",
+        "_workerConfigurationRow('advanced_environment'",
+        "_scopeEditOpen(\\'",
+        "skin: 'JSON object",
+        "connectors: 'JSON object",
+        "Backlog → To Do",
+        "To Do → In Progress",
+        "Continue non-terminal work",
+        "Pickup / continue master",
+        "On by default; parked and human-owned cards stay put",
+        "Status availability and Board gates below define transition requirements",
+        "external_email_allowed",
+        "Send external email without approval",
+    ] {
+        assert!(app.contains(needle), "Configurations omitted `{needle}`");
+    }
+    for field in [
+        "auto_drain_backlog",
+        "board_auto_pickup",
+        "board_auto_continue",
+        "board_standing_orders",
+    ] {
+        assert!(app.contains(&format!("field: '{field}'")), "missing runtime control for {field}");
+    }
+    assert!(
+        app.contains("if (!present.has(k)) out[k] = null"),
+        "removing a masked environment row must delete that worker-level key"
+    );
+    assert!(
+        app.contains("if (z && typeof z === 'object') return Object.keys(z).length > 0"),
+        "nested skin/connector settings must not render as an unset configuration"
+    );
+    assert!(
+        app.contains("_workerBoardConfigurationSet(\\'")
+            && app.contains("\\',null)\">Inherit</button>"),
+        "worker overrides need an explicit path back to inherited configuration"
+    );
+    let css = asset("app.css");
+    for needle in [
+        ".worker-config-grid",
+        ".worker-config-section",
+        ".worker-config-row",
+        "grid-template-columns:repeat(2,minmax(0,1fr))",
+    ] {
+        assert!(css.contains(needle), "Configurations layout lost `{needle}`");
+    }
 }

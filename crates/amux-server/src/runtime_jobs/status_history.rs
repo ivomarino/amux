@@ -95,7 +95,7 @@ fn retention_days() -> f64 {
 }
 
 pub fn tick_secs() -> u64 {
-    std::env::var("AMUX_STATUS_HISTORY_SECS")
+    std::env::var(super::per_job_disable_var(JOB))
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|s: &u64| *s >= 5)

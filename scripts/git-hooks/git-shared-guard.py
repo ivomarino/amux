@@ -480,9 +480,27 @@ def _amend_verdict(cmd, scrubbed, run_dir):
     can't discriminate: every session commits as the same git user). Rule:
     amend requires PROOF OF INSPECTION — the caller must have looked at HEAD
     and pinned it: `AMUX_AMEND_EXPECT=<head-sha> git commit --amend ...`.
-    Allowed iff the pinned sha == actual current HEAD (kills the race where
-    a foreign commit lands between your commit and your amend) AND HEAD is
-    not already pushed (published history is never amended on shared trunk).
+    Allowed iff the pinned sha == actual current HEAD AND HEAD is not already
+    pushed (published history is never amended on shared trunk).
+
+    THE PIN NARROWS THE RACE, IT DOES NOT KILL IT, and this docstring used to
+    claim otherwise ("kills the race where a foreign commit lands between your
+    commit and your amend"). That claim is false whenever anything DELAYS the
+    command between this hook admitting it and git executing it, because the
+    check happens at ADMISSION and nothing re-verifies at execution.
+
+    Measured 2026-09-03 (mixpeek MC-1624, self-disclosed by mvs-research against
+    themselves): they pinned correctly, their command then waited 30 iterations
+    on .git/index.lock held by another lane's commit, and by the time the amend
+    ran HEAD was that other lane's commit, which it rewrote. They had read this
+    docstring, concluded the pin was sufficient, and followed the documented
+    procedure exactly. A guard that overstates its coverage turns a careful
+    operator into a confident one.
+
+    So the lock check below is a LARGE, CHEAP REDUCTION, not a proof. Closing
+    the class needs a re-verify at execution time, and git has no atomic
+    compare-and-amend to build it from. Do not restore the "kills the race"
+    wording.
     Returns None to allow, or a block-reason string."""
     if not re.search(r'\bgit\s+(?:-C\s+\S+\s+)?commit\b[^\n;&|]*--amend\b', scrubbed):
         return None
@@ -499,6 +517,66 @@ def _amend_verdict(cmd, scrubbed, run_dir):
         if base == head:
             return ("git commit --amend on a PUSHED commit — published shared history is "
                     "never rewritten; make a follow-up commit instead")
+    # A PRESENT INDEX LOCK MEANS HEAD IS ABOUT TO MOVE. That is the window this
+    # guard cannot otherwise see: the pin is checked HERE, at admission, and a
+    # caller that then blocks waiting for the lock executes its amend against a
+    # HEAD this hook never looked at. Refusing while the lock is held converts
+    # the dangerous case into "retry in a moment", costs one stat, and needs no
+    # cooperation from the caller.
+    #
+    # ORDERED AFTER THE PUSHED CHECK ON PURPOSE. "Wait for the lock and re-run"
+    # is useless advice if the amend is going to be refused anyway for touching
+    # published history, and telling a caller to retry against an absolute rule
+    # sends them into a loop. The transient reason must not mask the permanent
+    # one.
+    #
+    # NOT COMPLETE, deliberately stated: a command admitted while the lock is
+    # ABSENT can still block on a lock taken a millisecond later. That
+    # refinement is mvs-research's, made against their own proposal. This
+    # removes the case that fired, not the class.
+    # A LOCK IS NOT ALWAYS A LIVE PEER, which is why this AGES it. Git's own
+    # error says so: "a git process may have crashed in this repository earlier
+    # ... remove the file manually to continue". On a ~40-lane checkout a
+    # crashed or SIGKILLed git is not rare, and a naive refuse-on-present turns
+    # a stale lock into "every lane's amend is refused forever, blaming a peer
+    # who is not there" (mvs-research, who hit the lock state twice in one
+    # evening while reviewing this patch).
+    #
+    # THE THRESHOLD IS GENEROUS ON PURPOSE. `git commit` holds this lock across
+    # its hooks, and on the mixpeek checkout pre-commit routinely runs for
+    # MINUTES: commits of 2 to 9 minutes were measured on 2026-09-03 and one
+    # pre-push gate ran 917s. A 120s cutoff would call a legitimately-held lock
+    # stale, which is the failure that matters, because it re-opens the exact
+    # window this check exists to close. 900s is longer than any commit observed
+    # here and far shorter than a lock nobody has noticed.
+    #
+    # Deliberately NOT "is a git process running": pgrep matching text it was
+    # handed has already produced one wrong conclusion on this box today, and a
+    # process check is the part most likely to be wrong in a way that fails
+    # CLOSED (mvs-research's caution).
+    _LOCK_FRESH_S = 900
+    try:
+        git_dir = _git("rev-parse", "--absolute-git-dir")
+        lock = os.path.join(git_dir, "index.lock") if git_dir else ""
+        if lock and os.path.exists(lock):
+            age = time.time() - os.stat(lock).st_mtime
+            if age < _LOCK_FRESH_S:
+                return ("git commit --amend while .git/index.lock is HELD (age "
+                        f"{int(age)}s) — another session has a commit in flight, so HEAD "
+                        "is about to move and your AMUX_AMEND_EXPECT pin is checked "
+                        "BEFORE your command runs, not after. That is exactly how a "
+                        "correctly-pinned amend rewrote a peer's commit on 2026-09-03. "
+                        "Wait for the lock and re-run; the pin is then re-checked "
+                        "against the new HEAD.\n"
+                        "  If it never clears, the lock may be STALE from a crashed git "
+                        "rather than a live peer. Distinguish before removing it:\n"
+                        f"    ls -l {lock}\n"
+                        "  A lock whose mtime is not advancing and older than 15m is "
+                        "treated as stale by this guard and stops blocking you.")
+            # Stale: not evidence of a peer. Allow rather than block every lane
+            # indefinitely; the pin check above still applies.
+    except Exception:
+        pass  # fail-open: a stat we cannot do must not block a legitimate amend
     m = re.search(r'AMUX_AMEND_EXPECT=([0-9a-f]{7,40})\b', cmd)
     if m and head.startswith(m.group(1)):
         # AF-106 durable half (AMUX-3407): the pin proves the COMMIT BEING
@@ -911,27 +989,61 @@ def _discard_verdict(cmd, scrubbed, run_dir):
             % (len(safe), ", ".join(h.get("path", "?") for h in safe[:5])))
     if not hits:
         return None
-    # NAME THE BLANK OWNER AS BLANK. `.get("owner", "?")` only defaults a MISSING
-    # key, so an owner that is present and empty rendered as nothing at all and
-    # the refusal claimed "another session" it could not name. A reader who goes
-    # looking for that peer and finds none stops, correctly, and is stuck.
-    who = ", ".join(sorted({(f.get("owner") or "").strip() or "an edit record with no session attached"
-                            for f in hits}))
+    # AF-423: "(unknown)" IS A PLACEHOLDER, NOT A SESSION NAME.
+    #
+    # The server sends `owner: "(unknown)"` on the shared branch when there is no
+    # peer record at all, and it sends `peer: false` beside it to say so. The
+    # staged-guard has branched on that since AF-24, in its own words: rendering
+    # the placeholder as a co-editor "asserts a co-editor who does not exist —
+    # the real fact is that YOU edited it and it has uncommitted changes". This
+    # guard never learned it, so its refusal read "(recently edited by
+    # (unknown))" and, worse, closed with "or ask (unknown) first".
+    #
+    # Measured 2026-09-02: it named a phantom co-editor on git_guard.rs whose
+    # every hunk was the committer's own, written minutes earlier.
+    #
+    # THE SAME BUG WAS ALREADY HALF-FIXED HERE and the fix made the tail
+    # nonsense: an empty owner rendered as "an edit record with no session
+    # attached", which is right in the first slot and absurd in "or ask <that>
+    # first". Both slots now come off one decision.
+    def _is_named_peer(h):
+        owner = (h.get("owner") or "").strip()
+        if owner in ("", "(unknown)"):
+            return False
+        # OLD SERVERS SEND NO `peer` KEY. Absent means "cannot answer", not
+        # "answer is no" — treating it as no would silently drop a real peer's
+        # name from every refusal against an older server. A real-looking name
+        # with no flag is taken at face value, exactly as before.
+        return bool(h["peer"]) if "peer" in h else True
+
+    named = sorted({(h.get("owner") or "").strip() for h in hits if _is_named_peer(h)})
     what = ", ".join(f.get("path", "?") for f in hits[:5])
-    # Distinct wording: "also edited" is a different fact from "is theirs", and a
-    # guard that says the wrong one gets argued with instead of obeyed.
-    lead = ("discarding UNCOMMITTED work that belongs to another session"
-            if foreign else
-            "discarding a file ANOTHER SESSION HAS ALSO EDITED")
-    return (lead + " — "
-            f"{what} (recently edited by {who}). Naming a path does NOT make this "
-            "yours in a shared checkout: in a single-file repo that one path holds "
-            "every session's edits, and editing it too is not a claim to destroy "
-            "their half. Unlike a bad commit or push, this is "
-            "UNRECOVERABLE — no object, no reflog entry. Make it recoverable "
-            "instead: `git stash push -- <paths>` keeps the content, or revert only "
-            "your own hunks (`git diff` then a sliced `git apply -R`), or ask "
-            f"{who} first")
+    # THE BLOCK IS UNCHANGED EITHER WAY. It is about recoverability — `git
+    # checkout --` leaves no object and no reflog entry — and that does not
+    # depend on who edited the file. Only the attribution is in question here.
+    tail = ("Unlike a bad commit or push, this is UNRECOVERABLE — no object, no "
+            "reflog entry. Make it recoverable instead: `git stash push -- <paths>` "
+            "keeps the content, or revert only your own hunks (`git diff` then a "
+            "sliced `git apply -R`)")
+    if named:
+        who = ", ".join(named)
+        # Distinct wording: "also edited" is a different fact from "is theirs",
+        # and a guard that says the wrong one gets argued with instead of obeyed.
+        lead = ("discarding UNCOMMITTED work that belongs to another session"
+                if foreign else
+                "discarding a file ANOTHER SESSION HAS ALSO EDITED")
+        return (lead + " — "
+                f"{what} (recently edited by {who}). Naming a path does NOT make this "
+                "yours in a shared checkout: in a single-file repo that one path holds "
+                "every session's edits, and editing it too is not a claim to destroy "
+                "their half. " + tail + f", or ask {who} first")
+    # No nameable peer: say what IS known and stop. No accusation, and no
+    # remedy that tells the reader to go ask somebody who does not exist.
+    return ("discarding UNCOMMITTED CHANGES — "
+            f"{what} has uncommitted content and NO other session's edit record names "
+            "it, so nothing here says a peer wrote any of it. That does not make the "
+            "discard safe: the changes are still unsaved, and on a shared checkout "
+            "they may be yours, a peer's with no record, or both. " + tail)
 
 
 def _has_cotenants(run_dir):
