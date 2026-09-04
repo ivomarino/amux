@@ -1052,9 +1052,15 @@ def _push_key_to_container(ctr_name, api_key):
         subprocess.run(
             ["docker", "exec", "-i", ctr_name, "sh", "-c", "cat > /root/.amux/server.env"],
             input=content.encode(), capture_output=True)
+        # server.env is read into the process environment at startup and the rust
+        # server binary is read-only inside the container, so the old python
+        # `touch /app/amux-server.py` hot-reload did NOTHING here (AMUX-2779) — the
+        # key was written and silently never applied. Restart the container so the
+        # new key reaches the process, the same mechanism the admin refresh-auth
+        # path uses (see /api/gateway/admin/orgs/<id>/refresh-auth).
         subprocess.run(
-            ["docker", "exec", ctr_name, "touch", "/app/amux-server.py"],
-            capture_output=True)
+            ["docker", "restart", ctr_name],
+            capture_output=True, timeout=90)
         return True
     except Exception:
         return False
