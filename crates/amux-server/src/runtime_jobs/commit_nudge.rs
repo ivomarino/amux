@@ -416,6 +416,20 @@ pub fn build(
         // empty `generated` has two causes (the repo marks nothing, or the probe
         // could not run) and they want different actions. See
         // Freshness::generated_checked.
+        //
+        // THE THREE CLAUSES BELOW COMPOSE, AND THAT IS WHY NONE OF THEM CAN BE
+        // DROPPED AS REDUNDANT (mixpeek-frustrations, 2026-09-04, tracing a
+        // near-miss backend had within an hour of this shipping). The chain:
+        // a stale checkout reads 0 marked, because `check-attr` reads the
+        // WORKING TREE and a graft-push checkout is routinely not the repo; the
+        // reader concludes the list is missing; the arm hands them a method for
+        // building one; and if that method were co-change they mark a generator
+        // INPUT and silently delete a real merge warning. Three correct
+        // components producing a wrong write, none individually wrong.
+        //
+        // So the zero says whose tree it is about, the guidance says which
+        // evidence to trust, and the generated section says which direction of
+        // error is silent. Deleting any one of them re-opens the chain.
         let coverage = match (fresh.generated_stopped_by, generated_paths.len()) {
             ("error", _) => "\n\nGENERATED-FILE CHECK DID NOT RUN: `git check-attr` failed \
                  here, so none of the above is known either way. Treat every path as \
