@@ -3643,12 +3643,33 @@ pub async fn raise_app_by_pid(pid: u32) -> Result<(), String> {
     let script = format!(
         "tell application \"System Events\" to set frontmost of (first process whose unix id is {pid}) to true"
     );
-    let out = tokio::process::Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .output()
-        .await
-        .map_err(|e| format!("osascript: {e}"))?;
+    // BOUNDED, because this can BLOCK INDEFINITELY and did (measured on the very
+    // first live call of this endpoint, 2026-09-04: 2 minutes, then the client
+    // gave up). macOS gates Automation between processes: the first System
+    // Events call from a process that has not been granted it puts up a consent
+    // dialog and `osascript` waits on the human. A "which window is it" button
+    // that hangs the request is worse than one that says it could not tell you,
+    // so the timeout is short and its message NAMES the likely cause rather
+    // than reporting a generic timeout nobody can act on.
+    //
+    // kill_on_drop, per tests/kill_on_drop_guard.rs: a dropped timeout future
+    // otherwise leaves the osascript child unreaped.
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        tokio::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        "osascript did not answer within 8s — macOS is most likely showing an Automation \
+         consent dialog for System Events. Approve it once (System Settings > Privacy & \
+         Security > Automation) and the raise works from then on."
+            .to_string()
+    })?
+    .map_err(|e| format!("osascript: {e}"))?;
     if out.status.success() {
         return Ok(());
     }

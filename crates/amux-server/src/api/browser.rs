@@ -1401,6 +1401,75 @@ mod identify_scope_tests {
     }
 }
 
+/// The one-line answer, computed from what actually HAPPENED (AF-496).
+///
+/// Every argument is an outcome. The first live call of this endpoint said "the
+/// amux window is now in front" over a raise that had failed with a real error,
+/// because the verdict read the REQUEST (`raise` was asked for) rather than the
+/// RESULT (`raised` came back 0). A summary a reader takes as the result of the
+/// lines above must be computed from those lines, or it is an independent claim
+/// sitting beside them that cannot disagree with them.
+fn identify_verdict(labeled: usize, browsers: usize, raised: usize, raise_attempted: bool) -> String {
+    if labeled == 0 {
+        return "no window could be labelled — read `errors` on each browser below".into();
+    }
+    let bar = if browsers == 1 {
+        "the amux window now carries a blue bar naming its profile".to_string()
+    } else {
+        format!("all {browsers} amux windows now carry a blue bar naming their profile")
+    };
+    let tail = "; a Chrome window WITHOUT one is your own";
+    match (raise_attempted, raised) {
+        (false, _) => format!("{bar}{tail}"),
+        (true, 0) => format!(
+            "{bar}{tail}. It could NOT be brought to the front — see `raise_error`; \
+             find it by the bar instead"
+        ),
+        (true, n) => format!("{bar}{tail}. {n} of them raised to the front"),
+    }
+}
+
+#[cfg(test)]
+mod identify_verdict_tests {
+    use super::*;
+
+    /// THE CELL THIS FUNCTION EXISTS FOR, and the bug it was written over: the
+    /// verdict must not claim a window is in front when the raise failed. The
+    /// endpoint shipped saying exactly that, over a `raise_error` in the same
+    /// payload.
+    #[test]
+    fn a_failed_raise_is_never_reported_as_a_window_in_front() {
+        let v = identify_verdict(1, 1, 0, true);
+        assert!(!v.contains("in front,"), "{v}");
+        assert!(v.contains("could NOT be brought to the front"), "{v}");
+        assert!(v.contains("raise_error"), "the reader is not told where the reason is: {v}");
+    }
+
+    #[test]
+    fn a_raise_that_worked_says_so() {
+        let v = identify_verdict(1, 1, 1, true);
+        assert!(v.contains("raised to the front"), "{v}");
+        assert!(!v.contains("could NOT"), "{v}");
+    }
+
+    /// The multi-window case never attempts a raise, so its verdict must not
+    /// mention one either way — the bar and the elimination rule ARE the answer.
+    #[test]
+    fn several_windows_are_answered_by_the_bar_and_the_elimination_rule() {
+        let v = identify_verdict(3, 3, 0, false);
+        assert!(v.contains("all 3 amux windows"), "{v}");
+        assert!(v.contains("WITHOUT one is your own"), "{v}");
+        assert!(!v.contains("front"), "no raise was attempted, so none should be mentioned: {v}");
+    }
+
+    #[test]
+    fn labelling_nothing_points_at_the_errors_rather_than_claiming_success() {
+        let v = identify_verdict(0, 2, 0, false);
+        assert!(v.contains("no window could be labelled"), "{v}");
+        assert!(v.contains("errors"), "{v}");
+    }
+}
+
 #[derive(Deserialize, Default)]
 struct IdentifyBody {
     #[serde(default)]
@@ -1459,12 +1528,14 @@ async fn identify(headers: HeaderMap, body: Option<Json<IdentifyBody>>) -> Respo
     }
     let labeled: usize = identified.iter().map(|i| i.labeled).sum();
     let pages: usize = identified.iter().map(|i| i.pages).sum();
+    let raised: usize = identified.iter().filter(|i| i.raised).count();
     tracing::info!(
         asked_by,
         browsers = identified.len(),
         labeled,
         pages,
-        raise,
+        raise_attempted = raise,
+        raised,
         "browser: identify labelled the amux window(s) (AF-496)"
     );
     Json(json!({
@@ -1477,15 +1548,14 @@ async fn identify(headers: HeaderMap, body: Option<Json<IdentifyBody>>) -> Respo
         // refusing the banner.
         "labeled": labeled,
         "pages": pages,
-        "raised": raise,
-        "verdict": if labeled == 0 {
-            "no window could be labelled — read `errors` on each browser below"
-        } else if raise {
-            "the amux window is now in front and carries a blue bar naming its profile"
-        } else {
-            "every amux window now carries a blue bar naming its profile; a Chrome window \
-             WITHOUT one is your own"
-        },
+        // ATTEMPT AND OUTCOME, NAMED APART. The first live call of this endpoint
+        // returned `raised: true` beside a per-browser `raised: false` and a
+        // real `raise_error`, because the top-level field carried the REQUEST
+        // and the nested one carried the RESULT under one name. Same word, same
+        // payload, opposite meanings.
+        "raise_attempted": raise,
+        "raised": raised,
+        "verdict": identify_verdict(labeled, identified.len(), raised, raise),
         "banner_ms": chrome::identify_banner_ms(),
     }))
     .into_response()
