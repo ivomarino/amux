@@ -3863,32 +3863,34 @@ pub(crate) async fn cmd_hist_record_full(
     // deliberate, and silently dropping one would turn a visible annoyance into
     // an invisible data-loss bug — strictly worse. It announces, and lets a
     // human or a sweep decide.
-    let dup_prior: Option<(i64, i64)> = match state.store.read() {
-        Ok(conn) => prior_delivered(&conn, &session, &text, now_ms - DUP_DELIVERY_WINDOW_MS),
-        Err(_) => None,
-    };
-    if let Some((prior_id, prior_ts)) = dup_prior {
-        let age_s = (now_ms - prior_ts) as f64 / 1000.0;
-        tracing::warn!(
-            session = %session, prior_id, age_s,
-            preview = %chars_truncate(&text, 80),
-            "duplicate delivery: identical text already recorded for this lane"
-        );
-        emit_event(
-            state,
-            &session,
-            "message.duplicate",
-            Some(json!({
-                "prior_id": prior_id, "age_s": age_s, "type": ctype,
-                "origin": origin.clone(),
-                "chars": text.chars().count(),
-                "preview": chars_truncate(&text, 120),
-            })),
-            None,
-            "cmd-history",
-        )
-        .await;
-    }
+    // THE LOOKUP RUNS INSIDE THE WRITE, and it did not (AF-483).
+    //
+    // It used to take a READ connection here, check, drop it, and let the
+    // INSERT happen later in its own `write_async`. Two sends whose reads both
+    // land before either write therefore each see no prior, and NEITHER
+    // announces — precisely the 0-1s pair a human does not produce, which is
+    // the case most worth announcing.
+    //
+    // Measured over all of cmd_history 2026-09-04: six exact-text duplicate
+    // pairs inside the window after the detector shipped, only two announced.
+    // The four misses had gaps of 2s, 1s, 7s and 31s. The first three are this
+    // race comfortably; 31s needs a stalled write queue as well, so this fix is
+    // claimed for the shape, not for all four rows.
+    //
+    // SQLite serialises writers, so performing the check in the same closure as
+    // the INSERT makes it a real check-then-act rather than a TOCTOU. The
+    // announcement stays OUT here: `emit_event` is async and the closure is not,
+    // and warning from inside a write would fire on a transaction that can still
+    // fail. The carrier is two atomics rather than a Mutex, matching msg_row_id
+    // directly below; 0 means no prior, and a real row id is never 0.
+    let dup_prior_id = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let dup_prior_ts = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let dup_prior_id_w = dup_prior_id.clone();
+    let dup_prior_ts_w = dup_prior_ts.clone();
+    // Copies for the announcement, which now runs AFTER the closure has taken
+    // ownership of the originals.
+    let cap_ctype = ctype.clone();
+    let cap_origin = origin.clone();
 
     let is_user = ctype == "user";
     // Carry the recorded row id out of the write so auto-capture can link the card.
@@ -3943,6 +3945,15 @@ pub(crate) async fn cmd_hist_record_full(
         .store
         .write_async(move |conn| {
             ensure_fleet_tables(conn)?;
+            // BEFORE the insert, on the writer's own connection: the prior must
+            // be one that already existed, and no concurrent record can slip its
+            // own insert between this read and ours (AF-483).
+            if let Some((pid, pts)) =
+                prior_delivered(conn, &session, &text, now_ms - DUP_DELIVERY_WINDOW_MS)
+            {
+                dup_prior_id_w.store(pid, std::sync::atomic::Ordering::SeqCst);
+                dup_prior_ts_w.store(pts, std::sync::atomic::Ordering::SeqCst);
+            }
             conn.execute(
                 "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at, submit_verdict) \
                  VALUES (?,?,?,?,?,?,?,?,?)",
@@ -3976,6 +3987,39 @@ pub(crate) async fn cmd_hist_record_full(
             })
         })
         .await;
+
+    // ANNOUNCE AFTER THE WRITE COMMITTED, never from inside it (AF-483). A warn
+    // emitted in the closure would fire on a transaction that can still fail,
+    // which is a duplicate report for a message that was never recorded.
+    //
+    // Still does NOT suppress the second delivery. Two identical sends can be
+    // deliberate, and silently dropping one turns a visible annoyance into an
+    // invisible data-loss bug, which is strictly worse. It announces and lets a
+    // human or a sweep decide.
+    let prior_id = dup_prior_id.load(std::sync::atomic::Ordering::SeqCst);
+    if prior_id > 0 {
+        let prior_ts = dup_prior_ts.load(std::sync::atomic::Ordering::SeqCst);
+        let age_s = (now_ms - prior_ts) as f64 / 1000.0;
+        tracing::warn!(
+            session = %cap_session, prior_id, age_s,
+            preview = %chars_truncate(&cap_text, 80),
+            "duplicate delivery: identical text already recorded for this lane"
+        );
+        emit_event(
+            state,
+            &cap_session,
+            "message.duplicate",
+            Some(json!({
+                "prior_id": prior_id, "age_s": age_s, "type": cap_ctype,
+                "origin": cap_origin,
+                "chars": cap_text.chars().count(),
+                "preview": chars_truncate(&cap_text, 120),
+            })),
+            None,
+            "cmd-history",
+        )
+        .await;
+    }
 
     // NO SILENT WORK (AMUX-3071): mint a ledger card for a HUMAN prompt and link
     // it to the message row. Separate write so a capture failure can never roll
@@ -11900,6 +11944,37 @@ async fn debug_duplicate_deliveries(State(state): State<AppState>, RawQuery(q): 
     for r in &rows {
         *by_session.entry(r["session"].as_str().unwrap_or("").to_string()).or_insert(0) += 1;
     }
+
+    // THE DENOMINATOR THIS PROBE NEVER HAD (AF-483).
+    //
+    // `total` counts what the detector ANNOUNCED. An unannounced duplicate is
+    // therefore invisible to the only endpoint a sweep is told to consult, and
+    // `total` is a lower bound with nothing beside it saying so. That is ethos
+    // rule 4 one layer up from the probe: the measurement can read low for two
+    // reasons and reports one number for both.
+    //
+    // The independent population is cmd_history itself: the same text to the
+    // same lane inside the same window is a duplicate whether or not anything
+    // noticed. Comparing the two is what turns "7 duplicates" into "7 announced
+    // of 11 that happened", and it is the query that would have surfaced the
+    // TOCTOU without a sweep — six pairs, two announced, measured by hand on
+    // 2026-09-04.
+    //
+    // ts is MILLISECONDS here and `since` is SECONDS, which is the same split
+    // the rest of this handler lives with; multiply rather than trusting the
+    // column names to agree.
+    let since_ms = (since * 1000.0) as i64;
+    let pairs_in_history: Option<i64> = conn
+        .query_row(
+            "SELECT COUNT(*) FROM cmd_history a JOIN cmd_history b \
+               ON b.session = a.session AND b.text = a.text AND b.id > a.id \
+              AND b.ts - a.ts BETWEEN 0 AND ?2 \
+             WHERE a.ts > ?1",
+            rusqlite::params![since_ms, DUP_DELIVERY_WINDOW_MS],
+            |r| r.get(0),
+        )
+        .ok();
+    let unannounced = pairs_in_history.map(|p| (p - rows.len() as i64).max(0));
     // AF-320. `total: 0` reads as "no duplicates" whether the query ran or
     // silently returned nothing; `unwrap_or_default()` above makes that a real
     // path rather than a hypothetical one.
@@ -11913,11 +11988,19 @@ async fn debug_duplicate_deliveries(State(state): State<AppState>, RawQuery(q): 
         "window_param": window_param,
         "window_ms": DUP_DELIVERY_WINDOW_MS,
         "total": rows.len(),
+        // ANNOUNCED vs HAPPENED. `total` is the first; these two are the second
+        // and the difference. `null` when the comparison query itself failed,
+        // which is distinct from 0 and must not read as "none missed".
+        "pairs_in_history": pairs_in_history,
+        "unannounced": unannounced,
         "by_session": by_session,
         "events": rows,
         "note": "a duplicate is the SAME text recorded twice for one lane inside window_ms. \
                  Deliveries are never suppressed on this signal — two identical sends can be \
-                 deliberate, and dropping one would turn a visible annoyance into silent loss.",
+                 deliberate, and dropping one would turn a visible annoyance into silent loss. \
+                 `total` is what the detector ANNOUNCED; `pairs_in_history` is what cmd_history \
+                 shows happened, counted independently. A non-zero `unannounced` means the \
+                 detector missed some, so `total` alone is a lower bound (AF-483).",
         }),
         rows.len(),
     ))
@@ -18565,6 +18648,83 @@ mod tests {
             "a DIRECT send really was delivered when it was recorded — blanking this too \
              would throw away true information instead of removing false information"
         );
+    }
+
+    /// THE DETECTOR MUST FIRE ON A CONCURRENT PAIR, NOT ONLY A SEQUENTIAL ONE
+    /// (AF-483).
+    ///
+    /// Measured over all of cmd_history on 2026-09-04: six exact-text duplicate
+    /// pairs to one lane inside the 120s window after the detector shipped, and
+    /// only two were announced. The four misses were 08-13 to 08-18 with gaps of
+    /// 2s, 31s, 1s and 7s, and deployment, retention, the `stuck` exclusion, the
+    /// client send-time stamp and row shape are all ruled out on AF-483.
+    ///
+    /// What is NOT ruled out is a TOCTOU in the detector itself. `dup_prior`
+    /// takes a READ connection, checks, drops it, and the INSERT happens later
+    /// in a separate `write_async`. Two sends whose reads both land before
+    /// either write therefore see no prior and neither announces, which is the
+    /// one case where the announcement matters most: a 0-1s gap is the shape a
+    /// human does not produce.
+    ///
+    /// The sequential case already works and this cell asserts it too, as the
+    /// control. Without it a "fix" that announced on every message would pass
+    /// the concurrent half and destroy the signal.
+    #[tokio::test]
+    async fn a_concurrent_duplicate_is_announced_like_a_sequential_one() {
+        // CONTROL FIRST: sequential. If this ever stops firing the concurrent
+        // assertion below is measuring a detector that is simply off.
+        let (st, _dir) = state();
+        cmd_hist_record_full(&st, "lane-seq", "same words", "user", "", true,
+                             DeliveryMeta::direct()).await;
+        cmd_hist_record_full(&st, "lane-seq", "same words", "user", "", true,
+                             DeliveryMeta::direct()).await;
+        assert_eq!(
+            duplicate_events(&st, "lane-seq"),
+            1,
+            "premise: a sequential duplicate pair must announce exactly once, or this \
+             cell cannot tell a broken detector from a race"
+        );
+
+        // THE CASE. Two records started together, so both reads can precede
+        // both writes.
+        let (st2, _dir2) = state();
+        let a = cmd_hist_record_full(&st2, "lane-race", "same words", "user", "", true,
+                                     DeliveryMeta::direct());
+        let b = cmd_hist_record_full(&st2, "lane-race", "same words", "user", "", true,
+                                     DeliveryMeta::direct());
+        tokio::join!(a, b);
+
+        let rows = lane_rows(&st2, "lane-race");
+        assert_eq!(rows, 2, "premise: both sends must have been recorded, got {rows}");
+        assert_eq!(
+            duplicate_events(&st2, "lane-race"),
+            1,
+            "two identical sends landed on one lane together and the detector said \
+             nothing. A 0-1s gap is the shape a human does not produce, so this is \
+             exactly the pair worth announcing (AF-483)."
+        );
+    }
+
+    /// How many `message.duplicate` events exist for a lane.
+    fn duplicate_events(st: &AppState, lane: &str) -> i64 {
+        st.store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM session_events \
+                 WHERE type='message.duplicate' AND session=?1",
+                [lane],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+    }
+
+    fn lane_rows(st: &AppState, lane: &str) -> i64 {
+        st.store
+            .read()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM cmd_history WHERE session=?1", [lane], |r| r.get(0))
+            .unwrap_or(0)
     }
 
     /// A healthy SSE connection used to make Messages LESS live than the 5s

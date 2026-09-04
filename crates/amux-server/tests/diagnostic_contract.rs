@@ -71,6 +71,43 @@ fn app() -> axum::Router {
     })
 }
 
+/// Same as `app()`, with a seed run against the store first.
+///
+/// A diagnostic over an EMPTY store answers 0 to everything, and 0 satisfies
+/// most arithmetic. A cell that needs to tell a real computation from a constant
+/// has to hand the probe something to count.
+fn app_with(
+    seed: impl FnOnce(&rusqlite::Connection) + Send + 'static,
+) -> axum::Router {
+    let dir = tempfile::tempdir().unwrap();
+    let dir = Box::leak(Box::new(dir));
+    let store = amux_server::db::Store::open(&dir.path().join("diag.db")).unwrap();
+    store
+        .write(move |conn| {
+            seed(conn);
+            Ok(amux_server::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .unwrap();
+    router(AppState {
+        store: std::sync::Arc::new(store),
+        started: std::time::Instant::now(),
+        build_hash: "test".into(),
+        auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    })
+}
+
+async fn get_json_on(app: &axum::Router, path: &str) -> (u16, Option<Value>) {
+    let res = app
+        .clone()
+        .oneshot(Request::builder().method("GET").uri(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = res.status().as_u16();
+    let body = axum::body::to_bytes(res.into_body(), 32 * 1024 * 1024).await.unwrap();
+    (status, serde_json::from_slice(&body).ok())
+}
+
 async fn get_json(path: &str) -> (u16, Option<Value>) {
     let res = app()
         .oneshot(Request::builder().method("GET").uri(path).body(Body::empty()).unwrap())
@@ -149,6 +186,88 @@ async fn a_diagnostic_that_reports_a_window_honours_since_h() {
         offenders.is_empty(),
         "a diagnostic reports a window it does not take from `since_h`, so a caller \n         following the fleet convention silently gets the default (AF-482):\n  {}",
         offenders.join("\n  ")
+    );
+}
+
+/// THE DUPLICATE PROBE PUBLISHES WHAT IT MISSED, not only what it caught
+/// (AF-483).
+///
+/// `total` counts `message.duplicate` EVENTS. A duplicate the detector never
+/// announced is invisible to it, so `total` is a lower bound and said so
+/// nowhere. Measured 2026-09-04: six exact-text duplicate pairs in cmd_history
+/// inside the detector's window after it shipped, and two announced. A sweep
+/// reading this endpoint would have seen 2 and concluded 2.
+///
+/// The independent population is cmd_history, so the endpoint now carries
+/// `pairs_in_history` and `unannounced` beside `total`. This cell asserts the
+/// three fields exist and agree arithmetically, which is the part that can rot:
+/// a later refactor that computes `unannounced` from the same events it is
+/// meant to be checked against would still return a number.
+#[tokio::test]
+async fn the_duplicate_probe_reports_announced_against_happened() {
+    // A FIXTURE THAT CAN CROSS THE BOUNDARY. On an empty store pairs, total and
+    // unannounced are all 0 and the arithmetic below holds for a constant zero,
+    // so the cell would certify a probe that computes nothing. Measured: with an
+    // empty store, mutating `unannounced` to always-0 left this green.
+    //
+    // So seed the exact state the card is about: a real duplicate pair in
+    // cmd_history and NO announcement for it. That is pairs=1, total=0,
+    // unannounced=1, and it is the only shape that tells the three fields apart.
+    let app = app_with(|conn| {
+        let now_ms = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64)
+            * 1000;
+        for off in [0i64, 3000] {
+            conn.execute(
+                "INSERT INTO cmd_history (text, type, session, ts, origin) \
+                 VALUES ('af483 seeded duplicate', 'user', 'af483-lane', ?1, '')",
+                rusqlite::params![now_ms + off],
+            )
+            .unwrap();
+        }
+    });
+    let (status, json) = get_json_on(&app, "/api/debug/duplicate-deliveries?since_h=500").await;
+    assert_eq!(status, 200, "the probe must answer");
+    let v = json.expect("JSON body");
+
+    let total = v["total"].as_i64().expect("total is a count");
+    // THE POSITIVE CONTROL. If the seed stopped producing an unannounced pair
+    // this cell would go back to asserting 0 == 0.
+    assert_eq!(
+        v["pairs_in_history"].as_i64(),
+        Some(1),
+        "premise: the seeded duplicate pair must be counted, or this cell proves nothing"
+    );
+    assert_eq!(total, 0, "premise: nothing announced it, so total must be 0");
+    assert_eq!(
+        v["unannounced"].as_i64(),
+        Some(1),
+        "a duplicate that happened and was never announced must show as unannounced, \
+         which is the entire point of the denominator (AF-483)"
+    );
+    let pairs = v["pairs_in_history"].as_i64().expect(
+        "pairs_in_history must be present: without a denominator `total` is a lower          bound that reads as a finding (AF-483)",
+    );
+    let unannounced = v["unannounced"].as_i64().expect("unannounced must be present");
+
+    // THE ARITHMETIC, which is what stops the trio being three decorative
+    // fields. On an empty store all three are 0 and this still holds.
+    assert_eq!(
+        unannounced,
+        (pairs - total).max(0),
+        "unannounced must be what happened minus what was announced, got          unannounced={unannounced} from pairs={pairs} total={total}"
+    );
+    assert!(pairs >= 0 && total >= 0, "counts cannot be negative");
+
+    // AND THE NOTE HAS TO SAY IT. A reader who does not know `total` counts
+    // events will read it as the number of duplicates, which is the whole
+    // defect; the fields alone do not tell them which is which.
+    let note = v["note"].as_str().unwrap_or("");
+    assert!(
+        note.contains("ANNOUNCED") && note.contains("lower bound"),
+        "the note must say total counts announcements and is a lower bound: {note:?}"
     );
 }
 
