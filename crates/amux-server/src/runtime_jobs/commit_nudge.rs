@@ -847,6 +847,13 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
              prove the direction with the ANCESTRY test, NOT the diff line-count: \
              worktree-has-more/has-less misclassifies about 2 in 10 (studio-plg measured it on \
              this checkout: files with MORE lines than origin that are nonetheless stale). \
+             FIRST compare BLOBS, which is what the classifier gates on and what the commit \
+             graph cannot tell you: `git rev-parse HEAD:<path> origin/main:<path>` — EQUAL \
+             sha1s mean origin holds your bytes already, so there is nothing to revert and you \
+             just commit. GRAFTING is why: a graft-push rebuilds your landed work as a new \
+             commit on origin\'s tip, same content, different sha, so it returns as \"a commit \
+             your HEAD lacks\". Measured 40.6% false flags on the mixpeek checkout, 737 of 1815 \
+             (AF-471). ONLY IF THE BLOBS DIFFER: \
              `git log --oneline HEAD..origin/main -- <path>`: prints a commit = origin has work \
              you lack = STALE, so do not commit; restore with `git checkout origin/main -- <path>` \
              ONLY after `git log --all --find-object=$(git hash-object <path>) -- <path>` prints a \
@@ -895,7 +902,20 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
          nonetheless stale, because origin has since moved to a shorter version). Roughly 1 in 4 \
          differing paths here are novel mid-edit a blind `checkout` would DESTROY irreversibly, \
          so the direction test is the headline, not a caveat:\n\
-         \u{2022} `git log --oneline HEAD..origin/main -- <path>`: if it prints ANY commit, \
+         \u{2022} FIRST compare the BLOBS, which is what the classifier does and what the \
+         commit graph cannot tell you: `git rev-parse HEAD:<path> origin/main:<path>`. If the \
+         two sha1s are EQUAL, origin holds the same bytes your HEAD does and there is nothing \
+         of origin's to revert, whatever the commit graph says. Skip to the ordinary commit. \
+         GRAFTING is why this comes first: a graft-push builds a NEW commit onto origin\'s tip, \
+         so your own landed work returns as a commit your HEAD lacks under a different sha with \
+         identical content. Measured on the mixpeek checkout 2026-09-04 (behind 1681, ahead \
+         767) by mixpeek-general, reproduced by amux-frustrations and sampled again by \
+         mixpeek-cicd: of 1815 paths the commit test flags, 1080 actually differ. 737 false \
+         flags, 40.6%. `--find-object` below survives grafting for the same reason this does — \
+         it asks about CONTENT reachability, and grafting changes commit identity while \
+         preserving content (AF-471).\n\
+         \u{2022} ONLY IF THE BLOBS DIFFER does the commit graph mean anything: \
+         `git log --oneline HEAD..origin/main -- <path>`: if it prints ANY commit, \
          origin has work on this path that your HEAD lacks, so the worktree copy is genuinely \
          older (STALE); do not commit. Restore with `git checkout origin/main -- <path>` ONLY \
          after BOTH: `git log --all --find-object=$(git hash-object <path>) -- <path>` prints a \
@@ -2382,6 +2402,29 @@ mod tests {
                 m.contains("HEAD..origin/main"),
                 "nudge must prescribe the ancestry test it classifies with: {m}"
             );
+            // AF-471: and it must prescribe the BLOB comparison FIRST, because
+            // that is what the classifier does first — step 2b computes
+            // `refs_agree` from HEAD:<path> vs origin/main:<path> and never
+            // reaches the commit test when they agree.
+            //
+            // The text used to lead with the commit test, which on a
+            // graft-pushed checkout is wrong 40.6% of the time (1815 flagged,
+            // 1080 actually differing, on ~/Dev/mixpeek 2026-09-04). The
+            // classifier was right the whole time and the printed recipe was
+            // not — the SECOND time this exact desync has been fixed in this
+            // function, which is why the assertion is ordered and not just
+            // presence-based.
+            let blob_at = m.find("rev-parse HEAD:<path>");
+            let graph_at = m.find("HEAD..origin/main");
+            assert!(
+                blob_at.is_some(),
+                "nudge must prescribe the blob comparison the classifier gates on: {m}"
+            );
+            assert!(
+                blob_at < graph_at,
+                "the blob comparison must come BEFORE the commit test, as it does in \
+                 the classifier — leading with the graph is the AF-471 defect: {m}"
+            );
             // The old recipe may still appear as an explicit warning NOT to use
             // it, but never as the prescribed check.
             let prescribes_blob = m.contains("`git cat-file -e $(git hash-object <path>) 2>/dev/null`: object EXISTS")
@@ -2891,6 +2934,91 @@ mod tests {
     /// Drives the real function against a real git repo, because the bug is
     /// entirely in how git resolves a path relative to a process CWD — a mocked
     /// git would have reproduced nothing.
+    /// AF-471. A GRAFT TWIN is the same CONTENT under a different commit, and
+    /// the commit-graph direction test cannot see the difference.
+    ///
+    /// Measured on ~/Dev/mixpeek 2026-09-04 (behind=1681, ahead=767), reported by
+    /// mixpeek-general, reproduced independently here and sampled again by
+    /// mixpeek-cicd: of 1815 paths flagged by `git log HEAD..origin/main`, 1080
+    /// actually differed. 737 false flags, 40.6%. Their specimen was
+    /// origin/main:scripts/commit-retry.sh and f4cc71ed5a:scripts/commit-retry.sh
+    /// holding blob 596724c016 under two shas.
+    ///
+    /// Constructed rather than sampled BECAUSE ~/Dev/amux cannot reproduce it:
+    /// behind=0 here, so the flagged set is empty and the rate is 0/0. A defect
+    /// that needs a diverged checkout still needs a test on one that is not.
+    #[tokio::test]
+    async fn a_graft_twin_is_not_stale_however_the_commit_graph_reads() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let sh = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git")
+        };
+        sh(&["init", "-q", "--initial-branch=main"]);
+        sh(&["config", "user.email", "t@t"]);
+        sh(&["config", "user.name", "t"]);
+        std::fs::write(root.join("twin.txt"), "shared content\n").unwrap();
+        std::fs::write(root.join("real.txt"), "mine\n").unwrap();
+        sh(&["add", "-A"]);
+        sh(&["commit", "-qm", "base"]);
+        let base = String::from_utf8_lossy(&sh(&["rev-parse", "HEAD"]).stdout).trim().to_string();
+
+        // ORIGIN gets a commit HEAD lacks. twin.txt keeps the SAME bytes (the
+        // graft twin); real.txt genuinely changes (the control).
+        sh(&["checkout", "-q", "-b", "origin-side"]);
+        std::fs::write(root.join("real.txt"), "theirs\n").unwrap();
+        sh(&["add", "-A"]);
+        sh(&["commit", "-qm", "origin work"]);
+        // Make origin's history TOUCH twin.txt and land back on the same blob.
+        // Writing it to itself commits nothing (git stages no change), so the
+        // path has to leave and return — which is what a graft's rebuilt commits
+        // do to a file whose end state is unchanged.
+        std::fs::write(root.join("twin.txt"), "shared content\nintermediate\n").unwrap();
+        sh(&["commit", "-qam", "origin touches twin.txt"]);
+        std::fs::write(root.join("twin.txt"), "shared content\n").unwrap();
+        sh(&["commit", "-qam", "graft: twin.txt back to the original blob"]);
+        let origin = String::from_utf8_lossy(&sh(&["rev-parse", "HEAD"]).stdout).trim().to_string();
+        sh(&["update-ref", "refs/remotes/origin/main", &origin]);
+        sh(&["checkout", "-q", &base]);
+        sh(&["checkout", "-q", "-B", "main", &base]);
+
+        // CONTROL 1: the commit-graph test must actually flag twin.txt, or this
+        // test proves nothing about the guard.
+        let flagged = String::from_utf8_lossy(
+            &sh(&["log", "--oneline", "HEAD..origin/main", "--", "twin.txt"]).stdout).trim().to_string();
+        assert!(!flagged.is_empty(),
+            "the commit test must flag the twin, else the fixture is not a graft twin");
+        // CONTROL 2: and the blobs must genuinely be equal.
+        let a = String::from_utf8_lossy(&sh(&["rev-parse", "HEAD:twin.txt"]).stdout).trim().to_string();
+        let b = String::from_utf8_lossy(&sh(&["rev-parse", "origin/main:twin.txt"]).stdout).trim().to_string();
+        assert_eq!(a, b, "the fixture's twin must be the same blob under two commits");
+
+        // Dirty both so the classifier considers them.
+        std::fs::write(root.join("twin.txt"), "shared content\nlocal edit\n").unwrap();
+        std::fs::write(root.join("real.txt"), "mine\nlocal edit\n").unwrap();
+
+        let paths = vec!["twin.txt".to_string(), "real.txt".to_string()];
+        let fresh = freshness_from_repo(root.to_str().unwrap(), &paths).await;
+
+        assert!(!fresh.stale.iter().any(|p| p == "twin.txt"),
+            "a graft twin must NOT be STALE: origin holds the same blob, so there is \
+             nothing of origin's to revert. stale={:?}", fresh.stale);
+        // THE OTHER SIDE. real.txt genuinely differs, so the guard must NOT have
+        // swallowed the real signal — without this the test passes on a classifier
+        // that calls everything fresh.
+        assert!(
+            fresh.stale.iter().any(|p| p == "real.txt")
+                || fresh.diverged.iter().any(|p| p == "real.txt"),
+            "a path whose content really differs must still be flagged; the guard \
+             must clear graft twins ONLY. stale={:?} diverged={:?}",
+            fresh.stale, fresh.diverged
+        );
+    }
+
     #[tokio::test]
     async fn phantom_filter_still_works_when_the_lane_dir_is_a_subdirectory() {
         let tmp = tempfile::tempdir().expect("tempdir");
