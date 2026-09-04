@@ -2672,3 +2672,28 @@ FIX: ATE-37 makes automatic draining a fallback after every To Do candidate has
  requires the runnable card alone to be selected. All 106 board-driver tests
  pass, including WIP, needs:you, freshness, capture-shell, irreversible-action,
  dependency-promotion, and explicit auto-drain opt-out controls.
+
+## Codex kept a live turn above its prompt shell and the dashboard called it idle
+AREA: instruments
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-38
+SYMPTOM: while `amux-testing-e2e` visibly showed `Waiting for background
+ terminal (... esc to interrupt)` directly above `Ask Codex to do anything`,
+ `/api/status-explain` set `pane.says_working=false` and the Workers UI labelled
+ the session idle. The status parser treated the persistent Codex prompt/model
+ shell as a newer idle boundary even though Codex paints that shell throughout
+ an active turn.
+COST: the worker's current board card lost its working highlight during a real
+ generation. That makes the board contradict the terminal and can also let the
+ driver reason from a false idle state.
+FIX: ATE-38 recognizes the exact adjacent live shapes on both supported Codex
+ layouts: older builds paint `Working` after the submitted prompt, while current
+ builds paint `Working`, `Running`, or `Waiting for background terminal/command`
+ immediately before the disabled prompt shell. A separated historical row still
+ cannot override the newest prompt, and a completed `Worked for` row is an idle
+ control. Adapter and end-to-end status-truth tests cover active, completed,
+ stale-row, queued-message, and prompt-churn cases without matching arbitrary
+ transcript prose.

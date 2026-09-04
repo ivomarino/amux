@@ -4395,7 +4395,8 @@ Claude usage limit reached. Your limit will reset at 3pm.
 
     fn fresh_idle_lane(lane: &str, claim_age_s: f64) -> FleetSignals {
         let mut s = signals();
-        s.activity.insert(format!("amux-{lane}"), (s.now - 1.0) as i64);
+        s.activity
+            .insert(format!("amux-{lane}"), (s.now - 1.0) as i64);
         s.running.insert(format!("amux-{lane}"));
         s.reports = json!({lane: {"state": "idle", "ts": s.now - claim_age_s, "source": "stop-hook"}});
         s.panes.insert(lane.into(), WORKING_BAR.into());
@@ -4692,6 +4693,37 @@ Checked, nothing of mine was at risk, no action needed from you.
         );
         assert_eq!(ex["pane"]["says_working"], json!(false), "{ex}");
         assert!(ex["pane"]["churn_distinct_frames"].as_u64().unwrap() >= 3, "{ex}");
+    }
+
+    /// ATE-38, the opposite live edge of ATE-36. Codex leaves the prompt shell
+    /// visible while generating; an exact active status row immediately above
+    /// it means the prompt is disabled, not that the worker is idle.
+    #[test]
+    fn a_codex_working_row_above_its_prompt_shell_is_active() {
+        let lane = "ate38-codex-active";
+        let active = "\
+• Waiting for background terminal (16m 29s • esc to interrupt)
+› Ask Codex to do anything
+  gpt-5.6-sol xhigh · ~/Dev/amux";
+        let mut s = signals();
+        s.activity.insert(format!("amux-{lane}"), (s.now - 1.0) as i64);
+        s.running.insert(format!("amux-{lane}"));
+        s.reports = json!({lane: {
+            "state": "idle", "ts": s.now - 1076.0, "source": "stop-hook-test"
+        }});
+        s.panes.insert(lane.into(), active.into());
+
+        let (status, ex) = s.derive_status_explain(lane, true);
+        assert_eq!(
+            status, "active",
+            "the adjacent live status row must win: {ex}"
+        );
+        assert_eq!(ex["pane"]["says_working"], json!(true), "{ex}");
+        assert_eq!(
+            ex["decided_by"],
+            json!("contradiction_pane_generating"),
+            "{ex}"
+        );
     }
 
     /// The two controls that keep churn honest: the SAME frame re-captured is

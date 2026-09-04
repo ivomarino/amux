@@ -974,20 +974,41 @@ fn codex_model_bar(line: &str) -> bool {
         && (location == "~" || location.starts_with("~/") || location.starts_with('/'))
 }
 
+fn codex_active_status_line(line: &str) -> bool {
+    let low = line.trim().to_ascii_lowercase();
+    low.starts_with("• working (")
+        || low.starts_with("• running (")
+        || low.starts_with("• waiting for background terminal (")
+        || low.starts_with("• waiting for background command (")
+}
+
 fn codex_generation_state_clean(clean: &str) -> Option<bool> {
-    // Order is the state. While generating, Codex paints the working row below
-    // the submitted prompt. Once complete it redraws an empty prompt and model
-    // bar BELOW that row, but the row can remain in the captured tail. Reading
-    // these as an unordered set pinned completed workers Active (ATE-36).
-    for s in nonempty_trimmed(clean).iter().rev().take(12) {
-        if is_prompt_line(s) || codex_model_bar(s) {
-            return Some(false);
-        }
-        let sl = s.to_lowercase();
-        if s.starts_with('•')
-            && (sl.contains("esc to interrupt") || sl.contains("working") || sl.contains("running"))
-        {
+    // The Codex prompt shell and model bar remain painted while a turn is
+    // running. The decisive shape is therefore the line immediately ABOVE the
+    // prompt: `• Working (…)` / `• Waiting for background terminal (…)` means
+    // the prompt is disabled and the turn is live; completed turns replace it
+    // with `Worked for …` or ordinary output. ATE-36 incorrectly made the mere
+    // presence of the prompt shell an idle boundary, which hid live ATE-37.
+    let lines = nonempty_trimmed(clean);
+    let start = lines.len().saturating_sub(12);
+    let tail = &lines[start..];
+    if let Some(prompt_i) = tail.iter().rposition(|s| is_prompt_line(s)) {
+        // Older Codex builds painted the active row after the submitted
+        // prompt; current builds keep a disabled prompt shell below the row.
+        // Support both exact adjacent shapes, while refusing an older status
+        // row separated from the newest prompt by completed output.
+        let active_before_prompt = prompt_i > 0 && codex_active_status_line(tail[prompt_i - 1]);
+        let active_after_prompt = tail[prompt_i + 1..]
+            .iter()
+            .any(|s| codex_active_status_line(s));
+        return Some(active_before_prompt || active_after_prompt);
+    }
+    for s in tail.iter().rev() {
+        if codex_active_status_line(s) {
             return Some(true);
+        }
+        if codex_model_bar(s) {
+            return Some(false);
         }
     }
     None
@@ -1739,11 +1760,16 @@ Running 1 shell command · 5s…
 
 • Working (12s • esc to interrupt)";
 
-    // `amux-testing-e2e`, live 2026-09-04 after Codex completed ATE-36.
-    // The final prompt and model bar are NEWER than the working row, but the
-    // old any-of-last-12 scan let that stale row pin the worker active.
-    const FX_CODEX_COMPLETED_AFTER_WORKING: &str = "\
-• Working (6m 26s • esc to interrupt)
+    // `amux-testing-e2e`, live 2026-09-04 while Codex was running ATE-37.
+    // Codex keeps the prompt shell/model bar painted during generation; the
+    // active row immediately above it is the current-state boundary.
+    const FX_CODEX_WORKING_WITH_PROMPT_SHELL: &str = "\
+• Waiting for background terminal (16m 29s • esc to interrupt)
+› Ask Codex to do anything
+  gpt-5.6-sol xhigh · ~/Dev/amux";
+
+    const FX_CODEX_COMPLETED: &str = "\
+• Worked for 4m 46s
 › Ask Codex to do anything
   gpt-5.6-sol xhigh · ~/Dev/amux";
 
@@ -1758,17 +1784,22 @@ Running 1 shell command · 5s…
     }
 
     #[test]
-    fn a_newer_codex_prompt_ends_an_older_working_row() {
+    fn codex_working_row_above_the_prompt_shell_is_generating() {
         assert!(
-            !adapter("codex").generating(FX_CODEX_COMPLETED_AFTER_WORKING),
-            "the bottom-up NEWEST signal is the idle prompt/model bar, not the stale working row"
+            adapter("codex").generating(FX_CODEX_WORKING_WITH_PROMPT_SHELL),
+            "Codex paints its prompt shell during a live turn; the adjacent working row wins"
         );
+        assert!(adapter("ollama").generating(FX_CODEX_WORKING_WITH_PROMPT_SHELL));
+    }
+
+    #[test]
+    fn codex_completed_row_above_the_prompt_shell_is_idle() {
+        assert!(!adapter("codex").generating(FX_CODEX_COMPLETED));
         assert_eq!(
-            waiting_reasons(&adapter("codex").scan(FX_CODEX_COMPLETED_AFTER_WORKING)),
+            waiting_reasons(&adapter("codex").scan(FX_CODEX_COMPLETED)),
             vec!["idle_prompt"]
         );
-        // Ollama uses the same Codex TUI and must inherit the same ordering.
-        assert!(!adapter("ollama").generating(FX_CODEX_COMPLETED_AFTER_WORKING));
+        assert!(!adapter("ollama").generating(FX_CODEX_COMPLETED));
     }
 
     #[test]
