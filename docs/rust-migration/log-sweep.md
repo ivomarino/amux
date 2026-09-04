@@ -220,9 +220,23 @@ fallback when a finding needs row-level inspection.
    is an accusation the qualifications below call "the expensive kind".
 
    Adding a `method=` filter to the page was the obvious cheaper fix and does not
-   work: mutating rows are 41.6% of traffic here (8,314 of 20,000 across 7.19h),
-   not the ~4% the proposal assumed, so filtering buys ~2.4x on a step that needs
-   ~33x. It would have reached 1.7h of 24 and closed as fixed.
+   work. Measured from the aggregate over a full 24h window: 34,145 mutating rows
+   out of 416,340. A 2,000-row page of mutating-only rows is 5.9% of the day's
+   writes, roughly 1.4 hours of 24. Better than the 0.48% an unfiltered page
+   reaches, and still not a window.
+
+   The decisive number is the answer itself, not the ratio. On the same window
+   the prescribed page yielded **12 sessions**; a hand-rolled 14-page walk yielded
+   37; the aggregate yields **53**. A filter that closes as fixed while still
+   naming a third of the writers is the worse outcome, because the next sweep
+   inherits a closed card telling it not to re-check.
+
+   Do not extrapolate coverage from one page's `page_span_h`. Traffic here is
+   bursty enough that the newest page ran at ~2,400 rows/h against a 24h mean of
+   ~17,300, so a span read off the newest page overstates coverage by 7x. Both
+   this card's original estimate and its first correction were computed that way
+   and both were wrong. `mutating_rows` and `n_considered` on this endpoint are
+   whole-window counts and are the numbers to reason from.
 
    Three qualifications, each from a false positive this rule produced on
    2026-08-09 (AF-34). It accused a peer, and the accusation is the expensive
