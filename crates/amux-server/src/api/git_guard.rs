@@ -994,6 +994,10 @@ const READ_ONLY_VERBS: &[&str] = &[
     "cut", "column", "od", "xxd", "hexdump", "tree", "du", "basename",
     "dirname", "realpath", "readlink", "sha256sum", "md5sum", "nl", "tac",
     "pwd", "echo", "printf",
+    // `read` consumes stdin into a shell variable and cannot touch a file.
+    // Reached via `while read -r l; do ...; done`, where stripping `while` leaves
+    // it as the segment's verb (AMUX-2841 fix, 2026-09-04).
+    "read",
     // `cd` cannot modify anything, and its ABSENCE silently undid the
     // git-read exemption directly below: `git show f` was correctly a read,
     // while `cd /repo && git show f` was not, because the FIRST segment's
@@ -1079,12 +1083,107 @@ fn is_pure_read_command(cmd: &str) -> bool {
             }
             return false;
         }
+        // SHELL STRUCTURE IS NOT A COMMAND (AMUX-2841's first observed specimen,
+        // 2026-09-04). `for c in A B; do git show HEAD:f | grep -c x; done` splits
+        // into verbs [for, do, git, grep, done], and `for`/`do`/`done` are not read
+        // verbs, so a loop wrapping nothing but reads was classified as a potential
+        // write. Its paths then went to the mtime gate, and while a PEER was
+        // committing frustrations.md the gate minted a self-claim on a file this
+        // lane had only read. That is the exact trigger AMUX-2841 was filed on and
+        // waited for a specimen since 2026-08-11; it produced two in one session.
+        //
+        // IDENTICAL TO THE `cd` CASE directly above, which cost 117 of 191
+        // inferred-edit records in 24h (AEAB-24): one non-command token at the
+        // front of a segment decided the whole command.
+        //
+        // SAFE FOR THE SAME REASON. The check is conjunctive: EVERY segment must
+        // read, so `for f in *; do rm $f; done` still fails on the `rm` segment.
+        // Adding structure words cannot make a mutation look like a read; it only
+        // stops structure from making a read look like a mutation.
+        // STRIP leading structure and check what FOLLOWS it. Skipping the whole
+        // segment was the first version of this fix and the negative cell caught
+        // it in one run: `for f in *.rs; do rm $f; done` splits to
+        // ["for f in *.rs", "do rm $f", "done"], and skipping on `do` never
+        // examined the `rm`. Structure must not be able to hide a command behind
+        // it, which is the entire safety property here.
+        let mut toks = seg.split_whitespace().skip_while(|t| {
+            let v = Path::new(t).file_name().and_then(|x| x.to_str()).unwrap_or(t);
+            SHELL_STRUCTURE.contains(&v)
+        });
+        let verb = match toks.next() {
+            // Nothing but structure (`done`, `fi`, `esac`). Reads nothing, writes
+            // nothing, decides nothing.
+            None => continue,
+            Some(t) => Path::new(t).file_name().and_then(|x| x.to_str()).unwrap_or(t),
+        };
+        // Inside a test expression. `if [ -f a.md ]; then cat a.md; fi` leaves
+        // `-f a.md ]` once `if` and `[` are stripped, and a command never begins
+        // with a dash. `[ ... ]` evaluates a condition and runs nothing.
+        if verb.starts_with('-') || verb == "]" || verb == "]]" {
+            continue;
+        }
+        // `for c in AF-1 AF-2` leaves `c in AF-1 AF-2` once `for` is stripped, and
+        // the loop VARIABLE is not a command. A segment whose head is a bare word
+        // followed by the `in` keyword is a for/case header and runs nothing.
+        if seg.split_whitespace().any(|t| t == "in")
+            && SHELL_STRUCTURE.contains(
+                &Path::new(seg.split_whitespace().next().unwrap_or(""))
+                    .file_name()
+                    .and_then(|x| x.to_str())
+                    .unwrap_or(""),
+            )
+        {
+            continue;
+        }
+        // Re-run the git and sed arms against the STRIPPED verb, so `do git show f`
+        // gets the same treatment as `git show f`.
+        if verb == "git" {
+            let after: Vec<&str> = seg
+                .split_whitespace()
+                .skip_while(|t| SHELL_STRUCTURE.contains(t))
+                .collect();
+            let mut rest = after.into_iter().skip(1);
+            let mut sub = None;
+            while let Some(t) = rest.next() {
+                if t == "-C" || t == "-c" {
+                    rest.next();
+                    continue;
+                }
+                if t.starts_with('-') {
+                    continue;
+                }
+                sub = Some(t);
+                break;
+            }
+            match sub {
+                Some(x) if GIT_READ_SUBCMDS.contains(&x) => continue,
+                _ => return false,
+            }
+        }
+        // A stray delimiter left by splitting on `(` and `)`. `echo "x $(git show
+        // f | grep y)"` yields a final segment of `"`, whose "verb" is `"` — not a
+        // read verb, so the same false claim followed. A token with no alphanumeric
+        // character is punctuation the split produced, never a command.
+        if !verb.chars().any(|c| c.is_alphanumeric()) {
+            continue;
+        }
         if !READ_ONLY_VERBS.contains(&verb) {
             return false;
         }
     }
     saw
 }
+
+/// Shell keywords and builtins that STRUCTURE a command without running one.
+///
+/// Deliberately not merged into `READ_ONLY_VERBS`: that list means "a command
+/// that reads", and `done` reads nothing. Keeping them apart is what makes the
+/// safety argument legible — structure is skipped, commands are checked.
+const SHELL_STRUCTURE: &[&str] = &[
+    "for", "do", "done", "while", "until", "if", "then", "elif", "else", "fi",
+    "case", "esac", "in", "select", "function", "time", "!", ":", "true",
+    "[", "[[", "]]", "test",
+];
 
 /// `sed -n '1,50p' <file>` is a READ, and it is the read this fleet is TOLD to
 /// use: bypass-permissions sessions are instructed to "read files with cat,
@@ -4847,8 +4946,38 @@ mod tests {
             "find . -name x.rs",
             "head foo.md | grep x",
             "cat a.md | head -5 | wc -l",
+            // AMUX-2841's first observed specimens, both from one session on
+            // 2026-09-04, both verbatim. A loop and a command substitution over
+            // nothing but reads; before this they classified as potential writes
+            // and minted a self-claim on frustrations.md while a PEER was
+            // committing it.
+            "for c in AF-485 AF-481; do printf '  %s: ' $c; \
+             git show HEAD:frustrations.md | grep -c \"CARD: $c\"; done",
+            "echo \"count: $(git show HEAD:frustrations.md | grep -c '^## ')\"",
+            "if [ -f a.md ]; then cat a.md; fi",
+            "while read -r l; do echo \"$l\"; done",
         ] {
             assert!(is_pure_read_command(cmd), "should be pure read: {cmd}");
+        }
+    }
+
+    /// STRUCTURE MUST NOT LAUNDER A WRITE (AMUX-2841 fix, 2026-09-04).
+    ///
+    /// The fix skips shell keywords and punctuation so a loop over reads is a
+    /// read. The direction that must never break is the other one: a mutation
+    /// inside the same structure still has to be authored, or the guard stops
+    /// protecting anything. The check is conjunctive per segment, and this is
+    /// what asserts that it stayed that way.
+    #[test]
+    fn shell_structure_does_not_launder_a_write() {
+        for cmd in [
+            "for f in *.rs; do rm $f; done",
+            "if [ -f a.md ]; then sed -i s/a/b/ a.md; fi",
+            "while read -r l; do echo $l > out.txt; done",
+            "for c in 1 2; do git add frustrations.md; done",
+            "echo \"$(git commit -am wip)\"",
+        ] {
+            assert!(!is_pure_read_command(cmd), "structure laundered a write: {cmd}");
         }
     }
 
