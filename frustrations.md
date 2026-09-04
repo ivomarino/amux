@@ -3195,3 +3195,22 @@ FIX: AC-416. The saved profiles and exact three-identity browser path now
  reproduce it without credentials, and the watchdog/server log records the TLS
  hang. Diagnose tenant wake latency and the local request-path stalls before
  claiming realtime multiplayer from a cached shell.
+
+## A CLI negative control assumed its specimen was globally unique
+AREA: tests
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-44
+SYMPTOM: Fresh descendant CI completed the full Rust workspace suite after the
+ PID-safety fix, then `scripts/test-cli-launch-unbound.sh` refused to build its
+ broken fixture because a second command legitimately gained the same local
+ AMUX_API declaration used by cmd_start.
+COST: The otherwise-valid ATE-44 descendant run stayed red after all 1,947
+ amux-server library tests and every integration binary passed; the failure was
+ attributed from the job log only after the old runner-shutdown defect cleared.
+FIX: The negative control now counts and removes the declaration only within
+ cmd_start, preserving the independent declaration in cmd_open_browser while
+ still proving the broken fixture fails with an unbound variable. Its failure
+ output names the scoped occurrence count.
