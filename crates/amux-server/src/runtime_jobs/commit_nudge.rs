@@ -1952,6 +1952,21 @@ async fn freshness_from_repo(dir: &str, paths: &[String]) -> Freshness {
                                     path = %p,
                                     dir = %dir,
                                     novel_lines = ?other,
+                                    // LOG THE QUANTITY THIS BRANCH DECIDED ON.
+                                    // It is 0 by construction here, which is
+                                    // exactly why it was omitted and exactly why
+                                    // it has to be present: the STANDS arm logs
+                                    // origin_lines_at_risk and this one did not,
+                                    // so the field's ABSENCE on a downgrade was a
+                                    // property of the logging rather than of the
+                                    // predicate. mixpeek-general asked whether the
+                                    // downgrade ever fires at zero, reached for
+                                    // this log, and found a question their
+                                    // instrument could not answer either way
+                                    // (2026-09-04). A decision whose own input is
+                                    // missing from its record cannot be audited
+                                    // from the record (ethos rule 4).
+                                    origin_lines_at_risk = 0,
                                     "commit-nudge: DIVERGED downgraded to EDITED — the worktree \
                                      is a strict superset of origin, so committing reverts \
                                      nothing and there is nothing to hand-merge"
