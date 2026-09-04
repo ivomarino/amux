@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 
 HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "git-shared-guard.py")
 
@@ -604,8 +605,79 @@ def main():
                    "BLOCK" if _rc != 0 else "ALLOW", _cmd))
     _subst = len(subst)
 
+    # ---- .git/index.lock is REPORTED on the ordinary path (AF-503 / MF-842) ----
+    # A stale zero-byte lock blocked every index write on ~/Dev/mixpeek for 15+
+    # minutes and nothing detected it; two lanes routed around it with temp-index
+    # grafts before anyone understood the cause. The guard reports; it never
+    # blocks or removes, because removing a lock on a shared checkout is the
+    # human's call.
+    _lock = os.path.join(work, ".git", "index.lock")
+    _lockcases = 0
+
+    def _note_for(command):
+        _rc, _err = run_hook(command, work, tmp)
+        return _rc, _err
+
+    # 1. NO LOCK: silent. Otherwise every commit on a healthy checkout gets noise.
+    _lockcases += 1
+    _rc, _err = _note_for("git commit -m x")
+    if "index.lock" in _err:
+        failures.append("lock-note: fired with no lock present: %r" % _err[:160])
+
+    # 2. STALE (0 bytes, aged past the threshold, no holder): full verdict.
+    open(_lock, "w").close()
+    _old = time.time() - 1200
+    os.utime(_lock, (_old, _old))
+    for _n, _c, _want in (
+        ("commit sees it", "git commit -m x", True),
+        ("add sees it", "git add f.txt", True),
+        # A command that does NOT write the index must stay silent, or the note
+        # becomes noise on every push in a repo with a live commit in flight.
+        ("push does not", "git push origin main", False),
+        ("log does not", "git log --oneline", False),
+    ):
+        _lockcases += 1
+        _rc, _err = _note_for(_c)
+        if ("index.lock" in _err) != _want:
+            failures.append("lock-note/%s: expected note=%s for %r, got %r"
+                            % (_n, _want, _c, _err[:160]))
+
+    # 3. THE VERDICT NAMES ITS EVIDENCE, or it is just a restatement of git's own
+    #    generic message, which is the thing being fixed.
+    _lockcases += 1
+    _rc, _err = _note_for("git commit -m x")
+    for _needle in ("age ", "0 bytes", "holder:", "YOUR call"):
+        if _needle not in _err:
+            failures.append("lock-note: verdict omits %r: %r" % (_needle, _err[:220]))
+    _lockcases += 1
+    if _rc != 0:
+        failures.append("lock-note must REPORT, never block: rc=%s" % _rc)
+
+    # 4. A HOLDER PROBE THAT CANNOT RUN MUST SAY SO. mixpeek-frustrations lost ten
+    #    minutes to `lsof f 2>/dev/null || echo no holder`, which printed the
+    #    reassuring branch because lsof is not on PATH here. An absent tool's
+    #    negative must never read as "unheld", or a future reaper deletes live
+    #    locks on a box without lsof.
+    _lockcases += 1
+    _rc, _err = _note_for("git commit -m x")
+    if "unheld" in _err and "no process holds it open" not in _err:
+        failures.append("lock-note: claimed unheld without the probe having run")
+
+    # 5. THE ABSENT-TOOL BRANCH, reached with AMUX_LSOF pointed at nothing. It
+    #    cannot be reached any other way on a box that HAS lsof, and it is the
+    #    branch that decides whether a future reaper deletes a LIVE lock. It must
+    #    say `unmeasured` and must NOT say `unheld`.
+    _lockcases += 1
+    _rc, _err = run_hook("git commit -m x", work, tmp,
+                         extra_env={"AMUX_LSOF": "/nonexistent/lsof"})
+    if "unmeasured" not in _err or "did NOT run" not in _err:
+        failures.append("lock-note: an absent lsof did not report unmeasured: %r" % _err[:220])
+    if "no process holds it open" in _err:
+        failures.append("lock-note: an absent lsof reported the lock UNHELD: %r" % _err[:220])
+    os.unlink(_lock)
+
     total = (len(cases) + len(trio) + len(quad) + len(matrix) + _bodies + 1
-             + len(redir_cases) + _mr101 + _subst)
+             + len(redir_cases) + _mr101 + _subst + _lockcases)
     if failures:
         print(f"FAIL {len(failures)}/{total}:")
         for f in failures:

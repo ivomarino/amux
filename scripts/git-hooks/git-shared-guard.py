@@ -523,6 +523,93 @@ def _audit_override(rec):
     except Exception:
         pass
 
+
+# Commands that take the index lock. `push`, `log`, `show` and friends are absent
+# on purpose: they do not write the index, so a lock is irrelevant to them and a
+# note there is noise.
+_INDEX_WRITERS = ("commit", "add", "stash", "reset", "checkout", "restore",
+                  "rm", "mv", "merge", "rebase", "pull", "am", "cherry-pick",
+                  "revert", "apply", "read-tree", "update-index")
+
+
+def _lock_holder(lock):
+    """(verdict, detail) for whether anything holds `lock` open.
+
+    NEVER returns "nobody" from a probe that could not run. mixpeek-frustrations
+    lost ten minutes to exactly that: `lsof <file> 2>/dev/null || echo no holder`
+    printed the reassuring branch because `lsof` IS NOT ON PATH on this box and
+    the `command not found` went to the suppressed stderr. A negative from an
+    absent tool reads identically to a negative from a working one.
+
+    So: absolute path, and a POSITIVE CONTROL. If lsof cannot see this very
+    process, it cannot see anything, and the answer is `unmeasured`.
+    """
+    import subprocess
+    # AMUX_LSOF exists so the ABSENT-TOOL branch is reachable in a test. It is the
+    # branch that decides whether a future reaper deletes live locks on a box
+    # without lsof, and on a box that HAS lsof there is no other way to reach it.
+    # Same idiom as AMUX_SHARED_CHECKOUTS and AMUX_AMEND_EXPECT elsewhere here.
+    cands = [os.environ["AMUX_LSOF"]] if os.environ.get("AMUX_LSOF") else [
+        "/usr/sbin/lsof", "/usr/bin/lsof", "/bin/lsof"]
+    exe = next((c for c in cands if os.path.exists(c)), None)
+    if exe is None:
+        return ("unmeasured", "lsof not found; holder unknown, NOT unheld")
+    try:
+        ctl = subprocess.run([exe, "-p", str(os.getpid())],
+                             capture_output=True, text=True, timeout=5)
+        if not (ctl.stdout or "").strip():
+            return ("unmeasured", "lsof produced nothing for this very process, "
+                                  "so a negative on the lock means nothing")
+        out = subprocess.run([exe, "--", lock],
+                             capture_output=True, text=True, timeout=5)
+        holders = [l for l in (out.stdout or "").splitlines()[1:] if l.strip()]
+        if holders:
+            return ("held", holders[0][:120])
+        return ("unheld", "no process holds it open")
+    except Exception as e:
+        return ("unmeasured", f"holder probe failed: {e}")
+
+
+def _index_lock_note(cmd, run_dir):
+    """A verdict on .git/index.lock for a command that would take it."""
+    if not re.search(r"\bgit\s+" + GIT_GLOBALS + r"(?:" + "|".join(_INDEX_WRITERS) + r")\b", cmd):
+        return ""
+    import subprocess
+    try:
+        gd = subprocess.run(["git", "-C", run_dir, "rev-parse", "--absolute-git-dir"],
+                            capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return ""
+    lock = os.path.join(gd, "index.lock") if gd else ""
+    if not lock or not os.path.exists(lock):
+        return ""
+    try:
+        st = os.stat(lock)
+    except Exception:
+        return ""
+    age = int(time.time() - st.st_mtime)
+    verdict, detail = _lock_holder(lock)
+    # SIZE IS THE SHARPEST SIGNAL AND IT IS FREE. git writes the new index INTO
+    # the lock and then renames, so a LIVE writer's lock grows. Zero bytes with a
+    # static mtime is the stale shape.
+    shape = ("0 bytes and not growing, which is the STALE shape"
+             if st.st_size == 0 else f"{st.st_size} bytes, so a writer has been filling it")
+    head = ("amux guard: NOTE — .git/index.lock exists and your command writes the index.\n")
+    body = (f"  age {age}s · {shape} · holder: {verdict} ({detail})\n")
+    if verdict == "held":
+        tail = "  A live writer holds it. Wait; it will clear when their command finishes.\n"
+    elif verdict == "unheld" and age > 900:
+        tail = ("  Older than 15m with no holder: this looks STALE, not contention. Removing it\n"
+                "  is destructive on a shared checkout and is YOUR call, not this guard's:\n"
+                f"    ls -l {lock}   # confirm the mtime is still not advancing\n"
+                f"    rm {lock}\n")
+    elif verdict == "unmeasured":
+        tail = ("  The holder probe did NOT run, so this is unknown rather than unheld.\n"
+                "  Do not remove the lock on the strength of this line.\n")
+    else:
+        tail = "  No holder and recently touched: most likely ordinary contention. Retry.\n"
+    return head + body + tail
+
 def _amend_verdict(cmd, scrubbed, run_dir):
     """Case 15/16 (2026-07-05 near-miss): `git commit --amend` rewrites shared
     HEAD — which may be ANOTHER session's just-landed commit (author identity
@@ -1380,6 +1467,23 @@ def main():
     if not any(d == s or d.startswith(s + os.sep) for d in _scope_dirs for s in shared):
         if not _has_cotenants(run_dir):
             return 0
+    # THE LOCK IS REPORTED ON THE ORDINARY PATH, not only inside the amend
+    # verdict (AF-503, reported by mixpeek-frustrations as MF-842).
+    #
+    # A stale zero-byte .git/index.lock blocked every index write on ~/Dev/mixpeek
+    # for 15+ minutes on 2026-09-04. Git's own message is generic and correct, and
+    # on a 50-lane checkout it is indistinguishable from healthy contention, so
+    # two lanes routed around it with GIT_INDEX_FILE temp-index grafts before
+    # anyone understood the cause. Routing around a blockage is rational and it is
+    # also how a 15-minute fleet stall produces no report.
+    #
+    # This REPORTS and never blocks or removes. Removing a lock is destructive on
+    # a shared checkout and is the human's call (ethos rule 8); what the guard can
+    # do is turn a generic message into a verdict, which costs one stat.
+    try:
+        sys.stderr.write(_index_lock_note(cmd, run_dir))
+    except Exception:
+        pass  # a note that cannot be produced must never block a command
     amend_why = None
     try:
         amend_why = _amend_verdict(cmd, scrubbed, run_dir)
