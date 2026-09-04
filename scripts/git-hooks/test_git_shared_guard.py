@@ -226,6 +226,34 @@ def main():
         # exactly that; without this cell the claim is unenforced prose.
         ("a different subcommand is not a global flag",
          "git log commit --amend", False),
+        # THE TREE-WIDE TABLE, which the first GIT_GLOBALS pass left on the
+        # narrow prefix (AF-490). Reported by mixpeek-frustrations and
+        # reproduced against the live hook before the fix: one global flag and
+        # the tree-wide discard of ~50 lanes' uncommitted work was unguarded.
+        #   git --no-pager reset --hard          exit 0
+        #   git -c a=b reset --hard              exit 0
+        #   git --literal-pathspecs reset --hard exit 0
+        #   git --no-pager clean -fd             exit 0
+        #   git --no-pager checkout -- .         exit 0
+        ("reset --hard behind --no-pager", "git --no-pager reset --hard", True),
+        ("reset --hard behind -c", "git -c a=b reset --hard", True),
+        ("reset --hard behind --literal-pathspecs",
+         "git --literal-pathspecs reset --hard", True),
+        ("clean -fd behind --no-pager", "git --no-pager clean -fd", True),
+        ("checkout -- . behind --no-pager", "git --no-pager checkout -- .", True),
+        ("stash drop behind -c", "git -c a=b stash drop", True),
+        ("add . behind --no-pager", "git --no-pager add .", True),
+        # THE LOOKAHEAD DIRECTION mixpeek-frustrations flagged: GIT_GLOBALS ends
+        # in a general dash-token arm that can also match a SUBCOMMAND flag, so
+        # `git stash --quiet pop` could have the prefix eat `--quiet` before the
+        # negative lookahead reads the verb. The failure direction there is a
+        # FALSE REFUSAL on `pop`, which is the one verb people use to RECOVER
+        # work, so it gets its own cells rather than a note.
+        ("stash pop still passes", "git stash pop", False),
+        ("stash pop behind a global still passes", "git --no-pager stash pop", False),
+        ("stash pop behind a subcommand flag still passes",
+         "git stash --quiet pop", False),
+        ("stash apply still passes", "git -c a=b stash apply", False),
         ("amend unpushed pinned -C HEAD", f"AMUX_AMEND_EXPECT={head} git commit --amend -C HEAD", False),
         # Copy detection is the same collision on a read-only verb: harmless in
         # itself, and it proves the fix is about WHERE -C sits, not about amend.

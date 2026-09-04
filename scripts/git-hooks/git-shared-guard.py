@@ -26,7 +26,7 @@ import sys, json, os, re, time, pathlib
 # mixpeek-frustrations fixed the run_dir resolver on 2026-09-04 (2815f442) after
 # `-C` was read as git's global `-C <dir>` when it was `git commit -C <commit>`,
 # and handed the rest of the file over. Two DETECTORS had the mirror defect: they
-# allowed only `(?:-C\s+\S+\s+)?` before the subcommand, so any OTHER global flag
+# allowed only `' + GIT_GLOBALS + r'` before the subcommand, so any OTHER global flag
 # hid the subcommand and the guard never fired at all. Measured before the fix:
 #
 #   git -c user.name=x commit --amend         amend detector MISS
@@ -51,6 +51,24 @@ GIT_GLOBALS = (
     r')*'
 )
 
+# The same prefix MINUS `-C`, for the resolver that must CAPTURE the `-C <dir>`.
+# GIT_GLOBALS contains a `-C` arm, so reusing it there lets the prefix eat the
+# very flag being captured. The lookahead keeps a bare `-C` out of the no-arg arm
+# for the same reason.
+# A SUBCOMMAND FLAG BETWEEN THE VERB AND ITS OBJECT (AF-490). The bare-stash
+# rule's negative lookahead required the recovery verb IMMEDIATELY after `stash`,
+# so `git stash --quiet pop` and `git stash -q apply` were REFUSED. Pre-existing,
+# measured against the unfixed copy, and the worst direction this guard has: a
+# false refusal on `pop`, the one verb people reach for to RECOVER work they
+# thought they had lost. The lookahead now steps over `-flag` tokens.
+GIT_GLOBALS_NOT_C = (
+    r'(?:'
+    r'-c\s+\S+\s+'
+    r'|--(?:exec-path|git-dir|work-tree|namespace|super-prefix)(?:=\S+|\s+\S+)\s+'
+    r'|--?(?!C\b)[A-Za-z][-A-Za-z0-9]*\s+'
+    r')*'
+)
+
 # Entries are (pattern, why) or (pattern, why, remedy).
 #
 # The 3-tuple exists because the shared refusal tail below hard-codes ONE hazard
@@ -62,7 +80,7 @@ GIT_GLOBALS = (
 # people to stop reading it. When a rule supplies a remedy, it replaces that
 # paragraph rather than being appended to it.
 DANGER = [
-    (r'\bgit\s+(?:-C\s+\S+\s+)?reset\s+--hard\b',
+    (r'\bgit\s+' + GIT_GLOBALS + r'reset\s+--hard\b',
      'git reset --hard — discards ALL uncommitted tracked changes tree-wide'),
     # 2026-07-05: a MIXED `git reset HEAD~2` slipped this guard (not --hard) and
     # decapitated another session's two PUSHED commits from the shared branch
@@ -70,19 +88,19 @@ DANGER = [
     # HEAD — bare/--soft/--mixed/--keep/--merge/<commit-ish> — rewrites every
     # session's branch state. Only the explicit path form (` -- <paths>`) is
     # safe, and it is the only form allowed through.
-    (r'\bgit\s+(?:-C\s+\S+\s+)?reset\b(?![^;&|\n]*\s--\s)',
+    (r'\bgit\s+' + GIT_GLOBALS + r'reset\b(?![^;&|\n]*\s--\s)',
      "git reset (HEAD-moving or bare) — moves/unstages the SHARED branch state for every "
      "session (a mixed `reset HEAD~N` decapitates other sessions' commits). Unstage only "
      "your paths with `git reset -- <your files>`; never move shared HEAD"),
-    (r'\bgit\s+(?:-C\s+\S+\s+)?checkout\s+(?:\S+\s+)?--\s+\.(?=\s|$|[;&|])',
+    (r'\bgit\s+' + GIT_GLOBALS + r'checkout\s+(?:\S+\s+)?--\s+\.(?=\s|$|[;&|])',
      'git checkout -- . — discards ALL working-tree changes'),
-    (r'\bgit\s+(?:-C\s+\S+\s+)?checkout\s+\.(?=\s|$|[;&|])',
+    (r'\bgit\s+' + GIT_GLOBALS + r'checkout\s+\.(?=\s|$|[;&|])',
      'git checkout . — discards ALL working-tree changes'),
-    (r'\bgit\s+(?:-C\s+\S+\s+)?restore\s+(?:--\S+\s+)*\.(?=\s|$|[;&|])',
+    (r'\bgit\s+' + GIT_GLOBALS + r'restore\s+(?:--\S+\s+)*\.(?=\s|$|[;&|])',
      'git restore . — discards ALL working-tree changes'),
-    (r'\bgit\s+(?:-C\s+\S+\s+)?clean\s+-[a-wyz]*f',
+    (r'\bgit\s+' + GIT_GLOBALS + r'clean\s+-[a-wyz]*f',
      'git clean -f — deletes untracked files tree-wide'),
-    (r'\bgit\s+(?:-C\s+\S+\s+)?stash\s+(?:drop|clear)\b',
+    (r'\bgit\s+' + GIT_GLOBALS + r'stash\s+(?:drop|clear)\b',
      "git stash drop/clear — permanently discards a stash that may hold OTHER sessions' work"),
     # 2026-07-07 CASE 21 (fleet reset incident): bare/un-scoped `git stash` was
     # deliberately allowed as "recoverable" — invalidated in practice: stash
@@ -90,7 +108,7 @@ DANGER = [
     # moving to HEAD" signature), sweeping every session's uncommitted work;
     # a conflicted pop strands the sweep and mid-flight readers see a wiped
     # tree. Allow only pathspec-scoped pushes + non-destructive subcommands.
-    (r'\bgit\s+(?:-C\s+\S+\s+)?stash\b(?!\s+(?:pop\b|apply\b|list\b|show\b|branch\b|drop\b|clear\b|push\b[^;&|\n]*\s--\s))',
+    (r'\bgit\s+' + GIT_GLOBALS + r'stash\b(?!(?:\s+-\S+)*\s+(?:pop\b|apply\b|list\b|show\b|branch\b|drop\b|clear\b|push\b[^;&|\n]*\s--\s))',
      "bare/un-scoped git stash — internally reset --hards the WHOLE shared tree "
      "(sweeps every session's uncommitted work; a conflicted pop strands it). "
      "Scope it: `git stash push -- <your paths>`"),
@@ -98,7 +116,7 @@ DANGER = [
     # in the one shared tree, sweeping up other sessions' unstaged edits into your
     # commit (wrong-attribution incidents). Bare `git commit` (no -a) is NOT blocked
     # here — too frequent to gate fleet-wide — but the fix is the same: name paths.
-    (r'\bgit\s+(?:-C\s+\S+\s+)?commit\b[^\n;&|]*?(?:\s--all\b|\s-[a-zA-Z]*a[a-zA-Z]*(?=[\s;&|]|$))',
+    (r'\bgit\s+' + GIT_GLOBALS + r'commit\b[^\n;&|]*?(?:\s--all\b|\s-[a-zA-Z]*a[a-zA-Z]*(?=[\s;&|]|$))',
      'git commit -a/--all — commits EVERY modified tracked file in this SHARED tree, '
      'sweeping up other sessions\' edits; commit only your paths: `git commit -m "msg" -- <your files>`'),
     # THE SHARED INDEX, staged half (AF-316). `git commit -a` is blocked above;
@@ -118,7 +136,7 @@ DANGER = [
     # TWO RULES, because one regex could not keep `-A -- <path>` legal.
     # `git add -A -- src/foo.rs` is SCOPED and must pass: the flag is bounded by
     # the pathspec. Only the unbounded forms are the hazard.
-    (r'\bgit\s+(?:-C\s+\S+\s+)?add\b(?![^;&|\n]*\s--\s+\S)[^\n;&|]*?'
+    (r'\bgit\s+' + GIT_GLOBALS + r'add\b(?![^;&|\n]*\s--\s+\S)[^\n;&|]*?'
      r'(?:\s-A\b|\s--all\b|\s--no-ignore-removal\b)',
      'git add -A/--all — stages EVERY modified file in this SHARED checkout, '
      'including other sessions\' in-flight edits, and leaves them staged for the '
@@ -128,7 +146,7 @@ DANGER = [
     # command as `git add .` and would otherwise read as "scoped" to the rule
     # above — the obvious next thing to type after being refused once.
     # `git add ./src/foo.rs` is a real path and is NOT matched.
-    (r'\bgit\s+(?:-C\s+\S+\s+)?add\b[^\n;&|]*?\s(?:--\s+)?\.(?=[\s;&|]|$)',
+    (r'\bgit\s+' + GIT_GLOBALS + r'add\b[^\n;&|]*?\s(?:--\s+)?\.(?=[\s;&|]|$)',
      'git add . — stages EVERY modified file under this directory in a SHARED '
      'checkout, including other sessions\' in-flight edits. Name your own paths: '
      '`git add <your files>` (AF-316)'),
@@ -166,7 +184,7 @@ DANGER = [
     #   * `--unshallow` and `--deepen` stay allowed — they are the remedy, and
     #     "deepen" does not contain "depth" so there is no overlap.
     #   * `[^;&|\n]*?` keeps the match inside one command, like the tuples above.
-    (r'\bgit\s+(?:-C\s+\S+\s+)?(?:fetch|pull)\b[^;&|\n]*?\s(?:--depth[=\s]|--shallow-since\b|--shallow-exclude\b)',
+    (r'\bgit\s+' + GIT_GLOBALS + r'(?:fetch|pull)\b[^;&|\n]*?\s(?:--depth[=\s]|--shallow-since\b|--shallow-exclude\b)',
      "git fetch/pull --depth (or --shallow-since/--shallow-exclude) — truncates history in "
      "this SHARED checkout, and every `merge-base --is-ancestor` past the cut then returns a "
      "bare exit 1 with no error, which is indistinguishable from a real 'not an ancestor'",
@@ -875,7 +893,7 @@ def _discard_operands(cmd):
     import shlex
     paths = []
     src_refs = set()
-    for m in re.finditer(r'\bgit\s+(?:-C\s+\S+\s+)?(checkout|restore)\b([^\n;&|]*)', cmd):
+    for m in re.finditer(r'\bgit\s+' + GIT_GLOBALS + r'(checkout|restore)\b([^\n;&|]*)', cmd):
         sub, tail = m.group(1), m.group(2)
         try:
             toks = shlex.split(tail)
@@ -1229,7 +1247,7 @@ def main():
     # not list (`git --no-pager -C /x ...`) falls back to cwd inference, which
     # is the safe direction: a false refusal naming the escape hatch, never a
     # silent pass.
-    mC = re.search(r'\bgit\s+(?:-c\s+\S+\s+)*-C\s+(\S+)', scrubbed)
+    mC = re.search(r'\bgit\s+' + GIT_GLOBALS_NOT_C + r'-C\s+(\S+)', scrubbed)
     # AMUX-3462 (MF-703): this hook reads the command TEXT, before the shell
     # expands it. A -C path spelled with a variable (`git -C $S/wipetest ...`)
     # therefore cannot be resolved here — the old code realpath'd the raw
