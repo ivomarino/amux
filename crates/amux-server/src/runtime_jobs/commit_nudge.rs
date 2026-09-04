@@ -132,6 +132,43 @@ pub struct Freshness {
     /// silent about cause, and the two causes want different actions
     /// (AMUX-3760).
     pub revived_stopped_by: &'static str,
+    /// The subset of `diverged` that the repo itself declares is GENERATED
+    /// output, via a `linguist-generated` attribute in its `.gitattributes`
+    /// (AF-428).
+    ///
+    /// The three-way merge this arm prescribes is WRONG for these, and
+    /// `conflicts=0` is exactly when it bites: a merge of two generator outputs
+    /// is syntactically valid, matches NEITHER source model, was produced by no
+    /// code, and is overwritten by the next regen. Restore is equally wrong. The
+    /// only correct remedy is to regenerate once the underlying change lands.
+    ///
+    /// WHY `.gitattributes` AND NOT AN AMUX LIST. The obvious source, the
+    /// repo's pre-commit config, declares each hook's INPUT TRIGGER (`files:`)
+    /// and not its outputs — mixpeek's generate-openapi names openapi.json only
+    /// in free-text `description`, and the real paths live inside the generator
+    /// script. So a config scan finds the hook and cannot learn what it writes.
+    /// `linguist-generated` already means exactly this, is versioned with the
+    /// code it describes, is edited by whoever adds the generator, and is read
+    /// with `git check-attr` rather than parsed.
+    ///
+    /// NOT INFERRED FROM AN ABSENT EDIT RECORD, which was the tempting option
+    /// and the dangerous one: "no record from any lane" also describes a lane
+    /// whose hooks are not installed (AF-409/AF-410, live in this fleet), and
+    /// would label their work as generated.
+    pub generated: Vec<String>,
+    /// How many diverged paths the attribute probe actually examined.
+    ///
+    /// PUBLISHED BESIDE `generated` BECAUSE AN EMPTY LIST HAS TWO CAUSES, and
+    /// this is the whole answer to the "a declared list goes stale silently"
+    /// objection. A repo with no `.gitattributes` yields zero marked paths,
+    /// which is indistinguishable from a repo that checked and found none —
+    /// unless the denominator is in the same payload (ethos rule 4). "0 of 7
+    /// marked" reads as a missing list; "0" alone reads as an assertion.
+    pub generated_checked: usize,
+    /// "" when the probe ran, "error" when git could not answer. On error
+    /// `generated_checked` is 0, so a failed probe can never be read as a
+    /// measurement that found nothing.
+    pub generated_stopped_by: &'static str,
 }
 
 /// Is the worktree copy of `path` an OLD COMMITTED REVISION rather than a new
@@ -364,10 +401,68 @@ pub fn build(
     // passes throughout because locally-committed content is
     // reachable-from-a-commit too.
     if !diverged_paths.is_empty() {
-        let n = diverged_paths.len();
-        let list = tagged_list(&diverged_paths);
-        let whose_d = whose(&diverged_paths);
-        sections.push(format!(
+        // PARTITION BEFORE RENDERING (AF-428). The paragraph at the bottom of
+        // this section has told readers since 05e280fd that the merge recipe is
+        // wrong for generated files and left them to work out which ones those
+        // are. Where the repo declares it, the arm can now do that itself, and a
+        // declared path must not be handed the recipe at all: a caveat under a
+        // command is read after the command.
+        let gen_set: BTreeSet<&str> = fresh.generated.iter().map(String::as_str).collect();
+        let generated_paths: Vec<&str> =
+            diverged_paths.iter().copied().filter(|p| gen_set.contains(*p)).collect();
+        let hand_paths: Vec<&str> =
+            diverged_paths.iter().copied().filter(|p| !gen_set.contains(*p)).collect();
+        // SAY WHAT THE PROBE COVERED, in the same payload as its result. An
+        // empty `generated` has two causes (the repo marks nothing, or the probe
+        // could not run) and they want different actions. See
+        // Freshness::generated_checked.
+        let coverage = match (fresh.generated_stopped_by, generated_paths.len()) {
+            ("error", _) => "\n\nGENERATED-FILE CHECK DID NOT RUN: `git check-attr` failed \
+                 here, so none of the above is known either way. Treat every path as \
+                 hand-written, which is what the recipe above assumes."
+                .to_string(),
+            (_, 0) => format!(
+                "\n\nNONE of these {checked} path(s) is marked generated: `git check-attr \
+                 linguist-generated` returned nothing set. That is a statement about \
+                 `.gitattributes` in this repo, NOT a finding that none are generated, because \
+                 a repo with no such file answers exactly this way. If one of them IS \
+                 generator output the recipe above is wrong for it, and one line in \
+                 `.gitattributes` fixes it for every future nudge:\n\
+                 \x20 <path> linguist-generated=true",
+                checked = fresh.generated_checked
+            ),
+            (_, g) => format!(
+                "\n\n{g} of {checked} diverged path(s) are marked `linguist-generated` in this \
+                 repo's `.gitattributes` and are listed under DIVERGED (GENERATED) above; the \
+                 rest are treated as hand-written.",
+                checked = fresh.generated_checked
+            ),
+        };
+        if !generated_paths.is_empty() {
+            let gn = generated_paths.len();
+            let glist = tagged_list(&generated_paths);
+            sections.push(format!(
+                "DIVERGED (GENERATED): {gn} path(s) under {dir} differ in BOTH directions AND \
+                 are declared generator output by this repo's `.gitattributes` \
+                 (`linguist-generated`):\n{glist}\
+                 DO NOT MERGE AND DO NOT RESTORE THESE. A three-way merge of two generator \
+                 outputs is syntactically valid, matches NEITHER source model, was produced by \
+                 no code, and is overwritten by the next regen. `conflicts=0` is exactly when \
+                 that bites, because a clean merge is the result that looks safest. \
+                 `git checkout origin/main -- <path>` is equally wrong: it restores an artifact \
+                 that does not match the sources now in the tree, and the next commit \
+                 regenerates the divergence.\n\
+                 The remedy is to REGENERATE FROM SOURCE once the underlying change lands, and \
+                 it belongs to the owner of the SOURCE rather than to whoever this nudge \
+                 happened to wake. If a path above is not actually generated, its \
+                 `.gitattributes` entry is wrong and that is the thing to fix."
+            ));
+        }
+        if !hand_paths.is_empty() {
+            let n = hand_paths.len();
+            let list = tagged_list(&hand_paths);
+            let whose_d = whose(&hand_paths);
+            sections.push(format!(
             "DIVERGED: {n} {whose_d} under {dir} have commits in BOTH directions — \
              origin/main carries commits on them that your HEAD lacks, AND your HEAD carries \
              commits origin lacks. They are novel and stale AT ONCE, so NEITHER standard remedy \
@@ -400,14 +495,17 @@ pub fn build(
              next commit regenerates the divergence. The only correct remedy for that class is \
              REGENERATE FROM SOURCE once the underlying change lands, which belongs to the \
              source owner rather than to whoever this nudge happened to wake.\n\
-             HOW TO TELL, since this arm cannot: a path with NO edit record from ANY lane — not \
-             just none of yours — is the signature, because a generator writes it as a \
-             pre-commit side effect and that write carries no record by construction. Check \
-             your repo's pre-commit config for a hook whose output this path is. Reported by \
-             mixpeek-frustrations and backend, who hit this independently in one night on \
-             server/openapi.json and docs/api-reference/openapi.json and both declined the \
-             recipe above on their own judgement."
+             HOW TO TELL, and this arm now does where the repo says so: a `linguist-generated` \
+             attribute in `.gitattributes` moves a path out of this list and into DIVERGED \
+             (GENERATED) above, with the regenerate remedy instead of the recipe. The repo's \
+             pre-commit config is NOT the place to look it up: `files:` there declares the \
+             hook's INPUT TRIGGER, not what it writes (mixpeek's generate-openapi names \
+             openapi.json only in free-text `description`). Reported by mixpeek-frustrations \
+             and backend, who hit this independently in one night on server/openapi.json and \
+             docs/api-reference/openapi.json and both declined the recipe above on their own \
+             judgement.{coverage}"
         ));
+        }
     }
 
     if !revived_paths.is_empty() {
@@ -1999,8 +2097,64 @@ async fn freshness_from_repo(dir: &str, paths: &[String]) -> Freshness {
         fresh.edited.push(p.clone());
     }
     drain_revived(dir, &pending_revived, &mut fresh).await;
+    mark_generated(dir, &mut fresh).await;
 
     fresh
+}
+
+/// Ask the REPO which of its diverged paths are generator output (AF-428).
+///
+/// `git check-attr` is the reader because the declaration is a git attribute;
+/// there is nothing to parse and no second place for the answer to live. `-z`
+/// rather than the default line format: the default is `<path>: <attr>: <value>`
+/// and a path containing a colon splits wrong, silently, in the direction of
+/// under-reporting.
+///
+/// FAILS TO "NOT MEASURED", NEVER TO "NONE ARE GENERATED". A git error leaves
+/// `generated` empty AND sets `generated_checked` to 0 with `stopped_by` =
+/// "error", so the renderer cannot print a coverage line that reads like a
+/// finding. Every path stays in `diverged` and gets today's merge recipe, which
+/// is the conservative direction: the reader is told to think, not told the
+/// wrong thing.
+async fn mark_generated(dir: &str, fresh: &mut Freshness) {
+    if fresh.diverged.is_empty() {
+        return;
+    }
+    let out = tokio::process::Command::new("git")
+        .args(["-C", dir, "check-attr", "-z", "linguist-generated", "--"])
+        .args(fresh.diverged.iter())
+        .output()
+        .await;
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        _ => {
+            fresh.generated_checked = 0;
+            fresh.generated_stopped_by = "error";
+            return;
+        }
+    };
+    fresh.generated_checked = fresh.diverged.len();
+    fresh.generated_stopped_by = "";
+    let text = String::from_utf8_lossy(&out.stdout);
+    // -z emits a flat NUL-separated stream of (path, attr, value) triples, not
+    // one record per line. A trailing NUL yields an empty final element, so the
+    // chunking has to tolerate a short tail rather than assume len % 3 == 0.
+    let fields: Vec<&str> = text.split('\0').collect();
+    for tri in fields.chunks(3) {
+        if tri.len() < 3 {
+            continue;
+        }
+        // BOTH SPELLINGS COUNT, and my first version took only "set" (AF-428).
+        // git reports a BARE `linguist-generated` as "set" and an explicit
+        // `linguist-generated=true` as "true" — and =true is the form GitHub
+        // documents, so the only spelling anyone is likely to write was the one
+        // that did not match. Caught by the cell that runs the real git rather
+        // than by reading the code; nothing about `set` looks wrong on its own.
+        // "unset", "false" and "unspecified" all correctly fall through.
+        if tri[2] == "set" || tri[2] == "true" {
+            fresh.generated.push(tri[0].to_string());
+        }
+    }
 }
 
 /// One sweep: nudge idle lanes that have uncommitted work OF THEIR OWN.
@@ -2539,11 +2693,15 @@ mod tests {
             "and name the correct remedy, not just the wrong ones: {m}"
         );
         // The reader has to be able to TELL, or the caveat is a worry rather
-        // than an instruction. The signature is the one this arm cannot check
-        // itself: no edit record from ANY lane, not merely none of yours.
+        // than an instruction. WHAT "TELL" MEANS CHANGED IN AF-428 and this
+        // assertion moved with it: the arm used to hand over a signature to
+        // check by eye ("no edit record from ANY lane"), which was the best it
+        // could do and also described a lane whose hooks are not installed. It
+        // now reads the repo's own declaration, so the thing to name is the
+        // declaration and how to add one.
         assert!(
-            m.contains("ANY lane"),
-            "say how to recognise the class, since this arm cannot detect it: {m}"
+            m.contains("linguist-generated") && m.contains(".gitattributes"),
+            "name the declaration that moves a path out of this list: {m}"
         );
         // AND the restore path must be named as equally wrong. Naming only the
         // merge would push the reader onto `git checkout origin/main --`, which
@@ -2552,6 +2710,199 @@ mod tests {
             m.contains("equally wrong"),
             "restoring from origin is wrong for this class too, and must say so: {m}"
         );
+    }
+
+    /// A DECLARED generated path must not be handed the merge recipe at all
+    /// (AF-428). The caveat shipped in 05e280fd sits UNDER the recipe, and a
+    /// caveat under a command is read after the command.
+    #[test]
+    fn a_declared_generated_path_gets_the_regenerate_remedy_not_the_recipe() {
+        let dirty = vec!["server/openapi.json".to_string()];
+        let fresh = Freshness {
+            diverged: vec!["server/openapi.json".to_string()],
+            generated: vec!["server/openapi.json".to_string()],
+            generated_checked: 1,
+            ..Default::default()
+        };
+        let m = build("/repo", &dirty, &Ownership::default(), &fresh, "S")
+            .expect("a diverged generated path must still produce a nudge");
+        assert!(
+            m.contains("DIVERGED (GENERATED):"),
+            "a declared generated path needs its own arm: {m}"
+        );
+        assert!(
+            m.contains("REGENERATE FROM SOURCE"),
+            "and the remedy that is actually correct for it: {m}"
+        );
+        // THE POINT OF THE WHOLE CARD. With every diverged path declared, the
+        // recipe must not appear anywhere in the message — not lower down, not
+        // as a caveat. If this passes only because the string moved, the next
+        // assertion catches it.
+        assert!(
+            !m.contains("merge-file -p"),
+            "the merge recipe must not be offered for a declared generated path: {m}"
+        );
+        assert!(!m.contains("DIVERGED:"), "the hand-written arm must not render at all: {m}");
+    }
+
+    /// THE OTHER ARM, which the card named as the check that can fail: a path
+    /// the repo does NOT declare must still get the merge recipe. Without this,
+    /// a carve-out that swallowed the recipe entirely would pass the cell above.
+    #[test]
+    fn an_undeclared_diverged_path_still_gets_the_merge_recipe() {
+        let dirty = vec!["hooks/pre-push".to_string(), "server/openapi.json".to_string()];
+        let fresh = Freshness {
+            diverged: vec!["hooks/pre-push".to_string(), "server/openapi.json".to_string()],
+            generated: vec!["server/openapi.json".to_string()],
+            generated_checked: 2,
+            ..Default::default()
+        };
+        let m = build("/repo", &dirty, &Ownership::default(), &fresh, "S")
+            .expect("a mixed diverged set must produce a nudge");
+        assert!(m.contains("DIVERGED (GENERATED):"), "the declared half must render: {m}");
+        assert!(m.contains("DIVERGED:"), "the hand-written half must render too: {m}");
+        assert!(
+            m.contains("merge-file -p"),
+            "the hand-written path must keep its recipe: {m}"
+        );
+        assert!(
+            m.contains("1 of 2 diverged path(s) are marked"),
+            "say how many of how many, so a partial list is visible: {m}"
+        );
+    }
+
+    /// AN EMPTY RESULT HAS TWO CAUSES AND THE MESSAGE MUST SEPARATE THEM
+    /// (ethos rule 4). A repo with no `.gitattributes` yields zero marked paths,
+    /// which is not a finding that none are generated. This is the whole answer
+    /// to "a declared list goes stale silently", so it is asserted rather than
+    /// left to the prose.
+    #[test]
+    fn nothing_marked_is_reported_as_a_statement_about_gitattributes() {
+        let dirty = vec!["server/openapi.json".to_string()];
+        let fresh = Freshness {
+            diverged: vec!["server/openapi.json".to_string()],
+            generated_checked: 1,
+            ..Default::default()
+        };
+        let m = build("/repo", &dirty, &Ownership::default(), &fresh, "S")
+            .expect("diverged section must render");
+        assert!(
+            m.contains("NONE of these 1 path(s) is marked generated"),
+            "publish the denominator beside the zero: {m}"
+        );
+        assert!(
+            m.contains("NOT a finding that none are generated"),
+            "an absent list must not read as a measurement: {m}"
+        );
+        assert!(
+            m.contains("linguist-generated=true"),
+            "hand the reader the line that fixes it, or the capability reaches nobody: {m}"
+        );
+        assert!(m.contains("merge-file -p"), "and the recipe still applies here: {m}");
+    }
+
+    /// A PROBE THAT COULD NOT RUN MUST NOT READ AS ONE THAT FOUND NOTHING.
+    /// `generated` is empty in both states; only `generated_stopped_by`
+    /// separates them, and if the renderer ignores it the two collapse into the
+    /// same reassuring sentence.
+    #[test]
+    fn a_failed_attribute_probe_says_so_instead_of_none_generated() {
+        let dirty = vec!["server/openapi.json".to_string()];
+        let fresh = Freshness {
+            diverged: vec!["server/openapi.json".to_string()],
+            generated_checked: 0,
+            generated_stopped_by: "error",
+            ..Default::default()
+        };
+        let m = build("/repo", &dirty, &Ownership::default(), &fresh, "S")
+            .expect("diverged section must render");
+        assert!(
+            m.contains("GENERATED-FILE CHECK DID NOT RUN"),
+            "an unrunnable probe must say so: {m}"
+        );
+        assert!(
+            !m.contains("NONE of these"),
+            "and must not borrow the wording of a probe that ran: {m}"
+        );
+    }
+
+    /// THE PARSE, AGAINST REAL `git check-attr` OUTPUT (AF-428).
+    ///
+    /// `-z` emits a flat NUL-separated stream of (path, attr, value) triples,
+    /// not one record per line, and the default format is `<path>: <attr>:
+    /// <value>` which a path containing a colon splits wrong. Both of those are
+    /// beliefs about a tool, and a belief about a tool is exactly what a unit
+    /// test over a hand-written fixture cannot check. This runs the real git.
+    #[tokio::test]
+    async fn the_generated_probe_reads_a_real_gitattributes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let sh = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git")
+        };
+        sh(&["init", "-q", "--initial-branch=main"]);
+        sh(&["config", "user.email", "t@t"]);
+        sh(&["config", "user.name", "t"]);
+        // ALL FOUR VALUES GIT CAN REPORT, because the vocabulary is the part a
+        // reader gets wrong. `=true` (the form GitHub documents) reports "true";
+        // a BARE attribute reports "set"; `=false` reports "false"; an unlisted
+        // path reports "unspecified". Taking only "set", which my first version
+        // did, matched the one spelling nobody writes and read as correct.
+        std::fs::write(
+            root.join(".gitattributes"),
+            "gen/*.json linguist-generated=true\n\
+             bare.json linguist-generated\n\
+             notgen.json linguist-generated=false\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("gen")).unwrap();
+        std::fs::write(root.join("gen/openapi.json"), "{}\n").unwrap();
+        std::fs::write(root.join("bare.json"), "{}\n").unwrap();
+        std::fs::write(root.join("notgen.json"), "{}\n").unwrap();
+        std::fs::write(root.join("hand.rs"), "fn main() {}\n").unwrap();
+        sh(&["add", "-A"]);
+        sh(&["commit", "-qm", "base"]);
+
+        let mut fresh = Freshness {
+            diverged: vec![
+                "gen/openapi.json".to_string(),
+                "bare.json".to_string(),
+                "notgen.json".to_string(),
+                "hand.rs".to_string(),
+            ],
+            ..Default::default()
+        };
+        mark_generated(&root.to_string_lossy(), &mut fresh).await;
+        assert_eq!(
+            fresh.generated,
+            vec!["gen/openapi.json".to_string(), "bare.json".to_string()],
+            "=true and a bare attribute both mark; =false and unspecified must not"
+        );
+        assert_eq!(fresh.generated_checked, 4, "coverage is the whole diverged set");
+        assert_eq!(fresh.generated_stopped_by, "", "the probe ran");
+
+        // CONTROL: the same call against a repo that declares NOTHING must come
+        // back empty WITH coverage, not empty-and-unmeasured. Without it, a
+        // probe that always returned nothing would pass the assertions above by
+        // way of the first repo's single match being a coincidence of parsing.
+        let bare = tempfile::tempdir().expect("tempdir");
+        std::process::Command::new("git")
+            .args(["init", "-q", "--initial-branch=main"])
+            .current_dir(bare.path())
+            .output()
+            .expect("git");
+        let mut none = Freshness {
+            diverged: vec!["gen/openapi.json".to_string()],
+            ..Default::default()
+        };
+        mark_generated(&bare.path().to_string_lossy(), &mut none).await;
+        assert!(none.generated.is_empty(), "no .gitattributes means nothing is marked");
+        assert_eq!(none.generated_checked, 1, "but the probe DID run, and must say so");
+        assert_eq!(none.generated_stopped_by, "", "an empty result is not an error");
     }
 
     #[test]
