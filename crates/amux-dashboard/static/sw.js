@@ -1,5 +1,18 @@
-const CACHE = 'amux-v0.9.797';
-const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
+const CACHE = 'amux-v0.9.806';
+const SHELL_URLS = [
+  '/',
+  '/app.css',
+  '/ui-system.css',
+  '/app.js',
+  '/ui-system.js',
+  '/vendor/basecoat/basecoat.min.css',
+  '/vendor/basecoat/all.min.js',
+  '/manifest.json',
+  '/icon.svg',
+  '/icon.png',
+  '/icon-192.png',
+  '/icon-512.png',
+];
 
 // Install: pre-cache entire app shell
 self.addEventListener('install', e => {

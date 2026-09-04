@@ -49,13 +49,9 @@
   body.light #gridstack-container .grid-stack-item-content { background: var(--card); }
   body.light .gp-body { color: var(--text); }
   body.light .gp-send .chips .chip { background: var(--bg); color: var(--text); border-color: var(--border); }
-  /* File/explore overlay — hardcoded near-black backdrop + body need light overrides */
+  /* File overlay — hardcoded near-black backdrop + body need light overrides */
   body.light .file-overlay { background: rgba(240,242,245,0.97); }
   body.light .file-overlay-header h2 { color: var(--text); }
-  /* Directory listing body — light bg with readable text */
-  body.light #explore-overlay .file-overlay-body { background: var(--bg); color: var(--text); }
-  body.light .explore-name { color: var(--text); }
-  body.light .explore-row:hover { background: var(--card); }
   /* File viewer body — keep dark for ANSI/code readability; use card bg for non-raw views */
   body.light #file-overlay .file-overlay-body { background: #1c2128; color: #cdd9e5; }
   body.light #file-overlay .file-overlay-body.file-image,
@@ -979,6 +975,7 @@
     word-break: break-word; -webkit-overflow-scrolling: touch;
   }
   .file-view-tabs { display: flex; gap: 3px; flex-shrink: 0; }
+  .file-mode-tabs { display: flex; gap: 3px; flex-shrink: 0; }
   .file-view-tab { padding: 4px 11px; border-radius: 6px; border: 1px solid var(--border);
     background: none; color: var(--dim); font-size: 0.78rem; cursor: pointer;
     -webkit-tap-highlight-color: transparent; transition: all 0.15s; }
@@ -1132,6 +1129,7 @@
       padding: 6px; z-index: 60; min-width: 190px; max-width: 78vw; max-height: 70vh; overflow-y: auto; }
     .file-actions.open { display: flex; }
     .file-actions .file-view-tabs { flex-direction: column; align-items: stretch; width: 100%; overflow: visible; gap: 2px; padding: 0; }
+    .file-actions .file-mode-tabs { flex-direction: column; align-items: stretch; width: 100%; gap: 2px; }
     .file-actions .file-view-tab,
     .file-actions #file-save-btn,
     .file-actions #file-download-btn {
@@ -1364,6 +1362,7 @@
 
   /* Connect session list */
   /* FullCalendar theme overrides */
+  #calendar-view { flex: 1 1 auto; min-height: calc(100dvh - 112px); }
   #fc-container { --fc-border-color: var(--border); --fc-button-bg-color: transparent; --fc-button-border-color: var(--border); --fc-button-text-color: var(--text); --fc-button-hover-bg-color: var(--hover); --fc-button-hover-border-color: var(--border); --fc-button-active-bg-color: var(--accent); --fc-button-active-border-color: var(--accent); --fc-today-bg-color: rgba(56,139,253,0.06); --fc-event-border-color: transparent; --fc-page-bg-color: var(--bg); --fc-neutral-bg-color: var(--bg); --fc-list-event-hover-bg-color: var(--hover); --fc-now-indicator-color: var(--accent); --fc-non-business-color: transparent; }
   #fc-container { font-family: inherit; font-size: 0.85rem; }
   #fc-container .fc-toolbar { padding: 8px 4px; gap: 8px; flex-wrap: wrap; }
@@ -2088,6 +2087,7 @@
   .peek-tabs { display: flex; border-bottom: 1px solid var(--border); flex-shrink: 0; padding: 0 12px;
     overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; scrollbar-width: none; -ms-overflow-style: none;
     overscroll-behavior-x: contain; touch-action: pan-x; }
+  .peek-tab-list { display: flex; align-items: stretch; flex: 0 0 auto; }
   .peek-tabs::-webkit-scrollbar { display: none; }
   /* min-height 44px: these are the peek's PRIMARY navigation and measured 29px
      tall — 66% of the css-mobile 44px floor (AC-225 finding 1, corrected on
@@ -5244,6 +5244,7 @@
   #journal-view.sidebar-collapsed .jrnl-expand-btn { display: flex; }
   .jrnl-main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
   .jrnl-sub-tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border); padding: 0 12px; align-items: center; }
+  .jrnl-view-tabs { display: flex; gap: 0; align-items: center; }
   .jrnl-sub-tab { padding: 8px 16px; font-size: 0.78rem; background: none; border: none; color: var(--dim); cursor: pointer; border-bottom: 2px solid transparent; font-family: inherit; }
   .jrnl-sub-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
   .jrnl-sub-tab:hover { color: var(--fg); }
