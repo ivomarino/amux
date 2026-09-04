@@ -454,8 +454,16 @@ pub fn build(
                  regenerates the divergence.\n\
                  The remedy is to REGENERATE FROM SOURCE once the underlying change lands, and \
                  it belongs to the owner of the SOURCE rather than to whoever this nudge \
-                 happened to wake. If a path above is not actually generated, its \
-                 `.gitattributes` entry is wrong and that is the thing to fix."
+                 happened to wake.\n\
+                 IF A PATH ABOVE IS NOT ACTUALLY GENERATED, its `.gitattributes` entry is \
+                 wrong, and that error is the WORSE of the two directions: an unmarked \
+                 generated file gets a recipe you can decline, while a marked hand-written \
+                 file loses its merge warning silently. The trap is a generator INPUT sitting \
+                 beside its outputs — a `generate.sh` or a config next to the tree it writes, \
+                 which changes on every regen exactly like the outputs do. Derive the list \
+                 from the generator's own manifest where it has one \
+                 (openapi-generator writes `.openapi-generator/FILES`), never from which \
+                 paths change together."
             ));
         }
         if !hand_paths.is_empty() {
@@ -2743,6 +2751,22 @@ mod tests {
             "the merge recipe must not be offered for a declared generated path: {m}"
         );
         assert!(!m.contains("DIVERGED:"), "the hand-written arm must not render at all: {m}");
+        // THE ASYMMETRY, named where it is actionable (mixpeek-frustrations,
+        // 2026-09-04, from turning this on for real). Over-marking is the worse
+        // error: an unmarked generated file gets a recipe the reader can
+        // decline, and a marked hand-written file loses its merge warning with
+        // nothing said. Their specimen is the one my own candidate list would
+        // have got wrong — `packages/python-sdk/setup.py` IS generated and
+        // `packages/python-sdk/generate.sh` is not, and both change on every
+        // regen, so the firing-frequency signal cannot separate them.
+        assert!(
+            m.contains("loses its merge warning silently"),
+            "name the direction of error that is silent, not just that errors happen: {m}"
+        );
+        assert!(
+            m.contains(".openapi-generator/FILES"),
+            "point at a manifest that can answer, since co-change cannot: {m}"
+        );
     }
 
     /// THE OTHER ARM, which the card named as the check that can fail: a path
