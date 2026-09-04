@@ -1260,6 +1260,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/browser/start", methods: &["POST"] },
     RouteEntry { path: "/api/browser/status", methods: &["GET"] },
     RouteEntry { path: "/api/browser/stop", methods: &["POST"] },
+    RouteEntry { path: "/api/browser/identify", methods: &["POST"] },
     RouteEntry { path: "/api/browser/profiles", methods: &["GET"] },
     RouteEntry { path: "/api/browser/profile/create", methods: &["POST"] },
     RouteEntry { path: "/api/browser/profile/{name}", methods: &["DELETE"] },

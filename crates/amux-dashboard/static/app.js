@@ -8898,7 +8898,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.804';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.805';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -36401,6 +36401,30 @@ async function _bwClearInspect() {
 // reCAPTCHA — many sites do. A human completing the challenge once in a real
 // window is the only thing that works, and closing the window is what flushes
 // the session to the profile for the API to reuse.
+// AF-496. amux launches Chrome into its own --user-data-dir, so the window it
+// opens sits beside the human's own Chrome and looks identical: same icon, same
+// frame, no badge. Measured in a live onboarding session (2026-09-04) — the user
+// signed into the wrong window and was corrected three times, and asked "should
+// I trust it, it does look like two different browsers?".
+//
+// amux held the answer the whole time (pid, port, profile, starting lane) and
+// had no way to SHOW it. This button puts it where the person is looking: it
+// raises the amux window and draws a bar across it. A Chrome window WITHOUT a
+// bar is their own, which is what makes the multi-window case answerable.
+async function _bwIdentify() {
+  _bwStatus('identifying the amux window\u2026');
+  try {
+    const r = await fetch('/api/browser/identify', { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' });
+    const d = await r.json();
+    if (d.error) { _bwStatus(d.error + (d.running_profiles ? ' (running: ' + d.running_profiles.join(', ') + ')' : '')); return; }
+    // Report the OUTCOME, not the request. `labeled/pages` is the pair that
+    // says whether a 0 means "no tabs" or "every tab refused" (ethos rule 4).
+    const names = (d.identified || []).map(b => b.profile).join(', ');
+    if (!d.identified || !d.identified.length) { _bwStatus(d.verdict || 'no amux browser is running'); return; }
+    _bwStatus(d.verdict + ' \u2014 ' + names + ' (' + d.labeled + '/' + d.pages + ' tab(s) labelled)');
+  } catch (e) { _bwStatus('identify failed: ' + e); }
+}
+
 async function _bwNewProfile() {
   const url = (document.getElementById('bw-url').value || '').trim();
   const suggested = (() => {

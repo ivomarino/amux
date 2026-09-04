@@ -3533,6 +3533,277 @@ pub fn delete_profile(home: &Path, name: &str) -> Result<Value, (u16, Value)> {
     Ok(json!({ "ok": true, "deleted": name }))
 }
 
+
+// ---- identify: which of these windows is the one amux drives? -------------
+//
+// AF-496. amux launches Chrome into its OWN --user-data-dir, so the window it
+// opens is a second, visually identical Chrome beside the human's. Nothing in
+// it says so. Measured in a live onboarding session (Doron + Ethan, 2026-09-04):
+// the user signed into HubSpot in the WRONG window, was corrected three times
+// ("that browser was already open", "go into the browser window that was
+// CREATED when it's trying to configure the profile"), and asked the question
+// the product could not answer — "should I trust it, it does look like two
+// different browsers?"
+//
+// amux HOLDS the answer the whole time: pid, CDP port, profile, and which lane
+// started it. It just never puts it anywhere the human is looking, which is the
+// window itself. `identify` does two independent things so a failure of either
+// still leaves a signal:
+//
+//   1. draws a banner IN the page naming the profile and the lane, which is
+//      visible without touching anything and labels EVERY amux window at once
+//      when no profile is named;
+//   2. raises that window, which answers "show me" when there is one to show.
+//
+// The unlabelled window is then the human's own, by elimination — the property
+// that makes the no-profile form worth having.
+
+/// How long the identify banner stays on screen.
+pub fn identify_banner_ms() -> u64 {
+    std::env::var("AMUX_BROWSER_IDENTIFY_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(12_000)
+}
+
+/// The JS an identify injects into one page.
+///
+/// Pure, and every interpolated value goes through `serde_json::to_string` — a
+/// profile name is caller-supplied and would otherwise be JS injected into the
+/// page this banner is meant to make trustworthy.
+///
+/// Returns the number of banners it placed (1), so the caller can tell a page
+/// that RAN the script from one that merely did not error.
+pub fn identify_js(profile: &str, started_by: &str, ms: u64) -> String {
+    let p = serde_json::to_string(profile).unwrap_or_else(|_| "\"?\"".into());
+    let b = serde_json::to_string(started_by).unwrap_or_else(|_| "\"?\"".into());
+    format!(
+        r#"(() => {{
+  const ID = 'amux-identify-banner';
+  document.getElementById(ID)?.remove();
+  const el = document.createElement('div');
+  el.id = ID;
+  el.setAttribute('data-amux', 'identify');
+  el.style.cssText = [
+    'position:fixed','top:0','left:0','right:0','z-index:2147483647',
+    'background:#1f6feb','color:#fff','padding:10px 14px',
+    'font:600 14px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif',
+    'box-shadow:0 2px 8px rgba(0,0,0,.35)','text-align:center',
+    'pointer-events:none','white-space:normal'
+  ].join(';');
+  const started = {b} ? (' · started by ' + {b}) : '';
+  el.textContent = 'This window is the amux browser · profile ' + {p} + started
+    + ' — sign in HERE and the worker inherits the login. Any Chrome window without this bar is your own.';
+  (document.body || document.documentElement).appendChild(el);
+  setTimeout(() => document.getElementById(ID)?.remove(), {ms});
+  return 1;
+}})()"#
+    )
+}
+
+/// What one browser's identify actually managed to do.
+///
+/// Every field is an OUTCOME, not an intention: `labeled` counts pages the
+/// banner script returned from, `raise_supported` says whether raising is even
+/// implemented on this platform, and both error strings are kept. A caller
+/// reading `labeled: 0, raised: false` with no errors would be reading a lie,
+/// so there is no path that produces it silently (ethos rule 4).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct IdentifiedBrowser {
+    pub profile: String,
+    pub started_by: String,
+    pub pid: u32,
+    pub cdp_port: u16,
+    /// Page targets the banner was injected into.
+    pub labeled: usize,
+    /// Page targets CDP listed at all. `labeled < pages` means some tab refused.
+    pub pages: usize,
+    pub raised: bool,
+    pub raise_supported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raise_error: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+}
+
+/// Bring a running app to the front by pid.
+///
+/// macOS only, deliberately: `Page.bringToFront` raises the TAB within its
+/// Chrome window but does not activate the application, and with two Chrome
+/// processes (the human's and amux's) the one the user is staring at stays on
+/// top. System Events activates by unix id, which is exactly the identity amux
+/// already records. On any other platform this returns the reason rather than
+/// a bare failure, so `raise_supported: false` and "it did not work" stay
+/// distinguishable.
+pub async fn raise_app_by_pid(pid: u32) -> Result<(), String> {
+    if !cfg!(target_os = "macos") {
+        return Err("raising a window by pid is implemented on macOS only".into());
+    }
+    let script = format!(
+        "tell application \"System Events\" to set frontmost of (first process whose unix id is {pid}) to true"
+    );
+    let out = tokio::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .await
+        .map_err(|e| format!("osascript: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    Err(if stderr.is_empty() { format!("osascript exited {}", out.status) } else { stderr })
+}
+
+/// Label every page of ONE running browser, and optionally raise its window.
+pub async fn identify_one(
+    profile: &str,
+    started_by: &str,
+    pid: u32,
+    port: u16,
+    raise: bool,
+) -> IdentifiedBrowser {
+    let mut out = IdentifiedBrowser {
+        profile: profile.to_string(),
+        started_by: started_by.to_string(),
+        pid,
+        cdp_port: port,
+        labeled: 0,
+        pages: 0,
+        raised: false,
+        raise_supported: cfg!(target_os = "macos"),
+        raise_error: None,
+        errors: Vec::new(),
+    };
+    let js = identify_js(profile, started_by, identify_banner_ms());
+    match cdp_list(port).await {
+        Ok(tabs) => {
+            let pages: Vec<Value> = tabs
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter(|t| t.get("type").and_then(Value::as_str) == Some("page"))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.pages = pages.len();
+            for t in &pages {
+                let ws = t.get("webSocketDebuggerUrl").and_then(Value::as_str).unwrap_or("");
+                if ws.is_empty() {
+                    out.errors.push("a page target had no webSocketDebuggerUrl".into());
+                    continue;
+                }
+                match CdpClient::connect(ws).await {
+                    Ok(mut c) => match c.eval(&js, 10).await {
+                        Ok(_) => out.labeled += 1,
+                        Err(e) => out.errors.push(format!("banner: {e}")),
+                    },
+                    Err(e) => out.errors.push(format!("connect: {e}")),
+                }
+            }
+        }
+        Err(e) => out.errors.push(format!("cdp_list: {e}")),
+    }
+    if raise {
+        match raise_app_by_pid(pid).await {
+            Ok(()) => out.raised = true,
+            Err(e) => out.raise_error = Some(e),
+        }
+    }
+    out
+}
+
+
+#[cfg(test)]
+mod identify_tests {
+    use super::*;
+
+    /// The banner has to say the thing that DISCRIMINATES, not just "amux".
+    /// A bar reading "amux browser" on one window still leaves the human
+    /// wondering what the other window is; the sentence about an unlabelled
+    /// window is what closes it, and it is the sentence Ethan had to say out
+    /// loud three times.
+    #[test]
+    fn the_banner_names_the_profile_and_says_what_an_unlabelled_window_means() {
+        let js = identify_js("hubspot", "gtm-engine", 12_000);
+        assert!(js.contains("\"hubspot\""), "the profile is not in the banner: {js}");
+        assert!(js.contains("\"gtm-engine\""), "the starting lane is not in the banner: {js}");
+        assert!(
+            js.contains("without this bar is your own"),
+            "the banner never says what an UNLABELLED window is, which is the whole answer"
+        );
+        assert!(js.contains("12000"), "the self-removal timeout is not the one asked for");
+    }
+
+    /// A profile name is caller-supplied (`POST /profile/create {name}`), and
+    /// this script is injected into a page. Interpolating the name raw would
+    /// let a profile named `"; fetch(...)` run arbitrary JS in whatever site
+    /// the human is signed into — in the window whose entire purpose is to be
+    /// the trustworthy one.
+    #[test]
+    fn a_profile_name_cannot_break_out_of_the_banner_string() {
+        let hostile = "a\"; document.title='pwned'; //";
+        let js = identify_js(hostile, "amux", 5);
+        assert!(
+            !js.contains(hostile),
+            "the raw profile name reached the script unescaped: {js}"
+        );
+        assert!(
+            js.contains(&serde_json::to_string(hostile).unwrap()),
+            "the name is not present as a JSON-escaped literal either: {js}"
+        );
+    }
+
+    /// The banner removes itself. A permanent overlay on a page the worker then
+    /// drives would sit on top of the buttons it needs to click.
+    #[test]
+    fn the_banner_removes_itself() {
+        let js = identify_js("default", "amux", 900);
+        assert!(js.contains("setTimeout"), "nothing schedules the removal");
+        assert!(js.contains("remove()"), "nothing removes it");
+        assert!(js.contains("pointer-events:none"), "the banner can swallow clicks while it is up");
+    }
+
+    #[test]
+    fn the_banner_duration_is_configurable_and_a_zero_falls_back() {
+        let key = "AMUX_BROWSER_IDENTIFY_MS";
+        let prior = std::env::var(key).ok();
+        // SAFETY: single-threaded test; restored below.
+        unsafe { std::env::set_var(key, "3000") };
+        assert_eq!(identify_banner_ms(), 3000);
+        unsafe { std::env::set_var(key, "0") };
+        assert_eq!(identify_banner_ms(), 12_000, "0 would mean a banner nobody can read");
+        unsafe { std::env::set_var(key, "not-a-number") };
+        assert_eq!(identify_banner_ms(), 12_000);
+        match prior {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    /// `raise_supported` is a claim about the PLATFORM, and it has to match
+    /// what `raise_app_by_pid` will actually attempt — otherwise a Linux caller
+    /// reads `raise_supported: true, raised: false` and goes looking for a
+    /// window manager problem that does not exist.
+    #[tokio::test]
+    async fn a_platform_that_cannot_raise_says_so_rather_than_failing_silently() {
+        if cfg!(target_os = "macos") {
+            // pid 1 is launchd: System Events refuses it, which is the point —
+            // the call is ATTEMPTED here, so the error is a real one.
+            let r = raise_app_by_pid(1).await;
+            assert!(r.is_err(), "raising launchd should not report success");
+        } else {
+            let r = raise_app_by_pid(1).await;
+            assert_eq!(
+                r.unwrap_err(),
+                "raising a window by pid is implemented on macOS only"
+            );
+        }
+    }
+}
+
 // ---- tests ----------------------------------------------------------------
 
 #[cfg(test)]
