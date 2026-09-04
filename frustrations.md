@@ -2841,3 +2841,46 @@ FIX: 8e515d80. The receipt writer moves to `scripts/write-test-receipt.sh` and i
  The FIX sha above was originally written as 5cd5be1c, a sha I had guessed before
  committing. Corrected in a follow-up; a predicted sha in this file is a citation
  that resolves to nothing.
+
+## a hand-written Amux-Session trailer silently outranks the hook's true stamp, and the push guard then calls your own commit foreign
+AREA: attribution
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-frustrations
+CARD: AF-479
+SYMPTOM: I wrote a commit message by hand and typed `Amux-Session: amux` into the
+ trailer block. This lane is `amux-frustrations`. The commit landed as ac550324
+ stamped to a real peer lane and nothing said a word. `prepare-commit-msg` stamps
+ with `git interpret-trailers --if-exists doNothing`, so any value already in the
+ message wins over the one the hook computed two lines earlier and knows is true.
+COST: caught only because I happened to render the trailer while checking for
+ foreign commits before a push. Had I not, the pre-push guard partitions unpushed
+ commits by exactly this trailer, so it would have listed my own commit under
+ `amux:` and offered me its author-consent exit, whose two-field form is ACCEPTED
+ whenever the trailer matches. Following the refusal literally records "the author
+ said yes" from a lane that never touched the commit, which is the AMUX-3533 shape
+ reached by obeying the sanctioned instruction. This hook's own header records the
+ same mis-stamp costing an amend-under-pin dance on 2026-08-22. The general form:
+ the harness held the true value and deferred to a false one with no signal, and
+ `Amux-Conversation` cannot corroborate because it is a lookup of the same string.
+FIX: f6bfeefe. Overwriting was rejected and stays unimplemented: a cherry-pick or
+ `git commit -c <peer-sha>` legitimately carries the original author's stamp, and
+ rewriting it to the committing lane would destroy a true fact to prevent a false
+ one. So the declared trailer is KEPT, the disagreement is printed at commit time
+ naming both lanes while the commit is still cheap to amend, and `Amux-Committer:
+ <lane>` is stamped beside it. It is written ONLY on disagreement, so its presence
+ is the signal rather than something a reader has to compare. `pre-push` reads it
+ and prints COMMITTED BY YOU, STAMPED TO ANOTHER LANE with the two causes and their
+ opposite remedies; it does NOT clear the commit, because a cherry-picked peer WIP
+ has this identical shape and is what the guard exists to stop. 15 cells in
+ `scripts/test-commit-stamp.sh` (6 new, 3 of them negative controls) and 19 in
+ `scripts/test-push-guard-range.sh` (3 new, one a control). Six mutations fire:
+ stamping unconditionally, overwriting the declared value, dropping the warning,
+ printing the note unconditionally, reverting the log format, and letting the note
+ return 0. Hooks ship by COPY, so `./scripts/install-hooks.sh` was run and the
+ INSTALLED copies verified. One real bug came out of writing the test rather than
+ the code: `%(trailers:key=X,valueonly)` emits the trailer's own trailing NEWLINE,
+ which is invisible while that field is last and splits every row in half the
+ moment a second field follows it. `separator=` suppresses it. Cell Q caught it;
+ reading the code did not.
