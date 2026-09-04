@@ -974,23 +974,50 @@ fn codex_model_bar(line: &str) -> bool {
         && (location == "~" || location.starts_with("~/") || location.starts_with('/'))
 }
 
-fn codex_generating(clean: &str) -> bool {
+fn codex_generation_state_clean(clean: &str) -> Option<bool> {
     // Order is the state. While generating, Codex paints the working row below
     // the submitted prompt. Once complete it redraws an empty prompt and model
     // bar BELOW that row, but the row can remain in the captured tail. Reading
     // these as an unordered set pinned completed workers Active (ATE-36).
     for s in nonempty_trimmed(clean).iter().rev().take(12) {
         if is_prompt_line(s) || codex_model_bar(s) {
-            return false;
+            return Some(false);
         }
         let sl = s.to_lowercase();
         if s.starts_with('•')
             && (sl.contains("esc to interrupt") || sl.contains("working") || sl.contains("running"))
         {
-            return true;
+            return Some(true);
         }
     }
-    false
+    None
+}
+
+fn codex_generating(clean: &str) -> bool {
+    codex_generation_state_clean(clean).unwrap_or(false)
+}
+
+/// The newest generation boundary when the capture is structurally
+/// identifiable as a Codex-family TUI, or `None` when another provider (or an
+/// unknown terminal) should keep using its own signals.
+///
+/// The sessions compatibility projection does not carry provider metadata,
+/// but it does have the raw pane. Returning an option lets it share Codex's
+/// ordered boundary logic without pretending every bullet containing
+/// "working" belongs to Codex. The prompt glyph and model/path bar are stable
+/// TUI structure; model and effort names stay intentionally open-ended.
+pub(crate) fn codex_pane_generation_state(captured: &str) -> Option<bool> {
+    let clean = strip_ansi(captured);
+    let tail = nonempty_trimmed(&clean);
+    let identifiable = tail
+        .iter()
+        .rev()
+        .take(12)
+        .any(|s| s.starts_with('›') || codex_model_bar(s));
+    if !identifiable {
+        return None;
+    }
+    codex_generation_state_clean(&clean)
 }
 
 fn scan_codex(clean: &str, provider: &ProviderId) -> Vec<WorkerEvent> {

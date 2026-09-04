@@ -1199,6 +1199,18 @@ impl FleetSignals {
         let Some(raw) = self.pane_of(name) else {
             return false;
         };
+        // Codex/ollama have an explicit, ordered terminal boundary. If the
+        // newest frame paints a fresh prompt/model bar, that current-state
+        // evidence outranks stale "Working" rows, queued-message prose, and
+        // the model-agnostic churn history below. Active Codex frames still
+        // return true when their newest boundary is the working row. `None`
+        // means this is not structurally a Codex-family pane, so Claude/Gemini
+        // retain the existing hooks + bar + churn logic unchanged.
+        if let Some(generating) =
+            crate::backend::adapter::codex_pane_generation_state(raw)
+        {
+            return generating;
+        }
         // THE BAR PHRASE ALONE NO LONGER PROVES A GENERATING MAIN TURN
         // (AMUX-2959, Ethan at 1am: "this worker says working" over an idle
         // prompt). Claude Code now shows "esc to interrupt" in the status bar
@@ -4639,6 +4651,46 @@ Claude usage limit reached. Your limit will reset at 3pm.
         let (status, ex) = s.derive_status_explain(lane, true);
         assert_eq!(status, "active", "{ex}");
         assert_eq!(ex["decided_by"], json!("contradiction_pane_generating"), "{ex}");
+        assert!(ex["pane"]["churn_distinct_frames"].as_u64().unwrap() >= 3, "{ex}");
+    }
+
+    /// ATE-36, the second live false-WORKING shape. Codex had finished and
+    /// painted its empty prompt/model bar below a queued-message notice, but
+    /// the dashboard projection OR'd recent pane churn back into "working".
+    /// A provider-specific terminal boundary is stronger evidence than the
+    /// model-agnostic churn fallback: the latter describes recent history,
+    /// while the former says what the newest frame is doing now.
+    #[test]
+    fn a_newer_codex_prompt_beats_queued_message_prose_and_recent_churn() {
+        let lane = "ate36-codex-complete";
+        let completed = "\
+• Messages to be submitted after next tool call (press esc to interrupt and send immediately)
+↳ [amux-origin: amux-frustrations]
+Checked, nothing of mine was at risk, no action needed from you.
+› Ask Codex to do anything
+  gpt-5.6-sol xhigh · ~/Dev/amux";
+        let mut s = signals();
+        s.activity.insert(format!("amux-{lane}"), (s.now - 1.0) as i64);
+        s.running.insert(format!("amux-{lane}"));
+        s.reports = json!({lane: {
+            "state": "idle", "ts": s.now - 1076.0, "source": "stop-hook-test"
+        }});
+
+        // The preceding turn painted multiple distinct bodies. This is the
+        // exact stale history that the live status-explain exposed as
+        // churn_distinct_frames=9 after the prompt was already idle.
+        for (i, body) in ["working one", "working two", "working three"].iter().enumerate() {
+            let frame = format!("{body}\n{completed}");
+            note_pane_frame(lane, &frame, s.now - 4.0 + i as f64, s.contradiction_window());
+        }
+        s.panes.insert(lane.into(), completed.into());
+
+        let (status, ex) = s.derive_status_explain(lane, true);
+        assert_eq!(
+            status, "idle",
+            "the newest Codex prompt is authoritative over queued-message prose and stale churn: {ex}"
+        );
+        assert_eq!(ex["pane"]["says_working"], json!(false), "{ex}");
         assert!(ex["pane"]["churn_distinct_frames"].as_u64().unwrap() >= 3, "{ex}");
     }
 
