@@ -3214,3 +3214,19 @@ FIX: The negative control now counts and removes the declaration only within
  cmd_start, preserving the independent declaration in cmd_open_browser while
  still proving the broken fixture fails with an unbound variable. Its failure
  output names the scoped occurrence count.
+
+## An async menu-reachability assertion raced the app's normal rerender
+AREA: tests
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-44
+SYMPTOM: The full Playwright run passed 300 scenarios, then the ATE-44 iOS
+ Safari parity case failed because `scrollIntoViewIfNeeded` acquired the Focus
+ action before a session poll rerendered the peek menu and detached that node.
+COST: The six-case focused matrix had passed, but the first full descendant CI
+ run stayed red after 16.7 minutes and could not satisfy ATE-44's final gate.
+FIX: The parity test now scrolls and measures the final Focus action inside the
+ same synchronous render snapshot. It still proves overflow, scrollability and
+ viewport reachability while eliminating the cross-rerender locator lifetime.
