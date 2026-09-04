@@ -3150,3 +3150,48 @@ FIX: ATE-44 validates every browser PID at the signed OS boundary, refuses
  `kill`, and emits `invalid_process_id_refused`. The original
  4294967295 fixture remains as an end-to-end regression, with boundary controls
  for PID 0, PID 1, ordinary positive PIDs, and the signed maximum.
+
+## Multiplayer workspace switching was replayed later as offline work
+AREA: cloud
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-codex
+CARD: AC-416
+SYMPTOM: In three simultaneous saved browser profiles, switching workspaces
+ returned synthetic HTTP 202 `queued/offline`, reloaded as though it succeeded,
+ and either stayed in the old workspace or changed context later when the
+ outbox replayed. The god-mode account's switcher also rendered all 62 inherited
+ workspaces as a giant green invitation banner, and chrome-cdp's shared
+ `pages.json` made listing profile C erase the target lookup for profiles A/B.
+COST: Ethan, god mode, and the Gmail participant could not be kept in one
+ workspace long enough to prove cross-user board/log visibility; retries
+ created delayed context switches, and the operator-facing page exposed the
+ whole customer directory above the actual dashboard.
+FIX: Workspace switching is now explicitly non-replayable, requires a real
+ JSON acknowledgement, and reports `workspace_switch_failed` instead of
+ reloading on failure. The gateway acknowledges JSON clients before entering a
+ tenant container and logs `[org-switch] ... verdict=switched`. Org rows say
+ `via_god_mode`, so inherited access remains in Settings without becoming an
+ invite banner. chrome-cdp now scopes targets/sockets by profile or port and
+ selects the requested profile from the multi-browser status array.
+
+## Three-user cloud test saturated on minute-long workspace requests
+AREA: cloud
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-04
+SESSION: amux-codex
+CARD: AC-416
+SYMPTOM: The Gmail workspace stayed on "Starting your workspace" for several
+ minutes while board/session reads in the other two profiles took 50-135s.
+ The local 8824 control plane simultaneously repeated its known failure mode:
+ TCP accepted, but TLS `/health` handshakes timed out until the watchdog or a
+ manual launchd restart replaced the process.
+COST: A browser-created Backlog canary existed only in Ethan's optimistic page
+ state; after more than a minute the owner profile still had an empty board, so
+ real cross-user observation and actor attribution could not be certified.
+FIX: AC-416. The saved profiles and exact three-identity browser path now
+ reproduce it without credentials, and the watchdog/server log records the TLS
+ hang. Diagnose tenant wake latency and the local request-path stalls before
+ claiming realtime multiplayer from a cached shell.

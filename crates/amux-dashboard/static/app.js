@@ -1204,7 +1204,13 @@ function _renderOrgSwitcher() {
 
   // Banner: you have access to other workspaces (but aren't in one yet)
   const dismissed = JSON.parse(localStorage.getItem('amux_dismissed_org_banners') || '[]');
-  const undismissedOrgs = otherOrgs.filter(o => !dismissed.includes(o.id));
+  // God-mode visibility is not an invitation. Admins may inspect every
+  // workspace, but rendering all of those inherited rows as a giant green
+  // "You have access to" banner exposed the whole customer directory and
+  // pushed the actual dashboard below the fold. Explicit memberships retain
+  // the banner; inherited god-mode rows remain available in the settings
+  // switcher where the operator deliberately looks for them.
+  const undismissedOrgs = otherOrgs.filter(o => !o.via_god_mode && !dismissed.includes(o.id));
   if (inviteBanner && inviteBannerText && !inOtherOrg && undismissedOrgs.length > 0) {
     const names = undismissedOrgs.map(o => o.name || o.id).join(', ');
     inviteBannerText.innerHTML = `You have access to: <strong>${esc(names)}</strong> &nbsp;`;
@@ -1222,12 +1228,36 @@ function _renderOrgSwitcher() {
 }
 
 async function _switchOrg(orgId) {
-  await fetch('/api/gateway/switch-org', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({org_id: orgId || ''})
-  }).catch(() => {});
-  location.reload();
+  const ctl = new AbortController();
+  const timeout = setTimeout(() => ctl.abort(), 20000);
+  try {
+    const r = await fetch('/api/gateway/switch-org', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json', 'Accept':'application/json'},
+      body: JSON.stringify({org_id: orgId || ''}),
+      // A workspace switch changes where every subsequent API call goes and
+      // needs its response now. Replaying it minutes later from the offline
+      // outbox silently moves a person while they are doing other work.
+      _skipOutbox: true,
+      signal: ctl.signal,
+    });
+    if (_isLocallyQueued(r)) throw new Error('workspace switch was queued locally');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const ack = await r.json();
+    if (ack?.ok !== true) throw new Error('gateway did not acknowledge workspace switch');
+    location.reload();
+  } catch (e) {
+    console.warn('workspace switch failed; staying in the current workspace', e);
+    try {
+      amuxTrack('workspace_switch_failed', {
+        target: orgId ? 'other' : 'personal',
+        err: String(e).slice(0, 200),
+      });
+    } catch (_) {}
+    showToast('Workspace switch failed — still viewing the current workspace');
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 // ── Org invite banner dismiss ──────────────────────────────────────────────
@@ -2307,7 +2337,7 @@ const _origFetch = window.fetch.bind(window);
 // deploy has its fetch fail, get queued, and report success. Ethan saw the two
 // halves separately — "mdai files are stuck at running", and a banner reading
 // `Syncing 0/1 · POST /api/files/mdai/run` that never cleared.
-const _OUTBOX_SKIP = /\/api\/(client-debug|speedtest|tts|lookup|sql|suggest-branch|terminal\/|upload|fs\/upload|sessions\/login\/|tunnel\/|push\/test|browser|files\/mdai\/run|config\/cross-group)/;
+const _OUTBOX_SKIP = /\/api\/(client-debug|speedtest|tts|lookup|sql|suggest-branch|terminal\/|upload|fs\/upload|sessions\/login\/|tunnel\/|push\/test|browser|files\/mdai\/run|config\/cross-group|gateway\/switch-org)/;
 const _OUTBOX_METHODS = { POST: 1, PATCH: 1, PUT: 1, DELETE: 1 };
 function _outboxQueueable(url, init) {
   if (!url || typeof url !== 'string') return false;
@@ -8898,7 +8928,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.812';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.813';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
