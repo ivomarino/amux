@@ -5404,3 +5404,331 @@ FIX: none in code yet. Documented as a hard rule in this session's own
   AMUX-70 filed for a durable fix (either that wrapper baked into the
   sanctioned local-build path, or making the remote-offload fallback
   actually reliable so this is never reached for).
+
+## a hand-written Amux-Session trailer silently outranks the hook's true stamp, and the push guard then calls your own commit foreign
+VALIDATED: amux-frustrations | Validated by the originating session (amux-frustrations, which both hit and fixed it).
+
+Fixed in f6bfeefe. prepare-commit-msg now prints the disagreement at commit time
+naming both lanes, keeps the declared trailer (a cherry-pick's stamp is real
+provenance), and records `Amux-Committer: <lane>` beside it. pre-push reads it and
+prints COMMITTED BY YOU, STAMPED TO ANOTHER LANE with the two causes and their
+opposite remedies, without clearing the commit.
+
+Confirmed on the very next commit made after the fix: f6bfeefe declared no session,
+so no warning fired and no Amux-Committer was stamped (the agreement path), and its
+trailer reads [amux-frustrations]. The mis-stamped commit that produced the entry
+(ac550324, stamped `amux`) was amended to e7808171 under a HEAD pin.
+
+scripts/test-commit-stamp.sh -> 15 passed, 0 failed (6 new, 3 negative controls)
+scripts/test-push-guard-range.sh -> 19 passed, 0 failed (3 new, one a control)
+Six mutations verified firing and reverting clean.
+Hooks ship by COPY; ./scripts/install-hooks.sh run and the INSTALLED copies verified.
+AREA: attribution
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-frustrations
+CARD: AF-479
+SYMPTOM: I wrote a commit message by hand and typed `Amux-Session: amux` into the
+ trailer block. This lane is `amux-frustrations`. The commit landed as ac550324
+ stamped to a real peer lane and nothing said a word. `prepare-commit-msg` stamps
+ with `git interpret-trailers --if-exists doNothing`, so any value already in the
+ message wins over the one the hook computed two lines earlier and knows is true.
+COST: caught only because I happened to render the trailer while checking for
+ foreign commits before a push. Had I not, the pre-push guard partitions unpushed
+ commits by exactly this trailer, so it would have listed my own commit under
+ `amux:` and offered me its author-consent exit, whose two-field form is ACCEPTED
+ whenever the trailer matches. Following the refusal literally records "the author
+ said yes" from a lane that never touched the commit, which is the AMUX-3533 shape
+ reached by obeying the sanctioned instruction. This hook's own header records the
+ same mis-stamp costing an amend-under-pin dance on 2026-08-22. The general form:
+ the harness held the true value and deferred to a false one with no signal, and
+ `Amux-Conversation` cannot corroborate because it is a lookup of the same string.
+FIX: f6bfeefe. Overwriting was rejected and stays unimplemented: a cherry-pick or
+ `git commit -c <peer-sha>` legitimately carries the original author's stamp, and
+ rewriting it to the committing lane would destroy a true fact to prevent a false
+ one. So the declared trailer is KEPT, the disagreement is printed at commit time
+ naming both lanes while the commit is still cheap to amend, and `Amux-Committer:
+ <lane>` is stamped beside it. It is written ONLY on disagreement, so its presence
+ is the signal rather than something a reader has to compare. `pre-push` reads it
+ and prints COMMITTED BY YOU, STAMPED TO ANOTHER LANE with the two causes and their
+ opposite remedies; it does NOT clear the commit, because a cherry-picked peer WIP
+ has this identical shape and is what the guard exists to stop. 15 cells in
+ `scripts/test-commit-stamp.sh` (6 new, 3 of them negative controls) and 19 in
+ `scripts/test-push-guard-range.sh` (3 new, one a control). Six mutations fire:
+ stamping unconditionally, overwriting the declared value, dropping the warning,
+ printing the note unconditionally, reverting the log format, and letting the note
+ return 0. Hooks ship by COPY, so `./scripts/install-hooks.sh` was run and the
+ INSTALLED copies verified. One real bug came out of writing the test rather than
+ the code: `%(trailers:key=X,valueonly)` emits the trailer's own trailing NEWLINE,
+ which is invisible while that field is last and splits every row in half the
+ moment a second field follows it. `separator=` suppresses it. Cell Q caught it;
+ reading the code did not.
+
+## the two sanctioned cargo wrappers cannot both be used, and pre-commit then reports your tested bytes as untested
+VALIDATED: amux-frustrations | Validated by the originating session (amux-frustrations).
+
+Fixed in 8e515d80. The receipt writer moved to scripts/write-test-receipt.sh and is
+called by BOTH sanctioned paths, so writing one is a property of running tests
+rather than of whichever wrapper you reached for. safe-cargo.sh test writes one and
+stops exec'ing (exit status now explicitly propagated and tested); test-contended.sh
+invokes cargo through safe-cargo.sh with _TC_RECEIPT=1 to suppress the duplicate.
+
+Validated by USE, not just by the suite: every commit made in this session went
+through the fixed path and pre-commit reported correctly each time, including the
+discriminating case. On a CSS/JS-only commit it said the staged bytes did not match
+the last run, which is TRUE (crates/amux-dashboard/static is under crates/ and
+dashboard_assets.rs reads those exact bytes), and running --test dashboard_assets
+cleared it: 21 passed. On every Rust commit it said "all N staged crate file(s)
+match the bytes your last run compiled" and named the target and age.
+
+scripts/test-test-receipt.sh -> 26 passed (5 new)
+Four mutations fire: no receipt written, written for every subcommand, exit status
+swallowed, duplicate guard removed.
+./scripts/install-hooks.sh run; grep -c AF-478 .git/hooks/pre-commit -> 1.
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-frustrations
+CARD: AF-478
+SYMPTOM: CLAUDE.md gives two instructions for a local test run. "Tests:
+ `scripts/test-contended.sh -p amux-server`", and "If a local run is genuinely
+ unavoidable, run it through `scripts/safe-cargo.sh <cargo args>` instead of bare
+ cargo". They could not both be followed. `test-contended.sh:162` was a bare
+ `cargo test "$@"`, so the sanctioned TEST path had none of the systemd-scope
+ isolation AMUX-70 exists for. And only `test-contended.sh` wrote
+ `~/.amux/test-receipts/$AMUX_SESSION.tsv`; `safe-cargo.sh` execs, so it could not
+ write one after the run. Three green runs through the safety wrapper, minutes
+ before a commit, and pre-commit answered: "1 of 1 staged crate file(s) DIFFER
+ from the bytes your last run compiled (`-p amux-server --lib board_drive`,
+ 72140s ago). That green result does not describe this commit."
+COST: the hook named a run from 20 hours earlier and was right about everything it
+ could see. There was no sequence of sanctioned commands that made it right, which
+ is ethos rule 3: a constraint with no truthful path through. The cheap damage is a
+ commit that reads as untested; the expensive one is the habit it teaches, since a
+ warning that fires on correct behaviour gets skipped, and this hook's whole value
+ is the case where it is telling the truth. On Linux the conflict runs the other
+ way and costs a session: an OOM-killed `cargo test` in the pane's own scope takes
+ the interactive pane down, not just the build.
+FIX: 8e515d80. The receipt writer moves to `scripts/write-test-receipt.sh` and is
+ called by both paths, so it is a property of running tests rather than of whichever
+ wrapper you reached for. `safe-cargo.sh test` writes one (and stops exec'ing, so
+ the exit status is now explicitly propagated and tested); `test-contended.sh`
+ invokes cargo through `safe-cargo.sh` and sets `_TC_RECEIPT=1` to suppress the
+ duplicate. The no-receipt branch of the hook now names the two commands that write
+ one, because reporting an absence without saying what produces it is honest and
+ unactionable. 26 cells in `scripts/test-test-receipt.sh`, 5 of them new; four
+ mutations fire (no receipt written, written for every subcommand, exit status
+ swallowed, duplicate guard removed). Hooks ship by COPY, so `./scripts/install-hooks.sh`
+ was run and the INSTALLED copy verified (`grep -c AF-478 .git/hooks/pre-commit` -> 1).
+ The FIX sha above was originally written as 5cd5be1c, a sha I had guessed before
+ committing. Corrected in a follow-up; a predicted sha in this file is a citation
+ that resolves to nothing.
+
+## The escape hatch the nudge advertises is what builds the pile it complains about
+VALIDATED: amux-frustrations | Validated by the originating session (amux-frustrations), re-verified in the shipped
+code today rather than from the fix commit messages.
+
+(1) The `updated > last_ts` silence is GONE. board_drive.rs:4628 carries the removal
+note by name ("REMOVED (AF-465)") and the surviving check at :4625 is the cooldown
+only (`last_ts > 0.0 && (now - last_ts) < win`), with MIN(added_at) kept as the
+monotonic ask clock. So re-statement is no longer a silence lever and the
+first-fire gap is dissolved.
+
+(2) The verify-nudge no longer promises a digest. board_drive.rs:3064 now reads
+"it moves the card into the dashboard needs:you view, and NOTHING pushes" it to the
+owner today. The only remaining "owner digest" strings are doc comments quoting the
+OLD text to explain what was fixed (:2973, :4655-4657) and an unrelated past-tense
+note in autofix.rs:6617.
+
+Fixed in 88f00fbd and cb3e966f (both amux-cloud), 105 board_drive tests green.
+
+Deliberately still open and NOT claimed by this validation: whether a push surface
+to the owner should exist at all is Ethan's call. This entry's claim was that the
+loop advertised a benefit that does not happen; that sentence has stopped being true.
+
+AREA: notices
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-03
+SESSION: amux-frustrations
+CARD: AF-465
+SYMPTOM: two false promises in the board loop, in the same family. (1) The needs:you
+ re-nag said "Re-state it on the card (silences this for 3d)"; both silence checks in
+ `needsyou_renag_text` are gated on `last_ts > 0.0`, so the FIRST fire skips them and
+ re-stating does nothing. (2) The verify-nudge told lanes that a card they cannot
+ verify "should be tagged `needs:you` so they surface in the owner digest rather than
+ sitting here indefinitely" — and THE OWNER DIGEST DOES NOT EXIST. No job in
+ `registry.rs` builds one, no runtime job selects needs:you cards into one, `digest`
+ appears nowhere in live `/api/health`, and `review.rs`'s `digest_dir()` only SERVES
+ `docs/weekly-review`, which holds two files both dated Aug 1 with no producer. The
+ only surviving trace is a past-tense comment (`autofix.rs:6617`) about a digest that
+ "emitted 92 cards in one SMS". Tagging needs:you moves a card to a dashboard view
+ nobody is pushed to.
+COST: this is a mechanism for the pile, not a coincidence beside it. ~/.claude/CLAUDE.md
+ records "445 cards ... in needsyou with a median age of 15 days, most of which never
+ needed me at all". The loop advertised an escape hatch whose stated benefit does not
+ happen, lanes took it as instructed, and the cards parked. Live specimen, verified:
+ AC-214, a SECURITY escalation (rotate a leaked E2E_COOKIE_SECRET, still unrotated,
+ value present verbatim in a transcript), tagged needs:you on 2026-08-04 — 30 days,
+ correctly tagged, reaching the owner through zero channels. Also cost me a wrong
+ mechanism on (1): I named INSERT OR IGNORE + MIN(added_at) without reading the
+ function that implements the promise.
+FIX: 88f00fbd and cb3e966f, both amux-cloud. (1) The `updated > last_ts` silence is
+ DELETED rather than repaired — one deletion makes the new text true, closes the
+ abuse vector where a lane suppresses a human's ask by re-stating every 3d, and
+ dissolves the first-fire gap. MIN stays as the monotonic clock. (2) The verify-nudge
+ now says tagging moves the card to the dashboard needs:you view, that NOTHING pushes
+ it to the owner today, and to tag only when a human genuinely owes the next step.
+ 105 board_drive tests green. Whether a push surface should EXIST is Ethan's and is
+ deliberately still open.
+
+## A test that extracts a function to avoid copying it inherits that function's dependencies
+VALIDATED: amux-frustrations | Validated by the originating session (amux-frustrations).
+
+Fixed in f883a98e. scripts/test-unstamped-ledger.sh extracts the shipped functions
+rather than copying them, and now extracts their DEPENDENCIES too, so an extraction
+can no longer pass while the real function would fail on a helper it needs.
+
+Re-run today against the current tree: 16 passed, 0 failed. The cells that would
+break first if the dependency extraction regressed are green (the injected body
+carries a marker not the bare text; the marker is a single line so the separately
+sent Enter still submits body and marker together; the audit row records the
+ORIGINAL undecorated body).
+
+AREA: tests
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-03
+SESSION: amux-frustrations
+CARD: AF-454
+SYMPTOM: scripts/test-unstamped-ledger.sh deliberately EXTRACTS the shipped ledger
+ functions instead of copying them, and says why in its own header: "A copy here
+ would pass forever while the real ones rot — the failure this file exists to
+ prevent, one level up." It extracted three functions by name and none of their
+ callees. AMUX-40 (978645c0) later swapped the bare `curl` inside
+ `_flush_unstamped_ledger` for the hang-guarded `_curl` helper. `_curl` was then an
+ undefined command in the test's shell, its rc-127 landed in the flush's own
+ "server went away mid-flush: KEEP the row" branch, and three assertions went red.
+COST: the failures read "the row never reached /api/history — every fallback send
+ would be lost" and "rows remain after flush — they would be re-sent forever",
+ against a live server, a POST verified working by hand, and a reconciled row
+ already in the trail. Every one of those sentences accuses the audit mechanism;
+ the defect was in the harness reading it. Anyone taking the output at face value
+ would have gone to debug AMUX-2670. Guarded against REIMPLEMENTATION drift and
+ bitten by DEPENDENCY drift, which the same argument covers and the implementation
+ did not.
+FIX: bd5dc6c8. Extraction walks the call graph (it now pulls `_curl` and
+ `_transport_breadcrumb`), and a helper that IS defined in ./amux but missing from
+ the harness is a named failure printed ABOVE the assertions it would otherwise
+ corrupt. Mutation M4 breaks the closure and confirms it names `_curl`.
+ Generalisable: a test that extracts a function to avoid copying it inherits that
+ function's dependencies, and nothing in "extract, do not copy" says so.
+
+## The fallback prints "no audit" one line after writing the audit row
+VALIDATED: amux-frustrations | Validated by the originating session (amux-frustrations), re-verified in the shipped
+CLI today rather than from the fix commit.
+
+Fixed in bd5dc6c8. `grep -n 'no audit' amux` returns NOTHING: the contradicting
+clause is gone and the message now says the send is recorded and reconciles.
+
+The verification order is also as the entry demanded. amux:1412 offers
+`tmux capture-pane -p -S -200 -t "=$tname:" | tail -40` FIRST, with the curl demoted
+below it at :1418 and labelled with the precondition it needs. All three details the
+entry called out are present and commented: $tname not $name (the 2026-07-27 shape
+that made gtm-engine read a delivered message as lost), the load-bearing trailing
+colon, and -S -200 for scrollback rather than the viewport.
+
+scripts/test-unstamped-ledger.sh -> 16 passed, 0 failed.
+
+AREA: cli
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-03
+SESSION: amux-frustrations
+CARD: AF-454
+SYMPTOM: `amux send` falls back to raw tmux when the server is unreachable. The
+ fallback calls `_record_unstamped_send`, which writes the send to a local ledger
+ that reconciles into /api/history on the next successful send (AMUX-2670). The
+ VERY NEXT LINE printed "DELIVERY UNVERIFIED, no origin stamp, no audit". The stamp
+ half is true. The audit half contradicts the statement one line above it.
+COST: gtm-engine hit a real flap on 2026-09-03, read "no audit" literally, spent a
+ measurement pass on it (three probes of /api/sessions: DOWN, DOWN, UP), and routed
+ a provenance gap here as "during a flap every lane's messages become
+ unattributable". The mechanism had worked perfectly on that exact send: it was
+ sitting in the trail as MSG-40621, type `raw-tmux-fallback`, origin
+ "unstamped-fallback from gtm-engine". A peer lane re-derived a closed gap because
+ the tool said the opposite of what the tool did. Second cost in the same message:
+ the only verification offered was `curl "$AMUX_URL/api/sessions/<name>/peek"`, a
+ request to the server whose unreachability is the ONLY reason that branch runs
+ (ethos rule 3), and it named the FLEET name, so gtm-engine ran `tmux has-session
+ -t gtm-ticker` against a session actually called `amux-gtm-ticker`, found nothing,
+ and briefly read a DELIVERED message as lost. That is the 2026-07-27 shape
+ CLAUDE.md already warns about by name.
+FIX: bd5dc6c8. The message now says recorded-and-reconciles, and offers `tmux
+ capture-pane -p -S -200 -t "=$tname:"` first with the curl demoted below it and
+ labelled with the precondition it needs. The trailing colon is load-bearing:
+ `-t "=$tname"` answers "can't find pane", which was in the line until it was
+ tested. `-S -200` because a bare capture-pane returns the viewport, the exact trap
+ CLAUDE.md documents for peek. Five assertions in
+ scripts/test-unstamped-ledger.sh, all mutation-verified.
+
+## The `verdict=READ verb` arm names a card by ID, and every one of its 17 positives is false
+VALIDATED: amux-frustrations | Validated by the originating session (amux-frustrations), and this one is validated
+by a MEASUREMENT taken today rather than by reading the fix.
+
+Fixed in e6cb8901 (2026-09-03 11:59:54). inferred_edit_verdict now separates a BARE
+git read subcommand, which is impossible from a real git invocation because
+first_blocking_verb skips those, from a genuine read verb. The bare case is named as
+quoted DATA tokenised as shell (AMUX-3822's defect through a quoted string) and
+explicitly NOT a specimen.
+
+MEASURED over both server logs, window 2026-08-30T03:09 -> 2026-09-04T13:03:
+  verdict=READ lines in server-rs.log.1 (pre-fix window):   17
+  verdict=READ lines in server-rs.log   (post-fix window):   0
+  all 17 carry blocked_by=status, on backend (9) and mixpeek-homepage-claude (8)
+  latest of the 17: 2026-09-03T08:58:12, i.e. three hours BEFORE the fix landed
+So every row that ever claimed to be AMUX-2841's specimen was the artifact this
+entry describes, and none has been minted since.
+
+COUNTING CAVEAT, recorded because it nearly cost me the number: `grep -o
+'verdict=READ'` over these logs returns 8, not 17. The logs contain NUL bytes
+(216,873 in .log.1, 36,340 in .log), so grep switches to binary mode and suppresses
+match output while -c still counts lines. Use `grep -c` or `grep -a`. Filed
+separately; it is not a defect in this entry's mechanism.
+
+AMUX-2841 remains OPEN and this validation does not touch it: it is the watch that
+wants a REAL specimen, and the measurement above says zero have appeared in the
+15.5h since the fix armed it.
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-03
+SESSION: amux-frustrations
+CARD: AF-452
+SYMPTOM: `[staged-guard/inferred-edit]` publishes a `verdict` field with three arms. The
+ READ arm's text is "READ verb — is_pure_read_command missed a reader ... This is the
+ specimen AMUX-2841 wants". Over 75,758 firings in a 4-day window it produced 17 rows, all
+ `blocked_by=status`, on two mixpeek lanes. All 17 are artifacts, and the proof needs no
+ transcript: `first_blocking_verb` (git_guard.rs:1726) `continue`s on a real git read
+ subcommand, so a genuine `git status` can NEVER reach that field. A bare `status` token
+ there PROVES it came from quoted DATA tokenised as shell. `is_known_read_verb` (:1696)
+ then consults GIT_READ_SUBCMDS and reads it as a genuine read. The two functions disagree
+ on one vocabulary: `first_blocking_verb` checks READ_ONLY_VERBS only, `is_known_read_verb`
+ checks both.
+COST: AMUX-2841 was unparked from backlog to todo on 2026-09-03 because "the discriminator
+ AMUX-3822 added now exists", and it does exist and it does fire — with nothing but false
+ positives, each naming that card by ID. A 23-day specimen hunt was pointed at prose. Also
+ cost a wrong first measurement in the same sitting: I counted `blocked_by` (~30% non-verbs
+ across 1,076 distinct values) and nearly reported the discriminator as unreadable, when
+ that field's unclassifiable tokens are the EXPECTED input to the verdict arm that replaced
+ it. Correct observation, wrong field.
+FIX: the whole READ arm is unreachable for its stated meaning — `first_blocking_verb`
+ returns a verb only when it is NOT in READ_ONLY_VERBS, so the arm's first half is dead by
+ construction and its second half only matches the artifact. Checked the artifact case
+ FIRST and named it, so the log stops claiming a specimen: git_guard.rs
+ `inferred_edit_verdict`, extracted from the log site so the arms are testable at all.
+ Whether the READ arm should exist is AMUX-3822's author's call, recorded on AF-452.
+
+---
