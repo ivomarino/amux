@@ -1199,9 +1199,18 @@ print(json.dumps({
 _warn_second_person_resend() {
   local target="$1" text="$2"
   local f="${CC_HOME}/recent-sends.jsonl"
-  TGT="$target" BODY="$text" LEDGER="$f" python3 - <<'PY' >&2 2>/dev/null || true
+  # SKIP when a multi-recipient sender has ALREADY made this decision
+  # (ts-gke's seam). mixpeek's scripts/fleet-send.sh takes N recipients, refuses a
+  # second-person body at N>1, and offers --allow-second-person as the escape. It
+  # then loops `amux send` per recipient, so recipients 2..N would trip this
+  # warning AFTER the author already typed the override. That is exactly the
+  # already-acted-on class the retry suppression exists for, so it gets the same
+  # treatment. Any multi-recipient wrapper can export this.
+  [[ -n "${AMUX_SEND_MULTI_ACK:-}" ]] && return 0
+  TGT="$target" BODY="$text" LEDGER="$f" FROM="${AMUX_SESSION:-}" python3 - <<'PY' >&2 2>/dev/null || true
 import json, os, re, time, hashlib
 tgt, body, f = os.environ['TGT'], os.environ['BODY'], os.environ['LEDGER']
+me = os.environ.get('FROM', '')
 WINDOW = 6 * 3600
 h = hashlib.sha256(body.encode('utf-8', 'replace')).hexdigest()[:16]
 now = time.time()
@@ -1227,12 +1236,22 @@ if prior and tgt not in seen:
     pron = re.findall(r"\b(you|your|yours|you're|you've|you'd|yourself)\b", body, re.I)
     if pron:
         who = ', '.join(prior)
-        print(f"warning: this body was already sent to {who}, and contains "
+        # SAY WHO SENT IT, because in a RELAY it was not me (ts-gke). A lane sends
+        # me a body and I forward it verbatim: the hash matches their row and the
+        # fire is CORRECT — a forwarded "you" meant the forwarder — but "this body
+        # was already sent to X" is false in my mouth. Rows carry the sender now,
+        # so the sentence is true in both cases and the relay one is more useful
+        # than the plain one.
+        senders = sorted({d.get('session') or '?' for d in rows
+                          if d.get('hash') == h and d.get('target') != tgt})
+        by = '' if senders == [me] else ' by ' + ', '.join(senders)
+        lead = 'you already sent this body to' if senders == [me] else 'this body was already sent to'
+        print(f"warning: {lead} {who}{by}, and it contains "
               f"{len(pron)} second-person reference(s).")
         print(f"  \"you\" resolves to whoever opens it, so {tgt} will read those as theirs.")
         print("  Name the session inline with each claim, or send each lane its own text.")
         print("  (A print, not a block — if it is genuinely addressed to all of them, send it.)")
-rows.append({'hash': h, 'target': tgt, 'ts': now})
+rows.append({'hash': h, 'target': tgt, 'ts': now, 'session': me})
 try:
     with open(f, 'w') as fh:
         for d in rows[-500:]:
