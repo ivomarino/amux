@@ -24,6 +24,18 @@ const SAMPLE = {
 };
 
 async function boot(page: import('@playwright/test').Page) {
+  // enterFiles() below calls boot() three times on the SAME page — each one a
+  // fresh page.goto('/'), but NOT a fresh origin, so localStorage survives
+  // across them. App boot restores the persisted view (_restoreScreen reads
+  // `amux_ui_view`) BEFORE any of this file's own seeding/clicking runs, at
+  // _filesPath's freshly-reset default of '/' — so the SECOND and THIRD calls
+  // in a test can auto-navigate into Files at '/' first, then race the click
+  // handler's own correct navigation to '/tmp/'. Whichever response lands
+  // last wins, which is why this showed up as an inconsistent path (not the
+  // consistent "never navigated" shape the seeding bug produced). An
+  // addInitScript clears the one key that persists this, before EVERY
+  // navigation on this page, so each boot() is really starting fresh.
+  await page.addInitScript(() => { try { localStorage.removeItem('amux_ui_view'); } catch (e) {} });
   await page.goto('/');
   await page.waitForFunction(() => typeof (window as any)._renderWorkerActionMenu === 'function');
   // `sessions`/`peekSession`/`peekSessionDir` are top-level lexical (`let`)
