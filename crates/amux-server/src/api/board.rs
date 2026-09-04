@@ -4681,6 +4681,12 @@ enum PatchOut {
         /// dropped goes and sets it again, or files a bug against working
         /// code, which is exactly what this card was.
         diverted: Vec<Value>,
+        /// Advisories are NOT diversions (AF-469 regression, 2026-09-04). A
+        /// diversion says "the key you named is not the key that changed"; an
+        /// advisory says "the write landed, and here is a companion field you
+        /// did not send". Merging them tripped a control written to stop an
+        /// advisory firing on every source_ref write.
+        advisories: Vec<Value>,
         /// (session, from_status, to_status) when a status change happened,
         /// for reactive pickup: if the transition freed the lane (done/verified/
         /// discarded), fire an immediate pickup instead of waiting 60s.
@@ -5154,6 +5160,8 @@ pub async fn patch_item(
             // Filled by the source_ref arm below when a trigger is rerouted to
             // the card body. Empty on every other write.
             let mut diverted: Vec<Value> = Vec::new();
+            // Separate from `diverted` on purpose — see the advisory push below.
+            let mut advisories: Vec<Value> = Vec::new();
             // EVERY key unwritable = the request was unusable (AEAB/#134 review,
             // reported by tsukimiya). Narrow on purpose: a MIXED body such as
             // {"status":"done","item_type":"code"} where the card is already
@@ -5649,10 +5657,23 @@ pub async fn patch_item(
                     && next.source_ref.as_deref().is_some_and(|v| !v.trim().is_empty())
                     && !map.contains_key("last_verified_at")
                 {
-                    diverted.push(json!({
+                    // ITS OWN FIELD, NOT `diverted`. A diversion means "the key
+                    // you named is deliberately not the key that changed"
+                    // (AMUX-3791). Nothing was diverted here: source_ref landed
+                    // exactly where the caller asked. This is an ADVISORY about a
+                    // companion field they did not send.
+                    //
+                    // Overloading `diverted` cost a real regression the same day:
+                    // a_trigger_cannot_overwrite_an_autofix_signature_but_can_
+                    // replace_a_trigger carries a CONTROL asserting an ordinary
+                    // trigger write reports NO diversion, written precisely so
+                    // "a version that emitted the advisory on every source_ref
+                    // write would pass every cell above and train readers to
+                    // ignore a line that cries wolf". It caught this, correctly,
+                    // and the control was right.
+                    advisories.push(json!({
                         "field": "last_verified_at",
-                        "landed_in": "(nothing — not set)",
-                        "value": null,
+                        "not_set": true,
                         "why": "source_ref was set without last_verified_at, so board-drive \
                                 reads this card as a trigger nobody has re-checked and will \
                                 re-offer it on every idle tick. `amux board <status> <id> \
@@ -7522,6 +7543,7 @@ pub async fn patch_item(
                     body,
                     ignored,
                     diverted,
+                    advisories,
                     status_transition: st,
                     progress_notify,
                     // FIRE ON THE TRANSITION INTO REVIEW, not only on a note
@@ -7657,11 +7679,15 @@ pub async fn patch_item(
             mut body,
             ignored,
             diverted,
+            advisories,
             status_transition,
             progress_notify,
             reviewer_notify,
         }) => {
             body["applied"] = json!(true);
+            if !advisories.is_empty() {
+                body["advisories"] = json!(advisories);
+            }
             body["global_rev"] = json!(reply.rev.0);
             // SEPARATE KEY FROM `ignored_fields`, because they are opposite
             // facts and a caller acts differently on each: ignored means set it

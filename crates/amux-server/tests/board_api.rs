@@ -3403,14 +3403,21 @@ async fn parking_with_a_trigger_and_no_verification_time_warns_the_caller() {
         Some(json!({"source_ref": "the next ts-engine roll"})),
         &[("X-Amux-Session", "amux")]).await;
     assert!(st.is_success(), "the write must still succeed: {body}");
-    let warned = body["diverted_fields"].as_array().map(|a| a.iter().any(|d| {
+    // `advisories`, NOT `diverted_fields`. The first version of this fix put the
+    // note in `diverted`, and the control in
+    // a_trigger_cannot_overwrite_an_autofix_signature_but_can_replace_a_trigger
+    // caught it — that control asserts an ordinary trigger write reports NO
+    // diversion, and exists so an advisory cannot fire on every source_ref write
+    // and train readers to ignore it. A diversion means "the key you named is not
+    // the key that changed"; nothing was diverted here.
+    let warned = body["advisories"].as_array().map(|a| a.iter().any(|d| {
         d["field"] == "last_verified_at" && d["why"].as_str().unwrap_or("").contains("re-offer it")
     })).unwrap_or(false);
     assert!(warned, "a trigger with no last_verified_at must warn the caller: {body}");
 
     // AND IT NAMES THE FIX, because a warning that does not is a warning that gets
     // read once and ignored.
-    let why = body["diverted_fields"][0]["why"].as_str().unwrap_or("");
+    let why = body["advisories"][0]["why"].as_str().unwrap_or("");
     assert!(why.contains("--trigger"), "the warning must name the verb that stamps both: {why}");
 
     // THE CLI's SHAPE: both fields together. Must stay SILENT, or the warning fires
@@ -3419,13 +3426,13 @@ async fn parking_with_a_trigger_and_no_verification_time_warns_the_caller() {
     let (_s, _h, body2) = send_with(&app, "PATCH", &format!("/api/board/{id2}"),
         Some(json!({"source_ref": "the next ts-engine roll", "last_verified_at": 1788510477i64})),
         &[("X-Amux-Session", "amux")]).await;
-    let quiet = body2["diverted_fields"].as_array().map(|a| a.iter().all(|d| d["field"] != "last_verified_at")).unwrap_or(true);
+    let quiet = body2["advisories"].as_array().map(|a| a.iter().all(|d| d["field"] != "last_verified_at")).unwrap_or(true);
     assert!(quiet, "the CLI shape stamps both and must not warn: {body2}");
 
     // CLEARING a trigger is not parking, so it must stay silent too.
     let (_s, _h, body3) = send_with(&app, "PATCH", &format!("/api/board/{id}"),
         Some(json!({"source_ref": ""})), &[("X-Amux-Session", "amux")]).await;
-    let quiet3 = body3["diverted_fields"].as_array().map(|a| a.iter().all(|d| d["field"] != "last_verified_at")).unwrap_or(true);
+    let quiet3 = body3["advisories"].as_array().map(|a| a.iter().all(|d| d["field"] != "last_verified_at")).unwrap_or(true);
     assert!(quiet3, "clearing a trigger must not warn about verification time: {body3}");
 }
 
