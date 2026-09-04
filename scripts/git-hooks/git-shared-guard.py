@@ -20,6 +20,37 @@ Configure guarded roots via AMUX_SHARED_CHECKOUTS (colon-separated; default
 """
 import sys, json, os, re, time, pathlib
 
+# GIT'S GLOBAL-OPTION PREFIX, shared by every detector that must find a
+# SUBCOMMAND in command text (AF-489).
+#
+# mixpeek-frustrations fixed the run_dir resolver on 2026-09-04 (2815f442) after
+# `-C` was read as git's global `-C <dir>` when it was `git commit -C <commit>`,
+# and handed the rest of the file over. Two DETECTORS had the mirror defect: they
+# allowed only `(?:-C\s+\S+\s+)?` before the subcommand, so any OTHER global flag
+# hid the subcommand and the guard never fired at all. Measured before the fix:
+#
+#   git -c user.name=x commit --amend         amend detector MISS
+#   git -c a=b -c c=d commit --amend          MISS
+#   git --no-pager commit --amend             MISS
+#   git -c a=b -C /repo commit --amend        MISS
+#   git -c protocol.version=2 checkout -- .   discard detector MISS
+#   git --literal-pathspecs checkout -- .     MISS
+#
+# A resolver that mis-resolves gives a wrong answer. A DETECTOR that misses is a
+# SILENT PASS, which is the worse direction and the one this closes.
+#
+# Arg-taking globals are enumerated because they consume the next token; every
+# other leading dash-token is a no-arg global. The group stops at the first bare
+# word, which is git's own rule for where the subcommand begins, so `git log
+# --oneline` and `git diff -C -- a b` still do not match.
+GIT_GLOBALS = (
+    r'(?:'
+    r'-(?:c|C)\s+\S+\s+'
+    r'|--(?:exec-path|git-dir|work-tree|namespace|super-prefix)(?:=\S+|\s+\S+)\s+'
+    r'|--?[A-Za-z][-A-Za-z0-9]*\s+'
+    r')*'
+)
+
 # Entries are (pattern, why) or (pattern, why, remedy).
 #
 # The 3-tuple exists because the shared refusal tail below hard-codes ONE hazard
@@ -502,7 +533,7 @@ def _amend_verdict(cmd, scrubbed, run_dir):
     compare-and-amend to build it from. Do not restore the "kills the race"
     wording.
     Returns None to allow, or a block-reason string."""
-    if not re.search(r'\bgit\s+(?:-C\s+\S+\s+)?commit\b[^\n;&|]*--amend\b', scrubbed):
+    if not re.search(r'\bgit\s+' + GIT_GLOBALS + r'commit\b[^\n;&|]*--amend\b', scrubbed):
         return None
     import subprocess
     def _git(*args):
@@ -923,7 +954,7 @@ def _discard_verdict(cmd, scrubbed, run_dir):
     Fail-open on anything unexpected, same posture as the rest of this guard.
     Returns a block-reason string, or None to allow."""
     import urllib.request, ssl, subprocess
-    if not re.search(r'\bgit\s+(?:-C\s+\S+\s+)?(?:checkout|restore)\b', scrubbed):
+    if not re.search(r'\bgit\s+' + GIT_GLOBALS + r'(?:checkout|restore)\b', scrubbed):
         return None
     # Detect on `scrubbed` (so prose/docs that merely mention the command never
     # match), but extract the operands from the ORIGINAL cmd — scrubbing removes

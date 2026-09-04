@@ -194,6 +194,38 @@ def main():
         # a matrix that never names the flag cannot see it.
         ("amend unpushed unpinned -C HEAD", "git commit --amend -C HEAD", True),
         ("amend unpushed unpinned -C sha", f"git commit --amend --no-verify -C {head}", True),
+        # A GLOBAL FLAG BEFORE THE SUBCOMMAND HID IT ENTIRELY (AF-489). The two
+        # cases above fixed the run_dir RESOLVER; the amend DETECTOR still
+        # allowed only `(?:-C\s+\S+\s+)?` in front of `commit`, so any other
+        # global flag meant the regex never matched and the verdict never ran.
+        # A resolver that mis-resolves gives a wrong answer; a detector that
+        # misses is a silent pass. Same reason the flag survived above: every
+        # case in this matrix spelled the amend with NO global flag at all.
+        ("amend unpushed, -c before subcommand",
+         "git -c user.name=x commit --amend --no-edit", True),
+        ("amend unpushed, repeated -c",
+         "git -c a=b -c c=d commit --amend --no-edit", True),
+        ("amend unpushed, --no-pager global",
+         "git --no-pager commit --amend --no-edit", True),
+        ("amend unpushed, -c then -C",
+         f"git -c a=b -C {work} commit --amend --no-edit", True),
+        ("amend unpushed, --git-dir= attached",
+         f"git --git-dir={work}/.git commit --amend --no-edit", True),
+        # NEGATIVE CONTROLS for the widened prefix. It must not start matching a
+        # command that is not an amend, or the guard blocks ordinary reads.
+        ("plain commit is not an amend", "git commit -m 'no amend here'", False),
+        ("git log is not an amend", "git -c a=b log --oneline", False),
+        ("diff -C is copy detection, not a global", "git diff -C -- a b", False),
+        # THE CELL THAT PINS "STOPS AT THE FIRST BARE WORD". The three negatives
+        # above are held by the literal `commit` anchor, not by the prefix, so a
+        # prefix loosened to accept ANY token still passes them — measured, by
+        # mutating `--?[A-Za-z]...` to `\S+` and watching all 126 stay green.
+        # Only a case where a DIFFERENT subcommand precedes the anchor can tell
+        # the two apart, which is what this is. git's own grammar ends the global
+        # section at the first bare word, and the comment in the guard claims
+        # exactly that; without this cell the claim is unenforced prose.
+        ("a different subcommand is not a global flag",
+         "git log commit --amend", False),
         ("amend unpushed pinned -C HEAD", f"AMUX_AMEND_EXPECT={head} git commit --amend -C HEAD", False),
         # Copy detection is the same collision on a read-only verb: harmless in
         # itself, and it proves the fix is about WHERE -C sits, not about amend.
