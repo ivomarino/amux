@@ -4522,6 +4522,34 @@ Claude usage limit reached. Your limit will reset at 3pm.
         assert_eq!(ex["subagents_live"], json!(0), "{ex}");
     }
 
+    #[test]
+    fn a_final_prompt_after_background_wait_does_not_override_idle() {
+        // ATE-45 live Primis acceptance, including the provider's retained
+        // agent-count footer. The capture-shell card is attached later in
+        // build_array and never participates in this derivation; its presence
+        // cannot turn a terminal pane back into runtime work.
+        let lane = "ate45-primis-complete";
+        let mut s = fresh_idle_lane(lane, 4.0);
+        s.reports[lane]["subagents"] = json!({"count": 0, "live_ids": []});
+        s.panes.insert(
+            lane.into(),
+            "\
+\u{2736} Waiting for 1 background agent to finish
+\u{23fa} Agent \"Post-fix status verification\" finished \u{b7} 16s
+\u{23fa} The background Explore agent finished and returned CLAUDE-POSTFIX-DONE.
+CLAUDE-POSTFIX-COMPLETE
+\u{273b} Churned for 23s \u{b7} done 3:40 PM
+\u{276f}\u{a0}
+\u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} \u{2190} 2 agents"
+                .into(),
+        );
+        let (status, ex) = s.derive_status_explain(lane, true);
+        assert_eq!(status, "idle", "the later terminal boundary must keep the lane idle: {ex}");
+        assert_eq!(ex["provider_background_working"], json!(false), "{ex}");
+        assert_eq!(ex["subagents_live"], json!(0), "{ex}");
+        assert_eq!(ex["decided_by"], json!("report"), "{ex}");
+    }
+
     /// The blast radius of making the count authoritative, stated as a test: a
     /// lane that reports NO count at all (gemini, codex, any hookless runtime)
     /// is pure mtime exactly as before. Without this, "authoritative" could

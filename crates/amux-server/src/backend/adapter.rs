@@ -276,6 +276,44 @@ pub(crate) fn claude_background_agents_waiting(line: &str) -> bool {
     RE_BG_AGENTS_WAIT.is_match(line[first.len_utf8()..].trim())
 }
 
+/// Does the newest provider-owned Claude turn marker still say the parent is
+/// waiting on background agents?
+///
+/// A tmux capture is scrollback, not a state packet. The waiting row remains
+/// visible after the agent finishes, followed by Claude's completed-turn row
+/// and the final prompt. A presence-only scan therefore pins a finished lane
+/// active until the old row scrolls out. Read the provider rows newest-first:
+/// a later completed-turn marker is the terminal edge for every older wait,
+/// while a newer wait still wins over a completion from the preceding turn.
+/// Raw lines are retained so pasted/indented replicas cannot become chrome.
+fn claude_background_wait_verdict(raw: &str) -> (bool, bool) {
+    let lines: Vec<&str> = raw.lines().filter(|line| !line.trim().is_empty()).collect();
+    for line in lines[lines.len().saturating_sub(12)..].iter().rev() {
+        let line = line.trim_end();
+        if claude_background_agents_waiting(line) {
+            return (true, false);
+        }
+        let Some(first) = line.chars().next() else { continue };
+        let provider_chrome = matches!(
+            first,
+            '*' | '\u{b7}' | '\u{2722}' | '\u{2733}' | '\u{2736}' | '\u{273b}' | '\u{273d}'
+        );
+        if provider_chrome && RE_COMPLETED_TURN.is_match(&line[first.len_utf8()..]) {
+            let older_wait_seen = lines.iter().any(|candidate| claude_background_agents_waiting(candidate));
+            return (false, older_wait_seen);
+        }
+    }
+    (false, false)
+}
+
+pub(crate) fn claude_background_agents_working(raw: &str) -> bool {
+    claude_background_wait_verdict(raw).0
+}
+
+pub(crate) fn claude_background_wait_superseded(raw: &str) -> bool {
+    claude_background_wait_verdict(raw).1
+}
+
 // Bash/zsh prompt at line end — the CLI process is gone (py 8315).
 lazy_re!(RE_SHELL_PROMPT_END, r"[$%]\s*$"); // py 8315
 
@@ -637,10 +675,8 @@ fn claude_tui_state(clean: &str) -> TuiState {
     // being early — those return states this must not override, so the window is
     // the recent tail rather than the whole pane, and it looks for a positive
     // "still waiting" statement rather than the mere presence of agents.
-    for s in ne.iter().rev().take(8) {
-        if claude_background_agents_waiting(s) {
-            return TuiState::Active;
-        }
+    if claude_background_agents_working(clean) {
+        return TuiState::Active;
     }
 
     // Step 0: active spinner — highest precedence, wide window
@@ -1736,6 +1772,34 @@ Running 1 shell command · 5s…
                      \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} \u{2190} 2 agents \u{b7} \u{2193} to manage";
         let st = claude_tui_state(frame);
         assert!(matches!(st, TuiState::Idle), "expected Idle, got {st:?}");
+    }
+
+    #[test]
+    fn a_completed_turn_after_a_background_wait_is_idle() {
+        // ATE-45, Primis at 15:40. tmux keeps the provider-owned waiting row
+        // in scrollback after the child and parent have both completed. The
+        // later completed-turn row is the ordered terminal edge; counting the
+        // older row by presence pinned this exact frame WORKING for minutes.
+        let frame = "\
+\u{2736} Waiting for 1 background agent to finish
+\u{23fa} Agent \"Post-fix status verification\" finished \u{b7} 16s
+\u{23fa} The background Explore agent finished and returned CLAUDE-POSTFIX-DONE.
+CLAUDE-POSTFIX-COMPLETE
+\u{273b} Churned for 23s \u{b7} done 3:40 PM
+\u{276f}\u{a0}
+\u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} \u{2190} 2 agents";
+        assert!(!claude_background_agents_working(frame));
+        assert!(claude_background_wait_superseded(frame));
+        let st = claude_tui_state(frame);
+        assert!(matches!(st, TuiState::Idle), "later completion must own the frame, got {st:?}");
+
+        let next_turn = format!(
+            "{frame}\n\u{2733} Waiting for 2 background agents to finish\n\u{276f}\n\u{23f5}\u{23f5} bypass permissions on"
+        );
+        assert!(
+            claude_background_agents_working(&next_turn),
+            "a newer wait still wins over the previous turn's completion"
+        );
     }
 
     #[test]

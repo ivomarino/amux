@@ -1439,10 +1439,8 @@ pub(crate) fn detect_claude_status(raw_output: &str) -> String {
     // so every ordinary main-turn signal looks idle. This provider-owned row
     // is the positive lifecycle statement; share its exact parser with the
     // adapter rather than maintaining a second spelling here (ATE-45).
-    for l in lines[n.saturating_sub(12)..].iter().rev() {
-        if crate::backend::adapter::claude_background_agents_waiting(l) {
-            return "active".into();
-        }
+    if crate::backend::adapter::claude_background_agents_working(&clean) {
+        return "active".into();
     }
     // 0. Active spinner, wide window.
     for l in lines[n.saturating_sub(30)..].iter().rev() {
@@ -9876,12 +9874,20 @@ pub(crate) fn provider_background_working(raw: &str) -> bool {
         return true;
     }
     let clean = crate::backend::adapter::strip_ansi(raw);
-    clean
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .rev()
-        .take(12)
-        .any(crate::backend::adapter::claude_background_agents_waiting)
+    let working = crate::backend::adapter::claude_background_agents_working(&clean);
+    if !working && crate::backend::adapter::claude_background_wait_superseded(&clean) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static ANNOUNCED: AtomicBool = AtomicBool::new(false);
+        if !ANNOUNCED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                target: "status_truth",
+                provider_signal = "claude_background_agent",
+                verdict = "superseded_by_completed_turn",
+                "stale provider background row ignored: a newer completed-turn boundary owns the pane"
+            );
+        }
+    }
+    working
 }
 
 /// A trusted idle report describes the parent prompt, not background work.
@@ -20399,6 +20405,20 @@ mod tests {
         ] {
             assert_eq!(detect_claude_status(waiting), "active", "{waiting}");
         }
+        let completed_after_wait = "\
+\u{2736} Waiting for 1 background agent to finish
+\u{23fa} Agent \"Post-fix status verification\" finished \u{b7} 16s
+\u{23fa} The background Explore agent finished and returned CLAUDE-POSTFIX-DONE.
+CLAUDE-POSTFIX-COMPLETE
+\u{273b} Churned for 23s \u{b7} done 3:40 PM
+\u{276f}\u{a0}
+\u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} \u{2190} 2 agents";
+        assert_eq!(
+            detect_claude_status(completed_after_wait),
+            "idle",
+            "a completed-turn/final-prompt boundary is newer than the stale wait row"
+        );
+        assert!(!provider_background_working(completed_after_wait));
         let quoted_wait = "I am testing Waiting for 1 background agent to finish\n\n\u{276f}\n\n\u{23f5}\u{23f5} bypass permissions on";
         assert_eq!(detect_claude_status(quoted_wait), "idle");
         let prompt_quote = "\u{276f} Waiting for 1 background agent to finish\n\n\u{23f5}\u{23f5} bypass permissions on";
