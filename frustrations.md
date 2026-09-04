@@ -2505,3 +2505,70 @@ FIX: not chosen — three candidates land in different places and it is a data-m
  one reader. Workaround that works today and is documented nowhere: PATCH
  archived:0, then done. Companion entry: the refusal message is correct and only
  reaches you when you ACT, never where the card is listed (AF-461).
+
+## 19 NUL bytes made grep call a 67 MB log binary, and every `grep -o` sweep silently lost half its matches
+AREA: instruments
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-frustrations
+CARD: AF-481
+SYMPTOM: same file, same pattern, three answers. `grep -c 'verdict=READ'` -> 17
+ lines. `grep -o 'verdict=READ' | wc -l` -> 8. `grep -ao ...` -> 17. grep declares a
+ file binary if it contains a single NUL byte and then SUPPRESSES match output while
+ `-c` keeps counting lines, and it says nothing at all when its output goes to a
+ pipe. The source was one warn: the create-path acyclicity check passes a placeholder
+ self id of `"\u{0}new-card"`, chosen because no real card id can contain a NUL,
+ which is correct and also true of a space. `depends_on_cycle` logs it as
+ `self_id = %self_id`, so 19 NULs landed in server-rs.log from one stuck cycle
+ (GE-473 -> MHC-256) retried across three days.
+COST: 53% of the matches, in the reassuring direction, on the instrument this repo's
+ own log-sweep doc prescribes. I nearly filed AMUX-2841's specimen count as 8 when it
+ is 17, which would have understated a watch's evidence by half. Nineteen bytes in 67
+ MB is enough, so no amount of the file being "mostly text" protects you. The wider
+ shape is that a probe can be correct, run cleanly, exit 0 and answer about a
+ different population than the one you asked about, with nothing beside the number
+ saying so.
+FIX: db3ff38a and accbba96. The sentinel is now `"(new card)"`; non-collision is
+ unchanged, since card ids are `[A-Z]+-<digits>` and a space and parentheses are as
+ impossible as a NUL was, and it survives a log. The guard asserts the PROPERTY, not
+ the string: no control characters, at least one character no card id can contain,
+ and non-empty so neither can pass vacuously. Two mutations fire (back to the NUL
+ sentinel; a valid-id-shaped "NEW-0"). The repo CLAUDE.md now tells lanes to grep
+ that file with `-a`, because AF-481 removed this source and any logged payload can
+ reintroduce one.
+ SELF-CORRECTION, recorded because it is the same class: I first reported 216,873
+ NULs from `grep -c $'\0'`. bash cannot put a NUL in a string, so `$'\0'` is the
+ EMPTY string and that command is `grep -c ''`, a line count wearing a NUL count's
+ label. The real figure is 19, read from the bytes in python. Both halves of this
+ entry are a probe whose argument silently became something else.
+
+## `GET /api/board` returns a WORKING SET, and the cap is disclosed only in headers the prescribed recipe cannot see
+AREA: instruments
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-frustrations
+CARD: AF-480
+SYMPTOM: `GET /api/board` returns 2,053 rows; `GET /api/board?all=1` returns 12,745.
+ The default caps terminal rows (done/verified/discarded) to the most recently
+ updated FLEET-WIDE, which across ~50 lanes can be none of yours. The cap is right
+ and the server is honest about it, in RESPONSE HEADERS: `x-amux-truncated: 1`,
+ `x-amux-total: 2052`, `x-amux-terminal-total: 10793`. The body is a bare JSON array
+ with no envelope, and the recipe in ~/.claude/CLAUDE.md is
+ `curl -sk $AMUX_URL/api/board | python3 -c "..."`, which cannot see a header.
+COST: reconciling all 84 frustrations.md entries against the default listing reported
+ 63 cards as MISSING FROM THE BOARD. All 63 existed. That is a whole reconciliation
+ pass, and the report it produced was wrong in the direction that invents work: it
+ would have had me file 63 duplicate cards for entries that already had one. The
+ `amux` CLI ALREADY reads those headers and prints the cap, and its own comment says
+ why ("nobody reads response headers from a pipe, which is ethos rule 4's second
+ layer: a tag in a store the reader never opens") — so the capability existed, was
+ correct, and did not reach the path CLAUDE.md tells every lane to run. Ethos rule 1:
+ a feature nobody can name is a feature nobody has.
+FIX: ~/.claude/CLAUDE.md now shows both forms with their row counts, says the cap is
+ header-only and that a raw curl cannot see it, and points at `amux board ls` which
+ can. The "read the whole board" recipe in the task-ledger section takes `?all=1`,
+ since that one is asked to be exhaustive by its own sentence. Not fixed and
+ deliberately not attempted: putting the disclosure in the BODY would need an
+ envelope, and every consumer of that endpoint parses a bare array.
