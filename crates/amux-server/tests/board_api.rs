@@ -3635,6 +3635,196 @@ async fn worker_outputs_auto_register_every_provider_artifact_and_survive_done()
     }
 }
 
+/// GCA-153: the provider-independent status endpoint must turn a worker's
+/// exact actionable card into current work. A stale source ref is provenance,
+/// not an eternal trigger block.
+#[tokio::test]
+async fn own_status_update_claims_exact_todo_or_backlog_for_every_provider() {
+    let (app, store, _dir) = app_with_store();
+    for (provider, initial) in [
+        ("claude", "todo"), ("codex", "backlog"),
+        ("gemini", "todo"), ("opencode", "backlog"),
+    ] {
+        let lane = format!("claim-{provider}");
+        let made = create(&app, json!({
+            "title": format!("{provider} exact-card claim"),
+            "status": initial, "session": lane,
+            "desc": "Implement the exact-card status claim."
+        })).await;
+        let id = made["id"].as_str().unwrap().to_string();
+        let id_for_db = id.clone();
+        store.write(move |conn| {
+            conn.execute(
+                "UPDATE issues SET source_ref='message:153', last_verified_at=NULL WHERE id=?1",
+                [&id_for_db],
+            )?;
+            Ok(amux_server::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let (st, _, body) = send_with(
+            &app, "POST", &format!("/api/board/{id}/status-update"),
+            Some(json!({"text": format!("{provider} is implementing {id}")})),
+            &[("X-Amux-Worker", lane.as_str())],
+        ).await;
+        assert_eq!(st, StatusCode::OK, "{provider}: {body}");
+        assert_eq!(body["claimed"], json!(true), "{provider}: {body}");
+        assert_eq!(body["claim_verdict"], json!("claimed"), "{provider}: {body}");
+        assert_eq!(body["status"], json!("doing"), "{provider}: {body}");
+
+        let conn = store.read().unwrap();
+        let (status, owner, log): (String, String, String) = conn.query_row(
+            "SELECT status, COALESCE(session,''), COALESCE(log,'') FROM issues WHERE id=?1",
+            [&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(status, "doing");
+        assert_eq!(owner, lane);
+        assert!(log.contains("Claimed by status update"), "{log}");
+        assert!(log.contains(&format!("STATUS ({lane})")), "{log}");
+    }
+}
+
+/// Refused claims preserve their progress note without stealing ownership,
+/// bypassing blockers/dependencies/WIP, or moving later states backward.
+#[tokio::test]
+async fn status_update_refuses_cross_worker_blocked_dependency_wip_and_later_states() {
+    let (app, store, _dir) = app_with_store();
+
+    let cross = create(&app, json!({
+        "title":"owned elsewhere", "status":"todo", "session":"owner-lane"
+    })).await;
+    let cross_id = cross["id"].as_str().unwrap().to_string();
+    let (_, _, body) = send_with(
+        &app, "POST", &format!("/api/board/{cross_id}/status-update"),
+        Some(json!({"text":"cross-worker note must survive"})),
+        &[("X-Amux-Worker", "other-lane")],
+    ).await;
+    assert_eq!(body["claim_verdict"], json!("owner_mismatch"));
+
+    let blocked = create(&app, json!({
+        "title":"blocked card", "status":"todo", "session":"blocked-lane"
+    })).await;
+    let blocked_id = blocked["id"].as_str().unwrap().to_string();
+    let blocked_for_db = blocked_id.clone();
+    store.write(move |conn| {
+        conn.execute("UPDATE issues SET blocked_on='network' WHERE id=?1", [&blocked_for_db])?;
+        Ok(amux_server::db::WriteOutcome { applied: true, events: vec![] })
+    }).unwrap();
+    let (_, _, body) = send_with(
+        &app, "POST", &format!("/api/board/{blocked_id}/status-update"),
+        Some(json!({"text":"still investigating the blocker"})),
+        &[("X-Amux-Worker", "blocked-lane")],
+    ).await;
+    assert_eq!(body["claim_verdict"], json!("blocked"));
+
+    let dep = create(&app, json!({
+        "title":"open dependency", "status":"backlog", "session":"dep-lane"
+    })).await;
+    let dependent = create(&app, json!({
+        "title":"dependent card", "status":"todo", "session":"dependent-lane",
+        "depends_on":[dep["id"].as_str().unwrap()]
+    })).await;
+    let dependent_id = dependent["id"].as_str().unwrap().to_string();
+    let (_, _, body) = send_with(
+        &app, "POST", &format!("/api/board/{dependent_id}/status-update"),
+        Some(json!({"text":"dependency has not cleared"})),
+        &[("X-Amux-Worker", "dependent-lane")],
+    ).await;
+    assert_eq!(body["claim_verdict"], json!("dependency_blocked"));
+
+    let triggered = create(&app, json!({
+        "title":"fresh external trigger", "status":"backlog", "session":"trigger-lane"
+    })).await;
+    let triggered_id = triggered["id"].as_str().unwrap().to_string();
+    let trigger_for_db = triggered_id.clone();
+    store.write(move |conn| {
+        conn.execute(
+            "UPDATE issues SET source_ref='wait for upstream', last_verified_at=?1 WHERE id=?2",
+            rusqlite::params![amux_server::config::now_f64() as i64, &trigger_for_db],
+        )?;
+        Ok(amux_server::db::WriteOutcome { applied: true, events: vec![] })
+    }).unwrap();
+    let (_, _, body) = send_with(
+        &app, "POST", &format!("/api/board/{triggered_id}/status-update"),
+        Some(json!({"text":"upstream is still unavailable"})),
+        &[("X-Amux-Worker", "trigger-lane")],
+    ).await;
+    assert_eq!(body["claim_verdict"], json!("external_trigger"));
+
+    let holding = create(&app, json!({
+        "title":"current work", "status":"doing", "session":"wip-lane"
+    })).await;
+    let target = create(&app, json!({
+        "title":"queued work", "status":"todo", "session":"wip-lane"
+    })).await;
+    let target_id = target["id"].as_str().unwrap().to_string();
+    let (_, _, body) = send_with(
+        &app, "POST", &format!("/api/board/{target_id}/status-update"),
+        Some(json!({"text":format!("still on {}", holding["id"])})),
+        &[("X-Amux-Worker", "wip-lane")],
+    ).await;
+    assert_eq!(body["claim_verdict"], json!("wip_conflict"));
+
+    for later in ["doing", "review", "done", "verified", "discarded"] {
+        let lane = format!("past-{later}");
+        let made = create(&app, json!({
+            "title":format!("already {later}"), "status":later, "session":lane
+        })).await;
+        let id = made["id"].as_str().unwrap().to_string();
+        let (_, _, body) = send_with(
+            &app, "POST", &format!("/api/board/{id}/status-update"),
+            Some(json!({"text":"informational follow-up"})),
+            &[("X-Amux-Worker", lane.as_str())],
+        ).await;
+        assert_eq!(body["claim_verdict"], json!("status_not_actionable"));
+        let (_, _, detail) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+        assert_eq!(detail["status"], json!(later), "{later} moved backward");
+    }
+
+    for id in [&cross_id, &blocked_id, &dependent_id, &target_id] {
+        let conn = store.read().unwrap();
+        let (status, log): (String, String) = conn.query_row(
+            "SELECT status, COALESCE(log,'') FROM issues WHERE id=?1", [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(status, "todo", "{id} bypassed its claim guard");
+        assert!(log.contains("STATUS ("), "refused update was lost: {log}");
+    }
+    let (_, _, detail) = send(&app, "GET", &format!("/api/board/{triggered_id}"), None).await;
+    assert_eq!(detail["status"], json!("backlog"), "fresh trigger was bypassed");
+}
+
+/// Claim and progress are one transaction: a failed progress write rolls back
+/// the claim rather than leaving a partially-mutated card.
+#[tokio::test]
+async fn status_update_claim_rolls_back_when_its_log_write_fails() {
+    let (app, store, _dir) = app_with_store();
+    let made = create(&app, json!({
+        "title":"atomic update", "status":"todo", "session":"atomic-lane"
+    })).await;
+    let id = made["id"].as_str().unwrap().to_string();
+    let trigger_id = id.clone();
+    store.write(move |conn| {
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER reject_status_progress BEFORE UPDATE OF log ON issues \
+             WHEN NEW.id='{trigger_id}' AND NEW.log LIKE '%ROLLBACK-SPECIMEN%' \
+             BEGIN SELECT RAISE(ABORT, 'forced status progress failure'); END;"
+        ))?;
+        Ok(amux_server::db::WriteOutcome { applied: true, events: vec![] })
+    }).unwrap();
+    let (st, _, _) = send_with(
+        &app, "POST", &format!("/api/board/{id}/status-update"),
+        Some(json!({"text":"ROLLBACK-SPECIMEN"})),
+        &[("X-Amux-Worker", "atomic-lane")],
+    ).await;
+    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
+    let conn = store.read().unwrap();
+    let (status, log): (String, Option<String>) = conn.query_row(
+        "SELECT status, log FROM issues WHERE id=?1", [&id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ).unwrap();
+    assert_eq!(status, "todo");
+    assert!(log.as_deref().unwrap_or("").is_empty(), "partial log: {log:?}");
+}
+
 /// Artifact identity is the `(task, artifact)` pair in the URL. A mismatched
 /// task must never be able to mutate or delete another task's output, and a
 /// deleted/missing artifact is a 404 rather than a 500 or a false 204 success.

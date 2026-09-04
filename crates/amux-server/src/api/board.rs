@@ -8541,20 +8541,39 @@ async fn status_update(
             Err(e) => return internal(e),
         }
     }
-    let captured = match append_card_log(
+    let update = match apply_status_update(
         &state,
         &id,
         &format!("STATUS ({actor}): {text}"),
-        Some((
-            bs::output_asset_refs(&text),
-            format!("automatically captured from status update by {actor}"),
-        )),
+        bs::output_asset_refs(&text),
+        &actor,
+        &text,
     )
     .await
     {
         Ok(v) => v,
         Err(e) => return internal(e),
     };
+    if update.claimed {
+        tracing::info!(
+            target: "amux::board", marker = "status_update_claimed_exact",
+            task = %id, worker = %actor, from = %update.prior_status,
+            "worker status update atomically claimed its exact actionable card"
+        );
+        crate::api::session_verbs::emit_event(
+            &state, &actor, "task.claimed",
+            Some(json!({"issue": id, "status": "doing"})), None,
+            "board-status-update",
+        ).await;
+    } else if matches!(update.prior_status.as_str(), "todo" | "backlog") {
+        tracing::warn!(
+            target: "amux::board", marker = "status_update_claim_refused",
+            task = %id, worker = %actor, owner = %update.owner,
+            status = %update.prior_status, verdict = %update.claim_verdict,
+            "worker status update was stored but did not claim the actionable card"
+        );
+    }
+    let captured = &update.captured;
     if !captured.is_empty() {
         tracing::info!(
             target: "amux::board",
@@ -8570,6 +8589,9 @@ async fn status_update(
         "chars": text.chars().count(),
         "original_chars": original_chars,
         "truncated": truncated,
+        "claimed": update.claimed,
+        "status": update.status,
+        "claim_verdict": update.claim_verdict,
         "artifacts_captured": captured.len(),
         "artifact_refs": captured.iter().map(|a| a.ref_value.clone()).collect::<Vec<_>>(),
     }))
@@ -9054,9 +9076,134 @@ mod discard_orphan_tests {
     }
 }
 
-/// Append one stamped line to a card's log. Both handlers above write only
-/// here — a status update must never move the card, and reusing the PATCH path
-/// would put a status report one typo away from a status TRANSITION.
+#[derive(Debug, Clone)]
+struct StatusUpdateResult {
+    captured: Vec<crate::db::artifact_store::ArtifactRow>,
+    claimed: bool,
+    prior_status: String,
+    status: String,
+    owner: String,
+    claim_verdict: String,
+}
+
+/// Store a worker's progress and, when eligible, claim that worker's exact
+/// card in the same serialized transaction (GCA-153 / ATE-41).
+async fn apply_status_update(
+    state: &AppState,
+    id: &str,
+    line: &str,
+    refs: Vec<String>,
+    actor: &str,
+    progress: &str,
+) -> Result<StatusUpdateResult, rusqlite::Error> {
+    let (id, line, actor, progress, stamp) = (
+        id.to_string(), line.to_string(), actor.to_string(),
+        progress.to_string(), hhmm(),
+    );
+    let result = Arc::new(Mutex::new(None));
+    let result_w = result.clone();
+    state.store.write_async(move |conn| {
+        let row = bs::get_issue(conn, &id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        let prior_status = row.status.clone();
+        let owner = row.session.as_deref().unwrap_or("").trim().to_string();
+        let mut claimed = false;
+        let mut status = prior_status.clone();
+        let mut events = Vec::new();
+
+        let claim_verdict = if !matches!(prior_status.as_str(), "todo" | "backlog") {
+            "status_not_actionable".to_string()
+        } else if actor == "session" {
+            "actor_unattributed".to_string()
+        } else if row.owner_type != "agent" {
+            "owner_not_agent".to_string()
+        } else if owner != actor {
+            "owner_mismatch".to_string()
+        } else if row.archived != 0 {
+            "archived".to_string()
+        } else if row.tags.iter().any(|tag| tag.to_ascii_lowercase().starts_with("needs:you")) {
+            "needs_you".to_string()
+        } else if row.waiting_on.as_deref().is_some_and(|v| !v.trim().is_empty()) {
+            "waiting".to_string()
+        } else if crate::runtime_jobs::board_drive::fresh_source_ref_trigger(&row, now_secs()) {
+            "external_trigger".to_string()
+        } else if !crate::runtime_jobs::board_drive::deps_blocking(conn, &row).is_empty() {
+            "dependency_blocked".to_string()
+        } else if let Some(exclusion) = frontier_exclusion(&row, false) {
+            match exclusion {
+                FrontierExclusion::Blocked => "blocked".to_string(),
+                FrontierExclusion::NoContinuation => unreachable!("continuation gate is off"),
+            }
+        } else if bs::continuation_required(Some(&actor))
+            && bs::continuation_verdict(&progress) != bs::ContinuationVerdict::Ok
+        {
+            "continuation_missing".to_string()
+        } else {
+            let holding: Vec<String> = conn.prepare(
+                "SELECT id FROM issues WHERE session=?1 AND status='doing' AND id!=?2 \
+                 AND deleted IS NULL AND COALESCE(archived,0)=0 \
+                 AND COALESCE(type,'') NOT IN ('tripwire','watch','epic') \
+                 AND NOT (creator='amux' AND substr(COALESCE(\"desc\",''),1,11)='**Prompt:**') \
+                 AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=issues.id \
+                                 AND lower(t.tag) LIKE 'needs:you%') ORDER BY id"
+            )?.query_map(rusqlite::params![&actor, &id], |r| r.get::<_, String>(0))?
+                .filter_map(Result::ok).collect();
+            if !holding.is_empty() {
+                "wip_conflict".to_string()
+            } else {
+                if bs::continuation_required(Some(&actor)) {
+                    conn.execute(
+                        "UPDATE issues SET next_action=?1 WHERE id=?2",
+                        rusqlite::params![&progress, &id],
+                    )?;
+                }
+                let opts = crate::db::advance::AdvanceOpts {
+                    expected_from: Some(prior_status.clone()),
+                    assign_to: Some(actor.clone()),
+                    log_line: Some(format!("Claimed by status update from {actor}")),
+                    force: false,
+                    skip_continuation: false,
+                    gate_ack: true,
+                    ..Default::default()
+                };
+                match crate::db::advance::advance(conn, &id, "doing", &actor, &opts)? {
+                    Ok(outcome) => {
+                        claimed = true;
+                        status = "doing".to_string();
+                        events.extend(outcome.events);
+                        "claimed".to_string()
+                    }
+                    Err(_) => "transition_refused".to_string(),
+                }
+            }
+        };
+
+        // `advance` appended the claim audit line, so read that before adding progress.
+        let current_log = if claimed { bs::get_issue(conn, &id)?.and_then(|r| r.log) } else { row.log };
+        let next = bs::append_log(current_log.as_deref(), &stamp, &line);
+        conn.execute("UPDATE issues SET log=?1 WHERE id=?2", rusqlite::params![next, &id])?;
+        let inserted = crate::db::artifact_store::insert_captured_refs(
+            conn, &id, refs,
+            &format!("automatically captured from status update by {actor}"), now_secs(),
+        )?;
+        events.extend(inserted.iter().map(|artifact| crate::db::PendingEvent {
+            entity_type: amux_core::revision::EntityType::Other("artifact".into()),
+            entity_id: artifact.id.clone(),
+            mutation: amux_core::revision::MutationKind::Created,
+            payload: None,
+        }));
+        *result_w.lock().expect("status update result slot poisoned") = Some(StatusUpdateResult {
+            captured: inserted, claimed, prior_status, status, owner, claim_verdict,
+        });
+        Ok(WriteOutcome { applied: true, events })
+    }).await.map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(
+        std::io::Error::other(e.to_string()),
+    )))?;
+    let outcome = result.lock().expect("status update result slot poisoned")
+        .clone().ok_or(rusqlite::Error::QueryReturnedNoRows);
+    outcome
+}
+
+/// Append one stamped line for requests that carry no worker progress claim.
 async fn append_card_log(
     state: &AppState,
     id: &str,

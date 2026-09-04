@@ -177,6 +177,14 @@ const BACKLOG_STALE_AGE_S: i64 = 14 * 86400;
 /// answer by either re-confirming the trigger (bumps `last_verified_at`) or
 /// finally acting on the card — never by an automated status change.
 const SOURCE_REF_STALE_S: i64 = 24 * 3600;
+
+/// A source ref is an external-trigger block only while the owner has recently
+/// verified it. Older refs still preserve message/provenance links but do not
+/// make an otherwise actionable card undispatchable.
+pub(crate) fn fresh_source_ref_trigger(row: &bs::IssueRow, now: i64) -> bool {
+    row.source_ref.as_deref().is_some_and(|v| !v.trim().is_empty())
+        && row.last_verified_at.is_some_and(|at| at > now - SOURCE_REF_STALE_S)
+}
 /// Idle-backlog DRAIN nudge cooldown, SCALED TO THE BACKLOG SIZE. Distinct from
 /// the 72h stale-triage above — this fires when a lane is idle (no doing) with an
 /// empty todo and a non-empty backlog OF ANY AGE, the "board doesn't drive to
