@@ -1199,8 +1199,90 @@ const SHELL_STRUCTURE: &[&str] = &[
 /// conservative treatment; anything unrecognized still falls through to
 /// authored, so no real write loses its attribution — the direction this must
 /// never get wrong.
+/// Split on whitespace, but treat a quoted span as one token.
+///
+/// Only good enough for counting operands: it does not resolve escapes or nested
+/// quoting, and it does not need to. Anything it gets wrong lands on "there is an
+/// operand", which is the conservative side.
+fn quote_aware_tokens(seg: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    for c in seg.chars() {
+        match quote {
+            Some(q) => {
+                cur.push(c);
+                if c == q {
+                    quote = None;
+                }
+            }
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                cur.push(c);
+            }
+            None if c.is_whitespace() => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            None => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 fn sed_is_pure_read(seg: &str) -> bool {
     let mut saw_n = false;
+    // A SED WITH NO FILE OPERAND CANNOT REACH A FILE (AMUX-2841's third specimen,
+    // 2026-09-04). `... | sed 's/^/x/'` reads stdin and writes stdout. The `-n`
+    // requirement below is right for `sed 's/a/b/' notes.md`, which NAMES a file,
+    // and wrong for a stream filter, which names none — and the wrong half claimed
+    // board_drive.rs off a peer's concurrent commit, through the pipeline
+    // `git show HEAD:...board_drive.rs | grep -c ... | sed 's/^/  n: /'`, where the
+    // first two segments classify as reads and the third decided the command.
+    //
+    // Operand counting, not flag counting: `-e` and `-f` CONSUME the next token
+    // (the script, and a script FILE), so a bare token after them is an operand
+    // rather than the script. With neither, the first bare token IS the script.
+    // `-i` still refuses regardless, and `-i` cannot occur without an operand
+    // anyway; `/w` still refuses, since it writes with no shell redirection.
+    // QUOTE-AWARE TOKENS. `split_whitespace` tears `'s/^/  n: /'` into three
+    // tokens and the last two counted as file operands, which put the specimen
+    // back where it started. A quoted span is ONE token: keeping it whole also
+    // keeps a quoted FILENAME (`sed -n 'p' 'my file.txt'`) countable as the
+    // operand it is, which dropping quoted spans entirely would have lost — the
+    // unsafe direction.
+    let toks = quote_aware_tokens(seg);
+    let mut operands = 0usize;
+    let mut script_taken = false;
+    let mut expect_arg = false;
+    for tok in toks.iter().skip(1).map(String::as_str) {
+        if expect_arg {
+            expect_arg = false;
+            script_taken = true;
+            continue;
+        }
+        if tok == "-e" || tok == "-f" || tok == "--expression" || tok == "--file" {
+            expect_arg = true;
+            continue;
+        }
+        if tok.starts_with("-e") || tok.starts_with("-f") {
+            script_taken = true; // attached form, e.g. -e's/a/b/'
+            continue;
+        }
+        if tok.starts_with('-') {
+            continue;
+        }
+        if script_taken {
+            operands += 1;
+        } else {
+            script_taken = true;
+        }
+    }
+    let stream_only = operands == 0;
     for tok in seg.split_whitespace().skip(1) {
         if tok == "--in-place" || tok.starts_with("--in-place=") {
             return false;
@@ -1228,7 +1310,9 @@ fn sed_is_pure_read(seg: &str) -> bool {
     if seg.contains("/w") || seg.contains("/W") {
         return false;
     }
-    saw_n
+    // Every write route is ruled out above. With no file operand there is nothing
+    // left for sed to write to, so `-n` is not required to call it a read.
+    stream_only || saw_n
 }
 
 /// MG-1484: is this command a RESTORE and nothing else? True when every
@@ -4956,8 +5040,32 @@ mod tests {
             "echo \"count: $(git show HEAD:frustrations.md | grep -c '^## ')\"",
             "if [ -f a.md ]; then cat a.md; fi",
             "while read -r l; do echo \"$l\"; done",
+            // AMUX-2841's THIRD specimen, 2026-09-04, verbatim. A stream sed has
+            // no file operand: it reads stdin and writes stdout and cannot touch
+            // a file. Requiring `-n` here claimed board_drive.rs off a peer's
+            // concurrent commit.
+            "git show HEAD:crates/x.rs | grep -c 'oldest-first' | sed 's/^/  n: /'",
+            "cat a.md | sed 's/foo/bar/'",
+            "grep x a.md | sed -e 's/a/b/' -e 's/c/d/'",
         ] {
             assert!(is_pure_read_command(cmd), "should be pure read: {cmd}");
+        }
+    }
+
+    /// A STREAM SED IS A READ; A SED WITH A FILE OPERAND KEEPS ITS CAUTION.
+    /// The `-n` requirement is correct when sed NAMES a file and wrong when it
+    /// filters a pipe. These are the writes that must stay authored.
+    #[test]
+    fn a_sed_that_can_reach_a_file_is_still_not_a_read() {
+        for cmd in [
+            "sed -i s/a/b/ notes.md",
+            "sed -i.bak s/a/b/ notes.md",
+            "cat a | sed -ni s/a/b/ notes.md",
+            "cat a | sed 's/x/y/w out.txt'",
+            "sed 's/a/b/' notes.md",
+            "cat a | sed --in-place s/a/b/ notes.md",
+        ] {
+            assert!(!is_pure_read_command(cmd), "a file-reaching sed read as pure: {cmd}");
         }
     }
 
