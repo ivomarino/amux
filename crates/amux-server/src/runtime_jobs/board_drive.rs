@@ -3093,10 +3093,16 @@ fn stale_backlog_candidates(
     .unwrap_or_default()
 }
 
-/// Backlog cards of ANY age, newest first — the candidates for the idle-drain
-/// nudge (a lane sitting on a fresh backlog with nothing in todo). Newest first
-/// because a just-arrived batch is the likeliest thing the worker meant to act
-/// on; the worker's own model picks which to promote.
+/// Backlog cards of ANY age, OLDEST FIRST — the candidates for the idle-drain
+/// nudge (a lane sitting on a fresh backlog with nothing in todo).
+///
+/// This comment said "newest first" three times, and gave the reason (a
+/// just-arrived batch is the likeliest thing the worker meant to act on), for as
+/// long as AMUX-3779 has been shipped — which reversed the order to `created ASC`
+/// so the drain reads the same way as the todo scorer. The query below is the
+/// truth; the prose was describing the code it replaced. Found 2026-09-04 while
+/// checking a dispatch-ordering report from ts-gke, where the stale comment was
+/// the first thing that made the behaviour look wrong.
 fn backlog_candidates(conn: &Connection, session: &str, now: i64) -> Vec<(String, String, i64)> {
     // DRAINABLE only — mirror the exclusions in the idle_drain gate so the cards
     // the nudge lists are exactly the ones it claims are un-worked: no dormant
