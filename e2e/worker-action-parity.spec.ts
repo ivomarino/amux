@@ -23,46 +23,69 @@ const SAMPLE = {
   status: 'idle',
 };
 
+// Minimal boot for the FIRST test below: it calls _renderWorkerActionMenu/
+// _renderPeekWorkerActions directly with an explicit `sample` argument and
+// never touches peekSession/sessions/peekSessionDir at all — it doesn't need
+// a real peek session, only the script loaded. Keep it that way: an earlier
+// version of this fix made ALL boots open a real peek via openPeek(), and
+// that function's own side effects (it schedules further async UI work —
+// message badge, branch fetch, panel resets) raced this test's OWN DOM
+// manipulation of the SAME elements, intermittently detaching
+// `#peek-focus-btn` between the state.evaluate() call and the later
+// `.scrollIntoViewIfNeeded()` ("Element is not attached to the DOM"). This
+// test has no reason to pay for that; only enterFiles() below does.
 async function boot(page: import('@playwright/test').Page) {
-  // enterFiles() below calls boot() three times on the SAME page — each one a
-  // fresh page.goto('/'), but NOT a fresh origin, so localStorage survives
-  // across them. App boot restores the persisted view (_restoreScreen reads
+  await page.goto('/');
+  await page.waitForFunction(() => typeof (window as any)._renderWorkerActionMenu === 'function');
+}
+
+// enterFiles() below calls this three times on the SAME page — each one a
+// fresh page.goto('/'), but NOT a fresh origin, so localStorage survives
+// across them, and drives a REAL peek session (openPeek) + real navigation
+// (_browseWorkerFiles/openExplore), unlike the plain boot() above.
+async function bootWithPeek(page: import('@playwright/test').Page) {
+  // App boot restores the persisted view (_restoreScreen reads
   // `amux_ui_view`) BEFORE any of this file's own seeding/clicking runs, at
-  // _filesPath's freshly-reset default of '/' — so the SECOND and THIRD calls
-  // in a test can auto-navigate into Files at '/' first, then race the click
-  // handler's own correct navigation to '/tmp/'. Whichever response lands
-  // last wins, which is why this showed up as an inconsistent path (not the
-  // consistent "never navigated" shape the seeding bug produced). An
-  // addInitScript clears the one key that persists this, before EVERY
-  // navigation on this page, so each boot() is really starting fresh.
+  // _filesPath's freshly-reset default of '/' — so the SECOND and THIRD
+  // calls in a test can auto-navigate into Files at '/' first, then race the
+  // click handler's own correct navigation to '/tmp/'. Whichever response
+  // lands last wins, which is why an earlier attempt at this fix showed an
+  // inconsistent final path (not the consistent "never navigated" shape the
+  // seeding bug below produced). An addInitScript clears the one key that
+  // persists this, before EVERY navigation on this page, so each call here
+  // genuinely starts fresh.
   await page.addInitScript(() => { try { localStorage.removeItem('amux_ui_view'); } catch (e) {} });
-  // Third AMUX-122 attempt. The first two (seed via page.evaluate's string
-  // form; clear the persisted view) were each real, necessary fixes — and
-  // still not sufficient, because they both poke `sessions` once and hope
-  // nothing overwrites it before the click. Something does: the app's own
-  // fetchSessions() poll runs on load AND periodically, and across THREE
-  // sequential enterFiles() calls in one test (real page loads, real
-  // navigation, real assertion retries) enough wall-clock time elapses that
-  // a live poll can land between this seed and the click, silently replacing
-  // the one-shot `sessions = [SAMPLE]` with whatever the real dev/CI server
-  // actually has running — which does not include a worker named
-  // 'ate-44-worker', so `_browseWorkerFiles` computed an empty root again on
-  // the third call specifically (more elapsed time = more chances), and
-  // toasted "This worker has no directory to browse" exactly like the very
-  // first (pre-any-fix) failure.
+  // `sessions`/`peekSession`/`peekSessionDir` are top-level lexical (`let`)
+  // bindings in the classic app bundle, not window properties, and a nested
+  // eval() inside a page.evaluate(fn, arg) callback cannot see or reassign
+  // them (Playwright drives that callback via Runtime.callFunctionOn, its
+  // own isolated scope) — an earlier attempt at this fix tried exactly that
+  // and it silently no-op'd every time, so `sessions` stayed `[]`,
+  // `_browseWorkerFiles` computed an empty root, and every click here just
+  // toasted "This worker has no directory to browse" instead of navigating.
+  //
+  // Poking `sessions` once via page.evaluate's STRING form (which DOES reach
+  // those bindings, like typing consecutive lines into the DevTools console)
+  // was closer, but still not sufficient on its own: the app's own
+  // fetchSessions() poll runs on load AND periodically, and across three
+  // sequential calls in one test (real page loads, real navigation, real
+  // assertion retries) enough wall-clock time elapses that a live poll can
+  // land between the seed and the click, silently replacing the one-shot
+  // fixture with whatever the real dev/CI server actually has running —
+  // which has no worker named 'ate-44-worker', so the root computed empty
+  // again, on whichever call happened to have the most elapsed time.
   //
   // The robust fix, and the one this whole suite already uses everywhere
   // else (see fixtures.ts's entire reason for existing): mock the REQUEST,
   // not the client variable. Every fetchSessions() call — first load and
-  // every later poll — now gets the fixture, so `sessions` stays correctly
-  // seeded for the FULL test, immune to timing.
+  // every later poll — now gets the fixture, so `sessions` stays correct for
+  // the entire test regardless of timing.
   //
-  // enterFiles() calls boot() up to three times on the SAME page, so guard
-  // against registering this route more than once per test: fixtures.ts's
-  // own AF-47 wrapper fails a stub with zero hits at teardown, and a second
-  // page.route() on an identical pattern shadows the first (last registered
-  // wins interception) — the first two of three registrations would each
-  // end up with zero hits and fail the test on their own safety net.
+  // Guarded to register the route only ONCE per test (this runs up to three
+  // times on the same page): fixtures.ts's own AF-47 wrapper fails a stub
+  // with zero hits at teardown, and a second page.route() on an identical
+  // pattern shadows the first (last registered wins interception) — the
+  // earlier registrations would each end up with zero hits.
   const routed = page as unknown as { _sessionsRouted?: boolean };
   if (!routed._sessionsRouted) {
     routed._sessionsRouted = true;
@@ -71,16 +94,15 @@ async function boot(page: import('@playwright/test').Page) {
   await page.goto('/');
   await page.waitForFunction(() => typeof (window as any)._renderWorkerActionMenu === 'function');
   // Wait for the mocked response to actually have landed in `sessions`
-  // before seeding the peek — a bare Array.isArray/some() check in STRING
-  // form (see the note on page.evaluate below for why string, not function).
+  // before opening the peek — a bare Array.isArray/some() check in STRING
+  // form, for the same reason the seeding attempt above needed one.
   await page.waitForFunction(`Array.isArray(sessions) && sessions.some(s => s.name === ${JSON.stringify(NAME)})`);
   // openPeek() is a genuine top-level FUNCTION DECLARATION, not a `let` —
   // the classic bundle attaches it to `window` automatically, so calling it
   // via a normal (function-form) page.evaluate correctly reaches its own
   // closure over peekSession/peekSessionDir regardless of how it's invoked.
   // That asymmetry (declarations reach window; `let`s do not) is the root
-  // fact this whole file's earlier attempts kept working around instead of
-  // using directly.
+  // fact every attempt above kept working around instead of using directly.
   await page.evaluate((name) => { (window as any).openPeek(name); }, NAME);
 }
 
@@ -131,7 +153,7 @@ test('worker card and peek share all 25 worker actions, plus both peek-only acti
 });
 
 async function enterFiles(page: import('@playwright/test').Page, source: 'peek-file-browser' | 'peek-directory' | 'browse-files') {
-  await boot(page);
+  await bootWithPeek(page);
   await page.evaluate(({ sample, source }) => {
     const w = window as any;
     w._renderPeekWorkerActions(sample);
