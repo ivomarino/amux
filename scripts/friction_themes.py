@@ -246,8 +246,29 @@ def is_bare_drive(text: str) -> bool:
 LONG_MSG_CHARS = int(os.environ.get("FRICTION_LONG_MSG_CHARS", "1200"))
 
 
+# Text AMUX APPENDS to a human's message. Must be removed before any phrase
+# comparison, or the harness's own words count as the human repeating himself.
+#
+# Measured 2026-09-04: `cross-lane-repeat` read n=14, and 4 of the 14 were this
+# footer. Two of them, MSG-40511 and MSG-42067, share 194 identical characters
+# and NOTHING ELSE: one asks to add public datasets to a table, the other asks
+# for MVS throughput metrics. The signal reported them as the same instruction
+# sent to two lanes.
+#
+# It matters more than 29% suggests, because `cross-lane-repeat` is the only
+# evidence under the theme "Ethan is the fleet's status poller", whose entire
+# claim is that he has to repeat himself. An instrument that counts amux's own
+# text as his repetition is arguing the theme from the harness's voice.
+AMUX_APPENDED = re.compile(r"\n*\[amux: ", re.I)
+
+
+def strip_amux_appended(text: str) -> str:
+    """The human's own words, with anything amux added removed."""
+    return AMUX_APPENDED.split(text or "", 1)[0]
+
+
 def instruction_of(text: str) -> str:
-    t = text or ""
+    t = strip_amux_appended(text)
     if len(t) <= LONG_MSG_CHARS:
         return t
     return t.split("\n\n", 1)[0][:LONG_MSG_CHARS]

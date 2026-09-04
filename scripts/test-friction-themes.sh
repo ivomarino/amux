@@ -357,6 +357,53 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Cell J: amux's own appended text is not the human repeating himself.
+#
+# `cross-lane-repeat` read n=14 on 2026-09-04 and 4 of the 14 were the @-mention
+# footer amux appends. MSG-40511 and MSG-42067 share 194 identical characters and
+# nothing else: one asks to add public datasets to a table, the other asks for MVS
+# throughput metrics. The signal called them the same instruction to two lanes.
+#
+# The cell asserts the two directions that matter: the footer is removed, and the
+# human's own words in front of it survive intact. Stripping the whole message
+# would pass a naive "footer is gone" check and delete the signal.
+# ---------------------------------------------------------------------------
+if python3 - "$(pwd)/scripts/friction_themes.py" <<'FOOTERPY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("ft", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+
+FOOT = ('\n\n[amux: @-mentions above are amux workers, NOT files. Reach them via HTTP '
+        'API, never tmux directly]\n  @mvs-research \u2192 POST $AMUX_URL/api/sessions/'
+        'mvs-research/send  {"text":"<msg>"}')
+a = "[02:39 PM] add the public datasets that `@mvs-research` is working on to the table md" + FOOT
+b = "[10:11 AM] I want MVS to have system level logging/metrics for write/import throughput" + FOOT
+
+ia, ib = m.instruction_of(a), m.instruction_of(b)
+assert "[amux:" not in ia and "[amux:" not in ib, "the appended footer survived the strip"
+assert "public datasets" in ia, "the human's own words were stripped too: " + repr(ia)
+assert "system level logging" in ib, "the human's own words were stripped too: " + repr(ib)
+
+# THE PROPERTY. Two unrelated instructions must share no shingle once the footer
+# is gone. Before the strip they shared the footer's phrases and scored as a
+# cross-lane repeat.
+assert not (set(m.shingle(ia)) & set(m.shingle(ib))), \
+    "two unrelated instructions still share a phrase: " + repr(set(m.shingle(ia)) & set(m.shingle(ib)))
+
+# NEGATIVE CONTROL: a message with no footer is untouched, and two genuinely
+# identical instructions must STILL match, or the strip has deleted the signal.
+plain = "review your backlog and todo see whats still relevant, discard what is not"
+assert m.instruction_of(plain) == plain, "a footerless message was altered"
+assert set(m.shingle(m.instruction_of(plain))) & set(m.shingle(m.instruction_of(plain + FOOT))), \
+    "the same instruction with and without a footer must still match"
+FOOTERPY
+then
+  ok "J: amux's appended footer is stripped, the human's words survive, real repeats still match"
+else
+  bad "J: the footer strip either left amux's text in, ate the human's, or killed the signal"
+fi
+
+# ---------------------------------------------------------------------------
 # Cell D: `continue` is fleet operation, not a rule restatement.
 # ---------------------------------------------------------------------------
 if echo "$OUT" | python3 -c "
