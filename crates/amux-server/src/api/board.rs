@@ -2271,7 +2271,17 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
     }
     // (see designate_owner_reach for why this exists)
     if slim {
-        obj.insert("desc_len".into(), json!(row.desc.chars().count()));
+        // AF-346: `desc` may be a bounded PREFIX here. The two derivations
+        // that cannot be recomputed from one arrive beside it, from SQL; the
+        // `None` arm is what every non-prefixed row and every hand-built test
+        // row takes, unchanged. Deliberately NOT `unwrap_or_else(compute from
+        // the prefix)` — that fallback would return a smaller number that looks
+        // exactly like a real one, which is the failure a99955f7 shipped.
+        let desc_len = match &row.desc_prefixed {
+            Some(p) => p.desc_len,
+            None => row.desc.chars().count(),
+        };
+        obj.insert("desc_len".into(), json!(desc_len));
         let log_n = row
             .log
             .as_deref()
@@ -2305,8 +2315,13 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
             .take(120)
             .collect();
         obj.insert("desc_head".into(), json!(head));
-        let folded_n = row.desc.matches("New task:").count()
-            + row.log.as_deref().map(|l| l.matches("New task:").count()).unwrap_or(0);
+        let folded_n = match &row.desc_prefixed {
+            Some(p) => p.folded_n,
+            None => {
+                row.desc.matches("New task:").count()
+                    + row.log.as_deref().map(|l| l.matches("New task:").count()).unwrap_or(0)
+            }
+        };
         obj.insert("folded_n".into(), json!(folded_n));
 
         // The third derivation the list makes over desc+log (app.js:19231): the
@@ -2967,6 +2982,11 @@ pub async fn list_board(
         }
     };
 
+    // AF-346: a slim response ships DERIVATIONS of desc, never desc, so it does
+    // not need the whole string. `Full` is not a fallback here, it is the shape
+    // `?full=1` / `?slim=0` asked for, and it is what every other caller of
+    // these two functions still gets.
+    let prose = if slim { bs::Prose::SlimDerivations } else { bs::Prose::Full };
     let quota = qp_truthy(p.quota.as_deref());
     let store = state.store.clone();
     let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -2987,12 +3007,13 @@ pub async fn list_board(
                     &session_f,
                     archived,
                     done_limit.max(0) as usize,
+                    prose,
                 )?,
                 0,
                 0,
             )
         } else {
-            bs::list_issues_capped(&conn, &status_f, &session_f, archived, done_limit)?
+            bs::list_issues_capped(&conn, &status_f, &session_f, archived, done_limit, prose)?
         };
         // The `stale` flag needs the active-session set only when an
         // in-progress card is present (Python computes it in `_load_board`).
