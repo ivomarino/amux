@@ -4181,7 +4181,7 @@ pub(crate) async fn steer_enqueue_precond(
 /// card cannot duplicate a callback. If the id is already queued its payload
 /// is refreshed in place; if it is in steering_history it is already delivered
 /// and is not queued again.
-#[must_use]
+#[must_use = "board callbacks must record whether their delivery was queued or refused"]
 pub(crate) async fn steer_enqueue_idempotent(
     state: &AppState,
     name: &str,

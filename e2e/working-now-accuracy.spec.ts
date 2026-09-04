@@ -53,7 +53,7 @@ test('one active worker marks exactly its claimed card as Working now', async ({
     for (const id of cards.filter(id => id !== claimed)) {
       await expect(page.locator(`.board-card[data-id="${id}"] .board-card-live-label`)).toHaveCount(0);
     }
-    await expect(page.locator('#board-unclaimed-mount')).toBeEmpty();
+    await expect(page.getByText('no board task claimed', { exact: false })).toHaveCount(0);
   } finally {
     for (const id of cards) await request.delete(`/api/board/${id}`, { headers: auth }).catch(() => {});
     await request.delete(`/api/sessions/${worker}`, { headers: auth }).catch(() => {});

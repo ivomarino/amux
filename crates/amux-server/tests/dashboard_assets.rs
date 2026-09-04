@@ -279,7 +279,7 @@ fn sse_message_invalidation_refreshes_each_visible_message_surface() {
 }
 
 #[test]
-fn only_the_explicitly_claimed_card_is_live_and_unclaimed_work_is_visible() {
+fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state() {
     let app = asset("app.js");
     let index = asset("index.html");
     let helper_start = app
@@ -296,8 +296,6 @@ fn only_the_explicitly_claimed_card_is_live_and_unclaimed_work_is_visible() {
         "c.session === name",
         "c.status === 'doing'",
         "!c.deleted && !c.archived",
-        "function _activeWithoutClaim()",
-        "function _boardUnclaimedWorkHTML()",
     ] {
         assert!(helper.contains(needle), "live-card selection lost `{needle}`");
     }
@@ -311,7 +309,6 @@ fn only_the_explicitly_claimed_card_is_live_and_unclaimed_work_is_visible() {
         "liveBoardTask ? (liveBoardTask.title || liveBoardTask.id)",
         "liveBoardTask ? liveBoardTask.id : s.task_board_id",
         "_taskIdChip({task_board_id: displayTaskBoardId})",
-        "no board task claimed",
     ] {
         assert!(render.contains(needle), "session card lost live board linkage `{needle}`");
     }
@@ -323,10 +320,10 @@ fn only_the_explicitly_claimed_card_is_live_and_unclaimed_work_is_visible() {
         app.contains("const _liveNow = !!(_liveCard && _liveCard.id === item.id)"),
         "only the explicitly claimed card may say Working now"
     );
-    assert!(
-        app.contains("board-unclaimed-mount") && index.contains("board-unclaimed-mount"),
-        "the board must expose active workers whose hooks have not named a card"
-    );
+    for rejected in ["no board task claimed", "board-unclaimed-mount", "_activeWithoutClaim"] {
+        assert!(!app.contains(rejected), "runtime activity must not manufacture the board pseudo-state `{rejected}`");
+        assert!(!index.contains(rejected), "the removed pseudo-state must not retain a dead mount `{rejected}`");
+    }
 }
 
 #[test]

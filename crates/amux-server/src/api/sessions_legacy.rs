@@ -2853,7 +2853,7 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             "spans_groups_value": crate::api::session_verbs::cross_group_allow_setting_in(
                 &crate::config::amux_home(), &name,
             ).map(|v| v.trim().trim_matches('"').to_string()).unwrap_or_else(|| "*".into()),
-            "spans_groups_own": env.get("CC_SEND_ALLOW").is_some(),
+            "spans_groups_own": env.contains_key("CC_SEND_ALLOW"),
             "steering_queue": [],
             "managed_by": "python",
         }));

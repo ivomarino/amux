@@ -3089,9 +3089,9 @@ function _cardBoardStatusCounts(name) {
 // than one historical/captured card in doing (TubeScience had four), while one
 // terminal turn can execute only one parent task. The old newest-doing fallback
 // made all four cards say "Working now" and could also replace the task named by
-// the status hook with whichever card happened to be touched last. A short
-// "active, no claimed task" window while sessions and board SSE converge is
-// honest; guessing a task is not.
+// the status hook with whichever card happened to be touched last. An active
+// worker can also be answering an informational message that correctly produced
+// no card. Runtime activity is not a board error state; guessing a task is wrong.
 function _cardDoingItem(name) {
   const session = (sessions || []).find(s => s.name === name);
   const claimed = String(session && session.task_board_id || '').trim();
@@ -3099,20 +3099,6 @@ function _cardDoingItem(name) {
   return (boardItems || []).find(c =>
     !c.deleted && !c.archived && c.session === name && c.status === 'doing' && c.id === claimed
   ) || null;
-}
-
-function _activeWithoutClaim() {
-  return (sessions || []).filter(s => s.status === 'active' && !_cardDoingItem(s.name));
-}
-
-function _boardUnclaimedWorkHTML() {
-  const rows = _activeWithoutClaim();
-  if (!rows.length) return '';
-  return '<div class="board-unclaimed-work" role="status"><strong>' + rows.length
-    + ' active worker' + (rows.length === 1 ? '' : 's')
-    + ' without a claimed board task</strong><span>This is live work, but amux cannot truthfully attach it to a card yet.</span><div>'
-    + rows.map(s => '<button type="button" onclick="openPeek(\'' + escJs(s.name)
-      + '\')">' + esc(s.name) + '</button>').join('') + '</div></div>';
 }
 
 // Turn the board-drive trace into the smallest useful operator explanation.
@@ -3357,7 +3343,6 @@ function render() {
     const effort = provider === 'claude' ? flagValue(flags, '--effort') : '';
     const pLabel = providerLabel(provider);
     const liveBoardTask = _cardDoingItem(s.name);
-    const activeWithoutClaim = s.status === 'active' && !liveBoardTask;
     // A board transition and the next sessions poll are not atomic. Render the
     // SSE-synced doing card immediately, then naturally converge on the server
     // fields on the next poll. This also repairs old/stale task summaries while
@@ -3434,7 +3419,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
               that hits the banner never fires Stop and the active latch keeps
               claiming work). The payload now only reports FUTURE limits, so when
               rate_limited_until is set it is the true state and it supersedes
-              the status badge outright (AMUX-2566). */ ''}          ${s.rate_limited_until ? '' : `${s.status === 'rate_limited' ? '<span class="status-badge rate-limited" title="Hit a usage limit (on credits or waiting for reset)">rate limited</span>' : ''}${s.status === 'active' ? '<span class="status-badge active">working</span>' + _agentsChip(s) : ''}${activeWithoutClaim ? '<span class="status-badge board-unclaimed-badge" title="The status hook says this worker is active, but it has not named a current board task. No card is guessed from its other in-progress work.">no board task claimed</span>' : ''}
+              the status badge outright (AMUX-2566). */ ''}          ${s.rate_limited_until ? '' : `${s.status === 'rate_limited' ? '<span class="status-badge rate-limited" title="Hit a usage limit (on credits or waiting for reset)">rate limited</span>' : ''}${s.status === 'active' ? '<span class="status-badge active">working</span>' + _agentsChip(s) : ''}
           ${s.status === 'waiting' ? `<span class="status-badge waiting"${_waitingTitle(s)}>${_waitingLabel(s)}</span>${_stalledFor(s)}` : ''}
           ${s.status === 'idle' ? '<span class="status-badge idle">idle</span>' : ''}`}
           ${s.rate_limited_until ? `<span class="status-badge rate-limited" title="${s.rate_limit_weekly ? 'Weekly limit' : 'Rate-limited'} — auto-resume at ${_fmtResetTime(s.rate_limited_until)}">${s.rate_limit_weekly ? 'Weekly limit until' : 'Rate-limited until'} ${_fmtResetTime(s.rate_limited_until)}</span>` : ''}
@@ -8767,7 +8752,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.797';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.798';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -25825,15 +25810,11 @@ function _renderBoardBySession(visible, container) {
     const items = name ? groups[name] : noSession;
     const collapsed = _sessionGroupCollapsed[name || '__none__'];
     const groupKey = name || '__none__';
-    const liveSession = name ? (sessions || []).find(s => s.name === name && s.status === 'active') : null;
-    const unclaimed = !!(liveSession && !_cardDoingItem(name));
     html += '<div class="board-session-group">';
     html += '<div class="board-session-header" onclick="toggleSessionGroup(\'' + esc(groupKey) + '\')">';
     html += '<span class="board-session-chevron' + (collapsed ? '' : ' open') + '">\u25B6</span>';
     html += '<span class="board-session-name">' + (name ? esc(name) : '<span style="color:var(--dim)">Unassigned</span>') + '</span>';
-    html += '<div class="board-session-counts">'
-      + (unclaimed ? '<span class="board-session-unclaimed">working · no board task claimed</span>' : '')
-      + _sessionCountsHtml(items) + '</div></div>';
+    html += '<div class="board-session-counts">' + _sessionCountsHtml(items) + '</div></div>';
     if (!collapsed) {
       html += '<div class="board-session-items">';
       const _sPage = _boardColPages[groupKey] || 20;
@@ -26023,9 +26004,6 @@ function renderBoard() {
   if (document.body.classList.contains('board-dragging')) { _boardRenderPending = true; return; }
   renderBoardFilters();
   const container = document.getElementById('board-columns');
-  const unclaimedMount = document.getElementById('board-unclaimed-mount');
-  if (unclaimedMount) unclaimedMount.innerHTML = _boardUnclaimedWorkHTML();
-
   // Update view toggle buttons
   var bvS = document.getElementById('bv-session');
   var bvC = document.getElementById('bv-status');
