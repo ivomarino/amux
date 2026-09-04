@@ -5624,6 +5624,43 @@ pub async fn patch_item(
                     }
                     _ => set_opt("source_ref", &mut next.source_ref, &mut changed),
                 }
+                // A TRIGGER WITH NO VERIFICATION TIME RE-DRAINS FOREVER, SILENTLY.
+                //
+                // board_drive's idle-drain gate is
+                //   COALESCE(source_ref,'')='' OR COALESCE(last_verified_at,0) < now-24h
+                // so a card parked with a source_ref and NO last_verified_at reads as
+                // "trigger nobody has re-checked" on every tick and is offered again,
+                // forever. `amux board <status> --trigger` stamps both. A raw PATCH —
+                // which is the shape ~/.claude/CLAUDE.md's board recipes teach — sets
+                // only the one field, and nothing said so.
+                //
+                // Measured 2026-09-04 by ts-gke, on themselves. They parked TG-3239 by
+                // raw PATCH and eleven other cards with the CLI. The drain served
+                // TG-3239 four times in one session while the eleven stayed quiet, and
+                // they filed a dispatch-ORDERING report against amux on the strength of
+                // it: wrong population, wrong conclusion, wrong recommendation, sent to
+                // a peer. The two calls do the same visible thing and only one stamps.
+                //
+                // TELL THE CALLER, not just the card (AMUX-3791, same reasoning as the
+                // autofix diversion above): the operator saw a 200 and a card that
+                // looked parked. This is the only signal that reaches the person who
+                // can fix it, at the moment they can.
+                if changed.iter().any(|c| c == "source_ref")
+                    && next.source_ref.as_deref().is_some_and(|v| !v.trim().is_empty())
+                    && !map.contains_key("last_verified_at")
+                {
+                    diverted.push(json!({
+                        "field": "last_verified_at",
+                        "landed_in": "(nothing — not set)",
+                        "value": null,
+                        "why": "source_ref was set without last_verified_at, so board-drive \
+                                reads this card as a trigger nobody has re-checked and will \
+                                re-offer it on every idle tick. `amux board <status> <id> \
+                                --trigger \"...\"` stamps both; a raw PATCH sets only \
+                                source_ref. Send last_verified_at (unix seconds) alongside \
+                                it, or park with the CLI.",
+                    }));
+                }
             }
             if let Some(ot) = body_str(&map, "owner_type") {
                 let ot = if ot == "agent" { "agent" } else { "human" }.to_string();
