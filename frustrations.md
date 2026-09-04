@@ -2800,3 +2800,40 @@ FIX: 88f00fbd and cb3e966f, both amux-cloud. (1) The `updated > last_ts` silence
  it to the owner today, and to tag only when a human genuinely owes the next step.
  105 board_drive tests green. Whether a push surface should EXIST is Ethan's and is
  deliberately still open.
+
+## the two sanctioned cargo wrappers cannot both be used, and pre-commit then reports your tested bytes as untested
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-frustrations
+CARD: AF-478
+SYMPTOM: CLAUDE.md gives two instructions for a local test run. "Tests:
+ `scripts/test-contended.sh -p amux-server`", and "If a local run is genuinely
+ unavoidable, run it through `scripts/safe-cargo.sh <cargo args>` instead of bare
+ cargo". They could not both be followed. `test-contended.sh:162` was a bare
+ `cargo test "$@"`, so the sanctioned TEST path had none of the systemd-scope
+ isolation AMUX-70 exists for. And only `test-contended.sh` wrote
+ `~/.amux/test-receipts/$AMUX_SESSION.tsv`; `safe-cargo.sh` execs, so it could not
+ write one after the run. Three green runs through the safety wrapper, minutes
+ before a commit, and pre-commit answered: "1 of 1 staged crate file(s) DIFFER
+ from the bytes your last run compiled (`-p amux-server --lib board_drive`,
+ 72140s ago). That green result does not describe this commit."
+COST: the hook named a run from 20 hours earlier and was right about everything it
+ could see. There was no sequence of sanctioned commands that made it right, which
+ is ethos rule 3: a constraint with no truthful path through. The cheap damage is a
+ commit that reads as untested; the expensive one is the habit it teaches, since a
+ warning that fires on correct behaviour gets skipped, and this hook's whole value
+ is the case where it is telling the truth. On Linux the conflict runs the other
+ way and costs a session: an OOM-killed `cargo test` in the pane's own scope takes
+ the interactive pane down, not just the build.
+FIX: 5cd5be1c. The receipt writer moves to `scripts/write-test-receipt.sh` and is
+ called by both paths, so it is a property of running tests rather than of whichever
+ wrapper you reached for. `safe-cargo.sh test` writes one (and stops exec'ing, so
+ the exit status is now explicitly propagated and tested); `test-contended.sh`
+ invokes cargo through `safe-cargo.sh` and sets `_TC_RECEIPT=1` to suppress the
+ duplicate. The no-receipt branch of the hook now names the two commands that write
+ one, because reporting an absence without saying what produces it is honest and
+ unactionable. 26 cells in `scripts/test-test-receipt.sh`, 5 of them new; four
+ mutations fire (no receipt written, written for every subcommand, exit status
+ swallowed, duplicate guard removed).

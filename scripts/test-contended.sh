@@ -159,7 +159,22 @@ case " $* " in
     ;;
 esac
 
-cargo test "$@"
+# Through safe-cargo.sh, not bare cargo (AF-478). CLAUDE.md tells you to run
+# tests with THIS script and to put any local cargo run through safe-cargo.sh
+# for the systemd-scope isolation AMUX-70 exists for; those two instructions
+# were in conflict because this line was bare. On a systemd host an OOM-killed
+# `cargo test` here failed the pane's whole scope and took the interactive
+# session down with it, which is the exact hazard the wrapper prevents. On a
+# host with no systemd the wrapper execs cargo directly and this is a no-op.
+_safe="$(dirname "${_TC_ORIGIN:-$0}")/safe-cargo.sh"
+if [ -x "$_safe" ]; then
+  # It writes its own receipt for a `test` run; this script writes one at the
+  # end, so tell it not to. Two identical receipts would be harmless and
+  # confusing, and the one written last is the one that saw the final tree.
+  _TC_RECEIPT=1 "$_safe" test "$@"
+else
+  cargo test "$@"
+fi
 RC=$?
 
 DIRTY_AFTER=$(dirty_now)
@@ -254,49 +269,10 @@ else
   echo "worktree:  build. Stated because a silent probe and a clean tree look identical."
 fi
 
-# THE RECEIPT (AF-195). A green result describes the bytes cargo compiled, and
-# the commit ships the bytes in the INDEX. On a shared checkout those come apart
-# between the end of this run and the `git commit` that cites it: a peer stages
-# a change to a file you tested, and your commit carries a version no test ever
-# saw. That is not hypothetical — c971756b shipped RED under a message asserting
-# the opposite of its own diff, and both the passing run and the failing rerun
-# were TRUE when taken.
-#
-# NOT a pre-commit test gate, which is what the entry originally proposed. The
-# pre-commit hook's own comments record why it compiles tests but does not run
-# them: ~40s on every commit across ~50 lanes, and a failing assertion blocks
-# only its author. That trade is measured and it stands. This costs nothing at
-# commit time — the hook compares two blob shas it already has.
-#
-# WHAT IS RECORDED: the blob sha of every tracked file under crates/ as cargo
-# saw it. Clean files come from HEAD in one `ls-tree` call; only the dirty ones
-# are hashed, so this is a handful of hashes rather than several hundred.
-{
-  receipt_dir="${AMUX_HOME:-$HOME/.amux}/test-receipts"
-  mkdir -p "$receipt_dir" 2>/dev/null || true
-  receipt="$receipt_dir/${AMUX_SESSION:-unknown}.tsv"
-  {
-    # Header carries what the body cannot: which run this was and how it ended.
-    # A receipt with no verdict would let a RED run vouch for a commit.
-    echo "# repo	$(git rev-parse --show-toplevel 2>/dev/null)"
-    echo "# head	$(git rev-parse HEAD 2>/dev/null)"
-    echo "# rc	$RC"
-    echo "# at	$(date -u +%s)"
-    echo "# args	$*"
-    # HEAD's blobs for every tracked file under crates/, then override with the
-    # worktree hash of each dirty one. Order matters: the second write wins.
-    git ls-tree -r HEAD --format='%(objectname)	%(path)' -- crates 2>/dev/null
-    # UNTRACKED FILES TOO. cargo compiles a new .rs the moment it exists, and
-    # `git diff` cannot see it, so omitting them made a brand-new module report
-    # "not in the tested set at all" on the very commit that adds it — a false
-    # alarm on the most ordinary case there is.
-    for f in $(git diff --name-only -- crates 2>/dev/null
-               git diff --cached --name-only -- crates 2>/dev/null
-               git ls-files --others --exclude-standard -- crates 2>/dev/null); do
-      [ -f "$f" ] || continue
-      printf '%s\t%s\n' "$(git hash-object "$f" 2>/dev/null)" "$f"
-    done
-  } > "$receipt.tmp" 2>/dev/null && mv "$receipt.tmp" "$receipt" 2>/dev/null
-} || true
+# THE RECEIPT (AF-195, extracted to its own script by AF-478 so that
+# `safe-cargo.sh test` writes one too — the receipt is a property of running
+# tests, not of whichever wrapper you reached for).
+_rcpt_writer="$(dirname "${_TC_ORIGIN:-$0}")/write-test-receipt.sh"
+[ -x "$_rcpt_writer" ] && "$_rcpt_writer" "$RC" "$@"
 
 exit "$RC"
