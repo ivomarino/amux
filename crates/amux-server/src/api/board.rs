@@ -4431,6 +4431,40 @@ fn chars_truncate_log(s: &str, n: usize) -> String {
     format!("{}…", s.chars().take(n).collect::<String>())
 }
 
+/// Head+tail with the dropped count NAMED, for a value the log is the only copy
+/// of (AF-459, reopened by gtm-engine 2026-09-04 after refusing to validate it).
+///
+/// `chars_truncate_log` keeps a PREFIX, and a prefix of a destroyed value
+/// reproduces the exact failure this log line exists to prevent: gtm-engine lost
+/// a 366-character five-item inventory, recovered four items from a prefix, and
+/// the fifth was gone. The first fix raised the cap from 60 to 200 and their
+/// case still lands past it, so partial recovery from a prefix survived the fix
+/// that was written for it. Any FIXED prefix cap has that property for some
+/// value; the question is only whose.
+///
+/// Two changes, and the second is the one that matters. The bound is generous
+/// enough that a real trigger is kept WHOLE, and past it the middle goes rather
+/// than the tail, with `[N chars elided]` in the gap. A reader then knows they
+/// are holding an incomplete value instead of believing a prefix is all there
+/// was, which is the difference between a recoverable loss and a silent one.
+fn chars_elide_middle(s: &str, head: usize, tail: usize) -> String {
+    let n = s.chars().count();
+    if n <= head + tail {
+        return s.to_string();
+    }
+    let h: String = s.chars().take(head).collect();
+    let t: String = s.chars().skip(n - tail).collect();
+    format!("{h}…[{} chars elided]…{t}", n - head - tail)
+}
+
+/// The destroyed `source_ref` is kept whole up to head+tail characters.
+///
+/// 1800 rather than 200: gtm-engine's real loss was 366 and the previous bound
+/// was chosen without one. A bound wants a measurement behind it, and the only
+/// measurement available is the largest value anyone has actually lost.
+const SOURCE_REF_LOG_HEAD: usize = 900;
+const SOURCE_REF_LOG_TAIL: usize = 900;
+
 /// AF-413: which fields did a REFUSAL throw away?
 ///
 /// A PATCH is atomic: when the status transition is refused, the whole body is
@@ -7284,10 +7318,18 @@ pub async fn patch_item(
                         // their own transcript. The fifth is gone. Second known
                         // clobber of this field on that board.
                         //
-                        // The old value is kept LONG (200 vs the 60 used for
-                        // arrivals) for the same reason: a truncated sole copy
-                        // reproduces the exact partial-recovery they got by
-                        // accident.
+                        // The old value is kept WHOLE where the arriving one is
+                        // truncated at 60, and the asymmetry is the point: the
+                        // arriving value is ON THE CARD, and this line is the
+                        // only copy of the one being destroyed.
+                        //
+                        // It said "kept LONG (200)" and named the hazard it was
+                        // still committing (AF-459). gtm-engine refused to
+                        // validate it and measured the boundary: 88 and 158
+                        // chars survive, 208 and beyond are head-truncated to
+                        // 201, and their real loss was 366. A prefix cap fails
+                        // for some value whatever the number; see
+                        // chars_elide_middle for why the middle goes instead.
                         "source_ref" => {
                             let before = row.source_ref.as_deref().unwrap_or("");
                             let after = next.source_ref.as_deref().unwrap_or("(cleared)");
@@ -7296,7 +7338,11 @@ pub async fn patch_item(
                             } else {
                                 format!(
                                     "source_ref: WAS {} -> {}",
-                                    chars_truncate_log(before, 200),
+                                    chars_elide_middle(
+                                        before,
+                                        SOURCE_REF_LOG_HEAD,
+                                        SOURCE_REF_LOG_TAIL
+                                    ),
                                     chars_truncate_log(after, 60)
                                 )
                             }

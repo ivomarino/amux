@@ -3327,6 +3327,101 @@ async fn overwriting_a_trigger_records_the_value_it_destroyed() {
         log.contains("shard roll evidence") && log.contains("scheduler breach"),
         "head AND tail of the destroyed value must survive, not just a prefix: {log}"
     );
+    // 2b. THIS FIXTURE IS 132 CHARACTERS AND THE CAP WAS 200, so the assertion
+    //     above is satisfied by ANY cap at or above 132 and cannot see the
+    //     boundary at all (gtm-engine, 2026-09-04, refusing to validate the
+    //     entry this test was written for). Mutating the cap to 60 reddens it;
+    //     mutating it to 201, the shipped value, does not. Their real loss was
+    //     366 characters, which the fix head-truncated to 201 exactly as before.
+    //
+    //     A fixture that cannot cross the boundary cannot test it, so the cell
+    //     below builds one that must. It is asserted through the ELISION MARKER
+    //     rather than through a constant this integration target cannot see: if
+    //     the fixture ever stops crossing, the marker is absent and this fails,
+    //     so the cell cannot go quietly vacuous the way the one above did.
+    let long_head = "HEADSENTINEL-inventory-2026-09-04";
+    let long_tail = "TAILSENTINEL-the-fifth-item-that-was-lost";
+    let long_original =
+        format!("{long_head}{}{long_tail}", "x".repeat(2600));
+    let (st, _h, _b) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({"source_ref": long_original})),
+        &[("X-Amux-Session", "amux")],
+    )
+    .await;
+    assert!(st.is_success());
+    let (st, _h, _b) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({"source_ref": "a third trigger, replacing the long one"})),
+        &[("X-Amux-Session", "amux")],
+    )
+    .await;
+    assert!(st.is_success());
+    let (_s, _h, detail) = send_with(&app, "GET", &format!("/api/board/{id}"), None, &[]).await;
+    let log = detail["log"].as_str().unwrap_or("");
+    // SELECT THE LINE WHERE IT IS THE *DESTROYED* VALUE, not the one where it
+    // ARRIVED. Both mention the fixture, and the arriving side is truncated at
+    // 60 by design — a whole-log `contains` would read the wrong record and
+    // this cell would be asserting the wrong half. The discriminator is the
+    // arriving value on the NEXT write, which is unique.
+    let was_line = log
+        .lines()
+        .find(|l| l.contains("a third trigger, replacing the long one"))
+        .unwrap_or_else(|| panic!("the over-long destroyed value must be logged: {log}"));
+    assert!(
+        was_line.contains("chars elided"),
+        "premise: the fixture must EXCEED the bound, or this cell measures nothing: {was_line}"
+    );
+    assert!(
+        was_line.contains(long_tail),
+        "the TAIL of an over-long destroyed value must survive: a prefix is the \
+         failure this card exists for, and the tail is the item gtm-engine lost: {was_line}"
+    );
+    assert!(
+        was_line.contains(long_head),
+        "and the head, so the elision is a middle rather than a suffix: {was_line}"
+    );
+
+    // 2c. gtm-engine's ACTUAL value size, which the previous fix silently cut.
+    //     366 characters must come back WHOLE, with no elision marker at all.
+    let real_case = format!("REALHEAD{}REALTAIL", "y".repeat(350));
+    assert_eq!(real_case.chars().count(), 366, "premise: their measured size");
+    let (st, _h, _b) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({"source_ref": real_case})),
+        &[("X-Amux-Session", "amux")],
+    )
+    .await;
+    assert!(st.is_success());
+    let (st, _h, _b) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({"source_ref": "a fourth trigger"})),
+        &[("X-Amux-Session", "amux")],
+    )
+    .await;
+    assert!(st.is_success());
+    let (_s, _h, detail) = send_with(&app, "GET", &format!("/api/board/{id}"), None, &[]).await;
+    let log = detail["log"].as_str().unwrap_or("");
+    let line = log
+        .lines()
+        .find(|l| l.contains("-> a fourth trigger"))
+        .unwrap_or_else(|| panic!("the 366-char destroyed value must be logged: {log}"));
+    assert!(
+        line.contains(&real_case),
+        "a 366-character trigger is gtm-engine's real loss and must survive WHOLE: {line}"
+    );
+    assert!(
+        !line.contains("chars elided"),
+        "and must not be elided at all, or the fix is a bigger version of the bug: {line}"
+    );
     // 3. It says WAS, so a reader can tell the old value from the new one.
     assert!(
         log.contains("source_ref: WAS"),
