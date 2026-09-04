@@ -17,6 +17,13 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 PASS=0; FAIL=0
+# POSITIVE CONTROL COUNTER (ts-gke). Four of the six cases assert SILENCE, and a
+# check that is dead is silent — so a totally broken check still passes them. They
+# proved it: neutering the pronoun regex on a copy of the CLI scored 5 of 8, which
+# READS as a partial regression and IS total failure. The suite's whole
+# discriminating power lives in the FIRE cases, so the run refuses to report a
+# verdict unless at least one of them actually fired.
+FIRED=0
 ok()  { PASS=$((PASS+1)); echo "  ok   — $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL — $1"; }
 
@@ -66,7 +73,7 @@ B="Your 01:00-03:00 peak is confirmed, and you wrote that the scan was clean."
 fire ts-gke tubescience "$B" >/dev/null
 out=$(fire ts-gke mvs-infra "$B")
 case "$out" in
-  *"you already sent this body to tubescience"*) ok "REAL: same body to a NEW lane -> warns, naming the prior lane" ;;
+  *"you already sent this body to tubescience"*) FIRED=$((FIRED+1)); ok "REAL: same body to a NEW lane -> warns, naming the prior lane" ;;
   "") bad "REAL: the reported incident produced NO warning" ;;
   *)  bad "REAL: warned with unexpected wording: $out" ;;
 esac
@@ -92,7 +99,7 @@ fresh
 fire mixpeek-cicd mvs-infra "$B" >/dev/null
 out=$(fire amux-frustrations backend "$B")
 case "$out" in
-  *"already sent to mvs-infra by mixpeek-cicd"*) ok "CONSTRUCTED: a relay names the ORIGINAL sender, not the forwarder" ;;
+  *"already sent to mvs-infra by mixpeek-cicd"*) FIRED=$((FIRED+1)); ok "CONSTRUCTED: a relay names the ORIGINAL sender, not the forwarder" ;;
   *"you already sent"*) bad "a relay claims the forwarder sent it — the pre-df33f271 wording: $out" ;;
   *) bad "relay produced unexpected output: $out" ;;
 esac
@@ -120,5 +127,17 @@ out=$(fire ts-gke b "The build is green; the scan found nothing.")
               || bad "CONSTRUCTED: fired without second person: $out"
 
 echo
+# THE POSITIVE CONTROL. Report NOTHING normal if the check never fired: a pass
+# count is a poor summary of a suite whose silence cases cannot distinguish a
+# working check from a dead one.
+if [ "$FIRED" -eq 0 ]; then
+  echo "VERDICT WITHHELD — the check NEVER FIRED in any case that should have."
+  echo "  $PASS of the assertions above are SILENCE assertions, and silence is"
+  echo "  exactly what a dead check produces. This run cannot tell a working"
+  echo "  check from one that can no longer fire at all. Treat it as BROKEN,"
+  echo "  not as $PASS passed."
+  exit 1
+fi
 echo "$PASS passed, $FAIL failed   (2 cases REAL, 4 CONSTRUCTED — see comments)"
+echo "positive control: $FIRED fire case(s) actually fired, so the silences mean something"
 [ "$FAIL" -eq 0 ] || exit 1
