@@ -54,17 +54,27 @@ cat > "$TMP/server.py" <<'PY'
 import http.server,json,os,socketserver,sys
 capture,port_file,down,loss=sys.argv[1:]
 class Handler(http.server.BaseHTTPRequestHandler):
+    transient_seen=set()
     def do_POST(self):
         raw=self.rfile.read(int(self.headers.get("content-length","0")))
         try: body=json.loads(raw)
         except Exception: body={"invalid":raw.decode(errors="replace")}
-        row={"body":body,"down":os.path.exists(down),"path":self.path}
+        session=self.headers.get("X-Amux-Session","")
+        expected=f"/api/sessions/{session}/report"
+        row={"body":body,"down":os.path.exists(down),"path":self.path,
+             "expected_path":expected,"session":session}
         with open(capture,"a") as stream:
             stream.write(json.dumps(row,separators=(",",":"))+"\n"); stream.flush()
+        if self.path != expected:
+            self.send_response(405); self.end_headers(); return
         if os.path.exists(down):
             self.send_response(503); self.end_headers(); return
         if body.get("agent_id")=="poison-agent":
             self.send_response(400); self.end_headers(); return
+        agent=str(body.get("agent_id", ""))
+        if agent.startswith("transient-") and agent not in self.transient_seen:
+            self.transient_seen.add(agent)
+            self.send_response(int(agent.split("-",1)[1])); self.end_headers(); return
         if os.path.exists(loss):
             os.unlink(loss)
             self.connection.shutdown(2)
@@ -109,7 +119,15 @@ v=next(json.loads(line)["body"] for line in open(sys.argv[1]) if "explore-1" in 
 assert v["subagent"] == "start" and "state" not in v, v
 assert v["source"] == "subagent-start-hook" and v["session_id"] == "abc-123", v
 assert v["event_id"] == "abc-123:explore-1:start", v
+assert v["delivery_attempt"] == 1, v
 print("ok   SubagentStart carries session, agent and stable event identity")
+PY
+/usr/bin/python3 - "$CAPTURE" <<'PY'
+import json,sys
+rows=[json.loads(line) for line in open(sys.argv[1])]
+assert all(r["path"]==r["expected_path"] for r in rows),rows
+assert rows[-1]["path"]=="/api/sessions/probe/report",rows[-1]
+print("ok   durable lifecycle delivery uses the exact session report route")
 PY
 
 # Two identity-less callbacks with identical payloads are two real agents, not
@@ -125,6 +143,22 @@ ids=[json.loads(line)["body"].get("event_id","") for line in open(sys.argv[1])]
 ids=[i for i in ids if i.startswith("anonymous:")]
 assert len(ids)>=2 and len(set(ids[-2:]))==2, ids
 print("ok   two empty-payload starts mint distinct identities")
+PY
+
+# Malformed provider payloads are still distinct hook invocations. The hook
+# fails open, emits valid lifecycle JSON, and never falls back to an empty key.
+for _ in 1 2; do
+  HOME="$TMP/home" AMUX_URL="$URL" AMUX_SESSION=probe \
+    bash scripts/hooks/hook-report.sh subagent-start malformed-hook <<<'{broken'
+done
+wait_for 'len([r for r in rows if r["body"].get("source")=="malformed-hook"]) >= 2'
+/usr/bin/python3 - "$CAPTURE" <<'PY'
+import json,sys
+rows=[json.loads(line)["body"] for line in open(sys.argv[1])]
+ids=[r.get("event_id","") for r in rows if r.get("source")=="malformed-hook"]
+assert len(ids)>=2 and all(i.startswith("anonymous:") for i in ids[-2:]),ids
+assert len(set(ids[-2:]))==2,ids
+print("ok   malformed lifecycle payloads mint distinct nonempty identities")
 PY
 
 # Response loss after the server read the event must retry the same identity.
@@ -175,6 +209,25 @@ grep -q 'lifecycle_queue=dead_letter.*verdict=non_retryable_http.*agent_id=poiso
   "$TMP/home/.amux/logs/hook-report-failures.log"
 echo "ok   poison 4xx dead-letters and does not head-of-line block the next event"
 
+# Transient 4xx classes stay at the FIFO head and retry with the same identity.
+for code in 408 409 425 429; do
+  HOME="$TMP/home" AMUX_URL="$URL" AMUX_SESSION=probe \
+    bash scripts/hooks/hook-report.sh subagent-start subagent-start-hook \
+    <<EOF
+{"session_id":"abc-123","agent_id":"transient-$code"}
+EOF
+  wait_for "len([r for r in rows if r[\"body\"].get(\"agent_id\")==\"transient-$code\"]) >= 2"
+done
+/usr/bin/python3 - "$CAPTURE" <<'PY'
+import json,sys
+rows=[json.loads(line)["body"] for line in open(sys.argv[1])]
+for code in (408,409,425,429):
+    got=[r for r in rows if r.get("agent_id")==f"transient-{code}"]
+    assert [r["delivery_attempt"] for r in got[:2]]==[1,2],got
+    assert got[0]["event_id"]==got[1]["event_id"],got
+print("ok   transient 408/409/425/429 responses retry without reordering")
+PY
+
 # A queue left by an expired drain is awakened by an ordinary prompt hook.
 QF="$TMP/home/.amux/hook-report-queue/probe.json"
 /usr/bin/python3 - "$QF" "$URL" <<'PY'
@@ -188,7 +241,47 @@ HOME="$TMP/home" AMUX_URL="$URL" AMUX_SESSION=probe \
   bash scripts/hooks/hook-report.sh active prompt-hook <<<'{}'
 wait_for 'any(r["body"].get("agent_id")=="surviving-queue" for r in rows)'
 wait_for 'any(r["body"].get("state")=="active" for r in rows)'
-echo "ok   ordinary state hook wakes a surviving lifecycle queue"
+echo "ok   ordinary state hook wakes and route-corrects a surviving legacy queue"
+
+# Corruption is evidence, not an empty queue. Preserve the exact bad bytes,
+# announce the verdict, and let the new event proceed in a fresh atomic file.
+printf '%s' '{not-json' > "$QF"
+HOME="$TMP/home" AMUX_URL="$URL" AMUX_SESSION=probe \
+  bash scripts/hooks/hook-report.sh subagent-start corrupt-successor \
+  <<<'{"session_id":"abc-123","agent_id":"after-corrupt"}'
+wait_for 'any(r["body"].get("agent_id")=="after-corrupt" for r in rows)'
+CORRUPT=$(find "$TMP/home/.amux/hook-report-queue" -name 'probe.json.corrupt.*' -print -quit)
+test -n "$CORRUPT"
+test "$(cat "$CORRUPT")" = '{not-json'
+printf '%s' '{}' > "$QF"
+HOME="$TMP/home" AMUX_URL="$URL" AMUX_SESSION=probe \
+  bash scripts/hooks/hook-report.sh subagent-start corrupt-schema-successor \
+  <<<'{"session_id":"abc-123","agent_id":"after-schema-corrupt"}'
+wait_for 'any(r["body"].get("agent_id")=="after-schema-corrupt" for r in rows)'
+test "$(find "$TMP/home/.amux/hook-report-queue" -name 'probe.json.corrupt.*' | wc -l | tr -d ' ')" -ge 2
+grep -q 'lifecycle_queue=corrupt.*verdict=preserved_corrupt_queue.*preserved=' \
+  "$TMP/home/.amux/logs/hook-report-failures.log"
+echo "ok   corrupt queue bytes and schemas are preserved and diagnosed before recovery"
+
+# A replacement drain that starts while another process owns the drain lock
+# waits for the bounded handoff instead of losing the only wakeup.
+RACE_Q="$TMP/home/.amux/hook-report-queue/race.json"
+RACE_MARK="$TMP/race-lock-held"
+/usr/bin/python3 - "$RACE_Q.drain.lock" "$RACE_MARK" <<'PY' &
+import fcntl,sys,time
+with open(sys.argv[1],"a+") as lock:
+    fcntl.flock(lock,fcntl.LOCK_EX)
+    open(sys.argv[2],"w").close()
+    time.sleep(.5)
+PY
+RACE_HOLDER=$!
+for _ in $(seq 1 100); do [ -e "$RACE_MARK" ] && break; sleep .01; done
+HOME="$TMP/home" AMUX_URL="$URL" AMUX_SESSION=race \
+  bash scripts/hooks/hook-report.sh subagent-start race-hook \
+  <<<'{"session_id":"race-session","agent_id":"race-agent"}'
+wait "$RACE_HOLDER"
+wait_for 'any(r["body"].get("agent_id")=="race-agent" for r in rows)'
+echo "ok   drain-lock handoff cannot lose the final enqueue wakeup"
 
 # Compact is not a process reset; startup is. Pin both paths.
 before=$(wc -l < "$CAPTURE")
@@ -227,5 +320,38 @@ PY
   sleep .05
 done
 test "$pending" -eq 0
+
+# Successes and dead letters do not consume the retry budget: one drain must
+# empty every row allowed by the production queue bound, not stop at row 90.
+BULK_Q="$TMP/home/.amux/hook-report-queue/bulk.json"
+/usr/bin/python3 - "$BULK_Q" "$URL/api/sessions/bulk/report" <<'PY'
+import json,os,sys
+rows=[]
+for i in range(128):
+    event_id=f"bulk:{i}"
+    body={"subagent":"start","source":"bulk-test","session_id":"bulk-session",
+          "agent_id":f"bulk-{i}","event_id":event_id,"event_ts":i+1}
+    rows.append({"event_id":event_id,"body":body,"url":sys.argv[2],"attempts":0})
+json.dump(rows,open(sys.argv[1],"w"))
+PY
+HOME="$TMP/home" bash scripts/hooks/hook-report.sh --drain-subagents \
+  "$BULK_Q" "$URL/api/sessions/bulk/report" bulk
+/usr/bin/python3 - "$BULK_Q" "$CAPTURE" <<'PY'
+import json,sys
+assert json.load(open(sys.argv[1]))==[]
+rows=[json.loads(line) for line in open(sys.argv[2])]
+got=[r for r in rows if r["body"].get("source")=="bulk-test"]
+assert len(got)==128,len(got)
+assert all(r["path"]=="/api/sessions/bulk/report" for r in got)
+print("ok   one drain empties all 128 bounded FIFO rows")
+PY
+
+/usr/bin/python3 - "$CAPTURE" <<'PY'
+import json,sys
+rows=[json.loads(line) for line in open(sys.argv[1])]
+bad=[r for r in rows if r["path"]!=r["expected_path"]]
+assert not bad,bad
+print("ok   every captured hook request used its exact worker report path")
+PY
 
 echo "ok   all shipped status-hook durability regressions passed"

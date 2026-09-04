@@ -30,17 +30,51 @@ if not queue or not url or not session: raise SystemExit(0)
 lock=queue+".drain.lock"
 os.makedirs(os.path.dirname(queue),mode=0o700,exist_ok=True)
 lf=open(lock,"a+")
-try: fcntl.flock(lf,fcntl.LOCK_EX|fcntl.LOCK_NB)
-except BlockingIOError: raise SystemExit(0)
+# A replacement drain can start while the prior drain is between its final
+# empty read and releasing this lock. Wait briefly for that handoff instead of
+# losing the only wakeup for a final SubagentStop. A drain retrying a real
+# outage holds the lock far longer than this bound, so ordinary hooks do not
+# accumulate an unbounded pile of waiting processes.
+lock_deadline=time.monotonic()+3.0
+while True:
+    try:
+        fcntl.flock(lf,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        break
+    except BlockingIOError:
+        if time.monotonic() >= lock_deadline: raise SystemExit(0)
+        time.sleep(.05)
 
-def locked_rows(change=None):
+def corrupt_note(preserved,exc):
+    path=os.path.expanduser("~/.amux/logs/hook-report-failures.log")
+    try:
+        os.makedirs(os.path.dirname(path),exist_ok=True)
+        with open(path,"a") as stream:
+            stream.write(time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())+
+                f" {session} lifecycle_queue=corrupt verdict=preserved_corrupt_queue "+
+                f"queue={queue} preserved={preserved} error={type(exc).__name__}\n")
+    except Exception: pass
+
+def locked_rows(change=None,release_on_empty=False):
     qlock=queue+".lock"
     with open(qlock,"a+") as guard:
         fcntl.flock(guard,fcntl.LOCK_EX)
         try:
             with open(queue) as stream: rows=json.load(stream)
-            if not isinstance(rows,list): rows=[]
-        except Exception: rows=[]
+            if not isinstance(rows,list) or any(
+                not isinstance(row,dict) or not isinstance(row.get("body"),dict)
+                for row in rows
+            ):
+                raise ValueError("invalid lifecycle queue schema")
+        except FileNotFoundError:
+            rows=[]
+        except Exception as exc:
+            preserved=queue+f".corrupt.{time.time_ns()}"
+            try: os.replace(queue,preserved)
+            except FileNotFoundError: preserved="missing-before-preserve"
+            except Exception as move_exc:
+                preserved=queue+f":preserve_failed:{type(move_exc).__name__}"
+            corrupt_note(preserved,exc)
+            rows=[]
         if change is not None:
             rows=change(rows)
             fd,tmp=tempfile.mkstemp(prefix="queue.",dir=os.path.dirname(queue))
@@ -54,6 +88,12 @@ def locked_rows(change=None):
                 try: os.unlink(tmp)
                 except FileNotFoundError: pass
                 raise
+        # Close the enqueue-vs-exit race: release the drain ownership while
+        # still holding the queue lock after the definitive empty read. A
+        # producer cannot append and launch its replacement until this drain
+        # lock is available to that replacement.
+        if release_on_empty and not rows:
+            fcntl.flock(lf,fcntl.LOCK_UN)
         return rows
 
 def note(kind,row,code,attempt):
@@ -72,8 +112,9 @@ def note(kind,row,code,attempt):
     except Exception: pass
 
 ctx=ssl._create_unverified_context()
-for _ in range(90):
-    rows=locked_rows()
+retry_failures=0
+while True:
+    rows=locked_rows(release_on_empty=True)
     if not rows: raise SystemExit(0)
     row=rows[0]
     attempt=max(0,int(row.get("attempts",0)))+1
@@ -81,7 +122,10 @@ for _ in range(90):
     body["delivery_attempt"]=attempt
     code="000"
     try:
-        req=urllib.request.Request(row.get("url") or url,
+        # The first ATE-45 build persisted the server root in each queue row.
+        # A queue surviving that build must heal under the corrected hook, so
+        # stale row metadata never overrides this invocation's canonical route.
+        req=urllib.request.Request(url,
             data=json.dumps(body,separators=(",",":")).encode(),method="POST",
             headers={"Content-Type":"application/json","X-Amux-Session":session})
         with urllib.request.urlopen(req,timeout=3,context=ctx) as response:
@@ -97,6 +141,7 @@ for _ in range(90):
             if current and current[0].get("event_id","")==event_id: return current[1:]
             return current
         locked_rows(delivered)
+        retry_failures=0
         continue
     retryable_4xx={"408","409","425","429"}
     if code.startswith("4") and code not in retryable_4xx:
@@ -106,6 +151,7 @@ for _ in range(90):
             if current and current[0].get("event_id","")==event_id: return current[1:]
             return current
         locked_rows(dead_letter)
+        retry_failures=0
         continue
     def failed(current):
         if current and current[0].get("event_id","")==row.get("event_id",""):
@@ -113,6 +159,8 @@ for _ in range(90):
         return current
     locked_rows(failed)
     if attempt in (1,5,15,45,90): note("retrying",row,code,attempt)
+    retry_failures+=1
+    if retry_failures >= 90: raise SystemExit(0)
     time.sleep(2)
 PY
   exit 0
@@ -180,6 +228,8 @@ C=$(sed -n 's/.*"canonical_url":"\([^"]*\)".*/\1/p' "$E" 2>/dev/null)
 L=$(sed -n 's/.*"legacy_port":\([0-9]*\).*/\1/p' "$E" 2>/dev/null)
 U="${AMUX_URL:-$C}"
 case "$U" in *localhost:$L|*127.0.0.1:$L) U="${C:-$U}";; esac
+U="${U%/}"
+REPORT_URL="$U/api/sessions/$AMUX_SESSION/report"
 # AMUX-4024: THE SUBAGENT LIFECYCLE PRODUCER.
 #
 # `subagent_event_post` (session_verbs.rs) has accepted {"subagent":"start"} /
@@ -295,6 +345,12 @@ try:
         out["event_id"]=event_id
 except Exception as e:
     err="payload:"+type(e).__name__
+# Malformed provider JSON is still one lifecycle invocation. It must not fall
+# through with an empty dedupe key, because two malformed starts may represent
+# two concurrent agents just as two valid empty objects do.
+if "subagent" in out and not out.get("event_id"):
+    out["event_ts"]=time.time()
+    out["event_id"]=f"anonymous:{time.time_ns()}:{os.getpid()}:{uuid.uuid4().hex}"
 # TRANSCRIPT READ GETS ITS OWN try (2026-08-11). It used to sit inside the outer
 # one, so a missing or unreadable transcript threw straight past the diagnostic
 # below — skipping the log in exactly the case the log exists to explain. Caught
@@ -362,18 +418,42 @@ QF="$QD/$AMUX_SESSION.json"
 case "${MODE/subagent-/subagent:}" in
   subagent:*)
     mkdir -p "$QD" 2>/dev/null; chmod 700 "$QD" 2>/dev/null || true
-    QUEUE_NOTE=$(/usr/bin/python3 - "$QF" "$BODY" "$U" <<'PY'
-import fcntl,json,os,sys,tempfile
+    QUEUE_NOTE=$(/usr/bin/python3 - "$QF" "$BODY" "$REPORT_URL" <<'PY'
+import fcntl,json,os,sys,tempfile,time,uuid
 path,raw,url=sys.argv[1:4]
 try: body=json.loads(raw)
 except Exception: raise SystemExit(0)
 event_id=str(body.get("event_id") or "")
+if not event_id:
+    event_id=f"queue-anonymous:{time.time_ns()}:{os.getpid()}:{uuid.uuid4().hex}"
+    body["event_id"]=event_id
 with open(path+".lock","a+") as guard:
     fcntl.flock(guard,fcntl.LOCK_EX)
     try:
         with open(path) as stream: rows=json.load(stream)
-        if not isinstance(rows,list): rows=[]
-    except Exception: rows=[]
+        if not isinstance(rows,list) or any(
+            not isinstance(row,dict) or not isinstance(row.get("body"),dict)
+            for row in rows
+        ):
+            raise ValueError("invalid lifecycle queue schema")
+    except FileNotFoundError:
+        rows=[]
+    except Exception as exc:
+        preserved=path+f".corrupt.{time.time_ns()}"
+        try: os.replace(path,preserved)
+        except FileNotFoundError: preserved="missing-before-preserve"
+        except Exception as move_exc:
+            preserved=path+f":preserve_failed:{type(move_exc).__name__}"
+        log=os.path.expanduser("~/.amux/logs/hook-report-failures.log")
+        try:
+            os.makedirs(os.path.dirname(log),exist_ok=True)
+            with open(log,"a") as stream:
+                stream.write(time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())+
+                    f" {os.environ.get('AMUX_SESSION','')} lifecycle_queue=corrupt "+
+                    f"verdict=preserved_corrupt_queue queue={path} preserved={preserved} "+
+                    f"error={type(exc).__name__}\n")
+        except Exception: pass
+        rows=[]
     if not any(str(row.get("event_id") or "")==event_id for row in rows):
         rows.append({"event_id":event_id,"body":body,"url":url,"attempts":0})
     try: limit=max(1,min(128,int(os.environ.get("AMUX_HOOK_QUEUE_LIMIT","128"))))
@@ -407,7 +487,7 @@ PY
         "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$AMUX_SESSION" "$SRC" "${1:-0}" "${2:-0}" "${3:-128}" \
         >> "$D/hook-report-failures.log" 2>/dev/null
     fi
-    nohup bash "$0" --drain-subagents "$QF" "$U" "$AMUX_SESSION" \
+    nohup bash "$0" --drain-subagents "$QF" "$REPORT_URL" "$AMUX_SESSION" \
       </dev/null >/dev/null 2>&1 &
     exit 0
     fi
@@ -417,7 +497,7 @@ esac
 # is proof the worker is alive and an opportunity to heal it; do not wait for
 # another subagent lifecycle edge that may never occur after the final stop.
 if [ -s "$QF" ]; then
-  nohup bash "$0" --drain-subagents "$QF" "$U" "$AMUX_SESSION" \
+  nohup bash "$0" --drain-subagents "$QF" "$REPORT_URL" "$AMUX_SESSION" \
     </dev/null >/dev/null 2>&1 &
 fi
 # X-Amux-Session stamps the write server-side (AMUX-1768). report_post's own
@@ -436,7 +516,7 @@ fi
 CODE=$(curl -sk -m 3 -o /dev/null -w '%{http_code}' \
   -X POST -H 'Content-Type: application/json' \
   -H "X-Amux-Session: $AMUX_SESSION" -d "$BODY" \
-  "$U/api/sessions/$AMUX_SESSION/report" 2>/dev/null) || CODE=000
+  "$REPORT_URL" 2>/dev/null) || CODE=000
 case "$CODE" in
   2*) ;;
   *)

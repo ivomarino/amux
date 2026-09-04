@@ -9793,6 +9793,25 @@ pub(crate) fn steer_decide(reported: Option<&str>, pane_idle: Option<bool>, age_
     SteerDelivery::Hold
 }
 
+/// A live background agent/terminal is not ordinary mid-turn work. The normal
+/// max-age escape deliberately hands an old message to the provider while a
+/// long foreground turn continues; doing that while the provider says a
+/// background child is live interrupted the parent conversation and killed the
+/// very work status was protecting. Only the terminal edge clears this hold.
+fn steer_decide_with_background(
+    reported: Option<&str>,
+    pane_idle: Option<bool>,
+    age_s: f64,
+    max_age_s: f64,
+    background_working: bool,
+) -> SteerDelivery {
+    if background_working {
+        SteerDelivery::Hold
+    } else {
+        steer_decide(reported, pane_idle, age_s, max_age_s)
+    }
+}
+
 /// One lane's stored self-report, with the SHARED trust verdict already applied.
 ///
 /// `None` means the lane has never reported — a hookless lane (gemini, codex),
@@ -9853,7 +9872,7 @@ pub(crate) fn lane_report(state: &AppState, name: &str) -> Option<LaneReport> {
 /// adjacent to its newest prompt. A worker quoting either sentence in prose
 /// does not match.
 pub(crate) fn provider_background_working(raw: &str) -> bool {
-    if crate::backend::adapter::codex_pane_generation_state(raw) == Some(true) {
+    if crate::backend::adapter::codex_pane_background_working(raw) {
         return true;
     }
     let clean = crate::backend::adapter::strip_ansi(raw);
@@ -9877,7 +9896,7 @@ fn warn_background_override_once(name: &str, raw: &str) {
     use std::collections::BTreeSet;
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
-    let kind = if crate::backend::adapter::codex_pane_generation_state(raw) == Some(true) {
+    let kind = if crate::backend::adapter::codex_pane_background_working(raw) {
         "codex_background_terminal"
     } else {
         "claude_background_agent"
@@ -10030,21 +10049,32 @@ pub(crate) async fn steer_delivery_for(state: &AppState, name: &str, age_s: f64)
     // that no longer applies is dropped to `None`, which routes to the pane
     // exactly as a hookless lane does.
     let report = lane_report(state, name).filter(|r| r.applies);
-    let mut reported: Option<String> = report.as_ref().map(|r| r.state.clone());
-    if let Some(r) = report.as_ref().filter(|r| r.state == "idle") {
-        let raw = tmux_capture(name, 12).await;
-        if !reported_idle_is_boundary(r.subagents_live, &raw) {
-            warn_background_override_once(name, &raw);
-            reported = Some("active".into());
-        }
+    let reported: Option<String> = report.as_ref().map(|r| r.state.clone());
+    // Capture even for a trusted active report: max-age delivery is allowed for
+    // ordinary foreground work, but must remain disabled for provider-owned
+    // background work until its terminal row appears.
+    let raw = tmux_capture(name, 12).await;
+    let provider_background = provider_background_working(&raw);
+    let background_working = report
+        .as_ref()
+        .and_then(|r| r.subagents_live)
+        .is_some_and(|count| count > 0)
+        || provider_background;
+    if provider_background {
+        warn_background_override_once(name, &raw);
     }
     let pane_idle = if reported.is_some() {
         None
     } else {
-        let raw = tmux_capture(name, 12).await;
         if raw.trim().is_empty() { None } else { Some(pane_is_at_boundary(&raw)) }
     };
-    steer_decide(reported.as_deref(), pane_idle, age_s, steer_max_age_s())
+    steer_decide_with_background(
+        reported.as_deref(),
+        pane_idle,
+        age_s,
+        steer_max_age_s(),
+        background_working,
+    )
 }
 
 /// One pass: deliver queued steering to every lane that is at a turn boundary.
@@ -15434,6 +15464,11 @@ fn apply_subagent_event(
         .filter_map(Value::as_str)
         .map(str::to_string)
         .collect();
+    let mut agent_edges = next["agent_edges"].as_object().cloned().unwrap_or_default();
+    // Terminal tombstones are compacted after 128 distinct finished agents.
+    // The floor keeps their ordering fact after compaction: an event older
+    // than an evicted terminal edge still cannot resurrect that agent.
+    let mut terminal_floor_ts = next["terminal_floor_ts"].as_f64().unwrap_or(0.0);
 
     if !event_id.is_empty() && seen.iter().any(|id| id == event_id) {
         return SubagentApply {
@@ -15453,15 +15488,40 @@ fn apply_subagent_event(
         && !stored_session.is_empty()
         && !lifecycle_session.is_empty()
         && stored_session != lifecycle_session;
+    let prior_agent = (!agent_id.is_empty())
+        .then(|| agent_edges.get(agent_id))
+        .flatten();
+    let prior_agent_ts = prior_agent.and_then(|edge| edge["ts"].as_f64()).unwrap_or(0.0);
+    let prior_agent_state = prior_agent.and_then(|edge| edge["state"].as_str()).unwrap_or("");
+    let stale_agent_order = ev != "reset"
+        && event_ts > 0.0
+        && prior_agent_ts > 0.0
+        && (event_ts < prior_agent_ts
+            || (event_ts == prior_agent_ts && ev == "start" && prior_agent_state == "terminal"));
+    let stale_terminal_floor = ev != "reset"
+        && !agent_id.is_empty()
+        && event_ts > 0.0
+        && terminal_floor_ts > 0.0
+        && event_ts <= terminal_floor_ts;
     let mut verdict = "applied";
 
-    if stale_time || stale_session {
-        verdict = if stale_session { "stale_session" } else { "stale_event" };
+    if stale_time || stale_session || stale_agent_order || stale_terminal_floor {
+        verdict = if stale_session {
+            "stale_session"
+        } else if stale_time {
+            "stale_event"
+        } else if stale_agent_order {
+            "stale_agent_event"
+        } else {
+            "stale_before_terminal_floor"
+        };
     } else {
         match ev {
             "reset" => {
                 live_ids.clear();
                 anonymous = 0;
+                agent_edges.clear();
+                terminal_floor_ts = 0.0;
                 next["reset_ts"] = json!(if event_ts > 0.0 { event_ts } else { now });
                 if !lifecycle_session.is_empty() {
                     next["session_id"] = json!(lifecycle_session);
@@ -15475,6 +15535,12 @@ fn apply_subagent_event(
                     live_ids.sort();
                 } else {
                     verdict = "duplicate_agent_start";
+                }
+                if !agent_id.is_empty() {
+                    agent_edges.insert(
+                        agent_id.to_string(),
+                        json!({"state": "live", "ts": event_ts}),
+                    );
                 }
                 if stored_session.is_empty() && !lifecycle_session.is_empty() {
                     next["session_id"] = json!(lifecycle_session);
@@ -15492,6 +15558,15 @@ fn apply_subagent_event(
                 } else {
                     verdict = "orphan_stop";
                 }
+                if !agent_id.is_empty() {
+                    // Keep a terminal edge even for stop-before-start. When the
+                    // older start arrives later, ordering rejects it instead of
+                    // resurrecting work that has already completed.
+                    agent_edges.insert(
+                        agent_id.to_string(),
+                        json!({"state": "terminal", "ts": event_ts}),
+                    );
+                }
             }
             _ => unreachable!("validated by subagent_event_post"),
         }
@@ -15503,11 +15578,26 @@ fn apply_subagent_event(
             seen.drain(..seen.len() - SUBAGENT_EVENT_HISTORY_LIMIT);
         }
     }
+    let mut terminal_edges: Vec<(String, f64)> = agent_edges
+        .iter()
+        .filter(|(_, edge)| edge["state"].as_str() == Some("terminal"))
+        .map(|(id, edge)| (id.clone(), edge["ts"].as_f64().unwrap_or(0.0)))
+        .collect();
+    if terminal_edges.len() > SUBAGENT_EVENT_HISTORY_LIMIT {
+        terminal_edges.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let remove_n = terminal_edges.len() - SUBAGENT_EVENT_HISTORY_LIMIT;
+        for (id, ts) in terminal_edges.into_iter().take(remove_n) {
+            agent_edges.remove(&id);
+            terminal_floor_ts = terminal_floor_ts.max(ts);
+        }
+    }
     let count = anonymous + live_ids.len() as i64;
     next["count"] = json!(count);
     next["live_ids"] = json!(live_ids);
     next["anonymous"] = json!(anonymous);
     next["seen_events"] = json!(seen);
+    next["agent_edges"] = Value::Object(agent_edges);
+    next["terminal_floor_ts"] = json!(terminal_floor_ts);
     next["ts"] = json!(now);
     next["last_event"] = json!({
         "event": ev,
@@ -15622,7 +15712,14 @@ async fn subagent_event_post(state: &AppState, name: &str, ev: &str, body: &Valu
                     "subagent lifecycle event replayed after an earlier delivery failure"
                 );
             }
-            if matches!(applied.verdict, "stale_event" | "stale_session" | "orphan_stop") {
+            if matches!(
+                applied.verdict,
+                "stale_event"
+                    | "stale_session"
+                    | "stale_agent_event"
+                    | "stale_before_terminal_floor"
+                    | "orphan_stop"
+            ) {
                 tracing::warn!(
                     target: "subagent_lifecycle",
                     session = name,
@@ -20304,6 +20401,18 @@ mod tests {
         }
         let quoted_wait = "I am testing Waiting for 1 background agent to finish\n\n\u{276f}\n\n\u{23f5}\u{23f5} bypass permissions on";
         assert_eq!(detect_claude_status(quoted_wait), "idle");
+        let prompt_quote = "\u{276f} Waiting for 1 background agent to finish\n\n\u{23f5}\u{23f5} bypass permissions on";
+        assert_eq!(
+            detect_claude_status(prompt_quote),
+            "idle",
+            "Claude's prompt glyph is not provider spinner chrome"
+        );
+        let pasted_row = "\u{276f} Here is the captured row:\n  \u{2736} Waiting for 1 background agent to finish\n\n\u{23f5}\u{23f5} bypass permissions on";
+        assert_eq!(
+            detect_claude_status(pasted_row),
+            "idle",
+            "an indented pasted provider row is still user text"
+        );
         // Provider/model controls: the new Claude frame must not turn a Codex
         // prompt or Gemini selector into active.
         assert_eq!(detect_claude_status("\u{203a} Ask Codex to do anything"), "");
@@ -22214,6 +22323,134 @@ mod steer_boundary_tests {
         assert_eq!(current["count"], json!(1), "new ids for one agent never inflate count");
     }
 
+    #[test]
+    fn subagent_terminal_edges_reject_reordered_and_aged_starts() {
+        let sid = "session-one";
+        let mut current = apply_subagent_event(
+            &Value::Null,
+            "reset",
+            "",
+            "reset",
+            100.0,
+            sid,
+            100.0,
+        )
+        .next;
+
+        // A terminal edge arriving first is a tombstone, not a disposable
+        // orphan. The older start must not make the finished agent live again.
+        let stop_first = apply_subagent_event(
+            &current,
+            "stop",
+            "reordered-agent",
+            "stop-first",
+            120.0,
+            sid,
+            120.0,
+        );
+        assert_eq!(stop_first.verdict, "orphan_stop");
+        current = stop_first.next;
+        let late_start = apply_subagent_event(
+            &current,
+            "start",
+            "reordered-agent",
+            "late-start",
+            110.0,
+            sid,
+            121.0,
+        );
+        assert_eq!(late_start.verdict, "stale_agent_event");
+        assert_eq!(late_start.count, 0);
+
+        // A genuinely newer reuse remains possible and establishes a new
+        // terminal high-water edge when it completes.
+        current = apply_subagent_event(
+            &late_start.next,
+            "start",
+            "reordered-agent",
+            "new-start",
+            130.0,
+            sid,
+            130.0,
+        )
+        .next;
+        current = apply_subagent_event(
+            &current,
+            "stop",
+            "reordered-agent",
+            "new-stop",
+            140.0,
+            sid,
+            140.0,
+        )
+        .next;
+        assert_eq!(current["count"], json!(0));
+
+        // Age `new-start` out of the bounded event-id list. Its retry remains
+        // stale because ordering belongs to the agent edge, not dedupe history.
+        for i in 0..(SUBAGENT_EVENT_HISTORY_LIMIT + 4) {
+            current = apply_subagent_event(
+                &current,
+                "stop",
+                "reordered-agent",
+                &format!("later-stop-{i}"),
+                141.0 + i as f64,
+                sid,
+                141.0 + i as f64,
+            )
+            .next;
+        }
+        assert!(
+            !current["seen_events"].as_array().unwrap().contains(&json!("new-start")),
+            "the test must actually age the start identity out"
+        );
+        let aged_retry = apply_subagent_event(
+            &current,
+            "start",
+            "reordered-agent",
+            "new-start",
+            130.0,
+            sid,
+            999.0,
+        );
+        assert_eq!(aged_retry.verdict, "stale_agent_event");
+        assert_eq!(aged_retry.count, 0);
+    }
+
+    #[test]
+    fn subagent_compacted_terminal_tombstones_leave_a_replay_floor() {
+        let sid = "session-one";
+        let mut current = Value::Null;
+        for i in 0..(SUBAGENT_EVENT_HISTORY_LIMIT + 1) {
+            current = apply_subagent_event(
+                &current,
+                "stop",
+                &format!("finished-{i:03}"),
+                &format!("stop-{i:03}"),
+                100.0 + i as f64,
+                sid,
+                200.0 + i as f64,
+            )
+            .next;
+        }
+        assert_eq!(
+            current["agent_edges"].as_object().unwrap().len(),
+            SUBAGENT_EVENT_HISTORY_LIMIT
+        );
+        assert_eq!(current["terminal_floor_ts"], json!(100.0));
+        let replay = apply_subagent_event(
+            &current,
+            "start",
+            "finished-000",
+            "ancient-start",
+            99.0,
+            sid,
+            999.0,
+        );
+        assert_eq!(replay.verdict, "stale_before_terminal_floor");
+        assert_eq!(replay.count, 0);
+    }
+
     /// Fail-closed is the whole safety property: an unknown lane must not be
     /// treated as idle. With no report AND no pane (no tmux session under test),
     /// the capture is empty and "cannot tell" must read as "do not deliver" —
@@ -23168,6 +23405,13 @@ mod steer_freeze_tests {
 
   gpt-5.6-sol xhigh · ~/Dev/amux";
 
+    const CODEX_FOREGROUND_WORKING: &str = "\
+• Working (42s • esc to interrupt)
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol xhigh · ~/Dev/amux";
+
     #[test]
     fn prose_about_esc_to_interrupt_is_not_a_generating_lane() {
         assert!(
@@ -23232,6 +23476,11 @@ mod steer_freeze_tests {
             "an idle parent report cannot authorize board-drive over live provider chrome"
         );
         assert!(!pane_is_at_boundary(CODEX_BACKGROUND_TERMINAL));
+        assert_eq!(
+            steer_decide_with_background(Some("active"), None, 86_400.0, 600.0, true),
+            SteerDelivery::Hold,
+            "max age never authorizes interruption while background work is live"
+        );
 
         assert!(!provider_background_working(CODEX_BACKGROUND_FINISHED));
         assert!(reported_idle_is_boundary(Some(0), CODEX_BACKGROUND_FINISHED));
@@ -23246,6 +23495,31 @@ mod steer_freeze_tests {
   gpt-5.6-sol xhigh · ~/Dev/amux";
         assert!(!provider_background_working(quoted), "quoted prose is not provider chrome");
         assert!(reported_idle_is_boundary(Some(0), quoted));
+
+        assert!(
+            !provider_background_working(CODEX_FOREGROUND_WORKING),
+            "ordinary Codex foreground work is not relabelled as a background terminal"
+        );
+        assert_eq!(
+            steer_decide_with_background(Some("active"), None, 601.0, 600.0, false),
+            SteerDelivery::OverdueMidTurn,
+            "the pre-existing max-age policy remains available for ordinary foreground work"
+        );
+
+        let pasted_frame = "\
+\u{276f} Compare this pasted Codex frame:
+  • Working (0s • esc to interrupt) · 1 background terminal running
+  › Ask Codex to do anything
+  gpt-5.6-sol xhigh · ~/Dev/amux
+\u{2500}\u{2500}\u{2500} claude \u{2500}\u{2500}\u{2500}
+\u{276f}\u{a0}
+\u{23f5}\u{23f5} bypass permissions on";
+        assert_eq!(
+            crate::backend::adapter::codex_pane_generation_state(pasted_frame),
+            None,
+            "a Codex-looking transcript inside Claude is not Codex provider state"
+        );
+        assert!(!provider_background_working(pasted_frame));
     }
 
     #[test]

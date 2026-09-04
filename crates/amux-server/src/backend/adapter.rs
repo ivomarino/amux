@@ -258,10 +258,18 @@ lazy_re!(
 /// active forever. Both the adapter and the legacy session-status path call
 /// this function so the two views cannot disagree about the same frame again.
 pub(crate) fn claude_background_agents_waiting(line: &str) -> bool {
-    let line = line.trim();
+    // Provider rows start at column zero. Submitted/pasted continuation lines
+    // are indented by the TUI; trimming first would turn quoted frame text into
+    // provider chrome.
+    let line = line.trim_end();
     let Some(first) = line.chars().next() else { return false };
-    let provider_chrome = ('\u{2700}'..='\u{27bf}').contains(&first)
-        || matches!(first, '*' | '\u{b7}');
+    // Claude's known spinner cycle. The old whole-dingbat range included `❯`,
+    // the input-prompt glyph, so a user typing the exact sentence was itself
+    // classified as a live agent.
+    let provider_chrome = matches!(
+        first,
+        '*' | '\u{b7}' | '\u{2722}' | '\u{2733}' | '\u{2736}' | '\u{273b}' | '\u{273d}'
+    );
     if !provider_chrome {
         return false;
     }
@@ -1003,20 +1011,14 @@ fn codex_active_status_line(line: &str) -> bool {
 }
 
 fn codex_generation_state_clean(clean: &str) -> Option<bool> {
-    // The Codex prompt shell and model bar remain painted while a turn is
-    // running. The decisive shape is therefore the line immediately ABOVE the
-    // prompt: `• Working (…)` / `• Waiting for background terminal (…)` means
-    // the prompt is disabled and the turn is live; completed turns replace it
-    // with `Worked for …` or ordinary output. ATE-36 incorrectly made the mere
-    // presence of the prompt shell an idle boundary, which hid live ATE-37.
+    // Provider-known Codex scanning also receives short/partial captures from
+    // native adapters where the footer is outside the window. It may use the
+    // active row alone because the caller has already established provider
+    // identity; the provider-agnostic compatibility path below may not.
     let lines = nonempty_trimmed(clean);
     let start = lines.len().saturating_sub(12);
     let tail = &lines[start..];
     if let Some(prompt_i) = tail.iter().rposition(|s| is_prompt_line(s)) {
-        // Older Codex builds painted the active row after the submitted
-        // prompt; current builds keep a disabled prompt shell below the row.
-        // Support both exact adjacent shapes, while refusing an older status
-        // row separated from the newest prompt by completed output.
         let active_before_prompt = prompt_i > 0 && codex_active_status_line(tail[prompt_i - 1]);
         let active_after_prompt = tail[prompt_i + 1..]
             .iter()
@@ -1034,6 +1036,52 @@ fn codex_generation_state_clean(clean: &str) -> Option<bool> {
     None
 }
 
+/// Parse the current Codex footer and return its structurally attached active
+/// row. `Some(None)` is an identifiable idle Codex frame; `None` is not a
+/// current Codex frame at all. Keeping that distinction lets consumers ask a
+/// narrower question than generic generation without reimplementing the frame
+/// anchors.
+fn codex_structured_active_line_clean(clean: &str) -> Option<Option<&str>> {
+    // The Codex prompt shell and model bar remain painted while a turn is
+    // running. The decisive shape is therefore the line immediately ABOVE the
+    // prompt: `• Working (…)` / `• Waiting for background terminal (…)` means
+    // the prompt is disabled and the turn is live; completed turns replace it
+    // with `Worked for …` or ordinary output. ATE-36 incorrectly made the mere
+    // presence of the prompt shell an idle boundary, which hid live ATE-37.
+    let lines = nonempty_trimmed(clean);
+    let start = lines.len().saturating_sub(12);
+    let tail = &lines[start..];
+    // Provider identity must be the CURRENT footer, not a Codex-looking frame
+    // pasted into another provider's prompt. The model/path bar is Codex's
+    // final non-empty row and its prompt glyph is `›` (not Claude's `❯`).
+    let model_i = tail.len().checked_sub(1).filter(|i| codex_model_bar(tail[*i]))?;
+    let prompt_i = tail[..model_i].iter().rposition(|s| s.starts_with('›'))?;
+    // Current Codex paints the active row immediately before its disabled
+    // prompt. Older builds painted it immediately after the submitted prompt,
+    // directly before the model bar. No arbitrary line between these anchors
+    // may vote active: that was the pasted-frame false positive.
+    if prompt_i > 0 && codex_active_status_line(tail[prompt_i - 1]) {
+        return Some(Some(tail[prompt_i - 1]));
+    }
+    if prompt_i + 1 == model_i.saturating_sub(1)
+        && codex_active_status_line(tail[prompt_i + 1])
+    {
+        return Some(Some(tail[prompt_i + 1]));
+    }
+    Some(None)
+}
+
+fn codex_structured_generation_state_clean(clean: &str) -> Option<bool> {
+    codex_structured_active_line_clean(clean).map(|line| line.is_some())
+}
+
+fn codex_background_status_line(line: &str) -> bool {
+    let low = line.trim().to_ascii_lowercase();
+    low.starts_with("• waiting for background terminal (")
+        || low.contains(" background terminal running")
+        || low.contains(" background terminals running")
+}
+
 fn codex_generating(clean: &str) -> bool {
     codex_generation_state_clean(clean).unwrap_or(false)
 }
@@ -1049,16 +1097,18 @@ fn codex_generating(clean: &str) -> bool {
 /// TUI structure; model and effort names stay intentionally open-ended.
 pub(crate) fn codex_pane_generation_state(captured: &str) -> Option<bool> {
     let clean = strip_ansi(captured);
-    let tail = nonempty_trimmed(&clean);
-    let identifiable = tail
-        .iter()
-        .rev()
-        .take(12)
-        .any(|s| s.starts_with('›') || codex_model_bar(s));
-    if !identifiable {
-        return None;
-    }
-    codex_generation_state_clean(&clean)
+    codex_structured_generation_state_clean(&clean)
+}
+
+/// Is the structurally current Codex status row specifically waiting on live
+/// background work? Generic foreground generation remains subject to the
+/// normal steering max-age policy; only this provider-owned state is a hard
+/// hold until its terminal row clears.
+pub(crate) fn codex_pane_background_working(captured: &str) -> bool {
+    let clean = strip_ansi(captured);
+    codex_structured_active_line_clean(&clean)
+        .flatten()
+        .is_some_and(codex_background_status_line)
 }
 
 fn scan_codex(clean: &str, provider: &ProviderId) -> Vec<WorkerEvent> {
