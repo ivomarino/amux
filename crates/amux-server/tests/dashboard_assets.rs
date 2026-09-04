@@ -99,6 +99,23 @@ fn app_ver_and_the_sw_cache_version_agree() {
 }
 
 #[test]
+fn idle_ready_work_names_the_queue_and_keeps_real_stalls_distinct() {
+    let app = asset("app.js");
+    let start = app.find("function _stalledChip(s)").expect("frontier chip renderer must exist");
+    let tail = &app[start..];
+    let end = tail.find("function updatePeekStatus()").expect("frontier chip must precede peek status");
+    let chip = &tail[..end];
+
+    for required in ["readyCards: d.ready || []", "queued behind", "_openIssue("] {
+        assert!(app.contains(required), "queued-WIP rendering lost `{required}`");
+    }
+    assert!(chip.contains("work-queued-chip"), "the holding card must be a semantic control");
+    assert!(chip.contains("queued-behind-wip"), "healthy WIP waits need a logged verdict");
+    assert!(chip.contains("'stalled'"), "the no-holding control must preserve real stalled detection");
+    assert!(chip.contains("no current work explains the block"), "stalled must say why it is alarming");
+}
+
+#[test]
 fn board_worker_actions_group_wrapped_lines_under_their_timestamp() {
     let app = asset("app.js");
     let start = app
@@ -574,6 +591,7 @@ fn board_detail_leads_with_actionable_task_context() {
         "a.resolved_ref",
         "const explicitPath =",
         "const serverResolvedPath =",
+        "<button type=\"button\" class=\"file-link board-artifact-file\"",
         "targetPath = target.replace(/#.*$/",
         "Produced assets (",
         "Source message",

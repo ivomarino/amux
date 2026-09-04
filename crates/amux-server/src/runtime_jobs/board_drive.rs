@@ -177,6 +177,14 @@ const BACKLOG_STALE_AGE_S: i64 = 14 * 86400;
 /// answer by either re-confirming the trigger (bumps `last_verified_at`) or
 /// finally acting on the card — never by an automated status change.
 const SOURCE_REF_STALE_S: i64 = 24 * 3600;
+
+/// A source ref is an external-trigger block only while the owner has recently
+/// verified it. Older refs still preserve message/provenance links but do not
+/// make an otherwise actionable card undispatchable.
+pub(crate) fn fresh_source_ref_trigger(row: &bs::IssueRow, now: i64) -> bool {
+    row.source_ref.as_deref().is_some_and(|v| !v.trim().is_empty())
+        && row.last_verified_at.is_some_and(|at| at > now - SOURCE_REF_STALE_S)
+}
 /// Idle-backlog DRAIN nudge cooldown, SCALED TO THE BACKLOG SIZE. Distinct from
 /// the 72h stale-triage above — this fires when a lane is idle (no doing) with an
 /// empty todo and a non-empty backlog OF ANY AGE, the "board doesn't drive to
@@ -1590,26 +1598,46 @@ fn backlog_by_type_count(conn: &Connection, session: &str) -> usize {
 
 /// How many drainable backlog cards remain. Reported beside the promotion so
 /// the trace answers "is this lane about to run dry" without a second query.
-fn drainable_backlog_count(conn: &Connection, session: &str, now: f64) -> usize {
+fn drainable_backlog_ids(conn: &Connection, session: &str, now: f64) -> Vec<String> {
     let reclaim_cut = now - reclaim_cooldown_s();
     let verified_cut = (now as i64) - SOURCE_REF_STALE_S;
-    conn.query_row(
-        "SELECT COUNT(*) FROM issues i WHERE i.session=?1 AND i.status='backlog' \
+    let candidates = conn
+        .prepare(
+            "SELECT i.id FROM issues i WHERE i.session=?1 AND i.status='backlog' \
            AND i.owner_type='agent' AND i.deleted IS NULL AND COALESCE(i.archived,0)=0 \
            AND COALESCE(i.type,'') NOT IN ('tripwire','watch','epic') \
            AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id \
                            AND lower(t.tag) LIKE 'needs:you%') \
            AND NOT EXISTS (SELECT 1 FROM session_events e WHERE e.type='task.claimed' \
                            AND e.ts > ?2 AND e.data LIKE '%\"' || i.id || '\"%') \
-           AND NOT (COALESCE(i.source_ref,'') <> '' AND COALESCE(i.last_verified_at,0) > ?3)",
-        rusqlite::params![session, reclaim_cut, verified_cut],
-        |r| r.get::<_, i64>(0),
-    )
-    .optional()
-    .ok()
-    .flatten()
-    .unwrap_or(0)
-    .max(0) as usize
+           AND NOT (COALESCE(i.source_ref,'') <> '' AND COALESCE(i.last_verified_at,0) > ?3) \
+         ORDER BY COALESCE(i.created,0) ASC, i.id ASC",
+        )
+        .and_then(|mut st| {
+            st.query_map(rusqlite::params![session, reclaim_cut, verified_cut], |r| {
+                r.get::<_, String>(0)
+            })
+            .map(|rows| rows.flatten().collect::<Vec<_>>())
+        })
+        .unwrap_or_default();
+
+    // A dependency-blocked backlog card is parked just as surely as a fresh
+    // external trigger. Counting or promoting it as drainable only moves the
+    // blockage sideways into To Do, where it can prevent independent backlog
+    // work from ever being considered (the live MR-14/MR-27 topology).
+    candidates
+        .into_iter()
+        .filter(|id| {
+            bs::get_issue(conn, id)
+                .ok()
+                .flatten()
+                .is_some_and(|row| deps_blocking(conn, &row).is_empty())
+        })
+        .collect()
+}
+
+fn drainable_backlog_count(conn: &Connection, session: &str, now: f64) -> usize {
+    drainable_backlog_ids(conn, session, now).len()
 }
 
 /// The oldest backlog card this lane could actually work, or `None`.
@@ -1625,24 +1653,28 @@ fn drainable_backlog_count(conn: &Connection, session: &str, now: f64) -> usize 
 /// condition"; draining it would override that, which is the MG-1388 mistake
 /// this module already carries a scar from.
 fn oldest_drainable_backlog(conn: &Connection, session: &str, now: f64) -> Option<String> {
-    let reclaim_cut = now - reclaim_cooldown_s();
-    let verified_cut = (now as i64) - SOURCE_REF_STALE_S;
-    conn.query_row(
-        "SELECT i.id FROM issues i WHERE i.session=?1 AND i.status='backlog' \
-           AND i.owner_type='agent' AND i.deleted IS NULL AND COALESCE(i.archived,0)=0 \
-           AND COALESCE(i.type,'') NOT IN ('tripwire','watch','epic') \
-           AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id \
-                           AND lower(t.tag) LIKE 'needs:you%') \
-           AND NOT EXISTS (SELECT 1 FROM session_events e WHERE e.type='task.claimed' \
-                           AND e.ts > ?2 AND e.data LIKE '%\"' || i.id || '\"%') \
-           AND NOT (COALESCE(i.source_ref,'') <> '' AND COALESCE(i.last_verified_at,0) > ?3) \
-         ORDER BY COALESCE(i.created,0) ASC LIMIT 1",
-        rusqlite::params![session, reclaim_cut, verified_cut],
-        |r| r.get::<_, String>(0),
-    )
-    .optional()
-    .ok()
-    .flatten()
+    drainable_backlog_ids(conn, session, now).into_iter().next()
+}
+
+/// Promote the next genuinely runnable backlog card when this lane opted into
+/// automatic draining. This is deliberately reusable after todo candidates
+/// have been inspected: the mere presence of a blocked todo must not hide
+/// independent work waiting in backlog.
+fn backlog_drain_pickup(
+    conn: &Connection,
+    session: &str,
+    now: f64,
+    todo_refusals: usize,
+) -> Option<Pickup> {
+    if !dispatch_backlog_when_idle(session) {
+        return None;
+    }
+    let card = oldest_drainable_backlog(conn, session, now)?;
+    Some(Pickup::DrainBacklog {
+        card,
+        backlog_left: drainable_backlog_count(conn, session, now),
+        todo_refusals,
+    })
 }
 
 /// The dependency promotion that must NOT wait for a free WIP slot (AMUX-4040).
@@ -2441,9 +2473,10 @@ pub enum Pickup {
     /// `blocked_card` is the todo that was waiting; `promoted` are the backlog
     /// ids that were promoted. The lane receives no nudge — it just gets work.
     PromoteDeps { blocked_card: String, promoted: Vec<String> },
-    /// A `backlog` card promoted to `todo` because the lane ran out of todo
-    /// and opted in to draining its own backlog (AMUX-4055).
-    DrainBacklog { card: String, backlog_left: usize },
+    /// A `backlog` card promoted to `todo` because the lane has no claimable
+    /// todo and opted in to draining its own backlog (AMUX-4055). A non-zero
+    /// `todo_refusals` makes the ATE-37 fallback visible in traces and logs.
+    DrainBacklog { card: String, backlog_left: usize, todo_refusals: usize },
     /// An ABANDONED `doing` card, returned to `todo` so it stops holding the
     /// lane's WIP slot (AMUX-4042). `held_h` is how long it went untouched.
     ReclaimStale { card: String, held_h: f64, blocking: usize },
@@ -2753,10 +2786,10 @@ pub fn select_pickup_with(
         } else {
             format!("{:.0}m", cooldown_s / 60.0)
         };
-        // OPT-IN BACKLOG DRAIN (AMUX-4055). The todo queue is empty, which is the
-        // only moment this may fire: a lane with todo work must work THAT, and
-        // reaching into backlog while todo has cards would reorder the owner's
-        // queue behind their back.
+        // OPT-IN BACKLOG DRAIN (AMUX-4055). The todo query is empty, so no card
+        // is even eligible for the refusal guards below. If candidates exist,
+        // we inspect them first and use this same drain arm only after every
+        // one proves unclaimable; runnable todo always keeps priority.
         //
         // Promotes ONE card to `todo` rather than claiming it into `doing`
         // directly, so the card takes the ordinary path and the board still
@@ -2768,11 +2801,8 @@ pub fn select_pickup_with(
         // acting on it. The nudge is advisory by design; this is the arm for an
         // owner who would rather it just happen.
         let drain_on = dispatch_backlog_when_idle(session);
-        if drain_on {
-            if let Some(card) = oldest_drainable_backlog(conn, session, now) {
-                let left = drainable_backlog_count(conn, session, now);
-                return Pickup::DrainBacklog { card, backlog_left: left };
-            }
+        if let Some(pickup) = backlog_drain_pickup(conn, session, now, 0) {
+            return pickup;
         }
         // SAY WHY THE DRAIN DID NOT FIRE, in the line someone already reads.
         //
@@ -2932,6 +2962,13 @@ pub fn select_pickup_with(
             ids: listed.into_iter().map(|(id, _)| id).collect(),
             text,
         };
+    }
+    // A todo row can exist yet be unclaimable (for example, waiting on a
+    // human-owned dependency). Once every todo candidate has been honestly
+    // refused, continue the opted-in lane with independent backlog rather than
+    // letting the blocked row shadow that work forever.
+    if let Some(pickup) = backlog_drain_pickup(conn, session, now, skipped.len()) {
+        return pickup;
     }
     Pickup::None {
         reason: "all-candidates-refused",
@@ -3093,10 +3130,16 @@ fn stale_backlog_candidates(
     .unwrap_or_default()
 }
 
-/// Backlog cards of ANY age, newest first — the candidates for the idle-drain
-/// nudge (a lane sitting on a fresh backlog with nothing in todo). Newest first
-/// because a just-arrived batch is the likeliest thing the worker meant to act
-/// on; the worker's own model picks which to promote.
+/// Backlog cards of ANY age, OLDEST FIRST — the candidates for the idle-drain
+/// nudge (a lane sitting on a fresh backlog with nothing in todo).
+///
+/// This comment said "newest first" three times, and gave the reason (a
+/// just-arrived batch is the likeliest thing the worker meant to act on), for as
+/// long as AMUX-3779 has been shipped — which reversed the order to `created ASC`
+/// so the drain reads the same way as the todo scorer. The query below is the
+/// truth; the prose was describing the code it replaced. Found 2026-09-04 while
+/// checking a dispatch-ordering report from ts-gke, where the stale comment was
+/// the first thing that made the behaviour look wrong.
 fn backlog_candidates(conn: &Connection, session: &str, now: i64) -> Vec<(String, String, i64)> {
     // DRAINABLE only — mirror the exclusions in the idle_drain gate so the cards
     // the nudge lists are exactly the ones it claims are un-worked: no dormant
@@ -4999,14 +5042,14 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 .with_counts(eligible, open),
             }
         }
-        Pickup::DrainBacklog { card, backlog_left } => {
+        Pickup::DrainBacklog { card, backlog_left, todo_refusals } => {
             // AMUX-4055. CAS on `expected_from: backlog`, so if the owner moved
             // the card between select and write we lose the race and say so
             // rather than promoting something they just re-parked.
             let card_c = card.clone();
             let line = format!(
-                "auto-drained: lane had no todo left and opted in to backlog dispatch \
-                 ({backlog_left} drainable card(s) remain)"
+                "auto-drained: lane had no claimable todo and opted in to backlog dispatch \
+                 ({backlog_left} drainable card(s) remain; {todo_refusals} todo refusal(s))"
             );
             let result = state
                 .store
@@ -5027,11 +5070,26 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 .await;
             match result {
                 Ok(o) if o.applied => {
+                    if todo_refusals > 0 {
+                        // Two-fix signal: the recovered topology is searchable
+                        // without reconstructing the board at that instant.
+                        tracing::info!(
+                            session = lane,
+                            card,
+                            todo_refusals,
+                            backlog_left,
+                            "board_drive: auto-drain bypassed unclaimable todo"
+                        );
+                    }
                     crate::api::session_verbs::emit_event(
                         state,
                         lane,
                         "backlog.drained",
-                        Some(json!({"issue": card, "backlog_left": backlog_left})),
+                        Some(json!({
+                            "issue": card,
+                            "backlog_left": backlog_left,
+                            "todo_refusals": todo_refusals,
+                        })),
                         None,
                         "board-drive",
                     )
@@ -5040,7 +5098,10 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                         lane,
                         "drain-backlog",
                         &card,
-                        format!("{card} backlog -> todo; {backlog_left} drainable left"),
+                        format!(
+                            "{card} backlog -> todo; {backlog_left} drainable left; \
+                             bypassed {todo_refusals} unclaimable todo(s)"
+                        ),
                     )
                     .with_counts(eligible, open)
                 }
@@ -8000,9 +8061,10 @@ mod tests {
         // needing a redundant opt-in key.
         std::env::remove_var(DISPATCH_BACKLOG_KEY);
         match select_pickup_with(&build(), "lane", now_f64(), false) {
-            Pickup::DrainBacklog { card, backlog_left } => {
+            Pickup::DrainBacklog { card, backlog_left, todo_refusals } => {
                 assert_eq!(card, "B-1", "oldest first, so a starved card is not starved further");
                 assert_eq!(backlog_left, 2, "the count reports what is drainable, before the move");
+                assert_eq!(todo_refusals, 0, "an empty todo queue has no refusals");
             }
             other => panic!("default-on backlog dispatch did not run: {other:?}"),
         }
@@ -8686,6 +8748,39 @@ mod tests {
                 assert_eq!(reason, "all-candidates-refused");
             }
             other => panic!("expected None/all-candidates-refused, got {other:?}"),
+        }
+    }
+
+    /// ATE-37 / live mvs-research acceptance case. A todo that exists but
+    /// cannot run is not queued work; it must not prevent an opted-in lane from
+    /// advancing independent backlog work. MR-14 was blocked on human-owned
+    /// MR-27 while MR-150 and other backlog work were independent, and the lane would
+    /// otherwise stop forever after its current card completed.
+    #[test]
+    fn a_blocked_todo_does_not_hide_actionable_backlog_from_auto_drain() {
+        let conn = board_db();
+        let now = now_f64();
+        add_card(&conn, "H-1", "human", "todo", "external prerequisite", "SCOPE: x");
+        add_card(&conn, "T-1", "lane", "todo", "blocked todo", "SCOPE: x\n- [ ] y");
+        conn.execute("UPDATE issues SET depends_on='[\"H-1\"]' WHERE id='T-1'", [])
+            .expect("dep");
+        add_card(&conn, "B-0", "lane", "backlog", "older blocked backlog", "SCOPE: x\n- [ ] y");
+        conn.execute(
+            "UPDATE issues SET depends_on='[\"H-1\"]', created=1 WHERE id='B-0'",
+            [],
+        )
+        .expect("blocked backlog dep");
+        add_card(&conn, "B-1", "lane", "backlog", "independent backlog", "SCOPE: x\n- [ ] y");
+        conn.execute("UPDATE issues SET created=2 WHERE id='B-1'", [])
+            .expect("backlog order");
+
+        match select_pickup_with(&conn, "lane", now, false) {
+            Pickup::DrainBacklog { card, backlog_left, todo_refusals } => {
+                assert_eq!(card, "B-1");
+                assert_eq!(backlog_left, 1);
+                assert_eq!(todo_refusals, 1, "the trace must expose the blocked todo bypass");
+            }
+            other => panic!("blocked todo must not strand independent backlog: {other:?}"),
         }
     }
 

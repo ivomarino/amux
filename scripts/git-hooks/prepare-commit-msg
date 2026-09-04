@@ -1,6 +1,6 @@
 #!/bin/sh
-# guard-features: interpret-trailers
-# guard-version: 1
+# guard-features: interpret-trailers Amux-Committer
+# guard-version: 2
 # (AF-431 / MR-44. A file declaring guard-features must carry exactly ONE
 #  anchored integer version so staleness is a NUMERIC comparison, not a
 #  substring hunt. Two spellings, per mixpeek-research's dc21a0d489: hooks
@@ -265,6 +265,49 @@ while [ "$_hops" -lt 12 ]; do
   esac
   _p="$_pp"
 done
+
+# A TRAILER ALREADY IN THE MESSAGE OUTRANKS THE ONE THE HOOK KNOWS IS TRUE
+# (AF-479, self-traced 2026-09-04). `--if-exists doNothing` below is correct for
+# both cases it was written for: the graft recipe runs this file by hand and then
+# commits, so re-stamping would duplicate; and a cherry-pick or `git commit -c
+# <peer-sha>` carries the ORIGINAL author's stamp, which is the right provenance
+# and must survive. It also means any hand-written value wins, including a wrong
+# one, while $stamp holds the truth two lines away.
+#
+# It cost a commit. ac550324 landed stamped `amux` because that is what I typed
+# into the message; my lane is `amux-frustrations`. Nothing said anything. The
+# downstream reader is the push guard, which partitions unpushed commits by this
+# trailer — so my own commit would have been listed under a peer's name, and the
+# exit it hands you is to record THAT PEER'S CONSENT for a commit they never
+# wrote. A false author-consent record is the AMUX-3533 shape, reached by
+# following the sanctioned instruction.
+#
+# OVERWRITING IS THE WRONG FIX and stays unimplemented: it would destroy the
+# cherry-pick's true stamp to prevent a typed one. So keep the existing trailer,
+# say the disagreement out loud while the commit is still trivially amendable,
+# and record the committing lane as its own field.
+#
+# `Amux-Committer` IS STAMPED ONLY ON DISAGREEMENT, so its PRESENCE is the
+# signal — a reader grepping for it finds exactly the commits where the session
+# stamp is not the lane that ran `git commit`. An always-present field would make
+# them hunt for a comparison instead. The pre-push guard reads it and drops the
+# ask-the-author advice for those commits.
+_declared="$(git interpret-trailers --parse "$msg_file" 2>/dev/null \
+  | sed -n 's/^Amux-Session:[[:space:]]*//p' | head -1)"
+if [ -n "$_declared" ] && [ "$_declared" != "$stamp" ]; then
+  printf '\namux commit-stamp: this message already declares `Amux-Session: %s`, but this\n' "$_declared" >&2
+  printf '  commit is being made by `%s`. The declared value is KEPT (a cherry-picked\n' "$stamp" >&2
+  printf '  or grafted message legitimately carries its original author), and\n' >&2
+  printf '  `Amux-Committer: %s` is added beside it so the two facts are both readable.\n' "$stamp" >&2
+  printf '  If you TYPED that session name and meant your own, fix it now while the\n' >&2
+  printf '  commit is still cheap to amend. The push guard partitions by Amux-Session,\n' >&2
+  printf '  so it will read this commit as belonging to that other lane.\n\n' >&2
+  git interpret-trailers --in-place --if-exists doNothing \
+    --trailer "Amux-Committer: $stamp" "$msg_file" 2>/dev/null || {
+    grep -q "^Amux-Committer: " "$msg_file" 2>/dev/null \
+      || printf 'Amux-Committer: %s\n' "$stamp" >> "$msg_file"
+  }
+fi
 
 git interpret-trailers --in-place --if-exists doNothing \
   --trailer "Amux-Session: $stamp" "$msg_file" 2>/dev/null || {

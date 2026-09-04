@@ -994,6 +994,10 @@ const READ_ONLY_VERBS: &[&str] = &[
     "cut", "column", "od", "xxd", "hexdump", "tree", "du", "basename",
     "dirname", "realpath", "readlink", "sha256sum", "md5sum", "nl", "tac",
     "pwd", "echo", "printf",
+    // `read` consumes stdin into a shell variable and cannot touch a file.
+    // Reached via `while read -r l; do ...; done`, where stripping `while` leaves
+    // it as the segment's verb (AMUX-2841 fix, 2026-09-04).
+    "read",
     // `cd` cannot modify anything, and its ABSENCE silently undid the
     // git-read exemption directly below: `git show f` was correctly a read,
     // while `cd /repo && git show f` was not, because the FIRST segment's
@@ -1079,12 +1083,107 @@ fn is_pure_read_command(cmd: &str) -> bool {
             }
             return false;
         }
+        // SHELL STRUCTURE IS NOT A COMMAND (AMUX-2841's first observed specimen,
+        // 2026-09-04). `for c in A B; do git show HEAD:f | grep -c x; done` splits
+        // into verbs [for, do, git, grep, done], and `for`/`do`/`done` are not read
+        // verbs, so a loop wrapping nothing but reads was classified as a potential
+        // write. Its paths then went to the mtime gate, and while a PEER was
+        // committing frustrations.md the gate minted a self-claim on a file this
+        // lane had only read. That is the exact trigger AMUX-2841 was filed on and
+        // waited for a specimen since 2026-08-11; it produced two in one session.
+        //
+        // IDENTICAL TO THE `cd` CASE directly above, which cost 117 of 191
+        // inferred-edit records in 24h (AEAB-24): one non-command token at the
+        // front of a segment decided the whole command.
+        //
+        // SAFE FOR THE SAME REASON. The check is conjunctive: EVERY segment must
+        // read, so `for f in *; do rm $f; done` still fails on the `rm` segment.
+        // Adding structure words cannot make a mutation look like a read; it only
+        // stops structure from making a read look like a mutation.
+        // STRIP leading structure and check what FOLLOWS it. Skipping the whole
+        // segment was the first version of this fix and the negative cell caught
+        // it in one run: `for f in *.rs; do rm $f; done` splits to
+        // ["for f in *.rs", "do rm $f", "done"], and skipping on `do` never
+        // examined the `rm`. Structure must not be able to hide a command behind
+        // it, which is the entire safety property here.
+        let mut toks = seg.split_whitespace().skip_while(|t| {
+            let v = Path::new(t).file_name().and_then(|x| x.to_str()).unwrap_or(t);
+            SHELL_STRUCTURE.contains(&v)
+        });
+        let verb = match toks.next() {
+            // Nothing but structure (`done`, `fi`, `esac`). Reads nothing, writes
+            // nothing, decides nothing.
+            None => continue,
+            Some(t) => Path::new(t).file_name().and_then(|x| x.to_str()).unwrap_or(t),
+        };
+        // Inside a test expression. `if [ -f a.md ]; then cat a.md; fi` leaves
+        // `-f a.md ]` once `if` and `[` are stripped, and a command never begins
+        // with a dash. `[ ... ]` evaluates a condition and runs nothing.
+        if verb.starts_with('-') || verb == "]" || verb == "]]" {
+            continue;
+        }
+        // `for c in AF-1 AF-2` leaves `c in AF-1 AF-2` once `for` is stripped, and
+        // the loop VARIABLE is not a command. A segment whose head is a bare word
+        // followed by the `in` keyword is a for/case header and runs nothing.
+        if seg.split_whitespace().any(|t| t == "in")
+            && SHELL_STRUCTURE.contains(
+                &Path::new(seg.split_whitespace().next().unwrap_or(""))
+                    .file_name()
+                    .and_then(|x| x.to_str())
+                    .unwrap_or(""),
+            )
+        {
+            continue;
+        }
+        // Re-run the git and sed arms against the STRIPPED verb, so `do git show f`
+        // gets the same treatment as `git show f`.
+        if verb == "git" {
+            let after: Vec<&str> = seg
+                .split_whitespace()
+                .skip_while(|t| SHELL_STRUCTURE.contains(t))
+                .collect();
+            let mut rest = after.into_iter().skip(1);
+            let mut sub = None;
+            while let Some(t) = rest.next() {
+                if t == "-C" || t == "-c" {
+                    rest.next();
+                    continue;
+                }
+                if t.starts_with('-') {
+                    continue;
+                }
+                sub = Some(t);
+                break;
+            }
+            match sub {
+                Some(x) if GIT_READ_SUBCMDS.contains(&x) => continue,
+                _ => return false,
+            }
+        }
+        // A stray delimiter left by splitting on `(` and `)`. `echo "x $(git show
+        // f | grep y)"` yields a final segment of `"`, whose "verb" is `"` — not a
+        // read verb, so the same false claim followed. A token with no alphanumeric
+        // character is punctuation the split produced, never a command.
+        if !verb.chars().any(|c| c.is_alphanumeric()) {
+            continue;
+        }
         if !READ_ONLY_VERBS.contains(&verb) {
             return false;
         }
     }
     saw
 }
+
+/// Shell keywords and builtins that STRUCTURE a command without running one.
+///
+/// Deliberately not merged into `READ_ONLY_VERBS`: that list means "a command
+/// that reads", and `done` reads nothing. Keeping them apart is what makes the
+/// safety argument legible — structure is skipped, commands are checked.
+const SHELL_STRUCTURE: &[&str] = &[
+    "for", "do", "done", "while", "until", "if", "then", "elif", "else", "fi",
+    "case", "esac", "in", "select", "function", "time", "!", ":", "true",
+    "[", "[[", "]]", "test",
+];
 
 /// `sed -n '1,50p' <file>` is a READ, and it is the read this fleet is TOLD to
 /// use: bypass-permissions sessions are instructed to "read files with cat,
@@ -1100,8 +1199,90 @@ fn is_pure_read_command(cmd: &str) -> bool {
 /// conservative treatment; anything unrecognized still falls through to
 /// authored, so no real write loses its attribution — the direction this must
 /// never get wrong.
+/// Split on whitespace, but treat a quoted span as one token.
+///
+/// Only good enough for counting operands: it does not resolve escapes or nested
+/// quoting, and it does not need to. Anything it gets wrong lands on "there is an
+/// operand", which is the conservative side.
+fn quote_aware_tokens(seg: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    for c in seg.chars() {
+        match quote {
+            Some(q) => {
+                cur.push(c);
+                if c == q {
+                    quote = None;
+                }
+            }
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                cur.push(c);
+            }
+            None if c.is_whitespace() => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            None => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 fn sed_is_pure_read(seg: &str) -> bool {
     let mut saw_n = false;
+    // A SED WITH NO FILE OPERAND CANNOT REACH A FILE (AMUX-2841's third specimen,
+    // 2026-09-04). `... | sed 's/^/x/'` reads stdin and writes stdout. The `-n`
+    // requirement below is right for `sed 's/a/b/' notes.md`, which NAMES a file,
+    // and wrong for a stream filter, which names none — and the wrong half claimed
+    // board_drive.rs off a peer's concurrent commit, through the pipeline
+    // `git show HEAD:...board_drive.rs | grep -c ... | sed 's/^/  n: /'`, where the
+    // first two segments classify as reads and the third decided the command.
+    //
+    // Operand counting, not flag counting: `-e` and `-f` CONSUME the next token
+    // (the script, and a script FILE), so a bare token after them is an operand
+    // rather than the script. With neither, the first bare token IS the script.
+    // `-i` still refuses regardless, and `-i` cannot occur without an operand
+    // anyway; `/w` still refuses, since it writes with no shell redirection.
+    // QUOTE-AWARE TOKENS. `split_whitespace` tears `'s/^/  n: /'` into three
+    // tokens and the last two counted as file operands, which put the specimen
+    // back where it started. A quoted span is ONE token: keeping it whole also
+    // keeps a quoted FILENAME (`sed -n 'p' 'my file.txt'`) countable as the
+    // operand it is, which dropping quoted spans entirely would have lost — the
+    // unsafe direction.
+    let toks = quote_aware_tokens(seg);
+    let mut operands = 0usize;
+    let mut script_taken = false;
+    let mut expect_arg = false;
+    for tok in toks.iter().skip(1).map(String::as_str) {
+        if expect_arg {
+            expect_arg = false;
+            script_taken = true;
+            continue;
+        }
+        if tok == "-e" || tok == "-f" || tok == "--expression" || tok == "--file" {
+            expect_arg = true;
+            continue;
+        }
+        if tok.starts_with("-e") || tok.starts_with("-f") {
+            script_taken = true; // attached form, e.g. -e's/a/b/'
+            continue;
+        }
+        if tok.starts_with('-') {
+            continue;
+        }
+        if script_taken {
+            operands += 1;
+        } else {
+            script_taken = true;
+        }
+    }
+    let stream_only = operands == 0;
     for tok in seg.split_whitespace().skip(1) {
         if tok == "--in-place" || tok.starts_with("--in-place=") {
             return false;
@@ -1129,7 +1310,9 @@ fn sed_is_pure_read(seg: &str) -> bool {
     if seg.contains("/w") || seg.contains("/W") {
         return false;
     }
-    saw_n
+    // Every write route is ruled out above. With no file operand there is nothing
+    // left for sed to write to, so `-n` is not required to call it a read.
+    stream_only || saw_n
 }
 
 /// MG-1484: is this command a RESTORE and nothing else? True when every
@@ -4847,8 +5030,62 @@ mod tests {
             "find . -name x.rs",
             "head foo.md | grep x",
             "cat a.md | head -5 | wc -l",
+            // AMUX-2841's first observed specimens, both from one session on
+            // 2026-09-04, both verbatim. A loop and a command substitution over
+            // nothing but reads; before this they classified as potential writes
+            // and minted a self-claim on frustrations.md while a PEER was
+            // committing it.
+            "for c in AF-485 AF-481; do printf '  %s: ' $c; \
+             git show HEAD:frustrations.md | grep -c \"CARD: $c\"; done",
+            "echo \"count: $(git show HEAD:frustrations.md | grep -c '^## ')\"",
+            "if [ -f a.md ]; then cat a.md; fi",
+            "while read -r l; do echo \"$l\"; done",
+            // AMUX-2841's THIRD specimen, 2026-09-04, verbatim. A stream sed has
+            // no file operand: it reads stdin and writes stdout and cannot touch
+            // a file. Requiring `-n` here claimed board_drive.rs off a peer's
+            // concurrent commit.
+            "git show HEAD:crates/x.rs | grep -c 'oldest-first' | sed 's/^/  n: /'",
+            "cat a.md | sed 's/foo/bar/'",
+            "grep x a.md | sed -e 's/a/b/' -e 's/c/d/'",
         ] {
             assert!(is_pure_read_command(cmd), "should be pure read: {cmd}");
+        }
+    }
+
+    /// A STREAM SED IS A READ; A SED WITH A FILE OPERAND KEEPS ITS CAUTION.
+    /// The `-n` requirement is correct when sed NAMES a file and wrong when it
+    /// filters a pipe. These are the writes that must stay authored.
+    #[test]
+    fn a_sed_that_can_reach_a_file_is_still_not_a_read() {
+        for cmd in [
+            "sed -i s/a/b/ notes.md",
+            "sed -i.bak s/a/b/ notes.md",
+            "cat a | sed -ni s/a/b/ notes.md",
+            "cat a | sed 's/x/y/w out.txt'",
+            "sed 's/a/b/' notes.md",
+            "cat a | sed --in-place s/a/b/ notes.md",
+        ] {
+            assert!(!is_pure_read_command(cmd), "a file-reaching sed read as pure: {cmd}");
+        }
+    }
+
+    /// STRUCTURE MUST NOT LAUNDER A WRITE (AMUX-2841 fix, 2026-09-04).
+    ///
+    /// The fix skips shell keywords and punctuation so a loop over reads is a
+    /// read. The direction that must never break is the other one: a mutation
+    /// inside the same structure still has to be authored, or the guard stops
+    /// protecting anything. The check is conjunctive per segment, and this is
+    /// what asserts that it stayed that way.
+    #[test]
+    fn shell_structure_does_not_launder_a_write() {
+        for cmd in [
+            "for f in *.rs; do rm $f; done",
+            "if [ -f a.md ]; then sed -i s/a/b/ a.md; fi",
+            "while read -r l; do echo $l > out.txt; done",
+            "for c in 1 2; do git add frustrations.md; done",
+            "echo \"$(git commit -am wip)\"",
+        ] {
+            assert!(!is_pure_read_command(cmd), "structure laundered a write: {cmd}");
         }
     }
 

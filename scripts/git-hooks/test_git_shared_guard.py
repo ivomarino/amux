@@ -185,6 +185,19 @@ def main():
         ("amend unpushed unpinned", "git commit --amend --no-edit", True),
         ("amend unpushed pinned-match", f"AMUX_AMEND_EXPECT={head} git commit --amend --no-edit", False),
         ("amend unpushed stale pin", "AMUX_AMEND_EXPECT=deadbeefdead git commit --amend --no-edit", True),
+        # `-C` IS TWO FLAGS. Every case above spells the amend without one, and
+        # that is why the hole below survived: an unanchored `-C\s+(\S+)` search
+        # read `git commit --amend -C HEAD` as `git -C HEAD`, resolved run_dir to
+        # <cwd>/HEAD, and the amend verdict failed open on the empty rev-parse.
+        # Two of these rewrote a peer's unpushed commits on 2026-09-04 without a
+        # word from the guard. The forms are otherwise identical to the trio, so
+        # a matrix that never names the flag cannot see it.
+        ("amend unpushed unpinned -C HEAD", "git commit --amend -C HEAD", True),
+        ("amend unpushed unpinned -C sha", f"git commit --amend --no-verify -C {head}", True),
+        ("amend unpushed pinned -C HEAD", f"AMUX_AMEND_EXPECT={head} git commit --amend -C HEAD", False),
+        # Copy detection is the same collision on a read-only verb: harmless in
+        # itself, and it proves the fix is about WHERE -C sits, not about amend.
+        ("log -C is not a directory flag", "git log -C -M --oneline", False),
     ]
     for name, cmd, expect_block in trio:
         code, err = run_hook(cmd, work, work)

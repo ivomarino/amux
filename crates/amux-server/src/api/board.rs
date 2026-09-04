@@ -407,6 +407,38 @@ mod frontier_exclusion_tests {
     /// entirely left every other cell green: the logic was inline in a handler
     /// that needs AppState, so nothing could reach it. A predicate the tests
     /// cannot call is a predicate nothing pins.
+    /// A LOGGED SENTINEL MUST BE PRINTABLE (AF-481).
+    ///
+    /// `NEW_CARD_SELF_ID` is passed to `depends_on_cycle`, which logs it as
+    /// `self_id` when it finds a pre-existing cycle elsewhere on the board. It
+    /// used to be "\u{0}new-card". Nineteen of those bytes in a 67 MB
+    /// server-rs.log made grep call the whole file binary, and `grep -o` then
+    /// returned 8 matches where `grep -c` counted 17 lines, silently, into a
+    /// pipe. The repo's own log-sweep doc prescribes greps over that file.
+    ///
+    /// The cell asserts the property rather than the string, so any future
+    /// sentinel is covered: no control characters, and still impossible as a
+    /// real card id (ids are `[A-Z]+-<digits>`).
+    #[test]
+    fn the_new_card_sentinel_cannot_poison_a_log_or_collide_with_an_id() {
+        assert!(
+            !NEW_CARD_SELF_ID.chars().any(|c| c.is_control()),
+            "a sentinel that reaches a log line must be printable: {NEW_CARD_SELF_ID:?}"
+        );
+        // NON-COLLISION, the property the NUL was chosen for and which must
+        // survive the fix. A real id is uppercase letters, a hyphen and digits;
+        // anything outside that alphabet is as impossible as a NUL was.
+        assert!(
+            NEW_CARD_SELF_ID
+                .chars()
+                .any(|c| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-')),
+            "the sentinel must contain a character no card id can: {NEW_CARD_SELF_ID:?}"
+        );
+        // AND IT MUST NOT BE EMPTY, which would satisfy both assertions above
+        // vacuously and match every id as a substring.
+        assert!(!NEW_CARD_SELF_ID.is_empty(), "an empty sentinel is not a sentinel");
+    }
+
     #[test]
     fn the_frontier_excludes_both_spellings_of_blocked() {
         // Ready: a plain todo with a continuation, gate on.
@@ -2272,7 +2304,17 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
     }
     // (see designate_owner_reach for why this exists)
     if slim {
-        obj.insert("desc_len".into(), json!(row.desc.chars().count()));
+        // AF-346: `desc` may be a bounded PREFIX here. The two derivations
+        // that cannot be recomputed from one arrive beside it, from SQL; the
+        // `None` arm is what every non-prefixed row and every hand-built test
+        // row takes, unchanged. Deliberately NOT `unwrap_or_else(compute from
+        // the prefix)` — that fallback would return a smaller number that looks
+        // exactly like a real one, which is the failure a99955f7 shipped.
+        let desc_len = match &row.desc_prefixed {
+            Some(p) => p.desc_len,
+            None => row.desc.chars().count(),
+        };
+        obj.insert("desc_len".into(), json!(desc_len));
         let log_n = row
             .log
             .as_deref()
@@ -2306,8 +2348,13 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
             .take(120)
             .collect();
         obj.insert("desc_head".into(), json!(head));
-        let folded_n = row.desc.matches("New task:").count()
-            + row.log.as_deref().map(|l| l.matches("New task:").count()).unwrap_or(0);
+        let folded_n = match &row.desc_prefixed {
+            Some(p) => p.folded_n,
+            None => {
+                row.desc.matches("New task:").count()
+                    + row.log.as_deref().map(|l| l.matches("New task:").count()).unwrap_or(0)
+            }
+        };
         obj.insert("folded_n".into(), json!(folded_n));
 
         // The third derivation the list makes over desc+log (app.js:19231): the
@@ -2968,6 +3015,11 @@ pub async fn list_board(
         }
     };
 
+    // AF-346: a slim response ships DERIVATIONS of desc, never desc, so it does
+    // not need the whole string. `Full` is not a fallback here, it is the shape
+    // `?full=1` / `?slim=0` asked for, and it is what every other caller of
+    // these two functions still gets.
+    let prose = if slim { bs::Prose::SlimDerivations } else { bs::Prose::Full };
     let quota = qp_truthy(p.quota.as_deref());
     let store = state.store.clone();
     let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -2988,12 +3040,13 @@ pub async fn list_board(
                     &session_f,
                     archived,
                     done_limit.max(0) as usize,
+                    prose,
                 )?,
                 0,
                 0,
             )
         } else {
-            bs::list_issues_capped(&conn, &status_f, &session_f, archived, done_limit)?
+            bs::list_issues_capped(&conn, &status_f, &session_f, archived, done_limit, prose)?
         };
         // The `stale` flag needs the active-session set only when an
         // in-progress card is present (Python computes it in `_load_board`).
@@ -3634,8 +3687,27 @@ pub async fn create_item(
             // create can slip a cycle between check and insert. The new id
             // does not exist yet, so a placeholder self id is fine — only
             // edges out of it are being added.
+            //
+            // THE PLACEHOLDER IS PRINTABLE, and it was not (AF-481). It used to
+            // be "\u{0}new-card": a leading NUL, chosen because no real card id
+            // can contain one, which is correct and is also true of a space. The
+            // sentinel reaches a LOG LINE verbatim, `depends_on_cycle` warns with
+            // `self_id = %self_id` on a pre-existing cycle elsewhere on the board,
+            // and a single NUL byte makes grep declare the WHOLE FILE binary.
+            //
+            // Measured 2026-09-04: 19 NUL bytes in a 67 MB server-rs.log, all 19
+            // from this one warn, all from the same stuck cycle
+            // (GE-473 -> MHC-256) retried across three days. `grep -c` still
+            // counted 17 matching lines while `grep -o` returned 8, because grep
+            // suppresses match OUTPUT for binary input and says nothing when the
+            // output goes to a pipe. Every `grep -o` sweep over that file
+            // undercounted by 53% and looked fine, and this repo's own log-sweep
+            // doc prescribes greps.
+            //
+            // Non-collision is unchanged: card ids are `[A-Z]+-<digits>`, so the
+            // space and the parentheses are as impossible as the NUL was.
             if !new.depends_on.is_empty() {
-                if let Some(cycle) = bs::depends_on_cycle(conn, "\u{0}new-card", &new.depends_on)? {
+                if let Some(cycle) = bs::depends_on_cycle(conn, NEW_CARD_SELF_ID, &new.depends_on)? {
                     return finish(&slot_w, Out::Cycle(cycle), no_write());
                 }
             }
@@ -3762,6 +3834,14 @@ pub async fn create_item(
 
 fn resolve_task_asset(reference: &str, work_dir: &str) -> String {
     let reference = reference.trim();
+    if let Some(rest) = reference.strip_prefix("~/") {
+        return std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join(rest)
+            .to_string_lossy()
+            .into_owned();
+    }
     let is_external = reference.starts_with("http://")
         || reference.starts_with("https://")
         || reference.starts_with('#')
@@ -3788,6 +3868,10 @@ fn resolve_task_asset(reference: &str, work_dir: &str) -> String {
     let path_shaped = path_ref.starts_with("./")
         || path_ref.starts_with("../")
         || path_ref.contains('/')
+        || path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with('.') && name.len() > 1)
         || path.extension().is_some();
     if !path_shaped {
         return reference.to_string();
@@ -3823,6 +3907,37 @@ fn resolve_task_asset(reference: &str, work_dir: &str) -> String {
     }
 }
 
+/// Availability is measured only where doing so is local and side-effect free.
+/// Fetching an arbitrary artifact URL from this endpoint would turn a board
+/// render into an SSRF primitive; an external link therefore says explicitly
+/// that reachability was not measured instead of pretending it passed.
+fn task_asset_availability(reference: &str, resolved: &str) -> Value {
+    let external = reference.starts_with("http://") || reference.starts_with("https://");
+    let symbolic = reference.starts_with('#')
+        || ((7..=40).contains(&reference.len())
+            && reference.bytes().all(|c| c.is_ascii_hexdigit()));
+    if external {
+        json!({
+            "state": "external",
+            "measured": false,
+            "why_unmeasured": "external URLs are not fetched by the server (avoids SSRF and side effects)",
+        })
+    } else if symbolic {
+        json!({
+            "state": "symbolic",
+            "measured": false,
+            "why_unmeasured": "commit and PR references are resolved by their repository surface",
+        })
+    } else {
+        let exists = std::path::Path::new(resolved.split('#').next().unwrap_or(resolved)).exists();
+        json!({
+            "state": if exists { "available" } else { "missing" },
+            "measured": true,
+            "exists": exists,
+        })
+    }
+}
+
 #[cfg(test)]
 mod task_asset_resolution_tests {
     use super::resolve_task_asset;
@@ -3845,8 +3960,10 @@ mod task_asset_resolution_tests {
         let repo = root.path().join("mixpeek");
         let cwd = repo.join("customers/tubescience");
         let file = cwd.join("migration/mxp.py");
+        let dotenv = cwd.join(".env");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, "# asset").unwrap();
+        std::fs::write(&dotenv, "TOKEN=hidden-asset").unwrap();
 
         assert_eq!(
             resolve_task_asset("migration/mxp.py", cwd.to_str().unwrap()),
@@ -3858,6 +3975,16 @@ mod task_asset_resolution_tests {
                 cwd.to_str().unwrap()
             ),
             format!("{}#contract", file.to_string_lossy())
+        );
+        assert_eq!(
+            resolve_task_asset("customers/tubescience/.env", cwd.to_str().unwrap()),
+            dotenv.to_string_lossy(),
+            "repo-relative dotfiles resolve from the producing worker's directory"
+        );
+        assert_eq!(
+            resolve_task_asset(".env", cwd.to_str().unwrap()),
+            dotenv.to_string_lossy(),
+            "a bare dotfile resolves from the producing worker's directory"
         );
     }
 }
@@ -3940,7 +4067,9 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
             .unwrap_or_default();
         for artifact in &mut artifacts {
             if let Some(reference) = artifact.get("ref").and_then(Value::as_str) {
-                artifact["resolved_ref"] = json!(resolve_task_asset(reference, &work_dir));
+                let resolved = resolve_task_asset(reference, &work_dir);
+                artifact["availability"] = task_asset_availability(reference, &resolved);
+                artifact["resolved_ref"] = json!(resolved);
             }
         }
         let mut add_asset = |reference: String, source: &str| {
@@ -3948,6 +4077,7 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
             let resolved_ref = resolve_task_asset(&reference, &work_dir);
             asset_links.push(json!({
                 "ref": reference,
+                "availability": task_asset_availability(&reference, &resolved_ref),
                 "resolved_ref": resolved_ref,
                 "source": source,
             }));
@@ -3955,9 +4085,14 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
         for (source, text) in [
             ("evidence", row.evidence.as_deref().unwrap_or("")),
             ("last result", row.last_result.as_deref().unwrap_or("")),
-            ("activity", row.log.as_deref().unwrap_or("")),
         ] {
             for reference in bs::asset_refs(text) { add_asset(reference, source); }
+        }
+        // Activity is broad: it names inputs, peer-owned dirty files, and
+        // commits belonging to other cards. Only explicit output language may
+        // synthesize a link; commit-report registers its exact outputs below.
+        for reference in bs::output_asset_refs(row.log.as_deref().unwrap_or("")) {
+            add_asset(reference, "worker output");
         }
         let mut file_stmt = conn.prepare(
             "SELECT path FROM issue_files WHERE issue_id=?1 ORDER BY added_at, path",
@@ -4404,12 +4539,54 @@ pub async fn claim_item(
 /// Truncate for a HISTORY LINE, on chars not bytes (a multi-byte title must not
 /// panic the writer) and with an ellipsis so a truncated value never reads as
 /// the whole value.
+/// Stand-in self id for a card that does not exist yet, used only by the
+/// create-path acyclicity check (AF-481).
+///
+/// Printable, because it is logged. See the call site for the 19 NUL bytes that
+/// turned a 67 MB log binary and cost every `grep -o` sweep over it 53% of its
+/// matches, silently.
+const NEW_CARD_SELF_ID: &str = "(new card)";
+
 fn chars_truncate_log(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         return s.to_string();
     }
     format!("{}…", s.chars().take(n).collect::<String>())
 }
+
+/// Head+tail with the dropped count NAMED, for a value the log is the only copy
+/// of (AF-459, reopened by gtm-engine 2026-09-04 after refusing to validate it).
+///
+/// `chars_truncate_log` keeps a PREFIX, and a prefix of a destroyed value
+/// reproduces the exact failure this log line exists to prevent: gtm-engine lost
+/// a 366-character five-item inventory, recovered four items from a prefix, and
+/// the fifth was gone. The first fix raised the cap from 60 to 200 and their
+/// case still lands past it, so partial recovery from a prefix survived the fix
+/// that was written for it. Any FIXED prefix cap has that property for some
+/// value; the question is only whose.
+///
+/// Two changes, and the second is the one that matters. The bound is generous
+/// enough that a real trigger is kept WHOLE, and past it the middle goes rather
+/// than the tail, with `[N chars elided]` in the gap. A reader then knows they
+/// are holding an incomplete value instead of believing a prefix is all there
+/// was, which is the difference between a recoverable loss and a silent one.
+fn chars_elide_middle(s: &str, head: usize, tail: usize) -> String {
+    let n = s.chars().count();
+    if n <= head + tail {
+        return s.to_string();
+    }
+    let h: String = s.chars().take(head).collect();
+    let t: String = s.chars().skip(n - tail).collect();
+    format!("{h}…[{} chars elided]…{t}", n - head - tail)
+}
+
+/// The destroyed `source_ref` is kept whole up to head+tail characters.
+///
+/// 1800 rather than 200: gtm-engine's real loss was 366 and the previous bound
+/// was chosen without one. A bound wants a measurement behind it, and the only
+/// measurement available is the largest value anyone has actually lost.
+const SOURCE_REF_LOG_HEAD: usize = 900;
+const SOURCE_REF_LOG_TAIL: usize = 900;
 
 /// AF-413: which fields did a REFUSAL throw away?
 ///
@@ -4682,6 +4859,12 @@ enum PatchOut {
         /// dropped goes and sets it again, or files a bug against working
         /// code, which is exactly what this card was.
         diverted: Vec<Value>,
+        /// Advisories are NOT diversions (AF-469 regression, 2026-09-04). A
+        /// diversion says "the key you named is not the key that changed"; an
+        /// advisory says "the write landed, and here is a companion field you
+        /// did not send". Merging them tripped a control written to stop an
+        /// advisory firing on every source_ref write.
+        advisories: Vec<Value>,
         /// (session, from_status, to_status) when a status change happened,
         /// for reactive pickup: if the transition freed the lane (done/verified/
         /// discarded), fire an immediate pickup instead of waiting 60s.
@@ -5155,6 +5338,8 @@ pub async fn patch_item(
             // Filled by the source_ref arm below when a trigger is rerouted to
             // the card body. Empty on every other write.
             let mut diverted: Vec<Value> = Vec::new();
+            // Separate from `diverted` on purpose — see the advisory push below.
+            let mut advisories: Vec<Value> = Vec::new();
             // EVERY key unwritable = the request was unusable (AEAB/#134 review,
             // reported by tsukimiya). Narrow on purpose: a MIXED body such as
             // {"status":"done","item_type":"code"} where the card is already
@@ -5624,6 +5809,56 @@ pub async fn patch_item(
                         }));
                     }
                     _ => set_opt("source_ref", &mut next.source_ref, &mut changed),
+                }
+                // A TRIGGER WITH NO VERIFICATION TIME RE-DRAINS FOREVER, SILENTLY.
+                //
+                // board_drive's idle-drain gate is
+                //   COALESCE(source_ref,'')='' OR COALESCE(last_verified_at,0) < now-24h
+                // so a card parked with a source_ref and NO last_verified_at reads as
+                // "trigger nobody has re-checked" on every tick and is offered again,
+                // forever. `amux board <status> --trigger` stamps both. A raw PATCH —
+                // which is the shape ~/.claude/CLAUDE.md's board recipes teach — sets
+                // only the one field, and nothing said so.
+                //
+                // Measured 2026-09-04 by ts-gke, on themselves. They parked TG-3239 by
+                // raw PATCH and eleven other cards with the CLI. The drain served
+                // TG-3239 four times in one session while the eleven stayed quiet, and
+                // they filed a dispatch-ORDERING report against amux on the strength of
+                // it: wrong population, wrong conclusion, wrong recommendation, sent to
+                // a peer. The two calls do the same visible thing and only one stamps.
+                //
+                // TELL THE CALLER, not just the card (AMUX-3791, same reasoning as the
+                // autofix diversion above): the operator saw a 200 and a card that
+                // looked parked. This is the only signal that reaches the person who
+                // can fix it, at the moment they can.
+                if changed.iter().any(|c| c == "source_ref")
+                    && next.source_ref.as_deref().is_some_and(|v| !v.trim().is_empty())
+                    && !map.contains_key("last_verified_at")
+                {
+                    // ITS OWN FIELD, NOT `diverted`. A diversion means "the key
+                    // you named is deliberately not the key that changed"
+                    // (AMUX-3791). Nothing was diverted here: source_ref landed
+                    // exactly where the caller asked. This is an ADVISORY about a
+                    // companion field they did not send.
+                    //
+                    // Overloading `diverted` cost a real regression the same day:
+                    // a_trigger_cannot_overwrite_an_autofix_signature_but_can_
+                    // replace_a_trigger carries a CONTROL asserting an ordinary
+                    // trigger write reports NO diversion, written precisely so
+                    // "a version that emitted the advisory on every source_ref
+                    // write would pass every cell above and train readers to
+                    // ignore a line that cries wolf". It caught this, correctly,
+                    // and the control was right.
+                    advisories.push(json!({
+                        "field": "last_verified_at",
+                        "not_set": true,
+                        "why": "source_ref was set without last_verified_at, so board-drive \
+                                reads this card as a trigger nobody has re-checked and will \
+                                re-offer it on every idle tick. `amux board <status> <id> \
+                                --trigger \"...\"` stamps both; a raw PATCH sets only \
+                                source_ref. Send last_verified_at (unix seconds) alongside \
+                                it, or park with the CLI.",
+                    }));
                 }
             }
             if let Some(ot) = body_str(&map, "owner_type") {
@@ -7206,10 +7441,18 @@ pub async fn patch_item(
                         // their own transcript. The fifth is gone. Second known
                         // clobber of this field on that board.
                         //
-                        // The old value is kept LONG (200 vs the 60 used for
-                        // arrivals) for the same reason: a truncated sole copy
-                        // reproduces the exact partial-recovery they got by
-                        // accident.
+                        // The old value is kept WHOLE where the arriving one is
+                        // truncated at 60, and the asymmetry is the point: the
+                        // arriving value is ON THE CARD, and this line is the
+                        // only copy of the one being destroyed.
+                        //
+                        // It said "kept LONG (200)" and named the hazard it was
+                        // still committing (AF-459). gtm-engine refused to
+                        // validate it and measured the boundary: 88 and 158
+                        // chars survive, 208 and beyond are head-truncated to
+                        // 201, and their real loss was 366. A prefix cap fails
+                        // for some value whatever the number; see
+                        // chars_elide_middle for why the middle goes instead.
                         "source_ref" => {
                             let before = row.source_ref.as_deref().unwrap_or("");
                             let after = next.source_ref.as_deref().unwrap_or("(cleared)");
@@ -7218,7 +7461,11 @@ pub async fn patch_item(
                             } else {
                                 format!(
                                     "source_ref: WAS {} -> {}",
-                                    chars_truncate_log(before, 200),
+                                    chars_elide_middle(
+                                        before,
+                                        SOURCE_REF_LOG_HEAD,
+                                        SOURCE_REF_LOG_TAIL
+                                    ),
                                     chars_truncate_log(after, 60)
                                 )
                             }
@@ -7486,6 +7733,7 @@ pub async fn patch_item(
                     body,
                     ignored,
                     diverted,
+                    advisories,
                     status_transition: st,
                     progress_notify,
                     // FIRE ON THE TRANSITION INTO REVIEW, not only on a note
@@ -7563,6 +7811,39 @@ pub async fn patch_item(
                     "these keys are not writable via PATCH and were NOT applied; \
                      the rest of this response reflects the card as stored"
                 );
+                // NAME THE FIELD THEY MEANT (AF-476). Telling a caller a key is
+                // unwritable answers "why did nothing happen" and leaves "what
+                // should I have sent" to guesswork. For keys that are CLI FLAG
+                // names rather than column names, the answer is exact and cheap.
+                //
+                // `trigger` is the whole reason this exists. It is the flag
+                // `amux board <status> <id> --trigger "..."`, which writes
+                // source_ref AND stamps last_verified_at — so a raw PATCH of
+                // {"trigger": ...} writes nothing at all. Measured by the
+                // 2026-09-04 log sweep: 226 such PATCHes from `backend` in 80
+                // seconds across ~220 distinct cards, every one a 422 that could
+                // not have done anything. I had made the identical mistake myself
+                // earlier the same day, which is what made it recognisable.
+                //
+                // Related to AF-469 but not the same: there the caller sent the
+                // right column and missed its companion, so the write LANDED and
+                // the card re-drained forever. Here the write is a complete
+                // no-op. Same root — the CLI flag and the API field have
+                // different names, and only one path stamps both.
+                let hints: Vec<Value> = ignored
+                    .iter()
+                    .filter_map(|k| match k.as_str() {
+                        "trigger" => Some(json!({
+                            "sent": "trigger",
+                            "meant": ["source_ref", "last_verified_at"],
+                            "how": "`amux board <status> <id> --trigger \"...\"` writes both. A raw PATCH must send source_ref AND last_verified_at (unix seconds) itself, or the card re-drains forever (AF-469).",
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                if !hints.is_empty() {
+                    body["ignored_hints"] = json!(hints);
+                }
             }
             // 422 WHEN NOTHING YOU SENT WAS WRITABLE.
             //
@@ -7588,11 +7869,15 @@ pub async fn patch_item(
             mut body,
             ignored,
             diverted,
+            advisories,
             status_transition,
             progress_notify,
             reviewer_notify,
         }) => {
             body["applied"] = json!(true);
+            if !advisories.is_empty() {
+                body["advisories"] = json!(advisories);
+            }
             body["global_rev"] = json!(reply.rev.0);
             // SEPARATE KEY FROM `ignored_fields`, because they are opposite
             // facts and a caller acts differently on each: ignored means set it
@@ -8184,7 +8469,7 @@ async fn status_request(
              cannot receive, so nobody was asked"
         ),
     };
-    if let Err(e) = append_card_log(&state, &id, &line).await {
+    if let Err(e) = append_card_log(&state, &id, &line, None).await {
         return internal(e);
     }
     match queued {
@@ -8257,14 +8542,59 @@ async fn status_update(
             Err(e) => return internal(e),
         }
     }
-    if let Err(e) = append_card_log(&state, &id, &format!("STATUS ({actor}): {text}")).await {
-        return internal(e);
+    let update = match apply_status_update(
+        &state,
+        &id,
+        &format!("STATUS ({actor}): {text}"),
+        bs::output_asset_refs(&text),
+        &actor,
+        &text,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return internal(e),
+    };
+    if update.claimed {
+        tracing::info!(
+            target: "amux::board", marker = "status_update_claimed_exact",
+            task = %id, worker = %actor, from = %update.prior_status,
+            "worker status update atomically claimed its exact actionable card"
+        );
+        crate::api::session_verbs::emit_event(
+            &state, &actor, "task.claimed",
+            Some(json!({"issue": id, "status": "doing"})), None,
+            "board-status-update",
+        ).await;
+    } else if matches!(update.prior_status.as_str(), "todo" | "backlog") {
+        tracing::warn!(
+            target: "amux::board", marker = "status_update_claim_refused",
+            task = %id, worker = %actor, owner = %update.owner,
+            status = %update.prior_status, verdict = %update.claim_verdict,
+            "worker status update was stored but did not claim the actionable card"
+        );
+    }
+    let captured = &update.captured;
+    if !captured.is_empty() {
+        tracing::info!(
+            target: "amux::board",
+            task = %id,
+            worker = %actor,
+            captured = captured.len(),
+            refs = ?captured.iter().map(|a| a.ref_value.as_str()).collect::<Vec<_>>(),
+            "board task artifacts auto-captured from worker output"
+        );
     }
     let mut resp = Json(json!({
         "ok": true, "id": id, "actor": actor,
         "chars": text.chars().count(),
         "original_chars": original_chars,
         "truncated": truncated,
+        "claimed": update.claimed,
+        "status": update.status,
+        "claim_verdict": update.claim_verdict,
+        "artifacts_captured": captured.len(),
+        "artifact_refs": captured.iter().map(|a| a.ref_value.clone()).collect::<Vec<_>>(),
     }))
     .into_response();
     if truncated {
@@ -8432,6 +8762,21 @@ async fn list_artifacts(State(state): State<AppState>, Path(id): Path<String>) -
     (StatusCode::OK, Json(json!(items))).into_response()
 }
 
+/// Does this write error mean "the card does not exist" (AF-477)?
+///
+/// EXTRACTED so the NARROWNESS is testable. The guard lives inline in a match
+/// arm otherwise, and the only mutation reachable there touches the Err side —
+/// so widening it to catch EVERY error would send a genuine storage fault to
+/// 404 and no test would notice. That gap was recorded on AF-477 as unproven
+/// rather than implied away; this is what closes it.
+///
+/// The closure returns `anyhow::Error`, so the rusqlite variant has to be
+/// downcast rather than matched (E0308 if you try, caught at compile).
+fn is_missing_task(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<rusqlite::Error>()
+        .is_some_and(|r| matches!(r, rusqlite::Error::QueryReturnedNoRows))
+}
+
 /// POST /api/board/{id}/artifacts
 async fn create_artifact(
     State(state): State<AppState>,
@@ -8440,18 +8785,42 @@ async fn create_artifact(
     Json(body): Json<Value>,
 ) -> Response {
     let kind = match body.get("kind").and_then(|v| v.as_str()) {
-        Some(k) => k.to_string(),
+        Some(k) if !k.trim().is_empty() => k.trim().to_string(),
         None => {
             return (StatusCode::BAD_REQUEST, Json(json!({"error": "kind required"}))).into_response()
         }
+        Some(_) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": "kind cannot be blank"}))).into_response()
+        }
     };
     let ref_value = match body.get("ref").and_then(|v| v.as_str()) {
-        Some(r) => r.to_string(),
+        Some(r) if !r.trim().is_empty() => r.trim().to_string(),
         None => {
             return (StatusCode::BAD_REQUEST, Json(json!({"error": "ref required"}))).into_response()
         }
+        Some(_) => {
+            tracing::warn!(
+                marker = "artifact_blank_ref",
+                task = %id,
+                "board artifact registration refused: a blank reference cannot be opened"
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "artifact ref cannot be blank",
+                    "code": "artifact_ref_blank",
+                    "task_id": id,
+                })),
+            )
+                .into_response();
+        }
     };
-    let state_val = body.get("state").and_then(|v| v.as_str()).unwrap_or("created").to_string();
+    let state_val = body
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("created")
+        .trim()
+        .to_string();
     let desc = body.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
     if !crate::db::artifact_store::KNOWN_KINDS.contains(&kind.as_str()) {
         return (StatusCode::BAD_REQUEST, Json(json!({
@@ -8535,6 +8904,22 @@ async fn create_artifact(
                 "actor": actor,
             }))).into_response()
         }
+        // A MISSING CARD IS A 404, NOT A 500 (AF-475). The closure signals
+        // "no such task" with rusqlite::Error::QueryReturnedNoRows, which fell
+        // into the arm below and answered `500 Query returned no rows` — a raw
+        // storage error as the entire body, on a request whose only fault was
+        // naming a card that does not exist. Found by the 2026-09-04 log sweep:
+        // one row, mixpeek-cicd, 0.25ms, and in the analyze output it is
+        // indistinguishable from a genuine server fault.
+        //
+        // That indistinguishability is the cost: the sweep's contract says a
+        // 500 is ALWAYS a finding, so a client error wearing a 500 buys a real
+        // investigation every time it appears.
+        Err(e) if is_missing_task(&e) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no such task", "task_id": id})),
+        )
+            .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -8550,19 +8935,32 @@ async fn patch_artifact(
     if new_state.is_none() && new_desc.is_none() {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "nothing to update"}))).into_response();
     }
+    if let Some(ref new_state) = new_state {
+        if !crate::db::artifact_store::ARTIFACT_STATES.contains(&new_state.as_str()) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "unknown artifact state",
+                    "state": new_state,
+                    "valid_states": crate::db::artifact_store::ARTIFACT_STATES,
+                })),
+            )
+                .into_response();
+        }
+    }
     let now = chrono::Utc::now().timestamp();
+    let task_for_log = id.clone();
+    let aid_for_log = aid.clone();
     let write = state.store.write_async(move |conn| {
+        if bs::get_issue(conn, &id)?.is_none() {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
         let existing = crate::db::artifact_store::get(conn, &aid)?
             .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
         if existing.task_id != id {
             return Err(rusqlite::Error::QueryReturnedNoRows);
         }
         if let Some(ref s) = new_state {
-            if !crate::db::artifact_store::ARTIFACT_STATES.contains(&s.as_str()) {
-                return Err(rusqlite::Error::InvalidParameterName(
-                    format!("invalid state: {s}"),
-                ));
-            }
             crate::db::artifact_store::update_state(conn, &aid, s, now)?;
         }
         if let Some(ref d) = new_desc {
@@ -8583,6 +8981,25 @@ async fn patch_artifact(
     }).await;
     match write {
         Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
+        Err(e) if is_missing_task(&e) => {
+            tracing::warn!(
+                marker = "artifact_target_missing",
+                task = %task_for_log,
+                artifact = %aid_for_log,
+                operation = "patch",
+                "board artifact mutation refused: artifact is absent or belongs to another task"
+            );
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": "artifact not found on this task",
+                    "code": "artifact_target_missing",
+                    "task_id": task_for_log,
+                    "artifact_id": aid_for_log,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -8590,26 +9007,49 @@ async fn patch_artifact(
 /// DELETE /api/board/{id}/artifacts/{aid}
 async fn delete_artifact(
     State(state): State<AppState>,
-    Path((_id, aid)): Path<(String, String)>,
+    Path((id, aid)): Path<(String, String)>,
 ) -> Response {
+    let task_for_log = id.clone();
+    let aid_for_log = aid.clone();
     let write = state.store.write_async(move |conn| {
-        let n = crate::db::artifact_store::delete(conn, &aid)?;
+        if bs::get_issue(conn, &id)?.is_none() {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        let n = crate::db::artifact_store::delete_for_task(conn, &id, &aid)?;
+        if n == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
         Ok(crate::db::WriteOutcome {
-            applied: n > 0,
-            events: if n > 0 {
-                vec![crate::db::PendingEvent {
-                    entity_type: amux_core::revision::EntityType::Other("artifact".into()),
-                    entity_id: aid.clone(),
-                    mutation: amux_core::revision::MutationKind::Deleted,
-                    payload: None,
-                }]
-            } else {
-                vec![]
-            },
+            applied: true,
+            events: vec![crate::db::PendingEvent {
+                entity_type: amux_core::revision::EntityType::Other("artifact".into()),
+                entity_id: aid.clone(),
+                mutation: amux_core::revision::MutationKind::Deleted,
+                payload: None,
+            }],
         })
     }).await;
     match write {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) if is_missing_task(&e) => {
+            tracing::warn!(
+                marker = "artifact_target_missing",
+                task = %task_for_log,
+                artifact = %aid_for_log,
+                operation = "delete",
+                "board artifact deletion refused: artifact is absent or belongs to another task"
+            );
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": "artifact not found on this task",
+                    "code": "artifact_target_missing",
+                    "task_id": task_for_log,
+                    "artifact_id": aid_for_log,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -8637,15 +9077,143 @@ mod discard_orphan_tests {
     }
 }
 
-/// Append one stamped line to a card's log. Both handlers above write only
-/// here — a status update must never move the card, and reusing the PATCH path
-/// would put a status report one typo away from a status TRANSITION.
+#[derive(Debug, Clone)]
+struct StatusUpdateResult {
+    captured: Vec<crate::db::artifact_store::ArtifactRow>,
+    claimed: bool,
+    prior_status: String,
+    status: String,
+    owner: String,
+    claim_verdict: String,
+}
+
+/// Store a worker's progress and, when eligible, claim that worker's exact
+/// card in the same serialized transaction (GCA-153 / ATE-41).
+async fn apply_status_update(
+    state: &AppState,
+    id: &str,
+    line: &str,
+    refs: Vec<String>,
+    actor: &str,
+    progress: &str,
+) -> Result<StatusUpdateResult, rusqlite::Error> {
+    let (id, line, actor, progress, stamp) = (
+        id.to_string(), line.to_string(), actor.to_string(),
+        progress.to_string(), hhmm(),
+    );
+    let result = Arc::new(Mutex::new(None));
+    let result_w = result.clone();
+    state.store.write_async(move |conn| {
+        let row = bs::get_issue(conn, &id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        let prior_status = row.status.clone();
+        let owner = row.session.as_deref().unwrap_or("").trim().to_string();
+        let mut claimed = false;
+        let mut status = prior_status.clone();
+        let mut events = Vec::new();
+
+        let claim_verdict = if !matches!(prior_status.as_str(), "todo" | "backlog") {
+            "status_not_actionable".to_string()
+        } else if actor == "session" {
+            "actor_unattributed".to_string()
+        } else if row.owner_type != "agent" {
+            "owner_not_agent".to_string()
+        } else if owner != actor {
+            "owner_mismatch".to_string()
+        } else if row.archived != 0 {
+            "archived".to_string()
+        } else if row.tags.iter().any(|tag| tag.to_ascii_lowercase().starts_with("needs:you")) {
+            "needs_you".to_string()
+        } else if row.waiting_on.as_deref().is_some_and(|v| !v.trim().is_empty()) {
+            "waiting".to_string()
+        } else if crate::runtime_jobs::board_drive::fresh_source_ref_trigger(&row, now_secs()) {
+            "external_trigger".to_string()
+        } else if !crate::runtime_jobs::board_drive::deps_blocking(conn, &row).is_empty() {
+            "dependency_blocked".to_string()
+        } else if let Some(exclusion) = frontier_exclusion(&row, false) {
+            match exclusion {
+                FrontierExclusion::Blocked => "blocked".to_string(),
+                FrontierExclusion::NoContinuation => unreachable!("continuation gate is off"),
+            }
+        } else if bs::continuation_required(Some(&actor))
+            && bs::continuation_verdict(&progress) != bs::ContinuationVerdict::Ok
+        {
+            "continuation_missing".to_string()
+        } else {
+            let holding: Vec<String> = conn.prepare(
+                "SELECT id FROM issues WHERE session=?1 AND status='doing' AND id!=?2 \
+                 AND deleted IS NULL AND COALESCE(archived,0)=0 \
+                 AND COALESCE(type,'') NOT IN ('tripwire','watch','epic') \
+                 AND NOT (creator='amux' AND substr(COALESCE(\"desc\",''),1,11)='**Prompt:**') \
+                 AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=issues.id \
+                                 AND lower(t.tag) LIKE 'needs:you%') ORDER BY id"
+            )?.query_map(rusqlite::params![&actor, &id], |r| r.get::<_, String>(0))?
+                .filter_map(Result::ok).collect();
+            if !holding.is_empty() {
+                "wip_conflict".to_string()
+            } else {
+                if bs::continuation_required(Some(&actor)) {
+                    conn.execute(
+                        "UPDATE issues SET next_action=?1 WHERE id=?2",
+                        rusqlite::params![&progress, &id],
+                    )?;
+                }
+                let opts = crate::db::advance::AdvanceOpts {
+                    expected_from: Some(prior_status.clone()),
+                    assign_to: Some(actor.clone()),
+                    log_line: Some(format!("Claimed by status update from {actor}")),
+                    force: false,
+                    skip_continuation: false,
+                    gate_ack: true,
+                    ..Default::default()
+                };
+                match crate::db::advance::advance(conn, &id, "doing", &actor, &opts)? {
+                    Ok(outcome) => {
+                        claimed = true;
+                        status = "doing".to_string();
+                        events.extend(outcome.events);
+                        "claimed".to_string()
+                    }
+                    Err(_) => "transition_refused".to_string(),
+                }
+            }
+        };
+
+        // `advance` appended the claim audit line, so read that before adding progress.
+        let current_log = if claimed { bs::get_issue(conn, &id)?.and_then(|r| r.log) } else { row.log };
+        let next = bs::append_log(current_log.as_deref(), &stamp, &line);
+        conn.execute("UPDATE issues SET log=?1 WHERE id=?2", rusqlite::params![next, &id])?;
+        let inserted = crate::db::artifact_store::insert_captured_refs(
+            conn, &id, refs,
+            &format!("automatically captured from status update by {actor}"), now_secs(),
+        )?;
+        events.extend(inserted.iter().map(|artifact| crate::db::PendingEvent {
+            entity_type: amux_core::revision::EntityType::Other("artifact".into()),
+            entity_id: artifact.id.clone(),
+            mutation: amux_core::revision::MutationKind::Created,
+            payload: None,
+        }));
+        *result_w.lock().expect("status update result slot poisoned") = Some(StatusUpdateResult {
+            captured: inserted, claimed, prior_status, status, owner, claim_verdict,
+        });
+        Ok(WriteOutcome { applied: true, events })
+    }).await.map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(
+        std::io::Error::other(e.to_string()),
+    )))?;
+    let outcome = result.lock().expect("status update result slot poisoned")
+        .clone().ok_or(rusqlite::Error::QueryReturnedNoRows);
+    outcome
+}
+
+/// Append one stamped line for requests that carry no worker progress claim.
 async fn append_card_log(
     state: &AppState,
     id: &str,
     line: &str,
-) -> Result<(), rusqlite::Error> {
+    capture: Option<(Vec<String>, String)>,
+) -> Result<Vec<crate::db::artifact_store::ArtifactRow>, rusqlite::Error> {
     let (id, line, stamp) = (id.to_string(), line.to_string(), hhmm());
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let captured_w = captured.clone();
     state
         .store
         .write_async(move |conn| {
@@ -8655,13 +9223,37 @@ async fn append_card_log(
             let next = bs::append_log(existing.as_deref(), &stamp, &line);
             conn.execute(
                 "UPDATE issues SET log=?1 WHERE id=?2",
-                rusqlite::params![next, id],
+                rusqlite::params![next, &id],
             )?;
-            Ok(WriteOutcome { applied: true, events: vec![] })
+            let inserted = match capture {
+                Some((refs, description)) => crate::db::artifact_store::insert_captured_refs(
+                    conn,
+                    &id,
+                    refs,
+                    &description,
+                    now_secs(),
+                )?,
+                None => Vec::new(),
+            };
+            let events = inserted
+                .iter()
+                .map(|artifact| crate::db::PendingEvent {
+                    entity_type: amux_core::revision::EntityType::Other("artifact".into()),
+                    entity_id: artifact.id.clone(),
+                    mutation: amux_core::revision::MutationKind::Created,
+                    payload: None,
+                })
+                .collect();
+            *captured_w.lock().expect("artifact capture slot poisoned") = inserted;
+            Ok(WriteOutcome { applied: true, events })
         })
         .await
-        .map(|_| ())
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e.to_string()))))
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e.to_string()))))?;
+    let inserted = captured
+        .lock()
+        .expect("artifact capture slot poisoned")
+        .clone();
+    Ok(inserted)
 }
 
 #[cfg(test)]
@@ -9344,6 +9936,36 @@ mod slim_tests {
 
 #[cfg(test)]
 mod bulk_migrate_tests {
+
+    /// AF-477. The 404 guard must be NARROW: only "the card does not exist"
+    /// becomes a 404, and every other storage fault stays a 500.
+    ///
+    /// This exists because the integration test could not prove it. That test
+    /// drives the real handler, so the only mutation it can reach touches the
+    /// Err arm — widening the guard to catch EVERY error would send a genuine DB
+    /// fault to 404 and the integration test would still pass, because its
+    /// success case is an Ok. The gap was recorded on the card as unproven; this
+    /// closes it by testing the classification directly.
+    #[test]
+    fn only_a_missing_row_is_a_missing_task() {
+        // The one that IS a missing card.
+        assert!(
+            super::is_missing_task(&anyhow::Error::new(rusqlite::Error::QueryReturnedNoRows)),
+            "QueryReturnedNoRows is how the closure signals 'no such task'"
+        );
+        // A DIFFERENT rusqlite error is a real fault and must stay a 500.
+        assert!(
+            !super::is_missing_task(&anyhow::Error::new(
+                rusqlite::Error::ExecuteReturnedResults
+            )),
+            "a genuine storage fault must NOT be reported to the caller as 404"
+        );
+        // And a non-rusqlite error must not be swallowed either.
+        assert!(
+            !super::is_missing_task(&anyhow::anyhow!("pool exhausted")),
+            "an error that is not a rusqlite error at all must stay a 500"
+        );
+    }
     use super::*;
 
     /// AMUX-4044. The safety property of bulk migrate is that a GATED column

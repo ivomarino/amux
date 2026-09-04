@@ -114,6 +114,19 @@ both fields fails `tests/diagnostic_contract.rs`.
 
 Raw logs: `~/.amux/logs/server-rs.log`
 
+**Grep them with `-a`.** A single NUL byte anywhere in the file makes grep call
+the whole thing binary and SUPPRESS match output, while `-c` keeps counting
+lines. Same file, same pattern, measured 2026-09-04: `grep -c` 17, `grep -o` 8,
+`grep -ao` 17. Nineteen NUL bytes in 67 MB did that, and grep says nothing when
+its output goes to a pipe. AF-481 removed the source (a sentinel that reached a
+warn), but any logged payload can reintroduce one, so pass `-a` rather than
+trusting the file.
+
+Also: `grep -c $'\0'` does not count NUL bytes. bash cannot put a NUL in a
+string, so that argument is the EMPTY string and the command is `grep -c ''`,
+which counts every line. It reads like a NUL count and is a line count. Read the
+bytes if you need the real figure.
+
 ## Reading CI: use the App token, and CHECK that you got it
 
 `gh` here defaults to the user identity (`esteininger`, id 15973166) on a **5000/hr**

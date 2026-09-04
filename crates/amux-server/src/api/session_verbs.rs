@@ -34,8 +34,8 @@
 //! - no boot board-digest briefing on start (standing instructions ARE re-sent)
 //! - no _install_amux_commit_hook / _auto_trust_dir / _ensure_memory side
 //!   effects (Python's loops still own those during coexistence)
-//! - commit-report attaches to the in-flight card but skips the cross-session
-//!   sweep notice (py:76008-76230)
+//! - commit-report records the exact task from its body/commit subject, but
+//!   skips the cross-session sweep notice (py:76008-76230)
 //! - env-explain / memory-explain answer 501 with a pointer (layered env
 //!   composition is not ported yet)
 //! - iTerm2-backed sessions (CC_ITERM2_SESSION_ID) answer 501 (0 in the fleet)
@@ -473,6 +473,10 @@ fn provider_of(cfg: &EnvFile) -> String {
 
 fn work_dir_of(cfg: &EnvFile) -> String {
     let wd = cfg.get_or("CC_DIR", "").trim();
+    normalize_work_dir(wd)
+}
+
+fn normalize_work_dir(wd: &str) -> String {
     if wd.is_empty() {
         return String::new();
     }
@@ -2398,10 +2402,13 @@ fn codex_rollout_files() -> Vec<(std::time::SystemTime, PathBuf)> {
     out
 }
 
-/// The `cwd` a rollout was recorded in, read from its first line
-/// (`session_meta`), so this stats one small read per candidate, not the whole
-/// file.
-fn rollout_cwd(path: &Path) -> Option<String> {
+/// Identity carried by a rollout's first `session_meta` row.
+///
+/// `cwd` alone is not an identity: several workers routinely share one
+/// checkout.  Keep the rollout's own start timestamp with it so the fallback
+/// resolver can associate it with the worker life that created it instead of
+/// assigning the newest sibling rollout to every worker in that directory.
+fn rollout_identity(path: &Path) -> Option<(String, f64)> {
     let Ok(f) = std::fs::File::open(path) else { return None };
     let mut reader = std::io::BufReader::new(f);
     let mut line = String::new();
@@ -2411,20 +2418,54 @@ fn rollout_cwd(path: &Path) -> Option<String> {
     if v.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
         return None;
     }
-    v.pointer("/payload/cwd")
-        .and_then(|c| c.as_str())
-        .map(str::to_string)
+    let cwd = normalize_work_dir(v.pointer("/payload/cwd").and_then(|c| c.as_str())?);
+    let started = v
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(parse_iso8601)?;
+    Some((cwd, started))
 }
 
-/// Map a codex/ollama worker to its live Codex rollout file. Mirrors
-/// `session_jsonl_path`'s resolution order: a recorded session-id claim first
-/// (deterministic: the id is the filename UUID), then the worker's `CC_DIR`
-/// cwd with newest mtime winning. `None` when nothing matches, which makes the
-/// caller fall back to the raw terminal (never a wrong transcript).
+const CODEX_ROLLOUT_START_WINDOW_S: f64 = 15.0 * 60.0;
+const CODEX_ROLLOUT_EARLY_GRACE_S: f64 = 30.0;
+
+/// Pick the rollout born nearest this worker life, never merely the newest
+/// rollout in the same checkout.  The bounded window accommodates startup
+/// pickers (the live ATE-42 specimen created its rollout six minutes after
+/// `last_started`) while refusing to borrow a later sibling's conversation.
+fn rollout_for_worker_start<'a>(
+    files: &'a [(std::time::SystemTime, PathBuf)],
+    cwd: &str,
+    started: f64,
+) -> Option<&'a PathBuf> {
+    if cwd.is_empty() || started <= 0.0 {
+        return None;
+    }
+    files
+        .iter()
+        .take(80)
+        .filter_map(|(_, path)| {
+            let (rollout_cwd, rollout_started) = rollout_identity(path)?;
+            let delta = rollout_started - started;
+            (rollout_cwd == cwd
+                && (-CODEX_ROLLOUT_EARLY_GRACE_S..=CODEX_ROLLOUT_START_WINDOW_S)
+                    .contains(&delta))
+                .then_some((delta.abs(), path))
+        })
+        .min_by(|(a, _), (b, _)| a.total_cmp(b))
+        .map(|(_, path)| path)
+}
+
+/// Map a codex/ollama worker to its live Codex rollout file: a recorded
+/// session-id claim first (deterministic: the id is the filename UUID), then a
+/// bounded `CC_DIR + worker start` association. `None` when nothing matches,
+/// which makes the caller fall back to the raw terminal (never a sibling's
+/// transcript).
 pub(crate) fn codex_rollout_path(name: &str) -> Option<PathBuf> {
     let cfg = parse_env(name);
-    let wd = cfg.get_or("CC_DIR", "").trim().to_string();
-    let sid = meta_str(&load_meta(name), "codex_session_id");
+    let wd = work_dir_of(&cfg);
+    let meta = load_meta(name);
+    let sid = meta_str(&meta, "codex_session_id");
     let files = codex_rollout_files();
     if files.is_empty() {
         return None;
@@ -2438,16 +2479,13 @@ pub(crate) fn codex_rollout_path(name: &str) -> Option<PathBuf> {
             return Some(p.clone());
         }
     }
-    // 2. cwd match, newest first. Bounded to the most recent candidates so a
-    //    years-deep history never turns one tab-open into thousands of reads.
-    if !wd.is_empty() {
-        for (_, p) in files.iter().take(80) {
-            if rollout_cwd(p).as_deref() == Some(wd.as_str()) {
-                return Some(p.clone());
-            }
-        }
-    }
-    None
+    // 2. Worker-life match. `cwd + newest` cross-linked every worker sharing
+    //    a checkout: an active sibling made an idle prompt read WORKING.  A
+    //    worker start is the second independent coordinate available before
+    //    Codex has given us a durable thread id, so use it and decline to guess
+    //    outside the bounded startup window.
+    let started = meta_i64(&meta, "last_started") as f64;
+    rollout_for_worker_start(&files, &wd, started).cloned()
 }
 
 /// The latest structured Codex turn boundary recorded in a rollout file.
@@ -3863,32 +3901,34 @@ pub(crate) async fn cmd_hist_record_full(
     // deliberate, and silently dropping one would turn a visible annoyance into
     // an invisible data-loss bug — strictly worse. It announces, and lets a
     // human or a sweep decide.
-    let dup_prior: Option<(i64, i64)> = match state.store.read() {
-        Ok(conn) => prior_delivered(&conn, &session, &text, now_ms - DUP_DELIVERY_WINDOW_MS),
-        Err(_) => None,
-    };
-    if let Some((prior_id, prior_ts)) = dup_prior {
-        let age_s = (now_ms - prior_ts) as f64 / 1000.0;
-        tracing::warn!(
-            session = %session, prior_id, age_s,
-            preview = %chars_truncate(&text, 80),
-            "duplicate delivery: identical text already recorded for this lane"
-        );
-        emit_event(
-            state,
-            &session,
-            "message.duplicate",
-            Some(json!({
-                "prior_id": prior_id, "age_s": age_s, "type": ctype,
-                "origin": origin.clone(),
-                "chars": text.chars().count(),
-                "preview": chars_truncate(&text, 120),
-            })),
-            None,
-            "cmd-history",
-        )
-        .await;
-    }
+    // THE LOOKUP RUNS INSIDE THE WRITE, and it did not (AF-483).
+    //
+    // It used to take a READ connection here, check, drop it, and let the
+    // INSERT happen later in its own `write_async`. Two sends whose reads both
+    // land before either write therefore each see no prior, and NEITHER
+    // announces — precisely the 0-1s pair a human does not produce, which is
+    // the case most worth announcing.
+    //
+    // Measured over all of cmd_history 2026-09-04: six exact-text duplicate
+    // pairs inside the window after the detector shipped, only two announced.
+    // The four misses had gaps of 2s, 1s, 7s and 31s. The first three are this
+    // race comfortably; 31s needs a stalled write queue as well, so this fix is
+    // claimed for the shape, not for all four rows.
+    //
+    // SQLite serialises writers, so performing the check in the same closure as
+    // the INSERT makes it a real check-then-act rather than a TOCTOU. The
+    // announcement stays OUT here: `emit_event` is async and the closure is not,
+    // and warning from inside a write would fire on a transaction that can still
+    // fail. The carrier is two atomics rather than a Mutex, matching msg_row_id
+    // directly below; 0 means no prior, and a real row id is never 0.
+    let dup_prior_id = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let dup_prior_ts = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let dup_prior_id_w = dup_prior_id.clone();
+    let dup_prior_ts_w = dup_prior_ts.clone();
+    // Copies for the announcement, which now runs AFTER the closure has taken
+    // ownership of the originals.
+    let cap_ctype = ctype.clone();
+    let cap_origin = origin.clone();
 
     let is_user = ctype == "user";
     // Carry the recorded row id out of the write so auto-capture can link the card.
@@ -3943,6 +3983,15 @@ pub(crate) async fn cmd_hist_record_full(
         .store
         .write_async(move |conn| {
             ensure_fleet_tables(conn)?;
+            // BEFORE the insert, on the writer's own connection: the prior must
+            // be one that already existed, and no concurrent record can slip its
+            // own insert between this read and ours (AF-483).
+            if let Some((pid, pts)) =
+                prior_delivered(conn, &session, &text, now_ms - DUP_DELIVERY_WINDOW_MS)
+            {
+                dup_prior_id_w.store(pid, std::sync::atomic::Ordering::SeqCst);
+                dup_prior_ts_w.store(pts, std::sync::atomic::Ordering::SeqCst);
+            }
             conn.execute(
                 "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at, submit_verdict) \
                  VALUES (?,?,?,?,?,?,?,?,?)",
@@ -3976,6 +4025,39 @@ pub(crate) async fn cmd_hist_record_full(
             })
         })
         .await;
+
+    // ANNOUNCE AFTER THE WRITE COMMITTED, never from inside it (AF-483). A warn
+    // emitted in the closure would fire on a transaction that can still fail,
+    // which is a duplicate report for a message that was never recorded.
+    //
+    // Still does NOT suppress the second delivery. Two identical sends can be
+    // deliberate, and silently dropping one turns a visible annoyance into an
+    // invisible data-loss bug, which is strictly worse. It announces and lets a
+    // human or a sweep decide.
+    let prior_id = dup_prior_id.load(std::sync::atomic::Ordering::SeqCst);
+    if prior_id > 0 {
+        let prior_ts = dup_prior_ts.load(std::sync::atomic::Ordering::SeqCst);
+        let age_s = (now_ms - prior_ts) as f64 / 1000.0;
+        tracing::warn!(
+            session = %cap_session, prior_id, age_s,
+            preview = %chars_truncate(&cap_text, 80),
+            "duplicate delivery: identical text already recorded for this lane"
+        );
+        emit_event(
+            state,
+            &cap_session,
+            "message.duplicate",
+            Some(json!({
+                "prior_id": prior_id, "age_s": age_s, "type": cap_ctype,
+                "origin": cap_origin,
+                "chars": cap_text.chars().count(),
+                "preview": chars_truncate(&cap_text, 120),
+            })),
+            None,
+            "cmd-history",
+        )
+        .await;
+    }
 
     // NO SILENT WORK (AMUX-3071): mint a ledger card for a HUMAN prompt and link
     // it to the message row. Separate write so a capture failure can never roll
@@ -4826,6 +4908,35 @@ fn gemini_composer_state(raw_lines: &[&str], stripped: &[String]) -> Option<Comp
     Some(ComposerState::Typed(plain))
 }
 
+/// Codex's model/path line is footer chrome, not a continuation of the input.
+///
+/// The current TUI draws no box rule between its composer and this footer, so
+/// the generic continuation scan cannot stop on geometry as it does for Claude
+/// Code. Match the footer's STRUCTURE and styling instead of any model/version:
+/// Codex dims only the middle-dot separator and leaves the model, effort, and
+/// working directory normally coloured. Requiring that raw ANSI evidence is
+/// deliberate. If a future Codex release changes the chrome, this fails toward
+/// `Typed` (a visible, unconfirmed send) rather than hiding real user input and
+/// falsely claiming that it was submitted.
+fn codex_model_footer_chrome(raw: &str, stripped: &str) -> bool {
+    let text = stripped.trim();
+    let Some((identity, location)) = text.rsplit_once('\u{b7}') else {
+        return false;
+    };
+    let location = location.trim();
+    if identity.trim().is_empty()
+        || !(location == "~" || location.starts_with("~/") || location.starts_with('/'))
+    {
+        return false;
+    }
+
+    let (plain, dim) = dim_mask(raw);
+    let plain_squashed: String = plain.split_whitespace().collect();
+    let expected_plain: String = format!("{identity}{location}").split_whitespace().collect();
+    let dim_squashed: String = dim.split_whitespace().collect();
+    dim_squashed == "\u{b7}" && plain_squashed == expected_plain
+}
+
 pub(crate) fn composer_state(raw_frame: &str) -> ComposerState {
     let clean = strip_ansi(raw_frame);
     // The manager view owns the keyboard: its own status bar says so. Positive
@@ -4879,7 +4990,9 @@ pub(crate) fn composer_state(raw_frame: &str) -> ComposerState {
     let mut block: Vec<&str> = vec![raw_lines[idx]];
     for (i, s) in stripped.iter().enumerate().skip(idx + 1) {
         let t = s.trim();
-        if matches!(t.chars().next(), Some('\u{2500}') | Some('\u{23f5}')) {
+        if matches!(t.chars().next(), Some('\u{2500}') | Some('\u{23f5}'))
+            || codex_model_footer_chrome(raw_lines[i], s)
+        {
             break;
         }
         block.push(raw_lines[i]);
@@ -11802,15 +11915,45 @@ fn json_str_after(blob: &str, key: &str) -> Option<String> {
 }
 
 
-/// GET /api/debug/duplicate-deliveries?hours=24 — every lane that received the
-/// SAME text twice inside the detector's window, newest first.
+/// GET /api/debug/duplicate-deliveries?since_h=24 — every lane that received
+/// the SAME text twice inside the detector's window, newest first.
 ///
 /// Reads `session_events` rows the detector writes, so it reports what actually
 /// happened rather than re-deriving a heuristic. `window_ms` is echoed so a
 /// reader knows what "duplicate" meant without going to the source.
+///
+/// `since_h` IS THE FLEET CONVENTION AND THIS ENDPOINT DID NOT SPEAK IT
+/// (AF-482). Every other diagnostic takes `since_h` — /api/logs/analyze,
+/// /api/logs/stats, /api/logs/writers, /api/debug/sse, the git-guard and
+/// messages probes, and CLAUDE.md's observability table lists them that way.
+/// This one took `hours` alone, and an unrecognised parameter fell back to the
+/// 24h default silently.
+///
+/// Measured 2026-09-04, asking this endpoint for a month:
+///     since_h=24 -> total 7      since_h=168 -> total 7
+///     since_h=72 -> total 7      since_h=720 -> total 7
+/// while 26 duplicate events existed. The number never moved because the
+/// parameter was never read, and the payload said `measured: true` beside it.
+/// This is the one endpoint a frustration sweep is told to consult for "was
+/// that a double delivery", which is always a question about a SPECIFIC old
+/// message, so a silently-24h window is wrong exactly when it is used.
+///
+/// Both names are accepted, `since_h` wins, and the response says WHICH ONE
+/// answered. Echoing the resolved window is not enough on its own: `hours: 24`
+/// in a reply to `since_h=720` is a true field that reads as agreement.
 async fn debug_duplicate_deliveries(State(state): State<AppState>, RawQuery(q): RawQuery) -> Response {
     let params = parse_qs(q.as_deref().unwrap_or(""));
-    let hours: f64 = qs_get(&params, "hours").and_then(|v| v.parse().ok()).unwrap_or(24.0);
+    let (hours, window_param) = match (
+        qs_get(&params, "since_h").and_then(|v| v.parse::<f64>().ok()),
+        qs_get(&params, "hours").and_then(|v| v.parse::<f64>().ok()),
+    ) {
+        (Some(h), _) => (h, "since_h"),
+        (None, Some(h)) => (h, "hours"),
+        (None, None) => (24.0, "default"),
+    };
+    // Same bounds as `since_h_of` in request_log.rs, so the family agrees on
+    // what an out-of-range window does instead of each probe choosing.
+    let hours = hours.clamp(0.01, 24.0 * 365.0);
     let since = now_f64() - hours * 3600.0;
     let conn = match state.store.read() {
         Ok(c) => c,
@@ -11839,19 +11982,63 @@ async fn debug_duplicate_deliveries(State(state): State<AppState>, RawQuery(q): 
     for r in &rows {
         *by_session.entry(r["session"].as_str().unwrap_or("").to_string()).or_insert(0) += 1;
     }
+
+    // THE DENOMINATOR THIS PROBE NEVER HAD (AF-483).
+    //
+    // `total` counts what the detector ANNOUNCED. An unannounced duplicate is
+    // therefore invisible to the only endpoint a sweep is told to consult, and
+    // `total` is a lower bound with nothing beside it saying so. That is ethos
+    // rule 4 one layer up from the probe: the measurement can read low for two
+    // reasons and reports one number for both.
+    //
+    // The independent population is cmd_history itself: the same text to the
+    // same lane inside the same window is a duplicate whether or not anything
+    // noticed. Comparing the two is what turns "7 duplicates" into "7 announced
+    // of 11 that happened", and it is the query that would have surfaced the
+    // TOCTOU without a sweep — six pairs, two announced, measured by hand on
+    // 2026-09-04.
+    //
+    // ts is MILLISECONDS here and `since` is SECONDS, which is the same split
+    // the rest of this handler lives with; multiply rather than trusting the
+    // column names to agree.
+    let since_ms = (since * 1000.0) as i64;
+    let pairs_in_history: Option<i64> = conn
+        .query_row(
+            "SELECT COUNT(*) FROM cmd_history a JOIN cmd_history b \
+               ON b.session = a.session AND b.text = a.text AND b.id > a.id \
+              AND b.ts - a.ts BETWEEN 0 AND ?2 \
+             WHERE a.ts > ?1",
+            rusqlite::params![since_ms, DUP_DELIVERY_WINDOW_MS],
+            |r| r.get(0),
+        )
+        .ok();
+    let unannounced = pairs_in_history.map(|p| (p - rows.len() as i64).max(0));
     // AF-320. `total: 0` reads as "no duplicates" whether the query ran or
     // silently returned nothing; `unwrap_or_default()` above makes that a real
     // path rather than a hypothetical one.
     j200(crate::api::measured::measured(
         json!({
         "hours": hours,
+        // WHICH PARAMETER ANSWERED, because "hours: 24" alone cannot tell a
+        // caller who asked for 720 that their parameter was never read. A
+        // reader who typos `since_h` on any other probe would get 24h here and
+        // no way to see it (AF-482).
+        "window_param": window_param,
         "window_ms": DUP_DELIVERY_WINDOW_MS,
         "total": rows.len(),
+        // ANNOUNCED vs HAPPENED. `total` is the first; these two are the second
+        // and the difference. `null` when the comparison query itself failed,
+        // which is distinct from 0 and must not read as "none missed".
+        "pairs_in_history": pairs_in_history,
+        "unannounced": unannounced,
         "by_session": by_session,
         "events": rows,
         "note": "a duplicate is the SAME text recorded twice for one lane inside window_ms. \
                  Deliveries are never suppressed on this signal — two identical sends can be \
-                 deliberate, and dropping one would turn a visible annoyance into silent loss.",
+                 deliberate, and dropping one would turn a visible annoyance into silent loss. \
+                 `total` is what the detector ANNOUNCED; `pairs_in_history` is what cmd_history \
+                 shows happened, counted independently. A non-zero `unannounced` means the \
+                 detector missed some, so `total` alone is a lower bound (AF-483).",
         }),
         rows.len(),
     ))
@@ -14163,8 +14350,116 @@ pub(crate) fn env_explain_verb(name: &str, qs: &[(String, String)]) -> Response 
 
 /// `commit-report` as a callable verb, for the grouped
 /// `/api/workers/{id}/git/...` surface (AF-291).
+fn commit_task_refs(subject: &str) -> Vec<String> {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"\b[A-Z][A-Z0-9]+-\d+\b").expect("commit task ref regex")
+    });
+    let mut seen = std::collections::HashSet::new();
+    re.find_iter(subject)
+        .map(|m| m.as_str().to_string())
+        .filter(|id| seen.insert(id.clone()))
+        .collect()
+}
+
+#[derive(Debug, Default)]
+struct CommitArtifactScan {
+    full_sha: Option<String>,
+    subject: Option<String>,
+    files: Vec<String>,
+    measured: bool,
+    why_unmeasured: Option<&'static str>,
+}
+
+/// Read the identity and files from the commit itself. The hook's subject is
+/// truncated for a log line, so it cannot be the authoritative source of a
+/// task id near the end of a long subject. All git arguments are passed without
+/// a shell and `sha` is validated before reaching git.
+async fn read_commit_artifacts(dir: &str, sha: &str) -> CommitArtifactScan {
+    if dir.trim().is_empty() {
+        return CommitArtifactScan {
+            why_unmeasured: Some("no repo dir in the report"),
+            ..Default::default()
+        };
+    }
+    if !commit_shape::usable_sha(sha) {
+        return CommitArtifactScan {
+            why_unmeasured: Some("sha is not a plain hex object name"),
+            ..Default::default()
+        };
+    }
+    if !std::path::Path::new(dir).is_dir() {
+        return CommitArtifactScan {
+            why_unmeasured: Some("reported dir is not a directory here"),
+            ..Default::default()
+        };
+    }
+    let git = |args: Vec<String>| {
+        let dir = dir.to_string();
+        async move {
+            tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .await
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        }
+    };
+    let Some(full_sha) = git(vec![
+        "rev-parse".into(),
+        "--verify".into(),
+        format!("{sha}^{{commit}}"),
+    ])
+    .await
+    else {
+        return CommitArtifactScan {
+            why_unmeasured: Some("git could not resolve the commit"),
+            ..Default::default()
+        };
+    };
+    let subject = git(vec!["show".into(), "-s".into(), "--format=%s".into(), full_sha.clone()])
+        .await;
+    let files = git(vec![
+        "diff-tree".into(),
+        "--no-commit-id".into(),
+        "--name-only".into(),
+        "-r".into(),
+        "--root".into(),
+        "-m".into(),
+        full_sha.clone(),
+    ])
+    .await
+    .map(|out| {
+        let mut seen = std::collections::HashSet::new();
+        out.lines()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .filter(|p| seen.insert(p.clone()))
+            .collect::<Vec<_>>()
+    });
+    match (subject, files) {
+        (Some(subject), Some(files)) => CommitArtifactScan {
+            full_sha: Some(full_sha),
+            subject: Some(subject),
+            files,
+            measured: true,
+            why_unmeasured: None,
+        },
+        _ => CommitArtifactScan {
+            full_sha: Some(full_sha),
+            why_unmeasured: Some("git could not read commit subject or files"),
+            ..Default::default()
+        },
+    }
+}
+
 pub(crate) async fn commit_report_verb(state: &AppState, name: &str, body: &Value) -> Response {
-    // Attach the commit to the in-flight card (py:76233-76246). The
+    // Attach the commit to the exact task named by the report/subject. The
     // cross-session sweep notice (py:76008-76230) is a named gap.
     let sha: String = body_str(body, "sha").trim().chars().take(16).collect();
     let subj: String = body_str(body, "subject").trim().chars().take(140).collect();
@@ -14178,6 +14473,7 @@ pub(crate) async fn commit_report_verb(state: &AppState, name: &str, body: &Valu
     // the session goes to read what it shipped.
     let dir = body_str(body, "dir");
     let shape = read_commit_shape(&dir, &sha).await;
+    let scan = read_commit_artifacts(&dir, &sha).await;
     let empty = matches!(shape, commit_shape::Shape::Empty);
     // WHAT THE HOOK SAW, held by the staged-guard (AMUX-3837).
     // amux-frustrations demonstrated the mechanism: git writes the tree
@@ -14207,7 +14503,16 @@ pub(crate) async fn commit_report_verb(state: &AppState, name: &str, body: &Valu
         );
     }
     let session = name.to_string();
-    let sha2 = sha.clone();
+    let reported_task = body_str(body, "task_id").trim().to_string();
+    let authoritative_subject = scan.subject.clone().unwrap_or_else(|| subj.clone());
+    let subject_tasks = commit_task_refs(&authoritative_subject);
+    let full_sha = scan.full_sha.clone().unwrap_or_else(|| sha.clone());
+    let files = scan.files.clone();
+    let scan_measured = scan.measured;
+    let why_unmeasured = scan.why_unmeasured;
+    let authoritative_subject_w = authoritative_subject.clone();
+    let full_sha_w = full_sha.clone();
+    let files_w = files.clone();
     // Named so the log line can say WHY it is silent: absent because
     // the commit was fine, versus absent because nothing looked.
     let shape_note = match shape {
@@ -14215,68 +14520,210 @@ pub(crate) async fn commit_report_verb(state: &AppState, name: &str, body: &Valu
         commit_shape::Shape::Unchecked(why) => format!(" (not checked for content: {why})"),
         _ => String::new(),
     };
+    #[derive(Debug)]
+    enum CommitReportOutcome {
+        Unattached,
+        Refused(StatusCode, Value),
+        Attached {
+            task: String,
+            source: &'static str,
+            artifacts: Vec<crate::db::artifact_store::ArtifactRow>,
+        },
+    }
+    let outcome: Arc<std::sync::Mutex<Option<CommitReportOutcome>>> = Default::default();
+    let outcome_w = outcome.clone();
     let reply = state
         .store
         .write_async(move |conn| {
-            let row: Option<String> = conn
-                .query_row(
-                    "SELECT id FROM issues WHERE session=? AND deleted IS NULL \
-                     AND COALESCE(archived,0)=0 AND status IN ('doing','review') \
-                     AND owner_type='agent' ORDER BY updated DESC LIMIT 1",
-                    [&session],
-                    |r| r.get(0),
-                )
-                .ok();
-            let Some(issue_id) = row else {
+            let mut active = Vec::new();
+            let mut stmt = conn.prepare(
+                "SELECT id FROM issues WHERE session=?1 AND deleted IS NULL \
+                 AND COALESCE(archived,0)=0 AND status IN ('doing','review') \
+                 AND owner_type='agent' ORDER BY id",
+            )?;
+            active.extend(stmt.query_map([&session], |r| r.get::<_, String>(0))?.flatten());
+
+            let (issue_id, source) = if !reported_task.is_empty() {
+                if !subject_tasks.is_empty() && !subject_tasks.contains(&reported_task) {
+                    *outcome_w.lock().expect("commit-report outcome poisoned") = Some(
+                        CommitReportOutcome::Refused(
+                            StatusCode::CONFLICT,
+                            json!({
+                                "error": "commit report task_id disagrees with the commit subject",
+                                "code": "commit_task_mismatch",
+                                "task_id": reported_task,
+                                "subject_tasks": subject_tasks,
+                            }),
+                        ),
+                    );
+                    return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+                }
+                (reported_task.clone(), "body")
+            } else if subject_tasks.len() == 1 {
+                (subject_tasks[0].clone(), "subject")
+            } else if subject_tasks.len() > 1 {
+                *outcome_w.lock().expect("commit-report outcome poisoned") = Some(
+                    CommitReportOutcome::Refused(
+                        StatusCode::CONFLICT,
+                        json!({
+                            "error": "commit subject names more than one task; pass task_id explicitly",
+                            "code": "commit_task_ambiguous",
+                            "subject_tasks": subject_tasks,
+                            "active_tasks": active,
+                        }),
+                    ),
+                );
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            } else if active.len() == 1 {
+                (active[0].clone(), "unique-in-flight")
+            } else if active.is_empty() {
+                *outcome_w.lock().expect("commit-report outcome poisoned") =
+                    Some(CommitReportOutcome::Unattached);
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            } else {
+                *outcome_w.lock().expect("commit-report outcome poisoned") = Some(
+                    CommitReportOutcome::Refused(
+                        StatusCode::CONFLICT,
+                        json!({
+                            "error": "commit names no task and this worker has multiple in-flight tasks",
+                            "code": "commit_task_ambiguous",
+                            "subject_tasks": [],
+                            "active_tasks": active,
+                            "how_to_fix": "include one task id in the commit subject or send task_id",
+                        }),
+                    ),
+                );
                 return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
             };
-            let log: String = conn
-                .query_row("SELECT COALESCE(log,'') FROM issues WHERE id=?", [&issue_id], |r| r.get(0))
-                .unwrap_or_default();
+            let Some(task) = crate::db::board_store::get_issue(conn, &issue_id)? else {
+                *outcome_w.lock().expect("commit-report outcome poisoned") = Some(
+                    CommitReportOutcome::Refused(
+                        StatusCode::NOT_FOUND,
+                        json!({
+                            "error": "commit names a task that does not exist",
+                            "code": "commit_task_missing",
+                            "task_id": issue_id,
+                        }),
+                    ),
+                );
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            };
             let ts = chrono::Local::now().format("%H:%M");
-            let new_log = format!("{}\n`{ts}` commit {sha2} — {subj}{shape_note}", log.trim_end())
+            let capture_desc = format!(
+                "automatically captured by commit-report from {session}; task selected by {source}"
+            );
+            let refs = files_w
+                .iter()
+                .cloned()
+                .chain(std::iter::once(full_sha_w.clone()))
+                .collect::<Vec<_>>();
+            let artifacts = crate::db::artifact_store::insert_captured_refs(
+                conn,
+                &issue_id,
+                refs,
+                &capture_desc,
+                now_i64(),
+            )?;
+            let new_log = format!(
+                "{}\n`{ts}` commit {full_sha_w} — {authoritative_subject_w}{shape_note}",
+                task.log.as_deref().unwrap_or("").trim_end()
+            )
                 .trim()
                 .to_string();
             conn.execute(
                 "UPDATE issues SET log=?, rev=COALESCE(rev,0)+1, updated=? WHERE id=?",
-                rusqlite::params![new_log, now_i64(), issue_id],
+                rusqlite::params![new_log, now_i64(), &issue_id],
             )?;
+            let mut events = vec![crate::db::PendingEvent {
+                entity_type: amux_core::revision::EntityType::Other("issue".into()),
+                entity_id: issue_id.clone(),
+                mutation: amux_core::revision::MutationKind::Updated,
+                payload: None,
+            }];
+            events.extend(artifacts.iter().map(|artifact| crate::db::PendingEvent {
+                entity_type: amux_core::revision::EntityType::Other("artifact".into()),
+                entity_id: artifact.id.clone(),
+                mutation: amux_core::revision::MutationKind::Created,
+                payload: None,
+            }));
+            *outcome_w.lock().expect("commit-report outcome poisoned") = Some(
+                CommitReportOutcome::Attached {
+                    task: issue_id,
+                    source,
+                    artifacts,
+                },
+            );
             Ok(crate::db::WriteOutcome {
                 applied: true,
-                events: vec![crate::db::PendingEvent {
-                    entity_type: amux_core::revision::EntityType::Other("issue".into()),
-                    entity_id: issue_id,
-                    mutation: amux_core::revision::MutationKind::Updated,
-                    payload: None,
-                }],
+                events,
             })
         })
         .await;
-    match reply {
-        // The emptiness verdict rides BOTH arms. A session with no
-        // in-flight card is exactly the one whose commit lands with no
-        // trail, so it is the last place the warning may be dropped.
-        Ok(r) if !r.applied => {
-            j200(json!({"ok": true, "attached": Value::Null, "empty_commit": empty,
-                       "staged_at_hook": staged_at_hook}))
+    if let Err(e) = reply {
+        return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()}));
+    }
+    let result = outcome.lock().expect("commit-report outcome poisoned").take();
+    match result {
+        Some(CommitReportOutcome::Attached { task, source, artifacts }) => {
+            tracing::info!(
+                marker = "commit_report_task_exact",
+                session = %name,
+                task = %task,
+                task_source = source,
+                sha = %full_sha,
+                artifacts_captured = artifacts.len(),
+                scan_measured,
+                why_unmeasured = why_unmeasured.unwrap_or(""),
+                "commit-report attached commit and files to the exact board task"
+            );
+            j200(json!({
+                "ok": true,
+                "attached": task,
+                "task_source": source,
+                "sha": full_sha,
+                "artifacts_captured": artifacts.len(),
+                "artifact_refs": artifacts.iter().map(|a| a.ref_value.clone()).collect::<Vec<_>>(),
+                "artifact_scan": {
+                    "measured": scan_measured,
+                    "n_considered": files.len(),
+                    "why_unmeasured": why_unmeasured,
+                },
+                "empty_commit": empty,
+                "staged_at_hook": staged_at_hook,
+            }))
         }
-        Ok(_) => {
-            // Re-read the card id for the response (the write closure
-            // cannot return it through WriteReply).
-            let attached: Option<String> = state.store.read().ok().and_then(|conn| {
-                conn.query_row(
-                    "SELECT id FROM issues WHERE session=? AND deleted IS NULL \
-                     AND COALESCE(archived,0)=0 AND status IN ('doing','review') \
-                     AND owner_type='agent' ORDER BY updated DESC LIMIT 1",
-                    [name],
-                    |r| r.get(0),
-                )
-                .ok()
-            });
-            j200(json!({"ok": true, "attached": attached, "sha": sha, "empty_commit": empty,
-                        "staged_at_hook": staged_at_hook}))
+        Some(CommitReportOutcome::Refused(status, mut body)) => {
+            tracing::warn!(
+                marker = "commit_report_task_ambiguous",
+                session = %name,
+                sha = %full_sha,
+                subject = %authoritative_subject,
+                "commit-report refused to guess which board task produced the commit"
+            );
+            body["ok"] = json!(false);
+            body["sha"] = json!(full_sha);
+            jresp(status, body)
         }
-        Err(e) => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
+        Some(CommitReportOutcome::Unattached) | None => {
+            tracing::info!(
+                marker = "commit_report_unattached",
+                session = %name,
+                sha = %full_sha,
+                "commit-report found no explicit task and no unique in-flight card"
+            );
+            j200(json!({
+                "ok": true,
+                "attached": Value::Null,
+                "sha": full_sha,
+                "artifact_scan": {
+                    "measured": scan_measured,
+                    "n_considered": files.len(),
+                    "why_unmeasured": why_unmeasured,
+                },
+                "empty_commit": empty,
+                "staged_at_hook": staged_at_hook,
+            }))
+        }
     }
 }
 
@@ -18502,6 +18949,83 @@ mod tests {
         );
     }
 
+    /// THE DETECTOR MUST FIRE ON A CONCURRENT PAIR, NOT ONLY A SEQUENTIAL ONE
+    /// (AF-483).
+    ///
+    /// Measured over all of cmd_history on 2026-09-04: six exact-text duplicate
+    /// pairs to one lane inside the 120s window after the detector shipped, and
+    /// only two were announced. The four misses were 08-13 to 08-18 with gaps of
+    /// 2s, 31s, 1s and 7s, and deployment, retention, the `stuck` exclusion, the
+    /// client send-time stamp and row shape are all ruled out on AF-483.
+    ///
+    /// What is NOT ruled out is a TOCTOU in the detector itself. `dup_prior`
+    /// takes a READ connection, checks, drops it, and the INSERT happens later
+    /// in a separate `write_async`. Two sends whose reads both land before
+    /// either write therefore see no prior and neither announces, which is the
+    /// one case where the announcement matters most: a 0-1s gap is the shape a
+    /// human does not produce.
+    ///
+    /// The sequential case already works and this cell asserts it too, as the
+    /// control. Without it a "fix" that announced on every message would pass
+    /// the concurrent half and destroy the signal.
+    #[tokio::test]
+    async fn a_concurrent_duplicate_is_announced_like_a_sequential_one() {
+        // CONTROL FIRST: sequential. If this ever stops firing the concurrent
+        // assertion below is measuring a detector that is simply off.
+        let (st, _dir) = state();
+        cmd_hist_record_full(&st, "lane-seq", "same words", "user", "", true,
+                             DeliveryMeta::direct()).await;
+        cmd_hist_record_full(&st, "lane-seq", "same words", "user", "", true,
+                             DeliveryMeta::direct()).await;
+        assert_eq!(
+            duplicate_events(&st, "lane-seq"),
+            1,
+            "premise: a sequential duplicate pair must announce exactly once, or this \
+             cell cannot tell a broken detector from a race"
+        );
+
+        // THE CASE. Two records started together, so both reads can precede
+        // both writes.
+        let (st2, _dir2) = state();
+        let a = cmd_hist_record_full(&st2, "lane-race", "same words", "user", "", true,
+                                     DeliveryMeta::direct());
+        let b = cmd_hist_record_full(&st2, "lane-race", "same words", "user", "", true,
+                                     DeliveryMeta::direct());
+        tokio::join!(a, b);
+
+        let rows = lane_rows(&st2, "lane-race");
+        assert_eq!(rows, 2, "premise: both sends must have been recorded, got {rows}");
+        assert_eq!(
+            duplicate_events(&st2, "lane-race"),
+            1,
+            "two identical sends landed on one lane together and the detector said \
+             nothing. A 0-1s gap is the shape a human does not produce, so this is \
+             exactly the pair worth announcing (AF-483)."
+        );
+    }
+
+    /// How many `message.duplicate` events exist for a lane.
+    fn duplicate_events(st: &AppState, lane: &str) -> i64 {
+        st.store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM session_events \
+                 WHERE type='message.duplicate' AND session=?1",
+                [lane],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+    }
+
+    fn lane_rows(st: &AppState, lane: &str) -> i64 {
+        st.store
+            .read()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM cmd_history WHERE session=?1", [lane], |r| r.get(0))
+            .unwrap_or(0)
+    }
+
     /// A healthy SSE connection used to make Messages LESS live than the 5s
     /// polling fallback: cmd_history committed silently, so no client refetched
     /// until a reload or an unrelated board/session event. The ledger write is
@@ -19554,6 +20078,61 @@ mod tests {
             "type": "turn.started"
         })];
         assert_eq!(codex_turn_signal_from_events(&exec_json).unwrap().state, "active");
+    }
+
+    /// ATE-42 live regression: `amux` and `amux-testing-e2e` shared one cwd.
+    /// The old newest-cwd resolver assigned e2e's active rollout to both, so
+    /// the idle `amux` prompt showed WORKING.  Each worker life must resolve
+    /// the rollout born near its own start, independent of file-list order.
+    #[test]
+    fn codex_rollout_fallback_is_worker_life_scoped_not_newest_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = normalize_work_dir(dir.path().to_str().unwrap());
+        let older = dir.path().join("rollout-amux.jsonl");
+        let newer = dir.path().join("rollout-e2e.jsonl");
+        std::fs::write(
+            &older,
+            format!(
+                "{{\"timestamp\":\"2026-09-03T21:44:35Z\",\"type\":\"session_meta\",\"payload\":{{\"cwd\":{}}}}}\n",
+                serde_json::to_string(&format!("{}/", dir.path().display())).unwrap()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &newer,
+            format!(
+                "{{\"timestamp\":\"2026-09-03T23:45:04Z\",\"type\":\"session_meta\",\"payload\":{{\"cwd\":{}}}}}\n",
+                serde_json::to_string(&cwd).unwrap()
+            ),
+        )
+        .unwrap();
+        let files = vec![
+            (std::time::SystemTime::now(), newer.clone()),
+            (std::time::SystemTime::UNIX_EPOCH, older.clone()),
+        ];
+
+        let amux_start = parse_iso8601("2026-09-03T21:44:10Z").unwrap();
+        let e2e_start = parse_iso8601("2026-09-03T23:39:24Z").unwrap();
+        assert_eq!(rollout_for_worker_start(&files, &cwd, amux_start), Some(&older));
+        assert_eq!(rollout_for_worker_start(&files, &cwd, e2e_start), Some(&newer));
+        assert_eq!(
+            rollout_for_worker_start(
+                &files,
+                &cwd,
+                parse_iso8601("2026-09-03T21:50:00Z").unwrap()
+            ),
+            None,
+            "a pre-restart rollout must not be adopted by the new worker life"
+        );
+        assert_eq!(
+            rollout_for_worker_start(
+                &files,
+                &cwd,
+                parse_iso8601("2026-09-04T12:00:00Z").unwrap()
+            ),
+            None,
+            "outside the bounded startup window the safe answer is unknown"
+        );
     }
 
     /// Codex's trust-directory picker, byte shape captured live 2026-08-11
@@ -21873,6 +22452,14 @@ mod send_retry_reporting_tests {
 mod composer_state_tests {
     use super::*;
 
+    /// `amux-testing-e2e`, captured live 2026-09-04 while the lane's native
+    /// stop hook and Codex rollout both said idle. The dashboard nevertheless
+    /// showed `UNSUBMITTED TEXT` with preview `gpt-5.6-solxhigh~/Dev/amux`:
+    /// `composer_state` correctly put the dim prompt hint in `Placeholder`,
+    /// then incorrectly folded Codex's normal-colour model/path footer into
+    /// the same composer block and promoted the whole thing to `Typed`.
+    const LIVE_CODEX_IDLE: &str = "\u{1b}[1m\u{203a}\u{1b}[0m \u{1b}[2mAsk Codex to do anything\u{1b}[0m\n\n  \u{1b}[38;2;246;226;183mgpt-5.6-sol xhigh\u{1b}[2m\u{1b}[39m \u{b7} \u{1b}[0m\u{1b}[38;2;171;223;167m~/Dev/amux\u{1b}[39m\n";
+
     /// `backend`, captured 2026-08-09 while it was being reported as "holding
     /// unsubmitted text for hours". The composer is EMPTY; `continue with the
     /// queue` is Claude Code's dim suggestion. Three people pressed Enter,
@@ -22041,6 +22628,28 @@ mod composer_state_tests {
             Some("continuewiththequeue"),
             "a pre-stripped frame re-creates the blindness — callers MUST pass the raw capture"
         );
+    }
+
+    #[test]
+    fn a_codex_model_footer_is_chrome_not_unsubmitted_text() {
+        assert_eq!(
+            composer_state(LIVE_CODEX_IDLE),
+            ComposerState::Placeholder("AskCodextodoanything".into())
+        );
+        assert_eq!(
+            composer_state(LIVE_CODEX_IDLE).typed(),
+            None,
+            "an idle Codex prompt must not inherit its model/path footer as typed input"
+        );
+
+        // CONTROL: only Codex's dim placeholder is replaced. Ordinary typed
+        // text in the same live frame must remain pending; otherwise a send
+        // could falsely claim success while the user's command is still there.
+        let typed = LIVE_CODEX_IDLE.replace(
+            "\u{1b}[2mAsk Codex to do anything\u{1b}[0m",
+            "ship the current task",
+        );
+        assert_eq!(composer_state(&typed).typed(), Some("shipthecurrenttask"));
     }
 
     #[test]
