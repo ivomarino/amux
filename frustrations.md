@@ -2760,3 +2760,22 @@ FIX: ATE-41 (this commit). An owned, actionable To Do/backlog card is now claime
  Cross-worker, blocked, dependency-held, fresh-trigger, WIP-conflicting, waiting,
  and later-state updates remain informational and return a named refusal verdict;
  claimed and refused paths emit distinct sweep-visible log markers.
+
+## An idle Codex worker borrowed a sibling's active rollout and showed WORKING
+AREA: status
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-42
+SYMPTOM: `amux` sat at the empty `Ask Codex to do anything` prompt and its own
+ stop hook reported idle, but the dashboard showed WORKING on stale AMUX-4079.
+ `status-explain` named `codex_rollout`; the chosen rollout actually belonged to
+ active sibling `amux-testing-e2e`, which shares `/Users/ethan/Dev/amux`.
+COST: the worker header and Board highlight asserted current execution where
+ none existed, while two workers' transcripts and lifecycle signals were
+ cross-linked solely because they used the same checkout.
+FIX: ATE-42. An explicit Codex session id still wins. Before one exists, rollout
+ fallback now canonicalizes the cwd and selects only the rollout born within a
+ bounded window around that worker's own `last_started`; outside that window it
+ refuses to guess and lets the exact terminal/provider signals decide.

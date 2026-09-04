@@ -473,6 +473,10 @@ fn provider_of(cfg: &EnvFile) -> String {
 
 fn work_dir_of(cfg: &EnvFile) -> String {
     let wd = cfg.get_or("CC_DIR", "").trim();
+    normalize_work_dir(wd)
+}
+
+fn normalize_work_dir(wd: &str) -> String {
     if wd.is_empty() {
         return String::new();
     }
@@ -2398,10 +2402,13 @@ fn codex_rollout_files() -> Vec<(std::time::SystemTime, PathBuf)> {
     out
 }
 
-/// The `cwd` a rollout was recorded in, read from its first line
-/// (`session_meta`), so this stats one small read per candidate, not the whole
-/// file.
-fn rollout_cwd(path: &Path) -> Option<String> {
+/// Identity carried by a rollout's first `session_meta` row.
+///
+/// `cwd` alone is not an identity: several workers routinely share one
+/// checkout.  Keep the rollout's own start timestamp with it so the fallback
+/// resolver can associate it with the worker life that created it instead of
+/// assigning the newest sibling rollout to every worker in that directory.
+fn rollout_identity(path: &Path) -> Option<(String, f64)> {
     let Ok(f) = std::fs::File::open(path) else { return None };
     let mut reader = std::io::BufReader::new(f);
     let mut line = String::new();
@@ -2411,20 +2418,54 @@ fn rollout_cwd(path: &Path) -> Option<String> {
     if v.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
         return None;
     }
-    v.pointer("/payload/cwd")
-        .and_then(|c| c.as_str())
-        .map(str::to_string)
+    let cwd = normalize_work_dir(v.pointer("/payload/cwd").and_then(|c| c.as_str())?);
+    let started = v
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(parse_iso8601)?;
+    Some((cwd, started))
 }
 
-/// Map a codex/ollama worker to its live Codex rollout file. Mirrors
-/// `session_jsonl_path`'s resolution order: a recorded session-id claim first
-/// (deterministic: the id is the filename UUID), then the worker's `CC_DIR`
-/// cwd with newest mtime winning. `None` when nothing matches, which makes the
-/// caller fall back to the raw terminal (never a wrong transcript).
+const CODEX_ROLLOUT_START_WINDOW_S: f64 = 15.0 * 60.0;
+const CODEX_ROLLOUT_EARLY_GRACE_S: f64 = 30.0;
+
+/// Pick the rollout born nearest this worker life, never merely the newest
+/// rollout in the same checkout.  The bounded window accommodates startup
+/// pickers (the live ATE-42 specimen created its rollout six minutes after
+/// `last_started`) while refusing to borrow a later sibling's conversation.
+fn rollout_for_worker_start<'a>(
+    files: &'a [(std::time::SystemTime, PathBuf)],
+    cwd: &str,
+    started: f64,
+) -> Option<&'a PathBuf> {
+    if cwd.is_empty() || started <= 0.0 {
+        return None;
+    }
+    files
+        .iter()
+        .take(80)
+        .filter_map(|(_, path)| {
+            let (rollout_cwd, rollout_started) = rollout_identity(path)?;
+            let delta = rollout_started - started;
+            (rollout_cwd == cwd
+                && (-CODEX_ROLLOUT_EARLY_GRACE_S..=CODEX_ROLLOUT_START_WINDOW_S)
+                    .contains(&delta))
+                .then_some((delta.abs(), path))
+        })
+        .min_by(|(a, _), (b, _)| a.total_cmp(b))
+        .map(|(_, path)| path)
+}
+
+/// Map a codex/ollama worker to its live Codex rollout file: a recorded
+/// session-id claim first (deterministic: the id is the filename UUID), then a
+/// bounded `CC_DIR + worker start` association. `None` when nothing matches,
+/// which makes the caller fall back to the raw terminal (never a sibling's
+/// transcript).
 pub(crate) fn codex_rollout_path(name: &str) -> Option<PathBuf> {
     let cfg = parse_env(name);
-    let wd = cfg.get_or("CC_DIR", "").trim().to_string();
-    let sid = meta_str(&load_meta(name), "codex_session_id");
+    let wd = work_dir_of(&cfg);
+    let meta = load_meta(name);
+    let sid = meta_str(&meta, "codex_session_id");
     let files = codex_rollout_files();
     if files.is_empty() {
         return None;
@@ -2438,16 +2479,13 @@ pub(crate) fn codex_rollout_path(name: &str) -> Option<PathBuf> {
             return Some(p.clone());
         }
     }
-    // 2. cwd match, newest first. Bounded to the most recent candidates so a
-    //    years-deep history never turns one tab-open into thousands of reads.
-    if !wd.is_empty() {
-        for (_, p) in files.iter().take(80) {
-            if rollout_cwd(p).as_deref() == Some(wd.as_str()) {
-                return Some(p.clone());
-            }
-        }
-    }
-    None
+    // 2. Worker-life match. `cwd + newest` cross-linked every worker sharing
+    //    a checkout: an active sibling made an idle prompt read WORKING.  A
+    //    worker start is the second independent coordinate available before
+    //    Codex has given us a durable thread id, so use it and decline to guess
+    //    outside the bounded startup window.
+    let started = meta_i64(&meta, "last_started") as f64;
+    rollout_for_worker_start(&files, &wd, started).cloned()
 }
 
 /// The latest structured Codex turn boundary recorded in a rollout file.
@@ -20039,6 +20077,61 @@ mod tests {
             "type": "turn.started"
         })];
         assert_eq!(codex_turn_signal_from_events(&exec_json).unwrap().state, "active");
+    }
+
+    /// ATE-42 live regression: `amux` and `amux-testing-e2e` shared one cwd.
+    /// The old newest-cwd resolver assigned e2e's active rollout to both, so
+    /// the idle `amux` prompt showed WORKING.  Each worker life must resolve
+    /// the rollout born near its own start, independent of file-list order.
+    #[test]
+    fn codex_rollout_fallback_is_worker_life_scoped_not_newest_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = normalize_work_dir(dir.path().to_str().unwrap());
+        let older = dir.path().join("rollout-amux.jsonl");
+        let newer = dir.path().join("rollout-e2e.jsonl");
+        std::fs::write(
+            &older,
+            format!(
+                "{{\"timestamp\":\"2026-09-03T21:44:35Z\",\"type\":\"session_meta\",\"payload\":{{\"cwd\":{}}}}}\n",
+                serde_json::to_string(&format!("{}/", dir.path().display())).unwrap()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &newer,
+            format!(
+                "{{\"timestamp\":\"2026-09-03T23:45:04Z\",\"type\":\"session_meta\",\"payload\":{{\"cwd\":{}}}}}\n",
+                serde_json::to_string(&cwd).unwrap()
+            ),
+        )
+        .unwrap();
+        let files = vec![
+            (std::time::SystemTime::now(), newer.clone()),
+            (std::time::SystemTime::UNIX_EPOCH, older.clone()),
+        ];
+
+        let amux_start = parse_iso8601("2026-09-03T21:44:10Z").unwrap();
+        let e2e_start = parse_iso8601("2026-09-03T23:39:24Z").unwrap();
+        assert_eq!(rollout_for_worker_start(&files, &cwd, amux_start), Some(&older));
+        assert_eq!(rollout_for_worker_start(&files, &cwd, e2e_start), Some(&newer));
+        assert_eq!(
+            rollout_for_worker_start(
+                &files,
+                &cwd,
+                parse_iso8601("2026-09-03T21:50:00Z").unwrap()
+            ),
+            None,
+            "a pre-restart rollout must not be adopted by the new worker life"
+        );
+        assert_eq!(
+            rollout_for_worker_start(
+                &files,
+                &cwd,
+                parse_iso8601("2026-09-04T12:00:00Z").unwrap()
+            ),
+            None,
+            "outside the bounded startup window the safe answer is unknown"
+        );
     }
 
     /// Codex's trust-directory picker, byte shape captured live 2026-08-11
