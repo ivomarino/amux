@@ -6821,14 +6821,56 @@ pub(crate) fn desc_without_refresh(desc: &str) -> &str {
 
 /// Should the existing card be refreshed? Split out so both gates are testable
 /// without a store or a clock — the whole defect was a decision nobody could see.
-pub(crate) fn should_refresh(
+/// The count already carded, parsed back out of the rendered evidence block.
+///
+/// autofix writes that block itself from `Finding::evidence` as `key: value`
+/// lines, so this reads its own output rather than anything a caller controls.
+/// `None` when absent (older cards, or a finding kind with no count) — and an
+/// absent count must never ENABLE the escalation path below, only leave the
+/// cooldown in charge.
+pub(crate) fn carded_count(desc: &str) -> Option<u64> {
+    desc.lines()
+        .find_map(|l| l.trim().strip_prefix("count:"))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+/// AF-474: a fault card frozen at its first burst reports the incident's
+/// SMALLEST numbers for the whole time it matters.
+///
+/// Measured 2026-09-04. AMUX-4093 was filed at 15:36:13 on a pool starvation and
+/// said "4 request(s) across 3 route(s), last_seen 15:35:15". The real episode ran
+/// to 19:52:37 — 43 rows across 5 routes over 257 minutes, with 38 of them in the
+/// LAST hour. The title condition below passed the whole time ("4 ... 3" would
+/// have become "43 ... 5"); the 6h cooldown was the only thing blocking it, and
+/// it opened 103 minutes AFTER the episode ended.
+///
+/// One rule was serving two questions. "Has this fault recurred later" is what
+/// the cooldown is for and 6h is right for it (AEAB-59 added the refresh, and the
+/// cooldown is what stops a recurring fault rewriting its card every tick).
+/// "Is this happening RIGHT NOW and bigger than when I filed" is a different
+/// question, and on that one a 6h cooldown guarantees silence for the duration of
+/// almost every incident.
+///
+/// ESCALATION BYPASSES THE COOLDOWN, and only escalation. A doubling is the
+/// threshold because it makes the bypass SELF-LIMITING: refreshes are logarithmic
+/// in the fault's size, so an incident growing 4 -> 43 refreshes about three
+/// times, not once per tick. A steady fault never doubles and never bypasses.
+pub(crate) fn should_refresh_with_counts(
     old_title: &str,
     new_title: &str,
     updated_at: i64,
     now: i64,
     min_secs: i64,
+    old_count: Option<u64>,
+    new_count: u64,
 ) -> bool {
-    old_title != new_title && now - updated_at >= min_secs
+    if old_title == new_title {
+        return false;
+    }
+    // An absent old count leaves the cooldown in charge — absence is not
+    // evidence of growth.
+    let escalating = old_count.is_some_and(|c| c > 0 && new_count >= c.saturating_mul(2));
+    escalating || now - updated_at >= min_secs
 }
 
 async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<String>> {
@@ -6858,12 +6900,14 @@ async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<St
             let Some((card_id, old_title, old_desc, updated_at)) = existing else {
                 return Ok(None);
             };
-            if !should_refresh(
+            if !should_refresh_with_counts(
                 &old_title,
                 &fresh_title,
                 updated_at,
                 now_s,
                 refresh_min_secs(),
+                carded_count(&old_desc),
+                f.count,
             ) {
                 return Ok(None);
             }
@@ -7910,12 +7954,14 @@ mod tests {
     #[test]
     fn a_moved_measurement_refreshes_the_standing_card() {
         let day = 86_400;
-        assert!(super::should_refresh(
+        assert!(super::should_refresh_with_counts(
             "disk: 4.2 GB free, below the 50 GB floor",
             "disk: 0.9 GB free, below the 50 GB floor",
             0,
             5 * day,
             6 * 3600,
+            None,
+            0,
         ));
     }
 
@@ -7926,7 +7972,7 @@ mod tests {
     #[test]
     fn an_unchanged_measurement_writes_nothing_however_old() {
         let t = "disk: 4.2 GB free, below the 50 GB floor";
-        assert!(!super::should_refresh(t, t, 0, 365 * 86_400, 6 * 3600));
+        assert!(!super::should_refresh_with_counts(t, t, 0, 365 * 86_400, 6 * 3600, None, 0));
     }
 
     /// The rate gate. A value oscillating across a rounding boundary would
@@ -7935,14 +7981,66 @@ mod tests {
     #[test]
     fn a_moved_measurement_still_waits_out_the_rate_gate() {
         let now = 1_000_000;
-        assert!(!super::should_refresh("a", "b", now - 60, now, 6 * 3600));
-        assert!(super::should_refresh(
+        assert!(!super::should_refresh_with_counts("a", "b", now - 60, now, 6 * 3600, None, 0));
+        assert!(super::should_refresh_with_counts(
             "a",
             "b",
             now - 6 * 3600,
             now,
-            6 * 3600
+            6 * 3600,
+            None,
+            0
         ));
+    }
+
+    /// AF-474. A card filed on an incident's FIRST BURST reports its smallest
+    /// numbers for the whole time it matters, because the cooldown outlasts the
+    /// incident.
+    ///
+    /// Real numbers: AMUX-4093 filed 15:36:13 saying "4 request(s) across 3
+    /// route(s)". The episode ran to 19:52:37 — 43 rows across 5 routes, 38 of
+    /// them in the last hour. The title condition passed throughout; the 6h
+    /// cooldown opened 103 minutes AFTER it ended.
+    #[test]
+    fn an_escalating_fault_refreshes_before_the_cooldown_but_a_steady_one_does_not() {
+        let now = 1_000_000;
+        let fresh = now - 60; // well inside the 6h cooldown
+        let (old_t, new_t) = ("… 4 request(s) across 3 route(s) …", "… 43 request(s) across 5 route(s) …");
+
+        // THE SPECIMEN: 4 -> 43 is more than a doubling, inside the cooldown.
+        assert!(
+            super::should_refresh_with_counts(old_t, new_t, fresh, now, 6 * 3600, Some(4), 43),
+            "an incident that grew 10x must update its card while it is still happening"
+        );
+        // A STEADY fault must NOT bypass — this is what the cooldown is for, and
+        // without this arm the change is just 'refresh always'.
+        assert!(
+            !super::should_refresh_with_counts(old_t, new_t, fresh, now, 6 * 3600, Some(40), 43),
+            "a fault ticking along must wait for the cooldown, or every tick rewrites the card"
+        );
+        // EXACTLY 2x is the boundary the doubling rule names.
+        assert!(super::should_refresh_with_counts(old_t, new_t, fresh, now, 6 * 3600, Some(4), 8));
+        assert!(!super::should_refresh_with_counts(old_t, new_t, fresh, now, 6 * 3600, Some(4), 7));
+        // ABSENT old count leaves the cooldown in charge. Absence is not growth.
+        assert!(
+            !super::should_refresh_with_counts(old_t, new_t, fresh, now, 6 * 3600, None, 9_999),
+            "a card with no carded count must not be escalated on a guess"
+        );
+        // An unchanged TITLE still short-circuits, escalation or not.
+        assert!(
+            !super::should_refresh_with_counts(old_t, old_t, fresh, now, 6 * 3600, Some(4), 43),
+            "no title change means nothing to say"
+        );
+    }
+
+    /// The count is read back out of autofix's OWN rendered evidence block.
+    #[test]
+    fn carded_count_reads_the_evidence_line_or_says_it_cannot() {
+        let desc = "verdict: whatever\ncount: 4\ndistinct_clients: 1 (ip:100.108.219.90)\n";
+        assert_eq!(super::carded_count(desc), Some(4));
+        assert_eq!(super::carded_count("no count here\n"), None,
+            "absent must be None, never 0 — 0 would read as a real measurement");
+        assert_eq!(super::carded_count("count: not-a-number\n"), None);
     }
 
     /// The refresh block is REPLACED, never appended, or the card grows without
