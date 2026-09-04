@@ -2640,6 +2640,37 @@ depends_on contains 1-based indexes of earlier tasks. Priority is p0 (highest) t
           *) die "amux board artifact: unexpected argument '$1'" ;;
         esac
       done
+      # A BARE COMMIT SHA IS A TOKEN NOBODY CAN OPEN (AF-493).
+      #
+      # Ethan, watching Doron hunt for a file a task had produced: "every task
+      # should have some kind of output ... Produced asset. So that's just an ID.
+      # But in an ideal world that has, like, a path to the actual file that was
+      # produced."
+      #
+      # Measured on the live board: 783 artifacts, and 399 of them (51%) render
+      # as a token with nothing to open. 301 are bare commit shas. The dashboard
+      # renderer is not at fault — it already links a URL and opens a path — the
+      # REF is simply not a thing you can open.
+      #
+      # A sha is resolvable, unlike an opaque id, so resolve it HERE where the
+      # repo context exists and put the subject and the touched paths in the
+      # description, which the card already renders under the ref. One artifact,
+      # not N: registering a row per file would turn one commit into fifty rows
+      # and bury the card's other assets.
+      #
+      # Only when the caller supplied no description of their own, and only when
+      # the ref really resolves to a commit in this repo. Anything else leaves
+      # the artifact exactly as it was.
+      if [[ -z "$description" ]] && [[ "$ref" =~ ^[0-9a-f]{7,40}$ ]]          && git rev-parse --verify --quiet "${ref}^{commit}" >/dev/null 2>&1; then
+        local _subj _files _n
+        _subj=$(git log -1 --format=%s "$ref" 2>/dev/null)
+        _n=$(git show --stat --format= --name-only "$ref" 2>/dev/null | grep -c . || true)
+        # `paste -sd', '` alternates the two delimiter chars rather than using
+        # both, so it yields `a,b c,d`. One delimiter, then space it.
+        _files=$(git show --stat --format= --name-only "$ref" 2>/dev/null | head -6 | paste -sd'|' - | sed 's/|/, /g')
+        [[ "$_n" -gt 6 ]] && _files="$_files, +$((_n - 6)) more"
+        [[ -n "$_files" ]] && description="$_subj — $_n file(s): $_files"
+      fi
       local body result
       body=$(R="$ref" K="$kind" S="$state" D="$description" python3 -c 'import json,os
 b={"ref":os.environ["R"],"kind":os.environ["K"],"state":os.environ["S"]}
