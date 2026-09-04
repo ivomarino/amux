@@ -2827,7 +2827,7 @@ COST: the hook named a run from 20 hours earlier and was right about everything 
  is the case where it is telling the truth. On Linux the conflict runs the other
  way and costs a session: an OOM-killed `cargo test` in the pane's own scope takes
  the interactive pane down, not just the build.
-FIX: 5cd5be1c. The receipt writer moves to `scripts/write-test-receipt.sh` and is
+FIX: 8e515d80. The receipt writer moves to `scripts/write-test-receipt.sh` and is
  called by both paths, so it is a property of running tests rather than of whichever
  wrapper you reached for. `safe-cargo.sh test` writes one (and stops exec'ing, so
  the exit status is now explicitly propagated and tested); `test-contended.sh`
@@ -2836,4 +2836,8 @@ FIX: 5cd5be1c. The receipt writer moves to `scripts/write-test-receipt.sh` and i
  one, because reporting an absence without saying what produces it is honest and
  unactionable. 26 cells in `scripts/test-test-receipt.sh`, 5 of them new; four
  mutations fire (no receipt written, written for every subcommand, exit status
- swallowed, duplicate guard removed).
+ swallowed, duplicate guard removed). Hooks ship by COPY, so `./scripts/install-hooks.sh`
+ was run and the INSTALLED copy verified (`grep -c AF-478 .git/hooks/pre-commit` -> 1).
+ The FIX sha above was originally written as 5cd5be1c, a sha I had guessed before
+ committing. Corrected in a follow-up; a predicted sha in this file is a citation
+ that resolves to nothing.
