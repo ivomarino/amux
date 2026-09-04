@@ -7599,6 +7599,39 @@ pub async fn patch_item(
                     "these keys are not writable via PATCH and were NOT applied; \
                      the rest of this response reflects the card as stored"
                 );
+                // NAME THE FIELD THEY MEANT (AF-476). Telling a caller a key is
+                // unwritable answers "why did nothing happen" and leaves "what
+                // should I have sent" to guesswork. For keys that are CLI FLAG
+                // names rather than column names, the answer is exact and cheap.
+                //
+                // `trigger` is the whole reason this exists. It is the flag
+                // `amux board <status> <id> --trigger "..."`, which writes
+                // source_ref AND stamps last_verified_at — so a raw PATCH of
+                // {"trigger": ...} writes nothing at all. Measured by the
+                // 2026-09-04 log sweep: 226 such PATCHes from `backend` in 80
+                // seconds across ~220 distinct cards, every one a 422 that could
+                // not have done anything. I had made the identical mistake myself
+                // earlier the same day, which is what made it recognisable.
+                //
+                // Related to AF-469 but not the same: there the caller sent the
+                // right column and missed its companion, so the write LANDED and
+                // the card re-drained forever. Here the write is a complete
+                // no-op. Same root — the CLI flag and the API field have
+                // different names, and only one path stamps both.
+                let hints: Vec<Value> = ignored
+                    .iter()
+                    .filter_map(|k| match k.as_str() {
+                        "trigger" => Some(json!({
+                            "sent": "trigger",
+                            "meant": ["source_ref", "last_verified_at"],
+                            "how": "`amux board <status> <id> --trigger \"...\"` writes both. A raw PATCH must send source_ref AND last_verified_at (unix seconds) itself, or the card re-drains forever (AF-469).",
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                if !hints.is_empty() {
+                    body["ignored_hints"] = json!(hints);
+                }
             }
             // 422 WHEN NOTHING YOU SENT WAS WRITABLE.
             //

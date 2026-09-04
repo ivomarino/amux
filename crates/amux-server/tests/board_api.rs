@@ -3461,6 +3461,44 @@ async fn an_artifact_on_a_missing_card_is_404_not_a_raw_db_error() {
     assert_eq!(st2, StatusCode::CREATED, "an artifact on a real card still lands: {b2}");
 }
 
+// AF-476. `trigger` is a CLI FLAG, not an API field. A raw PATCH of
+// {"trigger": ...} writes nothing and answers 422 all_ignored — correctly, since
+// no key sent was writable. What it did not say was what to send instead.
+//
+// Measured by the 2026-09-04 log sweep: 226 such PATCHes from `backend` in 80
+// seconds across ~220 distinct cards, every one incapable of doing anything.
+#[tokio::test]
+async fn an_ignored_trigger_key_names_the_fields_it_meant() {
+    let (app, _dir) = app();
+    let (_s, _h, c) = send_with(&app, "POST", "/api/board",
+        Some(json!({"title": "park me", "status": "todo", "session": "amux"})),
+        &[("X-Amux-Session", "amux")]).await;
+    let id = c["id"].as_str().unwrap().to_string();
+
+    let (st, _h, b) = send_with(&app, "PATCH", &format!("/api/board/{id}"),
+        Some(json!({"trigger": "the next ts-engine roll"})),
+        &[("X-Amux-Session", "amux")]).await;
+
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "nothing sent was writable: {b}");
+    assert_eq!(b["ignored_fields"][0], "trigger");
+    let h = &b["ignored_hints"][0];
+    assert_eq!(h["sent"], "trigger", "the hint must name the key sent: {b}");
+    assert_eq!(h["meant"][0], "source_ref");
+    assert_eq!(h["meant"][1], "last_verified_at",
+        "both fields, or the caller lands in AF-469's re-draining state: {b}");
+    assert!(h["how"].as_str().unwrap_or("").contains("--trigger"),
+        "and it must name the CLI verb that writes both: {b}");
+
+    // THE OTHER ARM: an ordinary unwritable key gets no hint. Without this the
+    // test passes on an implementation that attaches the trigger hint to
+    // everything, which would be worse than silence.
+    let (st2, _h, b2) = send_with(&app, "PATCH", &format!("/api/board/{id}"),
+        Some(json!({"nonsense_key": 1})), &[("X-Amux-Session", "amux")]).await;
+    assert_eq!(st2, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(b2.get("ignored_hints").is_none(),
+        "a key with no known equivalent must not invent one: {b2}");
+}
+
 // `source_ref` has two owners. autofix stores its fault signature there and
 // `open_card_for_fault` reads it to suppress a duplicate filing; `amux board
 // backlog --trigger` writes the external condition a parked card waits on, as
