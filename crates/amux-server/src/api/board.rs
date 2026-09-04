@@ -8571,6 +8571,27 @@ async fn create_artifact(
                 "actor": actor,
             }))).into_response()
         }
+        // A MISSING CARD IS A 404, NOT A 500 (AF-475). The closure signals
+        // "no such task" with rusqlite::Error::QueryReturnedNoRows, which fell
+        // into the arm below and answered `500 Query returned no rows` — a raw
+        // storage error as the entire body, on a request whose only fault was
+        // naming a card that does not exist. Found by the 2026-09-04 log sweep:
+        // one row, mixpeek-cicd, 0.25ms, and in the analyze output it is
+        // indistinguishable from a genuine server fault.
+        //
+        // That indistinguishability is the cost: the sweep's contract says a
+        // 500 is ALWAYS a finding, so a client error wearing a 500 buys a real
+        // investigation every time it appears.
+        Err(e)
+            if e.downcast_ref::<rusqlite::Error>()
+                .is_some_and(|r| matches!(r, rusqlite::Error::QueryReturnedNoRows)) =>
+        {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "no such task", "task_id": id})),
+            )
+                .into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

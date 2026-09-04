@@ -3429,6 +3429,38 @@ async fn parking_with_a_trigger_and_no_verification_time_warns_the_caller() {
     assert!(quiet3, "clearing a trigger must not warn about verification time: {body3}");
 }
 
+// AF-475. Posting an artifact to a card that does not exist answered
+// `500 Query returned no rows` — the raw rusqlite error as the entire body.
+//
+// Found by the 2026-09-04 log sweep: one row, mixpeek-cicd, 0.25ms latency. The
+// cost is not the wrong code, it is that the sweep's own contract says a 500 is
+// ALWAYS a finding, so a client error wearing a 500 buys a real investigation
+// every time it shows up in /api/logs/analyze.
+#[tokio::test]
+async fn an_artifact_on_a_missing_card_is_404_not_a_raw_db_error() {
+    let (app, _dir) = app();
+    // `implementation`, not `commit`: kind validation runs BEFORE the card
+    // lookup, so an invalid kind 400s and never reaches the arm under test.
+    let body = json!({"kind": "implementation", "ref": "deadbeef"});
+
+    let (st, _h, b) = send_with(&app, "POST", "/api/board/NOPE-999/artifacts",
+        Some(body.clone()), &[("X-Amux-Session", "amux")]).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "a missing card is a client error: {b}");
+    assert_eq!(b["error"], "no such task", "and it must say which fault: {b}");
+    assert!(!b.to_string().contains("Query returned no rows"),
+        "the raw storage error must not reach the caller: {b}");
+
+    // THE OTHER ARM: a real card still succeeds. Without this the test passes on
+    // a handler that 404s everything.
+    let (_s, _h, c) = send_with(&app, "POST", "/api/board",
+        Some(json!({"title": "has artifacts", "status": "todo", "session": "amux"})),
+        &[("X-Amux-Session", "amux")]).await;
+    let id = c["id"].as_str().unwrap().to_string();
+    let (st2, _h, b2) = send_with(&app, "POST", &format!("/api/board/{id}/artifacts"),
+        Some(body), &[("X-Amux-Session", "amux")]).await;
+    assert_eq!(st2, StatusCode::CREATED, "an artifact on a real card still lands: {b2}");
+}
+
 // `source_ref` has two owners. autofix stores its fault signature there and
 // `open_card_for_fault` reads it to suppress a duplicate filing; `amux board
 // backlog --trigger` writes the external condition a parked card waits on, as
