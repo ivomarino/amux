@@ -2572,3 +2572,46 @@ FIX: ~/.claude/CLAUDE.md now shows both forms with their row counts, says the ca
  since that one is asked to be exhaustive by its own sentence. Not fixed and
  deliberately not attempted: putting the disclosure in the BODY would need an
  envelope, and every consumer of that endpoint parses a bare array.
+
+## "commit by pathspec" protects other files, and does nothing for a file you BOTH edited
+AREA: attribution
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-frustrations
+CARD: AF-485
+SYMPTOM: ~/.claude/CLAUDE.md prescribes, for a shared checkout, "commit by pathspec.
+ `git commit <your paths>` ignores the index for everything it does not name and
+ leaves their staged entries untouched." Every clause is true and the paragraph reads
+ as a general guarantee against sweeping a peer. It is not one. `git commit <path>`
+ takes the WORKING TREE state of that path, all of it, not your hunks — so a peer's
+ UNSTAGED edits to a file you name land in your commit, under your message and your
+ Amux-Session trailer, while the pathspec does exactly what it promises. The same
+ paragraph pre-emptively dismisses `git add -p` ("theirs are already staged"), which
+ is correct for the state it describes and wrong for this one, so the reader is
+ steered away from the one tool that would have helped.
+COST: self-traced, 2026-09-04. I committed 66818693 by pathspec on
+ crates/amux-server/src/api/session_verbs.rs and swept amux-testing-e2e's
+ uncommitted Codex composer-footer fix, its LIVE_CODEX_IDLE fixture and its
+ regression test: four of six hunks, 59 of 171 added lines. I pushed it before they
+ could tell me, so the remedy CLAUDE.md prescribes for an absorbed change (do not
+ rewrite shared history; record the reasoning in a follow-up) is now the only one
+ available. The code survived correct and tested; the REASONING did not, because my
+ commit message is entirely about a diagnostic window parameter and says nothing
+ about Codex footer chrome. They found it, not me, and they asked whether they could
+ push a commit that was already on origin.
+ The guard was honest and I misread it: the commit printed "no transcript for RUNNING
+ cotenant(s) amux-codex — their edits are INVISIBLE to this verdict". It never named
+ amux-testing-e2e. A guard saying it cannot see is telling you to look.
+ Filed the same day I measured that 21 of 75 live entries in this file are the one
+ shared-index class (AF-336). This is the twenty-second, produced by following the
+ guidance written to prevent it.
+FIX: the pathspec paragraph in ~/.claude/CLAUDE.md now states what pathspec does NOT
+ cover, carries the measurement above, and gives the three commands to run before a
+ pathspec commit on a co-edited file: `git diff -- <path>`, `git diff --cached --
+ <path>`, and `git add -p -- <path>` followed by a commit with no pathspec. It also
+ says why `add -p` is right here despite the dismissal three lines above it: that
+ dismissal is about a peer's already-STAGED work, a different state.
+ NOT FIXED and deliberately not attempted: making the staged-guard see a cotenant it
+ has no transcript for. It already reports that blind spot by name, which is the
+ honest behaviour; the defect was in the guidance, not the guard.
