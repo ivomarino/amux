@@ -425,9 +425,12 @@ pub fn build(
                 "\n\nNONE of these {checked} path(s) is marked generated: `git check-attr \
                  linguist-generated` returned nothing set. That is a statement about \
                  `.gitattributes` in this repo, NOT a finding that none are generated, because \
-                 a repo with no such file answers exactly this way. If one of them IS \
-                 generator output the recipe above is wrong for it, and one line in \
-                 `.gitattributes` fixes it for every future nudge:\n\
+                 a repo with no such file answers exactly this way. AND IT IS READ FROM THIS \
+                 CHECKOUT: on a stale HEAD the file can read as absent while origin already \
+                 carries one, so `git show origin/main:.gitattributes` before you write a new \
+                 one, or you will regress a better version with a worse one. If one of them \
+                 IS generator output the recipe above is wrong for it, and one line fixes it \
+                 for every future nudge:\n\
                  \x20 <path> linguist-generated=true",
                 checked = fresh.generated_checked
             ),
@@ -460,10 +463,15 @@ pub fn build(
                  generated file gets a recipe you can decline, while a marked hand-written \
                  file loses its merge warning silently. The trap is a generator INPUT sitting \
                  beside its outputs — a `generate.sh` or a config next to the tree it writes, \
-                 which changes on every regen exactly like the outputs do. Derive the list \
-                 from the generator's own manifest where it has one \
-                 (openapi-generator writes `.openapi-generator/FILES`), never from which \
-                 paths change together."
+                 which changes on every regen exactly like the outputs do. Never derive the \
+                 list from which paths change together. Ask the PRODUCER, strongest first: \
+                 a per-file header (`@generated`, \"DO NOT EDIT\") in the first few lines, \
+                 which is a statement about THAT file and so cannot mistake a sibling input \
+                 for an output; a generator manifest where one exists \
+                 (openapi-generator writes `.openapi-generator/FILES`, kubb and most others \
+                 write nothing); a codegen CI gate\'s own path list; and last, a directory \
+                 named for it (`__generated__/`), which is the weakest and wants a second \
+                 source before you mark on it."
             ));
         }
         if !hand_paths.is_empty() {
@@ -2763,9 +2771,25 @@ mod tests {
             m.contains("loses its merge warning silently"),
             "name the direction of error that is silent, not just that errors happen: {m}"
         );
+        // RANKED, AND NOT MANIFEST-FIRST (mixpeek-frustrations, 2026-09-04).
+        // My first wording pointed at the generator's manifest as THE source
+        // that can answer. They measured it: 1 of their 4 generated trees emits
+        // one, and the 3 without hold 12,000 of 16,000 generated files. A reader
+        // in a manifest-less repo is then handed a method that returns nothing
+        // and falls back to the co-change signal the same paragraph just told
+        // them misleads, which is worse than saying nothing.
+        //
+        // The per-file HEADER leads instead. It has the property that makes a
+        // manifest good — a statement by the PRODUCER about THAT file, so a
+        // sibling input cannot be swept in — without requiring the generator to
+        // emit a separate artifact, and it is what actually covered their trees.
         assert!(
-            m.contains(".openapi-generator/FILES"),
-            "point at a manifest that can answer, since co-change cannot: {m}"
+            m.contains("@generated") && m.contains(".openapi-generator/FILES"),
+            "rank the producer's own evidence, do not pin one source: {m}"
+        );
+        assert!(
+            m.contains("Never derive the list from which paths change together"),
+            "and rule out the signal that cannot separate an input from an output: {m}"
         );
     }
 
@@ -2821,6 +2845,18 @@ mod tests {
         assert!(
             m.contains("linguist-generated=true"),
             "hand the reader the line that fixes it, or the capability reaches nobody: {m}"
+        );
+        // WHOSE .gitattributes THE ZERO IS ABOUT (backend, 2026-09-04). They hit
+        // this within an hour of the feature shipping: their working tree is a
+        // stale graft-push checkout whose HEAD predates mixpeek's
+        // .gitattributes, so the file read as ABSENT locally and they started
+        // writing a worse one over origin's 38-line version. `check-attr` reads
+        // the CHECKOUT, so this arm's zero is a statement about the local tree,
+        // and the honest instruction is to check origin's CONTENT rather than
+        // whether the path differs.
+        assert!(
+            m.contains("git show origin/main:.gitattributes"),
+            "the zero is about THIS checkout; say so before someone regresses origin's: {m}"
         );
         assert!(m.contains("merge-file -p"), "and the recipe still applies here: {m}");
     }
