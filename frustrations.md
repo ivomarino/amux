@@ -3079,3 +3079,53 @@ FIX: ATE-45 treats both top-level and nested Codex abort events as durable idle
  boundaries, surfaces the chosen boundary in status-explain, and emits the
  `interrupted_turn_is_terminal` status-truth verdict. Exact rollout and pane
  regressions pin the interrupted-turn prompt frame for Codex and Ollama.
+
+## No board state means "blocked on ANOTHER LANE's decision"
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-04
+SESSION: backend
+CARD: AF-506
+SYMPTOM: Autonomous backlog triage picked up MI-4155, a card owned by a different
+ lane. Every state is a lie or a loop: `backlog` re-feeds the same lane's
+ auto-pickup (it came back twice), `todo` re-queues after cooldown, `needsyou`
+ reads as blocked on Ethan rather than on a peer, and `review` — which the
+ DISPATCHER's own card text recommends ("if blocked on an owner decision, move to
+ review") — gates on acking "Implemented and self-tested" / "Diff / PR is up",
+ which a card you are ROUTING AWAY cannot truthfully claim.
+COST: A lane cycled a card through two dead ends before finding that PATCHing the
+ card's `session` to the owning lane is the answer. Nothing in the blocked
+ response's how_to_ack hints at it, so every lane running backlog triage
+ rediscovers it or picks a dead end. Ethos rule 3: no truthful path for a
+ legitimate state.
+FIX: AF-506. (b) first — surface "reassign session to the owning lane" in the
+ blocked response, the same way it already surfaces the gate-ack CLI. (a) a real
+ blocked-on-peer state that does not re-dispatch and is not gated on a
+ self-implementation attestation; that is a board-state change and is Ethan's to
+ approve. Also fix the dispatcher's "move to review" line, which routes people
+ into the refusal.
+
+## Shared-checkout guard blocks `git reset` but not the bare `git commit`
+AREA: gates
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-04
+SESSION: backend
+CARD: AF-507
+SYMPTOM: `git add <file>` hit a peer's index.lock and failed, so the file was
+ never staged. The follow-up bare `git commit -m` then committed the whole
+ index-vs-frozen-HEAD drift — 1120 files, +67067/-6296 — under their message, not
+ containing their change. `git reset --soft HEAD~1` to undo it was then BLOCKED by
+ git-shared-guard.py, correctly. The guard blocks the FIX and not the CAUSE.
+COST: A near-miss, contained only because the mega-commit was local-only and
+ diverged non-ff from origin; the real change landed via the zero-write graft
+ recipe instead. `git reset` is guarded because it moves HEAD, while a bare `git
+ commit` on this checkout is both more common and less recoverable, and is
+ unguarded.
+FIX: AF-507. Refuse a no-pathspec `git commit` whose staged set exceeds a
+ file-count threshold against ORIGIN/MAIN (not HEAD — graft-push freezes HEAD
+ ~1846 behind, which is what makes the drift large), with a named audited env
+ escape. backend confirms both primitives already exist in that guard: the
+ origin/main-diff is in the co-edit leg and the escape shape is the --allow-*/env
+ pins. Related: AF-503 (the index.lock contention that started the sequence).
