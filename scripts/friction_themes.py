@@ -287,6 +287,25 @@ def canon_area(text: str) -> str:
 # entry that says "documents" (8 -> 156) and `index|cluster|pipeline` inflating
 # engine 134 -> 472. So this adds ONE precise membership and takes nothing away:
 # instruments 103 -> 116, every other cluster unchanged.
+# WIDENED 2026-09-04, and the widening is the sweep's own finding. The arms above
+# were written from three specimens that all said "reports COMPLETED", so the
+# membership matched the WORDING of those three rather than the class. Measured
+# over the same 1206 open entries: the shipped arms caught 32, and 63 more open
+# entries describe the identical shape in different words. Sampled at 4 per arm,
+# every one is the class: "documents/list through the SHARED host returns a silent
+# 200-empty", "`objects/batch` silently drops any blob whose URL its fetcher cannot
+# reach", "setting an App `is_active: false` does NOT take it offline",
+# "`post_filters` is typed, documented, autocompleted, and never applied".
+#
+# THE BASELINE MOVES AND THE NEXT RUN MUST NOT READ IT AS A SURGE. instruments
+# goes 32 -> 95 memberships on the same corpus, with no entry leaving its
+# subsystem cluster. That is an instrument change, not new friction, and it is
+# recorded in docs/friction-themes.md against the theme it feeds.
+#
+# EACH ARM IS ITS OWN PHRASE, not a general "success" pattern. A bare \bok\b or
+# \bgreen\b was measured and rejected: they match ordinary prose and would let
+# this membership absorb the ledger, which is the failure the negative cells in
+# scripts/test-friction-themes.sh exist to catch.
 GREEN_BUT_EMPTY = re.compile(
     r"reports? (?:completed|success|green|ok)\b"
     r"|completes? green|complet\w* green"
@@ -294,7 +313,26 @@ GREEN_BUT_EMPTY = re.compile(
     r"|zero (?:bytes|documents|rows|results|files|objects)"
     r"|(?:reported|reports|says) (?:it )?(?:worked|succeeded|done)\b"
     r"|silent (?:write )?loss"
-    r"|nothing (?:says so|can search)",
+    r"|nothing (?:says so|can search)"
+    # a 2xx carrying nothing, said the several ways this fleet says it
+    r"|silent(?:ly)? (?:200|202)|(?:200|202)[- ]empty"
+    r"|HTTP 200 (?:with|and) (?:zero|no|an empty)"
+    # a success status contradicted in the same sentence, EITHER SIDE of it. The
+    # first version only looked forward and missed "is cancelled, and reports
+    # HTTP 200 / status: completed", where the contradiction is stated first;
+    # the test cell caught that on its own specimen.
+    r"|status:\s*(?:completed|success|ok)\b[^.\n]{0,80}"
+    r"(?:cancel|fail|never|still running|zero|empty)"
+    r"|(?:cancel\w*|fail\w*|times? out|timed out|never \w+)[^.\n]{0,80}"
+    r"(?:reports?|returns?)[^.\n]{0,30}(?:200|202|status:\s*(?:completed|success|ok))"
+    # the operation discarding work while answering normally
+    r"|silently (?:drops?|discards?|ignores?|skips?|reversible|overwrit\w+|swallow\w*)"
+    # a control that answers and does not act
+    r"|does NOT (?:take|apply|remove|delete|disable|stop)\b"
+    r"|plumbed[^.\n]{0,60}(?:no[- ]op|inert|nothing|never)"
+    r"|documented[^.\n]{0,40}and (?:inert|ignored|never)"
+    # the defining clause of the class, stated directly
+    r"|and (?:nothing|no one|nobody) (?:anywhere )?(?:says|warns|reports|notices)",
     re.I,
 )
 

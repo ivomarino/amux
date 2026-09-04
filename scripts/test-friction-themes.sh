@@ -309,12 +309,44 @@ for t in green:
 assert m.canon_area(green[0]) == "engine", m.canon_area(green[0])
 assert m.canon_area(green[1]) == "api-contract", m.canon_area(green[1])
 
+# THE 2026-09-04 WIDENING, one specimen per new arm, in the fleet's real wording.
+# The three originals above all say "reports COMPLETED", so they pin the WORDING
+# of three specimens rather than the class; measured that day, 63 further open
+# entries were the same shape in different words and the membership missed every
+# one. Without these cells the new arms can be deleted and everything stays green.
+for t in [
+    # a 2xx carrying nothing
+    "API/routing (documents/list through the SHARED host returns a silent 200-empty for a dedicated-tenant namespace)",
+    "API/retrievers (three filter-operator spellings, one 400s, one works, and one returns HTTP 200 with zero rows)",
+    # a success status contradicted in the same breath
+    "API/retrievers (`query_expand` exceeds a 6000ms hard ceiling, is cancelled, and reports HTTP 200 / status: completed)",
+    # work discarded while the call answers normally
+    "API/Ingestion — `objects/batch` silently drops any blob whose URL its server-side fetcher cannot reach",
+    "MVS (the vector store's `count()` SILENTLY IGNORES its `filters` argument and returns the NAMESPACE total)",
+    # a control that answers and does not act
+    "API/apps — setting an App `is_active: false` does NOT take it offline; the public URL keeps serving",
+    "API/Retrievers — `post_filters` is typed, documented, autocompleted, and never applied by any stage",
+    # the class stated outright
+    "API/collections (a document can be listed and still be unsearchable, and nothing says which)",
+]:
+    assert "instruments" in m.extra_areas(t), "widened arm missed its own specimen: " + t
+    assert m.canon_area(t) != "unclassified", "subsystem label lost by the widening: " + t
+
 # NEGATIVE: an ordinary defect must not acquire the label, or instruments
 # absorbs the whole ledger and the theme stops discriminating.
+#
+# The last four are the ones the WIDENING could plausibly over-match: a bare
+# success word, a bare "green", a plain 200, and an ordinary "does not" that is
+# not a control failing to act. All four were measured against the shipped
+# pattern before it was widened and must stay out.
 for t in [
     "Studio/retrievers (the input-type picker offered a type the API rejects at create time)",
     "API/manifest (POST /v1/manifest/diff ignores X-Namespace-Id and runs org-wide)",
     "CI/Security (the weekly full-tree secret scan shares a cancel-in-progress group)",
+    "CI (the suite is green on main and the nightly deep run is red, and nobody owns the difference)",
+    "API/auth (a valid key returns 200 and the docs example returns 401, so the example is wrong)",
+    "Studio/pricing (the estimate does not match the invoice by a few cents on annual plans)",
+    "Docs/api-reference (the endpoint is documented and the SDK method name does not match it)",
 ]:
     assert m.extra_areas(t) == [], "ordinary defect wrongly labelled instruments: " + t
 CANONPY
