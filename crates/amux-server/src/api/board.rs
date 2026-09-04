@@ -407,6 +407,38 @@ mod frontier_exclusion_tests {
     /// entirely left every other cell green: the logic was inline in a handler
     /// that needs AppState, so nothing could reach it. A predicate the tests
     /// cannot call is a predicate nothing pins.
+    /// A LOGGED SENTINEL MUST BE PRINTABLE (AF-481).
+    ///
+    /// `NEW_CARD_SELF_ID` is passed to `depends_on_cycle`, which logs it as
+    /// `self_id` when it finds a pre-existing cycle elsewhere on the board. It
+    /// used to be "\u{0}new-card". Nineteen of those bytes in a 67 MB
+    /// server-rs.log made grep call the whole file binary, and `grep -o` then
+    /// returned 8 matches where `grep -c` counted 17 lines, silently, into a
+    /// pipe. The repo's own log-sweep doc prescribes greps over that file.
+    ///
+    /// The cell asserts the property rather than the string, so any future
+    /// sentinel is covered: no control characters, and still impossible as a
+    /// real card id (ids are `[A-Z]+-<digits>`).
+    #[test]
+    fn the_new_card_sentinel_cannot_poison_a_log_or_collide_with_an_id() {
+        assert!(
+            !NEW_CARD_SELF_ID.chars().any(|c| c.is_control()),
+            "a sentinel that reaches a log line must be printable: {NEW_CARD_SELF_ID:?}"
+        );
+        // NON-COLLISION, the property the NUL was chosen for and which must
+        // survive the fix. A real id is uppercase letters, a hyphen and digits;
+        // anything outside that alphabet is as impossible as a NUL was.
+        assert!(
+            NEW_CARD_SELF_ID
+                .chars()
+                .any(|c| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-')),
+            "the sentinel must contain a character no card id can: {NEW_CARD_SELF_ID:?}"
+        );
+        // AND IT MUST NOT BE EMPTY, which would satisfy both assertions above
+        // vacuously and match every id as a substring.
+        assert!(!NEW_CARD_SELF_ID.is_empty(), "an empty sentinel is not a sentinel");
+    }
+
     #[test]
     fn the_frontier_excludes_both_spellings_of_blocked() {
         // Ready: a plain todo with a continuation, gate on.
@@ -3654,8 +3686,27 @@ pub async fn create_item(
             // create can slip a cycle between check and insert. The new id
             // does not exist yet, so a placeholder self id is fine — only
             // edges out of it are being added.
+            //
+            // THE PLACEHOLDER IS PRINTABLE, and it was not (AF-481). It used to
+            // be "\u{0}new-card": a leading NUL, chosen because no real card id
+            // can contain one, which is correct and is also true of a space. The
+            // sentinel reaches a LOG LINE verbatim, `depends_on_cycle` warns with
+            // `self_id = %self_id` on a pre-existing cycle elsewhere on the board,
+            // and a single NUL byte makes grep declare the WHOLE FILE binary.
+            //
+            // Measured 2026-09-04: 19 NUL bytes in a 67 MB server-rs.log, all 19
+            // from this one warn, all from the same stuck cycle
+            // (GE-473 -> MHC-256) retried across three days. `grep -c` still
+            // counted 17 matching lines while `grep -o` returned 8, because grep
+            // suppresses match OUTPUT for binary input and says nothing when the
+            // output goes to a pipe. Every `grep -o` sweep over that file
+            // undercounted by 53% and looked fine, and this repo's own log-sweep
+            // doc prescribes greps.
+            //
+            // Non-collision is unchanged: card ids are `[A-Z]+-<digits>`, so the
+            // space and the parentheses are as impossible as the NUL was.
             if !new.depends_on.is_empty() {
-                if let Some(cycle) = bs::depends_on_cycle(conn, "\u{0}new-card", &new.depends_on)? {
+                if let Some(cycle) = bs::depends_on_cycle(conn, NEW_CARD_SELF_ID, &new.depends_on)? {
                     return finish(&slot_w, Out::Cycle(cycle), no_write());
                 }
             }
@@ -4424,6 +4475,14 @@ pub async fn claim_item(
 /// Truncate for a HISTORY LINE, on chars not bytes (a multi-byte title must not
 /// panic the writer) and with an ellipsis so a truncated value never reads as
 /// the whole value.
+/// Stand-in self id for a card that does not exist yet, used only by the
+/// create-path acyclicity check (AF-481).
+///
+/// Printable, because it is logged. See the call site for the 19 NUL bytes that
+/// turned a 67 MB log binary and cost every `grep -o` sweep over it 53% of its
+/// matches, silently.
+const NEW_CARD_SELF_ID: &str = "(new card)";
+
 fn chars_truncate_log(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         return s.to_string();
