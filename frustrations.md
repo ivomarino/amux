@@ -2798,3 +2798,23 @@ FIX: ATE-43 (this commit). The ready frontier retains card identities and render
  TUBES-2419 as queued behind a clickable TUBES-2418 control. Only ready work with
  zero claimable cards and no holding work keeps the stalled verdict. A one-shot
  `idle-ready-work` client beacon records which classification rendered.
+
+## Peek and worker-card action menus drifted into different products
+AREA: dashboard
+SEVERITY: wrong-action
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-44
+SYMPTOM: the worker card exposed 25 worker actions and configurations, while the
+ peek overflow exposed only File browser and Focus mode. Worse, the peek File
+ browser opened a desktop-only split pane while clicking the displayed directory
+ entered the canonical full Files route for the same worker and path.
+COST: the place where the user was already operating a worker hid almost every
+ control, and two labels for the same file-browsing intent produced different
+ session, navigation, and visible-state outcomes. A duplicated `peek-more-btn`
+ id also made automation and DOM lookup choose whichever button came first.
+FIX: ATE-44 (this commit). Both surfaces render one shared worker-action
+ inventory; peek retains its two additional controls. All three peek file entry
+ controls call one canonical full-route helper, the two overflow buttons have
+ unique semantic IDs, and mismatch/file-entry verdicts reach client-debug logs.

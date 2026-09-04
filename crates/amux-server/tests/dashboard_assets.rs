@@ -116,6 +116,58 @@ fn idle_ready_work_names_the_queue_and_keeps_real_stalls_distinct() {
 }
 
 #[test]
+fn worker_card_and_peek_share_actions_and_the_canonical_file_entry() {
+    let app = asset("app.js");
+    let html = asset("index.html");
+    let css = asset("app.css");
+
+    for required in [
+        "function _workerActionDefinitions(s)",
+        "function _renderWorkerActionMenu(s, surface)",
+        "_renderWorkerActionMenu(s, 'card')",
+        "_renderWorkerActionMenu(s, 'peek')",
+        "data-worker-action",
+        "data-peek-action=\"file-browser\"",
+        "id=\"peek-focus-btn\"",
+        "worker-action-menu-parity",
+        "worker-file-entry",
+    ] {
+        assert!(app.contains(required), "shared worker-action contract lost `{required}`");
+    }
+    let inventory_start = app.find("function _workerActionDefinitions(s)")
+        .expect("shared worker-action inventory must exist");
+    let inventory_tail = &app[inventory_start..];
+    let inventory_end = inventory_tail.find("function _renderWorkerActionMenu")
+        .expect("the shared renderer must follow its inventory");
+    let inventory = &inventory_tail[..inventory_end];
+    assert_eq!(
+        inventory.matches("{ key: '").count(),
+        25,
+        "the full running Claude worker fixture has 25 shared worker actions"
+    );
+
+    let browse_start = app.find("function _browseWorkerFiles(name, source)")
+        .expect("canonical worker file entry must exist");
+    let browse_tail = &app[browse_start..];
+    let browse_end = browse_tail.find("function _reportWorkerActionParity")
+        .expect("file entry must precede the parity diagnostic");
+    let browse = &browse_tail[..browse_end];
+    assert!(browse.contains("openExplore(root, name)"), "worker file entry must use full Files route");
+    assert!(!browse.contains("togglePeekSplit"), "worker file entry must not retain the split-pane fork");
+    assert!(
+        html.contains("_browseWorkerFiles(peekSession,'peek-directory')"),
+        "the displayed directory must use the canonical worker file entry"
+    );
+    assert_eq!(html.matches("id=\"peek-worker-menu-btn\"").count(), 1, "peek header action id must be unique");
+    assert_eq!(html.matches("id=\"peek-composer-more-btn\"").count(), 1, "peek composer action id must be unique");
+    assert_eq!(html.matches("id=\"peek-more-btn\"").count(), 0, "ambiguous duplicate peek-more-btn returned");
+    assert!(
+        css.contains(".peek-more-dropdown") && css.contains("overflow-y:auto") && css.contains("max-height:min(500px"),
+        "the complete peek menu must remain scrollable on desktop and mobile"
+    );
+}
+
+#[test]
 fn board_worker_actions_group_wrapped_lines_under_their_timestamp() {
     let app = asset("app.js");
     let start = app
