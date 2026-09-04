@@ -309,12 +309,44 @@ for t in green:
 assert m.canon_area(green[0]) == "engine", m.canon_area(green[0])
 assert m.canon_area(green[1]) == "api-contract", m.canon_area(green[1])
 
+# THE 2026-09-04 WIDENING, one specimen per new arm, in the fleet's real wording.
+# The three originals above all say "reports COMPLETED", so they pin the WORDING
+# of three specimens rather than the class; measured that day, 63 further open
+# entries were the same shape in different words and the membership missed every
+# one. Without these cells the new arms can be deleted and everything stays green.
+for t in [
+    # a 2xx carrying nothing
+    "API/routing (documents/list through the SHARED host returns a silent 200-empty for a dedicated-tenant namespace)",
+    "API/retrievers (three filter-operator spellings, one 400s, one works, and one returns HTTP 200 with zero rows)",
+    # a success status contradicted in the same breath
+    "API/retrievers (`query_expand` exceeds a 6000ms hard ceiling, is cancelled, and reports HTTP 200 / status: completed)",
+    # work discarded while the call answers normally
+    "API/Ingestion — `objects/batch` silently drops any blob whose URL its server-side fetcher cannot reach",
+    "MVS (the vector store's `count()` SILENTLY IGNORES its `filters` argument and returns the NAMESPACE total)",
+    # a control that answers and does not act
+    "API/apps — setting an App `is_active: false` does NOT take it offline; the public URL keeps serving",
+    "API/Retrievers — `post_filters` is typed, documented, autocompleted, and never applied by any stage",
+    # the class stated outright
+    "API/collections (a document can be listed and still be unsearchable, and nothing says which)",
+]:
+    assert "instruments" in m.extra_areas(t), "widened arm missed its own specimen: " + t
+    assert m.canon_area(t) != "unclassified", "subsystem label lost by the widening: " + t
+
 # NEGATIVE: an ordinary defect must not acquire the label, or instruments
 # absorbs the whole ledger and the theme stops discriminating.
+#
+# The last four are the ones the WIDENING could plausibly over-match: a bare
+# success word, a bare "green", a plain 200, and an ordinary "does not" that is
+# not a control failing to act. All four were measured against the shipped
+# pattern before it was widened and must stay out.
 for t in [
     "Studio/retrievers (the input-type picker offered a type the API rejects at create time)",
     "API/manifest (POST /v1/manifest/diff ignores X-Namespace-Id and runs org-wide)",
     "CI/Security (the weekly full-tree secret scan shares a cancel-in-progress group)",
+    "CI (the suite is green on main and the nightly deep run is red, and nobody owns the difference)",
+    "API/auth (a valid key returns 200 and the docs example returns 401, so the example is wrong)",
+    "Studio/pricing (the estimate does not match the invoice by a few cents on annual plans)",
+    "Docs/api-reference (the endpoint is documented and the SDK method name does not match it)",
 ]:
     assert m.extra_areas(t) == [], "ordinary defect wrongly labelled instruments: " + t
 CANONPY
@@ -322,6 +354,53 @@ then
   ok "I: green-but-empty reaches instruments, keeps its subsystem, and ordinary defects do not"
 else
   bad "I: the cross-cutting label either missed its class, moved an entry, or over-matched"
+fi
+
+# ---------------------------------------------------------------------------
+# Cell J: amux's own appended text is not the human repeating himself.
+#
+# `cross-lane-repeat` read n=14 on 2026-09-04 and 4 of the 14 were the @-mention
+# footer amux appends. MSG-40511 and MSG-42067 share 194 identical characters and
+# nothing else: one asks to add public datasets to a table, the other asks for MVS
+# throughput metrics. The signal called them the same instruction to two lanes.
+#
+# The cell asserts the two directions that matter: the footer is removed, and the
+# human's own words in front of it survive intact. Stripping the whole message
+# would pass a naive "footer is gone" check and delete the signal.
+# ---------------------------------------------------------------------------
+if python3 - "$(pwd)/scripts/friction_themes.py" <<'FOOTERPY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("ft", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+
+FOOT = ('\n\n[amux: @-mentions above are amux workers, NOT files. Reach them via HTTP '
+        'API, never tmux directly]\n  @mvs-research \u2192 POST $AMUX_URL/api/sessions/'
+        'mvs-research/send  {"text":"<msg>"}')
+a = "[02:39 PM] add the public datasets that `@mvs-research` is working on to the table md" + FOOT
+b = "[10:11 AM] I want MVS to have system level logging/metrics for write/import throughput" + FOOT
+
+ia, ib = m.instruction_of(a), m.instruction_of(b)
+assert "[amux:" not in ia and "[amux:" not in ib, "the appended footer survived the strip"
+assert "public datasets" in ia, "the human's own words were stripped too: " + repr(ia)
+assert "system level logging" in ib, "the human's own words were stripped too: " + repr(ib)
+
+# THE PROPERTY. Two unrelated instructions must share no shingle once the footer
+# is gone. Before the strip they shared the footer's phrases and scored as a
+# cross-lane repeat.
+assert not (set(m.shingle(ia)) & set(m.shingle(ib))), \
+    "two unrelated instructions still share a phrase: " + repr(set(m.shingle(ia)) & set(m.shingle(ib)))
+
+# NEGATIVE CONTROL: a message with no footer is untouched, and two genuinely
+# identical instructions must STILL match, or the strip has deleted the signal.
+plain = "review your backlog and todo see whats still relevant, discard what is not"
+assert m.instruction_of(plain) == plain, "a footerless message was altered"
+assert set(m.shingle(m.instruction_of(plain))) & set(m.shingle(m.instruction_of(plain + FOOT))), \
+    "the same instruction with and without a footer must still match"
+FOOTERPY
+then
+  ok "J: amux's appended footer is stripped, the human's words survive, real repeats still match"
+else
+  bad "J: the footer strip either left amux's text in, ate the human's, or killed the signal"
 fi
 
 # ---------------------------------------------------------------------------

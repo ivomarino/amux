@@ -831,14 +831,25 @@ pub fn asset_refs(text: &str) -> Vec<String> {
         .get_or_init(|| Regex::new(r"(?:^|\s)(#\d+)\b").expect("asset ref regex"));
 
     fn file_like_component(part: &str) -> bool {
+        if let Some(name) = part.strip_prefix('.') {
+            return !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'));
+        }
         let Some((stem, ext)) = part.rsplit_once('.') else { return false };
         !stem.is_empty()
+            && stem.chars().any(|c| c.is_ascii_alphabetic() || matches!(c, '_' | '-'))
             && (1..=12).contains(&ext.len())
             && ext.chars().all(|c| c.is_ascii_alphanumeric())
     }
     fn ambiguous_joined_files(value: &str) -> bool {
         !value.contains("://")
-            && value.split('/').filter(|part| file_like_component(part)).count() > 1
+            && value
+                .split('/')
+                .filter(|part| !part.starts_with('.') && file_like_component(part))
+                .count()
+                > 1
     }
 
     let mut out = Vec::new();
@@ -869,6 +880,12 @@ pub fn asset_refs(text: &str) -> Vec<String> {
         push(m.as_str());
     }
     for raw in text.split_whitespace() {
+        // A compiler/test flag can contain a perfectly file-shaped value, but
+        // the flag itself is not a produced asset (`--config=e2e/x.ts` was
+        // rendered as a missing file on ATE-37). Keep it out before trimming.
+        if raw.starts_with('-') || raw.contains('=') {
+            continue;
+        }
         let tok = raw.trim_matches(|c: char| {
             !c.is_ascii_alphanumeric() && c != '/' && c != '.' && c != '_' && c != '-' && c != '~'
         });
@@ -877,15 +894,24 @@ pub fn asset_refs(text: &str) -> Vec<String> {
         }
         if let Some((dir, last)) = tok.rsplit_once('/') {
             if !dir.is_empty() || tok.starts_with('/') {
-                if let Some((stem, ext)) = last.rsplit_once('.') {
-                    if !stem.is_empty()
+                let hidden_file = last.strip_prefix('.').is_some_and(|name| {
+                    !name.is_empty()
+                        && name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+                });
+                let ordinary_file = last.rsplit_once('.').is_some_and(|(stem, ext)| {
+                    !stem.is_empty()
+                        && stem
+                            .chars()
+                            .any(|c| c.is_ascii_alphabetic() || matches!(c, '_' | '-'))
                         && (1..=12).contains(&ext.len())
                         && ext.chars().all(|c| c.is_ascii_alphanumeric())
                         && ext.chars().any(|c| c.is_ascii_alphabetic())
-                    {
-                        push(tok);
-                        continue;
-                    }
+                });
+                if hidden_file || ordinary_file {
+                    push(tok);
+                    continue;
                 }
             }
         } else if file_like_component(tok)
@@ -908,6 +934,39 @@ pub fn asset_refs(text: &str) -> Vec<String> {
     for caps in number_ref.captures_iter(text) {
         if let Some(reference) = caps.get(1) {
             push(reference.as_str());
+        }
+    }
+    out
+}
+
+/// References in model-authored prose that are explicitly presented as
+/// outputs. Generic activity text routinely names input files, peer-owned
+/// dirty files, or a different card's commit; treating every path-like token
+/// as produced is the ATE-39 misattribution class.
+pub fn output_asset_refs(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    const MARKERS: [&str; 8] = [
+        "produced ",
+        "created ",
+        "artifact: ",
+        "artifacts: ",
+        "output: ",
+        "outputs: ",
+        "wrote ",
+        "generated ",
+    ];
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        for marker in MARKERS {
+            let Some(i) = lower.find(marker) else { continue };
+            let tail = &line[i + marker.len()..];
+            for reference in asset_refs(tail) {
+                if seen.insert(reference.clone()) {
+                    out.push(reference);
+                }
+            }
+            break;
         }
     }
     out
@@ -1639,6 +1698,31 @@ pub struct IssueRow {
     pub callback_fired_at: Option<i64>,
     /// Visible refusal/recovery detail; never hidden in logs alone.
     pub callback_error: Option<String>,
+    /// Set ONLY when `desc` holds a bounded PREFIX rather than the whole
+    /// string, which the slim list does to stop hydrating ~30 MB of prose per
+    /// call (AF-346). `None` means `desc` is complete and every consumer
+    /// behaves exactly as it did before this field existed.
+    ///
+    /// It carries the two derivations that cannot be recomputed from a prefix.
+    /// The other three can: `desc_head` is the first non-empty line (verified
+    /// identical from a 512-char prefix on 8,260 live cards), `log_n` reads
+    /// `log`, which is still whole, and `needsyou_note` needs prose only for
+    /// rows that carry a marker, which are hydrated in full.
+    pub desc_prefixed: Option<DescPrefixed>,
+}
+
+/// What a truncated `desc` cannot answer for itself (AF-346).
+///
+/// Both come from SQL beside the prefix. They are NOT recomputable in Rust from
+/// what was hydrated, which is exactly why they are carried rather than derived
+/// a second time: a fallback that silently computed them from the prefix would
+/// return a smaller number that looks like a real one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescPrefixed {
+    /// `desc.chars().count()` over the WHOLE string.
+    pub desc_len: usize,
+    /// `"New task:"` occurrences across the whole `desc` AND `log`.
+    pub folded_n: usize,
 }
 
 impl IssueRow {
@@ -2020,6 +2104,9 @@ fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
         epic: r.get(26)?,
         closed_at: r.get(27)?,
         tags,
+        // Positional mapping only; the AF-346 prefix flag is read BY NAME in
+        // `hydrate_light`, which is the only place it can be true.
+        desc_prefixed: None,
     })
 }
 
@@ -2174,11 +2261,12 @@ pub fn list_issues_capped(
     session_filter: &[String],
     archived: ArchivedFilter,
     done_limit: i64,
+    prose: Prose,
 ) -> rusqlite::Result<(Vec<IssueRow>, usize, usize)> {
     let light = light_rows(conn, status_filter, session_filter, archived)?;
     let (kept_light, term_total, term_kept) =
         cap_terminal_by(light, done_limit, |r| &r.status, |r| r.updated);
-    Ok((hydrate_light(conn, &kept_light)?, term_total, term_kept))
+    Ok((hydrate_light(conn, &kept_light, prose)?, term_total, term_kept))
 }
 
 /// [`list_issues_capped`]'s sibling with [`sse_terminal_quota`] semantics
@@ -2192,10 +2280,11 @@ pub fn list_issues_quota(
     session_filter: &[String],
     archived: ArchivedFilter,
     done_limit: usize,
+    prose: Prose,
 ) -> rusqlite::Result<Vec<IssueRow>> {
     let light = light_rows(conn, status_filter, session_filter, archived)?;
     let kept_light = terminal_quota_by(light, done_limit, |r| &r.status, |r| r.updated);
-    hydrate_light(conn, &kept_light)
+    hydrate_light(conn, &kept_light, prose)
 }
 
 /// Pass 1 shared by the capped and quota lists: filter + sort over the
@@ -2253,19 +2342,147 @@ fn light_rows(
     Ok(light)
 }
 
+/// How much of `desc` a list hydration needs (AF-346).
+///
+/// `/api/board` hydrated 37.6 MB of prose per call, measured 2026-09-04 over
+/// the 8,260 rows a default call keeps, for a response that ships none of it.
+/// The slim body does not ship `desc`, but it ships FIVE derivations of it, so
+/// the obvious fix (stop selecting the column) blanked every card preview on
+/// the fleet dashboard when it was tried: a99955f7, reverted by b1227af0.
+///
+/// This is the version that keeps all five exact. Four of them need at most a
+/// bounded prefix or the (much smaller) `log`; the fifth, `needsyou_note`,
+/// needs whole prose only for rows that actually carry a marker.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Prose {
+    /// Every row's `desc` in full. What every caller got before AF-346.
+    Full,
+    /// A bounded prefix, plus whole `desc` for the rows that need it. Only
+    /// correct for a caller that ships `list_body(.., slim = true)`.
+    SlimDerivations,
+}
+
+/// Characters of `desc` hydrated for a row the slim list will only derive from.
+///
+/// 512 rather than 120 (the `desc_head` cap) because the head is the first
+/// NON-EMPTY line, so leading blank lines have to fit too. Verified against
+/// every live card: `desc_head` computed from a 512-char prefix is identical to
+/// the same computation over the whole string on 8,260 of 8,260 rows. The guard
+/// that would catch a regression here is
+/// `a_prefixed_desc_produces_the_same_slim_derivations_as_a_whole_one`, which
+/// fails on `desc_head` if this number shrinks.
+const DESC_PREFIX_CHARS: usize = 512;
+
+/// The nine marker spellings `list_body`'s `needsyou_note` accepts, as a SQL
+/// predicate over both prose columns.
+///
+/// It must stay a SUPERSET of what the extractor matches, which it is: the
+/// extractor requires the same nine literals, so a row this misses cannot
+/// contain one. Over-hydrating is free; under-hydrating silently drops a card's
+/// question from the owner view.
+///
+/// THE COLON IS LOAD-BEARING. A `%needs%` predicate was measured and rejected
+/// on 2026-08-30 for matching 4,725 of 8,260 rows and saving 17%. With the
+/// colon the same nine spellings match 287, holding 6.9% of the prose, and 367
+/// of the 371 matches across the whole table really do yield a note.
+fn needsyou_marker_sql() -> String {
+    const MARKERS: [&str; 9] = [
+        "needs-you:", "needs you:", "needsyou:",
+        "needs-ethan:", "needs ethan:", "needsethan:",
+        "needs-human:", "needs human:", "needshuman:",
+    ];
+    let mut parts: Vec<String> = Vec::new();
+    for col in ["i.\"desc\"", "i.log"] {
+        for m in MARKERS {
+            parts.push(format!("COALESCE({col},'') LIKE '%{m}%'"));
+        }
+    }
+    parts.join(" OR ")
+}
+
+/// `COLS` with the `desc` column swapped for `expr`, aliased back to `desc`.
+///
+/// Runtime substitution rather than a second hand-maintained column list: two
+/// spellings of fifty columns drift, and the drift would be a wrong VALUE in
+/// some field nobody is looking at. `cols_names_desc_exactly_once` fails if a
+/// future edit renames or duplicates the needle, so a silent no-match is not
+/// available.
+fn cols_with_desc(expr: &str) -> String {
+    let out = COLS.replacen(DESC_COL, expr, 1);
+    debug_assert_ne!(out, COLS, "COLS no longer contains {DESC_COL}");
+    out
+}
+
+/// The exact text `COLS` uses for the desc column. Named so the test and the
+/// substitution cannot disagree about it.
+const DESC_COL: &str = "i.\"desc\"";
+
 /// Pass 2: hydrate survivors only, preserving pass-1 order. Chunked well
 /// under SQLITE_MAX_VARIABLE_NUMBER's historical floor of 999.
-fn hydrate_light(conn: &Connection, kept_light: &[LightRow]) -> rusqlite::Result<Vec<IssueRow>> {
+fn hydrate_light(
+    conn: &Connection,
+    kept_light: &[LightRow],
+    prose: Prose,
+) -> rusqlite::Result<Vec<IssueRow>> {
+    // The projection and the two extra numbers, or neither. Building both here
+    // keeps the "when is desc a prefix" decision in ONE place: a row is
+    // prefixed exactly when `desc_prefixed` comes back 1, and that flag is
+    // computed by the same CASE that chose the projection, so the value and the
+    // claim about it cannot disagree.
+    let (cols, prefixed) = match prose {
+        Prose::Full => (COLS.to_string(), false),
+        Prose::SlimDerivations => {
+            let marker = needsyou_marker_sql();
+            // WHY A NUL ESCAPES TO THE FULL COLUMN. SQLite's LENGTH() on TEXT
+            // stops at the first NUL byte, so `desc_len` would be short for any
+            // card carrying one. Two live cards do today (MF-563: a NUL at
+            // offset 3,561 of 10,063 chars, so LENGTH reports 3,561;
+            // AMUX-2925: ten of them, first at 410 of 2,413). NULs arrive from
+            // pasted terminal output and will recur, and `instr(desc, char(0))`
+            // isolates exactly those two rows out of 8,260. Hydrating them
+            // whole is cheaper than shipping a quietly wrong length.
+            let full_desc_when =
+                format!("instr(COALESCE(i.\"desc\",''), char(0)) > 0 OR {marker}");
+            let desc_expr = format!(
+                "CASE WHEN {full_desc_when} THEN i.\"desc\" \
+                 ELSE substr(COALESCE(i.\"desc\",''), 1, {DESC_PREFIX_CHARS}) END"
+            );
+            // `desc_len` is only READ when the row was prefixed, and the CASE
+            // above guarantees a prefixed row has no NUL, so plain LENGTH() is
+            // exact on every row that uses it.
+            let extra = format!(
+                ", LENGTH(COALESCE(i.\"desc\",'')) AS d_len, \
+                 (LENGTH(COALESCE(i.\"desc\",'')||COALESCE(i.log,'')) \
+                  - LENGTH(REPLACE(COALESCE(i.\"desc\",'')||COALESCE(i.log,''),'New task:',''))) / 9 \
+                 AS d_folded, \
+                 CASE WHEN {full_desc_when} THEN 0 ELSE 1 END AS d_prefixed"
+            );
+            (format!("{}{}", cols_with_desc(&desc_expr), extra), true)
+        }
+    };
     let mut by_id: std::collections::HashMap<String, IssueRow> = std::collections::HashMap::new();
     for chunk in kept_light.chunks(500) {
         let marks = vec!["?"; chunk.len()].join(",");
         let mut stmt = conn.prepare(&format!(
-            "SELECT {COLS} FROM issues i LEFT JOIN issue_tags t ON t.issue_id = i.id \
+            "SELECT {cols} FROM issues i LEFT JOIN issue_tags t ON t.issue_id = i.id \
              WHERE i.deleted IS NULL AND i.id IN ({marks}) GROUP BY i.id"
         ))?;
         let params: Vec<&dyn rusqlite::types::ToSql> =
             chunk.iter().map(|r| &r.id as &dyn rusqlite::types::ToSql).collect();
-        for row in stmt.query_map(params.as_slice(), issue_from_row)? {
+        // Read the derived columns BY NAME. `issue_from_row` maps fifty columns
+        // positionally, so appending to that list by index is a standing invite
+        // to an off-by-one that silently reads the neighbouring field.
+        let rows = stmt.query_map(params.as_slice(), |r| {
+            let mut row = issue_from_row(r)?;
+            if prefixed && r.get::<_, i64>("d_prefixed")? == 1 {
+                row.desc_prefixed = Some(DescPrefixed {
+                    desc_len: r.get::<_, i64>("d_len")?.max(0) as usize,
+                    folded_n: r.get::<_, i64>("d_folded")?.max(0) as usize,
+                });
+            }
+            Ok(row)
+        })?;
+        for row in rows {
             let row = row?;
             by_id.insert(row.id.clone(), row);
         }
@@ -3085,6 +3302,23 @@ mod tests {
         assert!(!has_asset_link("result-a.txt/result-b.txt"));
         assert!(!has_asset_link("plan.md/result-a.txt/result-b.txt"));
         assert!(asset_refs("[ghost](plan.md/result-a.txt)").is_empty());
+        // Command flags and elapsed-time result text are not produced files.
+        // Both appeared as clickable, missing artifacts on ATE-37 because the
+        // old token parser looked only for a dotted tail.
+        assert!(!has_asset_link("--config=e2e/playwright.config.ts"));
+        assert!(!has_asset_link("3.0m"));
+        assert!(!has_asset_link("finished in 42.7s"));
+        assert!(!has_asset_link("processed 1.93M rows"));
+        assert_eq!(
+            asset_refs("customers/tubescience/.env"),
+            vec!["customers/tubescience/.env"],
+            "a hidden dotfile is still a produced file"
+        );
+        assert_eq!(
+            asset_refs("customers/.private/result.json"),
+            vec!["customers/.private/result.json"],
+            "hidden path components must not make a real file ambiguous"
+        );
 
         // The card renderer consumes the SAME parser and must receive every
         // produced asset, not just the first boolean proof that let Done pass.
@@ -3100,6 +3334,16 @@ mod tests {
                 "53a868f",
                 "#106",
             ]
+        );
+
+        assert_eq!(
+            output_asset_refs("Preserving unrelated sessions_legacy.rs while investigating"),
+            Vec::<String>::new(),
+            "an input/peer file mention is not a produced output"
+        );
+        assert_eq!(
+            output_asset_refs("Produced result.md and /tmp/screenshot.png"),
+            vec!["result.md".to_string(), "/tmp/screenshot.png".to_string()]
         );
     }
 
@@ -3930,24 +4174,160 @@ mod tests {
         )
         .unwrap();
 
-        let (kept, _, _) =
-            list_issues_capped(&conn, &[], &[], ArchivedFilter::All, 100).unwrap();
-        let row = kept.iter().find(|r| r.id == "D-1").expect("the seeded card");
-        let slim = crate::api::board::list_body(row, true, false);
+        // BOTH hydrations, same assertions. The doc comment above predicted that
+        // AF-346 would add "a SEPARATE slim hydrate ... so that guard would not
+        // cover the new path". It does not have to be a separate guard: running
+        // the identical assertions over both modes is what makes the new path
+        // unable to differ from the old one, and a mode added later without a
+        // row here fails to compile rather than silently going uncovered.
+        for prose in [Prose::Full, Prose::SlimDerivations] {
+            let (kept, _, _) =
+                list_issues_capped(&conn, &[], &[], ArchivedFilter::All, 100, prose).unwrap();
+            let row = kept.iter().find(|r| r.id == "D-1").expect("the seeded card");
+            let slim = crate::api::board::list_body(row, true, false);
 
-        // The diet still holds: the prose itself is not shipped.
-        assert!(slim["desc"].is_null(), "slim must not ship the prose");
-        assert!(slim["log"].is_null());
+            // The diet still holds: the prose itself is not shipped.
+            assert!(slim["desc"].is_null(), "slim must not ship the prose ({prose:?})");
+            assert!(slim["log"].is_null(), "{prose:?}");
 
-        // ...and every derivation over it survived the round trip. These are
-        // the assertions the card's proposed test does not make.
+            // ...and every derivation over it survived the round trip. These are
+            // the assertions the card's proposed test does not make.
+            assert_eq!(
+                slim["desc_head"], "First line is the preview.",
+                "app.js renders this as the card preview — blank means every card lost its preview ({prose:?})"
+            );
+            assert_eq!(slim["folded_n"], 2, "counts 'New task:' across desc AND log ({prose:?})");
+            assert_eq!(slim["desc_len"], 47, "{prose:?}");
+            assert_eq!(slim["log_n"], 2, "{prose:?}");
+        }
+    }
+
+    /// AF-346 — `cols_with_desc` substitutes into `COLS`, and a no-match is silent.
+    ///
+    /// `replacen` returns the input unchanged when the needle is absent, so a
+    /// future rename of the desc column would leave the slim hydration selecting
+    /// the WHOLE prose while still reporting rows as prefixed. That fails
+    /// nothing at runtime and gives back the bug this card exists to fix, with
+    /// the optimisation still apparently in place.
+    ///
+    /// Exactly once, not at-least-once: two occurrences and `replacen(.., 1)`
+    /// would swap the first and leave the second selecting raw prose.
+    #[test]
+    fn cols_names_desc_exactly_once_so_the_substitution_cannot_silently_miss() {
         assert_eq!(
-            slim["desc_head"], "First line is the preview.",
-            "app.js renders this as the card preview — blank means every card lost its preview"
+            COLS.matches(DESC_COL).count(),
+            1,
+            "COLS must name {DESC_COL} exactly once — cols_with_desc substitutes into it"
         );
-        assert_eq!(slim["folded_n"], 2, "counts 'New task:' across desc AND log");
-        assert_eq!(slim["desc_len"], 47);
-        assert_eq!(slim["log_n"], 2);
+        // A SENTINEL, not a realistic expression. The production replacement is a
+        // CASE that reads `i."desc"` itself, so "the needle is gone afterwards"
+        // is false for the real call and would be a test that only its own
+        // fixture can pass. What must hold is that the substitution landed in
+        // the projection and displaced the bare column.
+        let swapped = cols_with_desc("'SENTINEL'");
+        assert_ne!(swapped, COLS, "the substitution must actually change the projection");
+        assert!(swapped.contains("'SENTINEL'"), "the expression must reach the projection");
+        assert!(
+            !swapped.contains(DESC_COL),
+            "a substitution that leaves the bare column behind selects the prose anyway: {swapped}"
+        );
+    }
+
+    /// AF-346 — the derivations must survive a `desc` that arrives TRUNCATED.
+    ///
+    /// The test above seeds a 47-character desc, so `Prose::SlimDerivations`
+    /// hydrates it whole and the prefix path never runs. Everything that can go
+    /// wrong with this optimisation is on the other side of that boundary, so
+    /// every string here is deliberately built to straddle it.
+    ///
+    /// The comparison is against the SAME derivations computed from the whole
+    /// prose, taken from `Prose::Full` in the same test. Hardcoded expectations
+    /// would drift with the fixture and, worse, would let both sides be wrong
+    /// together.
+    #[test]
+    fn a_prefixed_desc_produces_the_same_slim_derivations_as_a_whole_one() {
+        let conn = create_db();
+        let now = 1_788_000_000i64;
+        // LEADING BLANK AND WHITESPACE-ONLY LINES, so `desc_head` exercises the
+        // "first NON-EMPTY line" rule rather than "first line" — the two agree
+        // on almost every real card, which is how the difference stayed
+        // invisible while it was measured as equivalent on 8,260 rows.
+        let head = "HEAD LINE, the card preview";
+        let pad = "padding that pushes past the prefix boundary. ".repeat(40);
+        // `New task:` markers AFTER the 512-char cut, so `folded_n` cannot be
+        // recomputed from what was hydrated. A fallback that counted the prefix
+        // would return 0 here and 0 is a plausible-looking answer.
+        let plain = format!("\n\n   \n{head}\n{pad}\nNew task: alpha\nNew task: beta\n");
+        assert!(plain.chars().count() > DESC_PREFIX_CHARS, "the fixture must straddle the cut");
+        // A marker BEYOND the cut: this row must take the full-desc escape, or
+        // the owner view silently loses the card's question.
+        let marked = format!("{plain}NEEDS-YOU: does the escape fire?\n");
+        // A NUL beyond the cut. SQLite LENGTH() stops at one, so this row must
+        // also escape to the full column or `desc_len` comes back short.
+        // The NUL goes in as an argument: `\u{0}` inside a format! literal reads
+        // as a format placeholder to anyone skimming, and this cannot be misread.
+        let nulled = format!("{plain}{}tail after the nul\n", '\u{0}');
+        for (id, desc) in [("P-1", &plain), ("P-2", &marked), ("P-3", &nulled)] {
+            conn.execute(
+                "INSERT INTO issues (id, title, \"desc\", status, session, created, updated, log, type) \
+                 VALUES (?1, 'a card', ?2, 'todo', 's', ?3, ?3, ?4, 'code')",
+                rusqlite::params![id, desc, now, "`10:00` one\n\n`10:01` two\n\n\n`10:02` three"],
+            )
+            .unwrap();
+        }
+
+        let (full, _, _) =
+            list_issues_capped(&conn, &[], &[], ArchivedFilter::All, 100, Prose::Full).unwrap();
+        let (slim, _, _) =
+            list_issues_capped(&conn, &[], &[], ArchivedFilter::All, 100, Prose::SlimDerivations)
+                .unwrap();
+
+        // POSITIVE CONTROL FIRST. Without it every assertion below is vacuous:
+        // if the prefix never engaged, the two hydrations are the same bytes and
+        // "they agree" is a tautology.
+        let p1 = slim.iter().find(|r| r.id == "P-1").unwrap();
+        assert_eq!(
+            p1.desc.chars().count(),
+            DESC_PREFIX_CHARS,
+            "P-1 must actually arrive truncated, or this test proves nothing"
+        );
+        assert!(p1.desc_prefixed.is_some(), "and must SAY it is truncated");
+        // The two escapes must NOT be truncated, and must say so the same way.
+        for id in ["P-2", "P-3"] {
+            let r = slim.iter().find(|r| r.id == id).unwrap();
+            assert!(
+                r.desc_prefixed.is_none(),
+                "{id} carries a marker or a NUL, so it must escape to the whole column"
+            );
+            let f = full.iter().find(|r| r.id == id).unwrap();
+            assert_eq!(r.desc, f.desc, "{id}'s escape must hydrate the SAME bytes");
+        }
+
+        // Now the claim: identical output, whichever way the row was loaded.
+        for id in ["P-1", "P-2", "P-3"] {
+            let f = crate::api::board::list_body(
+                full.iter().find(|r| r.id == id).unwrap(), true, false);
+            let s = crate::api::board::list_body(
+                slim.iter().find(|r| r.id == id).unwrap(), true, false);
+            for k in ["desc_len", "desc_head", "log_n", "folded_n", "needsyou_note"] {
+                assert_eq!(f[k], s[k], "{id}: `{k}` differs between hydrations");
+            }
+            // Named individually too, so a failure says WHICH derivation broke
+            // rather than only that two blobs differ.
+            assert_eq!(s["desc_head"], head, "{id}: the preview must skip the blank lines");
+            assert_eq!(s["folded_n"], 2, "{id}: both markers are past the cut");
+            assert_eq!(s["log_n"], 3, "{id}: blank log lines are not entries");
+        }
+        // And the marker, which is the derivation the prefix cannot serve at all.
+        let m = crate::api::board::list_body(
+            slim.iter().find(|r| r.id == "P-2").unwrap(), true, false);
+        assert_eq!(m["needsyou_note"], "does the escape fire?");
+        let n = crate::api::board::list_body(
+            slim.iter().find(|r| r.id == "P-3").unwrap(), true, false);
+        assert_eq!(
+            n["desc_len"], nulled.chars().count(),
+            "a NUL-carrying desc must report its REAL length; SQLite LENGTH() stops at the NUL"
+        );
     }
 
     /// AMUX-3491 — list_issues_capped is an OPTIMIZATION and must be
@@ -4007,7 +4387,7 @@ mod tests {
             let (single, st, sk) =
                 cap_terminal(list_issues(&conn, &status_f, &session_f, archived).unwrap(), limit);
             let (fused, ft, fk) =
-                list_issues_capped(&conn, &status_f, &session_f, archived, limit).unwrap();
+                list_issues_capped(&conn, &status_f, &session_f, archived, limit, Prose::Full).unwrap();
             let key =
                 |r: &IssueRow| (r.id.clone(), r.desc.clone(), r.tags.clone(), r.log.clone());
             assert_eq!(
@@ -4031,7 +4411,7 @@ mod tests {
             list_issues(&conn, &[], &[], ArchivedFilter::All).unwrap(),
             2,
         );
-        let fused_q = list_issues_quota(&conn, &[], &[], ArchivedFilter::All, 2).unwrap();
+        let fused_q = list_issues_quota(&conn, &[], &[], ArchivedFilter::All, 2, Prose::Full).unwrap();
         let key = |r: &IssueRow| (r.id.clone(), r.desc.clone(), r.tags.clone(), r.log.clone());
         assert_eq!(
             single_q.iter().map(key).collect::<Vec<_>>(),
@@ -4045,7 +4425,7 @@ mod tests {
         assert!(verified_kept > 2, "verified must ride its own floor, not the done quota");
         // Nor if the deleted row leaked into either path.
         let (all, _, _) =
-            list_issues_capped(&conn, &[], &[], ArchivedFilter::All, 0).unwrap();
+            list_issues_capped(&conn, &[], &[], ArchivedFilter::All, 0, Prose::Full).unwrap();
         assert!(all.iter().all(|r| r.id != "C-39"), "deleted row must stay invisible");
         assert!(!all.is_empty());
     }
@@ -4111,6 +4491,7 @@ mod tests {
         // newest verified, and the 100 newest done — the lumped 100-cap
         // showed 9 of a 141-card bulk-verify while Python showed all of it.
         let mk = |i: i64, status: &str| IssueRow {
+            desc_prefixed: None,
             id: format!("T-{i}"),
             title: String::new(),
             desc: String::new(),
@@ -4268,6 +4649,7 @@ mod configured_gate_tests {
 
     fn row(item_type: &str, gate: Option<&str>) -> IssueRow {
         IssueRow {
+            desc_prefixed: None,
             id: "T-1".into(), title: String::new(), desc: String::new(),
             status: "doing".into(), session: None, creator: String::new(),
             due: None, created: 0, updated: 0, owner_type: "agent".into(),

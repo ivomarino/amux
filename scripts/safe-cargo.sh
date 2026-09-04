@@ -44,21 +44,49 @@ set -euo pipefail
 # `/run/systemd/system` is the canonical "is systemd the init system" test, so a
 # Linux box that HAS systemd but is missing systemd-run still gets the refusal:
 # that is a real misconfiguration and the original judgement about it stands.
-if [ ! -d /run/systemd/system ]; then
+# A `test` run writes a RECEIPT, and a receipt can only be written after the
+# run — so this wrapper does not `exec` for `test`. Every other subcommand keeps
+# exec: rust-auto-build.sh builds through this script, and an extra shell in the
+# builder's process tree is a change nobody asked for.
+#
+# WHY THIS WRAPPER WRITES ONE AT ALL (AF-478). CLAUDE.md names two sanctioned
+# local paths and they were in conflict: run tests with `test-contended.sh`, and
+# put any local cargo run through this script. Only the first wrote a receipt,
+# so following the safety instruction produced a commit whose pre-commit hook
+# reported the bytes as untested and cited a run from twenty hours earlier.
+# There was no sequence of sanctioned commands that made the hook right.
+#
+# `_TC_RECEIPT` is set by test-contended.sh, which writes its own receipt at the
+# end of its run. Two identical receipts would be harmless and confusing.
+_receipt=""
+if [ "${1:-}" = "test" ] && [ -z "${_TC_RECEIPT:-}" ]; then
+  _receipt="$(cd "$(dirname "$0")" && pwd)/write-test-receipt.sh"
+  [ -x "$_receipt" ] || _receipt=""
+fi
+
+if [ -d /run/systemd/system ]; then
+  if ! command -v systemd-run >/dev/null 2>&1; then
+    echo "safe-cargo.sh: systemd-run not found on a systemd host — refusing to run cargo unisolated." \
+         "Offload remotely instead, or run systemd-run --user --scope by hand." >&2
+    exit 1
+  fi
+  CMD=(systemd-run --user --scope --quiet
+       --working-directory="$(pwd)"
+       --setenv=CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.amux/rust-build-target}"
+       --setenv=PATH="$PATH"
+       --setenv=HOME="$HOME"
+       -- cargo "$@")
+else
   echo "safe-cargo.sh: no systemd on this host — running cargo directly." \
        "There is no pane scope for an OOM to cascade into here." >&2
-  exec cargo "$@"
+  CMD=(cargo "$@")
 fi
 
-if ! command -v systemd-run >/dev/null 2>&1; then
-  echo "safe-cargo.sh: systemd-run not found on a systemd host — refusing to run cargo unisolated." \
-       "Offload remotely instead, or run systemd-run --user --scope by hand." >&2
-  exit 1
+if [ -z "$_receipt" ]; then
+  exec "${CMD[@]}"
 fi
 
-exec systemd-run --user --scope --quiet \
-  --working-directory="$(pwd)" \
-  --setenv=CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.amux/rust-build-target}" \
-  --setenv=PATH="$PATH" \
-  --setenv=HOME="$HOME" \
-  -- cargo "$@"
+rc=0
+"${CMD[@]}" || rc=$?
+"$_receipt" "$rc" "$@"
+exit "$rc"

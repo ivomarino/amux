@@ -96,8 +96,8 @@ scope was assessed on amux evidence and is re-measured across both repos daily.
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-08-31
-OCCURRENCES: 2
+LAST_SEEN: 2026-09-04
+OCCURRENCES: 3
 SIGNALS: board-resting:*, rule-restatement:backlog-growth
 FIX_SITE: crates/amux-server/src/api/board*, plus a runtime job
 CARDS: AF-317
@@ -106,12 +106,16 @@ status has a TTL, a WIP limit or a forced disposition. Re-measured 2026-08-30:
 Mixpeek `needsyou` is 265 cards and grew +73 in 7 days, so the accumulation is
 live and is currently faster on the Mixpeek side.
 
+Re-measured 2026-09-04: `board-resting:mixpeek:blocked` is 39 cards, median age
+32.8 days, 85% over a week, +6 against 33 seven days ago. Still growing, and the
+median age is now the highest of any resting queue in this file.
+
 ## `needsyou` is the cheap escape hatch, so the real asks are buried
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-09-01
-OCCURRENCES: 3
+LAST_SEEN: 2026-09-04
+OCCURRENCES: 4
 LAST_SEEN_NOTE: re-measured 2026-09-01, and it is GROWING
 SIGNALS: board-resting:*:needsyou
 FIX_SITE: board status gate; `needsyou` requires a typed `--ask`
@@ -143,12 +147,16 @@ ago. It is not resting, it is GROWING at roughly 13 cards a day. The typed-ask
 schema reached that board (see above) and the gate still has not, so the queue
 keeps taking cards that ask nobody anything.
 
+Re-measured 2026-09-04: Mixpeek `needsyou` is 306 cards, median 16.1 days, 66%
+over a week, oldest 64.5 days, +105 against 201 seven days ago. Growth is ~15/day
+against ~13/day on 2026-09-01, so the gate still has not reached that board.
+
 ## Nudging is the dominant channel and the loop has no negative feedback
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-08-31
-OCCURRENCES: 1
+LAST_SEEN: 2026-09-04
+OCCURRENCES: 2
 SIGNALS: nudge-no-movement, rule-restatement:idle-stall
 FIX_SITE: `idle_backlog_drain_cooldown_s()` and the board_drive job
 CARDS: AF-319
@@ -164,12 +172,18 @@ verified at scale you dont need me" and "continue todo and everything until
 they're all verified". Prose in three files losing to the mechanism eight times in
 a day is the argument that AF-319 is a mechanism fix, not a wording fix.
 
+Re-measured 2026-09-04: `rule-restatement:idle-stall` n=4 against a 1.23/day
+baseline, 3.3x, down from 8x on 2026-08-31. `nudge-no-movement` fired at n=1 and
+its single lane is `ledger-selftest-target`, a test fixture with 14 machine
+messages and 0 human ones, so that signal contributed no real specimen this pass
+and is reported rather than counted.
+
 ## Verification is something Ethan has to demand, every single time
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-09-01
-OCCURRENCES: 3
+LAST_SEEN: 2026-09-04
+OCCURRENCES: 4
 SIGNALS: rule-restatement:verification, rule-restatement:evidence
 FIX_SITE: NOT prose, and NOT a new mechanism. See AF-393: the push exists, the
 naming is enforced where a group asks for it, and the open question is whether the
@@ -238,12 +252,19 @@ verified over 351 done, so that backlog is a real compliance gap rather than a g
 mismatch. The theme stays open on that, and on the 4.6x restatement rate, not on
 the 90%.
 
+Re-measured 2026-09-04: `rule-restatement:verification` n=7 against a 3.77/day
+baseline, 1.9x, and 6 of the 7 are amux-side. That is DOWN from the 4.6x reading
+on 2026-09-01 that moved this theme back to open, and the per-repo split has
+inverted: 10 of 16 were Mixpeek then, 1 of 7 now. Not called absorbed on one
+reading in the right direction; a 1.9x excursion is still an excursion, and this
+file has already recorded this theme going UP after being marked absorbed.
+
 ## Access and credential gaps surface mid-task, never before
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-09-01
-OCCURRENCES: 2
+LAST_SEEN: 2026-09-04
+OCCURRENCES: 3
 SIGNALS: rule-restatement:permissions, ledger-cluster:auth-secrets
 FIX_SITE: a preflight that names required credentials before a lane starts
 CARDS: AF-372
@@ -265,12 +286,20 @@ in 54 minutes (MSG-37628 07:34, MSG-37678 08:28), the second one asking for the
 list to be written into a README so a human can enable them up front. That is the
 preflight this theme has been asking for, requested by Ethan in his own words.
 
+Re-measured 2026-09-04: `rule-restatement:permissions` n=4 against a 1.08/day
+baseline, 3.7x, and ALL FOUR are the same lane (tubescience) on the same day.
+Scope reads MIXPEEK this pass rather than both. The specimens are the shape this
+theme names, every one mid-task: "why do I need this permission" (18:20), and
+"you should have GitHub access, access to the app ... and supabase credentials
+all of which are in this folder" (11:29), which is the preflight arriving as a
+message seven hours before the complaint.
+
 ## Instruments that lie: the single largest cluster in either ledger
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-09-01
-OCCURRENCES: 3
+LAST_SEEN: 2026-09-04
+OCCURRENCES: 4
 SIGNALS: ledger-cluster:instruments, rule-restatement:instrument-lies
 FIX_SITE: the `measured`/`n_considered` contract + `tests/diagnostic_contract.rs`
 CARDS: AF-320, AF-394
@@ -298,6 +327,29 @@ labels over 1131 entries. The signal now fires at n=4 in a 1-day window.
 STATUS MOVED BACK TO open: this was `absorbed` on the strength of the amux
 diagnostic-route contract, and the Mixpeek side is where the class actually lives
 (80 of 99 last time, and 4 of 4 new entries today are Mixpeek).
+
+Re-measured 2026-09-04: `ledger-cluster:instruments` n=9 (2 amux / 7 mixpeek),
+163 open in total, 25 amux / 138 mixpeek. THE NUMBER MOVED BECAUSE THE
+INSTRUMENT DID, and the next run must not read it as a surge. 4216a537 widened
+`GREEN_BUT_EMPTY`, the cross-cutting membership added on 2026-09-01, after
+measuring that it matched the WORDING of the three specimens it was written from
+rather than the class: it caught 32 of 1,206 open entries while 63 more describe
+the identical shape in other words. Standing open therefore goes 127 -> 163 and
+the 1-day signal 5 -> 9 on an unchanged corpus. Surgical, re-verified: every
+other cluster is byte-identical across the two scans.
+WHAT THE 63 ACTUALLY ARE, and it is the finding rather than the regex: a call
+that answers with a success-shaped status over work it did not do. A silent
+200-empty, `objects/batch` dropping any blob it cannot fetch, `count()` ignoring
+its `filters` and returning the namespace total, `is_active: false` not taking an
+app offline, `post_filters` typed and documented and never applied. 92 of the 93
+memberships are Mixpeek, scattered over eight subsystem clusters with none
+holding more than 38%, which is why no single cluster ever made the argument.
+THE FIX SITE MOVES WITH IT. This theme's FIX_SITE is the amux `measured` /
+`n_considered` contract, an INTERNAL DIAGNOSTICS mechanism, and it cannot absorb
+"the batches endpoint reports COMPLETED while a leg runs". The Mixpeek half needs
+a response contract on the PRODUCT API, which is subsystem work owned by those
+lanes and not this sweep's to write. Carded and routed rather than written as
+prose here.
 
 ## A fix ships, its tests pass, and it does nothing in production
 SCOPE: amux
@@ -395,13 +447,33 @@ whether it reaches lanes is what the signal measures.
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-08-30
-OCCURRENCES: 2
+LAST_SEEN: 2026-09-04
+OCCURRENCES: 3
 SIGNALS: cross-lane-repeat, rule-restatement:staleness
 FIX_SITE: a lane status a human can read without asking the lane
 CARDS: none
 EVIDENCE: the same instruction reaching two or more lanes in a day is the
 measurable form. Four instances on 2026-08-30, one of them spanning both repos.
+Re-measured 2026-09-04, AND THE INSTRUMENT WAS ARGUING THE THEME IN THE HARNESS'S
+OWN VOICE. `cross-lane-repeat` read n=14 against 97 messages considered. 4 of the
+14 were the `[amux: @-mentions above are amux workers...]` footer that amux
+APPENDS to a message: MSG-40511 and MSG-42067 share 194 identical characters and
+nothing else, one asking to add public datasets to a table and the other asking
+for MVS throughput metrics, and the signal called them the same instruction sent
+to two lanes. Fixed in e1ad6c4e; `instruction_of` now cuts at the first `[amux: `.
+CORRECTED READING: n=10, not 14. That is the number this theme is incremented on.
+This signal is this theme's ONLY evidence, and its claim is that Ethan has to
+repeat himself, so 29% of the evidence being the harness's own text is a defect
+in the argument rather than in a count. Recorded here because the next run's
+comparison is against 10.
+WHAT SURVIVES AT 10 IS STILL THE THEME. The sharpest specimen is his own words:
+"I want you to send this command to every active non archived worker: 'review
+your backlog and todo see whats still relevant, discard what is not'"
+(MSG-40168), with MSG-40166 sending it by hand to mvs-infra a minute earlier. He
+is fanning an instruction out to the fleet by hand because nothing else will.
+Four more at 15:55-15:58 are four separately-typed deployment instructions to
+amux, amux-codex, amux-cloud and amux-testing-e2e about ONE blocked checkout,
+which is the same shape one layer up: one condition, four hand-written messages.
 
 ## The auto-builder restarts the server under in-flight work, and every caller fails differently
 SCOPE: amux

@@ -964,12 +964,81 @@ fn scan_gemini(clean: &str, provider: &ProviderId) -> Vec<WorkerEvent> {
 /// single source of truth for the pattern, shared by `scan_codex` (to
 /// short-circuit idle/trust) and [`TerminalAdapter::generating`] (which the
 /// clock-holding caller uses to mint the turn that makes the worker Active).
+fn codex_model_bar(line: &str) -> bool {
+    let Some((identity, location)) = line.rsplit_once('\u{b7}') else {
+        return false;
+    };
+    let location = location.trim();
+    let identity_parts = identity.split_whitespace().count();
+    identity_parts >= 2
+        && (location == "~" || location.starts_with("~/") || location.starts_with('/'))
+}
+
+fn codex_active_status_line(line: &str) -> bool {
+    let low = line.trim().to_ascii_lowercase();
+    low.starts_with("• working (")
+        || low.starts_with("• running (")
+        || low.starts_with("• waiting for background terminal (")
+        || low.starts_with("• waiting for background command (")
+}
+
+fn codex_generation_state_clean(clean: &str) -> Option<bool> {
+    // The Codex prompt shell and model bar remain painted while a turn is
+    // running. The decisive shape is therefore the line immediately ABOVE the
+    // prompt: `• Working (…)` / `• Waiting for background terminal (…)` means
+    // the prompt is disabled and the turn is live; completed turns replace it
+    // with `Worked for …` or ordinary output. ATE-36 incorrectly made the mere
+    // presence of the prompt shell an idle boundary, which hid live ATE-37.
+    let lines = nonempty_trimmed(clean);
+    let start = lines.len().saturating_sub(12);
+    let tail = &lines[start..];
+    if let Some(prompt_i) = tail.iter().rposition(|s| is_prompt_line(s)) {
+        // Older Codex builds painted the active row after the submitted
+        // prompt; current builds keep a disabled prompt shell below the row.
+        // Support both exact adjacent shapes, while refusing an older status
+        // row separated from the newest prompt by completed output.
+        let active_before_prompt = prompt_i > 0 && codex_active_status_line(tail[prompt_i - 1]);
+        let active_after_prompt = tail[prompt_i + 1..]
+            .iter()
+            .any(|s| codex_active_status_line(s));
+        return Some(active_before_prompt || active_after_prompt);
+    }
+    for s in tail.iter().rev() {
+        if codex_active_status_line(s) {
+            return Some(true);
+        }
+        if codex_model_bar(s) {
+            return Some(false);
+        }
+    }
+    None
+}
+
 fn codex_generating(clean: &str) -> bool {
-    nonempty_trimmed(clean).iter().rev().take(12).any(|s| {
-        let sl = s.to_lowercase();
-        s.starts_with('•')
-            && (sl.contains("esc to interrupt") || sl.contains("working") || sl.contains("running"))
-    })
+    codex_generation_state_clean(clean).unwrap_or(false)
+}
+
+/// The newest generation boundary when the capture is structurally
+/// identifiable as a Codex-family TUI, or `None` when another provider (or an
+/// unknown terminal) should keep using its own signals.
+///
+/// The sessions compatibility projection does not carry provider metadata,
+/// but it does have the raw pane. Returning an option lets it share Codex's
+/// ordered boundary logic without pretending every bullet containing
+/// "working" belongs to Codex. The prompt glyph and model/path bar are stable
+/// TUI structure; model and effort names stay intentionally open-ended.
+pub(crate) fn codex_pane_generation_state(captured: &str) -> Option<bool> {
+    let clean = strip_ansi(captured);
+    let tail = nonempty_trimmed(&clean);
+    let identifiable = tail
+        .iter()
+        .rev()
+        .take(12)
+        .any(|s| s.starts_with('›') || codex_model_bar(s));
+    if !identifiable {
+        return None;
+    }
+    codex_generation_state_clean(&clean)
 }
 
 fn scan_codex(clean: &str, provider: &ProviderId) -> Vec<WorkerEvent> {
@@ -1011,26 +1080,14 @@ fn scan_codex(clean: &str, provider: &ProviderId) -> Vec<WorkerEvent> {
     }
 
     // Idle: › prompt or the model status line "gpt-5.5 xhigh · ~/path".
-    // The model bar format for ALL providers is "<model> <effort> · <path>".
-    // Original check only matched OpenAI model names; ollama workers show
-    // "qwen3.8:27b low · ~" which has the same structure but different prefix.
-    // Detect by presence of an effort word alongside the · separator so any
-    // model name (including future local ones) works. (py 18600-18606)
+    // The model bar format for ALL providers is "<model> <effort> · <path>";
+    // `codex_model_bar` deliberately does not enumerate model or effort names,
+    // so a stronger future model does not fall outside the harness.
     let ne = nonempty_trimmed(clean);
     for s in ne.iter().rev().take(5) {
         let sl = s.to_lowercase();
-        let has_effort = sl.contains(" low ")
-            || sl.contains(" medium ")
-            || sl.contains(" high ")
-            || sl.contains(" xhigh ")
-            || sl.contains(" default ");
-        let model_bar = s.contains('·')
-            && (has_effort
-                || sl.contains("gpt-")
-                || sl.contains("o3")
-                || sl.contains("o4"));
         let prompt = s.starts_with('›') && (sl.contains("implement") || *s == "›");
-        if model_bar || prompt {
+        if codex_model_bar(s) || prompt {
             events.push(WorkerEvent::Waiting(WaitReason {
                 reason: "idle_prompt".to_string(),
                 detail: Some(s.to_string()),
@@ -1703,6 +1760,19 @@ Running 1 shell command · 5s…
 
 • Working (12s • esc to interrupt)";
 
+    // `amux-testing-e2e`, live 2026-09-04 while Codex was running ATE-37.
+    // Codex keeps the prompt shell/model bar painted during generation; the
+    // active row immediately above it is the current-state boundary.
+    const FX_CODEX_WORKING_WITH_PROMPT_SHELL: &str = "\
+• Waiting for background terminal (16m 29s • esc to interrupt)
+› Ask Codex to do anything
+  gpt-5.6-sol xhigh · ~/Dev/amux";
+
+    const FX_CODEX_COMPLETED: &str = "\
+• Worked for 4m 46s
+› Ask Codex to do anything
+  gpt-5.6-sol xhigh · ~/Dev/amux";
+
     #[test]
     fn codex_working_pane_is_generating() {
         assert!(
@@ -1711,6 +1781,25 @@ Running 1 shell command · 5s…
         );
         // ollama runs codex --oss, same pane format.
         assert!(adapter("ollama").generating(FX_CODEX_WORKING));
+    }
+
+    #[test]
+    fn codex_working_row_above_the_prompt_shell_is_generating() {
+        assert!(
+            adapter("codex").generating(FX_CODEX_WORKING_WITH_PROMPT_SHELL),
+            "Codex paints its prompt shell during a live turn; the adjacent working row wins"
+        );
+        assert!(adapter("ollama").generating(FX_CODEX_WORKING_WITH_PROMPT_SHELL));
+    }
+
+    #[test]
+    fn codex_completed_row_above_the_prompt_shell_is_idle() {
+        assert!(!adapter("codex").generating(FX_CODEX_COMPLETED));
+        assert_eq!(
+            waiting_reasons(&adapter("codex").scan(FX_CODEX_COMPLETED)),
+            vec!["idle_prompt"]
+        );
+        assert!(!adapter("ollama").generating(FX_CODEX_COMPLETED));
     }
 
     #[test]

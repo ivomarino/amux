@@ -671,6 +671,7 @@ pub fn routes() -> Router<AppState> {
         // request log — no model call anywhere in either handler.
         .route("/analyze", get(analyze))
         .route("/stats", get(stats))
+        .route("/writers", get(writers))
 }
 
 /// GET /api/logs — Python's LIVE handler shape (amux-server.py:67673):
@@ -1476,6 +1477,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/logs/raw", methods: &["GET"] },
     RouteEntry { path: "/api/logs/analyze", methods: &["GET"] },
     RouteEntry { path: "/api/logs/stats", methods: &["GET"] },
+    RouteEntry { path: "/api/logs/writers", methods: &["GET"] },
     // -- settings / push / dictation
     RouteEntry { path: "/api/settings/default-model", methods: &["GET", "PATCH"] },
     RouteEntry { path: "/api/settings/commit-guard", methods: &["GET", "PATCH"] },
@@ -2451,6 +2453,188 @@ async fn stats(
         "slow_outliers": outliers.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
         }),
         window_rows as usize,
+    ))
+    .into_response()
+}
+
+/// The methods that COUNT AS WORK for step 5 of the daily sweep. Defined here,
+/// once, because the contract's first false positive was a lane flagged on 105
+/// requests of which 103 were GETs (AF-34): reading the board and peeking at
+/// lanes is not silent work, and under the old wording every idle observer
+/// looked guilty. A caller who re-types this list can drop a verb and get a
+/// quieter answer that looks the same.
+const MUTATING_METHODS: &[&str] = &["POST", "PATCH", "PUT", "DELETE"];
+
+/// The most sessions `/api/logs/writers` will return. Not a scan cap — the
+/// aggregate below reads the whole window — but the list still has to end
+/// somewhere, and `scan_truncated` is computed FROM this rather than written as
+/// a constant `false`. A hardcoded completeness field cannot disagree with the
+/// run, which is the shape ethos rule 4 is about.
+const WRITERS_CAP: usize = 500;
+
+/// GET /api/logs/writers?since_h=24 — which sessions performed MUTATING writes
+/// in the window, over the WHOLE window.
+///
+/// Step 5 of the daily sweep ("worker traffic with no board trace",
+/// docs/rust-migration/log-sweep.md) used to answer this by pulling
+/// `GET /api/logs?since=$SINCE&limit=2000` and grouping the page by hand. That
+/// query is correct and has stopped being sufficient: measured 2026-09-04, one
+/// 2000-row page covered **0.85 hours of the 24 it was characterising** —
+/// 0.5% of 417,852 matched rows. The set of sessions it yielded was the set
+/// that happened to be writing in the last fifty minutes, and the step's output
+/// is an accusation the contract itself calls "the expensive kind".
+///
+/// A `method=` filter on the page was the obvious cheaper fix and it does not
+/// work. It rests on mutating rows being a small share of traffic; they are
+/// 41.6% (8,314 of 20,000 sampled across 7.19h — 37.2% POST, 4.4% PATCH, no
+/// PUT or DELETE at all). Filtering buys ~2.4x on a step that needs ~33x, so
+/// one page would reach 1.7h of 24 while the card closed as fixed. That is the
+/// same defect one volume-doubling later, with a closed card telling the next
+/// sweep not to re-check.
+///
+/// So the grouping moves to SQL, where there is no page to be a slice of. The
+/// three rules step 5 accumulated from its own false positives become
+/// properties of this handler instead of instructions a reader re-applies each
+/// morning:
+///
+/// - **Mutating methods only** ([`MUTATING_METHODS`], AF-34).
+/// - **Attribute on `amux_session`, NEVER fall back to `worker`.** `worker` is
+///   PATH-derived (`/api/sessions/{name}/*`), so an unattributed report *about*
+///   lane X is tagged `worker=X` and reads as a mutation *by* X. That fallback
+///   flagged `mixpeek-security` for 5 requests it never made. This query does
+///   not select `worker` at all, so the mistake is not available here.
+/// - **Unattributed rows are their own number, not somebody's.** They are
+///   `unattributed_mutations`, published beside the list. With ~7,708
+///   unattributed reports a day (AF-67) a reader who cannot see that total
+///   cannot tell "nobody wrote this" from "nobody was listed".
+///
+/// What it deliberately does NOT do: the board cross-check. Whether a lane's
+/// mutating work has a card is a judgement with three more documented traps of
+/// its own (uncapped `done_limit`, no-cards-here means UNKNOWN, and
+/// `max(created, updated)`), and it belongs to the reader making the
+/// accusation. This endpoint answers the half that was measured wrongly.
+async fn writers(State(state): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let since_h = since_h_of(&q);
+    let cutoff = unix_now() - since_h * 3600.0;
+
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(e) => return internal(e),
+    };
+
+    // The window's TRUE population, all methods. This is `n_considered`: a
+    // writers list that comes back empty over 0 rows and over 400,000 rows are
+    // different answers, and the list alone cannot tell them apart.
+    let (window_rows, oldest_ts): (i64, Option<f64>) = match conn.query_row(
+        "SELECT COUNT(*), MIN(ts) FROM _amux_request_log WHERE ts > ?1",
+        rusqlite::params![cutoff],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ) {
+        Ok(v) => v,
+        Err(e) => return internal(e),
+    };
+
+    let holes = MUTATING_METHODS.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT COALESCE(NULLIF(amux_session,''),''), method, COUNT(*), MIN(ts), MAX(ts) \
+         FROM _amux_request_log \
+         WHERE ts > ?1 AND method IN ({holes}) \
+         GROUP BY 1, 2"
+    );
+    let mut params: Vec<rusqlite::types::Value> = vec![cutoff.into()];
+    for m in MUTATING_METHODS {
+        params.push(rusqlite::types::Value::Text((*m).to_string()));
+    }
+
+    // session -> (total, per-method, first_ts, last_ts)
+    type Agg = (u64, serde_json::Map<String, Value>, f64, f64);
+    let mut by_session: HashMap<String, Agg> = HashMap::new();
+    let mut unattributed: u64 = 0;
+    let mut mutating_rows: u64 = 0;
+    if let Err(e) = (|| -> rusqlite::Result<()> {
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+        while let Some(r) = rows.next()? {
+            let sess: String = r.get(0)?;
+            let method: String = r.get(1)?;
+            let n: i64 = r.get(2)?;
+            let first: f64 = r.get(3)?;
+            let last: f64 = r.get(4)?;
+            let n = n.max(0) as u64;
+            mutating_rows += n;
+            if sess.is_empty() {
+                unattributed += n;
+                continue;
+            }
+            let e = by_session.entry(sess).or_insert_with(|| {
+                (0, serde_json::Map::new(), f64::MAX, f64::MIN)
+            });
+            e.0 += n;
+            e.1.insert(method, json!(n));
+            e.2 = e.2.min(first);
+            e.3 = e.3.max(last);
+        }
+        Ok(())
+    })() {
+        return internal(anyhow::Error::from(e));
+    }
+
+    let distinct_writers = by_session.len();
+    let mut list: Vec<Value> = by_session
+        .into_iter()
+        .map(|(sess, (total, methods, first, last))| {
+            json!({
+                "amux_session": sess,
+                "mutations": total,
+                "methods": methods,
+                "first_ts": first,
+                "first_local": local_when(first),
+                "last_ts": last,
+                "last_local": local_when(last),
+            })
+        })
+        .collect();
+    list.sort_by(|a, b| {
+        let (ca, cb) = (a["mutations"].as_u64().unwrap_or(0), b["mutations"].as_u64().unwrap_or(0));
+        cb.cmp(&ca).then_with(|| {
+            a["amux_session"].as_str().unwrap_or("").cmp(b["amux_session"].as_str().unwrap_or(""))
+        })
+    });
+    let truncated = list.len() > WRITERS_CAP;
+    list.truncate(WRITERS_CAP);
+
+    let now = unix_now();
+    Json(crate::api::measured::measured(
+        json!({
+            "since_h": since_h,
+            // The window the rows ACTUALLY cover. `scan_truncated: false` over
+            // six hours of a store that only holds six hours is a complete
+            // answer to a smaller question, and only this field says which.
+            "actual_window_h": oldest_ts.map(|o| round2((now - o) / 3600.0)),
+            "oldest_row_ts": oldest_ts,
+            "oldest_row_local": oldest_ts.map(local_when),
+            "window_start": cutoff,
+            "window_start_local": local_when(cutoff),
+            "generated_at": now,
+            // Computed from the list, not asserted. The aggregate reads the
+            // whole window, so the only way this answer can be partial is more
+            // than WRITERS_CAP distinct sessions.
+            "scan_truncated": truncated,
+            // The population `writers` is drawn from, distinct from
+            // `n_considered` (all methods). Both are needed: an empty list over
+            // 0 mutating rows in a busy window means the fleet only read.
+            "mutating_rows": mutating_rows,
+            "mutating_methods": MUTATING_METHODS,
+            "distinct_writers": distinct_writers,
+            // NOT assigned to anyone. See the doc comment: borrowing `worker`
+            // for these is the specific mistake that produced a false
+            // accusation, so the number is published unowned instead.
+            "unattributed_mutations": unattributed,
+            "attribution": "amux_session only; `worker` is path-derived and is never \
+                            used here (a report ABOUT a lane is not a write BY it)",
+            "writers": list,
+        }),
+        window_rows.max(0) as usize,
     ))
     .into_response()
 }
@@ -3611,6 +3795,7 @@ mod tests {
             ("/api/logs?limit=2000", "truncated"),
             ("/api/logs/analyze?since_h=24", "scan_truncated"),
             ("/api/logs/stats?since_h=24", "scan_truncated"),
+            ("/api/logs/writers?since_h=24", "scan_truncated"),
         ];
         for (uri, completeness) in sweep_endpoints {
             let (st, body) =
@@ -4238,6 +4423,222 @@ mod tests {
         // module.
         assert!(routes.iter().all(|r| r["owner"] == "native"), "{v}");
         assert_eq!(find("/api/scope")["methods"], json!(["*"]));
+    }
+
+    /// Seed one row with an explicit `worker`, which [`seed`] always leaves NULL.
+    ///
+    /// Needed because the property under test is that `worker` is NOT consulted,
+    /// and a fixture that cannot set it would pass against a handler that reads it.
+    async fn seed_with_worker(
+        store: &crate::db::Store,
+        ts: f64,
+        method: &str,
+        path: &str,
+        session: &str,
+        worker: &str,
+    ) {
+        let (method, path, session, worker) =
+            (method.to_string(), path.to_string(), session.to_string(), worker.to_string());
+        store
+            .write_async(move |conn| {
+                conn.execute(
+                    "INSERT INTO _amux_request_log \
+                     (ts, method, path, family, status, latency_ms, client_ip, \
+                      amux_session, worker, answered_by) \
+                     VALUES (?1,?2,?3,?4,200,1.0,'127.0.0.1',?5,?6,'native')",
+                    rusqlite::params![ts, method, path, family_of(&path), session, worker],
+                )?;
+                Ok(WriteOutcome { applied: false, events: vec![] })
+            })
+            .await
+            .unwrap();
+    }
+
+    /// AF-475 — step 5 grouped a 2000-row PAGE and called it the day.
+    ///
+    /// Measured 2026-09-04: `GET /api/logs?since=<24h>&limit=2000` returned
+    /// `page_span_h: 0.85` against `total_matched: 417852`. The step decides
+    /// whether a lane is working off-ledger, and it was reaching that verdict
+    /// from 0.5% of its window, taken from one end.
+    ///
+    /// Two assertions, and the first is the one that matters. `mutating_rows`
+    /// must equal the rows seeded across the FULL span — a handler that grouped
+    /// the newest page would return the tail and still look well-formed, because
+    /// nothing about a partial answer is malformed. The window is 20 hours here
+    /// rather than a few minutes so that `actual_window_h` can disagree with a
+    /// handler that quietly narrowed it.
+    ///
+    /// The GET rows are the AF-34 control. `amux-homepage` was flagged on 105
+    /// requests of which 103 were GETs: polling and messaging, not work. If the
+    /// method filter is dropped, `reader` appears in the writers list and the
+    /// counts inflate, so this fixture fails in two independent places rather
+    /// than one.
+    #[tokio::test]
+    async fn writers_counts_mutating_rows_across_the_whole_window_not_the_newest_page() {
+        let (store, _dir) = store();
+        let now = unix_now();
+        // Six writers spread across 20 hours, oldest first. A page-shaped
+        // handler sees only the last of these.
+        for (i, sess) in ["oldest", "early", "mid", "late", "later", "newest"].iter().enumerate() {
+            let ts = now - (20.0 - i as f64 * 4.0) * 3600.0;
+            seed(&store, ts, "POST", "/api/board", 200, 1.0, sess, "native", None).await;
+            seed(&store, ts + 1.0, "PATCH", "/api/board/X", 200, 1.0, sess, "native", None).await;
+        }
+        // A busy reader across the same span. Reading is not silent work.
+        for i in 0..10u32 {
+            seed(&store, now - 19.0 * 3600.0 + f64::from(i) * 60.0, "GET", "/api/board", 200, 1.0,
+                 "reader", "native", None).await;
+        }
+
+        let api = logs_api(store.clone());
+        let (st, body) = hit(
+            &api,
+            HttpRequest::builder().uri("/api/logs/writers?since_h=24").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let v: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            v["mutating_rows"], 12,
+            "all 12 mutating rows across the 20h span must be counted; a page-shaped \
+             answer returns the newest few and looks identical: {v}"
+        );
+        assert_eq!(v["distinct_writers"], 6, "every writer in the window, not the recent ones: {v}");
+        let names: Vec<&str> =
+            v["writers"].as_array().unwrap().iter().map(|w| w["amux_session"].as_str().unwrap()).collect();
+        assert!(names.contains(&"oldest"), "the 20h-old writer must appear: {names:?}");
+        assert!(
+            !names.contains(&"reader"),
+            "GET traffic is not mutating work (AF-34: 103 of 105 flagged requests were GETs): {names:?}"
+        );
+
+        // n_considered is the whole window INCLUDING reads; mutating_rows is the
+        // population the list is drawn from. An empty list over 0 mutating rows
+        // in a busy window means the fleet only read, and only these two
+        // together can say that.
+        assert_eq!(v["n_considered"], 22, "n_considered is every row in the window: {v}");
+        assert_eq!(v["measured"], true, "{v}");
+
+        let aw = v["actual_window_h"].as_f64().expect("actual_window_h");
+        assert!(aw >= 19.9, "actual_window_h must cover the seeded span, got {aw}: {v}");
+        assert_eq!(v["scan_truncated"], false, "6 writers is under the cap: {v}");
+
+        // Per-method breakdown, so "mutations: 2" can be read as what it was.
+        let oldest = v["writers"].as_array().unwrap().iter()
+            .find(|w| w["amux_session"] == "oldest").unwrap();
+        assert_eq!(oldest["methods"]["POST"], 1, "{oldest}");
+        assert_eq!(oldest["methods"]["PATCH"], 1, "{oldest}");
+        assert_eq!(oldest["mutations"], 2, "{oldest}");
+    }
+
+    /// AF-475, the attribution half — `worker` must not be reachable from here.
+    ///
+    /// The sweep contract forbids the `worker` fallback by name, having watched
+    /// it flag `mixpeek-security` for 5 requests the store showed it never made:
+    /// `worker` is PATH-derived, so an UNATTRIBUTED report *about* lane X is
+    /// tagged `worker=X` and reads as a mutation *by* X. With ~7,708
+    /// unattributed reports a day (AF-67) that fallback manufactures a silent
+    /// worker for every busy lane on the board.
+    ///
+    /// The fixture is that exact row: an unattributed POST to
+    /// `/api/sessions/mixpeek-security/report`. The strongest assertion here is
+    /// the last one — the name must not appear ANYWHERE in the response — because
+    /// a handler could keep `writers` clean and still leak the borrowed name into
+    /// a summary field, which is how it would reach a reader.
+    ///
+    /// And the count must be PUBLISHED, not dropped. Silently discarding
+    /// unattributed rows would also pass a "no false accusation" check while
+    /// making a fleet that writes 7,708 anonymous rows a day look quiet.
+    #[tokio::test]
+    async fn an_unattributed_write_is_its_own_number_never_the_path_derived_worker() {
+        let (store, _dir) = store();
+        let now = unix_now();
+        for i in 0..3u32 {
+            seed_with_worker(&store, now - f64::from(i) * 60.0, "POST",
+                             "/api/sessions/mixpeek-security/report", "", "mixpeek-security").await;
+        }
+        // One genuinely attributed write, so an empty list is not the reason.
+        seed_with_worker(&store, now - 10.0, "POST", "/api/board", "mvs-infra", "").await;
+
+        let api = logs_api(store.clone());
+        let (st, body) = hit(
+            &api,
+            HttpRequest::builder().uri("/api/logs/writers?since_h=24").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let v: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            v["unattributed_mutations"], 3,
+            "unattributed writes must be published as their own number, not dropped: {v}"
+        );
+        assert_eq!(v["mutating_rows"], 4, "the unattributed rows are still mutating rows: {v}");
+        let names: Vec<&str> =
+            v["writers"].as_array().unwrap().iter().map(|w| w["amux_session"].as_str().unwrap()).collect();
+        assert_eq!(
+            names, vec!["mvs-infra"],
+            "only the row that named its caller may be listed: {v}"
+        );
+        assert_eq!(v["distinct_writers"], 1, "{v}");
+        assert!(
+            !serde_json::to_string(&v).unwrap().contains("mixpeek-security"),
+            "the path-derived worker must not reach the reader by ANY field, not just \
+             `writers` — a name in a summary line accuses just as well: {v}"
+        );
+    }
+
+    /// AF-475 — `scan_truncated` has to be able to be true.
+    ///
+    /// The aggregate reads the whole window, so the tempting thing to write is
+    /// `"scan_truncated": false`. A constant cannot disagree with the run and
+    /// still reads as measured (ethos rule 4), so the field is computed from the
+    /// one truncation that does exist: the returned list ends at
+    /// [`WRITERS_CAP`]. This test is what makes that claim checkable, and the
+    /// control below is what stops it from being true-by-default.
+    ///
+    /// `distinct_writers` stays the FULL count while `writers` is capped, so a
+    /// truncated answer still says how much it left out.
+    #[tokio::test]
+    async fn the_writers_list_says_when_it_stopped_listing() {
+        let (store, _dir) = store();
+        let now = unix_now();
+        let n = WRITERS_CAP + 1;
+        store
+            .write_async(move |conn| {
+                for i in 0..n {
+                    conn.execute(
+                        "INSERT INTO _amux_request_log \
+                         (ts, method, path, family, status, latency_ms, client_ip, \
+                          amux_session, worker, answered_by) \
+                         VALUES (?1,'POST','/api/board','/api/board',200,1.0,'127.0.0.1',?2,NULL,'native')",
+                        rusqlite::params![now - i as f64, format!("lane-{i:04}")],
+                    )?;
+                }
+                Ok(WriteOutcome { applied: false, events: vec![] })
+            })
+            .await
+            .unwrap();
+
+        let api = logs_api(store.clone());
+        let (_, body) = hit(
+            &api,
+            HttpRequest::builder().uri("/api/logs/writers?since_h=24").body(Body::empty()).unwrap(),
+        )
+        .await;
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["scan_truncated"], true,
+            "{n} writers is over the cap, so the list is a slice and must say so: {v}"
+        );
+        assert_eq!(v["writers"].as_array().unwrap().len(), WRITERS_CAP, "{v}");
+        assert_eq!(
+            v["distinct_writers"], n as u64,
+            "the FULL count survives the cap, or a truncated answer cannot say how much \
+             it dropped: {v}"
+        );
+        assert_eq!(v["mutating_rows"], n as u64, "every write is still counted: {v}");
     }
 }
 

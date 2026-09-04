@@ -887,6 +887,7 @@
   .overlay-body a:active { color: #79c0ff; }
   .overlay-body .file-link { color: var(--cyan); text-decoration: none; border-bottom: 1px dashed var(--cyan); cursor: pointer; }
   .overlay-body .file-link:active { color: #79ead3; }
+  .overlay-body button.file-link { appearance: none; -webkit-appearance: none; background: none; border-top: 0; border-right: 0; border-left: 0; padding: 0; font: inherit; }
   .overlay-body .md-link { color: var(--yellow); text-decoration: none; border-bottom: 1px dashed var(--yellow); cursor: pointer; }
   .overlay-body .md-link:active { color: #e8c547; }
   /* A markdown link to ANOTHER file — opens IN the viewer (renderMarkdown +
@@ -1962,7 +1963,7 @@
   /* Peek compact mode — when visual viewport is constrained (pinch zoom / keyboard) */
   .overlay.vv-compact .peek-cmd-row .chips { display: none !important; }
   .overlay.vv-compact .peek-dir-bar { display: none; }
-  .overlay.vv-compact .peek-tabs { padding: 0 8px; }
+  .overlay.vv-compact .peek-tabs { padding: 0 0 0 8px; }   /* right stays 0, see .peek-tabs */
   .overlay.vv-compact .peek-tab { padding: 4px 10px; font-size: 0.75rem; }
   .overlay.vv-compact .overlay-header { padding-bottom: 4px !important; gap: 2px !important; }
   .overlay.vv-compact .peek-cmd-toggle { padding: 3px; }
@@ -2104,7 +2105,11 @@
     border-radius: 12px; font-weight: 600; letter-spacing: 0.02em;
   }
   /* Peek tabs & memory panel */
-  .peek-tabs { display: flex; border-bottom: 1px solid var(--border); flex-shrink: 0; padding: 0 12px;
+  /* padding-RIGHT is 0 deliberately (AF-45): #peek-tab-customize below is
+     position:sticky at right:0 of this scrollport, and a right padding is inside
+     the scrollable area, so tabs render in that gap and bleed past the pinned
+     button. The button carries its own padding, so nothing is lost. */
+  .peek-tabs { display: flex; border-bottom: 1px solid var(--border); flex-shrink: 0; padding: 0 0 0 12px;
     overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; scrollbar-width: none; -ms-overflow-style: none;
     overscroll-behavior-x: contain; touch-action: pan-x; }
   .peek-tabs::-webkit-scrollbar { display: none; }
@@ -2280,7 +2285,7 @@
     #peek-overlay .overlay-header { padding-bottom: 0 !important; gap: 2px !important; margin-bottom: 2px; }
     #peek-overlay #peek-task-row { display: none !important; }
     #peek-overlay .peek-dir-bar { padding: 1px 6px; font-size: 0.68rem; }
-    #peek-overlay .peek-tabs { padding: 0 4px; }
+    #peek-overlay .peek-tabs { padding: 0 0 0 4px; }   /* right stays 0, see .peek-tabs */
     #peek-overlay .peek-tab { padding: 3px 8px; min-height: 36px; font-size: 0.75rem; }
     #peek-overlay .overlay-body { padding: 6px; }
     /* Reclaim the "Updated … · vX" status line on mobile — its ~20px is
@@ -2463,6 +2468,17 @@
   .status-badge.idle { background: rgba(139,148,158,0.15); color: var(--dim); }
   .status-badge.steering { background: rgba(137,87,229,0.2); color: var(--purple,#8957e5); }
   .status-badge.rate-limited { background: rgba(248,81,73,0.18); color: #f85149; }
+  .status-badge.work-queued-chip {
+    border: 0; margin-left: 6px; cursor: pointer; font-family: inherit;
+    white-space: nowrap; max-width: min(260px, 42vw); overflow: hidden;
+    text-overflow: ellipsis; -webkit-tap-highlight-color: transparent;
+  }
+  .work-queued-short { display: none; }
+  @media (max-width: 600px) {
+    .work-queued-wide { display: none; }
+    .work-queued-short { display: inline; }
+    .status-badge.work-queued-chip { max-width: 170px; }
+  }
   .last-active { font-size: 0.7rem; color: var(--dim); flex-shrink: 0; }
   .token-count { font-size: 0.65rem; color: var(--dim); flex-shrink: 0; font-family: "SF Mono","Fira Code",monospace; opacity: 0.7; }
 
@@ -2980,6 +2996,33 @@
     color: var(--dim); padding: 4px 2px; transition: color 0.15s;
   }
   .tab-customize-btn:hover { color: var(--fg); }
+  /* AF-45, the part three passes at this card kept missing: on a phone the peek's
+     ⊞ is not merely SMALL, it is OFF-SCREEN. Measured 2026-09-04 on the shipped
+     build, both mobile targets, peek open with the default tab set:
+       iPhone 15 / WebKit  viewport 393  strip scrollWidth 1025  ⊞ at left=983
+       Chromium 375        viewport 375  strip scrollWidth  985  ⊞ at left=943
+     Nine of sixteen tabs and the ⊞ itself sit past the right edge. Reaching the
+     customizer requires discovering that a strip with no scrollbar
+     (`::-webkit-scrollbar{display:none}`) scrolls horizontally, and panning it
+     ~590px. That is consistent with every report on this card and with either
+     reading of "the box", so it needed no branch decision to fix.
+     WHY THE E2E WENT GREEN THROUGH ALL OF IT, and this is the same shape as the
+     44px comment above: Playwright scrolls an element into view before clicking
+     it. `btn.click()` therefore tests a path the user cannot take. The check that
+     discriminates is the button's rect against the viewport with NO scrolling,
+     which is what tab-customizer.spec.ts now asserts.
+     The main dashboard never had this bug because `.tab-bar-outer` keeps its
+     `.tab-customize-wrap` OUTSIDE the scroller as a sibling. The peek's button is
+     the last child INSIDE `.peek-tabs`. Sticky reproduces that pinning without
+     restructuring a strip whose focus/compact/mobile rules select `.peek-tabs`
+     by name in five places — a wrapper would have had to be added to each, and
+     missing one hides the border or leaves a stray button in focus mode. */
+  #peek-tab-customize {
+    position: sticky; right: 0; z-index: 2;
+    background: var(--bg);
+    border-left: 1px solid var(--border);
+    box-shadow: -10px 0 10px -8px rgba(0, 0, 0, 0.45);
+  }
   /* AF-45. Ethan, three reports: "I click it and nothing happens. It doesn't show."
      Measured on his viewport (screenshot 1125x2436 @3x = 375x812) under WebKit: the
      button's box is 16.5 x 35. The MENU was never the bug — it opens correctly,

@@ -6,6 +6,7 @@
 
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
+#[derive(Debug, Clone)]
 pub struct ArtifactRow {
     pub id: String,
     pub task_id: String,
@@ -59,6 +60,81 @@ pub fn insert(conn: &Connection, row: &ArtifactRow) -> rusqlite::Result<usize> {
     )
 }
 
+pub fn get_for_task_ref(
+    conn: &Connection,
+    task_id: &str,
+    ref_value: &str,
+) -> rusqlite::Result<Option<ArtifactRow>> {
+    conn.query_row(
+        "SELECT id, task_id, kind, ref_value, state, description, created_at, updated_at \
+         FROM _amux_task_artifacts WHERE task_id = ?1 AND ref_value = ?2 \
+         ORDER BY created_at ASC LIMIT 1",
+        params![task_id, ref_value],
+        row_to_artifact,
+    )
+    .optional()
+}
+
+/// Best-effort kind for references extracted from model-authored output.
+///
+/// Kind is presentation metadata, not a closed ontology. The reference and
+/// exact task id are the durable facts; this only keeps screenshots/docs from
+/// being displayed as generic implementation outputs.
+pub fn inferred_kind(reference: &str) -> &'static str {
+    let path = reference
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(reference)
+        .to_ascii_lowercase();
+    if [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"]
+        .iter()
+        .any(|ext| path.ends_with(ext))
+    {
+        "screenshot"
+    } else if [".md", ".mdx", ".pdf", ".doc", ".docx", ".txt"]
+        .iter()
+        .any(|ext| path.ends_with(ext))
+    {
+        "doc"
+    } else {
+        "implementation"
+    }
+}
+
+/// Register references captured from a worker output, once per exact task.
+///
+/// The store's writer is serialized, so the existence check plus insert is
+/// atomic with the card mutation that called it. This deliberately does not
+/// infer a task: callers must already have the authoritative card id.
+pub fn insert_captured_refs(
+    conn: &Connection,
+    task_id: &str,
+    refs: impl IntoIterator<Item = String>,
+    description: &str,
+    now: i64,
+) -> rusqlite::Result<Vec<ArtifactRow>> {
+    let mut inserted = Vec::new();
+    for raw in refs {
+        let reference = raw.trim();
+        if reference.is_empty() || get_for_task_ref(conn, task_id, reference)?.is_some() {
+            continue;
+        }
+        let row = ArtifactRow {
+            id: format!("ART-{}", ulid::Ulid::new().to_string().to_lowercase()),
+            task_id: task_id.to_string(),
+            kind: inferred_kind(reference).to_string(),
+            ref_value: reference.to_string(),
+            state: "created".to_string(),
+            description: Some(description.to_string()),
+            created_at: now,
+            updated_at: now,
+        };
+        insert(conn, &row)?;
+        inserted.push(row);
+    }
+    Ok(inserted)
+}
+
 pub fn list_for_task(conn: &Connection, task_id: &str) -> rusqlite::Result<Vec<ArtifactRow>> {
     let mut stmt = conn.prepare(
         "SELECT id, task_id, kind, ref_value, state, description, created_at, updated_at \
@@ -92,6 +168,9 @@ pub fn update_state(conn: &Connection, id: &str, state: &str, now: i64) -> rusql
     )
 }
 
-pub fn delete(conn: &Connection, id: &str) -> rusqlite::Result<usize> {
-    conn.execute("DELETE FROM _amux_task_artifacts WHERE id = ?1", params![id])
+pub fn delete_for_task(conn: &Connection, task_id: &str, id: &str) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM _amux_task_artifacts WHERE task_id = ?1 AND id = ?2",
+        params![task_id, id],
+    )
 }
