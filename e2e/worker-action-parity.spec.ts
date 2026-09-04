@@ -36,29 +36,52 @@ async function boot(page: import('@playwright/test').Page) {
   // addInitScript clears the one key that persists this, before EVERY
   // navigation on this page, so each boot() is really starting fresh.
   await page.addInitScript(() => { try { localStorage.removeItem('amux_ui_view'); } catch (e) {} });
+  // Third AMUX-122 attempt. The first two (seed via page.evaluate's string
+  // form; clear the persisted view) were each real, necessary fixes — and
+  // still not sufficient, because they both poke `sessions` once and hope
+  // nothing overwrites it before the click. Something does: the app's own
+  // fetchSessions() poll runs on load AND periodically, and across THREE
+  // sequential enterFiles() calls in one test (real page loads, real
+  // navigation, real assertion retries) enough wall-clock time elapses that
+  // a live poll can land between this seed and the click, silently replacing
+  // the one-shot `sessions = [SAMPLE]` with whatever the real dev/CI server
+  // actually has running — which does not include a worker named
+  // 'ate-44-worker', so `_browseWorkerFiles` computed an empty root again on
+  // the third call specifically (more elapsed time = more chances), and
+  // toasted "This worker has no directory to browse" exactly like the very
+  // first (pre-any-fix) failure.
+  //
+  // The robust fix, and the one this whole suite already uses everywhere
+  // else (see fixtures.ts's entire reason for existing): mock the REQUEST,
+  // not the client variable. Every fetchSessions() call — first load and
+  // every later poll — now gets the fixture, so `sessions` stays correctly
+  // seeded for the FULL test, immune to timing.
+  //
+  // enterFiles() calls boot() up to three times on the SAME page, so guard
+  // against registering this route more than once per test: fixtures.ts's
+  // own AF-47 wrapper fails a stub with zero hits at teardown, and a second
+  // page.route() on an identical pattern shadows the first (last registered
+  // wins interception) — the first two of three registrations would each
+  // end up with zero hits and fail the test on their own safety net.
+  const routed = page as unknown as { _sessionsRouted?: boolean };
+  if (!routed._sessionsRouted) {
+    routed._sessionsRouted = true;
+    await page.route('**/api/sessions', (route) => route.fulfill({ json: [SAMPLE] }));
+  }
   await page.goto('/');
   await page.waitForFunction(() => typeof (window as any)._renderWorkerActionMenu === 'function');
-  // `sessions`/`peekSession`/`peekSessionDir` are top-level lexical (`let`)
-  // bindings in the classic app bundle, not window properties — the comment
-  // this replaces already knew that much, but drew the wrong conclusion from
-  // it. A nested eval() INSIDE a page.evaluate(fn, arg) callback still runs in
-  // that callback's own isolated scope (Playwright drives it via
-  // Runtime.callFunctionOn): it cannot see or reassign another script's `let`
-  // bindings, so this silently no-op'd every time. `sessions` stayed `[]`,
-  // `_browseWorkerFiles` computed an empty root from it, and every click in
-  // this file just toasted "This worker has no directory to browse" instead
-  // of navigating — which is why #path= never appeared in the URL.
-  //
-  // page.evaluate's STRING form is different: Playwright sends it as a
-  // top-level Runtime.evaluate, which — like typing consecutive lines into
-  // the DevTools console — DOES interact with previously-declared top-level
-  // `let`/`const` in the page's real execution context. Confirmed working
-  // precedent: peek-default-tab.spec.ts's `sessions = [...]; openPeek(...)`.
-  await page.evaluate(`
-    sessions = ${JSON.stringify([SAMPLE])};
-    peekSession = ${JSON.stringify(NAME)};
-    peekSessionDir = ${JSON.stringify(ROOT)};
-  `);
+  // Wait for the mocked response to actually have landed in `sessions`
+  // before seeding the peek — a bare Array.isArray/some() check in STRING
+  // form (see the note on page.evaluate below for why string, not function).
+  await page.waitForFunction(`Array.isArray(sessions) && sessions.some(s => s.name === ${JSON.stringify(NAME)})`);
+  // openPeek() is a genuine top-level FUNCTION DECLARATION, not a `let` —
+  // the classic bundle attaches it to `window` automatically, so calling it
+  // via a normal (function-form) page.evaluate correctly reaches its own
+  // closure over peekSession/peekSessionDir regardless of how it's invoked.
+  // That asymmetry (declarations reach window; `let`s do not) is the root
+  // fact this whole file's earlier attempts kept working around instead of
+  // using directly.
+  await page.evaluate((name) => { (window as any).openPeek(name); }, NAME);
 }
 
 test('worker card and peek share all 25 worker actions, plus both peek-only actions', async ({ page }) => {
