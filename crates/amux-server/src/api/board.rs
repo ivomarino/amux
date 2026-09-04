@@ -8501,6 +8501,21 @@ async fn list_artifacts(State(state): State<AppState>, Path(id): Path<String>) -
     (StatusCode::OK, Json(json!(items))).into_response()
 }
 
+/// Does this write error mean "the card does not exist" (AF-477)?
+///
+/// EXTRACTED so the NARROWNESS is testable. The guard lives inline in a match
+/// arm otherwise, and the only mutation reachable there touches the Err side —
+/// so widening it to catch EVERY error would send a genuine storage fault to
+/// 404 and no test would notice. That gap was recorded on AF-477 as unproven
+/// rather than implied away; this is what closes it.
+///
+/// The closure returns `anyhow::Error`, so the rusqlite variant has to be
+/// downcast rather than matched (E0308 if you try, caught at compile).
+fn is_missing_task(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<rusqlite::Error>()
+        .is_some_and(|r| matches!(r, rusqlite::Error::QueryReturnedNoRows))
+}
+
 /// POST /api/board/{id}/artifacts
 async fn create_artifact(
     State(state): State<AppState>,
@@ -8615,16 +8630,11 @@ async fn create_artifact(
         // That indistinguishability is the cost: the sweep's contract says a
         // 500 is ALWAYS a finding, so a client error wearing a 500 buys a real
         // investigation every time it appears.
-        Err(e)
-            if e.downcast_ref::<rusqlite::Error>()
-                .is_some_and(|r| matches!(r, rusqlite::Error::QueryReturnedNoRows)) =>
-        {
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "no such task", "task_id": id})),
-            )
-                .into_response()
-        }
+        Err(e) if is_missing_task(&e) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no such task", "task_id": id})),
+        )
+            .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -9434,6 +9444,36 @@ mod slim_tests {
 
 #[cfg(test)]
 mod bulk_migrate_tests {
+
+    /// AF-477. The 404 guard must be NARROW: only "the card does not exist"
+    /// becomes a 404, and every other storage fault stays a 500.
+    ///
+    /// This exists because the integration test could not prove it. That test
+    /// drives the real handler, so the only mutation it can reach touches the
+    /// Err arm — widening the guard to catch EVERY error would send a genuine DB
+    /// fault to 404 and the integration test would still pass, because its
+    /// success case is an Ok. The gap was recorded on the card as unproven; this
+    /// closes it by testing the classification directly.
+    #[test]
+    fn only_a_missing_row_is_a_missing_task() {
+        // The one that IS a missing card.
+        assert!(
+            super::is_missing_task(&anyhow::Error::new(rusqlite::Error::QueryReturnedNoRows)),
+            "QueryReturnedNoRows is how the closure signals 'no such task'"
+        );
+        // A DIFFERENT rusqlite error is a real fault and must stay a 500.
+        assert!(
+            !super::is_missing_task(&anyhow::Error::new(
+                rusqlite::Error::ExecuteReturnedResults
+            )),
+            "a genuine storage fault must NOT be reported to the caller as 404"
+        );
+        // And a non-rusqlite error must not be swallowed either.
+        assert!(
+            !super::is_missing_task(&anyhow::anyhow!("pool exhausted")),
+            "an error that is not a rusqlite error at all must stay a 500"
+        );
+    }
     use super::*;
 
     /// AMUX-4044. The safety property of bulk migrate is that a GATED column
