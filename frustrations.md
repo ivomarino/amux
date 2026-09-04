@@ -3000,3 +3000,25 @@ COST: Seven minutes, an extra 2m32s server build, and a browser run that would
 FIX: Open as AMUX-4142. Make embedded-asset provenance part of the build
  fingerprint or have the build/deploy gate compare served APP_VER/CACHE with
  the source tree and emit a sweep-visible mismatch verdict.
+
+## A lost Stop report left a finished Primis turn WORKING for 139 seconds
+AREA: hooks
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: Root's live browser saw both Primis subagents finish and Claude return
+ to its prompt at 15:22, but the worker card and input still said WORKING. The
+ status explanation chose a fresh `prompt-hook` active report with zero live
+ subagents; the hook log showed the missing edge exactly: `15:22:22 primis
+ source=stop-hook http=000` during a server rebuild.
+COST: the production UI contradicted the provider for 139 seconds and Board
+ pickup remained suppressed after all work was terminal. It self-cleared only
+ when the active-report trust window expired, not because the final fact landed.
+FIX: ATE-45 makes main-turn state a durable singleton latest-wins queue using
+ the same bounded detached drain as lifecycle events. A newer report atomically
+ replaces an older pending state, so recovery cannot replay idle over a later
+ active turn; successful recovery logs the state, identity, attempt and
+ `replayed_state` verdict. The exact lost-Stop outage replays idle without any
+ later hook and is a shipped regression cell.

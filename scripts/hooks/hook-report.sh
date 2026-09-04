@@ -15,18 +15,20 @@
 # routing both through this one canonical reporter keeps attribution,
 # conversation adoption, endpoint resolution and failure logging identical.
 #
-# ATE-45: lifecycle delivery is a durable FIFO. A server rebuild used to turn
-# SubagentStart/Stop into one-shot http=000 log lines, leaving the authoritative
-# live count false until the next worker restart. The detached drain below
-# survives the hook invocation, retries the SAME event identity after response
-# loss, and leaves an fsynced bounded queue for the next hook if the outage
-# outlives its retry window. The hook still always exits zero: amux must never
-# block the model.
+# ATE-45: lifecycle delivery is a durable FIFO, and main-turn state is a
+# durable latest-wins row. A server rebuild used to turn either into a one-shot
+# http=000 log line, leaving the authoritative state false until another hook
+# happened or its trust window expired. The detached drain below survives the
+# hook invocation and retries the same row after response loss. Lifecycle edges
+# keep order; a newer main state replaces the older row so replayed idle can
+# never overwrite a later active turn. The hook still always exits zero: amux
+# must never block the model.
 if [ "${1:-}" = "--drain-subagents" ]; then
-  /usr/bin/python3 - "${2:-}" "${3:-}" "${4:-}" <<'PY'
+  /usr/bin/python3 - "${2:-}" "${3:-}" "${4:-}" "${5:-lifecycle_queue}" <<'PY'
 import fcntl,json,os,ssl,sys,tempfile,time,urllib.error,urllib.request
-queue,url,session=sys.argv[1:4]
+queue,url,session,queue_kind=sys.argv[1:5]
 if not queue or not url or not session: raise SystemExit(0)
+if queue_kind not in ("lifecycle_queue","state_queue"): queue_kind="lifecycle_queue"
 lock=queue+".drain.lock"
 os.makedirs(os.path.dirname(queue),mode=0o700,exist_ok=True)
 lf=open(lock,"a+")
@@ -50,7 +52,7 @@ def corrupt_note(preserved,exc):
         os.makedirs(os.path.dirname(path),exist_ok=True)
         with open(path,"a") as stream:
             stream.write(time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())+
-                f" {session} lifecycle_queue=corrupt verdict=preserved_corrupt_queue "+
+                f" {session} {queue_kind}=corrupt verdict=preserved_corrupt_queue "+
                 f"queue={queue} preserved={preserved} error={type(exc).__name__}\n")
     except Exception: pass
 
@@ -101,14 +103,16 @@ def note(kind,row,code,attempt):
     try:
         os.makedirs(os.path.dirname(path),exist_ok=True)
         with open(path,"a") as stream:
+            verdict=("non_retryable_http" if kind == "dead_letter" else
+                     "replayed_state" if kind == "delivered" else "retryable")
             stream.write(time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())+
                 f" {session} source={row.get('body',{}).get('source','subagent-hook')} url={url} "+
-                f"http={code} lifecycle_queue={kind} attempt={attempt} "+
-                f"verdict={'non_retryable_http' if kind == 'dead_letter' else 'retryable'} "+
+                f"http={code} {queue_kind}={kind} attempt={attempt} verdict={verdict} "+
                 f"event_id={row.get('event_id','')} "+
                 f"lifecycle_session={row.get('body',{}).get('session_id','')} "+
                 f"agent_id={row.get('body',{}).get('agent_id','')} "+
-                f"event={row.get('body',{}).get('subagent','')}\n")
+                f"event={row.get('body',{}).get('subagent','')} "+
+                f"state={row.get('body',{}).get('state','')}\n")
     except Exception: pass
 
 ctx=ssl._create_unverified_context()
@@ -141,6 +145,8 @@ while True:
             if current and current[0].get("event_id","")==event_id: return current[1:]
             return current
         locked_rows(delivered)
+        if queue_kind == "state_queue" and attempt > 1:
+            note("delivered",row,code,attempt)
         retry_failures=0
         continue
     retryable_4xx={"408","409","425","429"}
@@ -410,9 +416,9 @@ print(json.dumps(out))
 # be COUNTABLE in /api/logs/analyze, not something a human notices weeks later
 # by wondering why a worker stopped reporting (ethos rule 4).
 [ "$CORRECTED" = "1" ] && BODY="${BODY%\}}, \"amux_session_corrected_from\": \"$STALE_FROM\"}"
-# Lifecycle facts are ordered and durable; main-turn state remains latest-wins
-# and uses the immediate POST below. Keeping those policies separate prevents
-# an old queued idle heartbeat from overwriting a newer active turn.
+# Lifecycle facts are ordered and durable. Main-turn state uses a separate
+# singleton queue below: latest-wins replacement prevents an old queued idle
+# heartbeat from overwriting a newer active turn.
 QD="$HOME/.amux/hook-report-queue"
 QF="$QD/$AMUX_SESSION.json"
 case "${MODE/subagent-/subagent:}" in
@@ -500,6 +506,73 @@ if [ -s "$QF" ]; then
   nohup bash "$0" --drain-subagents "$QF" "$REPORT_URL" "$AMUX_SESSION" \
     </dev/null >/dev/null 2>&1 &
 fi
+# Main-turn state has the same outage problem as lifecycle. Primis returned to
+# a prompt at 15:22, but its Stop hook received http=000 during a rebuild; the
+# preceding active report remained authoritative for another 139 seconds. A
+# one-row atomic queue preserves the newest state through that outage. The
+# shared drain's compare-by-event-id removal means a drain posting an older row
+# cannot delete or overtake a newer replacement.
+SF="$QD/$AMUX_SESSION.state.json"
+mkdir -p "$QD" 2>/dev/null; chmod 700 "$QD" 2>/dev/null || true
+STATE_NOTE=$(/usr/bin/python3 - "$SF" "$BODY" <<'PY'
+import fcntl,json,os,sys,tempfile,time,uuid
+path,raw=sys.argv[1:3]
+try: body=json.loads(raw)
+except Exception: raise SystemExit(0)
+event_id=f"state:{time.time_ns()}:{os.getpid()}:{uuid.uuid4().hex}"
+with open(path+".lock","a+") as guard:
+    fcntl.flock(guard,fcntl.LOCK_EX)
+    previous=[]
+    try:
+        with open(path) as stream: previous=json.load(stream)
+        if not isinstance(previous,list) or any(
+            not isinstance(row,dict) or not isinstance(row.get("body"),dict)
+            for row in previous
+        ):
+            raise ValueError("invalid state queue schema")
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        preserved=path+f".corrupt.{time.time_ns()}"
+        try: os.replace(path,preserved)
+        except FileNotFoundError: preserved="missing-before-preserve"
+        except Exception as move_exc:
+            preserved=path+f":preserve_failed:{type(move_exc).__name__}"
+        log=os.path.expanduser("~/.amux/logs/hook-report-failures.log")
+        try:
+            os.makedirs(os.path.dirname(log),exist_ok=True)
+            with open(log,"a") as stream:
+                stream.write(time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())+
+                    f" {os.environ.get('AMUX_SESSION','')} state_queue=corrupt "+
+                    f"verdict=preserved_corrupt_queue queue={path} preserved={preserved} "+
+                    f"error={type(exc).__name__}\n")
+        except Exception: pass
+        previous=[]
+    attempts=max(0,int(previous[0].get("attempts",0))) if previous else 0
+    row={"event_id":event_id,"body":body,"attempts":attempts}
+    fd,tmp=tempfile.mkstemp(prefix="state.",dir=os.path.dirname(path))
+    try:
+        os.fchmod(fd,0o600)
+        with os.fdopen(fd,"w") as stream:
+            json.dump([row],stream,separators=(",",":")); stream.write("\n")
+            stream.flush(); os.fsync(stream.fileno())
+        os.replace(tmp,path)
+    except BaseException:
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
+        raise
+print(event_id)
+PY
+)
+if [ -n "$STATE_NOTE" ]; then
+  nohup bash "$0" --drain-subagents "$SF" "$REPORT_URL" "$AMUX_SESSION" state_queue \
+    </dev/null >/dev/null 2>&1 &
+  exit 0
+fi
+D="$HOME/.amux/logs"; mkdir -p "$D" 2>/dev/null
+printf '%s %s source=%s state_queue=enqueue_failed fallback=immediate\n' \
+  "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$AMUX_SESSION" "$SRC" \
+  >> "$D/hook-report-failures.log" 2>/dev/null
 # X-Amux-Session stamps the write server-side (AMUX-1768). report_post's own
 # comment names its absence as the standing residual: "the shipped hooks send no
 # header, so an UNSTAMPED write is still accepted". This IS the shipped hook.

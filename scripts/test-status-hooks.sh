@@ -228,6 +228,41 @@ for code in (408,409,425,429):
 print("ok   transient 408/409/425/429 responses retry without reordering")
 PY
 
+# Main-turn reports are latest-wins, but still durable. Reproduce Primis at
+# 15:22: active was already stored, Stop got http=000 during a rebuild, and the
+# prompt stayed WORKING until the active trust window expired. The detached
+# drain must replay the idle row without a later hook, while the older active
+# attempt may never land after the endpoint returns.
+touch "$DOWN"
+HOME="$TMP/home" AMUX_URL="$URL" AMUX_SESSION=state-replay \
+  bash scripts/hooks/hook-report.sh active state-outage-hook <<<'{}'
+sleep .15
+HOME="$TMP/home" AMUX_URL="$URL" AMUX_SESSION=state-replay \
+  bash scripts/hooks/hook-report.sh idle state-outage-hook <<<'{}'
+sleep .15
+rm "$DOWN"
+wait_for 'any(not r["down"] and r["body"].get("source")=="state-outage-hook" for r in rows)'
+/usr/bin/python3 - "$CAPTURE" "$TMP/home/.amux/hook-report-queue/state-replay.state.json" <<'PY'
+import json,sys,time
+rows=[json.loads(line) for line in open(sys.argv[1])]
+delivered=[r["body"]["state"] for r in rows
+           if not r["down"] and r["body"].get("source")=="state-outage-hook"]
+assert delivered and delivered[0]=="idle",delivered
+assert "active" not in delivered,delivered
+for _ in range(100):
+    try:
+        if json.load(open(sys.argv[2]))==[]: break
+    except FileNotFoundError: break
+    time.sleep(.02)
+else: raise AssertionError("state replay row did not clear")
+print("ok   lost Stop report replays latest idle without a later hook")
+PY
+grep -q 'state-replay source=state-outage-hook.*state_queue=retrying.*state=active' \
+  "$TMP/home/.amux/logs/hook-report-failures.log"
+grep -q 'state-replay source=state-outage-hook.*state_queue=delivered.*verdict=replayed_state.*state=idle' \
+  "$TMP/home/.amux/logs/hook-report-failures.log"
+echo "ok   successful state replay is sweep-visible with identity and verdict"
+
 # A queue left by an expired drain is awakened by an ordinary prompt hook.
 QF="$TMP/home/.amux/hook-report-queue/probe.json"
 /usr/bin/python3 - "$QF" "$URL" <<'PY'
