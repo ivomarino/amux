@@ -2980,27 +2980,6 @@ FIX: ATE-45 atomically preserves corrupt bytes/schemas under a timestamped path
  and logs the queue, preserved path, error and verdict before recovery. Every
  malformed invocation gets a unique persisted identity; tests cover both corrupt
  forms and duplicate malformed callbacks.
-
-## A green shared-target build embedded another worktree's dashboard
-AREA: build
-SEVERITY: wrong-conclusion
-STATUS: open
-DATE: 2026-09-04
-SESSION: amux
-CARD: AMUX-4142
-SYMPTOM: A post-commit `scripts/safe-cargo.sh build -p amux-server` in the
- Basecoat integration worktree exited 0 and `/health` reported that worktree's
- `11c1b789` commit, but the same process served `APP_VER=0.9.804` and no
- `ui-system.js` from another worktree instead of its own `0.9.807` Basecoat
- assets. Both worktrees use the required shared `CARGO_TARGET_DIR`; Cargo
- treated the other checkout's `amux-dashboard` RustEmbed artifact as current.
-COST: Seven minutes, an extra 2m32s server build, and a browser run that would
- have falsely certified the old UI if it had checked appearance without joining
- `/health.commit` to the actually served asset version.
-FIX: Open as AMUX-4142. Make embedded-asset provenance part of the build
- fingerprint or have the build/deploy gate compare served APP_VER/CACHE with
- the source tree and emit a sweep-visible mismatch verdict.
-
 ## A lost Stop report left a finished Primis turn WORKING for 139 seconds
 AREA: hooks
 SEVERITY: wrong-conclusion

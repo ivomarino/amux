@@ -29,7 +29,7 @@
         Values here are the unconfigured defaults; the server MAY substitute the
         block between the AMUX-BOOTSTRAP markers with real values at serve time.
 -->
-<html lang="en" class="dark" data-ui-system="basecoat">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
@@ -105,9 +105,7 @@
 <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
 <link id="hljs-theme" rel="stylesheet" crossorigin="anonymous" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
-<link rel="stylesheet" href="/vendor/basecoat/basecoat.min.css">
 <link rel="stylesheet" href="/app.css">
-<link rel="stylesheet" href="/ui-system.css">
 <!-- AMUX-BOOTSTRAP-BEGIN (see extraction note at top of file) -->
 <script>window._AMUX_S3_ICAL_URL="";window._AMUX_AUTH_TOKEN="";window._AMUX_HOME="";window._AMUX_POSTHOG_KEY="";window._AMUX_POSTHOG_HOST="https://us.i.posthog.com";window._AMUX_USER_EMAIL="";window._AMUX_USER_ID="";window._AMUX_UI_TOKEN="";window._AMUX_DEFAULT_MODEL="sonnet";</script>
 <!-- AMUX-BOOTSTRAP-END -->
@@ -675,7 +673,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <button class="search-clear" onclick="document.getElementById('sched-search').value='';schedSearchQuery='';document.getElementById('sched-search-wrap').classList.remove('has-value');renderScheduler()">&#x2715;</button>
     </div>
   </div>
-  <div id="scheduler-list" data-component="scheduler-surface" data-context="global" style="padding:10px 12px;display:flex;flex-direction:column;gap:6px;overflow-y:auto;"></div>
+  <div id="scheduler-list" style="padding:10px 12px;display:flex;flex-direction:column;gap:6px;overflow-y:auto;"></div>
   <!-- SYSTEM JOBS (AMUX-2703) — amux's own background loops, below the user's
        schedules and visually separated from them. They are NOT schedules:
        no run-now, no edit, no delete. See runtime_jobs/registry.rs. -->
@@ -710,7 +708,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 <div id="files-view" style="display:none;flex-direction:column;flex:1;min-height:0;">
   <!-- Toolbar -->
   <div class="fe-toolbar">
-    <button class="fe-tb-btn" id="files-back-session-btn" onclick="returnFromDirectoryExplorer()" title="Return to worker" style="display:none;background:var(--purple,#8957e5);color:#fff;border-color:var(--purple,#8957e5);font-size:0.72rem;white-space:nowrap;gap:4px;font-weight:600;">
+    <button class="fe-tb-btn" id="files-back-session-btn" onclick="closeExplore()" title="Return to worker" style="display:none;background:var(--purple,#8957e5);color:#fff;border-color:var(--purple,#8957e5);font-size:0.72rem;white-space:nowrap;gap:4px;font-weight:600;">
       &#x2190; <span id="files-back-session-label">Back</span>
     </button>
     <button class="fe-tb-btn fe-tb-nav" onclick="_filesUp()" title="Go up to the parent folder">
@@ -844,7 +842,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <div class="fe-col-hdr" id="fe-hdr-modified" onclick="_filesSetSort('modified')">Modified</div>
       <div class="fe-col-hdr-actions"></div>
     </div>
-    <div id="files-body" data-component="directory-explorer" data-context="global"></div>
+    <div id="files-body"></div>
   </div>
   <div id="fe-status" class="fe-status"></div>
   <!-- Library view: flat, searchable, faceted cover grid (ebook folders) -->
@@ -1356,11 +1354,9 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       line-height:1.45; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }
     #messages-view .msg-locate { flex-shrink:0; font-size:0.72rem; padding:4px 10px; align-self:center; }
   </style>
-  <div class="msg-mode-row" style="display:flex;gap:6px;margin-bottom:10px;flex-shrink:0;">
-    <div class="msg-mode-tabs" style="display:flex;gap:6px;">
-      <button class="msg-mode-btn active" id="msgmode-messages" onclick="_msgSetMode('messages')">Messages</button>
-      <button class="msg-mode-btn" id="msgmode-trends" onclick="_msgSetMode('trends')">&#x1F4C8; Trends</button>
-    </div>
+  <div style="display:flex;gap:6px;margin-bottom:10px;flex-shrink:0;">
+    <button class="msg-mode-btn active" id="msgmode-messages" onclick="_msgSetMode('messages')">Messages</button>
+    <button class="msg-mode-btn" id="msgmode-trends" onclick="_msgSetMode('trends')">&#x1F4C8; Trends</button>
     <select id="trends-days" onchange="_trendsLoad()" style="display:none;font-size:0.8rem;padding:4px 8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);margin-left:auto;">
       <option value="7">Last 7 days</option>
       <option value="14">Last 14 days</option>
@@ -1381,7 +1377,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <div id="msgs-kind-filter" style="display:flex;gap:6px;flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;margin-bottom:10px;flex-shrink:0;align-items:center;">
     <button class="btn" onclick="_msgsAllSessions=null;_messagesLoad(true)" title="Refresh" style="font-size:0.78rem;padding:5px 10px;min-height:44px;flex:0 0 auto;">&#x21BB;</button>
   </div>
-  <div id="msgs-list" data-component="message-timeline" data-context="global" style="overflow-y:auto;flex:1;min-height:0;display:flex;flex-direction:column;gap:6px;-webkit-overflow-scrolling:touch;"></div>
+  <div id="msgs-list" style="overflow-y:auto;flex:1;min-height:0;display:flex;flex-direction:column;gap:6px;-webkit-overflow-scrolling:touch;"></div>
   <div id="trends-view" style="display:none;overflow-y:auto;flex:1;min-height:0;">
     <div id="trends-totals" class="review-totals"></div>
     <div id="trends-body"><div style="color:var(--dim);padding:20px;">Loading…</div></div>
@@ -1449,7 +1445,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </select>
     </div>
   </div>
-  <div id="term-container" class="term-container" data-component="terminal-surface" data-context="global">
+  <div id="term-container" class="term-container">
     <div id="term-placeholder" class="term-placeholder">
       <div style="font-size:1.7rem;opacity:0.5;">&#x2318;</div>
       <div>Pick <b>Local Shell</b> or enter <b>user@host</b>, then <b>Connect</b>.</div>
@@ -1549,11 +1545,9 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     </div>
     <div id="bw-inspect-panel" style="display:none;width:340px;flex-shrink:0;border:1px solid var(--border);border-radius:6px;overflow:hidden;background:var(--bg);flex-direction:column;">
       <div style="padding:6px 8px;border-bottom:1px solid var(--border);display:flex;gap:4px;align-items:center;">
-        <div class="bw-inspector-tabs">
-          <button class="bw-btn bw-itab active" data-itab="console" onclick="_bwInspTab('console')" style="padding:3px 8px;">Console <span id="bw-ic-console" style="opacity:0.6;"></span></button>
-          <button class="bw-btn bw-itab" data-itab="network" onclick="_bwInspTab('network')" style="padding:3px 8px;">Network <span id="bw-ic-network" style="opacity:0.6;"></span></button>
-          <button class="bw-btn bw-itab" data-itab="errors" onclick="_bwInspTab('errors')" style="padding:3px 8px;">Errors <span id="bw-ic-errors" style="opacity:0.6;"></span></button>
-        </div>
+        <button class="bw-btn bw-itab active" data-itab="console" onclick="_bwInspTab('console')" style="padding:3px 8px;">Console <span id="bw-ic-console" style="opacity:0.6;"></span></button>
+        <button class="bw-btn bw-itab" data-itab="network" onclick="_bwInspTab('network')" style="padding:3px 8px;">Network <span id="bw-ic-network" style="opacity:0.6;"></span></button>
+        <button class="bw-btn bw-itab" data-itab="errors" onclick="_bwInspTab('errors')" style="padding:3px 8px;">Errors <span id="bw-ic-errors" style="opacity:0.6;"></span></button>
         <span style="flex:1;"></span>
         <button class="bw-btn" style="padding:2px 6px;" onclick="_bwLoadInspect()" title="Refresh">&#x21bb;</button>
         <button class="bw-btn" style="padding:2px 6px;" onclick="_bwClearInspect()" title="Clear buffers">&#128465;</button>
@@ -1641,12 +1635,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <div class="jrnl-main">
     <div class="jrnl-sub-tabs">
       <button class="jrnl-expand-btn" onclick="_jrnlToggleSidebar()" title="Show entries list"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="m14 9 3 3-3 3"/></svg></button>
-      <div class="jrnl-view-tabs">
-        <button class="jrnl-sub-tab active" data-view="list" onclick="_jrnlSwitchSub('list')">List</button>
-        <button class="jrnl-sub-tab" data-view="calendar" onclick="_jrnlSwitchSub('calendar')">Calendar</button>
-        <button class="jrnl-sub-tab" data-view="media" onclick="_jrnlSwitchSub('media')">Media</button>
-        <button class="jrnl-sub-tab" data-view="map" onclick="_jrnlSwitchSub('map')">Map</button>
-      </div>
+      <button class="jrnl-sub-tab active" data-view="list" onclick="_jrnlSwitchSub('list')">List</button>
+      <button class="jrnl-sub-tab" data-view="calendar" onclick="_jrnlSwitchSub('calendar')">Calendar</button>
+      <button class="jrnl-sub-tab" data-view="media" onclick="_jrnlSwitchSub('media')">Media</button>
+      <button class="jrnl-sub-tab" data-view="map" onclick="_jrnlSwitchSub('map')">Map</button>
     </div>
     <div class="jrnl-content" id="jrnl-content">
       <div id="jrnl-list-pane"><div class="jrnl-editor-empty">Select an entry or create a new one</div></div>
@@ -2211,7 +2203,6 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   </div>
   <!-- Tab bar -->
   <div class="peek-tabs" onwheel="_peekTabsWheel(event)">
-    <div class="peek-tab-list">
     <button class="peek-tab active" id="peek-tab-terminal" onclick="setPeekTab('terminal')"><span class="tab-ico">⮞</span><span class="tab-lbl">Terminal</span></button>
     <button class="peek-tab" id="peek-tab-simple" onclick="setPeekTab('simple')" title="Translate this worker's output — plain English by default, or your own prompt"><span class="tab-ico">◍</span><span class="tab-lbl">Translate</span></button>
     <button class="peek-tab" id="peek-tab-steering" onclick="setPeekTab('steering')"><span class="tab-ico">⇉</span><span class="tab-lbl">Steering</span><span class="peek-tab-count" id="peek-tab-steering-count"></span></button>
@@ -2227,7 +2218,6 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="peek-tab" id="peek-tab-memory" onclick="setPeekTab('memory')"><span class="tab-ico">&#x1F4DD;</span><span class="tab-lbl">Memory</span></button>
     <button class="peek-tab" id="peek-tab-git" onclick="setPeekTab('git')"><span class="tab-ico">⎇</span><span class="tab-lbl">Worktree</span></button>
     <button class="peek-tab" id="peek-tab-logs" onclick="setPeekTab('logs')" title="HTTP request log for this worker"><span class="tab-ico">≡</span><span class="tab-lbl">Logs</span><span class="peek-tab-count" id="peek-tab-logs-count"></span></button>
-    </div>
     <button class="tab-customize-btn" id="peek-tab-customize" onclick="event.stopPropagation();togglePeekTabCustomizer()" title="Show/hide/reorder worker tabs" style="flex:0 0 auto;">&#x229E;</button>
     <!-- The menu itself is NOT here on purpose — it is a direct child of the
          document body, at the end of this file. `.peek-tabs` is a ~44px
@@ -2246,7 +2236,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <!-- Split wrap: terminal + optional file browser side-by-side -->
   <div id="peek-split-wrap" class="peek-split-wrap">
   <!-- Terminal panel -->
-  <div id="peek-terminal-panel" class="peek-terminal-panel" data-component="worker-session-console">
+  <div id="peek-terminal-panel" class="peek-terminal-panel">
     <div id="peek-plan" class="peek-plan" style="display:none;">
       <button class="peek-plan-hdr" id="peek-plan-hdr" onclick="_peekTogglePlan()">
         <span class="pp-caret" id="peek-plan-caret">&#9656;</span>
@@ -2363,7 +2353,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <div id="psf-breadcrumb" style="flex:1;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;"></div>
       <button class="btn" style="font-size:0.7rem;padding:2px 8px;" onclick="togglePeekSplit()">&#x2715;</button>
     </div>
-    <div id="psf-body" class="peek-split-files-body" data-component="directory-explorer" data-context="worker-split"></div>
+    <div id="psf-body" class="peek-split-files-body"></div>
   </div>
   </div><!-- /peek-split-wrap -->
   <!-- Transcript panel (clean JSONL conversation history) -->
@@ -2610,7 +2600,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <button class="search-clear" onclick="document.getElementById('peek-sched-search').value='';_peekSchedSearch='';document.getElementById('peek-sched-search-wrap').classList.remove('has-value');_peekRenderSchedules()">&#x2715;</button>
       </div>
     </div>
-    <div class="peek-tasks-list" id="peek-schedules-list" data-component="scheduler-surface" data-context="worker" style="padding:10px 12px;"></div>
+    <div class="peek-tasks-list" id="peek-schedules-list" style="padding:10px 12px;"></div>
     <details id="peek-sched-runs-details" style="border-top:1px solid var(--border);padding:0 12px;padding-bottom:max(10px,env(safe-area-inset-bottom));flex-shrink:0;">
       <summary style="cursor:pointer;font-size:0.78rem;font-weight:600;color:var(--dim);padding:8px 0 4px;list-style:none;display:flex;align-items:center;gap:5px;">
         <span style="font-size:0.6rem;">&#x25B6;</span> Recent Runs
@@ -2978,11 +2968,9 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="file-menu-btn" id="file-menu-btn" onclick="_toggleFileMenu(event)" title="Actions" aria-label="Actions">&#x22EE;</button>
     <div class="file-actions" id="file-actions">
     <div class="file-view-tabs" id="file-view-tabs" style="display:none;">
-      <div class="file-mode-tabs">
-        <button class="file-view-tab active" id="file-tab-preview" onclick="setFileViewMode('preview')">Preview</button>
-        <button class="file-view-tab" id="file-tab-edit" onclick="setFileViewMode('edit')" style="display:none;">Edit</button>
-        <button class="file-view-tab" id="file-tab-raw" onclick="setFileViewMode('raw')">Raw</button>
-      </div>
+      <button class="file-view-tab active" id="file-tab-preview" onclick="setFileViewMode('preview')">Preview</button>
+      <button class="file-view-tab" id="file-tab-edit" onclick="setFileViewMode('edit')" style="display:none;">Edit</button>
+      <button class="file-view-tab" id="file-tab-raw" onclick="setFileViewMode('raw')">Raw</button>
       <button class="file-view-tab" id="file-tab-teleprompter" onclick="_filesOpenTeleprompter()" title="Teleprompter mode" style="display:none;">&#x25B6; Teleprompter</button>
       <button class="file-view-tab" id="file-tab-search" onclick="_mdSearchToggle()" title="Find in markdown" style="display:none;">&#x1F50D; Find</button>
       <button class="file-view-tab" id="file-tab-readaloud" onclick="_ttsSpeak(_mdToSpeech(_fileData&&_fileData.content),this)" title="Read aloud" style="display:none;">&#x1F50A; Read Aloud</button>
@@ -3026,8 +3014,23 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <div id="mdai-body" class="mdai-node-body"></div>
 </div>
 
-<script src="/vendor/basecoat/all.min.js"></script>
-<script src="/ui-system.js"></script>
+<!-- File explorer overlay -->
+<div id="explore-overlay" class="file-overlay" style="z-index:250;">
+  <div class="file-overlay-header">
+    <div class="explore-breadcrumb" id="explore-breadcrumb" style="flex:1;margin-right:8px;"></div>
+    <button class="btn" id="explore-hidden-btn" onclick="toggleExploreHidden()" style="font-size:0.7rem;padding:2px 8px;" title="Show hidden files">.*</button>
+    <button class="btn" onclick="triggerExploreUpload()" style="font-size:0.7rem;padding:2px 8px;" title="Upload files to current directory">&#x2191; Upload</button>
+    <input type="file" id="explore-upload-input" multiple style="display:none;" onchange="handleExploreUpload(this.files)"><span class="upq-badge" style="display:none;"></span>
+    <button class="btn" onclick="closeExplore()">&#x2715;</button>
+  </div>
+  <div style="padding:6px 12px;border-bottom:1px solid var(--border);">
+    <input id="explore-search" type="search" placeholder="Search files…" autocomplete="off"
+      style="width:100%;background:var(--input,var(--card));border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:0.82rem;color:var(--text);outline:none;"
+      oninput="_exploreSearchFilter(this.value)">
+  </div>
+  <div id="explore-body" class="file-overlay-body" style="padding:0;overflow-y:auto;"></div>
+</div>
+
 <script src="/app.js"></script>
 
 <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>

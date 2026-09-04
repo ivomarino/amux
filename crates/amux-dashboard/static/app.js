@@ -164,11 +164,6 @@ if (_authToken) {
 
 // ── Theme ──
 function _applyTheme(light) {
-  // Basecoat follows the Tailwind/shadcn convention: the dark theme is driven
-  // by a class on <html>. Keep the legacy body.light hook during migration so
-  // every old and new component switches from the same source of truth.
-  document.documentElement.classList.toggle('dark', !light);
-  document.documentElement.setAttribute('data-theme', light ? 'light' : 'dark');
   document.body.classList.toggle('light', light);
   const cb = document.getElementById('theme-checkbox');
   if (cb) cb.checked = light;
@@ -1878,8 +1873,8 @@ async function _upqDrain() {
   if (sent) {
     showToast('Uploaded ' + sent + ' queued file' + (sent === 1 ? '' : 's')
               + (failed ? ' \u00b7 ' + failed + ' still queued' : ''));
-    if (typeof loadFiles === 'function' && typeof _filesPath !== 'undefined') {
-      try { loadFiles(_filesPath); } catch (e) {}
+    if (typeof loadExplore === 'function' && typeof _explorePath !== 'undefined') {
+      try { loadExplore(_explorePath); } catch (e) {}
     }
   }
   _upqRenderBadge();
@@ -3356,7 +3351,7 @@ function _browseWorkerFiles(name, source) {
         n_considered: 1, ver: APP_VER }),
     }).catch(() => {});
   } catch (e) {}
-  openDirectoryExplorer(root, name);
+  openExplore(root, name);
 }
 
 function _reportWorkerActionParity(s) {
@@ -4486,7 +4481,7 @@ function _peekTabsWheel(e) {
   e.preventDefault(); // keep the page from scrolling instead of the tabs
 }
 
-// Derived from the actual peek-tab buttons inside the semantic tablist
+// Derived from the actual peek-tab buttons (.peek-tabs > button.peek-tab#peek-tab-<id>)
 // so every WORKER-VIEW tab, including any added later, is hideable/draggable
 // without being hand-registered — the same rule as the global bar (Ethan
 // 2026-08-18). `terminal` is deliberately excluded: it is pinned first by
@@ -4496,7 +4491,7 @@ function _peekTabsWheel(e) {
 const PEEK_TABS = (function _discoverPeekTabs() {
   const PINNED = new Set(['terminal']);
   const out = [];
-  document.querySelectorAll('.peek-tab-list > button.peek-tab[id^="peek-tab-"]').forEach(b => {
+  document.querySelectorAll('.peek-tabs button.peek-tab[id^="peek-tab-"]').forEach(b => {
     const id = b.id.slice('peek-tab-'.length);
     if (!id || PINNED.has(id)) return;
     const lbl = b.querySelector('.tab-lbl');
@@ -4522,13 +4517,13 @@ function _savePeekTabPrefs() {
   localStorage.setItem('amux_peek_tab_order', JSON.stringify(peekTabOrder));
 }
 function _applyPeekTabVisibility() {
-  const bar = document.querySelector('.peek-tab-list');
+  const bar = document.querySelector('.peek-tabs');
   if (!bar) return;
-  // Reorder after Terminal, which is pinned as the first child. The customizer
-  // is deliberately outside this ARIA tablist, so it keeps button semantics.
+  // Reorder AFTER terminal (which stays first), BEFORE the customize button.
+  const custBtn = document.getElementById('peek-tab-customize');
   peekTabOrder.forEach(id => {
     const el = document.getElementById('peek-tab-' + id);
-    if (el) bar.appendChild(el);
+    if (el && custBtn) bar.insertBefore(el, custBtn);
   });
   PEEK_TABS.forEach(t => {
     const el = document.getElementById('peek-tab-' + t.id);
@@ -4797,8 +4792,7 @@ function _embedFitZoom() {
 // against a real id= in this file.
 const _EMBED_VIEW_EL = {
   sessions:'session-view', board:'board-view', groups:'groups-view', calendar:'calendar-view',
-  scheduler:'scheduler-view', files:'files-view', mdai:'mdai-view', proxies:'proxies-view',
-  email:'email-view', connectors:'connectors-view', logs:'logs-view',
+  scheduler:'scheduler-view', files:'files-view', proxies:'proxies-view', logs:'logs-view',
   messages:'messages-view', map:'map-view', metrics:'metrics-view', cost:'cost-view',
   torrents:'torrents-view', terminal:'terminal-view', browser:'browser-view', sql:'sql-view',
   graph:'graph-view', journal:'journal-view', habits:'habits-view', skills:'skills-view'
@@ -4826,13 +4820,8 @@ let _embedViewApplied = false;
 })();
 function _applyEmbedView() {
   if (!window._embedView || _embedViewApplied) return;
-  // This bootstrap block runs before `let activeView` is initialized later in
-  // the bundle. A swallowed temporal-dead-zone error used to mark the embed as
-  // applied forever while leaving its page display:none. Only commit the flag
-  // after the dispatcher actually completes; the retry below then does its job.
-  try { switchView(window._embedView); }
-  catch(e) { setTimeout(_applyEmbedView, 50); return; }
   _embedViewApplied = true;
+  try { switchView(window._embedView); } catch(e) {}
   const id = _EMBED_VIEW_EL[window._embedView];
   const el = id && document.getElementById(id);
   if (el) el.classList.add('embed-filled');
@@ -7432,7 +7421,6 @@ function setPeekTab(tab) {
   const logsP = document.getElementById('peek-logs-panel');
   if (tab === 'logs') { logsP.classList.add('active'); _peekLogsLoad(); }
   else { logsP.classList.remove('active'); }
-  if (window.AmuxUI) window.AmuxUI.sync();
 }
 
 // ── Standing instructions (autonomy config) ──
@@ -8910,7 +8898,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.811';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.812';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -9430,7 +9418,7 @@ function _savePeekState() {
 function togglePeekSplit() {
   // On mobile, open full-screen Files view instead of split pane
   if (window.innerWidth <= 600) {
-    openDirectoryExplorer(peekSessionDir, peekSession);
+    openExplore(peekSessionDir, peekSession);
     return;
   }
   const wrap = document.getElementById('peek-split-wrap');
@@ -9449,33 +9437,97 @@ async function _psfLoad(dirPath) {
   _savePeekState();
   const body = document.getElementById('psf-body');
   const bc = document.getElementById('psf-breadcrumb');
-  _directoryExplorerBreadcrumb(bc, dirPath, _psfLoad);
+  // Breadcrumb
+  const parts = dirPath.split('/').filter(Boolean);
+  let crumbHtml = '<span class="psf-crumb" onclick="_psfLoad(\'/\')">/</span>';
+  let cum = '';
+  for (const part of parts) {
+    cum += '/' + part;
+    const cp = cum;
+    crumbHtml += '<span style="color:var(--dim)"> › </span><span class="psf-crumb" onclick="_psfLoad(\'' + cp.replace(/'/g, "\\'") + '\')">' + esc(part) + '</span>';
+  }
+  bc.innerHTML = crumbHtml;
   body.innerHTML = '<div style="padding:12px;color:var(--dim)">Loading...</div>';
-  const paint = (data, cacheTs) => _directoryExplorerRender(body, dirPath, data, {
-    context: 'worker-split',
-    navigate: _psfLoad,
-    openFile: openFilePreview,
-    query: '',
-    showHidden: _filesShowHidden,
-    cacheTs,
-  });
   try {
-    const data = await _directoryExplorerFetch(dirPath, _filesShowHidden);
+    const r = await fetch(API + '/api/ls?path=' + encodeURIComponent(dirPath));
+    const data = await r.json();
     if (data.error) { body.innerHTML = '<div style="padding:12px;color:var(--dim)">' + esc(data.error) + '</div>'; return; }
-    paint(data, false);
-    _idb.setFile(dirPath, { type: 'dir', data });
-    _autoCacheDirFiles(dirPath, data.entries);
+    body.innerHTML = '';
+    // Parent row — uses same fe-back-row class as Files tab
+    if (data.parent && data.parent !== data.path) {
+      const back = document.createElement('div');
+      back.className = 'fe-back-row';
+      back.innerHTML = `<div class="fe-cell-name"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M9 11 5 7l4-4" stroke="var(--dim)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg><span style="color:var(--dim);font-size:0.83rem;">.. (parent)</span></div><div></div><div></div><div></div>`;
+      back.onclick = () => _psfLoad(data.parent);
+      body.appendChild(back);
+    }
+    for (const entry of data.entries) {
+      const entryPath = dirPath.replace(/\/$/, '') + '/' + entry.name;
+      const row = document.createElement('div');
+      row.className = 'fe-row' + (entry.type === 'dir' ? ' fe-dir' : '');
+      const icon = _fileTypeIcon(entry.name, entry.type);
+      const sizeStr = entry.type === 'dir' ? '' : _fmtSize(entry.size);
+      const dateStr = entry.modified ? timeAgo(entry.modified) : '';
+      const slash = entry.type === 'dir' ? '<span style="color:var(--dim)">/</span>' : '';
+      const ep = entryPath.replace(/'/g, "\\'");
+      row.innerHTML =
+        `<div class="fe-cell-name">${icon}<span>${esc(entry.name)}${slash}</span></div>` +
+        `<div class="fe-cell-size">${sizeStr}</div>` +
+        `<div class="fe-cell-date">${dateStr}</div>` +
+        `<div class="fe-cell-actions"><button class="fe-menu-btn" title="Options" onclick="event.stopPropagation();_showFilesMenu('${ep}',this,'${entry.type}')">⋯</button></div>`;
+      row.onclick = entry.type === 'dir' ? () => _psfLoad(entryPath) : () => _psfViewFile(entryPath);
+      body.appendChild(row);
+    }
+    if (!data.entries.length) {
+      body.innerHTML = '<div style="padding:16px;color:var(--dim);text-align:center;font-size:0.82rem;">Empty folder</div>';
+    }
   } catch(e) {
-    const cached = await _idb.getFile(dirPath);
-    if (cached && cached.type === 'dir') paint(cached.data, cached.ts);
-    else body.innerHTML = '<div style="padding:12px;color:var(--dim)">Error: ' + esc(e.message) + '</div>';
+    body.innerHTML = '<div style="padding:12px;color:var(--dim)">Error: ' + esc(e.message) + '</div>';
   }
 }
 
-function _psfViewFile(filePath) {
-  // Compatibility entry point for restored state and old inline handlers. Both
-  // directory contexts now open the single canonical file viewer.
-  return openFilePreview(filePath);
+async function _psfViewFile(filePath) {
+  // .mdai opens in the dedicated MDAI viewer (metadata + version scroll +
+  // runs the chain on open), same as the main file browser (AMUX-3317).
+  if (/\.mdai$/i.test(filePath || '')) { openMdaiNode(filePath); return; }
+  if (/\.(xlsx|xls|ods)$/i.test(filePath || '')) { _openXlsxPreview(filePath); return; }
+  const body = document.getElementById('psf-body');
+  const bc = document.getElementById('psf-breadcrumb');
+  const dir = filePath.substring(0, filePath.lastIndexOf('/')) || '/';
+  const fname = filePath.split('/').pop();
+  bc.innerHTML = '<span class="psf-crumb" onclick="_psfLoad(\'' + dir.replace(/'/g, "\\'") + '\')">← back</span><span style="color:var(--dim)"> / </span><span style="color:var(--text)">' + esc(fname) + '</span>';
+  body.innerHTML = '<div style="padding:12px;color:var(--dim)">Loading...</div>';
+  try {
+    let url = API + '/api/file?path=' + encodeURIComponent(filePath);
+    if (peekSessionDir) url += '&cwd=' + encodeURIComponent(peekSessionDir);
+    const r = await fetch(url);
+    const data = await r.json();
+    if (data.error) { body.innerHTML = '<div style="padding:12px;color:var(--dim)">Error: ' + esc(data.error) + '</div>'; return; }
+    body.innerHTML = '';
+    const content = document.createElement('div');
+    content.className = 'file-overlay-body';
+    content.style.cssText = 'flex:1;min-height:0;margin:0;border-radius:0;';
+    if (data.is_image) {
+      content.className = 'file-overlay-body file-image';
+      const img = document.createElement('img');
+      img.src = data.data_url || _authUrl(API + (data.raw_url || ''));
+      img.style.cssText = 'max-width:100%;height:auto;border-radius:4px;display:block;margin:auto;';
+      content.appendChild(img);
+    } else if (data.is_markdown) {
+      content.className = 'file-overlay-body markdown md-content';
+      content.innerHTML = renderMarkdown(data.content);
+    } else if (data.is_csv) {
+      content.className = 'file-overlay-body file-csv';
+      content.innerHTML = renderCsvTable(data.content);
+    } else if (data.content != null) {
+      content.textContent = data.content;
+    } else {
+      content.textContent = '(binary file)';
+    }
+    body.appendChild(content);
+  } catch(e) {
+    body.innerHTML = '<div style="padding:12px;color:var(--dim)">Error: ' + esc(e.message) + '</div>';
+  }
 }
 
 // Keep the peek input visible above the on-screen keyboard WITHOUT ever
@@ -10100,7 +10152,7 @@ async function _openPathFromOutput(p) {
     openFilePreview(full);
     return;
   }
-  openDirectoryExplorer(full, (typeof peekSession !== 'undefined' && peekSession) ? peekSession : null);
+  openExplore(full, (typeof peekSession !== 'undefined' && peekSession) ? peekSession : null);
 }
 
 // Turn file paths in ALREADY-ESCAPED peek HTML into links to the file browser.
@@ -13818,8 +13870,6 @@ function _cmdHistRenderChips(items) {
 function _renderCmdHistoryList() {
   const list = document.getElementById('cmd-history-list');
   if (!list) return;
-  list.dataset.component = 'message-timeline';
-  list.dataset.context = 'history-dialog';
   const q = (document.getElementById('cmd-history-search')?.value || '').trim().toLowerCase();
   const sessFilter = document.getElementById('cmd-history-session-filter')?.value || '';
   // Server window when loaded (already kind- and session-scoped); otherwise the
@@ -14212,7 +14262,7 @@ function _cmdHistItemHTML(e, ctx) {
   const _matches = _mq && safe.toLowerCase().includes(_mq.trim().toLowerCase());
   const _collapsed = _msgCollapsed.has(_pk) && !_matches;
   const caret = `<button class="msg-caret" aria-expanded="${!_collapsed}" title="${_collapsed ? 'Expand message' : 'Collapse message'}" onclick="_msgToggleCollapse(this,&#39;${escJs(_pk)}&#39;,event)">${_collapsed ? '&#9656;' : '&#9662;'}</button>`;
-  return `<div class="${ctx.rowClass||''}" data-component="message-row" data-msg-key="${esc(_pk)}" onclick="${ctx.onOpen ? ctx.onOpen(e, enc) : `_pickCmdHistory(decodeURIComponent('${enc}'))`}" title="Click to insert into the composer" style="cursor:pointer;padding:8px 12px;background:${km.bg};border:1px solid var(--border);border-left:3px solid ${km.color};border-radius:6px;font-size:0.85rem;color:var(--text);transition:border-color 0.15s;display:flex;gap:6px;align-items:flex-start;position:relative;" onmouseenter="this.style.borderColor='${km.color}'" onmouseleave="this.style.borderColor='var(--border)'"><input type="checkbox" class="pm-check" ${_psel?"checked":""} onclick="${ctx.toggle}(&#39;${escJs(_pk)}&#39;,event)" title="Select for bulk resend">${caret}<div style="flex:1;min-width:0;">${meta?`<div style="margin-bottom:4px;">${meta}</div>`:''}<div class="msg-body${_collapsed?' collapsed':''}" style="white-space:pre-wrap;word-break:break-word;line-height:1.45;">${_hlSearch(_linkifyScheduleIds(_linkifyCardIds(safe)), _mq)}</div></div><div class="pm-actions"><button class="btn pm-dots" onclick="_msgMenu(this,event)" title="Actions">&#x22ef;</button><div class="msg-menu"><button onclick="event.stopPropagation();${ctx.resend}([&#39;${escJs(_pk)}&#39;])">Resend to ${esc(_target || 'session')}</button><button onclick="event.stopPropagation();_msgCopyBtn(this,&#39;${enc}&#39;)">Copy text</button><button onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent(&#39;${enc}&#39;),this)">Read aloud</button>${locSess ? `<button onclick="event.stopPropagation();_msgLocate(&#39;${escJs(locSess)}&#39;,&#39;${enc}&#39;)" title="Open that worker's peek and scroll to where this was sent">Find in ${esc(locSess)}</button>` : ''}</div></div></div>`;
+  return `<div class="${ctx.rowClass||''}" data-msg-key="${esc(_pk)}" onclick="${ctx.onOpen ? ctx.onOpen(e, enc) : `_pickCmdHistory(decodeURIComponent('${enc}'))`}" title="Click to insert into the composer" style="cursor:pointer;padding:8px 12px;background:${km.bg};border:1px solid var(--border);border-left:3px solid ${km.color};border-radius:6px;font-size:0.85rem;color:var(--text);transition:border-color 0.15s;display:flex;gap:6px;align-items:flex-start;position:relative;" onmouseenter="this.style.borderColor='${km.color}'" onmouseleave="this.style.borderColor='var(--border)'"><input type="checkbox" class="pm-check" ${_psel?"checked":""} onclick="${ctx.toggle}(&#39;${escJs(_pk)}&#39;,event)" title="Select for bulk resend">${caret}<div style="flex:1;min-width:0;">${meta?`<div style="margin-bottom:4px;">${meta}</div>`:''}<div class="msg-body${_collapsed?' collapsed':''}" style="white-space:pre-wrap;word-break:break-word;line-height:1.45;">${_hlSearch(_linkifyScheduleIds(_linkifyCardIds(safe)), _mq)}</div></div><div class="pm-actions"><button class="btn pm-dots" onclick="_msgMenu(this,event)" title="Actions">&#x22ef;</button><div class="msg-menu"><button onclick="event.stopPropagation();${ctx.resend}([&#39;${escJs(_pk)}&#39;])">Resend to ${esc(_target || 'session')}</button><button onclick="event.stopPropagation();_msgCopyBtn(this,&#39;${enc}&#39;)">Copy text</button><button onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent(&#39;${enc}&#39;),this)">Read aloud</button>${locSess ? `<button onclick="event.stopPropagation();_msgLocate(&#39;${escJs(locSess)}&#39;,&#39;${enc}&#39;)" title="Open that worker's peek and scroll to where this was sent">Find in ${esc(locSess)}</button>` : ''}</div></div></div>`;
 }
 function _peekMessagesFor() {
   if (!peekSession) return [];
@@ -14291,8 +14341,6 @@ function _peekMsgRenderChips(items) {
 function _peekMessagesRender() {
   const list = document.getElementById('peek-messages-list');
   if (!list) return;
-  list.dataset.component = 'message-timeline';
-  list.dataset.context = 'worker';
   const q = (document.getElementById('peek-messages-search')?.value || '').trim().toLowerCase();
   let items = _peekMessagesFor();
   _peekMsgRenderChips(items);   // chips reflect the full (pre-filter) set's counts
@@ -16377,7 +16425,7 @@ async function openFilePreview(path) {
     // rationale: see what is around it.
     _subEl.title = 'Open this folder in the file browser';
     _subEl.classList.add('clickable');
-      _subEl.onclick = () => openDirectoryExplorer(_dir,
+    _subEl.onclick = () => openExplore(_dir,
       (typeof peekSession !== 'undefined' && peekSession) ? peekSession : null);
   }
   document.getElementById('file-body').className = 'file-overlay-body';
@@ -16540,7 +16588,10 @@ async function copyFileContent() {
   setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
 }
 
-// ═══════ DIRECTORY EXPLORER ═══════
+// ═══════ FILE EXPLORER ═══════
+let _explorePath = '';
+let _exploreShowHidden = true;
+let _exploreLastData = null;  // last loaded dir data (for search re-filter)
 let _filesLastData = null;    // last loaded dir data for Files tab
 let _filesSort = { col: 'modified', dir: -1 }; // default: newest first (Ethan 2026-08-20); dirs still lead
 
@@ -16675,7 +16726,7 @@ const _FILES_DEFAULT_BOOKMARKS = [
 ];
 
 // Scope shortcuts by context: global (Files tab) vs a specific session's file
-// view (_exploreSession, set by openDirectoryExplorer → "Browse files"). Both persist to
+// view (_exploreSession, set by openExplore → "Browse files"). Both persist to
 // /api/prefs so they sync across devices; session scope is namespaced by name.
 function _filesBmScope() { return _exploreSession ? ('::' + _exploreSession) : ''; }
 function _filesBmLocalKey() { return 'amux_files_bookmarks' + _filesBmScope(); }
@@ -16907,7 +16958,7 @@ async function _filesRemoveBookmark(idx) {
 // Render bookmarks on load
 document.addEventListener('DOMContentLoaded', _filesRenderBookmarks);
 
-let _exploreSession = null;  // set when the shared Directory Explorer is session-scoped
+let _exploreSession = null;  // set when explore overlay is opened from a session
 // Load saved working dir + hidden files pref from server prefs
 (async () => {
   try {
@@ -17010,9 +17061,19 @@ async function loadFiles(path) {
   } catch(e) {}
   const srch = document.getElementById('files-search'); if (srch) srch.value = '';
   _updateFilesCwdBtn();
-  _directoryExplorerBreadcrumb(document.getElementById('files-breadcrumb'), path, loadFiles);
+  // Breadcrumb
+  const parts = path.split('/').filter(Boolean);
+  let crumbHtml = '<span class="fe-crumb" onclick="loadFiles(\'/\')">/</span>';
+  let cum = '';
+  for (const part of parts) {
+    cum += '/' + part;
+    const cp = cum;
+    crumbHtml += '<span class="fe-crumb-sep">›</span><span class="fe-crumb" onclick="loadFiles(\'' + cp.replace(/'/g, "\\'") + '\')">' + esc(part) + '</span>';
+  }
+  document.getElementById('files-breadcrumb').innerHTML = crumbHtml;
   try {
-    const data = await _directoryExplorerFetch(path, _filesShowHidden);
+    const r = await fetch(API + '/api/ls?path=' + encodeURIComponent(path) + (_filesShowHidden ? '&hidden=1' : ''));
+    const data = await r.json();
     if (data.error) { body.innerHTML = '<div style="padding:16px;color:var(--dim)">' + esc(data.error) + '</div>'; return; }
     _renderFilesEntries(body, path, data, false);
     _idb.setFile(path, { type: 'dir', data });
@@ -17032,51 +17093,12 @@ function _feHighlight(name, q) {
   const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
   return esc(name).replace(re, m => `<mark style="background:rgba(99,102,241,0.25);color:inherit;border-radius:2px;">${m}</mark>`);
 }
-
-// ── Canonical Directory Explorer component ────────────────────────────────
-// The Files tab, a worker-directory deeplink and the worker ellipsis split view
-// are contexts of ONE capability. They share breadcrumb, fetching, sorting,
-// row/menu behavior, inline expansion, file opening, offline fallback and empty
-// states here; a context supplies only its mount point and navigation callback.
-function _directoryExplorerBreadcrumb(host, path, navigate) {
-  if (!host) return;
-  host.replaceChildren();
-  host.dataset.component = 'directory-breadcrumb';
-  const appendCrumb = (label, target) => {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'fe-crumb';
-    button.textContent = label;
-    button.onclick = () => navigate(target);
-    host.appendChild(button);
-  };
-  appendCrumb('/', '/');
-  let current = '';
-  for (const part of String(path || '/').split('/').filter(Boolean)) {
-    current += '/' + part;
-    const separator = document.createElement('span');
-    separator.className = 'fe-crumb-sep';
-    separator.setAttribute('aria-hidden', 'true');
-    separator.textContent = '›';
-    host.appendChild(separator);
-    appendCrumb(part, current);
-  }
-}
-
-async function _directoryExplorerFetch(path, showHidden) {
-  const r = await fetch(API + '/api/ls?path=' + encodeURIComponent(path) + (showHidden ? '&hidden=1' : ''));
-  return r.json();
-}
-
-// Build one shared directory row. Directories navigate on one click and can be
-// expanded inline. Files use one tap on touch or select/double-click on pointer
-// devices in both the full-page and split contexts.
-function _directoryExplorerBuildRow(entry, parentPath, depth, q, options) {
-  options = options || {};
+// Build one file-explorer row. Dirs get an expand chevron (inline accordion) AND
+// still navigate on row click; `depth` indents nested rows.
+function _feBuildRow(entry, parentPath, depth, q) {
   const entryPath = parentPath.replace(/\/$/, '') + '/' + entry.name;
   const row = document.createElement('div');
   row.className = 'fe-row' + (entry.type === 'dir' ? ' fe-dir' : '');
-  row.dataset.component = 'directory-entry';
   row.dataset.depth = depth;
   row.dataset.path = entryPath;
   const nameHtml = _feHighlight(entry.name, q);
@@ -17084,37 +17106,29 @@ function _directoryExplorerBuildRow(entry, parentPath, depth, q, options) {
   const slash = entry.type === 'dir' ? '<span style="color:var(--dim)">/</span>' : '';
   const sizeStr = entry.type === 'dir' ? '' : _fmtSize(entry.size);
   const dateStr = entry.modified ? timeAgo(entry.modified) : '';
+  const ep = entryPath.replace(/'/g, "\\'");
   const toggle = entry.type === 'dir'
-    ? '<button class="fe-expand" title="Expand / collapse">&#9656;</button>'
+    ? `<button class="fe-expand" title="Expand / collapse" onclick="event.stopPropagation();_feToggleExpand(this)">&#9656;</button>`
     : `<span class="fe-expand-spacer"></span>`;
   const indentStyle = depth ? ` style="padding-left:${depth * 16}px"` : '';
   row.innerHTML =
     `<div class="fe-cell-name"${indentStyle}>${toggle}${icon}<span>${nameHtml}${slash}</span></div>` +
     `<div class="fe-cell-size">${sizeStr}</div>` +
     `<div class="fe-cell-date">${dateStr}</div>` +
-    '<div class="fe-cell-actions"><button class="fe-menu-btn" title="Options">⋯</button></div>';
-
-  const expand = row.querySelector('.fe-expand');
-  if (expand) expand.onclick = e => {
-    e.stopPropagation();
-    _directoryExplorerToggleExpand(expand, options);
-  };
-  const menu = row.querySelector('.fe-menu-btn');
-  if (menu) menu.onclick = e => {
-    e.stopPropagation();
-    _showFilesMenu(entryPath, menu, entry.type);
-  };
-
-  const navigate = options.navigate || loadFiles;
-  const openFile = options.openFile || openFilePreview;
+    `<div class="fe-cell-actions"><button class="fe-menu-btn" title="Options" onclick="event.stopPropagation();_showFilesMenu('${ep}',this,'${entry.type}')">⋯</button></div>`;
   if (entry.type === 'dir') {
-    row.onclick = () => navigate(entryPath);
+    // Folders open on a single click on every device (fast, and mobile-friendly).
+    row.onclick = () => loadFiles(entryPath);
   } else if (_feTouchDevice()) {
-    row.onclick = () => openFile(entryPath);
+    // Touch: a single tap opens the file. Mobile-first, no hover or double-tap.
+    row.onclick = () => openFilePreview(entryPath);
   } else {
+    // Desktop pointer: single click selects the row, double-click opens it in the
+    // existing viewer, matching a familiar OS file manager. openFilePreview is
+    // unchanged; this only changes what gesture triggers it.
     row.title = 'Double-click to open';
-    row.onclick = () => _directoryExplorerSelectRow(row, options.selectionRoot);
-    row.ondblclick = () => openFile(entryPath);
+    row.onclick = () => _feSelectRow(row);
+    row.ondblclick = () => openFilePreview(entryPath);
   }
   return row;
 }
@@ -17125,8 +17139,8 @@ function _feTouchDevice() {
 }
 // Single-selection highlight for the file list (desktop). Clears any prior
 // selection so exactly one row is highlighted, like a desktop file manager.
-function _directoryExplorerSelectRow(row, root) {
-  const body = root || row.parentElement;
+function _feSelectRow(row) {
+  const body = document.getElementById('files-body');
   if (body) body.querySelectorAll('.fe-row.fe-selected').forEach(r => r.classList.remove('fe-selected'));
   row.classList.add('fe-selected');
 }
@@ -17138,8 +17152,7 @@ function _filesUp() {
 }
 // Toggle a folder's inline expansion (accordion). Inserts/removes the folder's
 // child rows right after it, without navigating into the folder.
-async function _directoryExplorerToggleExpand(btn, options) {
-  options = options || {};
+async function _feToggleExpand(btn) {
   const row = btn.closest('.fe-row');
   if (!row) return;
   const dirPath = row.dataset.path;
@@ -17155,7 +17168,8 @@ async function _directoryExplorerToggleExpand(btn, options) {
   btn.classList.add('loading');
   let data = null;
   try {
-    data = await _directoryExplorerFetch(dirPath, options.showHidden);
+    const r = await fetch(API + '/api/ls?path=' + encodeURIComponent(dirPath) + (_filesShowHidden ? '&hidden=1' : ''));
+    data = await r.json();
     if (data && !data.error) { _idb.setFile(dirPath, { type: 'dir', data }); _autoCacheDirFiles(dirPath, data.entries); }
   } catch(e) {
     const cached = await _idb.getFile(dirPath);
@@ -17163,44 +17177,53 @@ async function _directoryExplorerToggleExpand(btn, options) {
   }
   btn.classList.remove('loading');
   if (!data || data.error) return;
-  const q = String(options.getQuery ? options.getQuery() : (options.query || '')).toLowerCase();
+  const q = (document.getElementById('files-search')?.value || '').toLowerCase();
   const list = q ? (data.entries || []).filter(e => e.name.toLowerCase().includes(q)) : (data.entries || []);
   const entries = _filesSortEntries(list);
   let anchor = row;
-  for (const entry of entries) {
-    const child = _directoryExplorerBuildRow(entry, dirPath, depth + 1, q, options);
-    anchor.after(child);
-    anchor = child;
-  }
+  for (const entry of entries) { const child = _feBuildRow(entry, dirPath, depth + 1, q); anchor.after(child); anchor = child; }
   row.classList.add('fe-expanded'); btn.classList.add('open');
 }
-
-function _directoryExplorerRender(body, path, data, options) {
-  options = options || {};
-  const q = String(options.getQuery ? options.getQuery() : (options.query || '')).toLowerCase();
-  const rawEntries = q ? (data.entries || []).filter(e => e.name.toLowerCase().includes(q)) : (data.entries || []);
-  const entries = _filesSortEntries(rawEntries);
-
+function _renderFilesEntries(body, path, data, cacheTs) {
+  _filesLastData = { path, data, cacheTs };
+  _libUpdateBtn(data.entries);   // show the Library button for ebook folders (+ auto-close on nav)
   body.innerHTML = '';
-  body.dataset.component = 'directory-explorer';
-  body.dataset.context = options.context || 'global';
 
-  if (options.cacheTs) {
-    const age = Math.round((Date.now() - options.cacheTs) / 60000);
+  // Show/hide column headers and update sort indicators
+  const hdrs = document.getElementById('fe-col-headers');
+  if (hdrs) hdrs.style.display = 'grid';
+  _filesUpdateSortHeaders();
+
+  if (cacheTs) {
+    const age = Math.round((Date.now() - cacheTs) / 60000);
     const ageStr = age < 60 ? age + 'm ago' : Math.round(age/60) + 'h ago';
     const banner = document.createElement('div');
-    banner.className = 'alert';
     banner.style.cssText = 'padding:3px 12px;font-size:0.7rem;color:var(--dim);background:var(--card);border-bottom:1px solid var(--border);';
     banner.innerHTML = '&#x1F4F5; Offline cache &middot; ' + ageStr;
     body.appendChild(banner);
   }
 
+  const q = (document.getElementById('files-search')?.value || '').toLowerCase();
+  const rawEntries = q ? data.entries.filter(e => e.name.toLowerCase().includes(q)) : data.entries;
+  const entries = _filesSortEntries(rawEntries);
+
+  // Status bar
+  const statusEl = document.getElementById('fe-status');
+  if (statusEl) {
+    const dirs = entries.filter(e => e.type === 'dir').length;
+    const files = entries.filter(e => e.type !== 'dir').length;
+    const parts = [];
+    if (dirs) parts.push(dirs + (dirs === 1 ? ' folder' : ' folders'));
+    if (files) parts.push(files + (files === 1 ? ' file' : ' files'));
+    statusEl.textContent = q ? `${entries.length} result${entries.length !== 1 ? 's' : ''} for "${q}"` : (parts.join(', ') || 'Empty folder');
+  }
+
+  // ".. up" row
   if (!q && data.parent && data.parent !== data.path) {
     const back = document.createElement('div');
     back.className = 'fe-back-row';
-    back.dataset.component = 'directory-parent';
     back.innerHTML = `<div class="fe-cell-name"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M9 11 5 7l4-4" stroke="var(--dim)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg><span style="color:var(--dim);font-size:0.83rem;">.. (parent)</span></div><div></div><div></div><div></div>`;
-    back.onclick = () => (options.navigate || loadFiles)(data.parent);
+    back.onclick = () => loadFiles(data.parent);
     body.appendChild(back);
   }
 
@@ -17213,59 +17236,22 @@ function _directoryExplorerRender(body, path, data, options) {
   }
 
   for (const entry of entries) {
-    body.appendChild(_directoryExplorerBuildRow(entry, path, 0, q, Object.assign({}, options, { selectionRoot: body })));
+    body.appendChild(_feBuildRow(entry, path, 0, q));
   }
 
-  if (options.allowUpload) {
-    body.ondragover = e => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; body.classList.add('files-drop-active'); };
-    body.ondragleave = () => body.classList.remove('files-drop-active');
-    body.ondrop = e => { e.preventDefault(); body.classList.remove('files-drop-active'); if (e.dataTransfer.files.length) handleFilesUpload(e.dataTransfer.files); };
-  } else {
-    body.ondragover = null;
-    body.ondragleave = null;
-    body.ondrop = null;
-  }
-  return entries;
-}
-
-function _renderFilesEntries(body, path, data, cacheTs) {
-  _filesLastData = { path, data, cacheTs };
-  _libUpdateBtn(data.entries);   // show the Library button for ebook folders (+ auto-close on nav)
-
-  const hdrs = document.getElementById('fe-col-headers');
-  if (hdrs) hdrs.style.display = 'grid';
-  _filesUpdateSortHeaders();
-
-  const options = {
-    context: _exploreSession ? 'worker-fullpage' : 'global',
-    navigate: loadFiles,
-    openFile: openFilePreview,
-    getQuery: () => document.getElementById('files-search')?.value || '',
-    showHidden: _filesShowHidden,
-    cacheTs,
-    allowUpload: true,
-  };
-  const entries = _directoryExplorerRender(body, path, data, options);
-  const q = options.getQuery().toLowerCase();
-
-  const statusEl = document.getElementById('fe-status');
-  if (statusEl) {
-    const dirs = entries.filter(e => e.type === 'dir').length;
-    const files = entries.filter(e => e.type !== 'dir').length;
-    const parts = [];
-    if (dirs) parts.push(dirs + (dirs === 1 ? ' folder' : ' folders'));
-    if (files) parts.push(files + (files === 1 ? ' file' : ' files'));
-    statusEl.textContent = q ? `${entries.length} result${entries.length !== 1 ? 's' : ''} for "${q}"` : (parts.join(', ') || 'Empty folder');
-  }
-  _feMarkDownloaded(body);   // async: flag rows whose file is downloaded on this device
+  // Drag-and-drop upload
+  body.ondragover = e => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; body.classList.add('files-drop-active'); };
+  body.ondragleave = () => body.classList.remove('files-drop-active');
+  body.ondrop = e => { e.preventDefault(); body.classList.remove('files-drop-active'); if (e.dataTransfer.files.length) handleFilesUpload(e.dataTransfer.files); };
+  _feMarkDownloaded();   // async: flag rows whose file is downloaded on this device
 }
 
 // Add a green ⤓ badge to each file row that is DOWNLOADED (cached) on this
 // device — works online AND offline (reflects local IndexedDB, not the network),
 // so you can always see what's available offline before you lose connection.
-async function _feMarkDownloaded(root) {
+async function _feMarkDownloaded() {
   try {
-    const body = root || document.getElementById('files-body');
+    const body = document.getElementById('files-body');
     if (!body) return;
     const rows = body.querySelectorAll('.fe-row:not(.fe-dir)');
     if (!rows.length) return;
@@ -18957,7 +18943,7 @@ async function cacheFilesDir(rootPath, maxDepth = 2) {
   setTimeout(() => setStatus(''), 5000);
 }
 
-function openDirectoryExplorer(startPath, session) {
+function openExplore(startPath, session) {
   const path = startPath || '/';
   _filesPath = path;
   _exploreSession = session || null;
@@ -18999,10 +18985,32 @@ async function setFilesSessionDir() {
     await fetchSessions();
   } catch(e) { console.error('setFilesSessionDir:', e); }
 }
-function returnFromDirectoryExplorer() {
+function closeExplore() {
   const sess = _exploreSession;
   _exploreSession = null;
+  document.getElementById('explore-overlay').classList.remove('active');
   if (sess) { switchView('sessions'); openPeek(sess); }
+}
+function triggerExploreUpload() {
+  const inp = document.getElementById('explore-upload-input');
+  inp.value = '';
+  inp.click();
+}
+async function handleExploreUpload(files) {
+  if (!files || !files.length) return;
+  const { uploaded, queued } = await _uploadOrQueue(files, _explorePath, 'file');
+  const inp = document.getElementById('explore-upload-input');
+  if (inp) inp.value = '';
+  if (queued) showToast(queued + ' file' + (queued === 1 ? '' : 's') + ' queued \u2014 will upload when back online');
+  if (uploaded) { showToast('Uploaded ' + uploaded + ' file' + (uploaded !== 1 ? 's' : '')); loadExplore(_explorePath); }
+  _upqRenderBadge();
+}
+function toggleExploreHidden() {
+  _exploreShowHidden = !_exploreShowHidden;
+  const btn = document.getElementById('explore-hidden-btn');
+  btn.style.background = _exploreShowHidden ? 'var(--accent)' : '';
+  btn.style.color = _exploreShowHidden ? '#000' : '';
+  loadExplore(_explorePath);
 }
 function _fmtSize(bytes) {
   if (bytes == null) return '';
@@ -19025,6 +19033,62 @@ async function _fsRename(path, refresh) {
     if (d.ok) { showToast('Renamed to ' + newName); refresh(); }
     else showToast(d.error || 'Rename failed');
   } catch (e) { showToast('Rename failed'); }
+}
+function _showExploreMenu(path, btn, type) {
+  // Remove any existing popup
+  document.querySelectorAll('.explore-menu-popup').forEach(el => el.remove());
+  const popup = document.createElement('div');
+  popup.className = 'explore-menu-popup';
+  const copyItem = document.createElement('button');
+  copyItem.className = 'explore-menu-item';
+  copyItem.textContent = 'Copy path';
+  copyItem.onclick = () => { popup.remove(); _copyExplorePath(path); };
+  popup.appendChild(copyItem);
+  // Rename
+  const renItem = document.createElement('button');
+  renItem.className = 'explore-menu-item';
+  renItem.textContent = 'Rename';
+  renItem.onclick = () => { popup.remove(); _fsRename(path, () => loadExplore(_explorePath)); };
+  popup.appendChild(renItem);
+  // Delete
+  const delItem = document.createElement('button');
+  delItem.className = 'explore-menu-item';
+  delItem.style.color = 'var(--red, #f85149)';
+  delItem.textContent = (type === 'dir' || type === 'directory') ? 'Delete folder' : 'Delete file';
+  delItem.onclick = async () => {
+    popup.remove();
+    const name = path.split('/').pop();
+    if (!confirm('Delete "' + name + '"? This cannot be undone.')) return;
+    try {
+      const r = await fetch(API + '/api/fs/delete', { method: 'DELETE', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ path }) });
+      const d = await r.json();
+      if (r.ok) { showToast('Deleted ' + name); loadExplore(_explorePath); }
+      else showToast('Delete failed: ' + (d.error || r.status));
+    } catch(e) { showToast('Delete error: ' + e.message); }
+  };
+  popup.appendChild(delItem);
+  document.body.appendChild(popup);
+  const r = _cssRect(btn);
+  const pw = popup.offsetWidth || 140;
+  const ph = popup.offsetHeight || 80;
+  const z = _uiZoomFactor();   // measured, engine-agnostic (see _cssRect)
+  const vw = window.innerWidth / z, vh = window.innerHeight / z;
+  // Open beside the ⋯ button: align the menu's right edge to the button's
+  // right edge (drops down from the button). If that would clip off the left,
+  // flip to open rightward from the button's left edge. Then clamp fully
+  // on-screen so it's never cut off in a narrow panel.
+  let left = r.right - pw;
+  if (left < 8) left = r.left;
+  left = Math.max(8, Math.min(left, vw - pw - 8));
+  let top = r.bottom + 4;
+  if (top + ph > vh - 8) top = r.top - ph - 4;   // flip above if it overflows
+  top = Math.max(8, Math.min(top, vh - ph - 8));
+  popup.style.left = left + 'px';
+  popup.style.top = top + 'px';
+  setTimeout(() => {
+    const dismiss = e => { if (!popup.contains(e.target)) { popup.remove(); document.removeEventListener('pointerdown', dismiss, true); } };
+    document.addEventListener('pointerdown', dismiss, true);
+  }, 0);
 }
 function _showFilesMenu(path, btn, type) {
   document.querySelectorAll('.explore-menu-popup').forEach(el => el.remove());
@@ -19159,6 +19223,86 @@ function _copyTextWithToastFallback(text, message) {
   document.body.removeChild(ta);
   showToast(message);
 }
+async function loadExplore(path) {
+  const body = document.getElementById('explore-body');
+  body.innerHTML = '<div style="padding:16px;color:var(--dim)">Loading...</div>';
+  _explorePath = path;
+  const srch = document.getElementById('explore-search'); if (srch) srch.value = '';
+  // Build breadcrumb
+  const parts = path.split('/').filter(Boolean);
+  let crumbHtml = `<span class="explore-crumb" onclick="loadExplore('/')">/</span>`;
+  let cum = '';
+  for (const part of parts) {
+    cum += '/' + part;
+    const cp = cum;
+    crumbHtml += `<span class="explore-crumb" onclick="loadExplore('${cp.replace(/'/g,"\\'")}')"> ${esc(part)}</span><span style="color:var(--dim)">/</span>`;
+  }
+  document.getElementById('explore-breadcrumb').innerHTML = crumbHtml;
+  try {
+    const r = await fetch(API + '/api/ls?path=' + encodeURIComponent(path) + (_exploreShowHidden ? '&hidden=1' : ''));
+    const data = await r.json();
+    if (data.error) { body.innerHTML = `<div style="padding:16px;color:var(--dim)">${esc(data.error)}</div>`; return; }
+    _idb.setFile(path, { type: 'dir', data });
+    _renderExploreEntries(body, path, data, false);
+  } catch(e) {
+    const cached = await _idb.getFile(path);
+    if (cached && cached.type === 'dir') {
+      _renderExploreEntries(body, path, cached.data, cached.ts);
+    } else {
+      body.innerHTML = '<div style="padding:16px;color:var(--dim)">Offline — no cached data for this directory.</div>';
+    }
+  }
+}
+function _renderExploreEntries(body, path, data, cacheTs) {
+  _exploreLastData = { path, data, cacheTs };  // cache for search re-filter
+  body.innerHTML = '';
+  body.ondragover = e => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; body.classList.add('files-drop-active'); };
+  body.ondragleave = () => body.classList.remove('files-drop-active');
+  body.ondrop = e => { e.preventDefault(); body.classList.remove('files-drop-active'); if (e.dataTransfer.files.length) handleExploreUpload(e.dataTransfer.files); };
+  if (cacheTs) {
+    const age = Math.round((Date.now() - cacheTs) / 60000);
+    const ageStr = age < 60 ? age + 'm ago' : Math.round(age/60) + 'h ago';
+    body.innerHTML = '<div style="padding:4px 12px;font-size:0.7rem;color:var(--dim);background:var(--card);border-bottom:1px solid var(--border);">&#x1F4F5; Offline cache &middot; ' + ageStr + '</div>';
+  }
+  const q = (document.getElementById('explore-search')?.value || '').toLowerCase();
+  const entries = q ? data.entries.filter(e => e.name.toLowerCase().includes(q)) : data.entries;
+  if (!q && data.parent && data.parent !== data.path) {
+    const back = document.createElement('div');
+    back.className = 'explore-row';
+    back.innerHTML = `<span class="explore-icon">&#x2B05;</span><span class="explore-name" style="color:var(--dim)">.. (up)</span>`;
+    back.onclick = () => loadExplore(data.parent);
+    body.appendChild(back);
+  }
+  if (!entries.length) {
+    const msg = q ? `No results for "${q}"` : 'Empty directory';
+    body.innerHTML += `<div style="padding:16px;color:var(--dim)">${esc(msg)}</div>`;
+    return;
+  }
+  for (const entry of entries) {
+    const entryPath = path.replace(/\/$/, '') + '/' + entry.name;
+    const row = document.createElement('div');
+    row.className = 'explore-row';
+    const icon = entry.type === 'dir' ? '&#x1F4C2;' : '&#x1F4C4;';
+    const displayName = entry.name + (entry.type === 'dir' ? '/' : '');
+    const menuBtn = `<button class="explore-menu-btn" title="Options" onclick="event.stopPropagation();_showExploreMenu('${entryPath.replace(/'/g,"\\'")}',this,'${entry.type}')">⋯</button>`;
+    const mtime = entry.modified ? `<span class="explore-mtime">${timeAgo(entry.modified)}</span>` : '';
+    const nameHtml = q ? esc(displayName).replace(new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'), 'gi'), m => `<mark style="background:var(--accent-muted,rgba(99,102,241,0.25));color:inherit;border-radius:2px;">${m}</mark>`) : esc(displayName);
+    row.innerHTML = `<span class="explore-icon">${icon}</span><span class="explore-name">${nameHtml}</span><span class="explore-size">${esc(_fmtSize(entry.size))}</span>${mtime}${menuBtn}`;
+    if (entry.type === 'dir') {
+      row.onclick = () => loadExplore(entryPath);
+    } else {
+      row.onclick = () => openFilePreview(entryPath);
+    }
+    body.appendChild(row);
+  }
+}
+function _exploreSearchFilter(q) {
+  const body = document.getElementById('explore-body');
+  if (!body || !_exploreLastData) return;
+  const { path, data, cacheTs } = _exploreLastData;
+  _renderExploreEntries(body, path, data, cacheTs);
+}
+
 // Swipe right to close file preview.
 //
 // Must never hijack a PINCH. This tracked touches[0] unconditionally, so during
@@ -19218,6 +19362,36 @@ function _copyTextWithToastFallback(text, message) {
     if (dx > _SWIPE_CLOSE && dx > dyEnd * _SWIPE_RATIO) {
       el.style.transform = 'translateX(100%)';
       setTimeout(() => { closeFilePreview(); el.style.transform = ''; el.style.transition = ''; }, 260);
+    } else {
+      el.style.transform = '';
+      setTimeout(() => { el.style.transition = ''; }, 260);
+    }
+  });
+})();
+
+// Swipe right to close explorer
+(function() {
+  const el = document.getElementById('explore-overlay');
+  let sx = 0, sy = 0, tracking = false;
+  el.addEventListener('touchstart', e => {
+    sx = e.touches[0].clientX; sy = e.touches[0].clientY; tracking = true;
+    el.style.transition = 'none';
+  }, {passive: true});
+  el.addEventListener('touchmove', e => {
+    if (!tracking) return;
+    const dx = e.touches[0].clientX - sx;
+    const dy = Math.abs(e.touches[0].clientY - sy);
+    if (dy > 30 && dx < 30) { tracking = false; el.style.transform = ''; el.style.transition = ''; return; }
+    if (dx > 10) el.style.transform = 'translateX(' + dx + 'px)';
+  }, {passive: true});
+  el.addEventListener('touchend', e => {
+    if (!tracking) { el.style.transition = ''; return; }
+    tracking = false;
+    const dx = e.changedTouches[0].clientX - sx;
+    el.style.transition = 'transform 0.25s cubic-bezier(.4,0,.2,1)';
+    if (dx > 80) {
+      el.style.transform = 'translateX(100%)';
+      setTimeout(() => { closeExplore(); el.style.transform = ''; el.style.transition = ''; }, 260);
     } else {
       el.style.transform = '';
       setTimeout(() => { el.style.transition = ''; }, 260);
@@ -21432,7 +21606,6 @@ function switchView(view) {
     ['cost', 'cost', 'flex'], ['torrents', 'torrents', 'flex'], ['terminal', 'terminal', ''],
     ['browser', 'browser', 'flex'], ['graph', 'graph', 'flex'],
     ['email', 'email', 'flex'], ['connectors', 'connectors', 'flex'],
-    ['journal', 'journal', 'flex'], ['habits', 'habits', 'flex'],
   ];
   for (const [domId, name, display] of _svViews) {
     const ve = document.getElementById(domId + '-view');
@@ -21441,15 +21614,7 @@ function switchView(view) {
     if (te) te.classList.toggle('active', view === name);
   }
   if (view === 'groups') { _renderGroupsTab(); fetchBoard().then(() => _renderGroupsTab()); }
-  if (view === 'calendar') {
-    // Calendar rendering is a UI concern, so it must not wait behind the board
-    // request (which can be slow/offline). FullCalendar is loaded just after
-    // app.js in the shell; retry briefly for direct/deep-linked Calendar loads.
-    _fcEnsureInit();
-    fetchBoard().then(() => {
-      if (activeView === 'calendar') renderCalendar();
-    });
-  }
+  if (view === 'calendar') { fetchBoard().then(() => { _fcInit(); }); }
   if (view === 'torrents') _torrentLoad(); else _torrentStopTimer();
   if (view === 'terminal') _termInit();
   if (view === 'graph') _graphInit();
@@ -21505,7 +21670,6 @@ function switchView(view) {
     if (boardTimer) { clearInterval(boardTimer); boardTimer = null; }
   }
   if (view !== 'scheduler') _stopSysJobsTimer();
-  if (window.AmuxUI) window.AmuxUI.sync();
 }
 
 // ── Habits tab ───────────────────────────────────────────────────────────────
@@ -23221,8 +23385,6 @@ function renderScheduler(opts) {
   const runsEl = document.getElementById(opts.runsId || 'scheduler-runs');
   const statsEl = document.getElementById(opts.statsId || 'sched-stats');
   if (!listEl) return;
-  listEl.dataset.component = 'scheduler-surface';
-  listEl.dataset.context = opts.session ? 'worker' : 'global';
 
   // Scope: when driven from the peek Schedules tab (opts.session), only the
   // current session's schedules/runs are shown; the homepage view shows the whole
@@ -23938,12 +24100,12 @@ function _bindMdFileLinks(container) {
     if (!a || !container.contains(a) || !a.dataset.file) return;
     e.preventDefault();
     e.stopPropagation();
-    if (a.dataset.dir && typeof openDirectoryExplorer === 'function') {
-      // Directory link -> the shared Directory Explorer (carry the session
+    if (a.dataset.dir && typeof openExplore === 'function') {
+      // Directory link -> the file explorer at that path (carry the session
       // scope if we have one, so cwd-relative reads keep working).
       const sess = (typeof _exploreSession !== 'undefined' && _exploreSession)
         || (typeof peekSession !== 'undefined' && peekSession) || null;
-      openDirectoryExplorer(a.dataset.file, sess);
+      openExplore(a.dataset.file, sess);
     } else {
       openFilePreview(a.dataset.file);
     }
@@ -27700,16 +27862,6 @@ function _fcGetEvents() {
   return out;
 }
 
-function _fcEnsureInit(attempt = 0) {
-  if (activeView !== 'calendar') return;
-  if (window.FullCalendar) {
-    if (_fcInstance) _fcInstance.refetchEvents();
-    else _fcInit();
-    return;
-  }
-  if (attempt < 20) setTimeout(() => _fcEnsureInit(attempt + 1), 100);
-}
-
 function _fcInit() {
   const el = document.getElementById('fc-container');
   if (!el || !window.FullCalendar) return;
@@ -28699,42 +28851,6 @@ function _wsTermSetupHandlers(pid) {
   });
 }
 
-// Canonical xterm surface used by both the full Terminal page and every
-// Workspace terminal tile. Connection lifecycle remains contextual; typography,
-// ANSI palette, selection, link handling, sizing and component semantics do not.
-const _AMUX_TERMINAL_THEME = {
-  background: '#0d1117', foreground: '#c9d1d9',
-  cursor: '#58a6ff', cursorAccent: '#0d1117',
-  selectionBackground: 'rgba(56,139,253,0.3)',
-  black: '#484f58', red: '#ff7b72', green: '#3fb950', yellow: '#d29922',
-  blue: '#58a6ff', magenta: '#bc8cff', cyan: '#39d353', white: '#b1bac4',
-  brightBlack: '#6e7681', brightRed: '#ffa198', brightGreen: '#56d364', brightYellow: '#e3b341',
-  brightBlue: '#79c0ff', brightMagenta: '#d2a8ff', brightCyan: '#56d364', brightWhite: '#f0f6fc',
-};
-
-function _createTerminalSurface(container, options) {
-  options = options || {};
-  const term = new Terminal(Object.assign({
-    cursorBlink: true,
-    cursorStyle: 'block',
-    fontSize: 13,
-    fontFamily: "'JetBrains Mono', 'Menlo', 'Monaco', 'Courier New', monospace",
-    theme: _AMUX_TERMINAL_THEME,
-    scrollback: 5000,
-    allowProposedApi: true,
-    macOptionIsMeta: true,
-    macOptionClickForcesSelection: true,
-    allowTransparency: false,
-  }, options));
-  const fit = new FitAddon.FitAddon();
-  term.loadAddon(fit);
-  term.loadAddon(new WebLinksAddon.WebLinksAddon());
-  container.dataset.component = 'terminal-surface';
-  term.open(container);
-  fit.fit();
-  return { term, fit };
-}
-
 async function _initWsTermPane(pid) {
   const p = _wsTerm[pid];
   if (!p) return;
@@ -28742,9 +28858,31 @@ async function _initWsTermPane(pid) {
   const container = document.getElementById(sid + '-body');
   if (!container) return;
 
-  const surface = _createTerminalSurface(container);
-  const term = surface.term;
-  const fit = surface.fit;
+  const term = new Terminal({
+    cursorBlink: true,
+    cursorStyle: 'block',
+    fontSize: 13,
+    fontFamily: "'JetBrains Mono', 'Menlo', 'Monaco', 'Courier New', monospace",
+    theme: {
+      background: '#0d1117', foreground: '#c9d1d9',
+      cursor: '#58a6ff', cursorAccent: '#0d1117',
+      selectionBackground: 'rgba(56,139,253,0.3)',
+      black: '#484f58',   red: '#ff7b72',    green: '#3fb950',  yellow: '#d29922',
+      blue: '#58a6ff',    magenta: '#bc8cff', cyan: '#39d353',   white: '#b1bac4',
+      brightBlack: '#6e7681', brightRed: '#ffa198', brightGreen: '#56d364', brightYellow: '#e3b341',
+      brightBlue: '#79c0ff',  brightMagenta: '#d2a8ff', brightCyan: '#56d364', brightWhite: '#f0f6fc',
+    },
+    scrollback: 5000,
+    allowProposedApi: true,
+    macOptionIsMeta: true,
+    macOptionClickForcesSelection: true,
+  });
+
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.loadAddon(new WebLinksAddon.WebLinksAddon());
+  term.open(container);
+  fit.fit();
   p.term = term; p.fit = fit;
   // Second fit after paint to correct dimensions in flex layout
   requestAnimationFrame(() => { try { fit.fit(); } catch(e) {} });
@@ -31477,9 +31615,6 @@ _handleDeeplink(location.hash);
 // sane default rather than a stale heavy tab.
 const _UI_RESTORE_MAX_AGE = 24 * 3600 * 1000;
 function _restoreScreen() {
-  // An embed URL is an explicit destination owned by its workspace tile. Never
-  // let this browser tab's last standalone page or peek replace that surface.
-  if (window._embedView || window._peekEmbed) return;
   // Must run AFTER the DOM is parsed: switchView touches #grid-view, which is
   // defined later in the HTML than this inline script — calling it during boot
   // (setTimeout 0) null-derefs and throws. The app never calls switchView on
@@ -33425,7 +33560,7 @@ function _fmtBytes(b) {
 
 function _torrentBrowseDir() {
   fetch(API + '/api/torrents/config').then(r => r.json()).then(d => {
-    if (d.download_dir) openDirectoryExplorer(d.download_dir);
+    if (d.download_dir) openExplore(d.download_dir);
   });
 }
 
@@ -33832,15 +33967,36 @@ async function _termConnect() {
     _termId = null;
   }
 
-  // Create the same xterm surface used by Workspace terminal tiles; only the
-  // page-specific font size, scrollback depth and pointer preference differ.
-  const surface = _createTerminalSurface(container, {
+  // Create xterm.js instance
+  _term = new Terminal({
+    cursorBlink: true,
+    cursorStyle: 'block',
     fontSize: fontSize,
+    fontFamily: "'JetBrains Mono', 'Menlo', 'Monaco', 'Courier New', monospace",
+    theme: {
+      background: '#0d1117',
+      foreground: '#c9d1d9',
+      cursor: '#58a6ff',
+      cursorAccent: '#0d1117',
+      selectionBackground: 'rgba(56,139,253,0.3)',
+      black: '#484f58',   red: '#ff7b72',    green: '#3fb950',  yellow: '#d29922',
+      blue: '#58a6ff',    magenta: '#bc8cff', cyan: '#39d353',   white: '#b1bac4',
+      brightBlack: '#6e7681', brightRed: '#ffa198', brightGreen: '#56d364', brightYellow: '#e3b341',
+      brightBlue: '#79c0ff',  brightMagenta: '#d2a8ff', brightCyan: '#56d364', brightWhite: '#f0f6fc',
+    },
     scrollback: 10000,
+    allowProposedApi: true,
+    macOptionIsMeta: true,
+    macOptionClickForcesSelection: true,
     rightClickSelectsWord: true,
+    allowTransparency: false,
   });
-  _term = surface.term;
-  _termFit = surface.fit;
+
+  _termFit = new FitAddon.FitAddon();
+  _term.loadAddon(_termFit);
+  _term.loadAddon(new WebLinksAddon.WebLinksAddon());
+
+  _term.open(container);
   _termLayout();   // pin container to full viewport height BEFORE measuring cols/rows
   _termFit.fit();
 
@@ -34204,8 +34360,6 @@ async function _msgResend(keys) {
 function _messagesRender() {
   const list = document.getElementById('msgs-list');
   if (!list) return;
-  list.dataset.component = 'message-timeline';
-  list.dataset.context = 'global';
   const q = (document.getElementById('msgs-search')?.value || '').trim().toLowerCase();
   const sessF = document.getElementById('msgs-session-filter')?.value || '';
   _msgsRenderChips();
