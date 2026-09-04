@@ -3129,3 +3129,24 @@ FIX: AF-507. Refuse a no-pathspec `git commit` whose staged set exceeds a
  escape. backend confirms both primitives already exist in that guard: the
  origin/main-diff is in the co-edit leg and the escape shape is the --allow-*/env
  pins. Related: AF-503 (the index.lock contention that started the sequence).
+
+## An unsigned fake browser PID shut down every Linux CI runner process
+AREA: tests
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-44
+SYMPTOM: Ten consecutive Rust check jobs ended around seven minutes with "runner
+ received a shutdown signal" after commit 92044fc8 added a browser-reaper test
+ seeded with PID 4294967295. The test called the real browser stop path, which
+ passed that decimal string to Linux procps `kill -TERM`; procps returned success
+ and treated the unsigned value as the signed process-group sentinel -1.
+COST: Every descendant main run lost the workspace-test process and GitHub runner,
+ blocking ATE-44 and ATE-45 verification while the 25-minute workflow timeout and
+ passing test output falsely suggested external cancellation.
+FIX: ATE-44 validates every browser PID at the signed OS boundary, refuses
+ reserved/group values before constructing arguments or launching external
+ `kill`, and emits `invalid_process_id_refused`. The original
+ 4294967295 fixture remains as an end-to-end regression, with boundary controls
+ for PID 0, PID 1, ordinary positive PIDs, and the signed maximum.

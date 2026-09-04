@@ -550,9 +550,10 @@ mod tests {
     /// reporting success. This one drives the real `tick` and reads the queue.
     ///
     /// The activity arm is the one exercised because it fires before any CDP
-    /// call, so the reap happens without a Chrome. `u32::MAX` is a pid no
-    /// process can hold, so the stop path's `kill -0` fails immediately and the
-    /// test neither waits nor signals anything real.
+    /// call, so the reap happens without a Chrome. `u32::MAX` is intentionally
+    /// retained as the regression sentinel: Linux procps interpreted that
+    /// unsigned value as the process-group pid -1 and terminated the CI runner
+    /// until the browser signal boundary began rejecting it (ATE-44).
     #[tokio::test]
     async fn a_reap_actually_enqueues_the_notice_for_the_owning_lane() {
         let home = tempfile::tempdir().unwrap();
@@ -560,7 +561,31 @@ mod tests {
         let store: crate::db::SharedStore =
             std::sync::Arc::new(crate::db::Store::open(&db.path().join("t.db")).unwrap());
 
-        // SAFETY: single-threaded test; both are restored below.
+        // Prove the target exists through the durable worker row that the
+        // enqueue chokepoint already understands. Do not take HomeGuard here:
+        // this test also exercises the process-global browser registry, and a
+        // parallel browser test can take those two locks in the opposite order.
+        // The first guarded draft wedged 14 unrelated tests in the full suite.
+        store
+            .write_async(|conn| {
+                conn.execute(
+                    "INSERT INTO _amux_workers \
+                     (id, display_name, name_aliases, cwd, provider, model, state, created_at, updated_at) \
+                     VALUES ('wrk_reaper_notice', 'gtm-engine', '[]', '/tmp', 'claude', \
+                             'test', '{\"state\":\"stopped\"}', \
+                             '2026-09-04T00:00:00Z', '2026-09-04T00:00:00Z')",
+                    [],
+                )?;
+                Ok(crate::db::WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
+            })
+            .await
+            .unwrap();
+
+        // SAFETY: this is the only test that mutates these two variables, and
+        // both are restored below before the test returns.
         let prior_after = std::env::var("AMUX_BROWSER_REAP_AFTER_S").ok();
         let prior_act = std::env::var("AMUX_BROWSER_ACTIVITY_REAP_S").ok();
         unsafe { std::env::set_var("AMUX_BROWSER_REAP_AFTER_S", "60") };
@@ -569,7 +594,25 @@ mod tests {
         crate::integrations::browser::test_clear_running();
         crate::integrations::browser::test_seed_running_port("hubspot", "gtm-engine", u32::MAX, 1);
 
-        let reaped = tick(home.path(), Some(&store)).await;
+        let reaped = crate::integrations::browser::test_with_kill_capture(async {
+            let reaped = tick(home.path(), Some(&store)).await;
+            assert!(
+                crate::integrations::browser::test_kill_commands().is_empty(),
+                "u32::MAX reached /bin/kill through the real reaper stop path"
+            );
+            assert!(
+                crate::integrations::browser::test_normal_pid_reaches_kill(std::process::id())
+                    .await,
+                "the normal positive-pid control did not invoke a successful kill -0"
+            );
+            assert_eq!(
+                crate::integrations::browser::test_kill_commands(),
+                vec![["-0".to_string(), std::process::id().to_string()]],
+                "only the normal control may reach /bin/kill"
+            );
+            reaped
+        })
+        .await;
         assert_eq!(reaped, vec!["hubspot".to_string()], "the activity arm did not fire");
 
         let rows: Vec<(String, String)> = {

@@ -759,12 +759,7 @@ fn spawn_exit_monitor() {
                 });
                 match snap {
                     Some((profile, owner, _, pid, _, _)) => {
-                        let alive = tokio::process::Command::new("kill")
-                            .args(["-0", &pid.to_string()])
-                            .status()
-                            .await
-                            .map(|s| s.success())
-                            .unwrap_or(true); // cannot poll ≠ dead
+                        let alive = pid_alive(pid);
                         // Only report dead if the registry STILL names this pid
                         // (a stop/start between poll and here changes the pid).
                         // Still the SAME pid under THIS profile (a stop/start
@@ -985,8 +980,20 @@ pub async fn adopt_if_orphaned(home: &Path) -> bool {
 /// Adopt ONE persisted record if its browser is genuinely alive.
 async fn adopt_one(home: &Path, v: &serde_json::Value) -> bool {
     let port = v.get("cdp_port").and_then(serde_json::Value::as_u64).unwrap_or(0) as u16;
-    let pid = v.get("pid").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32;
-    if port == 0 || pid == 0 {
+    let raw_pid = v.get("pid").and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let pid = persisted_process_id(v);
+    let Some(pid) = pid else {
+        if raw_pid != 0 {
+            tracing::warn!(
+                raw_pid,
+                verdict = "invalid_process_id_refused",
+                "browser: refused an unsafe process id from the persisted running-file; \
+                 it cannot be adopted or signalled"
+            );
+        }
+        return false;
+    };
+    if port == 0 {
         return false;
     }
     // Does CDP still answer? That is the only proof that matters — a live pid
@@ -1130,25 +1137,17 @@ async fn reconcile_orphan_before_launch(home: &Path, target_dir: &Path) {
     // delegate to it. Only when the recorded dir matches what we are about to
     // launch on, so we never kill a browser on an unrelated profile.
     if let Some(v) = persisted {
-        let pid = v.get("pid").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32;
+        let pid = persisted_process_id(&v).unwrap_or(0);
         let dir = v.get("user_data_dir").and_then(serde_json::Value::as_str).unwrap_or_default();
         if pid != 0 && Path::new(dir) == target_dir {
-            let alive = tokio::process::Command::new("kill")
-                .args(["-0", &pid.to_string()])
-                .status()
-                .await
-                .map(|s| s.success())
-                .unwrap_or(false);
+            let alive = pid_alive(pid);
             if alive {
                 tracing::warn!(
                     pid, dir,
                     "browser: killing an orphan Chrome that held the profile but whose CDP was \
                      unreachable — a launch on this dir would delegate to it and exit 0 (AMUX-3207)"
                 );
-                let _ = tokio::process::Command::new("kill")
-                    .args(["-KILL", &pid.to_string()])
-                    .status()
-                    .await;
+                let _ = run_kill(pid, "-KILL", "orphan reconciliation").await;
                 clear_running(home);
             }
         }
@@ -1181,7 +1180,7 @@ async fn reconcile_orphan_before_launch(home: &Path, target_dir: &Path) {
              user-data-dir is what shows the user 'Something went wrong when opening your \
              profile' (AMUX-3674)"
         );
-        let _ = tokio::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status().await;
+        let _ = run_kill(*pid, "-KILL", "stray browser reconciliation").await;
     }
     if !strays.is_empty() {
         // Counted, not just logged: a silent cleanup cannot tell anyone the
@@ -1940,12 +1939,15 @@ pub async fn stop_profile_as_reason(
         chrono::Utc::now().timestamp(),
     ));
 
-    // std/tokio only offer SIGKILL; /bin/kill sends the TERM we need.
-    let _ = tokio::process::Command::new("kill")
-        .arg("-TERM")
-        .arg(running.pid.to_string())
-        .status()
-        .await;
+    // Validate before crossing the signed OS pid boundary. procps `kill` on
+    // Linux accepts u32::MAX and turns it into the process-group sentinel -1;
+    // a test fixture using that supposedly-impossible pid terminated the CI
+    // runner and every sibling process (ATE-44). A Chrome child can never be
+    // pid 0/1, so refusing those reserved values is also the safe direction.
+    let signalable = checked_process_id(running.pid).is_some();
+    // std/tokio only offer SIGKILL; /bin/kill sends the TERM Chrome needs to
+    // flush Cookies and Local Storage. `run_kill` validates before spawning.
+    let _ = run_kill(running.pid, "-TERM", "browser stop").await;
     match running.child.as_mut() {
         Some(ch) => {
             let graceful =
@@ -1959,23 +1961,16 @@ pub async fn stop_profile_as_reason(
             // ADOPTED: not our child, so we cannot wait() on it. Poll for exit
             // by pid instead, keeping the same 8s TERM budget before SIGKILL —
             // the flush window is the point, not the handle.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-            while std::time::Instant::now() < deadline {
-                let alive = tokio::process::Command::new("kill")
-                    .args(["-0", &running.pid.to_string()])
-                    .status()
-                    .await
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-                if !alive {
-                    break;
+            if signalable {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+                while std::time::Instant::now() < deadline {
+                    if !pid_alive(running.pid) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let _ = run_kill(running.pid, "-KILL", "adopted browser stop").await;
             }
-            let _ = tokio::process::Command::new("kill")
-                .args(["-KILL", &running.pid.to_string()])
-                .status()
-                .await;
         }
     }
     clear_running(home);
@@ -2386,10 +2381,95 @@ pub static DEAD_BROWSER_RECOVERIES: std::sync::atomic::AtomicU64 =
 /// Is `pid` a currently-live process? `kill(pid, 0)` sends no signal but
 /// performs the existence+permission check — Ok/EPERM means alive, ESRCH means
 /// gone.
+fn checked_process_id(pid: u32) -> Option<i32> {
+    let pid = i32::try_from(pid).ok()?;
+    (pid > 1).then_some(pid)
+}
+
+fn persisted_process_id(v: &serde_json::Value) -> Option<u32> {
+    let raw = v.get("pid")?.as_u64()?;
+    let pid = u32::try_from(raw).ok()?;
+    checked_process_id(pid)?;
+    Some(pid)
+}
+
+/// Construct arguments that can signal one process, never a POSIX process-group
+/// sentinel. `None` means the caller MUST return before spawning `/bin/kill`.
+///
+/// The WARN is the two-fix signal for the CI-killing ATE-44 failure: the next
+/// malformed persisted pid or unsafe test sentinel is visible in the normal
+/// server log instead of being parsed by an external utility and broadcast.
+fn checked_kill_args(
+    pid: u32,
+    signal: &'static str,
+    operation: &'static str,
+) -> Option<[String; 2]> {
+    let Some(pid) = checked_process_id(pid) else {
+        tracing::warn!(
+            pid,
+            signal,
+            operation,
+            verdict = "invalid_process_id_refused",
+            "browser: refused to signal an unsafe process id; no OS signal was sent"
+        );
+        return None;
+    };
+    Some([signal.to_string(), pid.to_string()])
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_KILL_COMMANDS: std::cell::RefCell<Vec<[String; 2]>>;
+}
+
+/// The only external-signal launch point. Invalid PIDs return before both the
+/// test observer and `Command::new`, so the reaper regression can prove that
+/// its unsigned sentinel never invoked kill at all.
+async fn run_kill(
+    pid: u32,
+    signal: &'static str,
+    operation: &'static str,
+) -> Option<std::io::Result<std::process::ExitStatus>> {
+    let args = checked_kill_args(pid, signal, operation)?;
+    #[cfg(test)]
+    let _ = TEST_KILL_COMMANDS.try_with(|commands| commands.borrow_mut().push(args.clone()));
+    Some(tokio::process::Command::new("kill").args(args).status().await)
+}
+
+#[cfg(test)]
+pub async fn test_with_kill_capture<F>(future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    TEST_KILL_COMMANDS.scope(std::cell::RefCell::new(Vec::new()), future).await
+}
+
+#[cfg(test)]
+pub fn test_kill_commands() -> Vec<[String; 2]> {
+    TEST_KILL_COMMANDS.try_with(|commands| commands.borrow().clone()).unwrap_or_default()
+}
+
+#[cfg(test)]
+pub async fn test_normal_pid_reaches_kill(pid: u32) -> bool {
+    matches!(run_kill(pid, "-0", "normal pid control").await, Some(Ok(status)) if status.success())
+}
+
 fn pid_alive(pid: u32) -> bool {
-    // SAFETY: kill with signal 0 is the canonical liveness probe; it touches
-    // no memory and cannot affect the target.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    let Some(pid) = checked_process_id(pid) else {
+        tracing::warn!(
+            pid,
+            signal = 0,
+            operation = "browser liveness probe",
+            verdict = "invalid_process_id_refused",
+            "browser: refused to probe an unsafe process id; no OS signal was sent"
+        );
+        return false;
+    };
+    // Signal 0 performs the existence+permission check without affecting the
+    // target. EPERM still proves the process exists.
+    // SAFETY: `checked_process_id` admits only a positive non-special signed
+    // pid, never 0 or -1, so this cannot target a process group.
+    let rc = unsafe { libc::kill(pid, 0) };
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
@@ -2575,6 +2655,48 @@ mod cdp_list_failure_tests {
         let pid = c.id();
         c.wait().expect("wait");
         assert!(!pid_alive(pid), "a reaped child (pid {pid}) must read as gone");
+    }
+
+    /// The exact Linux runner-kill boundary from ATE-44. procps accepted
+    /// 4294967295 and passed it to the signed pid API as -1, which means every
+    /// signalable process except the caller. Keep both group sentinels out while
+    /// proving an ordinary positive process id still passes.
+    #[test]
+    fn process_id_validation_rejects_group_sentinels_and_unsigned_wrap() {
+        for invalid in [0, 1, (i32::MAX as u32) + 1, u32::MAX] {
+            assert_eq!(checked_process_id(invalid), None, "accepted invalid pid {invalid}");
+            assert_eq!(
+                checked_kill_args(invalid, "-TERM", "test"),
+                None,
+                "pid {invalid} reached /bin/kill argument construction"
+            );
+        }
+        assert_eq!(checked_process_id(2), Some(2), "ordinary positive pid must remain valid");
+        assert_eq!(
+            checked_kill_args(42, "-TERM", "test"),
+            Some(["-TERM".to_string(), "42".to_string()]),
+            "a normal pid must still reach the one-process signal path"
+        );
+        assert_eq!(
+            checked_process_id(i32::MAX as u32),
+            Some(i32::MAX),
+            "the top of the signed pid range is still one process, not a group"
+        );
+    }
+
+    #[test]
+    fn persisted_state_cannot_create_a_running_browser_with_an_unsafe_pid() {
+        for invalid in [
+            serde_json::json!({"pid": 0}),
+            serde_json::json!({"pid": 1}),
+            serde_json::json!({"pid": (i32::MAX as u64) + 1}),
+            serde_json::json!({"pid": u32::MAX}),
+            serde_json::json!({"pid": u64::MAX}),
+            serde_json::json!({"pid": "42"}),
+        ] {
+            assert_eq!(persisted_process_id(&invalid), None, "accepted {invalid}");
+        }
+        assert_eq!(persisted_process_id(&serde_json::json!({"pid": 42})), Some(42));
     }
 }
 
