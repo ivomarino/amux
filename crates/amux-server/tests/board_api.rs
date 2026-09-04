@@ -4992,3 +4992,56 @@ async fn a_gate_refusal_offers_the_reassignment_exit_and_says_it_is_not_a_bypass
     assert_eq!(v["kind"], json!("gate_blocked"), "{v}");
     assert!(v["how_to_ack"]["gate_ack"] == json!(true), "{v}");
 }
+
+/// AF-506, second pass — EVERY refusal that blocks closing or reviewing a card
+/// offers the reassignment exit, not just the one it was written for.
+///
+/// Found by probing the LIVE server on the commit that added the exit to
+/// `gate_409`: `done_requires_asset_link` fires first, then
+/// `done_requires_evidence`, and only then the gate ack. A lane routing a card
+/// away hits whichever comes first and never reaches the one that had been
+/// taught. A fix verified only through the path it was written for would have
+/// shipped looking complete — the live probe is what caught it.
+///
+/// SCOPE, deliberately: refusals that block CLOSING or REVIEWING. The needs-you,
+/// blocked-must-name and todo-capacity refusals are excluded because supplying
+/// the ask or the reason IS their exit; reassignment there would be noise.
+#[tokio::test]
+async fn every_close_refusal_offers_the_reassignment_exit() {
+    let (app, _dir) = app();
+
+    // Each tuple walks one card further along the ladder, so a DIFFERENT
+    // refusal answers each time. The order is the order the server applies.
+    let cases: Vec<(&str, Value, &str)> = vec![
+        // No desc artifact at all -> the asset-link gate answers first.
+        ("done_requires_asset_link", json!({ "status": "done" }), ""),
+        // Artifact present, evidence missing -> the evidence gate answers.
+        (
+            "done_requires_evidence",
+            json!({ "status": "done" }),
+            "artifact: crates/amux-server/src/api/board.rs",
+        ),
+    ];
+
+    for (want_code, patch, desc) in cases {
+        let card = create(&app, json!({
+            "title": format!("card for {want_code}"), "status": "doing",
+            "desc": desc, "session": "mvs-infra",
+        })).await;
+        let id = card["id"].as_str().unwrap().to_string();
+        let (st, _, v) = send_with(
+            &app, "PATCH", &format!("/api/board/{id}"), Some(patch.clone()),
+            &[("X-Amux-Session", "backend")],
+        ).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{want_code}: {v}");
+        assert_eq!(v["code"], json!(want_code), "wrong refusal answered: {v}");
+        assert!(
+            v["or_reassign"]["how"].as_str().unwrap_or("").contains("mvs-infra"),
+            "{want_code} teaches only its own exit: {v}"
+        );
+        assert!(
+            v["or_reassign"]["not_a_bypass"].as_str().unwrap_or("").contains("does not skip"),
+            "{want_code}: the exit reads as a way around the refusal: {v}"
+        );
+    }
+}

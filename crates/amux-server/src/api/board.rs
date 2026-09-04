@@ -6508,6 +6508,9 @@ pub async fn patch_item(
                                             "blocked": true,
                                             "item": next.id,
                                             "detail": msg,
+                                            "or_reassign": reassign_exit(
+                                                &next.id, next.session.as_deref(), &caller_lane,
+                                            ),
                                         }),
                                     ),
                                     no_write(),
@@ -6610,6 +6613,9 @@ pub async fn patch_item(
                                         "blocked": true,
                                         "item": next.id,
                                         "attempted_status": target_raw,
+                                        "or_reassign": reassign_exit(
+                                            &next.id, next.session.as_deref(), &caller_lane,
+                                        ),
                                         "why": "A card cannot be marked done without pointing at the artifact it produced: a URL, a repo file path, a commit sha, or a #PR/issue. This is a global constraint and gate_ack cannot satisfy it.",
                                         "how_to_fix": {
                                             "add_link": "PATCH /api/board/<id> with a desc containing the URL / file path / commit / #PR, then retry done.",
@@ -6697,6 +6703,18 @@ pub async fn patch_item(
                                         "attempted_status": target_raw,
                                         "why": why,
                                         "recorded_evidence": next.evidence,
+                                        // AF-506, second pass. This refusal fires
+                                        // BEFORE the gate-ack one, so a lane routing
+                                        // a card away hits it FIRST and never sees the
+                                        // exit added to gate_409 — measured against the
+                                        // live server on the very commit that added it.
+                                        // Same friction (a refusal that teaches one way
+                                        // out), same remedy: if the work is another
+                                        // lane's, you should not be closing this card at
+                                        // all.
+                                        "or_reassign": reassign_exit(
+                                            &next.id, next.session.as_deref(), &caller_lane,
+                                        ),
                                         "how_to_fix": {
                                             "cli": format!("amux board done {} --evidence-stdin  (heredoc; inline text is evaluated by YOUR shell)", next.id),
                                             "api": "PATCH /api/board/<id> with {\"evidence\": \"...\"} — writable on its own, so record it first and the transition cannot discard it",
