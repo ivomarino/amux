@@ -88,6 +88,125 @@ const CALLER_GUARDED_ABSENT: &[&str] = &[];
 
 
 
+/// AF-453. `route.callers_have_routes` asks whether a route EXISTS. Nothing in
+/// this repo asked whether a mounted route ANSWERS, and the gap had a live
+/// specimen: `GET /api/workers/{id}` is in ROUTE_TABLE with GET/PATCH/DELETE,
+/// and returned 2xx for 0 of 15 calls over 14 days while 0 of 12 probed lanes
+/// resolved. The existence check passes it, correctly and uselessly.
+///
+/// GRANULARITY IS THE WHOLE CHECK, and the first version of this got it wrong.
+/// Aggregated by FAMILY, `/api/workers` reports 4,016 of 4,394 succeeding, which
+/// is healthy, because `/api/workers/{id}/<verb>` is 4,006/4,368 and drowns
+/// `/api/workers/{id}` at 1/17. A family-level version of this check reports the
+/// fleet clean and misses the one defect it was written for. Group by ROUTE
+/// SHAPE (`normalize_target_verb`), never by family.
+///
+/// WHAT A PASS DOES NOT MEAN. Four blind spots, published in the evidence of
+/// every result rather than left for a reader to rediscover (ethos rule 4),
+/// because "no findings" from this check means "no mounted route failed loudly
+/// enough, often enough, with a status", not "every mounted route answers":
+///
+///   1. n >= 10. A mounted route failing 9 times in the window is invisible.
+///   2. Never-called routes are invisible. 23 `/api` families had zero calls in
+///      the 14-day window that produced this check.
+///   3. A route answering 2xx for one input and failing every other stays above
+///      the threshold at low n.
+///   4. THE REAL ONE: this keys on STATUS. A route returning 200 with an error
+///      body passes it, and 1,646,523 2xx `/api` rows in the window are not
+///      inspected for that shape by anything.
+const MOUNTED_ANSWERS_BLIND_SPOTS: &[&str] = &[
+    "n >= 10: a mounted route failing fewer times in the window is invisible",
+    "never-called routes are invisible — this reads the request log, not the route table",
+    "a route answering 2xx for one input and failing the rest can stay above the threshold at low n",
+    "keys on STATUS ONLY: a route returning 200 with an error body passes this check",
+];
+
+/// One (method, route-shape) group from the request log. `shape` must come from
+/// `normalize_target_verb`, not `family` — see the granularity note above.
+#[derive(Debug, Clone)]
+pub struct RouteOutcomeRow {
+    pub method: String,
+    pub shape: String,
+    pub n: i64,
+    pub ok: i64,
+}
+
+/// Minimum calls before a shape is judged at all. Named rather than inlined so
+/// blind spot 1 and the code cannot drift apart.
+const MOUNTED_ANSWERS_MIN_N: i64 = 10;
+/// A shape is "not answering" below this 2xx percentage.
+const MOUNTED_ANSWERS_MAX_OK_PCT: i64 = 10;
+
+pub fn mounted_routes_answer(
+    rows: &[RouteOutcomeRow],
+    mounted: &[(&str, &[&str])],
+) -> Vec<InvariantResult> {
+    const ID: &str = "route.mounted_routes_answer";
+    // The empty-probe trap, same one `route.callers_have_routes` guards: a log
+    // that yielded nothing reports the identical silence to a fleet where every
+    // mounted route answers. Say which happened.
+    if rows.is_empty() {
+        return vec![InvariantResult::unknown(
+            ID,
+            "no request-log groups in the window — the probe did not run, which is not \
+             the same as every mounted route answering",
+        )];
+    }
+    let considered: i64 = rows.len() as i64;
+    let judged: Vec<&RouteOutcomeRow> = rows
+        .iter()
+        .filter(|r| r.n >= MOUNTED_ANSWERS_MIN_N)
+        .collect();
+    // n_considered BESIDE the answer (ethos rule 4): a zero here is only
+    // meaningful next to how many shapes cleared the threshold to produce it.
+    let ev = |extra: serde_json::Value| -> serde_json::Value {
+        serde_json::json!({
+            "measured": true,
+            "n_considered": considered,
+            "n_judged": judged.len(),
+            "min_n": MOUNTED_ANSWERS_MIN_N,
+            "max_ok_pct": MOUNTED_ANSWERS_MAX_OK_PCT,
+            "blind_spots": MOUNTED_ANSWERS_BLIND_SPOTS,
+            "detail": extra,
+        })
+    };
+    let mut out = Vec::new();
+    let mut failed = 0usize;
+    for r in &judged {
+        if r.ok * 100 > r.n * MOUNTED_ANSWERS_MAX_OK_PCT {
+            continue; // answering well enough
+        }
+        // MOUNTED filter. An unmounted path failing is a client guessing a URL,
+        // which /api/logs/analyze already reports as a 404 group with
+        // nearest_routes. This check is only about routes that DO exist.
+        if !matches!(match_route_full(mounted, &r.method, &r.shape), RouteMatch::Ok) {
+            continue;
+        }
+        failed += 1;
+        out.push(
+            InvariantResult::fail(
+                ID,
+                format!(
+                    "a route in ROUTE_TABLE answers 2xx for more than {}% of its calls",
+                    MOUNTED_ANSWERS_MAX_OK_PCT
+                ),
+                format!("{} {} — {}/{} 2xx", r.method, r.shape, r.ok, r.n),
+            )
+            .entity(format!("{} {}", r.method, r.shape))
+            .evidence(ev(serde_json::json!({ "n": r.n, "ok": r.ok }))),
+        );
+    }
+    if failed == 0 {
+        out.push(
+            InvariantResult::pass(ID).evidence(ev(serde_json::json!({
+                "means": "no MOUNTED route failed loudly enough, often enough, with a status — \
+                          see blind_spots; this is not 'every mounted route answers'"
+            }))),
+        );
+    }
+    out
+}
+
 pub fn route_callers_have_routes(
     mounted: &[(&str, &[&str])],
     callers: &[CallerPath],
@@ -531,6 +650,9 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     // which the caller stamps in seconds, and backfilled through
     // `strftime('%s', ...)` which yields seconds (AMUX-3609).
     ("issues", "closed_at", false),
+    // SECONDS: the callback outbox stamps this from board.rs `now_secs()` in
+    // the same write that updates the issue's seconds-valued `updated` field.
+    ("issues", "callback_fired_at", false),
     // SECONDS, same as every other `issues` timestamp and for the same reason:
     // `entered_state_at_for_write` stamps `row.updated`, and `create_issue`
     // stamps the same `now` it writes to `created`/`updated`. Nothing backfilled
@@ -2776,6 +2898,215 @@ pub fn frustration_cards_are_reachable(
     }))]
 }
 
+/// The first SYMPTOM line of each entry, normalised, paired with its title.
+///
+/// AF-434. Titles alone are not enough. `7dbab8f6`'s whole-file overwrite left
+/// one entry's HEADING sitting on top of a DIFFERENT entry's body: MR-43's
+/// title over AF-195's already-archived symptom, fields and all. That chimera
+/// read as a live MR-43 to anyone scanning headings and as a live AF-195 to
+/// anyone reading bodies, and it survived a title-keyed sweep because its
+/// heading was not in the archive.
+///
+/// The inverse is equally real, which is why BOTH keys are needed and neither
+/// replaces the other: 17 of AF-430's 29 resurrections were the PRE-archive
+/// drafts of entries their authors edited before signing off, so their titles
+/// matched and their prose did not. Title alone misses the chimera; prose alone
+/// misses the revised draft.
+///
+/// The key is the SYMPTOM's first line rather than the whole body because the
+/// body is what gets edited: an entry gains a VERIFIED paragraph, a re-check, a
+/// correction. What it opens with is what identifies it.
+pub fn frustration_entry_fingerprints(md: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut started = false;
+    let mut cur: Option<String> = None;
+    let mut done_this = false;
+    for line in md.lines() {
+        if !started {
+            if line.trim() == "---" {
+                started = true;
+            }
+            continue;
+        }
+        if let Some(t) = line.strip_prefix("## ") {
+            cur = Some(t.trim().to_string());
+            done_this = false;
+            continue;
+        }
+        if done_this {
+            continue;
+        }
+        let Some(title) = cur.as_ref() else { continue };
+        if let Some(v) = line.strip_prefix("SYMPTOM:") {
+            let norm: String = v
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(120)
+                .collect();
+            if !norm.is_empty() {
+                out.push((title.clone(), norm));
+            }
+            done_this = true;
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// 11c. A retired entry stays retired (AF-430)
+// ---------------------------------------------------------------------------
+
+/// No title appears in BOTH `frustrations.md` and `frustrations-archive.md`.
+///
+/// INCIDENT (AF-430, 2026-08-29 to 2026-09-02). One commit, `7dbab8f6`,
+/// overwrote the ledger with a fork's older copy to satisfy the append-only
+/// push guard. It re-added 29 headings that had already been archived with a
+/// `VALIDATED:` stamp, and deleted 33 that had been appended since. For four
+/// days the live file carried 29 retired entries reading `STATUS: open`, and
+/// every count run over it overstated the backlog by that much. Twelve were
+/// byte-identical to their archived copy; the other seventeen were the
+/// PRE-archive drafts of entries their authors had corrected before signing
+/// off, so the ledger served older text than the archive held.
+///
+/// WHY THIS IS A CHECK AND NOT A FOURTH SENTENCE. Three separate places already
+/// state the rule: `.claude/rules/frustrations.md` ("grep here first, present
+/// means it was retired on purpose"), the archive file's own header, and
+/// `scripts/frustrations-archive.py`, which warns when it is asked to archive a
+/// title the archive already holds. All three sit on the ARCHIVE path. A
+/// resurrection lands on the LEDGER, which nothing was watching, so a
+/// whole-file overwrite walked past all three without tripping anything. That
+/// is ethos rule 1: the guidance existed and did not reach the moment it was
+/// needed.
+///
+/// The direction matters and is the reason the message says so out loud. A
+/// title in both files does NOT mean an entry was lost; the archive exists
+/// precisely so a set-difference over the ledger alone cannot read a MOVE as a
+/// deletion (creative-dna measured 15 of 15 "lost" entries as archive moves).
+/// It means the ledger is serving a copy of something already signed off. The
+/// remedy is to delete the LEDGER copy, never to un-archive.
+fn trunc(s: &str, n: usize) -> String {
+    match s.char_indices().nth(n) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_string(),
+    }
+}
+
+pub fn frustration_retired_entries_stay_retired(
+    ledger_titles: &[String],
+    archive_titles: &[String],
+    ledger_prints: &[(String, String)],
+    archive_prints: &[(String, String)],
+    source: &str,
+) -> InvariantResult {
+    const ID: &str = "frustrations.retired_entries_stay_retired";
+    // Rule 4: an empty side makes the intersection empty and the check pass
+    // vacuously, which is exactly the theatre this module forbids. Zero
+    // archived entries is a broken read or a broken parse, never a healthy
+    // archive, because the archive is append-only and has held entries since
+    // 2026-08-06.
+    if archive_titles.is_empty() {
+        return InvariantResult::unknown(
+            ID,
+            format!("parsed 0 entries from the archive (ledger read from {source}); with no \
+                    archived titles the intersection is empty for the wrong reason"),
+        );
+    }
+    if ledger_titles.is_empty() {
+        return InvariantResult::unknown(
+            ID,
+            format!("parsed 0 entries from the ledger ({source})"),
+        );
+    }
+    let archived: BTreeSet<&str> = archive_titles.iter().map(|s| s.as_str()).collect();
+    let both: Vec<&String> =
+        ledger_titles.iter().filter(|t| archived.contains(t.as_str())).collect();
+    // AF-434, the second key. An entry whose SYMPTOM opens exactly like an
+    // archived one, under a title the archive does not have, is a resurrection
+    // wearing someone else's heading. Reported separately because the remedy
+    // differs: a title match means delete the ledger copy, while a chimera also
+    // means a DIFFERENT entry's heading is orphaned and its body may be lost.
+    let arch_prints: BTreeSet<&str> = archive_prints.iter().map(|(_, f)| f.as_str()).collect();
+    let chimeras: Vec<&(String, String)> = ledger_prints
+        .iter()
+        .filter(|(t, f)| arch_prints.contains(f.as_str()) && !archived.contains(t.as_str()))
+        .collect();
+    if both.is_empty() && chimeras.is_empty() {
+        return InvariantResult::pass(ID).evidence(json!({
+            "ledger_entries": ledger_titles.len(),
+            "archive_entries": archive_titles.len(),
+            "ledger_fingerprints": ledger_prints.len(),
+            "archive_fingerprints": archive_prints.len(),
+            "keys": "title and first-SYMPTOM-line; neither alone is sufficient (AF-434)",
+            "source": source,
+        }));
+    }
+    // A chimera with no title overlap is its own message: the title-only text
+    // below would send the reader to delete a ledger copy whose HEADING belongs
+    // to a different, possibly lost, entry.
+    if both.is_empty() {
+        let ex: Vec<String> = chimeras
+            .iter()
+            .take(3)
+            .map(|(t, f)| format!("\"{}\" opens like an archived entry: {}…", trunc(t, 60), trunc(f, 70)))
+            .collect();
+        return InvariantResult::fail(
+            ID,
+            "no frustrations.md entry duplicates an archived one, by title OR by opening \
+             SYMPTOM"
+                .to_string(),
+            format!(
+                "{} ledger entry/entries open with the SAME SYMPTOM as an archived entry while \
+                 carrying a title the archive does not have ({}). That is a CHIMERA, not an \
+                 ordinary resurrection: a whole-file overwrite left one entry's heading on top \
+                 of another's body (AF-434, MR-43's title over AF-195's archived body). Two \
+                 things are wrong, not one — the archived body is live again under a false \
+                 name, AND the entry that owns the heading has lost its own body, which is \
+                 probably in neither file. Recover the headed entry from git before deleting \
+                 anything. Ledger read from {source}.",
+                chimeras.len(),
+                ex.join("; "),
+            ),
+        )
+        .evidence(json!({
+            "chimeras": chimeras.iter().map(|(t, f)| json!({"title": t, "symptom_opens": f}))
+                .collect::<Vec<_>>(),
+            "ledger_entries": ledger_titles.len(),
+            "archive_entries": archive_titles.len(),
+            "source": source,
+            "remedy": "recover the headed entry from git history, then delete the archived body",
+        }));
+    }
+    let sample: Vec<String> = both.iter().take(4).map(|t| {
+        let t = t.as_str();
+        if t.len() > 70 { format!("{}…", &t[..t.char_indices().nth(70).map_or(t.len(), |(i, _)| i)]) }
+        else { t.to_string() }
+    }).collect();
+    InvariantResult::fail(
+        ID,
+        "no frustrations.md entry title also appears in frustrations-archive.md".to_string(),
+        format!(
+            "{} ledger entry/entries are also in the archive, where each carries a VALIDATED \
+             stamp naming the session that signed it off ({}). They read as live friction and \
+             `grep '^STATUS: open' frustrations.md` counts every one of them. This is a \
+             RESURRECTION, not a loss: the archive is where retired entries are supposed to be, \
+             so the fix is to delete the LEDGER copy, never to un-archive. Check the archived \
+             copy's text first, because it may be a later revision than the ledger's \
+             (17 of AF-430's 29 were). Ledger read from {source}.",
+            both.len(),
+            sample.join("; "),
+        ),
+    )
+    .evidence(json!({
+        "resurrected": both.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
+        "ledger_entries": ledger_titles.len(),
+        "archive_entries": archive_titles.len(),
+        "source": source,
+        "remedy": "delete the frustrations.md copy; the archive copy is the signed-off one",
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Negative controls (AMUX-2624). Each proves the check DETECTS the real bug.
 // ---------------------------------------------------------------------------
@@ -3087,6 +3418,137 @@ mod negative_controls {
             "unexpected STATUS values: {:?}",
             es.iter().map(|e| &e.2).collect::<BTreeSet<_>>()
         );
+    }
+
+    // -- AF-430: a retired entry stays retired ---------------------------
+
+    fn ttl(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The positive control, rebuilt from the incident: `7dbab8f6` put 29
+    /// already-archived headings back into the ledger. The check must FAIL on
+    /// exactly that, and its message must send the reader at the ledger copy,
+    /// because the opposite reading (the entry was lost, restore it) is the
+    /// mistake the archive exists to prevent.
+    #[test]
+    fn detects_an_archived_entry_resurrected_into_the_ledger() {
+        let led = ttl(&["a live one", "amux-launched browser does not survive a server self-adopt"]);
+        let arc = ttl(&["amux-launched browser does not survive a server self-adopt", "another"]);
+        let r = frustration_retired_entries_stay_retired(&led, &arc, &[], &[], "worktree");
+        assert_eq!(r.status, Status::Fail, "{}", r.observed);
+        let obs = &r.observed;
+        assert!(obs.contains("1 ledger entry"), "{obs}");
+        assert!(obs.contains("delete the LEDGER copy"), "remedy must name the side to delete: {obs}");
+        assert!(obs.contains("RESURRECTION"), "must say which direction this is: {obs}");
+    }
+
+    /// The control that matters. A checker that fires on every ledger is worth
+    /// nothing, and the honest ledger is the far more common state.
+    #[test]
+    fn a_ledger_sharing_no_title_with_the_archive_passes() {
+        let r = frustration_retired_entries_stay_retired(
+            &ttl(&["one", "two"]),
+            &ttl(&["three", "four"]),
+            &[],
+            &[],
+            "worktree",
+        );
+        assert_eq!(r.status, Status::Pass, "{}", r.observed);
+    }
+
+    /// Rule 4. An empty archive makes the intersection empty, so the check
+    /// would PASS while measuring nothing. That is the shape this module
+    /// forbids, and `unknown` is the only honest answer.
+    #[test]
+    fn an_empty_archive_is_unknown_not_a_pass() {
+        let r = frustration_retired_entries_stay_retired(&ttl(&["one"]), &[], &[], &[], "worktree");
+        assert_eq!(r.status, Status::Unknown, "{}", r.observed);
+        assert!(r.observed.contains("for the wrong reason"), "{}", r.observed);
+        let r2 = frustration_retired_entries_stay_retired(&[], &ttl(&["one"]), &[], &[], "HEAD");
+        assert_eq!(r2.status, Status::Unknown);
+    }
+
+    fn fp(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    }
+
+    /// AF-434's specimen, rebuilt: MR-43's heading sitting on AF-195's already
+    /// archived body. Title-keyed detection CANNOT see this, which is the whole
+    /// reason the second key exists, so the cell asserts the title key is blind
+    /// AND the fingerprint key is not.
+    #[test]
+    fn detects_a_chimera_whose_heading_is_not_in_the_archive() {
+        let led = ttl(&["A main lane with no $AMUX_SESSION in its env"]);
+        let arc = ttl(&["A green test suite EXPIRES through the shared index"]);
+        // The control first: on titles alone this pair is clean.
+        assert_eq!(
+            frustration_retired_entries_stay_retired(&led, &arc, &[], &[], "worktree").status,
+            Status::Pass,
+            "the title key must be BLIND here, or this cell proves nothing"
+        );
+        let lp = fp(&[("A main lane with no $AMUX_SESSION in its env", "I ran cargo test -p amux-server --test board_api: 37 passed")]);
+        let ap = fp(&[("A green test suite EXPIRES through the shared index", "I ran cargo test -p amux-server --test board_api: 37 passed")]);
+        let r = frustration_retired_entries_stay_retired(&led, &arc, &lp, &ap, "worktree");
+        assert_eq!(r.status, Status::Fail, "{}", r.observed);
+        assert!(r.observed.contains("CHIMERA"), "{}", r.observed);
+        assert!(
+            r.observed.contains("lost its own body"),
+            "the remedy must name BOTH halves: {}",
+            r.observed
+        );
+    }
+
+    /// The control for the second key. Two entries that merely share a subject
+    /// must not collide; only an identical opening SYMPTOM counts.
+    #[test]
+    fn different_symptoms_under_different_titles_are_not_a_chimera() {
+        let r = frustration_retired_entries_stay_retired(
+            &ttl(&["live one"]),
+            &ttl(&["retired one"]),
+            &fp(&[("live one", "the board refused a PATCH and dropped the desc")]),
+            &fp(&[("retired one", "the guard named a peer it could not identify")]),
+            "worktree",
+        );
+        assert_eq!(r.status, Status::Pass, "{}", r.observed);
+    }
+
+    /// The fingerprint parser on the real file: it must actually find symptoms,
+    /// or the second key is an empty set that can never match.
+    #[test]
+    fn the_fingerprint_parser_finds_a_symptom_for_almost_every_entry() {
+        const LED: &str = include_str!("../../../../frustrations.md");
+        let n_entries = parse_frustration_entries(LED).len();
+        let prints = frustration_entry_fingerprints(LED);
+        assert!(n_entries > 20, "only {n_entries} entries parsed");
+        assert!(
+            prints.len() * 10 >= n_entries * 9,
+            "only {} of {n_entries} entries yielded a SYMPTOM fingerprint",
+            prints.len()
+        );
+        assert!(
+            prints.iter().all(|(_, f)| f.len() <= 120 && !f.contains("  ")),
+            "fingerprints must be normalised and bounded"
+        );
+    }
+
+    /// The live pair, which is the cell that would have caught AF-430 four days
+    /// earlier than a human did. It reads both real files rather than a
+    /// fixture, because a fixture cannot go stale and the ledger can.
+    #[test]
+    fn the_real_ledger_holds_nothing_the_real_archive_has_already_retired() {
+        const LED: &str = include_str!("../../../../frustrations.md");
+        const ARC: &str = include_str!("../../../../frustrations-archive.md");
+        let lt: Vec<String> =
+            parse_frustration_entries(LED).into_iter().map(|e| e.1).collect();
+        let at: Vec<String> =
+            parse_frustration_entries(ARC).into_iter().map(|e| e.1).collect();
+        assert!(at.len() > 20, "archive parsed only {} entries", at.len());
+        let lp = frustration_entry_fingerprints(LED);
+        let ap = frustration_entry_fingerprints(ARC);
+        assert!(ap.len() > 20, "archive yielded only {} fingerprints", ap.len());
+        let r = frustration_retired_entries_stay_retired(&lt, &at, &lp, &ap, "baked-at-build");
+        assert_eq!(r.status, Status::Pass, "{}", r.observed);
     }
 
     /// AMUX-3203, rebuilt from the incident artifact: both channels ENABLED with
@@ -3402,6 +3864,36 @@ mod negative_controls {
             match_route_full(&mounted(), "POST", "/api/workers/amux/send"),
             RouteMatch::Missing,
             "/api/workers must NOT satisfy /api/workers/amux/send"
+        );
+    }
+
+    /// A `{*rest}` wildcard must CONSUME at least one segment, which is axum's
+    /// own rule and what `segments_match`'s comment already claims ("must have
+    /// at least one segment left to consume").
+    ///
+    /// Found by `scripts/mutate.sh survey` on its first real run, not by
+    /// reading: `return want.len() > i` flipped to `>=` and the entire
+    /// negative_controls suite stayed green. So the arm that decides whether a
+    /// wildcard route swallows its own prefix had a documented invariant, a
+    /// comment explaining it, and nothing holding it. With `>=`,
+    /// `/api/logs/{*rest}` would report `/api/logs` as mounted, which is the
+    /// prefix-matching false pass the neighbouring cell exists to prevent,
+    /// arriving through the one arm that cell does not reach.
+    #[test]
+    fn a_wildcard_tail_does_not_match_with_nothing_left_to_consume() {
+        let pat = ["api", "logs", "{*rest}"];
+        assert!(
+            segments_match(&pat, &["api", "logs", "x"]),
+            "a wildcard must match when there IS a segment to consume"
+        );
+        assert!(
+            segments_match(&pat, &["api", "logs", "x", "y"]),
+            "a wildcard must match a multi-segment tail"
+        );
+        assert!(
+            !segments_match(&pat, &["api", "logs"]),
+            "a wildcard tail must NOT match with zero segments left — that is the \
+             prefix false-pass, one arm over"
         );
     }
 
@@ -3960,6 +4452,65 @@ mod negative_controls {
         let row = rs2.iter().find(|r| r.entity_key == "POST /api/tunnel/start").unwrap();
         assert_eq!(row.status, Status::Fail);
         assert!(row.observed.contains("STALE"), "{}", row.observed);
+    }
+
+    /// AF-453, both arms. A check that flags every mounted route would satisfy
+    /// the first assertion alone and be worthless, so the healthy-route arm is
+    /// what makes this a test rather than a tautology.
+    #[test]
+    fn a_mounted_route_that_never_answers_is_reported_and_a_healthy_one_is_not() {
+        let mounted: Vec<(&str, &[&str])> = vec![
+            ("/api/workers/{id}", &["GET", "PATCH", "DELETE"]),
+            ("/api/workers/{id}/send", &["POST"]),
+        ];
+        let rows = vec![
+            // The live specimen: mounted, called 15 times, answered 0.
+            RouteOutcomeRow { method: "GET".into(), shape: "/api/workers/{id}".into(), n: 15, ok: 0 },
+            // ARM 2 — a HEALTHY mounted route. Without this the check could
+            // flag everything and still pass arm 1.
+            RouteOutcomeRow { method: "POST".into(), shape: "/api/workers/{id}/send".into(), n: 4368, ok: 4006 },
+            // Below the threshold: judged on nothing, so reported as nothing.
+            RouteOutcomeRow { method: "GET".into(), shape: "/api/workers/{id}".into(), n: 0, ok: 0 },
+            // UNMOUNTED and failing: a client guessing a URL. /api/logs/analyze
+            // already reports these as 404 groups with nearest_routes, and this
+            // check must not double-file them.
+            RouteOutcomeRow { method: "GET".into(), shape: "/api/stripe/status".into(), n: 430, ok: 0 },
+        ];
+        let rs = mounted_routes_answer(&rows, &mounted);
+        let fails: Vec<_> = rs.iter().filter(|r| r.status == Status::Fail).collect();
+        assert_eq!(fails.len(), 1, "expected exactly the mounted-and-dead route, got {:?}",
+                   fails.iter().map(|r| &r.entity_key).collect::<Vec<_>>());
+        assert_eq!(fails[0].entity_key, "GET /api/workers/{id}");
+        assert!(fails[0].observed.contains("0/15"), "{}", fails[0].observed);
+        assert!(!rs.iter().any(|r| r.entity_key.contains("/send")),
+                "a mounted route answering 4006/4368 must not be reported");
+        assert!(!rs.iter().any(|r| r.entity_key.contains("stripe")),
+                "an UNMOUNTED failing path is a client guessing a URL, not this check's finding");
+
+        // ARM 3 — the caveat must SHIP, not live in a doc comment. A pass here
+        // means "nothing failed loudly enough, often enough, with a status",
+        // and a reader who cannot see that will read it as "every route answers".
+        let clean = mounted_routes_answer(
+            &[RouteOutcomeRow { method: "POST".into(), shape: "/api/workers/{id}/send".into(), n: 4368, ok: 4006 }],
+            &mounted,
+        );
+        assert_eq!(clean.len(), 1);
+        assert_eq!(clean[0].status, Status::Pass);
+        let ev = &clean[0].evidence;
+        assert_eq!(ev["measured"], true);
+        assert_eq!(ev["n_considered"], 1, "a zero finding is only readable beside its population");
+        assert_eq!(ev["blind_spots"].as_array().map(|a| a.len()), Some(4),
+                   "all four blind spots ship with every result");
+        assert!(ev["blind_spots"].to_string().contains("error body"),
+                "the status-only blind spot is the one most likely to be forgotten");
+
+        // ARM 4 — an empty log is UNKNOWN, never a pass. This is the trap
+        // route.callers_have_routes already guards: a probe that could not run
+        // reports the same silence as a clean fleet.
+        let none = mounted_routes_answer(&[], &mounted);
+        assert_eq!(none.len(), 1);
+        assert_eq!(none[0].status, Status::Unknown);
+        assert!(none[0].observed.contains("did not run"), "{}", none[0].observed);
     }
 
     /// AF-137 both directions: unowned auto-filed cards must go RED naming

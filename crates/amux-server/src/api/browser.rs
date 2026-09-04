@@ -327,8 +327,30 @@ fn lookup_start_origin(store: &crate::db::SharedStore, started_at: i64) -> Start
     let Ok(conn) = store.read() else {
         return StartOrigin::NotLooked;
     };
+    // AF-419: ONLY ROWS THAT WERE THEMSELVES UNATTRIBUTED CAN BE THIS HOLDER'S.
+    //
+    // This function is called for an UNATTRIBUTED holder and nowhere else (the
+    // call site gates on `r_owner.trim().is_empty()`). A holder is unattributed
+    // exactly when its start carried no session — neither a body/query `session`
+    // nor an `X-Amux-Session` header, since `explicit_session` reads both. The
+    // log stores the raw header, so that start's row MUST have an empty
+    // `amux_session`. A row carrying a session therefore cannot be the one that
+    // began this holder, whatever its timestamp.
+    //
+    // Without this clause the nearest-row rule can hand an unattributed holder
+    // the ip and user-agent of a DIFFERENT lane's start, and the refusal then
+    // describes the wrong caller with full confidence — the wrong-but-confident
+    // attribution class of AF-411, AF-179 and AMUX-3954. Measured live: 115 of
+    // 265 all-time start rows are unattributed, and 5 windows exist where an
+    // attributed start falls within 120s after an unattributed one (e.g.
+    // 2026-08-29 09:08:10 unattributed, ai-video-editor 20.0s later).
+    //
+    // NOT PROVEN TO HAVE FIRED. `started_at` is not in the log, so I can show
+    // the windows exist and not that a wrong answer was produced. The clause is
+    // worth it anyway because it makes the wrong answer UNREACHABLE rather than
+    // unlikely, and it costs one predicate.
     let row = conn.query_row(
-        "SELECT COALESCE(client_ip,''), COALESCE(user_agent,'')          FROM _amux_request_log          WHERE path = '/api/browser/start' AND method = 'POST'            AND ts <= ?1 AND ts >= ?1 - 120          ORDER BY ts DESC LIMIT 1",
+        "SELECT COALESCE(client_ip,''), COALESCE(user_agent,'')          FROM _amux_request_log          WHERE path = '/api/browser/start' AND method = 'POST'            AND COALESCE(amux_session,'') = ''            AND ts <= ?1 AND ts >= ?1 - 120          ORDER BY ts DESC LIMIT 1",
         [started_at as f64],
         |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
     );
@@ -339,6 +361,88 @@ fn lookup_start_origin(store: &crate::db::SharedStore, started_at: i64) -> Start
         // A BROKEN LOOKUP IS NOT AN ABSENT ROW. Reporting "no origin" here would
         // let a schema change or a locked db read as evidence about the holder.
         Err(_) => StartOrigin::NotLooked,
+    }
+}
+
+#[cfg(test)]
+mod af419_start_origin_tests {
+    use super::*;
+
+    fn store_with(rows: &[(f64, &str, &str, &str)]) -> crate::db::SharedStore {
+        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let store = std::sync::Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
+        let owned: Vec<(f64, String, String, String)> = rows
+            .iter()
+            .map(|(t, i, u, s)| (*t, (*i).to_string(), (*u).to_string(), (*s).to_string()))
+            .collect();
+        store
+            .write(move |conn| {
+                for (ts, ip, ua, sess) in &owned {
+                    conn.execute(
+                        "INSERT INTO _amux_request_log \
+                         (ts, method, path, family, status, latency_ms, client_ip, user_agent, amux_session, answered_by) \
+                         VALUES (?1,'POST','/api/browser/start','/api/browser',200,1.0,?2,?3,?4,'native')",
+                        rusqlite::params![ts, ip, ua, sess],
+                    )?;
+                }
+                Ok(crate::db::WriteOutcome { applied: false, events: vec![] })
+            })
+            .unwrap();
+        store
+    }
+
+    /// THE CARD'S NAMED CHECK. Two starts inside one 120s window from different
+    /// callers: an UNATTRIBUTED one, then an ATTRIBUTED one that is NEARER to
+    /// the holder's started_at. The holder is unattributed, so only the first
+    /// can be its start — and the nearest-row rule alone would pick the second.
+    #[test]
+    fn an_unattributed_holder_is_never_described_by_an_attributed_start() {
+        let s = store_with(&[
+            (1000.0, "100.66.26.84", "Mozilla/5.0 (Macintosh)", ""),
+            (1050.0, "127.0.0.1", "curl/8.7.1", "ai-video-editor"),
+        ]);
+        match lookup_start_origin(&s, 1060) {
+            StartOrigin::Found { ip, ua } => {
+                assert_eq!(ip, "100.66.26.84", "must be the UNATTRIBUTED row, not the nearer one");
+                assert!(ua.contains("Mozilla"), "got {ua}");
+            }
+            other => panic!("expected the unattributed row, got {}", other.label()),
+        }
+    }
+
+    /// CONTROL, and the one that makes this honest: with ONLY an attributed row
+    /// in the window there is no candidate at all, and the answer must be
+    /// NotFound rather than a confident description of the wrong caller.
+    /// Without this cell, "return the oldest row" would pass the test above.
+    #[test]
+    fn only_attributed_rows_in_the_window_means_no_candidate() {
+        let s = store_with(&[(1050.0, "127.0.0.1", "curl/8.7.1", "ai-video-editor")]);
+        assert!(
+            matches!(lookup_start_origin(&s, 1060), StartOrigin::NotFound),
+            "an attributed row cannot describe an unattributed holder"
+        );
+    }
+
+    /// CONTROL: the ordinary case still works — nearest unattributed row wins
+    /// among several, so the fix narrows the candidates without inverting them.
+    #[test]
+    fn among_unattributed_rows_the_nearest_still_wins() {
+        let s = store_with(&[
+            (1000.0, "10.0.0.1", "old-client", ""),
+            (1055.0, "10.0.0.2", "new-client", ""),
+        ]);
+        match lookup_start_origin(&s, 1060) {
+            StartOrigin::Found { ip, .. } => assert_eq!(ip, "10.0.0.2"),
+            other => panic!("expected the nearer row, got {}", other.label()),
+        }
+    }
+
+    /// CONTROL: the 120s window is still enforced — an unattributed row older
+    /// than the window must not be adopted just because it is the only one.
+    #[test]
+    fn the_window_still_bounds_the_search() {
+        let s = store_with(&[(900.0, "10.0.0.1", "too-old", "")]);
+        assert!(matches!(lookup_start_origin(&s, 1060), StartOrigin::NotFound));
     }
 }
 
@@ -926,8 +1030,59 @@ async fn start(
             }
             Json(v).into_response()
         }
-        Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
+        Err(e) => {
+            let (status, body) = start_failure(&e);
+            err(status, body)
+        }
     }
+}
+
+/// 409 for a launch the CALLER can resolve, 502 for one that genuinely failed.
+///
+/// AF-381: `start` mapped every launch failure to 502, so "another Chrome
+/// already holds this --user-data-dir" — whose own hint says "Try again, or GET
+/// /api/browser/status and stop it first" — went out as "the upstream is broken,
+/// your request was fine". A client that retries on 5xx retries a conflict that
+/// will not clear itself, and 5xx is what alerting keys on, so a resolvable
+/// state inflated the error budget of a server behaving correctly.
+///
+/// 409 rather than 400 because it matches the taxonomy this file already has:
+/// `driver_err` answers 409 for `NotRunning`, the other state the caller fixes
+/// by acting on the browser rather than by changing the request.
+///
+/// Decided on the TYPE, exactly as `cdp_status` above states and for the same
+/// reason: this error's message is a hint someone will reword, and a status that
+/// depends on wording breaks the first time they do.
+fn start_status(e: &anyhow::Error) -> StatusCode {
+    if e.downcast_ref::<chrome::ProfileDelegated>().is_some()
+        || e.downcast_ref::<chrome::ExternalProfileInUse>().is_some()
+    {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
+}
+
+/// Status plus machine-readable launch verdict. The external-profile conflict
+/// is the one state where an undifferentiated error string is actively unsafe:
+/// retrying it opens another tab in the human's Chrome. Keep the ordinary
+/// failure shape unchanged; enrich only the typed pre-spawn refusal.
+fn start_failure(e: &anyhow::Error) -> (StatusCode, Value) {
+    let status = start_status(e);
+    let mut body = json!({ "error": with_cause(e) });
+    if let Some(conflict) = e.downcast_ref::<chrome::ExternalProfileInUse>() {
+        body["error_code"] = json!("human_chrome_profile_in_use");
+        body["retryable"] = json!(false);
+        body["spawned"] = json!(false);
+        body["profile"] = json!(conflict.profile);
+        body["lock_owner_pid"] = json!(conflict.owner_pid);
+        body["user_data_dir"] = json!(conflict.user_data_dir.display().to_string());
+        body["use_instead"] = json!({
+            "live_browser": "/chrome-cdp after enabling chrome://inspect/#remote-debugging",
+            "saved_profile": "fully quit Chrome, then retry POST /api/browser/start once"
+        });
+    }
+    (status, body)
 }
 
 async fn status() -> Response {
@@ -2231,6 +2386,87 @@ mod tests {
         let wrapped = anyhow::Error::new(chrome::CdpTimeout { method: "X".into(), secs: 1 })
             .context("while resizing the viewport");
         assert_eq!(cdp_status(&wrapped), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    /// AF-381: a launch the CALLER can resolve is 409, not 502.
+    ///
+    /// `start` mapped every launch failure to BAD_GATEWAY, so "another Chrome
+    /// already holds this --user-data-dir" — whose own hint says "Try again, or
+    /// GET /api/browser/status and stop it first" — went out as "the upstream is
+    /// broken, your request was fine". Measured live on 2026-09-03: 3 such 502s
+    /// in a 24h window carrying that exact body.
+    #[test]
+    fn a_delegated_launch_is_409_and_a_real_launch_failure_stays_502() {
+        let msg = "Chrome (pid Some(33823)) exited exit status: 0 before CDP on port 64178 \
+                   came up — exit 0 is the delegation signature: another Chrome already holds \
+                   this --user-data-dir.";
+        let delegated = anyhow::Error::new(chrome::ProfileDelegated(msg.into()));
+        assert_eq!(start_status(&delegated), StatusCode::CONFLICT);
+
+        // CONTROL 1, and the one that matters: a launch that genuinely failed
+        // must stay 502. A classifier answering 409 for everything passes the
+        // assertion above and hides every real browser fault behind a status
+        // nothing alerts on — the inverse of the bug being fixed.
+        let real = anyhow::anyhow!(
+            "Chrome (pid Some(41)) exited exit status: 1 before CDP on port 9 came up"
+        );
+        assert_eq!(start_status(&real), StatusCode::BAD_GATEWAY);
+
+        // CONTROL 2: wrapped in CONTEXT it is still delegated. `?` adds context
+        // freely on this path and a downcast reading only the outermost error
+        // regresses to 502 the first time someone writes `.context(...)` —
+        // exactly the trap cdp_status's own third control names.
+        let wrapped = anyhow::Error::new(chrome::ProfileDelegated(msg.into()))
+            .context("while starting the browser");
+        assert_eq!(start_status(&wrapped), StatusCode::CONFLICT);
+
+        // CONTROL 3: the MESSAGE is unchanged. The body is quoted in AF-443's
+        // card, in the log-sweep contract's cleared AMUX-3689 line, and in the
+        // hint callers read. Typing the error must not reword it.
+        assert_eq!(delegated.to_string(), msg);
+
+        // MO-3146: the PRE-SPAWN version of the conflict is also 409, and its
+        // body is explicit that retrying is unsafe. This is what prevents an
+        // agent's retry watcher from turning one locked profile into dozens of
+        // user-visible tabs.
+        let external = anyhow::Error::new(chrome::ExternalProfileInUse {
+            profile: "ethan-tubescience".into(),
+            user_data_dir: "/Users/ethan/Library/Application Support/Google/Chrome".into(),
+            owner_pid: 97230,
+        });
+        let (status, body) = start_failure(&external);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error_code"], "human_chrome_profile_in_use");
+        assert_eq!(body["retryable"], false);
+        assert_eq!(body["spawned"], false);
+        assert_eq!(body["lock_owner_pid"], 97230);
+        assert_eq!(body["profile"], "ethan-tubescience");
+        assert!(body["use_instead"]["live_browser"].as_str().unwrap().contains("/chrome-cdp"));
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("every retry would open another tab"), "{error}");
+        assert!(error.contains("Do not retry"), "{error}");
+    }
+
+    /// The SEAM between "what Chrome did" and "which error type gets built".
+    ///
+    /// `a_delegated_launch_is_409...` pins the classifier and this pins the
+    /// decision that feeds it. Neither reaches the other: mutating the
+    /// construction site to never build `ProfileDelegated` passed the entire
+    /// suite, because the classifier's test hands it a value the launch loop
+    /// never had to produce. Same shape as AF-438, closed the same way.
+    #[cfg(unix)]
+    #[test]
+    fn exit_zero_before_cdp_is_delegation_and_any_other_code_is_a_real_failure() {
+        use std::os::unix::process::ExitStatusExt;
+        let code = |c: i32| std::process::ExitStatus::from_raw(c << 8);
+        assert!(
+            chrome::is_delegation_exit(&code(0)),
+            "exit 0 before CDP is the delegation signature — another Chrome took the URL"
+        );
+        // The CONTROL: a real launch failure must not read as delegation, or
+        // every broken start answers 409 and stops alerting.
+        assert!(!chrome::is_delegation_exit(&code(1)), "exit 1 is a genuine launch failure");
+        assert!(!chrome::is_delegation_exit(&code(127)), "exit 127 is a genuine launch failure");
     }
 
     /// AMUX-98. A malformed selector (Playwright-style `text=...` syntax

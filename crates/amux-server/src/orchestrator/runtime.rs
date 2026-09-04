@@ -1386,8 +1386,12 @@ impl Runtime {
                         ask_type: None,
                         ask_question: None,
                         ask_unblocks: None,
+                        ask_actor: None,
                         // AF-367: minted by the orchestrator runtime.
                         source: Some("orchestrator".into()),
+                        requested_by: None,
+                        callback_session: None,
+                        callback_prompt: None,
                     },
                     now.timestamp(),
                 )?;
@@ -1934,8 +1938,12 @@ mod adherence_tests {
                         ask_type: None,
                         ask_question: None,
                         ask_unblocks: None,
+                        ask_actor: None,
                         // AF-367: minted by the orchestrator runtime.
                         source: Some("orchestrator".into()),
+                        requested_by: None,
+                        callback_session: None,
+                        callback_prompt: None,
                     },
                     1_700_000_000,
                 )?;

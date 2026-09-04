@@ -18,8 +18,9 @@
   body.light .overlay-body {
     background: #1c2128 !important; color: #cdd9e5 !important;
   }
-  body.light .peek-copy-btn {
-    background: rgba(28,33,40,0.85); border-color: rgba(255,255,255,0.2); color: #cdd9e5;
+  body.light .peek-copy-btn,
+  body.light .peek-agent-nav button {
+    background: #1c2128; border-color: rgba(255,255,255,0.2); color: #cdd9e5;
   }
   /* Connection status — hardcoded neon colors are invisible on white */
   body.light .conn-status.online  { color: #1a7f37; background: rgba(26,127,55,0.1); }
@@ -179,7 +180,19 @@
   .card-menu {
     display: none; position: fixed;
     background: var(--card); border: 1px solid var(--border);
-    border-radius: 10px; min-width: 200px; z-index: 50;
+    /* TWO constraints, and only a value above BOTH satisfies them.
+       1. Menus can open upward into the global approval strip (90), so a
+          pending permission request must not make worker actions unclickable.
+       2. The column ellipsis menu also opens INSIDE #peek-overlay, which is
+          `.overlay { z-index: 100 }` a few hundred lines up. At 95 it paints
+          underneath: the menu is built, populated and positioned correctly and
+          the click does nothing. Measured with elementFromPoint at the menu's
+          own corner, which returned the tab bar. It works on the global board,
+          which is not inside an overlay, which is why 95 looks sufficient.
+       310 clears the strip (90) and the overlay (100) and the modal backdrop
+       (300), and stays under the toast/picker layers (2000+) that must cover
+       it. 95 clears only the first. */
+    border-radius: 10px; min-width: 200px; z-index: 310;
     box-shadow: 0 8px 24px rgba(0,0,0,0.4);
     overflow-x: hidden; overflow-y: auto; max-height: 500px;
   }
@@ -451,6 +464,8 @@
      would train people to ignore red. `unknown` is every row written before the
      verdict existed — grey, never green, because "not recorded" is not "fine". */
   .sched-run-dot.queued { background:transparent;box-shadow:inset 0 0 0 1.5px var(--accent); }
+  .sched-run-dot.running { background:var(--yellow,#fbbf24);animation:sched-running-pulse 1.2s ease-in-out infinite; }
+  @keyframes sched-running-pulse { 50% { opacity:0.35;transform:scale(0.8); } }
   .sched-run-dot.warn { background:var(--yellow,#fbbf24); }
   .sched-run-dot.unknown { background:var(--dim,#6b7280);opacity:0.45; }
   .sched-cmd-expand { margin-top:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 10px;max-height:180px;overflow-y:auto; }
@@ -768,6 +783,10 @@
     margin-bottom: 8px; flex-shrink: 0;
   }
   .overlay-header h2 { font-size: 1.1rem; }
+  /* Reserve the control strip so output does not start underneath it. Scoped
+     to #peek-body: .overlay-body is shared with overlays that have no such
+     controls, and padding them would be a gap with nothing in it. */
+  #peek-body { padding-top: 40px; }
   .overlay-body {
     flex: 1; min-height: 0; overflow-x: hidden; overflow-y: auto;
     background: #010409; border-radius: 8px;
@@ -810,10 +829,25 @@
      220-col lane: 4196 vs 1416 at 1440px desktop (2780px unreachable without
      panning) and 4196 vs 366 at 390px phone — ~9% of each line visible on the
      platform amux optimises for first. */
+  /* THE CONTROL STRIP MUST NOT BLEED (AMUX-4050). Ethan's phone screenshot:
+     `crates/amux-` of a panicked-at path was unreadable because these controls
+     float over #peek-body (position:absolute; inset:0) at 0.85 alpha, so the
+     terminal text showed THROUGH them and neither the text nor the button was
+     legible. Two changes, and both are needed:
+
+       1. Opaque. At 0.85 the text behind is still visible and the result is
+          mush. A sticky control that hides what is under it is honest; one
+          that half-hides it is not readable either way.
+       2. #peek-body reserves the strip (padding-top below), so at rest the
+          first line of output starts BELOW the buttons rather than under them.
+
+     The pane auto-scrolls to the bottom, so the occluded zone is the top,
+     which is exactly where someone scrolled up to read old output is looking.
+     That is the case in the screenshot. */
   .peek-copy-btn {
     position: absolute; top: 6px; right: 6px; z-index: 10;
     height: 28px; border-radius: 6px; padding: 0 8px;
-    border: 1px solid rgba(255,255,255,0.15); background: rgba(13,17,23,0.85);
+    border: 1px solid rgba(255,255,255,0.15); background: #0d1117;
     color: var(--dim); font-size: 0.75rem; cursor: pointer;
     display: flex; align-items: center; gap: 4px;
     -webkit-tap-highlight-color: transparent; transition: all 0.15s;
@@ -826,7 +860,7 @@
   }
   .peek-agent-nav button {
     height: 28px; min-width: 32px; border-radius: 6px; padding: 0 6px;
-    border: 1px solid rgba(255,255,255,0.15); background: rgba(13,17,23,0.85);
+    border: 1px solid rgba(255,255,255,0.15); background: #0d1117;
     color: var(--dim); font-size: 0.78rem; cursor: pointer;
     -webkit-tap-highlight-color: transparent; transition: all 0.15s;
   }
@@ -2088,10 +2122,10 @@
   /* In-progress board issues for this worker: informational, so accent rather
      than a success/failure colour — it is a count, not a verdict. */
   .meta-count .mc-doing { color: var(--accent); font-weight: 700; }
-  /* Total board items: deliberately DIMMER than .mc-doing. Both sit in the same
-     bare-number row, and if the larger number (total is always >= doing) were
-     the brighter one it would read as the more urgent figure. Doing is what
-     wants attention. */
+  /* Todo is actionable but not running; later lifecycle states stay dimmer
+     than .mc-doing so the running count remains the most urgent figure. The
+     legacy class names remain for compatible themes; renderer-specific
+     mc-todo/mc-backlog classes make the status semantics explicit. */
   .meta-count .mc-active { color: var(--green, #4ade80); font-weight: 700; }
   .meta-count .mc-total { color: var(--dim); font-weight: 600; }
   /* Session card: scrollback cached on this device (readable with no signal). */
@@ -3536,6 +3570,13 @@
     background:var(--green,#3fb950); margin-right:5px; vertical-align:1px;
     animation: boardLivePulse 1.6s ease-in-out infinite;
   }
+  .board-card-live-label {
+    display:inline-flex; align-items:center; margin-left:8px; padding:1px 6px;
+    border-radius:8px; color:var(--green,#3fb950); background:rgba(63,185,80,0.12);
+    border:1px solid rgba(63,185,80,0.35); font-family:system-ui,sans-serif;
+    font-size:0.62rem; font-weight:700; letter-spacing:0; text-transform:none;
+  }
+  .board-card-live-label .board-live-dot { flex:0 0 auto; }
   @keyframes boardLivePulse { 0%,100% { opacity:1; } 50% { opacity:0.35; } }
   .board-card-live .board-card-session { color: var(--green,#3fb950); border-color: rgba(63,185,80,0.4); }
   .board-pin-btn {
@@ -3614,6 +3655,7 @@
       flex: 0 0 auto; min-width: auto; max-width: 40vw; padding: 4px 8px;
     }
     .board-col.col-collapsed .col-gate-btn,
+    .board-col.col-collapsed .col-more-btn,
     .board-col.col-collapsed .col-del-btn { display: none; }
     .board-col.col-collapsed .board-col-header {
       position: static; border-bottom: none; padding-bottom: 2px; margin-bottom: 0;
@@ -3720,6 +3762,38 @@
   .board-sortable-chosen { opacity: 0.7; box-shadow: none; }
   /* Drag = the floating clone following the pointer */
   .board-sortable-drag { opacity: 0.96; box-shadow: 0 14px 36px rgba(0,0,0,0.45); transform: rotate(1.2deg) scale(1.03); border-radius: 8px; }
+  /* Column actions (AMUX-4044) — the ellipsis beside Gate. Same restrained
+     weight as the gate button: it opens a menu, it does not act on its own.
+     A 44px minimum so it is a real tap target on a phone, matching the
+     css-mobile rule the gate button already follows. */
+  .col-more-btn {
+    background: none; border: 1px solid transparent; border-radius: 5px;
+    color: var(--dim); cursor: pointer; font-size: 0.95rem; line-height: 1;
+    padding: 2px 6px; opacity: 0.75;
+    transition: opacity 0.15s, color 0.15s, border-color 0.15s;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .col-more-btn:hover, .col-more-btn:active {
+    opacity: 1; color: var(--text); border-color: var(--border);
+  }
+  @media (max-width: 600px) {
+    .col-more-btn { min-width: 44px; min-height: 44px; }
+  }
+  /* Run-now on a system job (AMUX-4046). Quiet by default: this section is a
+     health view first, and the button must not compete with the status word
+     that says whether the job is alive. The disabled state stays visible
+     rather than hidden, so "cannot be run on demand" reads as a deliberate
+     refusal instead of a missing feature. */
+  .sysjob-run {
+    background: none; border: 1px solid var(--border); border-radius: 5px;
+    color: var(--dim); cursor: pointer; font-size: 0.7rem; padding: 2px 8px;
+    margin-right: 8px; line-height: 1.4; white-space: nowrap;
+    transition: color 0.15s, border-color 0.15s;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .sysjob-run:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+  .sysjob-run:disabled { opacity: 0.35; cursor: not-allowed; }
+  @media (max-width: 600px) { .sysjob-run { min-height: 44px; padding: 2px 12px; } }
   .col-del-btn {
     background: none; border: none; color: var(--dim); cursor: pointer; font-size: 0.75rem;
     padding: 0 2px; line-height: 1; opacity: 0.5; transition: opacity 0.15s, color 0.15s;
@@ -3761,6 +3835,28 @@
   .scope-tile-val { font-size:0.66rem; color:var(--dim);
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .scope-detail { border-top:1px solid var(--border); padding-top:7px; margin-top:2px; }
+  .worker-config-intro { color:var(--dim); font-size:0.7rem; line-height:1.45; margin:0 0 9px; }
+  .worker-config-grid { display:grid; grid-template-columns:minmax(0,1fr); gap:10px; margin-bottom:10px; }
+  .worker-config-section { border:1px solid var(--border); background:color-mix(in srgb, var(--card) 72%, transparent); border-radius:10px; overflow:hidden; min-width:0; }
+  .worker-config-section-head { padding:10px 11px 8px; background:color-mix(in srgb, var(--hover) 72%, transparent); border-bottom:1px solid var(--border); }
+  .worker-config-section-title { color:var(--text); font-size:0.78rem; font-weight:700; }
+  .worker-config-section-note { color:var(--dim); font-size:0.65rem; line-height:1.35; margin-top:2px; }
+  .worker-config-section-rows { padding:0 11px; }
+  .worker-config-row { display:flex; align-items:center; gap:8px; padding:9px 0; border-top:1px solid var(--border); }
+  .worker-config-row:first-child { border-top:0; }
+  .worker-config-copy { min-width:0; flex:1; }
+  .worker-config-label { color:var(--text); font-size:0.74rem; font-weight:600; }
+  .worker-config-note { color:var(--dim); font-size:0.66rem; line-height:1.35; overflow-wrap:anywhere; }
+  .worker-config-actions { display:flex; align-items:center; gap:5px; flex:0 0 auto; }
+  .worker-config-grid-board { margin-top:0; }
+  @media (min-width: 980px) {
+    #peek-scope-panel .worker-config-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    #peek-scope-panel .worker-config-grid-board { grid-template-columns:minmax(0,1fr); }
+  }
+  @media (max-width: 560px) {
+    .worker-config-row { align-items:flex-start; flex-direction:column; }
+    .worker-config-actions { width:100%; justify-content:flex-end; }
+  }
   @media (max-width: 600px) {
     .scope-tile { min-width:118px; padding:9px 10px; }
     .scope-tile-label { font-size:0.8rem; }

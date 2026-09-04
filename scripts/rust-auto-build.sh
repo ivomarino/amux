@@ -38,6 +38,7 @@ cleanup() {
     rm -rf "$WORK"
   fi
   [ -n "${BUILD_OUT:-}" ] && rm -f "$BUILD_OUT"
+  [ -n "${INSTALL_TMP:-}" ] && rm -f "$INSTALL_TMP"
   [ -n "${LOCK_HELD:-}" ] && rm -rf "$LOCK"
   return 0   # a falsey last test must not make the trap itself fail under set -e
 }
@@ -345,7 +346,28 @@ fi
       fi
       CAND_GB=$(du -sk "$cand" 2>/dev/null | awk '{print int($1/1048576)}')
       if [ "$cand" = "$HOME/.amux/rust-build-target" ]; then
-        echo "== DISK LOW: ${FREE_GB}GB free (< ${AMUX_BUILD_SACRIFICE_CACHE_BELOW_GB:-8}GB). Clearing the ${CAND_GB:-?}GB SHARED target dir — this build goes cold."
+        # AF-415: THIS ARM HAS NO PEER-BUILD GATE, AND THAT IS DELIBERATE.
+        #
+        # The debug-SIZE arm above defers while any rustc/cargo is running
+        # (AF-303, the vanished-rlib class). This one does not, and the
+        # asymmetry is easy to read as an oversight, so: AF-303's own reasoning
+        # covers it. "When disk IS low the override is automatic and needs no
+        # counter, because ENOSPC breaks every lane including the ones being
+        # protected." A peer build dies either way below this threshold; the
+        # difference is whether it dies with a diagnosable error or with the
+        # disk full.
+        #
+        # Do NOT add a peer check here without changing that argument. The
+        # ordering already does the cheap part — the idle e2e dir is cleared
+        # first, and the shared one only survives to this line when that was not
+        # enough.
+        #
+        # WHOSE BUILD GOES COLD: every lane's, not this builder's. That is worth
+        # saying in the log because the sentence used to read as if the cost
+        # landed on the process doing the clearing, and it was 11 firings of the
+        # 25GB-era version of this arm that produced the three mid-build failures
+        # in AMUX-2936 (see AF-416 for the full diagnosis).
+        echo "== DISK LOW: ${FREE_GB}GB free (< ${AMUX_BUILD_SACRIFICE_CACHE_BELOW_GB:-8}GB). Clearing the ${CAND_GB:-?}GB SHARED target dir — EVERY lane's next build goes cold, not just this one. No peer-build gate here on purpose: below this floor ENOSPC breaks them anyway (AF-415)."
       else
         echo "== DISK LOW: ${FREE_GB}GB free. Clearing the ${CAND_GB:-?}GB idle e2e target dir first (this build does not need it)."
       fi
@@ -429,14 +451,16 @@ fi
   # not wrong-looking" shape ethos rule 4 exists to catch.
   if [ "$BUILD_OK" = 1 ]; then
     tail -3 "$BUILD_OUT"
-    install -m 0755 "$HOME/.amux/rust-build-target/release/amux-server" "$INSTALL"
-    echo "$head" > "$STAMP"
-    # AEAB-50: only NOW is this true. Written after the install so the file means
-    # "what is installed" rather than "what was attempted". On the failure branch
-    # below it is left alone, so it keeps naming the last good build — which is
-    # exactly what that branch says is still running.
-    printf '%s\n' "$PROV_JSON" > "$PROV_FILE" 2>/dev/null || true
-    echo "== installed; running server will self-adopt within 5s"
+    # Build the complete replacement beside the live executable, including its
+    # final signature, and expose it with ONE atomic rename. `install` used to
+    # truncate the executable that the running server was watching and then
+    # `codesign` changed it a second time. On macOS that creates a real interval
+    # where the path names an invalid/partially-signed program. The self-adopter
+    # can observe that interval, fail its exec, exit, and leave launchd stuck at
+    # EX_CONFIG until somebody manually re-registers the agent. From a phone the
+    # symptom is simply that the canonical Tailscale URL stays offline.
+    INSTALL_TMP="${INSTALL}.new.$$"
+    install -m 0755 "$HOME/.amux/rust-build-target/release/amux-server" "$INSTALL_TMP"
     # STABLE CODE IDENTITY, or say why there is not one (AMUX-3527).
     #
     # cargo/rustc emit a LINKER-SIGNED ADHOC binary: `Signature=adhoc`,
@@ -459,11 +483,9 @@ fi
     #
     # Signing is OPT-IN and silent-by-absence on purpose: this script is the
     # deploy path for the whole fleet, so the change must be incapable of
-    # stopping an install. Every command below is guarded, it runs AFTER the
-    # stamp is written and the success line is printed, and with no identity
-    # present the behaviour is byte-for-byte what it was — plus one line saying
-    # so, because "adhoc, and that is why the prompt is back" is precisely the
-    # fact that was nowhere in any log while the prompt fired daily for weeks.
+    # stopping an install. Every signing command below is guarded; with no
+    # identity present the completed temp binary is atomically installed
+    # unchanged, plus one line saying why it remains ad-hoc signed.
     #
     # Creating the identity is a KEYCHAIN action and therefore the human's:
     #   Keychain Access ▸ Certificate Assistant ▸ Create a Certificate…
@@ -482,7 +504,7 @@ fi
         # signing would look like it was working. Pinned, both copies came back
         # `com.amux.server-rs` regardless of filename or content.
         if codesign --force --sign "$CS_ID" --identifier com.amux.server-rs \
-                    --timestamp=none "$INSTALL" 2>&1; then
+                    --timestamp=none "$INSTALL_TMP" 2>&1; then
           echo "== signed as '$CS_ID' — TCC approvals survive this rebuild"
         else
           echo "== WARN codesign as '$CS_ID' FAILED; binary stays adhoc and macOS will re-prompt"
@@ -493,6 +515,15 @@ fi
              "Create the identity (see AMUX-3527) or set AMUX_CODESIGN_IDENTITY."
       fi
     fi
+    mv -f "$INSTALL_TMP" "$INSTALL"
+    INSTALL_TMP=""
+    echo "$head" > "$STAMP"
+    # AEAB-50: only NOW is this true. Written after the atomic install so the
+    # file means "what is installed" rather than "what was attempted". On the
+    # failure branch below it is left alone, so it keeps naming the last good
+    # build — which is exactly what that branch says is still running.
+    printf '%s\n' "$PROV_JSON" > "$PROV_FILE" 2>/dev/null || true
+    echo "== installed atomically; running server will self-adopt within 5s"
   else
     echo "== BUILD FAILED for $head — running server keeps the last good build"
     echo "-- diagnostics (every error, with context) ---------------------------"

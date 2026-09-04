@@ -270,6 +270,67 @@ async fn git_out(dir: &str, args: &[&str]) -> Option<String> {
 /// Deliberately the NEWEST commit and not merely "any commit of theirs": if a
 /// peer has committed this path since, the owner's bytes may have been changed
 /// or reverted by that commit, and only the owner can judge it.
+/// Has this session EVER written this path, by commit trailer? (AF-420, porting
+/// MC-1561 from the local hook.)
+///
+/// The mirror notice tells a lane their WORK may be lost under someone else's
+/// commit. That claim needs the lane to have authored something here, and the
+/// only input behind it is an edit record — which on a shared cwd records
+/// whoever was ACTIVE, not whoever WROTE. mixpeek-general received the full
+/// alarm about a tubescience iconik daily tick they had never opened.
+///
+/// The exact answer is already on every commit, and the local hook has asked it
+/// since MC-1561 (`_never_wrote`). This is the same question, server-side.
+///
+/// THREE ANSWERS, and the middle one is why this returns Option<bool>.
+/// `Some(true)` means the path has trailer-attributed history and none of it is
+/// theirs. `Some(false)` means some of it is. `None` means the question could
+/// not be asked — no history, or history carrying no trailers at all — and that
+/// must NOT read as "they never wrote it", or every repo that does not use
+/// trailers would silently suppress every notice.
+async fn owner_never_wrote(dir: &str, path: &str, owner: &str) -> Option<bool> {
+    if owner.trim().is_empty() {
+        return None;
+    }
+    // HEAD ALONE IS THE WRONG HISTORY, and the existing AMUX-3445 fixture caught
+    // this before it shipped. `git log` defaults to HEAD, and on a graft-push
+    // checkout a lane's own commits live ONLY on origin/main — local HEAD never
+    // advances. Asking HEAD-only therefore reports the lane as a non-writer of a
+    // path they landed themselves, which is the same defect AF-421 had one
+    // function away: a HEAD-relative question on a checkout whose HEAD is
+    // permanently behind.
+    //
+    // Both refs, falling back to HEAD alone when there is no origin/main (a
+    // fresh clone, a test fixture, the cloud image). `git_out` is None on
+    // nonzero exit, so the fallback is what runs when the ref is missing.
+    let out = match git_out(
+        dir,
+        &["log", "-n", "200", "--format=%(trailers:key=Amux-Session,valueonly,separator=,)",
+          "HEAD", "origin/main", "--", path],
+    )
+    .await
+    {
+        Some(o) => o,
+        None => {
+            git_out(
+                dir,
+                &["log", "-n", "200",
+                  "--format=%(trailers:key=Amux-Session,valueonly,separator=,)", "--", path],
+            )
+            .await?
+        }
+    };
+    let attributed: Vec<&str> =
+        out.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if attributed.is_empty() {
+        return None; // no history, or none of it carries a trailer
+    }
+    let wrote = attributed
+        .iter()
+        .any(|l| l.split(',').map(str::trim).any(|w| w == owner));
+    Some(!wrote)
+}
+
 async fn owner_owns_newest_commit(dir: &str, path: &str, owner: &str) -> Option<String> {
     let out = git_out(
         dir,
@@ -291,6 +352,27 @@ pub(crate) async fn owner_committed_since(
     owner: &str,
     edit_age_secs: i64,
 ) -> Option<String> {
+    // A DIRECTION ASSERTION, not a validation (AF-439).
+    //
+    // `dir` and `path` are both `&str` and both plausible, so swapping them
+    // compiles and runs: `git -C <path> log -- <dir>` fails, this returns None,
+    // and the caller reads that as "the owner has not committed" — settled work
+    // reported as unsettled, silently, with no error anywhere.
+    //
+    // Found by `scripts/mutate.sh seams` on its first real run: the swap at
+    // commit_nudge.rs:1447 compiled and passed the whole suite. This function
+    // HAS a test; the call site's argument ORDER had nothing, which is the
+    // seven-instance class this assertion exists to close (mvs-pitr's framing:
+    // a missing DIRECTION, invisible from either side alone).
+    //
+    // At the boundary rather than per call site, so it covers every caller
+    // including ones not yet written, and `debug_assert` so it costs nothing in
+    // release while failing loudly in every test that gets the order wrong.
+    debug_assert!(
+        std::path::Path::new(dir).is_dir(),
+        "owner_committed_since: `dir` must be a directory, got {dir:?} \
+         (arguments swapped with `path`? — AF-439)"
+    );
     let out = git_out(
         dir,
         &["log", "-8", "--format=%h%x09%ct%x09%(trailers:key=Amux-Session,valueonly,separator=)", "--", path],
@@ -342,10 +424,55 @@ pub(crate) enum PathFate {
     /// byte-identical no-ops). Nothing identical to origin can be absorbed or
     /// reverted; carries origin's newest sha on the path for the receipt.
     LandedOnOrigin(String),
+    /// AF-420: the path is genuinely dirty, but this lane has NEVER written it —
+    /// the path carries trailer-attributed history and none of it is theirs. The
+    /// edit record behind the notice is activity in a shared cwd, not authorship,
+    /// so there is no work of theirs to lose. Carries the sessions that HAVE
+    /// written it, because "not yours" is only actionable beside "theirs".
+    ///
+    /// DOWNGRADE, NOT SUPPRESSION. The file is still named and the dirt is still
+    /// real; what goes is the claim that the reader's reasoning is at stake.
+    NotTheirWork(Vec<String>),
     /// The path differs from HEAD and the owner has no commit for it: the work
     /// is genuinely uncommitted and a sweep would take it. This is the state
     /// the AC-355 block exists to prevent.
     AtRisk,
+}
+
+/// AF-422: which closing line does this notice deserve?
+///
+/// "COMMITTED BY YOU" IS A DIFFERENT CLAIM FROM "NOT AT RISK", and the footer
+/// conflated them. `all_settled` is `n_at_risk == 0`, which `AbsorbedBy`,
+/// `LandedOnOrigin` and `NotTheirWork` all satisfy — and every one of those
+/// means committed by SOMEBODY ELSE, or not the reader's at all. So a set of
+/// purely-absorbed paths closed with "EVERY path above is already committed by
+/// you", asserting the reader's authorship from the same mtime evidence that
+/// produced the alarm this sentence was added to soften.
+///
+/// Reported by mixpeek-general 2026-09-02 on
+/// server/infra/gke/chart/templates/_helpers.tpl, whose history holds zero of
+/// their commits: "the heuristic added to soften the false alarm asserts
+/// authorship on the same mtime evidence that produced the false alarm, and
+/// inherits the same defect one level down."
+///
+/// Pure, because the wording is the product here and the branch it sits in is a
+/// 60-line async block nothing could reach — the same reason `victim_path_line`
+/// below was pulled out.
+pub(crate) fn victim_verdict(all_settled: bool, all_mine: bool) -> &'static str {
+    if all_settled && all_mine {
+        "\n\nEVERY path above is already committed by you, so this is almost certainly \
+         noise — the notice fires on EDIT RECORDS and cannot tell \"edited and committed\" \
+         from \"edited and staged\" on its own. Kept rather than suppressed because a \
+         false alarm costs you a glance and a missed one costs work."
+    } else if all_settled {
+        "\n\nNothing above is at risk, but they are NOT all yours — some were committed by \
+         another session, landed on origin, or carry no commit of yours at all, and each \
+         line above says which. The notice fires on EDIT RECORDS, and an edit record is not \
+         authorship on a shared checkout. Nothing here needs reconciling."
+    } else {
+        "\n\nAt least one path has no commit of yours since the edit — that is the one to \
+         reconcile."
+    }
 }
 
 /// The victim notice's per-path line, pure so the wording is testable
@@ -354,7 +481,40 @@ pub(crate) enum PathFate {
 /// authored content — "your WORK is at risk" plus "record your reasoning"
 /// operated on an empty set, and the reader had to disprove the warning by
 /// hand. Say what the record actually was.
-pub(crate) fn victim_path_line(pth: &str, fate: &PathFate, provenance: &str) -> (String, bool) {
+/// The two flags the mirror notice's footer rests on, derived from the fates
+/// and nothing else.
+///
+/// EXTRACTED SO THEY CAN BE PINNED (AF-422). Both lived inline at the emitter,
+/// and `scripts/mutate.sh survey` found both SURVIVING the whole `git_guard`
+/// suite: `n_at_risk == 0` flipped to `>= 0` (so every notice claims everything
+/// is settled, deleting the loud arm entirely) and `all_mine`'s `.all()` flipped
+/// to `.any()` (so one settled path among ten absorbed ones restores the exact
+/// possessive this card was filed to remove). The card's own acceptance
+/// criterion asked for both arms, and only the quiet one was held.
+///
+/// `all_settled` and `all_mine` are DIFFERENT CLAIMS and the footer conflated
+/// them once already: AbsorbedBy, LandedOnOrigin and NotTheirWork all satisfy
+/// "nothing at risk" and every one of them means committed by somebody else, or
+/// not yours at all. Only SettledByOwner supports the possessive.
+///
+/// Takes the per-path `at_risk` flags the emitter already computed rather than
+/// re-deriving them: `victim_path_line` decides at-risk from the fate AND the
+/// provenance (a `restore` touch is downgraded), so recomputing it here from
+/// the fate alone would be a second, quietly different implementation of the
+/// question — which is the drift this card is about, one layer down.
+pub(crate) fn victim_flags(fates: &[PathFate], at_risk: &[bool]) -> (bool, bool) {
+    let all_settled = !at_risk.iter().any(|r| *r);
+    let all_mine = !fates.is_empty()
+        && fates.iter().all(|f| matches!(f, PathFate::SettledByOwner(_)));
+    (all_settled, all_mine)
+}
+
+pub(crate) fn victim_path_line(
+    pth: &str,
+    fate: &PathFate,
+    provenance: &str,
+    owner: &str,
+) -> (String, bool) {
     match fate {
         PathFate::SettledByOwner(sha) => {
             (format!("  {pth}  — already committed by you in {sha}; nothing at risk"), false)
@@ -364,6 +524,98 @@ pub(crate) fn victim_path_line(pth: &str, fate: &PathFate, provenance: &str) -> 
         // point at the card, do not send anyone hunting for lost work.
         // Reporting this as at-risk is what cries wolf on every absorption
         // that went fine.
+        // AF-422: THE ABSORPTION ARM NEVER INHERITED THE PROVENANCE BRANCH the
+        // at-risk arms below have had since AMUX-3778 and MG-1484.
+        //
+        // "your CODE is safe, record the REASONING on the card" presumes the
+        // reader HAD reasoning here. That holds when their claim is a recorded
+        // write; it does not when the claim is a cwd mtime or a restore, and
+        // then the sentence sends them to document work that never existed.
+        //
+        // Reported by mixpeek-general 2026-09-02, who received BOTH forms from
+        // this emitter within an hour: the at-risk arm on one file correctly
+        // said "your claim here is OBSERVED (a file mtime moved during one of
+        // your Bash commands), not a recorded edit", and the absorption arm on
+        // server/infra/gke/chart/templates/_helpers.tpl said "absorbed into
+        // 3cb19fde1b under byo-ray" and nothing else. Their case was
+        // `mine_provenance == "observed"`. The value was reaching the mirror;
+        // this arm was not reading it.
+        //
+        // WHY THE OBVIOUS FIX IS WRONG, recorded so nobody re-derives it:
+        // gating this on `owner_never_wrote` (AF-420's check, which the report
+        // originally asked for) deletes the signal. Real absorption means the
+        // victim's UNCOMMITTED work was swept into someone else's commit, so
+        // they legitimately have no commit on the path — the check returns true
+        // for exactly the case this arm exists to report. Commit history cannot
+        // separate the two; provenance can, because a real absorption is
+        // transcript-backed and an mtime echo is not.
+        //
+        // Still not at-risk (`false`) in every arm: absorption is not lost work,
+        // and that was never the defect. Only the claim about whose reasoning is
+        // stranded changes.
+        PathFate::AbsorbedBy(sha, who) if provenance == "restore" => (
+            format!(
+                "  {pth}  — absorbed into {sha} under `{who}`. Your only recorded touch here \
+                 is a RESTORE from a committed ref (no authored content of yours; MG-1484), \
+                 so there is no reasoning of yours to record"
+            ),
+            false,
+        ),
+        // ANSWER THE QUESTION INSTEAD OF ASSIGNING IT (mixpeek-cicd, 2026-09-03).
+        //
+        // They received this three times in one day, on three different shas,
+        // all peers' one-line appends to FRUSTRATIONS.md, and resolved every
+        // one the same way: run `git log`, read the Amux-Session trailer, see a
+        // peer's name, conclude not mine. Zero reconciled. Their point is that
+        // the notice ALREADY HAS that answer — `who` is read from the commit's
+        // Amux-Session trailer in `path_fate` (:793), not from the mtime that
+        // produced the claim — so it was asking the reader to re-derive
+        // something it had already computed. A true-negative that still costs a
+        // command is one people learn to skim, and skimming is what breaks it on
+        // the day the answer is different.
+        //
+        // I DID NOT TAKE THEIR PROPOSED WORDING. They suggested "almost
+        // certainly not yours; nothing to do", and flagged the case it must not
+        // swallow: a genuine absorption where a peer's `git add` sweeps in a
+        // file the recipient actually wrote. They reasoned that `observed`
+        // provenance excludes it, because observed means no recorded edit.
+        //
+        // It does not exclude it. `observed` is exactly what a Bash-authored
+        // edit produces — the AF-123 hook pair exists to catch writes that never
+        // go through the Edit tool — and `cat >> FRUSTRATIONS.md <<EOF` is the
+        // NORMAL way that particular file gets written on this fleet. So for the
+        // very file that prompted the report, "observed" is as consistent with
+        // "you wrote it in a shell" as with "a peer wrote it under your cwd".
+        //
+        // So: state both facts and name the ONE condition that separates them,
+        // which the reader can answer from memory in a beat rather than from
+        // `git log`. That keeps the cost at zero in the common case without
+        // asserting a conclusion the evidence does not carry.
+        PathFate::AbsorbedBy(sha, who)
+            if provenance == "observed" && who != owner && who != "(untrailered)" =>
+        {
+            (
+                format!(
+                    "  {pth}  — committed by `{who}`, per the Amux-Session trailer on {sha}, not \
+                     by you. Your only claim on this path is an OBSERVED mtime, which a peer \
+                     writing under your cwd produces identically. NOT YOURS unless you wrote it \
+                     through a shell command (a heredoc append leaves exactly this record) — if \
+                     you did, your content is in {sha} under their name and the reasoning is \
+                     worth putting on the card. If you did not, there is nothing to do here."
+                ),
+                false,
+            )
+        }
+        PathFate::AbsorbedBy(sha, who) if provenance == "observed" => (
+            format!(
+                "  {pth}  — absorbed into {sha} under `{who}`; your CODE is safe. NOTE: your \
+                 claim here is OBSERVED (a file mtime moved during one of your Bash commands), \
+                 not a recorded edit — on a shared checkout a peer writing under your cwd looks \
+                 identical from here. Check whether you actually wrote this before recording \
+                 reasoning for it"
+            ),
+            false,
+        ),
         PathFate::AbsorbedBy(sha, who) => (
             format!(
                 "  {pth}  — absorbed into {sha} under `{who}`; your CODE is safe, \
@@ -382,6 +634,26 @@ pub(crate) fn victim_path_line(pth: &str, fate: &PathFate, provenance: &str) -> 
             ),
             false,
         ),
+        // AF-420: named, not accused. The dirt is real and the file is still
+        // printed; what is dropped is the claim that THEIR reasoning is at
+        // stake, which is the sentence that makes a careful lane stop and
+        // verify. `counts_as_at_risk` is false — this must not inflate the
+        // count the notice leads with.
+        PathFate::NotTheirWork(writers) => {
+            let who = if writers.is_empty() {
+                String::new()
+            } else {
+                format!(" (written here by {})", writers.join(", "))
+            };
+            (
+                format!(
+                    "  {pth}  — dirty, but you have no commit to this path{who}; the record \
+                     behind this notice is activity in a shared checkout, not authorship, so \
+                     none of your work is in it (MC-1561)"
+                ),
+                false,
+            )
+        }
         PathFate::AtRisk if provenance == "restore" => (
             format!(
                 "  {pth}  — your only recorded touch here is a RESTORE from a committed ref \
@@ -487,10 +759,49 @@ pub(crate) async fn path_fate(
         // talks the victim out of checking while the pending commit would
         // revert their landed lines). Worktree-clean AND index-clean against
         // origin, or it stays AtRisk.
-        if git_out(dir, &["diff", "--quiet", "origin/main", "--", path]).await.is_some()
-            && git_out(dir, &["diff", "--quiet", "--cached", "origin/main", "--", path])
+        // AF-421: THE INDEX CONDITION ONLY BITES WHEN THE PATH IS STAGED.
+        //
+        // The index guard above is right about its hazard and wrong about its
+        // scope. It exists because the commit takes the STAGED blob, so an index
+        // holding a pre-graft copy would revert landed lines while the receipt
+        // talked the victim out of checking. That hazard needs the path to be IN
+        // the pending commit. For an UNSTAGED path the index simply mirrors
+        // local HEAD — nothing will be committed for it, and there is nothing to
+        // revert.
+        //
+        // And local HEAD is exactly what never advances on a graft-push
+        // checkout, which is the checkout class AMUX-3445 added this rescue FOR.
+        // So `index == origin/main` is structurally unsatisfiable there for
+        // every path the lane has not staged, and the rescue could not fire on
+        // the lanes it was written for.
+        //
+        // MEASURED on the mirror checkout, 2026-09-02, reported by
+        // mixpeek-general:
+        //     276  paths dirty vs local HEAD
+        //     181  worktree byte-identical to origin/main (landed)
+        //       5  reached LandedOnOrigin
+        //     176  landed, NOT STAGED AT ALL, reported "your WORK is at risk"
+        // Their specimen, customers/tubescience/archived/2026-07-07-iconik-sync-
+        // evidence.md: worktree and origin/main both bdf5759be7, index and local
+        // HEAD both d3c6f395b0. Cond1 passes, cond2 fails, and the file is one
+        // they had never opened.
+        //
+        // THE LOUD DIRECTION IS STILL THE DEFAULT. A staged path must still
+        // match origin on BOTH trees, so backend's amendment specimen — worktree
+        // == origin while the index held a pre-graft copy 44 lines behind —
+        // stays AtRisk exactly as before.
+        //
+        // `git diff --cached --quiet HEAD` exits nonzero when there IS a staged
+        // change, and `git_out` is None on nonzero exit, so `is_none()` reads as
+        // "this path is staged".
+        let path_is_staged =
+            git_out(dir, &["diff", "--cached", "--quiet", "HEAD", "--", path]).await.is_none();
+        let index_ok = !path_is_staged
+            || git_out(dir, &["diff", "--quiet", "--cached", "origin/main", "--", path])
                 .await
-                .is_some()
+                .is_some();
+        if git_out(dir, &["diff", "--quiet", "origin/main", "--", path]).await.is_some()
+            && index_ok
         {
             let sha = git_out(dir, &["log", "origin/main", "-1", "--format=%h", "--", path])
                 .await
@@ -498,6 +809,32 @@ pub(crate) async fn path_fate(
                 .trim()
                 .to_string();
             return PathFate::LandedOnOrigin(sha);
+        }
+        // AF-420: before claiming their WORK is at risk, ask whether they have
+        // ever written this path. `Some(true)` means the path HAS
+        // trailer-attributed history and none of it is theirs — a reader, not an
+        // author. `None` (no history, or none carrying trailers) falls through
+        // to AtRisk, because "could not ask" must never read as "never wrote".
+        if let Some(true) = owner_never_wrote(dir, path, owner).await {
+            let writers = git_out(
+                dir,
+                &["log", "-n", "50", "--format=%(trailers:key=Amux-Session,valueonly,separator=,)", "--", path],
+            )
+            .await
+            .map(|o| {
+                let mut v: Vec<String> = o
+                    .lines()
+                    .flat_map(|l| l.split(','))
+                    .map(|w| w.trim().to_string())
+                    .filter(|w| !w.is_empty())
+                    .collect();
+                v.sort();
+                v.dedup();
+                v.truncate(3);
+                v
+            })
+            .unwrap_or_default();
+            return PathFate::NotTheirWork(writers);
         }
         return PathFate::AtRisk;
     }
@@ -1420,6 +1757,39 @@ pub(crate) fn inferred_warn_fields(
     (r(base), r(verb), r(blocked_by))
 }
 
+/// The verdict the WARN can actually support for a `blocked_by` token (AF-452).
+///
+/// Extracted from the log site so the arms can be tested. They could not be
+/// before, and the first one was wrong for its whole life.
+///
+/// THE ORDER IS LOAD-BEARING. `first_blocking_verb` `continue`s on a real git
+/// read subcommand, so a genuine `git status` can NEVER reach this field. A
+/// BARE `status`/`show`/`log`/`blame` token therefore proves the OPPOSITE of
+/// what it looks like: it came from quoted DATA tokenised as shell, not from a
+/// git invocation. `is_known_read_verb` consults GIT_READ_SUBCMDS and so reads
+/// it as a genuine read, which is the upgrade that manufactured the lie.
+///
+/// Measured 2026-09-03 over 75,758 firings: all 17 `verdict=READ verb` rows
+/// ever emitted were this artifact (`blocked_by=status`, on two mixpeek lanes),
+/// and each told its reader it was the specimen AMUX-2841 had been parked on
+/// since 2026-08-11. Zero real specimens. Same class as AMUX-3822 — quoted data
+/// read as shell — arriving through a quoted string instead of a heredoc.
+fn inferred_edit_verdict(blocked_by: &str) -> &'static str {
+    if GIT_READ_SUBCMDS.contains(&blocked_by) {
+        "a BARE git read subcommand — impossible from a real git invocation, which \
+         first_blocking_verb skips, so this token came from QUOTED DATA tokenised as \
+         shell. NOT a specimen; it is AMUX-3822's defect through a quoted string (AF-452)"
+    } else if is_known_read_verb(blocked_by) {
+        "READ verb — is_pure_read_command missed a reader, so this record may be minting \
+         FALSE co-authorship. This is the specimen AMUX-2841 wants"
+    } else if blocked_by == "redirect" {
+        "output redirection — a write, the record working as designed"
+    } else {
+        "NOT a known read verb, and not classifiable from this token alone — treat as \
+         unmeasured rather than as a write (AMUX-3822)"
+    }
+}
+
 fn warn_inferred_edit(session: &str, abs_path: &str, cmd: &str) {
     // Same stripper as `first_blocking_verb` (AMUX-3822): this extractor had
     // the identical defect and produced `verb=persona_tick.json`, a filename.
@@ -1458,15 +1828,7 @@ fn warn_inferred_edit(session: &str, abs_path: &str, cmd: &str) {
     // third answer and must stay distinguishable from both others: it means the
     // token is in neither vocabulary, so this row cannot be classified and is
     // not evidence either way.
-    let verdict = if is_known_read_verb(&blocked_by) {
-        "READ verb — is_pure_read_command missed a reader, so this record may be minting \
-         FALSE co-authorship. This is the specimen AMUX-2841 wants"
-    } else if blocked_by == "redirect" {
-        "output redirection — a write, the record working as designed"
-    } else {
-        "NOT a known read verb, and not classifiable from this token alone — treat as \
-         unmeasured rather than as a write (AMUX-3822)"
-    };
+    let verdict = inferred_edit_verdict(&blocked_by);
     // AF-343: `verb`, `blocked_by` and `base` are TOKENS LIFTED OUT OF A BASH
     // COMMAND, so anything a lane typed can reach this line, and this line goes
     // to a file. Measured before the fix: 192 live-looking `mxp_sk_` secrets in
@@ -2073,11 +2435,40 @@ fn split_risk(paths: &[(String, String)], inp: &GuardInputs, v: &mut Verdict) {
             continue;
         }
         left.sort();
-        v.split_risk.push(json!({
-            "owner": owner,
-            "staged": staged_rels,
-            "left_dirty": left,
-            "why": format!(
+        // AF-414: IS THIS OWNERSHIP CLAIM AUTHORSHIP, OR AN MTIME?
+        //
+        // `inp.theirs` is satisfied by an MTIME. `apply_observed` inserts into
+        // `theirs_firsthand` at firsthand rank deliberately, so on a shared
+        // checkout a peer's Bash window catches nearly every actively-edited
+        // path. `peer_authored_content` is the discriminator this file already
+        // built for exactly this distinction, and its docstring records that
+        // AF-342 shipped reading `theirs`, stayed INERT FOR A FULL RELEASE for
+        // this reason, and has a test refusing a mutation that puts `theirs`
+        // back. split_risk was never migrated.
+        //
+        // MEASURED ON ITSELF, 2026-09-02. Committing a frustrations.md entry,
+        // this warning announced "amux's work is being cut in half" and named
+        // invariants/checks.rs and invariants/monitor.rs as "THEIR files". Both
+        // were mine: 368 insertions, 0 deletions, every added item written
+        // minutes earlier in that session. The prescribed remedy, "confirm with
+        // them", would have sent me to a peer about my own code.
+        //
+        // BOTH SIDES, because the hazard is a symbol split ACROSS them. Their
+        // authored content in the staged half with only an mtime on the left
+        // half is not a split of their work, and neither is the reverse.
+        let staged_authored = paths
+            .iter()
+            .any(|(rel, ap)| staged_rels.contains(&rel) && peer_authored_content(inp, ap));
+        let left_authored = left.iter().any(|p| peer_authored_content(inp, p));
+        let authored = staged_authored && left_authored;
+        // DOWNGRADE, NEVER SUPPRESS. The BUILD hazard is real whoever owns the
+        // bytes — those files genuinely are dirty and genuinely not in this
+        // commit — so the warning stays and only the possessive goes. That is
+        // also what the hook's own renderer docstring has always said this is:
+        // "a warning about a BUILD, not an assertion that the staged bytes are
+        // somebody else's".
+        let why = if authored {
+            format!(
                 "you are committing {} — which '{owner}' co-edited — while {} of THEIR files \
                  are dirty and NOT in this commit. A symbol added on one side may be missing \
                  from the other, so this commit can fail to build even though your tree \
@@ -2087,7 +2478,27 @@ fn split_risk(paths: &[(String, String)], inp: &GuardInputs, v: &mut Verdict) {
                  yours (`git add -p`), or confirm with them.",
                 staged_rels.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
                 left.len()
-            ),
+            )
+        } else {
+            format!(
+                "you are committing {} while {} other file(s) below are dirty and NOT in this \
+                 commit. A symbol added on one side may be missing from the other, so this \
+                 commit can fail to build even though your tree compiles: nothing here builds \
+                 the COMMIT, only the TREE. The only record linking these paths to '{owner}' \
+                 is an mtime, which on a shared checkout is routinely an echo of YOUR OWN \
+                 write caught in their Bash window — so this names the files and stops there \
+                 rather than calling them that lane's work. Check the paths; do not go ask \
+                 '{owner}' on the strength of this line.",
+                staged_rels.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+                left.len()
+            )
+        };
+        v.split_risk.push(json!({
+            "owner": owner,
+            "authored": authored,
+            "staged": staged_rels,
+            "left_dirty": left,
+            "why": why,
         }));
     }
 }
@@ -2889,16 +3300,36 @@ pub async fn staged_guard_inner(
                 // committed" from "edited and still staged" — so it used to hand the
                 // recipient a `git log` to run every time. Now it runs it for them.
                 let mut lines: Vec<String> = Vec::new();
+                let mut fates: Vec<PathFate> = Vec::new();
                 let mut n_at_risk = 0usize;
+                let mut risk_flags: Vec<bool> = Vec::new();
                 for (pth, age, prov) in paths.iter().take(10) {
                     let fate = path_fate(&wd, pth, &owner, *age, prov).await;
-                    let (line, at_risk) = victim_path_line(pth, &fate, prov);
+                    let (line, at_risk) = victim_path_line(pth, &fate, prov, &owner);
                     if at_risk {
                         n_at_risk += 1;
                     }
+                    risk_flags.push(at_risk);
                     lines.push(line);
+                    fates.push(fate);
                 }
-                let all_settled = n_at_risk == 0;
+                // AF-422: derived by `victim_flags` so the two claims are
+                // testable apart from the async emitter. `n_at_risk` stays as
+                // the LOGGED count; the verdict reads the pure function.
+                let _ = n_at_risk;
+                // AF-422: "COMMITTED BY YOU" IS A DIFFERENT CLAIM FROM "NOT AT
+                // RISK", and this footer conflated them. `all_settled` is
+                // `n_at_risk == 0`, which AbsorbedBy, LandedOnOrigin and
+                // NotTheirWork all satisfy — and every one of those means
+                // committed by SOMEBODY ELSE, or not yours at all. So a set of
+                // purely-absorbed paths produced "EVERY path above is already
+                // committed by you", asserting the reader's authorship from the
+                // same mtime evidence that produced the alarm it was written to
+                // soften. Reported by mixpeek-general on a file whose history
+                // holds zero of their commits.
+                //
+                // Only SettledByOwner supports the possessive.
+                let (all_settled, all_mine) = victim_flags(&fates, &risk_flags);
                 // AF-130: the victim notice was delivered as a session message
                 // and NEVER logged, so `grep -c 'WORK ITSELF is at risk'`
                 // returned 0 across the whole retained window — nobody could
@@ -2922,15 +3353,7 @@ pub async fn staged_guard_inner(
                 }
                 let list = lines.join("\n");
                 let more = paths.len().saturating_sub(10);
-                let verdict = if all_settled {
-                    "\n\nEVERY path above is already committed by you, so this is almost certainly \
-                     noise — the notice fires on EDIT RECORDS and cannot tell \"edited and committed\" \
-                     from \"edited and staged\" on its own. Kept rather than suppressed because a \
-                     false alarm costs you a glance and a missed one costs work."
-                } else {
-                    "\n\nAt least one path has no commit of yours since the edit — that is the one to \
-                     reconcile."
-                };
+                let verdict = victim_verdict(all_settled, all_mine);
                 let text = format!(
                     "[amux staged-guard] Session `{}` is committing in {} and the staged set \
                      includes {} file(s) whose edit records are YOURS:\n{}{}\n\n\
@@ -3363,14 +3786,33 @@ mod tests {
         let graft = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout).unwrap().trim().to_string();
         git(&["update-ref", "refs/remotes/origin/main", &graft]);
         git(&["reset", "-q", "--hard", &base]);
+        // AF-421: THE TRAP ARM NOW STAGES, because backend's real case did.
+        //
+        // This arm used to rely on `reset --hard` leaving the index at v1 and
+        // call that "the pre-graft blob". It is — but it is there because
+        // NOTHING IS STAGED, not because anyone staged a stale copy, and those
+        // two are different states that `--cached vs origin` cannot separate.
+        // The amendment's own commit message (33b92a51) says which one backend
+        // measured: "worktree == origin while the STAGED blob sat 44 lines
+        // behind (a pre-graft copy) ... the commit takes the STAGED blob".
+        //
+        // The unstaged reading made this arm assert a hazard that no commit
+        // shape can produce. `git commit` omits an unstaged path; `git commit
+        // -a` stages the worktree, which IS origin's content; and graft-push
+        // builds a PRIVATE index (`GIT_INDEX_FILE`, `read-tree origin/main`)
+        // taking each named path's blob from the COMMIT via
+        // `git rev-parse "$SHA:$p"` — it never reads the shared index at all.
+        // Verified in mixpeek's scripts/graft-push.sh; the leg-13 comment there
+        // states the same property, which is why a peer's WIP cannot reach
+        // origin. Reported by mixpeek-general, whose checkout had 176 landed,
+        // unstaged paths reading "your WORK is at risk" against 5 receipts.
+        //
+        // So: stage a blob that differs from BOTH head and origin, which is
+        // backend's measured state, and the trap keeps biting exactly where the
+        // amendment intended.
+        std::fs::write(dir.path().join("grafted.txt"), "pre-graft copy, 44 lines behind\n").unwrap();
+        git(&["add", "grafted.txt"]);
         std::fs::write(dir.path().join("grafted.txt"), "landed v2\n").unwrap();
-        // backend's amendment, THE TRAP ARM: worktree == origin bytes but the
-        // INDEX still holds the pre-graft blob (reset --hard left it at v1).
-        // The commit takes the staged blob, so committing HERE would revert
-        // the landed lines — a receipt on this state talks the victim out of
-        // checking. Must stay AtRisk. (The first fix's own fixture sat in
-        // exactly this state and asserted the receipt, which is the proof the
-        // amendment was needed.)
         assert_eq!(
             path_fate(&d, "grafted.txt", "backend", 3600, "firsthand").await,
             PathFate::AtRisk,
@@ -3388,6 +3830,392 @@ mod tests {
         // at-risk case, and it must stay loud.
         std::fs::write(dir.path().join("grafted.txt"), "novel v3, uncommitted\n").unwrap();
         assert_eq!(path_fate(&d, "grafted.txt", "backend", 0, "firsthand").await, PathFate::AtRisk);
+    }
+
+    /// AF-444, reported by mixpeek-cicd: answer the question instead of
+    /// assigning it.
+    ///
+    /// They got the hedged absorption notice three times in one day on three
+    /// different shas, all peers' appends to FRUSTRATIONS.md, and cleared each
+    /// one by running `git log`, reading the Amux-Session trailer, and seeing a
+    /// peer's name. The notice already HAD that name — `who` comes from the
+    /// trailer, not from the mtime — so it was asking readers to re-derive its
+    /// own input.
+    #[test]
+    fn an_absorption_whose_trailer_names_a_peer_says_so_instead_of_asking() {
+        let fate = PathFate::AbsorbedBy("9394ee7".into(), "mixpeek-funnel".into());
+        let (line, at_risk) = victim_path_line("FRUSTRATIONS.md", &fate, "observed", "mixpeek-cicd");
+        assert!(!at_risk, "an absorption is never lost work: {line}");
+        assert!(line.contains("mixpeek-funnel"), "name the real author: {line}");
+        assert!(line.contains("Amux-Session trailer"), "say WHERE that name came from: {line}");
+        assert!(line.contains("9394ee7"), "name the commit: {line}");
+        assert!(line.contains("not by you"), "state the conclusion the reader was deriving: {line}");
+        assert!(
+            !line.contains("Check whether you actually wrote this"),
+            "the whole point is that it no longer assigns that check: {line}"
+        );
+
+        // THE CASE IT MUST NOT SWALLOW, which mixpeek-cicd raised and their own
+        // proposed wording ("almost certainly not yours; nothing to do") would
+        // have. `observed` does NOT mean "you did not write it": it is exactly
+        // what a Bash-authored edit produces, and `cat >> FRUSTRATIONS.md` is
+        // how that file is normally written here. So the line must still name
+        // the one condition under which it IS theirs.
+        assert!(
+            line.contains("shell command"),
+            "must name the condition that makes it theirs after all: {line}"
+        );
+        assert!(
+            line.contains("worth putting on the card"),
+            "and say what to do in that case: {line}"
+        );
+
+        // CONTROL 1: the trailer AGREES with the recipient. Nothing can be
+        // ruled out, so the hedged form must survive — a downgrade here would
+        // tell someone their own absorbed work was not theirs.
+        let (same, _) = victim_path_line("FRUSTRATIONS.md", &fate, "observed", "mixpeek-funnel");
+        assert!(
+            same.contains("Check whether you actually wrote this"),
+            "trailer == recipient cannot be downgraded: {same}"
+        );
+
+        // CONTROL 2: an UNTRAILERED commit names nobody, so there is no
+        // disagreement to report and the hedged form must survive.
+        let untrailered = PathFate::AbsorbedBy("9394ee7".into(), "(untrailered)".into());
+        let (unt, _) =
+            victim_path_line("FRUSTRATIONS.md", &untrailered, "observed", "mixpeek-cicd");
+        assert!(
+            unt.contains("Check whether you actually wrote this"),
+            "an untrailered commit proves nothing about authorship: {unt}"
+        );
+
+        // CONTROL 3: a FIRSTHAND claim is a recorded edit, not an mtime, so the
+        // reasoning genuinely is the reader's to record and this must not fire.
+        let (first, _) =
+            victim_path_line("FRUSTRATIONS.md", &fate, "firsthand", "mixpeek-cicd");
+        assert!(
+            first.contains("record the REASONING"),
+            "a recorded edit keeps the original prompt: {first}"
+        );
+    }
+
+    /// AF-422: the ABSORPTION arm reads provenance, like the at-risk arms have
+    /// since AMUX-3778.
+    ///
+    /// mixpeek-general received both forms from this emitter within an hour:
+    /// the at-risk arm correctly noted "your claim here is OBSERVED ... not a
+    /// recorded edit", and the absorption arm on
+    /// server/infra/gke/chart/templates/_helpers.tpl said only "absorbed into
+    /// 3cb19fde1b under byo-ray; your CODE is safe, record the REASONING on the
+    /// card". Their claim was `observed`. There was no reasoning to record.
+    #[test]
+    fn absorption_does_not_ask_you_to_record_reasoning_you_never_wrote() {
+        let fate = PathFate::AbsorbedBy("3cb19fd".into(), "byo-ray".into());
+
+        // THE SPECIMEN: an mtime claim. Still absorbed, still not at risk, but
+        // it must not send the reader to document work they may not have done.
+        // owner == the trailer's name, so the AF-439 disagreement arm below does
+        // NOT fire and this keeps exercising the arm it was written for: when
+        // the trailer agrees with the recipient, nothing can be ruled out and
+        // the hedged text is the honest one.
+        let (line, at_risk) = victim_path_line("_helpers.tpl", &fate, "observed", "byo-ray");
+        assert!(!at_risk, "absorption is not lost work, in any arm: {line}");
+        assert!(line.contains("absorbed into 3cb19fd"), "still says what happened: {line}");
+        assert!(
+            !line.contains("record the REASONING"),
+            "an mtime claim must not presume reasoning: {line}"
+        );
+        assert!(line.contains("OBSERVED"), "say what the claim actually is: {line}");
+
+        // A RESTORE carries no authored content at all (MG-1484), so it is even
+        // more certain there is nothing to record.
+        let (line, at_risk) = victim_path_line("_helpers.tpl", &fate, "restore", "me");
+        assert!(!at_risk);
+        assert!(line.contains("RESTORE"), "{line}");
+        assert!(!line.contains("record the REASONING"), "{line}");
+
+        // CONTROL, and the reason this is a fix rather than a mute: a
+        // TRANSCRIPT-backed claim is a real absorption — the reader did write
+        // bytes and a peer committed them — and it must still say so. This is
+        // also why AF-420's `owner_never_wrote` is the WRONG gate here: a real
+        // absorption has no commit of theirs either, by definition.
+        let (line, at_risk) = victim_path_line("_helpers.tpl", &fate, "firsthand", "me");
+        assert!(!at_risk);
+        assert!(
+            line.contains("record the REASONING on the card"),
+            "a real absorption still strands reasoning and must say so: {line}"
+        );
+        assert!(!line.contains("OBSERVED"), "{line}");
+    }
+
+    /// AF-422: the closing line must not claim authorship it cannot support.
+    #[test]
+    fn the_notice_only_says_committed_by_you_when_every_path_actually_is() {
+        // All SettledByOwner: the possessive is earned.
+        let mine = victim_verdict(true, true);
+        assert!(mine.contains("already committed by you"), "{mine}");
+
+        // THE REPORTED BUG: nothing at risk, but not all of it is theirs —
+        // absorbed under a peer, landed on origin, or never written by them.
+        let theirs = victim_verdict(true, false);
+        assert!(
+            !theirs.contains("committed by you"),
+            "must not claim authorship from an edit record: {theirs}"
+        );
+        assert!(theirs.contains("NOT all yours"), "say whose they are instead: {theirs}");
+        assert!(
+            theirs.contains("Nothing here needs reconciling"),
+            "still tell them there is no action, or the softening is lost: {theirs}"
+        );
+
+        // CONTROL: a genuinely at-risk path still gets the reconcile line, and
+        // `all_mine` must not be able to suppress it. Without this cell, wiring
+        // the possessive to `all_mine` alone would pass everything above.
+        for all_mine in [true, false] {
+            let risky = victim_verdict(false, all_mine);
+            assert!(risky.contains("that is the one to reconcile"), "{risky}");
+            assert!(!risky.contains("almost certainly noise"), "{risky}");
+        }
+    }
+
+    /// AF-420, mixpeek-general: the mirror told them their WORK was at risk about
+    /// a tubescience iconik daily tick they had never opened. The local hook has
+    /// asked "has this session ever written this path" since MC-1561; the mirror
+    /// AF-422's OTHER ARM, which the card asked for and nothing held.
+    ///
+    /// `scripts/mutate.sh survey` found both of these surviving the whole
+    /// git_guard suite: `n_at_risk == 0` flipped to `>= 0`, and `all_mine`'s
+    /// `.all()` flipped to `.any()`. The first deletes the loud notice
+    /// entirely; the second restores the exact possessive
+    /// ("EVERY path above is already committed by you") that this card exists
+    /// to remove. Both passed, on a fix whose quiet arm was carefully pinned.
+    #[test]
+    fn the_loud_mirror_notice_stays_loud_when_any_path_is_at_risk() {
+        let fates = vec![
+            PathFate::SettledByOwner("abc1234".into()),
+            PathFate::AtRisk,
+        ];
+        let (all_settled, all_mine) = victim_flags(&fates, &[false, true]);
+        assert!(!all_settled, "one at-risk path must defeat the settled verdict");
+        assert!(!all_mine, "a set containing AtRisk is not all the reader's own work");
+        // And the control: with nothing at risk it IS the quiet form, or the
+        // assertion above would pass on a function that always says "loud".
+        let (settled2, _) = victim_flags(&fates, &[false, false]);
+        assert!(settled2, "with no at-risk flags the verdict must go quiet");
+    }
+
+    /// The possessive needs EVERY path to be the reader's own commit. One
+    /// settled path among absorbed ones must not license "committed by you" —
+    /// AbsorbedBy, LandedOnOrigin and NotTheirWork all mean committed by
+    /// somebody else, or not the reader's at all.
+    #[test]
+    fn one_settled_path_among_absorbed_ones_does_not_license_the_possessive() {
+        let mixed = vec![
+            PathFate::SettledByOwner("abc1234".into()),
+            PathFate::AbsorbedBy("def5678".into(), "byo-ray".into()),
+            PathFate::NotTheirWork(vec!["ts-gke".into()]),
+        ];
+        let (all_settled, all_mine) = victim_flags(&mixed, &[false, false, false]);
+        assert!(all_settled, "none of these three is at risk");
+        assert!(
+            !all_mine,
+            "only SettledByOwner supports the possessive — this is the mixpeek-general \
+             report, where the file's history held zero of their commits"
+        );
+        // The control: all-settled DOES license it, or the assertion is vacuous.
+        let mine = vec![
+            PathFate::SettledByOwner("abc1234".into()),
+            PathFate::SettledByOwner("def5678".into()),
+        ];
+        assert!(victim_flags(&mine, &[false, false]).1, "all-SettledByOwner is the reader's own");
+    }
+
+    /// An EMPTY fate list must not read as "everything above is yours". `all()`
+    /// on an empty iterator is true, which is the vacuous-pass shape this
+    /// module keeps filing, and here it would put a possessive claim under a
+    /// notice listing no paths at all.
+    #[test]
+    fn no_paths_is_not_a_possessive_claim() {
+        let (all_settled, all_mine) = victim_flags(&[], &[]);
+        assert!(all_settled, "nothing listed is nothing at risk");
+        assert!(!all_mine, "nothing listed is not 'every path above is yours'");
+    }
+
+    /// never learned it.
+    #[tokio::test]
+    async fn a_path_this_lane_never_wrote_is_not_their_work_to_lose() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_string_lossy().to_string();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(&d).output().unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+
+        // The path's whole history belongs to tubescience.
+        std::fs::write(dir.path().join("tick.md"), "iconik tick v1\n").unwrap();
+        git(&["add", "tick.md"]);
+        git(&["commit", "-q", "-m", "tick\n\nAmux-Session: tubescience"]);
+        // Someone is mid-edit, so the path is genuinely dirty and NOT on origin.
+        std::fs::write(dir.path().join("tick.md"), "iconik tick v1\nedit\n").unwrap();
+
+        // PREMISE: dirty, or AtRisk is never reached and this is vacuous.
+        assert!(
+            git_out(&d, &["diff", "HEAD", "--name-only", "--", "tick.md"])
+                .await
+                .map(|o| !o.trim().is_empty())
+                .unwrap_or(false),
+            "fixture must be dirty"
+        );
+
+        match path_fate(&d, "tick.md", "mixpeek-general", 0, "firsthand").await {
+            PathFate::NotTheirWork(writers) => {
+                assert!(writers.contains(&"tubescience".to_string()), "name the real writers: {writers:?}");
+            }
+            other => panic!("a lane that never wrote this path has no work to lose: {other:?}"),
+        }
+
+        // CONTROL 1 — the lane that DID write it still gets the full warning.
+        // Without this the fix would have deleted the signal, not sharpened it.
+        assert_eq!(
+            path_fate(&d, "tick.md", "tubescience", 0, "firsthand").await,
+            PathFate::AtRisk,
+            "the actual author's work IS at risk and must stay loud"
+        );
+
+        // CONTROL 3 — A LANE WHOSE ONLY COMMITS ARE ON ORIGIN still counts as a
+        // writer. `git log` defaults to HEAD, and on a graft-push checkout local
+        // HEAD never advances, so a HEAD-only question reports the lane as a
+        // non-writer of a path they landed themselves. The AMUX-3445 fixture
+        // caught this before it shipped; this cell keeps it caught.
+        let dir3 = tempfile::tempdir().unwrap();
+        let d3 = dir3.path().to_string_lossy().to_string();
+        let git3 = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(&d3).output().unwrap()
+        };
+        git3(&["init", "-q"]);
+        git3(&["config", "user.email", "t@t"]);
+        git3(&["config", "user.name", "t"]);
+        std::fs::write(dir3.path().join("g.md"), "v1\n").unwrap();
+        git3(&["add", "g.md"]);
+        git3(&["commit", "-q", "-m", "base\n\nAmux-Session: someone-else"]);
+        let base3 = String::from_utf8(git3(&["rev-parse", "HEAD"]).stdout).unwrap().trim().to_string();
+        std::fs::write(dir3.path().join("g.md"), "v2\n").unwrap();
+        git3(&["add", "g.md"]);
+        git3(&["commit", "-q", "-m", "landed\n\nAmux-Session: grafter"]);
+        git3(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git3(&["reset", "-q", "--hard", &base3]); // local HEAD back behind origin
+        std::fs::write(dir3.path().join("g.md"), "v2 plus local edit\n").unwrap();
+        assert_eq!(
+            path_fate(&d3, "g.md", "grafter", 0, "firsthand").await,
+            PathFate::AtRisk,
+            "grafter's only commit is on origin, and they are still a writer here"
+        );
+
+        // CONTROL 2 — NO TRAILERS ANYWHERE is "cannot ask", not "never wrote".
+        // A repo that does not use trailers must not silently suppress every
+        // notice; that is the three-answers rule MC-1561 is built on.
+        let dir2 = tempfile::tempdir().unwrap();
+        let d2 = dir2.path().to_string_lossy().to_string();
+        let git2 = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(&d2).output().unwrap()
+        };
+        git2(&["init", "-q"]);
+        git2(&["config", "user.email", "t@t"]);
+        git2(&["config", "user.name", "t"]);
+        std::fs::write(dir2.path().join("plain.md"), "v1\n").unwrap();
+        git2(&["add", "plain.md"]);
+        git2(&["commit", "-q", "-m", "no trailer here"]);
+        std::fs::write(dir2.path().join("plain.md"), "v1\nedit\n").unwrap();
+        assert_eq!(
+            path_fate(&d2, "plain.md", "anyone", 0, "firsthand").await,
+            PathFate::AtRisk,
+            "untrailered history means the question could not be asked, so stay loud"
+        );
+    }
+
+    /// AF-421, rebuilt from the mirror checkout's real state (mixpeek-general,
+    /// 2026-09-02).
+    ///
+    /// A graft-push lane ships by pushing a dangling commit built from origin
+    /// bytes, so its local HEAD never advances. Every untouched file therefore
+    /// reads dirty-vs-HEAD forever, which is what AMUX-3445's `LandedOnOrigin`
+    /// rescue exists to forgive. But that rescue also required the INDEX to
+    /// match origin — and for a path the lane has not staged, the index mirrors
+    /// local HEAD, which is exactly the ref that never advances. So the rescue
+    /// was unsatisfiable on the checkout class it was written for.
+    ///
+    /// Measured there: 276 paths dirty vs HEAD, 181 byte-identical to
+    /// origin/main, 5 reaching LandedOnOrigin, 176 landed-and-unstaged reported
+    /// as "your WORK is at risk".
+    #[tokio::test]
+    async fn a_landed_unstaged_path_is_a_receipt_even_when_the_index_trails_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_string_lossy().to_string();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(&d).output().unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+
+        // Local HEAD holds the OLD bytes and stays there — the graft-push shape.
+        std::fs::write(dir.path().join("doc.md"), "old\n").unwrap();
+        git(&["add", "doc.md"]);
+        git(&["commit", "-q", "-m", "old"]);
+        // origin/main carries the LANDED bytes, ahead of local HEAD.
+        std::fs::write(dir.path().join("doc.md"), "landed\n").unwrap();
+        git(&["add", "doc.md"]);
+        git(&["commit", "-q", "-m", "landed"]);
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(&["reset", "-q", "--hard", "HEAD~1"]); // local HEAD back to `old`
+        // The worktree carries origin's bytes; the index is NOT touched, so it
+        // mirrors local HEAD. This is the untouched-file state, not a staged one.
+        std::fs::write(dir.path().join("doc.md"), "landed\n").unwrap();
+
+        // PREMISES, asserted so the arms below cannot be vacuously green.
+        assert!(
+            git_out(&d, &["diff", "HEAD", "--name-only", "--", "doc.md"])
+                .await
+                .map(|o| !o.trim().is_empty())
+                .unwrap_or(false),
+            "fixture must be dirty vs local HEAD, or AtRisk is never reached"
+        );
+        assert!(
+            git_out(&d, &["diff", "--quiet", "origin/main", "--", "doc.md"]).await.is_some(),
+            "fixture worktree must equal origin/main"
+        );
+        assert!(
+            git_out(&d, &["diff", "--quiet", "--cached", "origin/main", "--", "doc.md"])
+                .await
+                .is_none(),
+            "fixture INDEX must differ from origin — that is the whole defect"
+        );
+
+        match path_fate(&d, "doc.md", "peer", 0, "firsthand").await {
+            PathFate::LandedOnOrigin(sha) => assert!(!sha.is_empty(), "receipt carries origin's sha"),
+            other => panic!("landed and unstaged is a receipt, not an alarm: {other:?}"),
+        }
+
+        // CONTROL, and the one that keeps the loud direction default: STAGE a
+        // blob that differs from origin. Now the path IS in the pending commit
+        // and would revert the landed bytes, which is backend's amendment
+        // specimen. It must stay AtRisk.
+        std::fs::write(dir.path().join("doc.md"), "pre-graft copy\n").unwrap();
+        git(&["add", "doc.md"]);
+        std::fs::write(dir.path().join("doc.md"), "landed\n").unwrap();
+        assert_eq!(
+            path_fate(&d, "doc.md", "peer", 0, "firsthand").await,
+            PathFate::AtRisk,
+            "a STAGED blob differing from origin is the revert-in-waiting and stays loud"
+        );
+
+        // CONTROL 2: worktree differing from origin is still the genuine
+        // at-risk case, staged or not.
+        git(&["reset", "-q"]);
+        std::fs::write(dir.path().join("doc.md"), "novel local work\n").unwrap();
+        assert_eq!(path_fate(&d, "doc.md", "peer", 0, "firsthand").await, PathFate::AtRisk);
     }
 
     /// AMUX-3677, rebuilt from the notice's own text and the repo state that
@@ -3468,6 +4296,44 @@ mod tests {
         assert!(owner_owns_newest_commit(&d, "other.rs", "").await.is_none());
     }
 
+    /// AF-439. Pins the DIRECTION assertion itself, which is a narrower claim
+    /// than it looks and the difference matters.
+    ///
+    /// `scripts/mutate.sh seams` found that swapping `dir` and `path` at
+    /// commit_nudge.rs:1447 compiles and passes the entire suite. The assertion
+    /// added to this function makes that swap LOUD instead of silent — a
+    /// panicking debug build rather than a None the caller reads as "the owner
+    /// has not committed", which reports settled work as unsettled.
+    ///
+    /// IT DOES NOT CLOSE THE SEAM, and this cell exists partly to say so. No
+    /// test reaches that call site (the sweep needs a live lane, a repo and the
+    /// guard API), so the assertion never executes there and `seams` still
+    /// reports SURVIVED for it — correctly. What is pinned here is that the
+    /// assertion exists and fires; what is still unheld is the argument order
+    /// at a caller no test exercises.
+    #[tokio::test]
+    #[should_panic(expected = "must be a directory")]
+    async fn owner_committed_since_rejects_a_swapped_dir_and_path() {
+        let f = std::env::temp_dir().join(format!("af439-{}.txt", std::process::id()));
+        std::fs::write(&f, b"x").unwrap();
+        // The swapped call: a FILE where the directory belongs. Without the
+        // assertion this returns None and every caller reads it as a fact
+        // about the repo.
+        let _ = owner_committed_since(f.to_str().unwrap(), "some/path.rs", "amux", 60).await;
+    }
+
+    /// The control. A real directory must NOT trip the assertion, or the guard
+    /// above would be a function that always panics and the cell would pass for
+    /// the wrong reason.
+    #[tokio::test]
+    async fn owner_committed_since_accepts_a_real_directory() {
+        let d = std::env::temp_dir();
+        // No repo there, so the git call fails and this returns None. That is
+        // the point: it returns rather than panicking.
+        let r = owner_committed_since(d.to_str().unwrap(), "some/path.rs", "amux", 60).await;
+        assert!(r.is_none(), "a non-repo directory yields None, not a panic");
+    }
+
     #[tokio::test]
     async fn owner_committed_since_distinguishes_committed_from_still_staged() {
         let dir = tempfile::tempdir().unwrap();
@@ -3515,6 +4381,22 @@ mod tests {
     }
 
     fn peer_wrote(path: &str, owner: &str, ts: f64) -> GuardInputs {
+        let mut g = GuardInputs::default();
+        g.theirs.insert(format!("/repo/{path}"), (owner.into(), ts));
+        g.theirs_firsthand.insert(format!("/repo/{path}"));
+        // AF-414: the helper is named for AUTHORSHIP, so it must set the set that
+        // MEANS authorship. It set only `theirs`/`theirs_firsthand`, both of
+        // which a bare mtime satisfies — so every split_risk cell was really
+        // exercising the mtime case while reading as if it proved the authored
+        // one. `peer_touched` below is the mtime case, named honestly.
+        g.theirs_transcript.insert(format!("/repo/{path}"));
+        g
+    }
+
+    /// A peer RECORD with no authored content: an mtime their Bash window
+    /// caught. Differs from `peer_wrote` on exactly the field that decides
+    /// whether an ownership claim is supportable.
+    fn peer_touched(path: &str, owner: &str, ts: f64) -> GuardInputs {
         let mut g = GuardInputs::default();
         g.theirs.insert(format!("/repo/{path}"), (owner.into(), ts));
         g.theirs_firsthand.insert(format!("/repo/{path}"));
@@ -3609,6 +4491,73 @@ mod tests {
         assert!(
             classify(&staged, 200.0, 3600.0, &other).split_risk.is_empty(),
             "only the co-editor's OWN dirty files can split their own symbol"
+        );
+    }
+
+    /// AF-414, from the specimen this warning produced about ME.
+    ///
+    /// Committing a frustrations.md entry, split_risk announced "amux's work is
+    /// being cut in half" and named two files as "THEIR files". Both were mine:
+    /// 368 insertions, 0 deletions, written minutes earlier. The prescribed
+    /// remedy, "confirm with them", would have sent me to a peer about my own
+    /// code. The claim came from `inp.theirs`, which a bare mtime satisfies.
+    #[test]
+    fn an_mtime_only_record_names_the_files_without_claiming_they_are_the_peers() {
+        // MTIME ONLY on both sides: a record exists, no authored content does.
+        let mut g = peer_touched("crates/amux-server/src/api/board.rs", "amux", 100.0);
+        g.theirs.insert("/repo/crates/amux-server/src/db/board_store.rs".into(), ("amux".into(), 100.0));
+        g.theirs_firsthand.insert("/repo/crates/amux-server/src/db/board_store.rs".into());
+        g.dirty.insert("/repo/crates/amux-server/src/db/board_store.rs".into());
+        g.mine_firsthand.insert("/repo/crates/amux-server/src/api/board.rs".into());
+
+        let staged = [pair("crates/amux-server/src/api/board.rs")];
+        let v = classify(&staged, 200.0, 3600.0, &g);
+
+        // DOWNGRADE, NEVER SUPPRESS: the build hazard is real whoever owns the
+        // bytes, so the row must still be here and still name the file.
+        assert_eq!(v.split_risk.len(), 1, "the BUILD warning must survive: {:?}", v.split_risk);
+        let r = &v.split_risk[0];
+        assert_eq!(r["authored"], json!(false), "{r}");
+        assert!(
+            r["left_dirty"].as_array().unwrap()[0].as_str().unwrap().ends_with("db/board_store.rs"),
+            "still names the file left behind: {r}"
+        );
+        let why = r["why"].as_str().unwrap();
+        assert!(why.contains("fail to build"), "the hazard still stated: {why}");
+        // ...and the possessive is gone, with the remedy that sends you to a peer.
+        assert!(!why.contains("THEIR files"), "no ownership assertion from an mtime: {why}");
+        assert!(!why.contains("confirm with them"), "do not send them to a peer: {why}");
+        assert!(why.contains("mtime"), "say what the record actually is: {why}");
+        assert!(
+            !why.contains('?'),
+            "STATE A FACT, never ask the committer a question (the rule the authored arm keeps): {why}"
+        );
+
+        // CONTROL, and the half that keeps this honest: with TRANSCRIPT evidence
+        // on both sides the claim is supportable and the full wording returns.
+        // Without this cell, deleting the possessive unconditionally would pass.
+        let mut a = peer_wrote("crates/amux-server/src/api/board.rs", "amux", 100.0);
+        a.theirs.insert("/repo/crates/amux-server/src/db/board_store.rs".into(), ("amux".into(), 100.0));
+        a.theirs_firsthand.insert("/repo/crates/amux-server/src/db/board_store.rs".into());
+        a.theirs_transcript.insert("/repo/crates/amux-server/src/db/board_store.rs".into());
+        a.dirty.insert("/repo/crates/amux-server/src/db/board_store.rs".into());
+        a.mine_firsthand.insert("/repo/crates/amux-server/src/api/board.rs".into());
+        let v2 = classify(&staged, 200.0, 3600.0, &a);
+        assert_eq!(v2.split_risk[0]["authored"], json!(true));
+        assert!(v2.split_risk[0]["why"].as_str().unwrap().contains("THEIR files"));
+
+        // CONTROL 2: transcript on ONE side only is not a split of their work.
+        // The hazard is a symbol split ACROSS the two halves, so one authored
+        // side plus one mtime side must stay downgraded.
+        let mut half = peer_wrote("crates/amux-server/src/api/board.rs", "amux", 100.0);
+        half.theirs.insert("/repo/crates/amux-server/src/db/board_store.rs".into(), ("amux".into(), 100.0));
+        half.theirs_firsthand.insert("/repo/crates/amux-server/src/db/board_store.rs".into());
+        half.dirty.insert("/repo/crates/amux-server/src/db/board_store.rs".into());
+        half.mine_firsthand.insert("/repo/crates/amux-server/src/api/board.rs".into());
+        assert_eq!(
+            classify(&staged, 200.0, 3600.0, &half).split_risk[0]["authored"],
+            json!(false),
+            "authored needs BOTH sides; one is not a split of their work"
         );
     }
 
@@ -4452,22 +5401,22 @@ mod tests {
     /// risk" — the remedy that line prescribes operates on an empty set.
     #[test]
     fn a_restore_only_touch_is_never_reported_as_work_at_risk() {
-        let (line, at_risk) = victim_path_line("docs/openapi.json", &PathFate::AtRisk, "restore");
+        let (line, at_risk) = victim_path_line("docs/openapi.json", &PathFate::AtRisk, "restore", "me");
         assert!(!at_risk, "a restore carries no authored content");
         assert!(line.contains("RESTORE"), "{line}");
         assert!(!line.contains("CHECK THIS ONE"), "{line}");
         // Authored content stays the loud case.
-        let (line, at_risk) = victim_path_line("src/lib.rs", &PathFate::AtRisk, "firsthand");
+        let (line, at_risk) = victim_path_line("src/lib.rs", &PathFate::AtRisk, "firsthand", "me");
         assert!(at_risk);
         assert!(line.contains("CHECK THIS ONE"), "{line}");
         // Settled and absorbed keep their calm wording regardless.
         let (line, at_risk) =
-            victim_path_line("a.rs", &PathFate::SettledByOwner("abc123".into()), "restore");
+            victim_path_line("a.rs", &PathFate::SettledByOwner("abc123".into()), "restore", "me");
         assert!(!at_risk);
         assert!(line.contains("nothing at risk"), "{line}");
         // AMUX-3445: landed-on-origin is a receipt, never a warning.
         let (line, at_risk) =
-            victim_path_line("g.rs", &PathFate::LandedOnOrigin("def456".into()), "firsthand");
+            victim_path_line("g.rs", &PathFate::LandedOnOrigin("def456".into()), "firsthand", "me");
         assert!(!at_risk, "identical-to-origin cannot be at risk");
         assert!(line.contains("origin/main") && line.contains("def456"), "{line}");
     }
@@ -4501,7 +5450,7 @@ mod tests {
             "an observed row is ranked with firsthand but is not firsthand EVIDENCE"
         );
 
-        let (line, at_risk) = victim_path_line("s04_faces.py", &PathFate::AtRisk, "observed");
+        let (line, at_risk) = victim_path_line("s04_faces.py", &PathFate::AtRisk, "observed", "me");
         assert!(at_risk, "it is still flagged — under-warning is the expensive direction");
         assert!(
             line.contains("OBSERVED"),
@@ -4519,7 +5468,7 @@ mod tests {
         let mut inp2 = GuardInputs::default();
         inp2.theirs_firsthand.insert(p.clone());
         assert_eq!(provenance_of(&inp2, &p), "firsthand");
-        let (line2, at_risk2) = victim_path_line("s04_faces.py", &PathFate::AtRisk, "firsthand");
+        let (line2, at_risk2) = victim_path_line("s04_faces.py", &PathFate::AtRisk, "firsthand", "me");
         assert!(at_risk2);
         assert!(
             line2.contains("the WORK ITSELF is at risk"),
@@ -4662,6 +5611,51 @@ mod tests {
         //    silently rewriting every command it sees.
         let plain = "cd /repo && python3 -c 'open(\"x\",\"w\")'";
         assert_eq!(strip_heredoc_bodies(plain), plain);
+    }
+
+    /// AF-452: `verdict=READ verb` was reachable ONLY as an artifact.
+    ///
+    /// All 17 rows it ever produced were `blocked_by=status` from quoted prose,
+    /// each announcing itself as the specimen AMUX-2841 was parked on. Both
+    /// arms below, because the fix must not become a deletion: arm 1 kills the
+    /// false positive, arm 2 fails if the read arm was removed rather than
+    /// reordered.
+    #[test]
+    fn a_bare_git_read_token_is_an_artifact_and_says_so() {
+        // ARM 1 — the artifact. A REAL git read never reaches the field.
+        assert_eq!(
+            first_blocking_verb("cd /repo && git status"),
+            None,
+            "a real `git status` is a pure read and names no blocking verb, so a \
+             `status` in blocked_by cannot have come from one",
+        );
+        // ...but quoted DATA is tokenised as shell, so a bare one does reach it.
+        assert_eq!(
+            first_blocking_verb("echo \"checking\nstatus of the run\"").as_deref(),
+            Some("status"),
+            "the newline inside the quoted string splits it into a segment whose \
+             first token is a bare `status` — this is the live defect",
+        );
+        let v = inferred_edit_verdict("status");
+        assert!(
+            v.contains("BARE git read subcommand") && v.contains("NOT a specimen"),
+            "a bare git-read token must be reported as an artifact, got: {v}",
+        );
+        assert!(
+            !v.contains("specimen AMUX-2841 wants"),
+            "the artifact must not claim to be AMUX-2841's specimen",
+        );
+
+        // ARM 2 — the read arm still exists. Reordering must not delete it.
+        // (`cat` cannot reach blocked_by today either, which is AF-452's larger
+        // finding; the arm is kept so a future tokeniser fix has it to reach.)
+        assert!(
+            inferred_edit_verdict("cat").contains("specimen AMUX-2841 wants"),
+            "a genuine read verb must still classify as the specimen case",
+        );
+        // And the other two arms are untouched.
+        assert!(inferred_edit_verdict("redirect").contains("output redirection"));
+        assert!(inferred_edit_verdict("kubectl").contains("not classifiable"));
     }
 
     /// The WARN must state the verdict it can support, not hand the reader a

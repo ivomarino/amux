@@ -1113,6 +1113,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/debug/routes", methods: &["GET"] },
     RouteEntry { path: "/api/debug/duplicate-deliveries", methods: &["GET"] },
     RouteEntry { path: "/api/system-jobs", methods: &["GET"] },
+    RouteEntry { path: "/api/system-jobs/{id}/run", methods: &["POST"] },
     RouteEntry { path: "/api/health/invariants", methods: &["GET"] },
     RouteEntry { path: "/api/debug/invariants", methods: &["GET"] },
     RouteEntry { path: "/api/gmail/callback", methods: &["GET"] },
@@ -1339,6 +1340,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // scanned only api/mod.rs's own .route() calls.
     RouteEntry { path: "/api/board/contract", methods: &["GET"] },
     RouteEntry { path: "/api/board/ready", methods: &["GET"] },
+    RouteEntry { path: "/api/board/bulk-migrate", methods: &["POST"] },
     RouteEntry { path: "/api/board/{id}/decompose", methods: &["POST"] },
     RouteEntry { path: "/api/board/needsyou", methods: &["GET"] },
     RouteEntry { path: "/api/schedules/{id}/skip", methods: &["POST"] },
@@ -1365,6 +1367,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // POST declares a connector at runtime, DELETE forgets one (AMUX-3993).
     // Owner-approved ad-hoc permission grants (AMUX-3997).
     RouteEntry { path: "/api/config/cross-group", methods: &["GET", "PUT"] },
+    RouteEntry { path: "/api/config/board-drain", methods: &["GET", "PUT"] },
     RouteEntry { path: "/api/grants", methods: &["GET"] },
     RouteEntry { path: "/api/grants/{id}/approve", methods: &["POST"] },
     RouteEntry { path: "/api/grants/{id}/reject", methods: &["POST"] },

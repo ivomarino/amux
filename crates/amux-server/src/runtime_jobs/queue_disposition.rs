@@ -62,7 +62,8 @@ pub const DISPOSITION_TAG: &str = "queue:disposition";
 /// up excluded by one rule and reported live by another.
 fn stalled_todos(conn: &rusqlite::Connection, lane: &str) -> Vec<(String, String, i64)> {
     let now = crate::config::now_f64();
-    let cut = now - crate::runtime_jobs::board_drive::pickup_freshness_s() as f64;
+    if crate::runtime_jobs::board_drive::pickup_freshness_s() <= 0 { return Vec::new(); }
+    let cut = crate::runtime_jobs::board_drive::pickup_fresh_cut(now) as f64;
     let mut out = Vec::new();
     if let Ok(mut st) = conn.prepare(
         "SELECT id, title, updated FROM issues i WHERE i.session=?1 AND i.status='todo' \
@@ -84,8 +85,8 @@ fn stalled_todos(conn: &rusqlite::Connection, lane: &str) -> Vec<(String, String
 
 /// Every lane holding at least one stalled todo.
 fn lanes_with_stalled(conn: &rusqlite::Connection) -> Vec<String> {
-    let cut = crate::config::now_f64()
-        - crate::runtime_jobs::board_drive::pickup_freshness_s() as f64;
+    if crate::runtime_jobs::board_drive::pickup_freshness_s() <= 0 { return Vec::new(); }
+    let cut = crate::runtime_jobs::board_drive::pickup_fresh_cut(crate::config::now_f64());
     let mut out = Vec::new();
     if let Ok(mut st) = conn.prepare(
         "SELECT DISTINCT session FROM issues WHERE session IS NOT NULL AND session <> '' \
@@ -245,8 +246,12 @@ pub async fn tick(state: AppState) -> (usize, usize, usize) {
                     ask_type: None,
                     ask_question: None,
                     ask_unblocks: None,
+                    ask_actor: None,
                     // AF-367: filed by the queue-disposition job.
                     source: Some("queue_disposition".into()),
+                    requested_by: None,
+                    callback_session: None,
+                    callback_prompt: None,
                 };
                 let _ = state
                     .store

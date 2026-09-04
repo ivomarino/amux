@@ -1,5 +1,11 @@
 #!/bin/sh
 # guard-features: interpret-trailers
+# guard-version: 1
+# (AF-431 / MR-44. A file declaring guard-features must carry exactly ONE
+#  anchored integer version so staleness is a NUMERIC comparison, not a
+#  substring hunt. Two spellings, per mixpeek-research's dc21a0d489: hooks
+#  that self-report at runtime use `GUARD_VERSION = N`; hooks with no runtime
+#  need use this line. Bump it whenever a guard-features token is added.)
 # (Drift token for install-hooks.sh — see append-only-push-guard's header for
 #  the mechanism. A vendored copy lacking a canonical token reads STALE.)
 # amux-session-stamp — tags each commit with the originating amux session, and

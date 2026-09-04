@@ -23,6 +23,25 @@ struct Migration {
     sql: &'static str,
 }
 
+/// Recorded names that are known to be an earlier name for the SAME migration.
+///
+/// A version/name mismatch normally means a migration was skipped and remains
+/// a startup error. This one is different and was already proven/documented in
+/// this file: version 35's regenerable-samples migration was renamed from a
+/// stale `0029_` filename prefix to `0035_` without changing its schema work.
+/// Keeping that fact executable prevents every healthy boot from raising a
+/// false migration-collision alarm while preserving the alarm for every
+/// unrecognized mismatch.
+const MIGRATION_NAME_ALIASES: &[(i64, &str, &str)] = &[
+    (35, "0029_regenerable_samples", "0035_regenerable_samples"),
+];
+
+fn known_name_alias(version: i64, recorded: &str, registered: &str) -> bool {
+    MIGRATION_NAME_ALIASES.iter().any(|(v, old, new)| {
+        *v == version && *old == recorded && *new == registered
+    })
+}
+
 // Embedded at compile time so the binary is self-contained (single-artifact
 // deploy is one of the four reasons this rewrite exists).
 const MIGRATIONS: &[Migration] = &[
@@ -303,15 +322,20 @@ const MIGRATIONS: &[Migration] = &[
         name: "0054_telegram_chat_type",
         sql: include_str!("../../migrations/0054_telegram_chat_type.sql"),
     },
-    // Renumbered from 0033/0035/0049/0050/0054 across successive rebases
-    // onto main (last: 2026-09-03): main's own migrations kept claiming
-    // those slots first (most recently the telegram group-chat feature's
-    // own 0054_telegram_chat_type), so this PR's secret_metadata migration
-    // keeps moving to the next free version.
     Migration {
         version: 55,
-        name: "0055_secret_metadata",
-        sql: include_str!("../../migrations/0055_secret_metadata.sql"),
+        name: "0055_issue_callbacks",
+        sql: include_str!("../../migrations/0055_issue_callbacks.sql"),
+    },
+    // Renumbered from 0033/0035/0049/0050/0054/0055 across successive
+    // rebases onto main (last: 2026-09-04): main's own migrations kept
+    // claiming those slots first (most recently 0055_issue_callbacks), so
+    // this PR's secret_metadata migration keeps moving to the next free
+    // version.
+    Migration {
+        version: 56,
+        name: "0056_secret_metadata",
+        sql: include_str!("../../migrations/0056_secret_metadata.sql"),
     },
 ];
 
@@ -495,7 +519,7 @@ fn truthy_env(key: &str) -> bool {
 /// case — every version this binary has ever successfully applied hits this
 /// path on every subsequent startup, and must stay silent).
 fn version_collision_warning(version: i64, expected_name: &str, recorded_name: &str) -> Option<String> {
-    if recorded_name == expected_name {
+    if recorded_name == expected_name || known_name_alias(version, recorded_name, expected_name) {
         return None;
     }
     Some(format!(
@@ -648,8 +672,9 @@ pub fn apply_all(conn: &mut Connection) -> anyhow::Result<()> {
 /// over that would be a gate with no truthful path (ethos rule 3).
 ///
 /// Live on this box when written: v35 recorded as `0029_regenerable_samples`,
-/// registered as `0035_regenerable_samples`. Same migration, renumbered, nothing
-/// skipped. The point is that nothing anywhere noticed it had moved.
+/// registered as `0035_regenerable_samples`. Same migration, renamed, nothing
+/// skipped. That known alias is now excluded; every unknown mismatch remains a
+/// collision finding.
 pub(crate) fn renumbered_migrations(conn: &Connection) -> Vec<(i64, String, String)> {
     let mut stmt = match conn.prepare("SELECT version, name FROM _amux_migrations") {
         Ok(s) => s,
@@ -663,7 +688,7 @@ pub(crate) fn renumbered_migrations(conn: &Connection) -> Vec<(i64, String, Stri
     for row in rows.flatten() {
         let (version, recorded) = row;
         if let Some(m) = MIGRATIONS.iter().find(|m| m.version == version) {
-            if m.name != recorded {
+            if m.name != recorded && !known_name_alias(version, &recorded, m.name) {
                 out.push((version, recorded, m.name.to_string()));
             }
         }
@@ -907,6 +932,36 @@ mod tests {
             renumbered_migrations(&conn).len(),
             1,
             "the mismatch must still be reported on a later boot"
+        );
+    }
+
+    #[test]
+    fn a_known_same_migration_rename_is_not_reported_as_a_collision() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_all(&mut conn).unwrap();
+        conn.execute(
+            "UPDATE _amux_migrations SET name = ?1 WHERE version = 35",
+            ["0029_regenerable_samples"],
+        )
+        .unwrap();
+
+        assert_eq!(
+            version_collision_warning(
+                35,
+                "0035_regenerable_samples",
+                "0029_regenerable_samples",
+            ),
+            None,
+            "the documented rename performed the same schema work"
+        );
+        assert!(
+            renumbered_migrations(&conn).is_empty(),
+            "known aliases must not keep every healthy startup in a false error state"
+        );
+
+        assert!(
+            version_collision_warning(35, "0035_regenerable_samples", "0035_unrelated").is_some(),
+            "only the exact documented alias may be suppressed"
         );
     }
 

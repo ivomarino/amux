@@ -148,6 +148,12 @@ fn is_session_blocked(name: &str) -> bool {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EnvFile {
     pairs: Vec<(String, String)>,
+    dirty: Vec<(String, Option<String>)>,
+}
+
+fn env_write_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 /// A temp path unique to THIS CALL, for the write-then-rename dance (AF-104).
@@ -187,10 +193,10 @@ impl EnvFile {
         self.pairs.iter().map(|(k, _)| k.clone()).collect()
     }
 
-    fn load(path: &Path) -> Self {
+    pub(crate) fn load(path: &Path) -> Self {
         let mut pairs = Vec::new();
         let Ok(text) = std::fs::read_to_string(path) else {
-            return Self { pairs };
+            return Self { pairs, dirty: Vec::new() };
         };
         for line in text.lines() {
             let line = line.trim();
@@ -214,7 +220,7 @@ impl EnvFile {
                 None => pairs.push((k.to_string(), v.to_string())),
             }
         }
-        Self { pairs }
+        Self { pairs, dirty: Vec::new() }
     }
 
     pub(crate) fn get(&self, key: &str) -> Option<&str> {
@@ -223,18 +229,34 @@ impl EnvFile {
     fn get_or<'a>(&'a self, key: &str, default: &'a str) -> &'a str {
         self.get(key).unwrap_or(default)
     }
-    fn set(&mut self, key: &str, value: &str) {
+    pub(crate) fn set(&mut self, key: &str, value: &str) {
         match self.pairs.iter_mut().find(|(k, _)| k == key) {
             Some((_, v)) => *v = value.to_string(),
             None => self.pairs.push((key.to_string(), value.to_string())),
         }
+        self.dirty.retain(|(k, _)| k != key);
+        self.dirty.push((key.to_string(), Some(value.to_string())));
     }
-    fn remove(&mut self, key: &str) {
+    pub(crate) fn remove(&mut self, key: &str) {
         self.pairs.retain(|(k, _)| k != key);
+        self.dirty.retain(|(k, _)| k != key);
+        self.dirty.push((key.to_string(), None));
     }
 
     /// Python `_write_env` (py:4252): `# updated:` header + K="V", atomic 0600.
-    fn write(&self, path: &Path) -> std::io::Result<()> {
+    pub(crate) fn write(&self, path: &Path) -> std::io::Result<()> {
+        let _guard = env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut latest = if self.dirty.is_empty() { self.clone() } else { Self::load(path) };
+        for (key, value) in &self.dirty {
+            match value {
+                Some(value) => latest.set(key, value),
+                None => latest.remove(key),
+            }
+        }
+        latest.write_unlocked(path)
+    }
+
+    fn write_unlocked(&self, path: &Path) -> std::io::Result<()> {
         use std::io::Write as _;
         let mut out = format!("# updated: {}\n", chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.6f"));
         for (k, v) in &self.pairs {
@@ -253,6 +275,59 @@ impl EnvFile {
             }
             f.write_all(out.as_bytes())?;
             f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)
+    }
+
+    pub(crate) fn replace_text(path: &Path, text: &str) -> std::io::Result<()> {
+        let _guard = env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
+        use std::io::Write as _;
+        if let Some(dir) = path.parent() { std::fs::create_dir_all(dir)?; }
+        let tmp = unique_tmp_path(path);
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; f.set_permissions(std::fs::Permissions::from_mode(0o600))?; }
+            f.write_all(text.as_bytes())?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Merge key deltas into the legacy unquoted `KEY=value` representation.
+    /// Scope configuration historically writes this shape, while worker env
+    /// files use [`Self::write`]'s quoted/header form. Both paths share the
+    /// same lock and reload under it, so concurrent UI saves cannot resurrect
+    /// a stale copy of another setting merely because their serialization
+    /// formats differ.
+    pub(crate) fn merge_plain(
+        path: &Path,
+        updates: &[(String, Option<String>)],
+    ) -> std::io::Result<()> {
+        let _guard = env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut current: std::collections::BTreeMap<String, String> =
+            crate::config::parse_env_file(path).into_iter().collect();
+        for (key, value) in updates {
+            match value {
+                Some(value) => {
+                    current.insert(key.clone(), value.clone());
+                }
+                None => {
+                    current.remove(key);
+                }
+            }
+        }
+        let text: String = current.iter().map(|(key, value)| format!("{key}={value}\n")).collect();
+        use std::io::Write as _;
+        if let Some(dir) = path.parent() { std::fs::create_dir_all(dir)?; }
+        let tmp = unique_tmp_path(path);
+        {
+            let mut file = std::fs::File::create(&tmp)?;
+            #[cfg(unix)] {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
         }
         std::fs::rename(&tmp, path)
     }
@@ -363,6 +438,28 @@ pub(crate) fn scoped_setting_in(home: &std::path::Path, lane: &str, key: &str) -
         }
     }
     EnvFile::load(&home.join("amux.env")).get(key).and_then(nonempty)
+}
+
+/// Resolve `CC_SEND_ALLOW` while preserving an explicit empty value.
+///
+/// The general scoped resolver deliberately treats empty as absent because
+/// most switches spell an override as `0`. Cross-worker reach predates that
+/// convention: its persisted opt-out is an empty allow-list. Once the product
+/// default became open, collapsing empty into absent made OFF reload as ON —
+/// exactly the resetting toggle the user observed. Same layer order as the
+/// launched shell and [`scoped_setting_in`], but presence and value stay two
+/// separate facts.
+pub(crate) fn cross_group_allow_setting_in(
+    home: &std::path::Path,
+    lane: &str,
+) -> Option<String> {
+    for path in scope_env_layers(home, lane).into_iter().rev() {
+        let cfg = EnvFile::load(&path);
+        if let Some(v) = cfg.get("CC_SEND_ALLOW") {
+            return Some(v.trim().trim_matches('"').to_string());
+        }
+    }
+    None
 }
 
 fn provider_of(cfg: &EnvFile) -> String {
@@ -1720,6 +1817,86 @@ pub const GENERATIONS_WARN_AT: u32 = 20;
 /// be EXECUTED by a test rather than paraphrased by one (ethos rule 7: a test
 /// that restates the list is green whichever columns the shipped path
 /// actually touches).
+/// What a RENAME must do with a table keyed by a session name (AMUX-4033).
+pub enum RenameDisposition {
+    /// The rows are the lane's own state and must follow it. Orphaning them
+    /// silently changes the worker's behaviour under a cosmetic rename.
+    Migrate,
+    /// An append-only record of what happened UNDER THAT NAME. Rewriting it
+    /// would falsify history, so it deliberately keeps the old name. The string
+    /// is why, because "not in the list" and "deliberately excluded" look
+    /// identical to the next reader.
+    KeepForAudit(&'static str),
+}
+
+/// EVERY table with a session-name column, and its disposition.
+///
+/// THE LIST USED TO BE THE BUG. The cascade carried two hand-maintained arrays,
+/// and a table added later simply never joined them — no error, no warning, the
+/// rows just stopped being addressable. Measured 2026-09-02 while renaming
+/// `leadership-coaching`: 12 of 21 session-keyed tables were uncovered,
+/// including `token_ledger` (the lane's whole cost history) and
+/// `telegram_mappings` (chat routing, so messages would address a dead name).
+///
+/// `tests/rename_covers_every_session_table.rs` enumerates the schema BUILT FROM
+/// MIGRATIONS and fails on any table missing here, so the next one cannot join
+/// that gap quietly — the same argument AF-328 made for the issues fixture.
+pub const SESSION_SCOPED_TABLES: &[(&str, RenameDisposition)] = &[
+    // -- the lane's own state: must follow the rename --
+    ("issues", RenameDisposition::Migrate),
+    ("schedules", RenameDisposition::Migrate),
+    ("session_gates", RenameDisposition::Migrate),
+    ("saved_messages", RenameDisposition::Migrate),
+    ("steering_queue", RenameDisposition::Migrate),
+    ("steering_history", RenameDisposition::Migrate),
+    ("share_tokens", RenameDisposition::Migrate),
+    ("cmd_history", RenameDisposition::Migrate),
+    ("token_ledger", RenameDisposition::Migrate),
+    ("tasks", RenameDisposition::Migrate),
+    ("task_windows", RenameDisposition::Migrate),
+    ("telegram_mappings", RenameDisposition::Migrate),
+    ("mdai_runs", RenameDisposition::Migrate),
+    ("board_drive_nudge_state", RenameDisposition::Migrate),
+    ("dictation_history", RenameDisposition::Migrate),
+    ("reclaim_quarantine", RenameDisposition::Migrate),
+    ("send_dedup", RenameDisposition::Migrate),
+    // -- history written under the old name: keeps it, on purpose --
+    (
+        "session_events",
+        RenameDisposition::KeepForAudit(
+            "the rename journal entry links the old and new name, so the audit \
+             trail stays readable across the rename",
+        ),
+    ),
+    (
+        "logs",
+        RenameDisposition::KeepForAudit("a log line records who emitted it at the time"),
+    ),
+    (
+        "guard_verdicts",
+        RenameDisposition::KeepForAudit(
+            "AF-127 outcome rows exist to measure a false-positive rate over time; \
+             rewriting the actor would re-attribute past verdicts",
+        ),
+    ),
+    (
+        "reclaim_scans",
+        RenameDisposition::KeepForAudit("a scan is a dated observation, not live state"),
+    ),
+];
+
+/// The `Migrate` tables a plain `SET session=?1 WHERE session=?2` handles —
+/// everything except the ones [`RENAME_MIGRATIONS`] already covers with custom
+/// SQL (those filter on `deleted IS NULL` or touch a second column).
+pub fn simple_rename_tables() -> Vec<&'static str> {
+    const CUSTOM: [&str; 4] = ["issues", "schedules", "session_gates", "saved_messages"];
+    SESSION_SCOPED_TABLES
+        .iter()
+        .filter(|(t, d)| matches!(d, RenameDisposition::Migrate) && !CUSTOM.contains(t))
+        .map(|(t, _)| *t)
+        .collect()
+}
+
 pub const RENAME_MIGRATIONS: [(&str, &str); 6] = [
     ("issues", "UPDATE issues SET session=?1 WHERE session=?2 AND deleted IS NULL"),
     // BEYOND PYTHON, and the reason AMUX-3749 exists: the cascade
@@ -3244,13 +3421,15 @@ pub(crate) async fn emit_event_store(store: &crate::db::SharedStore, session: &s
 
 /// The secret-redaction pass Python applies before any chat text lands in a
 /// DB row (py:8676 _cmd_hist_record / py:8655 steer history — AMUX-2525).
-/// Same pattern family as the pipe-pane redactor (py:21478).
+/// Same pattern family as the delivery/history redactor (py:21478). Terminal
+/// output itself is intentionally preserved; this helper protects copied text
+/// that is about to enter a shared record.
 pub(crate) fn redact_secrets(text: &str) -> String {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
         regex::Regex::new(
-            r"((?:mxp|usr|ret)_sk)_[A-Za-z0-9_-]+|((?:AMUX_MIXPEEK_OPS_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY|GOOGLE_MAPS_API_KEY|GOOGLE_API_KEY|CLOUDFLARE_API_TOKEN|ELEVENLABS_API_KEY|POSTHOG_KEY|POSTHOG_PERSONAL_API_KEY)=)[^\s\r\n]+|(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]+|sk-ant-[A-Za-z0-9_-]+|sk-proj-[A-Za-z0-9_-]+|sk[_-][A-Za-z0-9]{32,}|AIza[0-9A-Za-z_-]{30,}|(?:phx|phc)_[A-Za-z0-9]+",
+            r"((?:mxp|usr|ret)_sk)_[A-Za-z0-9_-]+|((?i:[A-Z_][A-Z0-9_]*(?:PASSWORD|PASSWD|PWD|SECRET|TOKEN|API_KEY|ACCESS_KEY|PRIVATE_KEY|CLIENT_SECRET|CREDENTIAL|_KEY)[A-Z0-9_]*=))[^\s\r\n]+|(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]+|sk-ant-[A-Za-z0-9_-]+|sk-proj-[A-Za-z0-9_-]+|sk[_-][A-Za-z0-9]{32,}|AIza[0-9A-Za-z_-]{30,}|(?:phx|phc)_[A-Za-z0-9]+",
         )
         .expect("redact regex")
     });
@@ -3455,10 +3634,19 @@ pub(crate) fn redact_prompt_secrets(s: &str) -> String {
     out = tok
         .replace_all(&out, |c: &regex::Captures| {
             let m = &c[0];
+            // Absolute/relative filesystem paths and lowercase kebab-case
+            // filenames are not credentials. The previous "any punctuation"
+            // rule treated `/Users/.../video-moderation-launch-9x16` as a
+            // token, replacing the useful part of every produced-asset link
+            // with `[REDACTED]`. Known token prefixes were already handled
+            // above; a path must retain its identity to remain auditable.
+            if m.starts_with('/') || m.starts_with("./") || m.starts_with("../") {
+                return m.to_string();
+            }
             let has_upper = m.bytes().any(|b| b.is_ascii_uppercase());
             let has_lower = m.bytes().any(|b| b.is_ascii_lowercase());
-            let has_punct = m.bytes().any(|b| matches!(b, b'+' | b'/' | b'=' | b'-'));
-            if (has_upper && has_lower) || has_punct {
+            let has_b64_punct = m.bytes().any(|b| matches!(b, b'+' | b'/' | b'='));
+            if (has_upper && has_lower) || has_b64_punct {
                 "[REDACTED]".to_string()
             } else {
                 m.to_string() // pure-hex / single-case run (git sha, hex hash): leave it
@@ -3580,8 +3768,12 @@ fn mint_capture_card(
             ask_type: None,
             ask_question: None,
             ask_unblocks: None,
+            ask_actor: None,
             // AF-367: an auto-captured human prompt — the population AF-367 is about.
             source: Some("capture".into()),
+            requested_by: None,
+            callback_session: None,
+            callback_prompt: None,
         },
         now_ms / 1000,
     )?;
@@ -3759,13 +3951,29 @@ pub(crate) async fn cmd_hist_record_full(
                     delivery, queued_at_ms, delivered_at_ms, submit_verdict
                 ],
             )?;
-            msg_row_id_w.store(conn.last_insert_rowid(), std::sync::atomic::Ordering::SeqCst);
+            let row_id = conn.last_insert_rowid();
+            msg_row_id_w.store(row_id, std::sync::atomic::Ordering::SeqCst);
             conn.execute(
                 "DELETE FROM cmd_history WHERE session=?1 AND id NOT IN \
                  (SELECT id FROM cmd_history WHERE session=?1 ORDER BY ts DESC LIMIT ?2)",
                 rusqlite::params![session, CMD_HIST_KEEP],
             )?;
-            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            // cmd_history is the durable Messages ledger, but this write used
+            // to publish no StateEvent. A healthy SSE client therefore had no
+            // reason to refetch Messages: the row appeared only after a manual
+            // reload, while the less-healthy polling fallback happened to look
+            // current. Publish the committed fact without its text payload;
+            // SSE turns Message into a coalesced `messages` invalidation and
+            // the authenticated history endpoint remains the data plane.
+            Ok(crate::db::WriteOutcome {
+                applied: true,
+                events: vec![crate::db::PendingEvent {
+                    entity_type: amux_core::revision::EntityType::Message,
+                    entity_id: format!("MSG-{row_id}"),
+                    mutation: amux_core::revision::MutationKind::Created,
+                    payload: None,
+                }],
+            })
         })
         .await;
 
@@ -3966,6 +4174,43 @@ pub(crate) async fn steer_enqueue_precond(
     sender: &str,
     precond: Option<(&str, i64)>,
 ) -> Result<String, &'static str> {
+    steer_enqueue_precond_with_id(store, name, text, guard, sender, precond, None).await
+}
+
+/// Board callbacks use a stable id so a crash between enqueue and marking the
+/// card cannot duplicate a callback. If the id is already queued its payload
+/// is refreshed in place; if it is in steering_history it is already delivered
+/// and is not queued again.
+#[must_use = "board callbacks must record whether their delivery was queued or refused"]
+pub(crate) async fn steer_enqueue_idempotent(
+    state: &AppState,
+    name: &str,
+    text: &str,
+    guard: &str,
+    sender: &str,
+    message_id: &str,
+) -> Result<String, &'static str> {
+    steer_enqueue_precond_with_id(
+        &state.store,
+        name,
+        text,
+        guard,
+        sender,
+        None,
+        Some(message_id),
+    )
+    .await
+}
+
+async fn steer_enqueue_precond_with_id(
+    store: &crate::db::SharedStore,
+    name: &str,
+    text: &str,
+    guard: &str,
+    sender: &str,
+    precond: Option<(&str, i64)>,
+    stable_id: Option<&str>,
+) -> Result<String, &'static str> {
     // ZERO AMUX HARNESS INTO AN ISOLATED LANE (Ethan, 2026-08-26: "isolated =
     // zero amux harness, just raw LLM pass through"), gated at the CHOKEPOINT
     // for the same reason AF-188 put the archived refusal here.
@@ -4038,7 +4283,9 @@ pub(crate) async fn steer_enqueue_precond(
         );
         return Err(reason);
     }
-    let msg_id = format!("steer-{}", (now_f64() * 1000.0) as i64);
+    let msg_id = stable_id
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("steer-{}", (now_f64() * 1000.0) as i64));
     let id = msg_id.clone();
     // The id we RETURN must be the row that actually exists. When a guarded
     // re-enqueue updates the prior row in place (AMUX-3557) the freshly minted
@@ -4052,9 +4299,46 @@ pub(crate) async fn steer_enqueue_precond(
     let guard_s = guard.to_string();
     let sender_s = sender.to_string();
     let precond_w = precond.map(|(c, r)| (c.to_string(), r));
-    let _ = store
+    let stable_w = stable_id.map(str::to_string);
+    let should_emit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let should_emit_w = should_emit.clone();
+    let persisted = store
         .write_async(move |conn| {
             ensure_fleet_tables(conn)?;
+            if let Some(ref fixed) = stable_w {
+                let delivered = conn
+                    .query_row(
+                        "SELECT 1 FROM steering_history WHERE id=?1 LIMIT 1",
+                        rusqlite::params![fixed],
+                        |_| Ok(true),
+                    )
+                    .unwrap_or(false);
+                if delivered {
+                    should_emit_w.store(false, std::sync::atomic::Ordering::SeqCst);
+                    if let Ok(mut g) = effective_id_w.lock() {
+                        *g = fixed.clone();
+                    }
+                    return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+                }
+                let queued = conn
+                    .query_row(
+                        "SELECT 1 FROM steering_queue WHERE id=?1 LIMIT 1",
+                        rusqlite::params![fixed],
+                        |_| Ok(true),
+                    )
+                    .unwrap_or(false);
+                if queued {
+                    conn.execute(
+                        "UPDATE steering_queue SET text=?1, session=?2, guard=?3, sender=?4 \
+                         WHERE id=?5",
+                        rusqlite::params![text_s, session, guard_s, sender_s, fixed],
+                    )?;
+                    if let Ok(mut g) = effective_id_w.lock() {
+                        *g = fixed.clone();
+                    }
+                    return Ok(crate::db::WriteOutcome { applied: true, events: vec![] });
+                }
+            }
             // A GUARDED RE-ENQUEUE UPDATES IN PLACE AND KEEPS `queued_at`
             // (AMUX-3557). This was DELETE-then-INSERT, which looks like the
             // same thing and is not: the new row got `now_f64()`, so a guarded
@@ -4116,15 +4400,20 @@ pub(crate) async fn steer_enqueue_precond(
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         })
         .await;
-    emit_event_store(
-        store,
-        name,
-        "message.queued",
-        Some(json!({"chars": text.chars().count(), "preview": chars_truncate(text, 120), "guard": if guard.is_empty() { Value::Null } else { json!(guard) }})),
-        Some(format!("q:{msg_id}")),
-        "steering",
-    )
-    .await;
+    if persisted.is_err() {
+        return Err("could not persist steering message");
+    }
+    if should_emit.load(std::sync::atomic::Ordering::SeqCst) {
+        emit_event_store(
+            store,
+            name,
+            "message.queued",
+            Some(json!({"chars": text.chars().count(), "preview": chars_truncate(text, 120), "guard": if guard.is_empty() { Value::Null } else { json!(guard) }})),
+            Some(format!("q:{msg_id}")),
+            "steering",
+        )
+        .await;
+    }
     // The row that exists, not the one we minted (AMUX-3557).
     Ok(effective_id.lock().map(|g| g.clone()).unwrap_or(msg_id))
 }
@@ -6247,8 +6536,7 @@ fn tmux_rows() -> String {
     std::env::var("AMUX_TMUX_ROWS").ok().filter(|v| v.parse::<u32>().is_ok()).unwrap_or_else(|| "50".into())
 }
 
-/// The `pipe-pane` writer program (py:21478 `_log_pipe_command` was
-/// redaction-only; AMUX-2628 rewrote it).
+/// The `pipe-pane` writer program (AMUX-2628).
 ///
 /// **Why this is not `for line in sys.stdin.buffer`.** That is what shipped,
 /// and it froze every log on the fleet for over an hour with `pane_pipe=1`
@@ -6280,11 +6568,6 @@ fn tmux_rows() -> String {
 fn log_pipe_command(log_path: &Path) -> String {
     const PROG: &str = r#"import os,re,select,sys,time
 LOG=sys.argv[1]; MAXB=int(sys.argv[2]); RAW=sys.argv[3]=='1'; FLUSH=int(sys.argv[4])/1000.0
-SEC=re.compile(rb'((?:mxp|usr|ret)_sk)_[A-Za-z0-9_-]+|((?:AMUX_MIXPEEK_OPS_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY|GOOGLE_MAPS_API_KEY|GOOGLE_API_KEY|CLOUDFLARE_API_TOKEN|ELEVENLABS_API_KEY|POSTHOG_KEY|POSTHOG_PERSONAL_API_KEY)=)[^\s\r\n]+|(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]+|sk-ant-[A-Za-z0-9_-]+|sk-proj-[A-Za-z0-9_-]+|sk[_-][A-Za-z0-9]{32,}|AIza[0-9A-Za-z_-]{30,}|(?:phx|phc)_[A-Za-z0-9]+')
-def repl(m):
-    if m.group(1): return m.group(1)+b'_REDACTED'
-    if m.group(2): return m.group(2)+b'REDACTED'
-    return b'SECRET_REDACTED'
 CSI=re.compile(rb'\x1b\[[0-9;?]*([a-zA-Z])')
 def csi(m):
     f=m.group(1)
@@ -6309,7 +6592,7 @@ def rot():
 prev=None
 def emit(seg,redraw):
     global prev
-    s=SEC.sub(repl,seg)
+    s=seg
     if RAW:
         try: fh.write(s+b'\n')
         except OSError: return
@@ -6328,7 +6611,7 @@ if RAW:
     while True:
         c=os.read(0,65536)
         if not c: break
-        try: fh.write(SEC.sub(repl,c))
+        try: fh.write(c)
         except OSError: break
         rot()
     sys.exit(0)
@@ -6379,7 +6662,7 @@ fn log_rotate_bytes() -> u64 {
 }
 
 /// `AMUX_LOG_RAW=1` keeps the verbatim byte stream (colour, cursor escapes)
-/// instead of readable text. Secrets are still redacted in both modes.
+/// instead of readable text. Worker output is never content-redacted.
 fn log_raw_capture() -> bool {
     matches!(std::env::var("AMUX_LOG_RAW").unwrap_or_default().trim(), "1" | "true" | "yes")
 }
@@ -6989,18 +7272,34 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
     if provider != "codex" && provider != "gemini" && provider != "ollama" && has_oauth {
         shell_rc.push_str("unset ANTHROPIC_API_KEY; ");
     }
+    // Settings writes provider keys to server.env at runtime. Reading that file
+    // here is what makes the next worker actually inherit a key saved through
+    // the UI; std::env still contains only the values captured at server boot.
+    // Keep the values out of shell_rc/logs and pass them straight to tmux's
+    // child environment.
+    let runtime_provider_env = super::settings::runtime_provider_env(&home());
+    let provider_value = |key: &str| {
+        runtime_provider_env
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.clone())
+    };
     let mut env_args: Vec<String> = Vec::new();
     if has_oauth {
         env_args.push("-e".into());
         env_args.push("ANTHROPIC_API_KEY=".into());
-    } else if let Ok(v) = std::env::var("ANTHROPIC_API_KEY") {
-        if !v.is_empty() {
+    } else if let Some(v) = provider_value("ANTHROPIC_API_KEY") {
+        env_args.push("-e".into());
+        env_args.push(format!("ANTHROPIC_API_KEY={v}"));
+    }
+    for k in ["OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"] {
+        if let Some(v) = provider_value(k) {
             env_args.push("-e".into());
-            env_args.push(format!("ANTHROPIC_API_KEY={v}"));
+            env_args.push(format!("{k}={v}"));
         }
     }
     for k in [
-        "ANTHROPIC_API_BASE", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY",
+        "ANTHROPIC_API_BASE",
         "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION",
     ] {
         if let Ok(v) = std::env::var(k) {
@@ -7013,6 +7312,37 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
 
     let tmux_sess = tmux_name(name);
     let tmux_exists = tmux_sessions_set().await.contains(&tmux_sess);
+    if tmux_exists {
+        // A stopped worker keeps its tmux session and shell. Updating
+        // server.env and pressing Start must not reuse the credentials that
+        // shell inherited before the PATCH. Refresh tmux's session environment
+        // now; the shell imports it below without ever printing a value.
+        // Bound as `st`, not `target`: tests/tmux_target_audit.rs whitelists the
+        // literal expressions ["st","pt","stq","ptq"] as a `-t` argument, so a
+        // correctly-derived target under any other name fails the audit. The
+        // VALUE was already exact here (st() is session_target(tmux_name(..)),
+        // i.e. "=amux-<n>"); only the binding's name was outside the list, and
+        // `let pt = pane_target(sess)` a few thousand lines down is the same
+        // convention.
+        let st = st(name);
+        for key in super::settings::PROVIDER_ENV_KEYS {
+            let value = if has_oauth && key == "ANTHROPIC_API_KEY" {
+                None
+            } else {
+                provider_value(key)
+            };
+            let refreshed = match value {
+                Some(value) => tmux(&["set-environment", "-t", &st, key, &value]).await,
+                None => tmux(&["set-environment", "-u", "-t", &st, key]).await,
+            };
+            if !refreshed.map(|out| out.status.success()).unwrap_or(false) {
+                return (
+                    false,
+                    format!("could not refresh {key} for the existing tmux session"),
+                );
+            }
+        }
+    }
     if tmux_exists {
         // Reuse the surviving tmux session (py:24589).
         let output = tmux_capture(name, 10).await;
@@ -7045,6 +7375,20 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
                 poll_shell_prompt(name, 3000).await;
             }
         }
+        // `tmux set-environment` changes what future pane processes inherit;
+        // this shell already exists. Import the session environment through
+        // tmux's shell-escaped output. The typed command contains no values,
+        // so provider keys cannot land in terminal history or pane logs.
+        let target = st(name);
+        type_line(
+            name,
+            &format!(
+                "eval \"$(tmux show-environment -s -t {})\"",
+                sh_quote(&target)
+            ),
+        )
+        .await;
+        poll_shell_prompt(name, 3000).await;
     } else {
         // Fresh tmux session hosting the user's login shell (py:24647).
         let cols = tmux_cols();
@@ -7284,14 +7628,24 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
     meta.insert("last_started".into(), json!(now_i64()));
     let count = meta.get("start_count").and_then(|v| v.as_i64()).unwrap_or(0);
     meta.insert("start_count".into(), json!(count + 1));
-    let pending_reload = meta.remove("pending_log_reload").is_some();
+    // Old `pending_log_reload` keys are consumed for migration, but the new
+    // worker never receives raw terminal replay. Durable board state is the
+    // cross-provider continuity contract.
+    let pending_resume = meta.remove("pending_structured_resume").is_some()
+        || meta.remove("pending_log_reload").is_some();
     let pending_reason = meta
-        .remove("pending_log_reload_reason")
+        .remove("pending_structured_resume_reason")
+        .or_else(|| meta.remove("pending_log_reload_reason"))
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_default();
     save_meta(name, &meta);
-    if pending_reload && log_path(name).exists() {
-        let prompt = log_reload_prompt(name, &pending_reason);
+    if pending_resume {
+        let prompt = structured_resume_prompt(name, &pending_reason);
+        tracing::info!(
+            session = %name,
+            reason = %pending_reason,
+            "context hydration: structured board state queued; raw terminal replay suppressed"
+        );
         let st2 = state.clone();
         let n = name.to_string();
         tokio::spawn(async move { send_after_ready(st2, n, prompt, 60, SendOrigin::Automation).await });
@@ -7331,20 +7685,16 @@ fn libc_geteuid() -> u32 {
     })
 }
 
-fn log_reload_prompt(name: &str, reason: &str) -> String {
-    let lp = log_path(name);
-    let size = lp.metadata().map(|m| m.len()).unwrap_or(0);
-    let size_mb = size as f64 / (1024.0 * 1024.0);
-    let cap_mb = MAX_LOG_BYTES / (1024 * 1024);
+fn structured_resume_prompt(name: &str, reason: &str) -> String {
     let reason_text = if reason.is_empty() { "session swap" } else { reason };
     format!(
-        "Before continuing, load the previous amux terminal context.\n\n\
-         The log tail captured for this {reason_text} is at:\n{}\n\n\
-         Read that file now. It contains up to the last {cap_mb} MB of this \
-         session's terminal history ({size_mb:.1} MB currently saved). Use it \
-         as continuity context for the work in this session. Do not summarize it \
-         back unless asked.",
-        lp.display()
+        "Continue this worker after a {reason_text} using durable amux state, not terminal \
+         replay. Run `amux board ls --session {name}` and inspect every non-terminal card \
+         assigned to this worker with `amux board show <ID>`. Treat each card's source message, \
+         epic, dependencies, priority, next action, gates, worker actions, and produced assets \
+         as the source of truth. Resume the highest-priority actionable card and keep driving \
+         until no actionable non-terminal work remains. Consult a linked message only when the \
+         card says context is missing. Do not automatically load the worker terminal log."
     )
 }
 
@@ -7660,79 +8010,6 @@ fn write_plain_log(name: &str) -> Option<(PathBuf, usize)> {
     Some((cp, clean.len()))
 }
 
-/// py:22616 _capture_log_tail_for_reload — persist the last MAX_LOG_BYTES of
-/// output before a provider/model/effort/yolo swap.
-async fn capture_log_tail_for_reload(name: &str, reason: &str) -> bool {
-    if !valid_session_name(name) {
-        return false;
-    }
-    let _ = std::fs::create_dir_all(logs_dir());
-    let lp = log_path(name);
-    let mut chunks: Vec<u8> = Vec::new();
-    let existing = load_session_log(name, MAX_LOG_BYTES as u64);
-    chunks.extend_from_slice(existing.as_bytes());
-    let mut captured = String::new();
-    let mut was_piped = false;
-    if is_running(name).await {
-        let ptq = pt(name);
-        // Detaching the pipe is deliberate: the whole-file rewrite below would
-        // otherwise race the writer's appends. But it has to be put BACK —
-        // this used to detach and return, so any provider/model/effort/yolo
-        // swap left the session permanently unlogged with nothing reporting it.
-        was_piped = pane_is_piped(name).await;
-        let _ = tmux(&["pipe-pane", "-t", &ptq]).await;
-        if let Some(o) = run_cmd("tmux", &["capture-pane", "-t", &ptq, "-p", "-S", "-"], Duration::from_secs(30)).await {
-            captured = String::from_utf8_lossy(&o.stdout).into_owned();
-        }
-    }
-    if !captured.trim().is_empty() {
-        let safe_reason = reason.replace('\n', " ").trim().to_string();
-        let safe_reason = if safe_reason.is_empty() { "session swap".to_string() } else { safe_reason };
-        let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S");
-        let marker = format!("\n\n=== Captured before {safe_reason}: {ts} ===\n\n");
-        let cap_text = if tmux_alt_screen(name).await {
-            collapse_blank_runs(&captured)
-        } else {
-            captured
-        };
-        chunks.extend_from_slice(marker.as_bytes());
-        chunks.extend_from_slice(cap_text.as_bytes());
-    }
-    if chunks.is_empty() {
-        if was_piped {
-            rearm_log_pipe(name).await;
-        }
-        return false;
-    }
-    let start = chunks.len().saturating_sub(MAX_LOG_BYTES);
-    let ok = std::fs::write(&lp, &chunks[start..]).is_ok();
-    if was_piped {
-        rearm_log_pipe(name).await;
-    }
-    ok
-}
-
-/// Is this pane currently piped? `#{pane_pipe}` is tmux's own answer, and it
-/// is the field the stale-log verdict in `/api/debug/logs` keys off.
-async fn pane_is_piped(name: &str) -> bool {
-    let ptq = pt(name);
-    match tmux(&["list-panes", "-t", &ptq, "-F", "#{pane_pipe}"]).await {
-        Some(o) => String::from_utf8_lossy(&o.stdout).lines().any(|l| l.trim() == "1"),
-        None => false,
-    }
-}
-
-/// Re-attach the log pipe. Same construction as `start_session` and, like it,
-/// without `-o` — see the comment there for why `-o` silently disables the
-/// pipe it is supposed to guard.
-async fn rearm_log_pipe(name: &str) {
-    let _ = std::fs::create_dir_all(logs_dir());
-    let lp = log_path(name);
-    let ptq = pt(name);
-    let pipe_cmd = log_pipe_command(&lp);
-    let _ = tmux(&["pipe-pane", "-t", &ptq, &pipe_cmd]).await;
-}
-
 /// Previous generation produced by the writer's rotation.
 fn rotated_log_path(name: &str) -> PathBuf {
     logs_dir().join(format!("{name}.log.1"))
@@ -8004,11 +8281,31 @@ pub async fn debug_logs(RawQuery(q): RawQuery) -> Response {
     ))
 }
 
-fn mark_pending_log_reload(name: &str, reason: &str) {
+fn mark_pending_structured_resume(name: &str, reason: &str) {
     update_meta(
         name,
-        &[("pending_log_reload", json!(now_i64())), ("pending_log_reload_reason", json!(reason))],
+        &[
+            ("pending_structured_resume", json!(now_i64())),
+            ("pending_structured_resume_reason", json!(reason)),
+        ],
     );
+}
+
+/// A model/provider switch is the one moment the harness has direct evidence
+/// that a configured model became the running model. Keep that fact separate
+/// from provider self-reports, which may belong to the previous process life.
+fn set_confirmed_active_model(name: &str, provider: &str, model: Option<&str>) {
+    let mut meta = load_meta(name);
+    if let Some(model) = model.filter(|m| !m.trim().is_empty()) {
+        meta.insert("active_model_confirmed".into(), json!(model));
+        meta.insert("active_model_provider".into(), json!(provider));
+        meta.insert("active_model_confirmed_at".into(), json!(now_i64()));
+    } else {
+        meta.remove("active_model_confirmed");
+        meta.remove("active_model_provider");
+        meta.remove("active_model_confirmed_at");
+    }
+    save_meta(name, &meta);
 }
 
 // ---------------------------------------------------------------------------
@@ -8524,9 +8821,10 @@ const FLEET_ROSTER_HEADER: &str = "\n## Fleet — who else is running (auto-gene
      Every live worker is listed, INCLUDING YOU — this file is shared by every lane in \
      this directory, so it cannot omit the reader. You are the one whose name matches \
      $AMUX_SESSION.\n\n\
-     Reach any of them with `amux send <name> --stdin` (origin-stamped). Peek before \
-     interrupting: `curl -sk $AMUX_URL/api/sessions/<name>/peek?lines=200`.\n\n\
-     | worker | groups | description |\n|---|---|---|\n";
+     Reach any of them with `amux send <name> --stdin` (origin-stamped), or make \
+     durable delegated work with `amux board request <name> <title>`. \
+     The latter keeps the request, gates, assets and terminal return on one card.\n\n\
+     | worker | groups | description | provider / model | workspace / branch |\n|---|---|---|---|---|\n";
 
 /// The fleet roster every worker gets, regenerated on each write.
 ///
@@ -8541,10 +8839,11 @@ const FLEET_ROSTER_HEADER: &str = "\n## Fleet — who else is running (auto-gene
 /// session env files that are already the source of truth for the worker list,
 /// so a roster cannot drift from the fleet the way a checked-in list would.
 ///
-/// Excludes archived lanes and the reader itself — "who else is out there" is
-/// the question, and 50 rows of which one is you is noise.
+/// Excludes archived/isolated lanes. It deliberately includes the reader: the
+/// roster is one shared generated file, so a per-reader omission would either
+/// require N copies or make the contents depend on whoever regenerated it.
 fn fleet_roster() -> String {
-    let mut rows: Vec<(String, String, String)> = Vec::new();
+    let mut rows: Vec<(String, String, String, String, String)> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(sessions_dir()) {
         let mut names: Vec<String> = rd
             .flatten()
@@ -8586,18 +8885,35 @@ fn fleet_roster() -> String {
                 })
                 .unwrap_or_default();
             let desc = env.get("CC_DESC").cloned().unwrap_or_default();
-            rows.push((other, groups, desc));
+            let provider = env.get("CC_PROVIDER").cloned().unwrap_or_else(|| "claude".into());
+            let model = env.get("CC_MODEL").cloned().unwrap_or_default();
+            let runtime = if model.is_empty() { provider } else { format!("{provider} / {model}") };
+            let dir = env.get("CC_DIR").cloned().unwrap_or_default();
+            let branch = env.get("CC_BRANCH").cloned().unwrap_or_default();
+            let workspace = if branch.is_empty() { dir } else { format!("{dir} @ {branch}") };
+            rows.push((other, groups, desc, runtime, workspace));
         }
     }
     if rows.is_empty() {
         return String::new();
     }
     let mut out = String::from(FLEET_ROSTER_HEADER);
-    for (n, g, d) in rows.iter().take(120) {
-        let d = d.replace('|', "\\|").chars().take(110).collect::<String>();
-        out.push_str(&format!("| `{n}` | {} | {} |\n", if g.is_empty() { "—" } else { g }, if d.is_empty() { "—" } else { &d }));
+    for (n, g, d, r, w) in rows.iter().take(120) {
+        let cell = |s: &str, max: usize| {
+            let escaped = s.replace('|', "\\|").replace('\n', " ");
+            let trimmed = escaped.chars().take(max).collect::<String>();
+            if trimmed.is_empty() { "—".to_string() } else { trimmed }
+        };
+        out.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} |\n",
+            cell(n, 64), cell(g, 80), cell(d, 110), cell(r, 80), cell(w, 140)
+        ));
     }
-    out.push_str(&format!("\n{} peer worker(s). Same-group peers share memory, env and gates.\n", rows.len()));
+    out.push_str(&format!(
+        "\n{} discoverable peer worker(s). Cross-group messaging is open by default; \
+         isolation is the explicit opt-out.\n",
+        rows.len()
+    ));
     out
 }
 
@@ -10698,12 +11014,28 @@ pub async fn steer_deliver_for_session(state: &AppState, session: &str) -> bool 
 // silently unlogged 29 of 60 panes.
 //
 // The writer comes from log_pipe_command() and is never hand-rolled, because
-// that function is where REDACTION lives (sk-ant-, ANTHROPIC_API_KEY=, ghp_,
-// AIza..., sk-proj-, POSTHOG_KEY). Re-arming a pane with a bare `cat` works and
-// redacts nothing — I did exactly that by hand while diagnosing this and had to
-// detach it. "Re-arming is safe" is true of the tmux VERB, not of an arbitrary
-// command handed to it.
+// that function owns the readable/raw capture contract, CR/LF handling,
+// rotation, and flush behavior. "Re-arming is safe" is true of the tmux VERB,
+// not of an arbitrary command handed to it.
 // ---------------------------------------------------------------------------
+
+fn pipe_writer_fingerprint() -> String {
+    // Stable FNV-1a over the complete generated command. Unlike a hand-maintained
+    // version number this changes whenever the embedded writer OR one of its
+    // effective runtime knobs changes, so a deployment cannot leave old writer
+    // children running indefinitely behind pane_pipe=1.
+    let command = log_pipe_command(Path::new("__amux_log_path__"));
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in command.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn pipe_writer_marker_path() -> PathBuf {
+    logs_dir().join(".pipe-writer-version")
+}
 
 /// Should this pane be re-armed? Pure, so the discriminator is testable without
 /// a tmux server — and so the NEGATIVE case is pinned as tightly as the
@@ -10713,8 +11045,8 @@ pub async fn steer_deliver_for_session(state: &AppState, session: &str) -> bool 
 /// those would spray shell noise into per-worker logs for lanes that have no
 /// worker; 10 of the 11 unpiped panes measured were exactly that (disposable
 /// smprobe*/zz-* test lanes) and only ONE was a live agent.
-fn should_rearm_pipe(pane_pipe: i64, children: usize) -> bool {
-    pane_pipe == 0 && children > 0
+fn should_rearm_pipe(pane_pipe: i64, children: usize, writer_changed: bool) -> bool {
+    children > 0 && (pane_pipe == 0 || writer_changed)
 }
 
 /// One reconciliation pass. Returns how many panes were re-armed — a count, so
@@ -10728,8 +11060,17 @@ pub async fn pipe_reconcile_tick() -> usize {
     else {
         return 0; // tmux unreachable: not a reconciliation, and not a pass
     };
+    if !out.status.success() {
+        return 0;
+    }
+    let fingerprint = pipe_writer_fingerprint();
+    let marker_path = pipe_writer_marker_path();
+    let writer_changed = std::fs::read_to_string(&marker_path)
+        .map(|value| value.trim() != fingerprint)
+        .unwrap_or(true);
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     let mut rearmed = 0usize;
+    let mut failed = false;
     for line in text.lines() {
         let mut f = line.split_whitespace();
         let (Some(sess), Some(pipe), Some(pid)) = (f.next(), f.next(), f.next()) else {
@@ -10744,15 +11085,29 @@ pub async fn pipe_reconcile_tick() -> usize {
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
             .unwrap_or(0);
-        if !should_rearm_pipe(pipe, children) {
+        if !should_rearm_pipe(pipe, children, writer_changed) {
             continue;
         }
         let lp = log_path(name);
         let cmd = log_pipe_command(&lp);
         let pt = pane_target(sess);
-        let _ = tmux(&["pipe-pane", "-t", &pt, &cmd]).await;
-        rearmed += 1;
-        tracing::warn!(session = %name, children, "re-armed a lost pipe-pane");
+        match tmux(&["pipe-pane", "-t", &pt, &cmd]).await {
+            Some(result) if result.status.success() => {
+                rearmed += 1;
+                tracing::warn!(session = %name, children, writer_changed, "re-armed pipe-pane");
+            }
+            _ => {
+                failed = true;
+                tracing::error!(session = %name, children, writer_changed, "failed to re-arm pipe-pane");
+            }
+        }
+    }
+    // Mark the fleet current only after every eligible pane accepted the new
+    // writer. A partial failure deliberately retries the migration next tick.
+    if writer_changed && !failed {
+        if let Err(error) = EnvFile::replace_text(&marker_path, &format!("{fingerprint}\n")) {
+            tracing::error!(error = %error, "failed to persist pipe-writer version");
+        }
     }
     rearmed
 }
@@ -11085,6 +11440,9 @@ pub fn routes() -> Router<AppState> {
         // Fleet-wide cross-group default (AMUX-4018). GET is open; PUT is
         // owner-only, enforced in the handler.
         .route("/api/config/cross-group", axum::routing::get(get_cross_group_config).put(put_cross_group_config))
+        // Fleet-wide board-drain default.  Per-worker/group values still win,
+        // but this is the operator control for "all workers on by default".
+        .route("/api/config/board-drain", axum::routing::get(get_board_drain_config).put(put_board_drain_config))
         .route("/api/sessions/{name}", any(session_root_handler))
         // A WARN nobody can query is the same gap one layer out: this is
         // where a sweep or an autofix loop asks "did anything get delivered
@@ -12845,20 +13203,20 @@ fn dirs_home() -> Option<std::path::PathBuf> {
 
 /// Why a worker-to-worker send is allowed, or `Err(reason)` if it is not.
 ///
-/// Ethan's rule: "worker to worker communication should be limited to intra
-/// group unless explicitly stated." The escapes are CONFIG, never something the
-/// sending agent can assert about itself in a request body — a flag any caller
-/// could set would make the rule advisory.
+/// Worker-to-worker communication is open across the fleet by default. An
+/// explicit empty `CC_SEND_ALLOW` remains a configuration-level opt-out; it is
+/// never a request-body flag that a caller can forge or accidentally override.
 ///
 /// - same group (or a self-send)          -> allowed
-/// - sender's `CC_SEND_ALLOW`             -> groups it may reach, or `*`
+/// - absent sender `CC_SEND_ALLOW`         -> `*` (the product default)
+/// - sender's `CC_SEND_ALLOW`             -> explicit groups, `*`, or empty opt-out
 /// - receiver's `CC_RECEIVE_ANY=1`        -> a documented fleet-wide routing
 ///   target. `amux` is one by construction: the worker roster tells every lane
 ///   to route amux platform bugs here, which IS the explicit statement, and
 ///   683 of the 908 worker-to-worker sends in the 24h before this shipped were
 ///   cross-group — mostly bug reports inbound to this lane. Blocking those
 ///   would have severed the fleet's only bug channel to fix a broadcast problem.
-fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, String> {
+pub(crate) fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, String> {
     if origin.is_empty() || origin == target {
         return Ok("self-or-human");
     }
@@ -12883,7 +13241,7 @@ fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, Strin
     // (AMUX-4015). Both switches below are POLICY — a standing order about who
     // may talk to whom — and AMUX-2930 already established that policy read
     // through `parse_env` is the ethos-rule-1 shape: `/api/scope` advertises
-    // `env` at all three levels and the Scope tab writes all three, so a
+    // `env` at all three levels and the Configurations tab writes all three, so a
     // group-level or global `CC_SEND_ALLOW` saved cleanly and changed nothing,
     // because this gate only ever consulted `sessions/<worker>.env`.
     //
@@ -12912,9 +13270,16 @@ fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, Strin
     if recently_contacted_by(target, origin) {
         return Ok("reply-to-inbound");
     }
-    let allow: Vec<String> = scoped_setting_in(&home, origin, "CC_SEND_ALLOW")
-        .map(|v| v.split(',').map(|t| t.trim().trim_matches('"').to_lowercase()).filter(|t| !t.is_empty()).collect())
-        .unwrap_or_default();
+    // OPEN BY DEFAULT (Ethan, 2026-09-03). An absent setting means `*`; an
+    // explicit empty worker/group/global value remains the opt-out. Keeping
+    // the policy in this one resolver means direct sends, board requests and
+    // reviewer routing cannot acquire three different defaults.
+    let allow: Vec<String> = cross_group_allow_setting_in(&home, origin)
+        .unwrap_or_else(|| "*".into())
+        .split(',')
+        .map(|t| t.trim().trim_matches('"').to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
     if allow.iter().any(|a| a == "*") || allow.iter().any(|a| tg.contains(a)) {
         return Ok("sender-allowlist");
     }
@@ -12922,12 +13287,13 @@ fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, Strin
         if g.is_empty() { "(untagged)".to_string() } else { g.iter().cloned().collect::<Vec<_>>().join(",") }
     };
     Err(format!(
-        "cross-group send refused: {origin} [{}] -> {target} [{}]. Worker-to-worker \
-         messaging is intra-group unless explicitly configured. To allow it \
-         STANDING (no per-message approval): set CC_SEND_ALLOW on {origin} \
+        "cross-group send refused: {origin} [{}] -> {target} [{}]. This worker has \
+         an explicit cross-group opt-out. To allow it STANDING (no per-message \
+         approval): clear that override so it inherits the open fleet default, \
+         or set CC_SEND_ALLOW on {origin} \
          (comma-separated groups, or *), or CC_RECEIVE_ANY=1 on {target} if it is a \
          fleet-wide routing target. BOTH RESOLVE worker > group > global, so the \
-         Scope tab can set them for this one worker, for its whole group, or \
+         Configurations tab can set them for this one worker, for its whole group, or \
          fleet-wide, and a worker-level value overrides a group or global one \
          (AMUX-4015). For a ONE-OFF instead, this refusal mints a grant the owner \
          approves from the dashboard. A human send is never \
@@ -12955,7 +13321,9 @@ async fn get_cross_group_config() -> Response {
     let global = crate::config::parse_env_file(&home.join("amux.env"))
         .get("CC_SEND_ALLOW")
         .map(|v| v.trim().trim_matches('"').to_string())
-        .unwrap_or_default();
+        // Product default: a fresh install is an open peer fleet. Writing an
+        // explicit empty value through PUT is how an owner opts it back out.
+        .unwrap_or_else(|| "*".into());
     let enforcing = std::env::var("AMUX_GROUP_SEND_ENFORCE")
         .map(|v| !matches!(v.trim(), "0" | "false" | "no"))
         .unwrap_or(true);
@@ -13012,11 +13380,70 @@ async fn put_cross_group_config(headers: HeaderMap, body: Option<Json<Value>>) -
         // A worker-level value still overrides this, so the honest message says
         // "default" rather than implying it settles every lane.
         "message": if allow.is_empty() {
-            "cross-group sends are refused by default again; per-worker allowances still apply"
+            "cross-group sends are disabled by an explicit global opt-out; per-worker allowances still apply"
         } else if allow == "*" {
             "every worker may now send to any group by default, no approval needed"
         } else {
             "workers may now send to the listed groups by default"
+        },
+    }))
+}
+
+/// GET /api/config/board-drain — the fleet-wide backlog -> To Do default.
+///
+/// Absence means ON. That is the product default, so a fresh install and an
+/// old install with no override agree. Worker and group scope may still opt a
+/// lane out through the ordinary configuration resolver.
+async fn get_board_drain_config() -> Response {
+    let home = crate::config::amux_home();
+    let key = crate::runtime_jobs::board_drive::DISPATCH_BACKLOG_KEY;
+    let configured = EnvFile::load(&home.join("amux.env"))
+        .get(key)
+        .map(|v| v.trim().trim_matches('"').to_string());
+    let enabled = configured
+        .as_deref()
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(true);
+    j200(json!({
+        "enabled": enabled,
+        "configured": configured,
+        "default_when_unset": true,
+        "note": "worker and group configuration may explicitly opt individual lanes out",
+    }))
+}
+
+/// PUT /api/config/board-drain — set the all-worker backlog-drain default.
+/// Owner-only for the same reason as the cross-group fleet setting: a worker
+/// may tune its own lane, but may not rewrite every peer's automation policy.
+async fn put_board_drain_config(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    if ["x-amux-session", "x-amux-worker"].iter().any(|h| {
+        headers.get(*h).and_then(|v| v.to_str().ok()).is_some_and(|s| !s.trim().is_empty())
+    }) {
+        return jresp(StatusCode::FORBIDDEN, json!({
+            "error": "a worker may not set the fleet-wide board-drain default",
+            "how": "set it from dashboard Settings, or use the worker's Configurations tab for one lane",
+        }));
+    }
+    let b = body.map(|Json(v)| v).unwrap_or(Value::Null);
+    let Some(enabled) = b.get("enabled").and_then(Value::as_bool) else {
+        return jresp(StatusCode::BAD_REQUEST, json!({"error": "enabled must be a boolean"}));
+    };
+    let home = crate::config::amux_home();
+    let path = home.join("amux.env");
+    let key = crate::runtime_jobs::board_drive::DISPATCH_BACKLOG_KEY;
+    let mut cfg = EnvFile::load(&path);
+    cfg.set(key, if enabled { "1" } else { "0" });
+    if cfg.write(&path).is_err() {
+        return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write amux.env"}));
+    }
+    tracing::warn!(enabled, "config: fleet-wide backlog drain default changed");
+    j200(json!({
+        "ok": true,
+        "enabled": enabled,
+        "message": if enabled {
+            "all workers will drain eligible backlog by default"
+        } else {
+            "workers will not drain backlog unless a group or worker override enables it"
         },
     }))
 }
@@ -13088,6 +13515,35 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
         .unwrap_or(true)
     {
         if let Err(reason) = cross_group_send_ok(&send_origin, name) {
+            // Isolation is a permanent reachability boundary, not a permission
+            // prompt. The generic refusal path below used to mint a one-shot
+            // cross-group grant even though approving it could never make an
+            // isolated raw-agent lane a valid peer target. Worse, a previously
+            // approved allowance was consumed before the refusal and bypassed
+            // the isolation check entirely. Return the exact refusal without a
+            // grant: only the owner/dashboard path (empty origin) is allowed.
+            if session_is_isolated(name) {
+                tracing::warn!(origin = %send_origin, target = %name, "{reason}");
+                emit_event(
+                    state,
+                    name,
+                    "send.isolated_refused",
+                    Some(json!({"origin": send_origin, "target": name})),
+                    None,
+                    "isolation",
+                )
+                .await;
+                return jresp(
+                    StatusCode::FORBIDDEN,
+                    json!({
+                        "ok": false,
+                        "error": reason,
+                        "blocked": "isolated",
+                        "code": "isolated_target",
+                        "what_to_do": "An isolated worker is reachable only by its owner from the dashboard; no approval can authorize peer delivery.",
+                    }),
+                );
+            }
             // AN OWNER-APPROVED, SINGLE-USE ALLOWANCE RELEASES EXACTLY ONE SEND
             // (AMUX-3997). Checked before the refusal so an approval the owner
             // already gave is honoured on the worker's own retry.
@@ -14392,13 +14848,61 @@ pub(crate) fn context_pct_remaining(used: u64, window: u64) -> u8 {
 /// ONLY the `subagents` sub-key, preserving state/model/tokens — a subagent
 /// starting or stopping says nothing about the main turn's state.
 async fn subagent_event_post(state: &AppState, name: &str, ev: &str) -> Response {
+    // `reset` is not a delta — it is the LEAK BOUND (AMUX-4024), and it is the
+    // "leak-safe reset" AMUX-3048's deferral said the count-authoritative "off"
+    // direction needed before it could ship.
+    //
+    // A lost SubagentStop (a lane killed mid-agent, a crashed subagent) pins the
+    // count positive, and since the count now outranks the mtime window that
+    // used to bound this at 240s, a leak would read WORKING forever — and
+    // survive a restart, because a state report carries the count forward.
+    //
+    // SESSION START is the one moment a zero is provably correct rather than a
+    // guess: a background agent belongs to the process that spawned it, so a
+    // NEW session has none by construction. That is exactly the property the
+    // deferral demanded — this cannot zero a live `run_in_background` agent,
+    // because a live one implies the session it belongs to is still the old one.
+    // The caller is responsible for not sending this on a compact, which does
+    // not restart the process (see `scripts/hooks/hook-report.sh`).
+    if ev == "reset" {
+        let name_s = name.to_string();
+        let reply = state
+            .store
+            .write_async(move |conn| {
+                ensure_fleet_tables(conn)?;
+                let mut reports: Value = conn
+                    .query_row("SELECT value FROM prefs WHERE key='session_reports'", [], |r| {
+                        r.get::<_, String>(0)
+                    })
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_else(|| json!({}));
+                if !reports[&name_s].is_object() {
+                    reports[&name_s] = json!({});
+                }
+                reports[&name_s]["subagents"] = json!({"count": 0, "ts": now_f64()});
+                conn.execute(
+                    "INSERT INTO prefs(key, value) VALUES('session_reports', ?1) \
+                     ON CONFLICT(key) DO UPDATE SET value=?1",
+                    [reports.to_string()],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await;
+        return match reply {
+            Ok(_) => j200(json!({"ok": true, "session": name, "subagent": "reset"})),
+            Err(e) => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
+        };
+    }
     let delta: i64 = match ev {
         "start" => 1,
         "stop" | "done" => -1,
         other => {
             return jresp(
                 StatusCode::BAD_REQUEST,
-                json!({"error": format!("subagent must be 'start' or 'stop' (got '{other}')")}),
+                json!({"error": format!(
+                    "subagent must be 'start', 'stop' or 'reset' (got '{other}')"
+                )}),
             );
         }
     };
@@ -14657,10 +15161,27 @@ pub(crate) async fn report_post(state: &AppState, name: &str, headers: &HeaderMa
             // ABSENT != EMPTY above): the model does not change per tool call.
             let prev_model = reports[&name_s]["model"].clone();
             let prev_tokens = reports[&name_s]["tokens"].clone();
-            // Main-turn reports and subagent lifecycle reports share this one
-            // object. Replacing it without carrying `subagents` erased the live
-            // count on every prompt/tool/stop event, so the card could flip idle
-            // while children were still running.
+            // AND `subagents` (AMUX-4024 / #182 — both found this independently).
+            //
+            // This assignment REPLACES the lane's whole object, so every state
+            // report deleted the live-subagent count: a Stop, a
+            // UserPromptSubmit, or any tool-hook heartbeat. A subagent that
+            // started had its count erased by the lane's very next tool call,
+            // seconds later, and the card could flip idle while its children
+            // were still running.
+            //
+            // Measured while verifying the producer: of 127 lanes only 3 still
+            // had a `subagents` key, every one reading 0, while lanes seen
+            // reporting a count minutes earlier had none. A count of 0 and a
+            // count that was DELETED are the same null to every reader, which is
+            // why this survived AMUX-3048's own tests: they drive
+            // `subagent_event_post` back to back with no state report between.
+            //
+            // Set only when non-null, so a lane that has never reported one
+            // keeps an ABSENT key rather than gaining an explicit null. Absent
+            // means "this lane sends no lifecycle events" and 0 means "it sends
+            // them and none are live"; the mtime fallback reads those
+            // differently, so the distinction has to survive the write.
             let prev_subagents = reports[&name_s]["subagents"].clone();
             // Did the STATUS actually change? Only then is an SSE push worth it.
             let status_changed = prev_state != st2;
@@ -14739,6 +15260,8 @@ pub(crate) async fn report_post(state: &AppState, name: &str, headers: &HeaderMa
                 let st_clone = state.clone();
                 let name_clone = name.to_string();
                 tokio::spawn(async move {
+                    steer_deliver_for_session(&st_clone, &name_clone).await;
+                    let _ = crate::runtime_jobs::board_drive::drive_session(&st_clone, &name_clone).await;
                     steer_deliver_for_session(&st_clone, &name_clone).await;
                 });
             }
@@ -15152,12 +15675,22 @@ async fn rename_session(state: &AppState, name: &str, raw_new: &str) -> Response
                     Err(_) => out.push(format!("db.{table}: table absent (fresh home)")),
                 }
             }
-            for table in ["steering_queue", "steering_history", "share_tokens", "cmd_history"] {
-                let n = conn.execute(
+            // FROM THE DECLARED LIST, not a second hand-maintained array
+            // (AMUX-4033). This used to name four tables inline while the
+            // schema had seventeen that a rename must carry; the missing ones
+            // were not excluded, they were forgotten, and nothing said so.
+            for table in simple_rename_tables() {
+                match conn.execute(
                     &format!("UPDATE {table} SET session=?1 WHERE session=?2"),
                     rusqlite::params![new_s, old_s],
-                )?;
-                out.push(format!("db.{table}: {n} row(s)"));
+                ) {
+                    Ok(n) => out.push(format!("db.{table}: {n} row(s)")),
+                    // A table can legitimately be absent on an older home that
+                    // has not run every migration. Reported, never skipped in
+                    // silence — the whole failure being fixed here is a
+                    // silent skip.
+                    Err(e) => out.push(format!("db.{table}: not migrated ({e})")),
+                }
             }
             // prefs session_reports is keyed by NAME inside a JSON blob —
             // Python orphans it and the renamed lane loses its self-reported
@@ -15197,7 +15730,13 @@ async fn rename_session(state: &AppState, name: &str, raw_new: &str) -> Response
         return fail(&steps, format!("db reference migration failed (transaction rolled back): {e}"));
     }
     steps.extend(counts.lock().unwrap().iter().cloned());
-    steps.push("db.session_events: audit rows keep the old name (deliberate — the rename journal entry links them)".into());
+    // Say WHICH tables kept the old name and WHY, rather than naming one of
+    // them and leaving the rest to look like an oversight.
+    for (t, d) in SESSION_SCOPED_TABLES {
+        if let RenameDisposition::KeepForAudit(why) = d {
+            steps.push(format!("db.{t}: keeps the old name — {why}"));
+        }
+    }
     // 9. Re-export AMUX_SESSION for future panes (py:76416) — best-effort;
     //    the RUNNING shell keeps its env until restart, same as Python.
     if is_running(&new_name).await {
@@ -15618,19 +16157,16 @@ fn mode_after_delivery(fold: &HotFold) -> SwapMode {
     }
 }
 
-/// The restart path, with the scrollback capture that makes it survivable.
-/// Only ever called when a restart actually happens: `capture_log_tail_for_reload`
-/// stops the pane pipe as a side effect, which would be a real harm on a hot
-/// switch that never restarts anything.
-async fn restart_with_log_reload(
+/// The restart path queues a compact, structured re-hydration from the board.
+/// Terminal scrollback is diagnostic evidence, not a context protocol: replay
+/// leaked secrets and stale instructions across providers in the live audit.
+async fn restart_with_structured_resume(
     state: &AppState,
     name: &str,
     provider: &str,
     reason: &str,
 ) -> bool {
-    if capture_log_tail_for_reload(name, reason).await {
-        mark_pending_log_reload(name, reason);
-    }
+    mark_pending_structured_resume(name, reason);
     restart_for_swap(state, name, provider).await
 }
 
@@ -15694,12 +16230,12 @@ async fn apply_live_config_change(
                         HotFold::Failed(w) => w,
                         _ => String::new(),
                     };
-                    let restarted = restart_with_log_reload(state, name, provider, reason).await;
+                    let restarted = restart_with_structured_resume(state, name, provider, reason).await;
                     SwapReport {
                         mode: SwapMode::Restart,
                         applied: restarted,
                         note: if restarted {
-                            " (live switch failed; session restarted to apply it, log reload queued)"
+                            " (live switch failed; session restarted to apply it, board-state resume queued)"
                         } else {
                             " (live switch failed AND the restart failed — the session may still be on the old model)"
                         },
@@ -15719,12 +16255,12 @@ async fn apply_live_config_change(
             }
         }
         SwapMode::Restart => {
-            let restarted = restart_with_log_reload(state, name, provider, reason).await;
+            let restarted = restart_with_structured_resume(state, name, provider, reason).await;
             SwapReport {
                 mode,
                 applied: restarted,
                 note: if restarted {
-                    " (session restarted; log reload queued)"
+                    " (session restarted; board-state resume queued)"
                 } else {
                     " (restart failed)"
                 },
@@ -15805,14 +16341,19 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
         cfg.set("CC_PROVIDER", &provider_val);
         cfg.set("CC_FLAGS", &flags);
         let was_running = is_running(name).await;
-        if capture_log_tail_for_reload(name, "provider swap").await {
-            mark_pending_log_reload(name, "provider swap");
-        }
         if cfg.write(&f).is_err() {
             return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
         }
+        if was_running {
+            mark_pending_structured_resume(name, "provider swap");
+        }
         let restarted = if was_running { restart_for_swap(state, name, &old_provider).await } else { false };
-        let suffix = if restarted { " (session restarted; log reload queued)" } else { "" };
+        if restarted {
+            set_confirmed_active_model(name, &provider_val, Some(&default_model));
+        } else if !was_running {
+            set_confirmed_active_model(name, &provider_val, None);
+        }
+        let suffix = if restarted { " (session restarted; board-state resume queued)" } else { "" };
         let body = json!({"ok": true, "message": format!("provider set to {}{suffix}", provider_label(&provider_val))});
         return if restarted { j200_slow_ok(body, "worker-restart") } else { j200(body) };
     }
@@ -15876,8 +16417,8 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
         // process state this origin does not hold.
         // The env rewrite is the DURABLE half and happens either way: whatever
         // the live agent does, the next cold start must come up on the new
-        // model. Log-tail capture moved into restart_with_log_reload — it is
-        // only meaningful when a restart actually discards the scrollback.
+        // model. A restart resumes from structured board state, never from a
+        // raw terminal transcript.
         if cfg.write(&f).is_err() {
             return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
         }
@@ -15885,6 +16426,16 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
             state, name, &current_provider, was_running, &cmds, expressible, "model swap",
         )
         .await;
+        if rep.applied {
+            let confirmed = if model_val.is_empty() {
+                default_model_for_provider(&current_provider)
+            } else {
+                model_val.clone()
+            };
+            set_confirmed_active_model(name, &current_provider, Some(&confirmed));
+        } else if !was_running {
+            set_confirmed_active_model(name, &current_provider, None);
+        }
         let mut out = json!({
             "ok": true,
             "applied": rep.applied,
@@ -15977,15 +16528,15 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
         }
         cfg.set("CC_FLAGS", &new_flags);
         let was_running = is_running(name).await;
-        if was_running && capture_log_tail_for_reload(name, "YOLO mode change").await {
-            mark_pending_log_reload(name, "YOLO mode change");
-        }
         if cfg.write(&f).is_err() {
             return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
         }
+        if was_running {
+            mark_pending_structured_resume(name, "YOLO mode change");
+        }
         let restarted = if was_running { restart_for_swap(state, name, &provider).await } else { false };
         let state_word = if enabled { "enabled" } else { "disabled" };
-        let suffix = if restarted { " (session restarted; log reload queued)" } else { "" };
+        let suffix = if restarted { " (session restarted; board-state resume queued)" } else { "" };
         let body = json!({"ok": true, "message": format!("yolo {state_word}{suffix}")});
         return if restarted { j200_slow_ok(body, "worker-restart") } else { j200(body) };
     }
@@ -16107,9 +16658,105 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
     // which a checkbox cannot express and which is the honest default for a
     // permission.
     //
-    // WRITES THE WORKER LAYER ONLY. Group and global layers are the Scope tab's
+    // WRITES THE WORKER LAYER ONLY. Group and global layers are Configurations'
     // to set, and silently writing one from a per-worker menu would change every
     // lane in that group from a control labelled with one worker's name.
+    // BOARD AUTOMATION CONFIGURATION. These are the same scoped env keys the
+    // runtime reads on every drive tick, now exposed as first-class worker UI
+    // controls from backlog -> todo -> doing -> terminal rather than requiring
+    // somebody to know implementation-specific environment names.
+    //
+    // `null` removes the worker override and restores group/global/default
+    // inheritance. A boolean writes an explicit worker value. The response is
+    // the RESOLVED value after the write: a false master switch can still make
+    // an explicitly enabled pickup/continue class resolve false, and claiming
+    // otherwise would make the UI disagree with the next runtime tick.
+    let automation = [
+        (
+            "auto_drain_backlog",
+            crate::runtime_jobs::board_drive::DISPATCH_BACKLOG_KEY,
+            "Backlog to To Do",
+        ),
+        ("board_auto_pickup", "CC_AUTO_PICKUP", "To Do pickup"),
+        ("board_auto_continue", "CC_AUTO_CONTINUE", "Non-terminal continuation"),
+        ("board_standing_orders", "CC_STANDING_ORDERS", "Pickup / continue master"),
+    ];
+    if let Some((field, key, label, v)) = automation
+        .iter()
+        .find_map(|(field, key, label)| body.get(*field).map(|v| (*field, *key, *label, v)))
+    {
+        let inherit = v.is_null();
+        if inherit {
+            cfg.remove(key);
+        } else {
+            cfg.set(key, if py_truthy(v) { "1" } else { "0" });
+        }
+        if cfg.write(&f).is_err() {
+            return jresp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": "could not write session env"}),
+            );
+        }
+        let effective = if key == crate::runtime_jobs::board_drive::DISPATCH_BACKLOG_KEY {
+            crate::runtime_jobs::board_drive::dispatch_backlog_when_idle(name)
+        } else {
+            standing_orders_on(name, key)
+        };
+        let mut out = json!({
+            "ok": true,
+            "effective": effective,
+            "inherited": inherit,
+            "message": if inherit {
+                format!("{label}: worker override removed; resolved {} from inherited/default configuration", if effective { "on" } else { "off" })
+            } else {
+                format!("{label}: worker override set {}; effective value is {}", if py_truthy(v) { "on" } else { "off" }, if effective { "on" } else { "off" })
+            },
+        });
+        out[field] = json!(effective);
+        return j200(out);
+    }
+    // EXTERNAL EMAIL AUTHORIZATION. This is a standing worker policy, not a
+    // provider startup flag, so it is resolved on every send and takes effect
+    // immediately. `null` restores worker > group > global inheritance; an
+    // explicit false at the worker layer can close a broader group/global
+    // allowance. The email gate reads this exact scoped key.
+    if let Some(v) = body.get("external_email_allowed") {
+        let key = "AMUX_EMAIL_EXTERNAL_ALLOW";
+        let inherit = v.is_null();
+        if inherit {
+            cfg.remove(key);
+        } else {
+            cfg.set(key, if py_truthy(v) { "1" } else { "0" });
+        }
+        if cfg.write(&f).is_err() {
+            return jresp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": "could not write session env"}),
+            );
+        }
+        let effective = crate::api::email_approval::external_email_allowed(
+            &crate::config::amux_home(),
+            name,
+        );
+        tracing::warn!(
+            session = %name,
+            effective,
+            inherited = inherit,
+            "config: external-email standing authorization changed"
+        );
+        return j200(json!({
+            "ok": true,
+            "external_email_allowed": effective,
+            "inherited": inherit,
+            "message": if inherit {
+                format!("external email authorization: worker override removed; effective value is {}", if effective { "on" } else { "off" })
+            } else if effective {
+                "this worker may send external email without per-message approval".to_string()
+            } else {
+                "this worker's external email still requires per-message approval".to_string()
+            },
+        }));
+    }
     if body.get("spans_groups").is_some() || body.get("send_allow").is_some() {
         let value = if let Some(sv) = body.get("send_allow").and_then(Value::as_str) {
             sv.trim().to_string()
@@ -16126,8 +16773,8 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
         // enforce rather than what was just typed — a group or global layer can
         // still grant this lane even when its own value is now empty, and
         // reporting "off" there would be a lie the next send disproves.
-        let effective = scoped_setting_in(&crate::config::amux_home(), name, "CC_SEND_ALLOW")
-            .unwrap_or_default();
+        let effective = cross_group_allow_setting_in(&crate::config::amux_home(), name)
+            .unwrap_or_else(|| "*".into());
         let effective = effective.trim().trim_matches('"').to_string();
         tracing::info!(
             session = %name, send_allow = %value, effective = %effective,
@@ -16544,6 +17191,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn concurrent_key_updates_merge_instead_of_resetting_other_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("amux.env");
+        std::fs::write(&path, "BASE=kept\n").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8).map(|i| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut env = super::EnvFile::load(&path);
+                env.set(&format!("SETTING_{i}"), "1");
+                barrier.wait();
+                env.write(&path).unwrap();
+            })
+        }).collect();
+        for handle in handles { handle.join().unwrap(); }
+        let final_env = super::EnvFile::load(&path);
+        assert_eq!(final_env.get("BASE"), Some("kept"));
+        for i in 0..8 {
+            assert_eq!(final_env.get(&format!("SETTING_{i}")), Some("1"));
+        }
+    }
+
 
     // ---- AF-96: /api/debug/logs verdict, now testable ------------------------
     //
@@ -16745,20 +17416,23 @@ mod tests {
         // Ordinary prose is untouched.
         let clean = "fix the login bug in auth.rs and rerun the tests";
         assert_eq!(r(clean), clean, "prose must not be redacted");
+        let assets = "~/tubescience-video-moderation-launch.mp4\n/Users/ethan/work/video-moderation-launch-9x16.mp4";
+        assert_eq!(
+            r(assets), assets,
+            "produced asset paths must retain their identity and link target"
+        );
         // A 40-hex git sha survives (single-case, no punct, < 44 chars).
         let sha = "revert a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2 please";
         assert_eq!(r(sha), sha, "git sha must survive: {}", r(sha));
     }
 
-    /// Ethan, 2026-08-11: worker-to-worker messaging is intra-group unless
-    /// explicitly configured. The escapes must be CONFIG — a body flag any
-    /// caller could set would make the rule advisory.
-    /// CONFIGURE A WORKER (OR A WHOLE GROUP) TO SPAN GROUPS, WITHOUT A
-    /// PER-MESSAGE APPROVAL (AMUX-4015).
+    /// Worker-to-worker messaging is open by default. Configuration may narrow
+    /// an individual worker or a whole group without putting policy in a body
+    /// flag that a caller could forge (AMUX-4015).
     ///
     /// `CC_SEND_ALLOW` and `CC_RECEIVE_ANY` were read through `parse_env`, which
     /// reads `sessions/<worker>.env` and nothing else. `/api/scope` has always
-    /// advertised `env` at global/group/worker and the Scope tab writes all
+    /// advertised `env` at global/group/worker and the Configurations tab writes all
     /// three, so setting either switch at the GROUP or GLOBAL layer saved a file
     /// this gate never opened: it appeared to work and changed nothing. That is
     /// AMUX-2930's shape, still live for these two keys.
@@ -16779,8 +17453,16 @@ mod tests {
 
         w("roamer", "CC_TAGS=\"customers\"\n");
         w("target", "CC_TAGS=\"gtm\"\n");
-        // Baseline: no configuration anywhere, so it is refused.
-        assert!(cross_group_send_ok("roamer", "target").is_err(), "premise: refused unconfigured");
+        // Product baseline: no configuration anywhere means open peer discovery
+        // and messaging.
+        assert_eq!(
+            cross_group_send_ok("roamer", "target").expect("fresh fleet must be open"),
+            "sender-allowlist"
+        );
+        // An explicit empty global value is the fleet opt-out. More-specific
+        // group/worker configuration may still open a deliberately selected lane.
+        std::fs::write(dir.path().join("amux.env"), "CC_SEND_ALLOW=\"\"\n").expect("write");
+        assert!(cross_group_send_ok("roamer", "target").is_err(), "explicit opt-out must close");
 
         // GROUP LAYER on the SENDER's group. This is the "configure it once for
         // the group" case, and before the fix it did nothing at all.
@@ -16794,7 +17476,7 @@ mod tests {
         // once rather than per worker.
         std::fs::remove_file(groups.join("customers.env")).expect("rm");
         assert!(cross_group_send_ok("roamer", "target").is_err(), "control: grant withdrawn");
-        std::fs::write(dir.path().join("amux.env"), "CC_RECEIVE_ANY=1\n").expect("write");
+        std::fs::write(dir.path().join("amux.env"), "CC_SEND_ALLOW=\"\"\nCC_RECEIVE_ANY=1\n").expect("write");
         assert_eq!(
             cross_group_send_ok("roamer", "target").expect("global layer must grant"),
             "receiver-open"
@@ -16830,7 +17512,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_group_sends_are_refused_unless_configured() {
+    fn cross_group_sends_are_open_by_default_and_explicitly_opt_out() {
         let dir = tempfile::tempdir().expect("tmp");
         let _g = crate::api::settings::test_env::set_home(dir.path());
         let sessions = dir.path().join("sessions");
@@ -16845,7 +17527,11 @@ mod tests {
         write("broadcaster", "CC_TAGS=\"customers\"\nCC_SEND_ALLOW=\"gtm\"\n");
         write("lonely", "\n"); // untagged
 
-        // THE REPORTED CASE: different groups, no config -> refused.
+        // Fresh fleets are open across groups.
+        assert_eq!(cross_group_send_ok("ts-gke", "gtm-engine").unwrap(), "sender-allowlist");
+        // An explicit global empty value closes the default. This is the only
+        // state in which the refusal/approval path should appear.
+        std::fs::write(dir.path().join("amux.env"), "CC_SEND_ALLOW=\"\"\n").expect("write");
         let err = cross_group_send_ok("ts-gke", "gtm-engine").expect_err("must refuse");
         assert!(err.contains("cross-group send refused"), "{err}");
         // The refusal must NAME both escapes, or it is a wall rather than a rule.
@@ -16911,6 +17597,26 @@ mod tests {
         // owner peek/send to an isolated worker still works.
         assert_eq!(cross_group_send_ok("", "secret").unwrap(), "self-or-human");
     }
+
+    #[tokio::test]
+    async fn an_isolated_peer_refusal_never_mints_an_approval_request() {
+        let (state, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("caller.env"), "CC_TAGS=alpha\n").unwrap();
+        std::fs::write(sessions.join("raw.env"), "CC_TAGS=beta\nCC_ISOLATED=1\n").unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-amux-session", "caller".parse().unwrap());
+        let response = send_post(&state, "raw", &headers, &json!({"text": "do work"})).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["blocked"], json!("isolated"));
+        assert_eq!(body["code"], json!("isolated_target"));
+        assert!(body.get("grant_id").is_none(), "an impossible send must not ask for approval: {body}");
+    }
+
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -17121,10 +17827,11 @@ mod tests {
         assert!(!got.contains(&0x1b), "ANSI escapes must be stripped by default");
     }
 
-    /// Redaction is the writer's original job and must survive the rewrite,
-    /// including for a secret that arrives with only CR terminators.
+    /// Worker output is evidence. Preserve it byte-for-byte at the content
+    /// layer, including strings that resemble credentials; access control owns
+    /// who may see the terminal, not irreversible mutation of its output.
     #[test]
-    fn secrets_are_redacted_in_cr_terminated_output() {
+    fn credential_shaped_text_is_not_redacted_from_worker_output() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("s.log");
         let got = run_pipe_writer(
@@ -17132,10 +17839,10 @@ mod tests {
             &log,
         );
         let text = String::from_utf8_lossy(&got);
-        assert!(!text.contains("hunter2"), "api key leaked: {text}");
-        assert!(!text.contains("DEADBEEF"), "anthropic key leaked: {text}");
-        assert!(!text.contains("abcdefghijklmnopqrstuvwxyz01"), "github token leaked: {text}");
-        assert!(text.contains("REDACTED"), "expected a redaction marker: {text}");
+        assert!(text.contains("hunter2hunter2"), "env-shaped output changed: {text}");
+        assert!(text.contains("DEADBEEF"), "token-shaped output changed: {text}");
+        assert!(text.contains("abcdefghijklmnopqrstuvwxyz01"), "prefixed output changed: {text}");
+        assert!(!text.contains("REDACTED"), "worker output must not be redacted: {text}");
     }
 
     /// Cursor MOVEMENT becomes whitespace rather than being deleted. Deleting
@@ -17795,6 +18502,34 @@ mod tests {
         );
     }
 
+    /// A healthy SSE connection used to make Messages LESS live than the 5s
+    /// polling fallback: cmd_history committed silently, so no client refetched
+    /// until a reload or an unrelated board/session event. The ledger write is
+    /// now itself a revisioned Message event. `skip_board=true` isolates this
+    /// assertion from auto-capture's separate Task event.
+    #[tokio::test]
+    async fn a_recorded_message_publishes_the_event_that_refreshes_messages() {
+        let (st, _dir) = state();
+        let mut events = st.store.subscribe();
+        cmd_hist_record_full(
+            &st,
+            "lane-live",
+            "answer this without creating work",
+            "user",
+            "",
+            true,
+            DeliveryMeta::direct(),
+        )
+        .await;
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("message write must wake an SSE subscriber")
+            .expect("event channel remains open");
+        assert_eq!(event.entity_type, amux_core::revision::EntityType::Message);
+        assert!(event.entity_id.starts_with("MSG-"), "the invalidation names the durable row");
+        assert_eq!(event.mutation, amux_core::revision::MutationKind::Created);
+    }
+
     // ── AMUX-3903: a failed send is a fact worth keeping ────────────────────
 
     /// THE DISCRIMINATOR THE NEW BRANCH RESTS ON. `send_post` records a failed
@@ -18189,7 +18924,7 @@ mod tests {
         cmd_hist_record_full(
             &st,
             "lane-info",
-            "What is the difference between todo and backlog? Please answer only; do not change anything.",
+            "Acceptance check only: what provider and model are you currently running? Answer in one sentence. Do not create or modify any board task.",
             "user",
             "",
             false,
@@ -19070,6 +19805,25 @@ mod tests {
             redact_secrets("ANTHROPIC_API_KEY=sk-live-x y"),
             "ANTHROPIC_API_KEY=REDACTED y"
         );
+        let password_key = format!("AMUX_QA_{}", "PASSWORD");
+        let s3_key = format!("AMUX_S3_{}", "KEY");
+        let input = format!("{password_key}=fake-login-value {s3_key}=fake-storage-value");
+        let out = redact_secrets(&input);
+        assert_eq!(
+            out,
+            format!("{password_key}=REDACTED {s3_key}=REDACTED"),
+            "unlisted secret-bearing env names must be redacted by shape"
+        );
+    }
+
+    #[test]
+    fn provider_resume_uses_structured_state_not_terminal_replay() {
+        let prompt = structured_resume_prompt("lane-a", "provider swap");
+        assert!(prompt.contains("amux board ls --session lane-a"), "{prompt}");
+        assert!(prompt.contains("amux board show <ID>"), "{prompt}");
+        assert!(prompt.contains("source message") && prompt.contains("dependencies"), "{prompt}");
+        assert!(!prompt.contains(".amux/logs"), "{prompt}");
+        assert!(!prompt.contains("terminal history"), "{prompt}");
     }
 
     /// The file/DB-backed verbs, exercised through the full router shape on a
@@ -19333,6 +20087,121 @@ mod tests {
             call(&app, "PATCH", "/api/sessions/probe/config", Some(json!({"toggle_pin": true}))).await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(parse_env("probe").get("CC_PINNED"), Some("1"));
+
+        // Every board-automation stage exposed in worker Configurations writes
+        // the exact scoped key the runtime consumes. Null removes the worker
+        // override instead of writing a second spelling for "inherit".
+        let (st, v) = call(
+            &app,
+            "PATCH",
+            "/api/sessions/probe/config",
+            Some(json!({"auto_drain_backlog": true})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(parse_env("probe").get("AMUX_DISPATCH_BACKLOG_WHEN_IDLE"), Some("1"));
+        assert_eq!(v["effective"], json!(true));
+
+        let (st, v) = call(
+            &app,
+            "PATCH",
+            "/api/sessions/probe/config",
+            Some(json!({"board_auto_pickup": false})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(parse_env("probe").get("CC_AUTO_PICKUP"), Some("0"));
+        assert_eq!(v["board_auto_pickup"], json!(false));
+
+        let (st, v) = call(
+            &app,
+            "PATCH",
+            "/api/sessions/probe/config",
+            Some(json!({"board_auto_continue": true})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(parse_env("probe").get("CC_AUTO_CONTINUE"), Some("1"));
+
+        let (st, v) = call(
+            &app,
+            "PATCH",
+            "/api/sessions/probe/config",
+            Some(json!({"board_standing_orders": false})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(parse_env("probe").get("CC_STANDING_ORDERS"), Some("0"));
+        assert_eq!(v["board_standing_orders"], json!(false));
+
+        // A child switch reports the resolved runtime truth while the master
+        // is off; removing the master override immediately restores it.
+        let (_, v) = call(
+            &app,
+            "PATCH",
+            "/api/sessions/probe/config",
+            Some(json!({"board_auto_pickup": true})),
+        )
+        .await;
+        assert_eq!(v["effective"], json!(false));
+        let (_, v) = call(
+            &app,
+            "PATCH",
+            "/api/sessions/probe/config",
+            Some(json!({"board_standing_orders": null})),
+        )
+        .await;
+        assert_eq!(v["inherited"], json!(true));
+        assert_eq!(v["effective"], json!(true));
+        assert_eq!(parse_env("probe").get("CC_STANDING_ORDERS"), None);
+
+        let (_, v) = call(
+            &app,
+            "PATCH",
+            "/api/sessions/probe/config",
+            Some(json!({"auto_drain_backlog": null})),
+        )
+        .await;
+        assert_eq!(v["effective"], json!(true));
+        assert_eq!(parse_env("probe").get("AMUX_DISPATCH_BACKLOG_WHEN_IDLE"), None);
+        for field in ["board_auto_pickup", "board_auto_continue"] {
+            let (st, v) = call(
+                &app,
+                "PATCH",
+                "/api/sessions/probe/config",
+                Some(json!({(field): null})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            assert_eq!(v["effective"], json!(true));
+        }
+        assert_eq!(parse_env("probe").get("CC_AUTO_PICKUP"), None);
+        assert_eq!(parse_env("probe").get("CC_AUTO_CONTINUE"), None);
+
+        // External-email authorization is a first-class, immediately-applied
+        // worker configuration. It writes the exact key the email gate reads,
+        // and null restores inheritance rather than inventing another flag.
+        let (st, v) = call(
+            &app,
+            "PATCH",
+            "/api/sessions/probe/config",
+            Some(json!({"external_email_allowed": true})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(parse_env("probe").get("AMUX_EMAIL_EXTERNAL_ALLOW"), Some("1"));
+        assert_eq!(v["external_email_allowed"], json!(true));
+        let (st, v) = call(
+            &app,
+            "PATCH",
+            "/api/sessions/probe/config",
+            Some(json!({"external_email_allowed": null})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["inherited"], json!(true));
+        assert_eq!(parse_env("probe").get("AMUX_EMAIL_EXTERNAL_ALLOW"), None);
+
         let (st, v) =
             call(&app, "PATCH", "/api/sessions/probe/config", Some(json!({"mcp": "bogus"}))).await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
@@ -19988,8 +20857,12 @@ mod steer_boundary_tests {
                         ask_type: None,
                         ask_question: None,
                         ask_unblocks: None,
+                        ask_actor: None,
                         // AF-367: an auto-captured human prompt — the population AF-367 is about.
                         source: Some("capture".into()),
+                        requested_by: None,
+                        callback_session: None,
+                        callback_prompt: None,
                     },
                     now_ms / 1000,
                 )?;
@@ -20115,11 +20988,17 @@ mod steer_boundary_tests {
             "a same-group reviewer must still be assignable"
         );
 
-        // THE NEW CELL: registered, real, and in another group. The old gate
-        // passed this — it is ECOLO-14 and AMUX-3761 exactly — and the owner
-        // then could not message the reviewer it was waiting on.
+        // EXPLICITLY CLOSED: registered, real, and in another group. Fresh
+        // fleets are intentionally open now; preserve this boundary regression
+        // by closing the owner's lane through the documented worker-level
+        // override before checking reviewer reachability.
+        std::fs::write(
+            sessions.join("owner.env"),
+            "CC_DIR=/tmp\nCC_TAGS=\"alpha\"\nCC_SEND_ALLOW=\"\"\n",
+        )
+        .unwrap();
         let why = reviewer_unreachable_reason("owner", "far")
-            .expect("a cross-group reviewer must refuse even though it IS registered");
+            .expect("an explicitly opted-out cross-group reviewer must refuse");
         assert!(
             !why.contains("not a registered worker"),
             "the refusal must name the REACH problem, not mislead about existence: {why}"
@@ -20290,6 +21169,76 @@ mod steer_boundary_tests {
             Some(0),
             "count floors at 0 on excess stops"
         );
+
+        // AMUX-4024: A STATE REPORT MUST NOT DELETE THE COUNT.
+        //
+        // Every assertion above drives `subagent_event_post` back to back with
+        // nothing else writing in between, which is the one sequence a live lane
+        // never produces: it interleaves state reports constantly, a tool-hook
+        // on every tool call and a Stop on every turn end. `report_post`
+        // REPLACES the lane's whole object and carried only `model` and `tokens`
+        // forward, so the count was deleted seconds after it was set.
+        //
+        // Driven through `report_post` — the SHIPPED handler, with the headers
+        // its attribution check reads — and not through the `set_report`
+        // fixture, which writes the blob directly and would have "passed" this
+        // by never exercising the replacement at all. That distinction is the
+        // whole cell: the bug lives in the carry-forward list, and only the real
+        // handler has one.
+        //
+        // Measured live before the fix: 3 of 127 lanes still had a `subagents`
+        // key, all reading 0, while lanes that had reported a count minutes
+        // earlier had none at all.
+        let mut h = HeaderMap::new();
+        h.insert("X-Amux-Session", "probe".parse().unwrap());
+        report_post(&state, "probe", &h, &json!({"subagent": "start"})).await;
+        assert_eq!(
+            read(&state)["probe"]["subagents"]["count"].as_i64(),
+            Some(1),
+            "the shipped handler must route a subagent event to the count"
+        );
+        report_post(&state, "probe", &h, &json!({"state": "idle", "source": "stop-hook"})).await;
+        let after = read(&state);
+        assert_eq!(
+            after["probe"]["subagents"]["count"].as_i64(),
+            Some(1),
+            "a state report must CARRY the live count, not delete it: {after}"
+        );
+        assert_eq!(
+            after["probe"]["state"].as_str(),
+            Some("idle"),
+            "...while still applying the state it was sent for: {after}"
+        );
+
+        // THE LEAK BOUND (AMUX-4024). Making the count authoritative removed the
+        // 240s mtime ceiling that used to bound a lost SubagentStop, and the
+        // carry-forward above means a leaked count now survives restarts too. A
+        // SessionStart reset is the bound, and it is the one zero that is
+        // provably right rather than a guess.
+        report_post(&state, "probe", &h, &json!({"subagent": "start"})).await;
+        report_post(&state, "probe", &h, &json!({"subagent": "start"})).await;
+        // 3, not 2: the block above left one live count standing, which is the
+        // point — reset must clear a count it did not create, not just undo the
+        // two starts on the line above it.
+        assert_eq!(read(&state)["probe"]["subagents"]["count"].as_i64(), Some(3), "1 carried + 2 starts");
+        report_post(&state, "probe", &h, &json!({"subagent": "reset"})).await;
+        let r = read(&state);
+        assert_eq!(
+            r["probe"]["subagents"]["count"].as_i64(),
+            Some(0),
+            "a session start must clear a leaked count: {r}"
+        );
+        assert_eq!(
+            r["probe"]["state"].as_str(),
+            Some("idle"),
+            "...without touching the main state, like every other subagent event: {r}"
+        );
+
+        // An unknown event is still refused rather than silently counted, and the
+        // error NAMES the accepted set — `reset` included, or the hook author
+        // reads a message that forbids the thing the hook is being asked to send.
+        let bad = report_post(&state, "probe", &h, &json!({"subagent": "sideways"})).await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST, "an unknown subagent event must 400");
     }
 
     /// Fail-closed is the whole safety property: an unknown lane must not be
@@ -21986,8 +22935,8 @@ mod pipe_reconcile_tests {
     /// `node` agent with 1 child and pane_pipe=0, logging nothing.
     #[test]
     fn a_live_agent_with_no_pipe_is_rearmed() {
-        assert!(should_rearm_pipe(0, 1), "rec-gov's exact shape must re-arm");
-        assert!(should_rearm_pipe(0, 5));
+        assert!(should_rearm_pipe(0, 1, false), "rec-gov's exact shape must re-arm");
+        assert!(should_rearm_pipe(0, 5, false));
     }
 
     /// THE NEGATIVE CASE, and the one that makes this check worth having.
@@ -21996,7 +22945,8 @@ mod pipe_reconcile_tests {
     /// 10 of the 11 unpiped panes measured were bare shells (smprobe*, zz-*).
     #[test]
     fn a_bare_shell_is_never_rearmed() {
-        assert!(!should_rearm_pipe(0, 0), "a pane whose agent is gone has nothing to log");
+        assert!(!should_rearm_pipe(0, 0, false), "a pane whose agent is gone has nothing to log");
+        assert!(!should_rearm_pipe(1, 0, true), "writer migrations must also skip bare shells");
     }
 
     /// An already-piped pane is left alone. Re-arming it would be harmless
@@ -22004,8 +22954,15 @@ mod pipe_reconcile_tests {
     /// would restart 51 writer processes a minute across the fleet.
     #[test]
     fn an_already_piped_pane_is_left_alone() {
-        assert!(!should_rearm_pipe(1, 1));
-        assert!(!should_rearm_pipe(1, 0));
+        assert!(!should_rearm_pipe(1, 1, false));
+        assert!(!should_rearm_pipe(1, 0, false));
+    }
+
+    /// Deploying a changed writer must replace the already-running child once;
+    /// pane_pipe=1 only says a pipe exists, not that it runs current code.
+    #[test]
+    fn an_already_piped_live_agent_is_upgraded_when_the_writer_changes() {
+        assert!(should_rearm_pipe(1, 1, true));
     }
 }
 

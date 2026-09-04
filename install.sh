@@ -445,6 +445,29 @@ mkdir -p "$PLIST_DIR"
 UID_N="$(id -u)"
 SERVER_PLIST="$PLIST_DIR/$LABEL.plist"
 
+# `launchctl bootout` can return before launchd has fully released the label.
+# On a busy host an immediate bootstrap then fails with opaque error 5 even
+# though the same command succeeds a few seconds later.  Installer runs are
+# upgrades, so make that teardown race self-healing and bounded rather than
+# leaving the freshly installed binary offline until a human retries it.
+launchctl_reload_agent() {
+  local label="$1" plist="$2" domain="gui/$UID_N" attempt err=""
+  launchctl bootout "$domain/$label" 2>/dev/null || true
+  for attempt in 1 2 3 4 5 6; do
+    if err="$(launchctl bootstrap "$domain" "$plist" 2>&1)"; then
+      return 0
+    fi
+    if (( attempt == 1 )); then
+      warn "launchd is still releasing $label; retrying bootstrap"
+    fi
+    if (( attempt < 6 )); then
+      sleep "$attempt"
+    fi
+  done
+  echo "$err" >&2
+  return 1
+}
+
 # launchd does NOT inherit a shell PATH — a thrice-hit incident class in this
 # repo (restic, the rust builder, the server itself): every subprocess the
 # server spawns (tmux, claude, herdr, git) must be reachable from the PATH
@@ -476,8 +499,7 @@ cat > "$SERVER_PLIST" <<PLIST
 PLIST
 
 # (Re)load: bootout is a no-op complaint when the label isn't loaded yet.
-launchctl bootout "gui/$UID_N/$LABEL" 2>/dev/null || true
-launchctl bootstrap "gui/$UID_N" "$SERVER_PLIST"
+launchctl_reload_agent "$LABEL" "$SERVER_PLIST"
 say "launchd agent loaded: $LABEL"
 
 if [[ "${AMUX_NO_BUILDER:-}" != "1" ]]; then
@@ -498,8 +520,7 @@ if [[ "${AMUX_NO_BUILDER:-}" != "1" ]]; then
 </dict>
 </plist>
 PLIST
-  launchctl bootout "gui/$UID_N/$BUILDER_LABEL" 2>/dev/null || true
-  launchctl bootstrap "gui/$UID_N" "$BUILDER_PLIST"
+  launchctl_reload_agent "$BUILDER_LABEL" "$BUILDER_PLIST"
   say "launchd agent loaded: $BUILDER_LABEL (rebuilds + redeploys on new commits in $SCRIPT_DIR)"
 fi
 
@@ -540,8 +561,7 @@ if [[ "${AMUX_NO_FLEET_START:-}" != "1" ]]; then
 </dict>
 </plist>
 PLIST
-  launchctl bootout "gui/$UID_N/$FLEET_LABEL" 2>/dev/null || true
-  launchctl bootstrap "gui/$UID_N" "$FLEET_PLIST"
+  launchctl_reload_agent "$FLEET_LABEL" "$FLEET_PLIST"
   say "launchd agent loaded: $FLEET_LABEL (starts every non-archived worker at login; log: $AMUX_HOME/logs/fleet-boot.log)"
 fi
 

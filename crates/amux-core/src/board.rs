@@ -1118,14 +1118,19 @@ const CAPTURE_FILLER: [&str; 19] = [
 /// means "do not mint a ledger card", not "untitled".
 pub fn title_from_prompt(text: &str) -> Option<String> {
     let mut t = text.trim();
-    // Explicit opt-out marker, checked BEFORE stamp-stripping so the marker
-    // itself is never mistaken for a timestamp prefix.
-    let lower_all = t.to_lowercase();
-    if lower_all.starts_with("[no-board]") || lower_all.starts_with("[no_board]") {
-        return None;
-    }
-    // Drop leading "[03:47 PM] " / "[amux-origin: ...]" style stamps.
-    while t.starts_with('[') {
+    // Drop leading "[03:47 PM] " / "[amux-origin: ...]" style stamps, but
+    // recognize the opt-out marker at EVERY layer. Dashboard sends are stamped
+    // before capture, so checking only the raw prefix turned
+    // `[08:51 AM] [no-board] ...` into a normal task after the loop stripped
+    // both brackets (ATE-27).
+    loop {
+        let lower = t.to_lowercase();
+        if lower.starts_with("[no-board]") || lower.starts_with("[no_board]") {
+            return None;
+        }
+        if !t.starts_with('[') {
+            break;
+        }
         match t.find(']') {
             Some(i) => t = t[i + 1..].trim_start(),
             None => break,
@@ -1315,43 +1320,56 @@ pub fn is_informational_query(text: &str) -> bool {
         return false;
     }
     let lower = collapsed.to_lowercase();
-    if capture_has_task_followup(&lower) {
+    // A human doing an acceptance/smoke check will often qualify the question
+    // before asking it.  Treat only explicit answer-only preambles as syntax;
+    // the question that follows still has to pass every normal safeguard below
+    // (so, for example, "acceptance check only: does this build?" remains work).
+    const INFORMATIONAL_PREAMBLES: &[&str] = &[
+        "acceptance check only: ",
+        "informational check only: ",
+        "information only: ",
+        "informational only: ",
+        "question only: ",
+        "answer only: ",
+    ];
+    let intent = INFORMATIONAL_PREAMBLES
+        .iter()
+        .find_map(|prefix| lower.strip_prefix(prefix))
+        .unwrap_or(&lower);
+    if capture_has_task_followup(intent) {
         return false;
     }
-    if is_status_query(text) {
+    if is_status_query(intent) {
         return true;
     }
 
-    let polite = lower.strip_prefix("please ").unwrap_or(&lower);
+    let polite = intent.strip_prefix("please ").unwrap_or(intent);
     const ANSWER_ONLY_COMMANDS: &[&str] = &[
         "answer ", "compare ", "clarify ", "describe ", "explain ", "recap ",
         "summarize ", "tell me ", "give me a summary ", "help me understand ",
     ];
-    if !lower.contains('?') {
+    if !intent.contains('?') {
         return ANSWER_ONLY_COMMANDS.iter().any(|p| polite.starts_with(p));
     }
 
-    let question_end = lower.find('?').unwrap_or(lower.len());
-    let question = &lower[..question_end];
-    let tail = lower[question_end.saturating_add(1)..]
+    let question_end = intent.find('?').unwrap_or(intent.len());
+    let question = &intent[..question_end];
+    let tail = intent[question_end.saturating_add(1)..]
         .trim()
         .trim_end_matches(['.', '!', ';', ' ']);
     // A second clause normally means the prompt has work after the question.
-    // Preserve the explicit non-mutating tails people naturally add when they
-    // want only an answer.
+    // Preserve explicit non-mutating tails people naturally add when they want
+    // only an answer. This is grammatical rather than an exact sentence list:
+    // `do not change files or create board work` means the same thing as `do
+    // not change anything`, and an opt-out contract must not depend on one
+    // memorized phrasing.
     if !tail.is_empty() {
-        const ANSWER_ONLY_TAILS: &[&str] = &[
-            "answer only", "just answer", "please answer only", "no changes",
-            "do not change anything", "don't change anything", "do not make changes",
-            "don't make changes", "please answer only; do not change anything",
-            "please answer only; don't change anything",
-        ];
         const QUESTION_TAILS: &[&str] = &[
             "are ", "can ", "could ", "did ", "do ", "does ", "has ", "have ", "how ",
             "is ", "should ", "was ", "were ", "what ", "when ", "where ", "which ",
             "who ", "why ", "will ", "would ",
         ];
-        if !ANSWER_ONLY_TAILS.contains(&tail)
+        if !is_non_mutating_answer_tail(tail)
             && !(tail.ends_with('?') && QUESTION_TAILS.iter().any(|p| tail.starts_with(p)))
         {
             return false;
@@ -1398,6 +1416,71 @@ pub fn is_informational_query(text: &str) -> bool {
         "should ", "was ", "were ", "will ", "would ",
     ];
     YES_NO_QUESTIONS.iter().any(|p| question.starts_with(p))
+}
+
+/// Whether every clause after a question explicitly asks for an answer and/or
+/// forbids mutation. Unknown clauses fail closed to WORK so this helper cannot
+/// silently swallow an imperative.
+fn is_non_mutating_answer_tail(tail: &str) -> bool {
+    const ANSWER_ONLY: &[&str] = &["answer only", "just answer", "please answer only"];
+    const ANSWER_FORMAT_PREFIXES: &[&str] = &["answer in ", "reply in ", "respond in "];
+    const ANSWER_FORMAT_WORDS: &[&str] = &[
+        "a", "one", "two", "three", "single", "short", "brief", "concise",
+        "word", "words", "line", "lines", "sentence", "sentences", "paragraph",
+        "paragraphs",
+    ];
+    const MUTATION_WORDS: &[&str] = &[
+        "change", "changes", "edit", "modify", "write", "create", "delete", "run",
+        "build", "fix", "make", "file", "files", "commit", "push", "deploy", "board",
+        "task", "tasks", "work",
+    ];
+
+    let mut saw_clause = false;
+    // Sentence punctuation is as natural here as a semicolon ("Answer in one
+    // sentence. Do not create a task."). Normalize it before applying the same
+    // per-clause proof; otherwise a negated mutation word in the second
+    // sentence makes the whole answer-only tail look like work.
+    let normalized = tail.replace(". ", ";").replace("! ", ";");
+    for raw in normalized.split(';') {
+        let clause = raw.trim().trim_end_matches(['.', '!', ' ']);
+        if clause.is_empty() {
+            continue;
+        }
+        saw_clause = true;
+        if ANSWER_ONLY.contains(&clause) || matches!(clause, "no changes" | "make no changes") {
+            continue;
+        }
+        if let Some(format) = ANSWER_FORMAT_PREFIXES
+            .iter()
+            .find_map(|prefix| clause.strip_prefix(prefix))
+        {
+            let words = format.split_whitespace().map(|word| {
+                word.trim_matches(|c: char| !c.is_ascii_alphanumeric())
+            });
+            if !format.is_empty() && words.clone().all(|word| ANSWER_FORMAT_WORDS.contains(&word)) {
+                continue;
+            }
+        }
+        let negated = clause
+            .strip_prefix("please do not ")
+            .or_else(|| clause.strip_prefix("please don't "))
+            .or_else(|| clause.strip_prefix("do not "))
+            .or_else(|| clause.strip_prefix("don't "));
+        let Some(scope) = negated else { return false };
+        if !MUTATION_WORDS.iter().any(|word| scope.split_whitespace().any(|w| {
+            w.trim_matches(|c: char| !c.is_ascii_alphanumeric()) == *word
+        })) {
+            return false;
+        }
+        // Negation ended before a new imperative: do not edit X, then deploy Y.
+        if [", then ", ". then ", " and then "]
+            .iter()
+            .any(|marker| scope.contains(marker))
+        {
+            return false;
+        }
+    }
+    saw_clause
 }
 
 /// Bare demonstratives/pronouns: words whose referent lives OUTSIDE the title.
@@ -1571,6 +1654,12 @@ mod capture_tests {
             None,
             "explicit opt-out"
         );
+        for stamped in [
+            "[08:51 AM] [no-board] What is backlog? Answer only.",
+            "[amux-origin: dashboard] [no_board] Explain this without making changes.",
+        ] {
+            assert_eq!(title_from_prompt(stamped), None, "stamped opt-out: {stamped}");
+        }
     }
 
     #[test]
@@ -1616,6 +1705,8 @@ mod capture_tests {
         for s in [
             "What is the difference between todo and backlog on this board?",
             "What is the difference between todo and backlog? Please answer only; do not change anything.",
+            "What is the difference between todo and backlog? Answer only; do not change files or create board work.",
+            "What is backlog? Please do not edit files, create tasks, or run commands.",
             "How does the Done gate work?",
             "Can you explain why ATE-10 is linked to ATE-11?",
             "Is the board source of truth the issue row or the message?",
@@ -1626,6 +1717,12 @@ mod capture_tests {
             "What is backlog? How is todo different?",
             "[amux-origin: dashboard]   WHAT is backlog?",
             &format!("Why does this happen {}?", "in this particular configuration ".repeat(20)),
+            // ATE-17: the exact wording that reproduced this bug a day after the
+            // literal-list fix shipped — never matched ANSWER_ONLY_TAILS because
+            // that list only had "please answer only; do not change anything.".
+            "What is the difference between todo and backlog on this board? Answer only; do not change files or create board work.",
+            "[08:24 AM] What is the difference between todo and backlog in this September 3 rerun? Answer only; do not change files or create board work.",
+            "Acceptance check only: what provider and model are you currently running? Answer in one sentence. Do not create or modify any board task.",
         ] {
             assert!(is_informational_query(s), "{s:?} should remain message-only");
         }
@@ -1635,11 +1732,19 @@ mod capture_tests {
             "what broke; fix the failing test?",
             "why is the build red — investigate the failure?",
             "what broke? please diagnose it",
+            "what broke? do not edit the docs; then fix the implementation",
             "why did this fail and can you reproduce it?",
             "is it done? if not, add a retry to the fetch",
             "write an explanation to docs/status.md",
             "",
             "[broken stamp",
+            // A tail can stack a real task after its answer-only clause; the
+            // structural tail check must still catch it (negative control for
+            // the ATE-17 fix, so broadening the match cannot silently swallow
+            // real work stacked onto an answer-only opener).
+            "What is the difference between todo and backlog? Answer only, then update the docs.",
+            "Acceptance check only: does this build? Answer in one sentence. Do not create a board task.",
+            "Acceptance check only: what provider is active? Answer in one sentence. Do not create a board task, then update the docs.",
         ] {
             assert!(!is_informational_query(s), "{s:?} produces work and needs a card");
         }

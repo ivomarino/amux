@@ -442,3 +442,41 @@ FIX_SITE: delivery accounting in the send path
 CARDS: none
 EVIDENCE: `output` is a viewport and `history` is the record; reading the wrong
 one has already produced a "message was swallowed" incident that was false.
+
+## A capability ships and is nameable nowhere, so the person who asked for it keeps asking
+SCOPE: both
+STATUS: absorbed
+FIRST_SEEN: 2026-09-03
+LAST_SEEN: 2026-09-03
+OCCURRENCES: 1
+SIGNALS: rule-restatement:backlog-growth
+FIX_SITE: `~/.claude/CLAUDE.md` board section, held by
+`board_drive::tests::the_global_prompt_names_the_real_backlog_dispatch_key`
+CARDS: AF-449
+EVIDENCE: `rule-restatement:backlog-growth` fired at n=23 against a 0.54/day
+baseline (43x) across BOTH repos — 15 amux, 8 mixpeek — with the scanner
+reporting `prose_exists: false` and `already_written_in: []`.
+The messages are not complaints about the pile. They ask for a switch:
+"Toggle this worker so that it automatically drains the backlog. There should be
+an environment variable in the scope" (MSG-40011, primis) and "there should be a
+flag" (MSG-40009, tubescience). That switch already existed:
+`AMUX_DISPATCH_BACKLOG_WHEN_IDLE`, shipped by AMUX-4055 in 16eaeae0 at 22:00 on
+2026-09-02, default off, scoped worker > group > global.
+It was named in no prompt file, no doc, and no nudge text — checked, not assumed:
+grep across ~/.claude/CLAUDE.md, amux CLAUDE.md, docs/ and .claude/rules/ returned
+nothing, and the idle nudge that fires on exactly this condition tells a lane
+"board-drive only dispatches `todo` ... you have to pull from it" without naming
+the flag that changes it. Eleven hours between shipping and the first of 23 asks.
+DELIBERATELY NOT COUNTED under "The board accumulates" (SIGNALS lists this same
+key). That theme is about a pile with no TTL and no forced disposition; today's
+messages are about a control that exists and cannot be named. Incrementing it
+from this evidence would inflate a count with observations that do not support
+it, which is the one way this file corrupts itself.
+WHY IT IS `absorbed` AND NOT `open`: the paragraph shipped to the global prompt
+this pass. That is not the same as the friction being gone — nine of the ten seed
+themes were correct prose that lost to the mechanism — so the prose is held by a
+test that reads the CONSTANT rather than a copy of its text, and reports UNMEASURED
+rather than passing when the global prompt is absent (cloud image). Rename the key
+and the test fails; drop the paragraph and the test fails. Watch
+`rule-restatement:backlog-growth` next run: if it stays at 20+ with the prose
+live, the prose lost and the fix site is the nudge text, not the prompt.

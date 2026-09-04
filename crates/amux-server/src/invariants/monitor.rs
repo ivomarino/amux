@@ -122,6 +122,64 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     out.extend(checks::route_callers_have_routes(&mounted, &callers));
 
     tm.mark(&out, "1. route contract");
+
+    // -- 1a. do the routes that EXIST actually answer? (AF-453)
+    //
+    // Section 1 checks existence and passes `GET /api/workers/{id}` cleanly
+    // while it returns 2xx for 0 of 15 calls. These are two different questions
+    // and only one of them had a check.
+    //
+    // TWO-STAGE AGGREGATION, deliberately. The grouping key is
+    // `normalize_target_verb`, a Rust function, so SQL cannot GROUP BY it. SQL
+    // collapses to (method, RAW path) first, which is bounded by distinct paths
+    // rather than by the 1.6M-row window, and Rust folds those into shapes.
+    // Grouping in SQL by `family` instead would be cheaper and would report the
+    // fleet clean: `/api/workers` is 4,016/4,394 healthy at family level because
+    // `/api/workers/{id}/<verb>` drowns `/api/workers/{id}`.
+    match state.store.read() {
+        Err(_) => out.push(InvariantResult::unknown(
+            "route.mounted_routes_answer",
+            "store unreadable",
+        )),
+        Ok(conn) => {
+            let since = crate::config::now_f64() - 14.0 * 86400.0;
+            let mut acc: std::collections::HashMap<(String, String), (i64, i64)> =
+                std::collections::HashMap::new();
+            let rows = conn
+                .prepare(
+                    "SELECT method, path,                             SUM(CASE WHEN status >= 200 AND status < 300 THEN 1 ELSE 0 END),                             COUNT(*)                      FROM _amux_request_log WHERE ts >= ?1 GROUP BY method, path",
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map([since], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, i64>(3)?,
+                        ))
+                    })
+                    .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+                })
+                .unwrap_or_default();
+            for (method, path, ok, n) in rows {
+                let shape = crate::api::request_log::normalize_target_verb(&path);
+                let e = acc.entry((method, shape)).or_insert((0, 0));
+                e.0 += ok;
+                e.1 += n;
+            }
+            let groups: Vec<checks::RouteOutcomeRow> = acc
+                .into_iter()
+                .map(|((method, shape), (ok, n))| checks::RouteOutcomeRow {
+                    method,
+                    shape,
+                    n,
+                    ok,
+                })
+                .collect();
+            out.extend(checks::mounted_routes_answer(&groups, &mounted));
+        }
+    }
+    tm.mark(&out, "1a. mounted routes answer");
     // -- 1b. no two lanes share a Claude conversation (AMUX-1730 / AMUX-2819).
     //
     // Reads the session meta files, which are the same store the resume path
@@ -1351,29 +1409,51 @@ fn card_type_vocabulary_check(state: &AppState) -> Vec<InvariantResult> {
 fn frustration_ledger_check(state: &AppState) -> Vec<InvariantResult> {
     const AGREE: &str = "frustrations.ledger_agrees_with_board";
     const REACH: &str = "frustrations.cards_are_reachable";
+    const RETIRED: &str = "frustrations.retired_entries_stay_retired";
     const BAKED: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../frustrations.md"
     ));
+    const BAKED_ARCHIVE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../frustrations-archive.md"
+    ));
     let repo = crate::api::self_update::repo_dir();
-    let (md, source) = repo
-        .as_ref()
-        .and_then(|d| {
-            std::fs::read_to_string(d.join("frustrations.md")).ok().map(|s| (s, "worktree"))
-        })
-        .or_else(|| {
-            let dir = repo.as_ref()?;
-            let out = std::process::Command::new("git")
-                .args(["-C", &dir.to_string_lossy(), "show", "HEAD:frustrations.md"])
-                .output()
-                .ok()?;
-            out.status
-                .success()
-                .then(|| (String::from_utf8_lossy(&out.stdout).into_owned(), "HEAD"))
-        })
-        .unwrap_or_else(|| (BAKED.to_string(), "baked-at-build"));
+    // One resolver for both files, so the ledger and the archive can never be
+    // read from DIFFERENT commits. Comparing a worktree ledger against a baked
+    // archive would report every entry archived since the last build as a
+    // resurrection, which is the AF-132 trap this module already carries a
+    // warning about one function up.
+    let load = |name: &str, baked: &'static str| -> (String, &'static str) {
+        repo.as_ref()
+            .and_then(|d| std::fs::read_to_string(d.join(name)).ok().map(|s| (s, "worktree")))
+            .or_else(|| {
+                let dir = repo.as_ref()?;
+                let out = std::process::Command::new("git")
+                    .args(["-C", &dir.to_string_lossy(), "show", &format!("HEAD:{name}")])
+                    .output()
+                    .ok()?;
+                out.status
+                    .success()
+                    .then(|| (String::from_utf8_lossy(&out.stdout).into_owned(), "HEAD"))
+            })
+            .unwrap_or_else(|| (baked.to_string(), "baked-at-build"))
+    };
+    let (md, source) = load("frustrations.md", BAKED);
+    let (archive_md, archive_source) = load("frustrations-archive.md", BAKED_ARCHIVE);
+    let archive_titles: Vec<String> =
+        checks::parse_frustration_entries(&archive_md).into_iter().map(|e| e.1).collect();
+    // AF-434: the second key. Title alone missed a chimera (one entry's heading
+    // over another's archived body); prose alone would miss the 17 AF-430
+    // resurrections whose authors had revised the text before signing off.
+    let archive_prints = checks::frustration_entry_fingerprints(&archive_md);
+    let ledger_prints = checks::frustration_entry_fingerprints(&md);
 
     let entries = checks::parse_frustration_entries(&md);
+    // Taken BEFORE the join loop consumes `entries`, and it is every title
+    // rather than only the ones that yielded a card: all 29 of AF-430's
+    // resurrected entries carried perfectly good CARD lines.
+    let ledger_titles: Vec<String> = entries.iter().map(|e| e.1.clone()).collect();
     if entries.is_empty() {
         // Zero entries makes BOTH checks pass vacuously, which is the exact
         // theatre this module forbids. An empty ledger is either a drained file
@@ -1381,13 +1461,25 @@ fn frustration_ledger_check(state: &AppState) -> Vec<InvariantResult> {
         let msg = format!("parsed 0 entries from {source} ({} bytes)", md.len());
         return vec![
             InvariantResult::unknown(AGREE, msg.clone()),
-            InvariantResult::unknown(REACH, msg),
+            InvariantResult::unknown(REACH, msg.clone()),
+            InvariantResult::unknown(RETIRED, msg),
         ];
     }
     let Ok(conn) = state.store.read() else {
+        // The board join needs the store; the ledger/archive comparison does
+        // NOT, so it still runs and still reports. A check that goes silent
+        // because a DIFFERENT check's dependency is down is how a resurrection
+        // sits unseen through an outage.
         return vec![
             InvariantResult::unknown(AGREE, "store unreadable"),
             InvariantResult::unknown(REACH, "store unreadable"),
+            checks::frustration_retired_entries_stay_retired(
+                &ledger_titles,
+                &archive_titles,
+                &ledger_prints,
+                &archive_prints,
+                source,
+            ),
         ];
     };
     // The prefixes THIS instance mints, read off the board rather than
@@ -1447,6 +1539,14 @@ fn frustration_ledger_check(state: &AppState) -> Vec<InvariantResult> {
         &cardless,
         &local_prefixes,
         source,
+    ));
+    // AF-430.
+    out.push(checks::frustration_retired_entries_stay_retired(
+        &ledger_titles,
+        &archive_titles,
+        &ledger_prints,
+        &archive_prints,
+        if source == archive_source { source } else { "ledger and archive from different sources" },
     ));
     out
 }

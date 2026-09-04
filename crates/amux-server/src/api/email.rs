@@ -421,7 +421,7 @@ pub async fn send(
             &connected,
         );
         if !externals.is_empty()
-            && !crate::api::email_approval::exempt_sessions(&home).contains(&lane.to_lowercase())
+            && !crate::api::email_approval::external_email_allowed(&home, &lane)
         {
             let preview = json!({
                 "endpoint": "send", "from": from_acct, "to": to, "cc": cc,
@@ -648,8 +648,7 @@ pub async fn reply(
         // runs), classify, and freeze for a human if anyone external is on it.
         if let Some(lane) = hdr_worker(&headers) {
             let home = ctx.client.home().to_path_buf();
-            if !crate::api::email_approval::exempt_sessions(&home).contains(&lane.to_lowercase())
-            {
+            if !crate::api::email_approval::external_email_allowed(&home, &lane) {
                 let (r_to, r_cc, r_subject) = match ctx
                     .client
                     .resolve_reply_recipients(&gmail_from, &message_id, reply_all, allow_self)
@@ -2089,6 +2088,33 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::OK, "{res}");
+
+        // First-class worker configuration: the same scoped key exposed in
+        // Configurations reaches this actual send gate immediately.
+        let home3 = temp_home();
+        std::fs::create_dir_all(home3.path().join("sessions")).unwrap();
+        std::fs::write(
+            home3.path().join("sessions/campaign.env"),
+            "AMUX_EMAIL_EXTERNAL_ALLOW=1\n",
+        )
+        .unwrap();
+        let http3 = MockHttp::new(vec![
+            ("GET", "/messages?q=", 200, json!({ "messages": [] })),
+            ("GET", "/settings/sendAs", 200, json!({ "sendAs": [] })),
+            ("POST", "/messages/send", 200, json!({ "id": "m11", "threadId": "t11" })),
+        ]);
+        let (app3, _d3, _r3) = app_with(http3, home3.path());
+        let (st, res) = send_req(
+            &app3,
+            "POST",
+            "/api/email/send",
+            Some(json!({ "to": "lead@prospect.com", "subject": "Hi", "body": "b",
+                         "from": ACCT, "force_new_thread": true })),
+            &[("x-amux-session", "campaign")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{res}");
+        assert_eq!(res["id"], json!("m11"));
     }
 
     /// AMUX-3698: a human can DISCARD a held draft, and it is recorded.

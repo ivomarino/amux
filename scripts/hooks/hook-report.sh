@@ -28,6 +28,36 @@ if [ -z "$AMUX_SESSION" ]; then
     amux-*) export AMUX_SESSION="${TNAME#amux-}"; DERIVED=1 ;;
   esac
 fi
+# AMUX-4033: a STALE $AMUX_SESSION, which the empty check above cannot see.
+#
+# Renaming a running worker moves its env file and renames its tmux session,
+# then re-exports AMUX_SESSION into the tmux SESSION environment — and that only
+# reaches panes started afterwards. The agent already running keeps the OLD name
+# for its entire life, so every report it sends names a session that no longer
+# exists. Measured 2026-09-02, one minute after leadership-coaching became
+# leadership-coach: `leadership-coaching source=prompt-hook http=404` and
+# `source=stop-hook http=404`, while tmux itself already read leadership-coach.
+# The worker looked renamed and was quietly reporting nothing.
+#
+# The correction is NARROW on purpose: only when the claimed name has NO session
+# file AND the pane's own name HAS one. That covers the rename and the typo this
+# file's own POST block describes (4h15m as `amax-gtm`, 138 reports, every one a
+# 404, zero 200s). It cannot capture a deliberate cross-session claim, because
+# there the claimed session exists and this leaves it alone.
+CORRECTED=0
+if [ -n "$AMUX_SESSION" ] && [ ! -f "$HOME/.amux/sessions/$AMUX_SESSION.env" ]; then
+  _TN=$(tmux display-message -p '#S' 2>/dev/null)
+  case "$_TN" in
+    amux-*)
+      _TRUE="${_TN#amux-}"
+      if [ "$_TRUE" != "$AMUX_SESSION" ] && [ -f "$HOME/.amux/sessions/$_TRUE.env" ]; then
+        STALE_FROM="$AMUX_SESSION"
+        export AMUX_SESSION="$_TRUE"
+        CORRECTED=1
+      fi
+      ;;
+  esac
+fi
 [ -n "$AMUX_SESSION" ] || exit 0
 # ISOLATED WORKERS (AMUX-3232). An isolated worker has AMUX_SESSION stripped at
 # spawn, so DERIVED=1 is the discriminator. But "derived" also covers a real lane
@@ -47,12 +77,61 @@ C=$(sed -n 's/.*"canonical_url":"\([^"]*\)".*/\1/p' "$E" 2>/dev/null)
 L=$(sed -n 's/.*"legacy_port":\([0-9]*\).*/\1/p' "$E" 2>/dev/null)
 U="${AMUX_URL:-$C}"
 case "$U" in *localhost:$L|*127.0.0.1:$L) U="${C:-$U}";; esac
+# AMUX-4024: THE SUBAGENT LIFECYCLE PRODUCER.
+#
+# `subagent_event_post` (session_verbs.rs) has accepted {"subagent":"start"} /
+# {"subagent":"stop"} since AMUX-3048, and `FleetSignals::subagents_working`
+# has read the resulting count ever since. NOTHING EVER SENT ONE. Measured
+# 2026-09-02: `subagents_live` was null for 125 of 125 lanes, so the durable
+# signal that whole cluster (AMUX-2646/2904/2959/2952/3022/3030/3047) was
+# built around had a reader, a store, a test and no producer — the same shape
+# this file's own `active_model` comment describes thirty lines below.
+#
+# That is also why the count could not simply be switched on: an mtime cannot
+# tell "thinking, will write in 90s" from "finished 30s ago", and with no
+# events there was nothing better to prefer. Two live specimens, one in each
+# direction, on the same afternoon: tubescience read IDLE while blocked on a
+# background agent, and mvs-pitr read WORKING with an AGENTS badge over an
+# empty composer, its subagents long finished and their transcripts still
+# inside the 240s window.
+#
+# THE MATCHER IS ANCHORED (`^(Task|Agent)$`) and that is load-bearing. Claude
+# Code matches the matcher against the TOOL NAME as an unanchored regex, and
+# `TaskOutput` and `TaskStop` are separate tools you call WHILE polling
+# background work — a bare `Task|Agent` matches both, so every poll of a running
+# agent would have incremented the count again and pinned the lane WORKING. That
+# is the exact false-WORKING this card is fixing, reintroduced by its own fix.
+#
+# A subagent event says nothing about the main turn, so this branch skips the
+# transcript/token extraction entirely and posts only the lifecycle fact. It
+# reuses the POST + failure-logging below rather than adding a second sender,
+# so a refused subagent event is visible in the same log as every other
+# refused report.
+# BOTH SPELLINGS ARE ACCEPTED, and that is not politeness. Two independent
+# implementations of this producer landed on the same day: this one uses
+# `subagent:start` (colon) and #182 used `subagent-start` (hyphen). The
+# settings.json wired on this box and verified live calls the COLON form, so
+# dropping it would silently stop the counting — the hook would post
+# {"state":"subagent:start"}, the server would refuse it, and the only symptom
+# would be lanes reading WORKING for four minutes again.
+case "${MODE/subagent-/subagent:}" in
+  subagent:reset)
+    # SessionStart fires for startup, resume AND compact, and only the first two
+    # mean a NEW process. A compact keeps the same process, so its background
+    # agents are still running and zeroing the count here would invent the very
+    # false-idle this card is fixing. Skip on compact; the payload says which.
+    case "$IN" in
+      *'"source":"compact"'*|*'"source": "compact"'*) exit 0 ;;
+    esac
+    ;;
+esac
 BODY=$(printf '%s' "$IN" | /usr/bin/python3 -c '
 import json,sys,os
 raw=sys.stdin.read()
 mode,src=sys.argv[1],sys.argv[2]
-if mode in ("subagent-start", "subagent-stop"):
-    out={"subagent":mode[len("subagent-"):],"source":src}
+norm=mode.replace("subagent-","subagent:",1)
+if norm.startswith("subagent:"):
+    out={"subagent":norm.split(":",1)[1],"source":src}
 else:
     out={"state":mode,"source":src}
 h={}; tp=""; nlines=0; err=""
@@ -95,7 +174,7 @@ except Exception as e:
 # below — skipping the log in exactly the case the log exists to explain. Caught
 # by building a failing payload and checking the log stayed empty, which is the
 # only way that class of hole shows up: everything looked like it ran.
-if tp:
+if tp and "subagent" not in out:
     try:
         tot=0
         # MODEL FROM THE TRANSCRIPT, not only from the hook payload: the payload
@@ -135,18 +214,20 @@ if "subagent" not in out and (not out.get("model") or not out.get("tokens")):
     except Exception: pass
 print(json.dumps(out))
 ' "$MODE" "$SRC" 2>/dev/null)
-if [ -z "$BODY" ]; then
-  case "$MODE" in
-    subagent-start) BODY="{\"subagent\":\"start\",\"source\":\"$SRC\"}" ;;
-    subagent-stop)  BODY="{\"subagent\":\"stop\",\"source\":\"$SRC\"}" ;;
-    *)              BODY="{\"state\":\"$MODE\",\"source\":\"$SRC\"}" ;;
-  esac
-fi
+# One parser above now owns both subagent spellings, reset, conversation
+# attribution, and main-turn reports. Keeping a fast hand-built JSON branch for
+# subagents dropped the hook payload's session_id and made subagent status less
+# attributable than the parent status it augments.
+[ -n "$BODY" ] || BODY="{\"state\":\"$MODE\",\"source\":\"$SRC\"}"
 # Surgery, not a third JSON encoder: BODY is always a flat object ending in
 # "}" (python's json.dumps above, or the fallback literal on this same line),
 # so appending before the final brace is safe and avoids a second place this
 # script can break on stdin shape (MR-43).
 [ "$DERIVED" = "1" ] && BODY="${BODY%\}}, \"amux_session_derived\": true}"
+# Same surgery, same reason: a rename that silently de-attributed a lane should
+# be COUNTABLE in /api/logs/analyze, not something a human notices weeks later
+# by wondering why a worker stopped reporting (ethos rule 4).
+[ "$CORRECTED" = "1" ] && BODY="${BODY%\}}, \"amux_session_corrected_from\": \"$STALE_FROM\"}"
 # X-Amux-Session stamps the write server-side (AMUX-1768). report_post's own
 # comment names its absence as the standing residual: "the shipped hooks send no
 # header, so an UNSTAMPED write is still accepted". This IS the shipped hook.

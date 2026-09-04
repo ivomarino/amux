@@ -69,6 +69,8 @@
 //! `GET /api/debug/autofix`. A detector that silently declines is exactly the
 //! failure this whole subsystem exists to end: an absence nobody can see.
 
+const JOB: &str = "autofix";
+
 use crate::api::request_log as rl;
 use crate::api::AppState;
 use crate::db::board_store as bs;
@@ -2918,7 +2920,9 @@ fn detect_schedule_run_health(
                 (
                     "missing_artifact".into(),
                     format!(
-                        "No cmd_history row type=schedule for this worker within -60s/+120s whose origin names [{}] (or its legacy title).",
+                        "No cmd_history row type=schedule for this worker within -60s/+120s whose origin names [{}] or matches its CURRENT title \"{}\". Note the second arm is the current title, not a historical one: schedule_audit records no `title` field, so a rename leaves no trail to look a previous title up in (AF-429). If this schedule was renamed after the run, an older row may exist under the old name and only the [{}] arm can find it.",
+                        newest.id,
+                        newest.title.replace('"', "'"),
                         newest.id
                     ),
                 ),
@@ -6968,8 +6972,12 @@ async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<St
                 ask_type: None,
                 ask_question: None,
                 ask_unblocks: None,
+                ask_actor: None,
                 // AF-367: filed by the autofix detector.
                 source: Some("autofix".into()),
+                requested_by: None,
+                callback_session: None,
+                callback_prompt: None,
             };
             let row = bs::create_issue(conn, &new, now_s)?;
             conn.execute(
@@ -7310,7 +7318,7 @@ async fn note_quiet_signatures(
 /// Note the difference from the Settings toggle: 0 stops the JOB, the toggle
 /// stops the WRITE and keeps the evidence.
 pub fn spawn(state: AppState) -> Option<super::PeriodicTask> {
-    let secs = std::env::var("AMUX_AUTOFIX_SECS")
+    let secs = std::env::var(super::per_job_disable_var(JOB))
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(AUTOFIX_TICK_SECS);
@@ -7319,7 +7327,7 @@ pub fn spawn(state: AppState) -> Option<super::PeriodicTask> {
         return None;
     }
     let home = crate::runtime_jobs::autofix::amux_home();
-    Some(super::spawn_periodic("autofix", secs, move || {
+    Some(super::spawn_periodic(JOB, secs, move || {
         let state = state.clone();
         let home = home.clone();
         async move {
@@ -7361,7 +7369,7 @@ async fn debug_autofix(
     use axum::response::IntoResponse;
     let r = last_report();
     let on = state.store.read().map(|c| enabled(&c)).unwrap_or(true);
-    let secs = std::env::var("AMUX_AUTOFIX_SECS")
+    let secs = std::env::var(super::per_job_disable_var(JOB))
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(AUTOFIX_TICK_SECS);
@@ -7571,9 +7579,28 @@ mod tests {
             .iter()
             .any(|f| f.signature == "silent|schedule-message-missing|SCHED-9"));
 
+        // THE FIXTURE IS THE WRITER'S OWN OUTPUT, NOT A HAND-TYPED STRING
+        // (AF-429). This seeded the literal '[SCHED-9] Nightly sync' and passed
+        // for months while the live writer emitted a BARE TITLE, so the id arm
+        // of the detector's predicate matched zero of 956 production rows and
+        // the join rested entirely on two mutable title arms. ts-gke hit the
+        // race that produces: they renamed a schedule 3h12m after a run, the
+        // row held the old title, the detector looked up the new one, and a
+        // false report was filed against them for a delivery that worked.
+        //
+        // Neither test was wrong on its own. `schedule_message_origin_always_
+        // names_the_exact_schedule` pins the writer, this pins the detector,
+        // and NOTHING pinned that the writer's output satisfies the detector's
+        // predicate — which is the only property either of them exists for.
+        // Calling the real function here is what makes the two inseparable.
+        let origin = crate::runtime_jobs::scheduler::schedule_message_origin(
+            "Nightly sync",
+            "SCHED-9",
+            "cron-rs",
+        );
         conn.execute(
-            "INSERT INTO cmd_history(text,type,session,ts,origin) VALUES('sync','schedule','worker-a',?1,'[SCHED-9] Nightly sync')",
-            [(now - 600) * 1000],
+            "INSERT INTO cmd_history(text,type,session,ts,origin) VALUES('sync','schedule','worker-a',?1,?2)",
+            rusqlite::params![(now - 600) * 1000, origin],
         )
         .unwrap();
         let (linked, _) = super::detect_schedule_run_health(&conn, now as f64);
@@ -7582,6 +7609,60 @@ mod tests {
                 .iter()
                 .any(|f| f.signature == "silent|schedule-message-missing|SCHED-9"),
             "the exact Messages link is the negative control"
+        );
+
+        // EVERY source shape the writer can emit, against the same predicate.
+        // `manual:<who>` produces '[SCHED-9] [manual:ethan] Nightly sync', a
+        // form no hand-written fixture in this file had ever contained.
+        for source in ["cron-rs", "manual:ethan", "trigger"] {
+            let conn = schedule_health_conn();
+            conn.execute(
+                "INSERT INTO schedule_runs(schedule_id,ran_at,status,note,source) VALUES('SCHED-9',?1,'delivered','confirmed',?2)",
+                rusqlite::params![now - 600, source],
+            )
+            .unwrap();
+            let o = crate::runtime_jobs::scheduler::schedule_message_origin(
+                "Nightly sync",
+                "SCHED-9",
+                source,
+            );
+            conn.execute(
+                "INSERT INTO cmd_history(text,type,session,ts,origin) VALUES('sync','schedule','worker-a',?1,?2)",
+                rusqlite::params![(now - 600) * 1000, o],
+            )
+            .unwrap();
+            let (f, _) = super::detect_schedule_run_health(&conn, now as f64);
+            assert!(
+                !f.iter().any(|f| f.signature == "silent|schedule-message-missing|SCHED-9"),
+                "source={source}: the writer's own origin must satisfy the detector"
+            );
+        }
+
+        // THE CONTROL, and the reason the loop above is not theatre: a RENAMED
+        // schedule. The row carries the title the writer used; the detector
+        // looks up the current one. The id arm is the only thing that can link
+        // them, so this is ts-gke's exact case and it must NOT file a finding.
+        let conn = schedule_health_conn();
+        conn.execute(
+            "INSERT INTO schedule_runs(schedule_id,ran_at,status,note,source) VALUES('SCHED-9',?1,'delivered','confirmed','cron-rs')",
+            [now - 600],
+        )
+        .unwrap();
+        let stale = crate::runtime_jobs::scheduler::schedule_message_origin(
+            "the title it had when it ran",
+            "SCHED-9",
+            "cron-rs",
+        );
+        conn.execute(
+            "INSERT INTO cmd_history(text,type,session,ts,origin) VALUES('sync','schedule','worker-a',?1,?2)",
+            rusqlite::params![(now - 600) * 1000, stale],
+        )
+        .unwrap();
+        let (renamed, _) = super::detect_schedule_run_health(&conn, now as f64);
+        assert!(
+            !renamed.iter().any(|f| f.signature == "silent|schedule-message-missing|SCHED-9"),
+            "a schedule renamed after its run must still link by id — this is ts-gke's \
+             false report, and the title arms cannot see it"
         );
     }
 
