@@ -5927,3 +5927,71 @@ SCOPED 2026-08-09 by amux-frustrations, from amux-cloud's validation: the shippe
   it, and the entry's own FIX-NOTE records that shape as validated STILL SILENT. Held open
   on the honest basis that a plausible fix is not an exercised one. amux-cloud volunteered
   to re-run the specimen; the entry goes when that runs, not before.
+
+## `--trigger` destroys the value it replaces and records only the field name
+VALIDATED: gtm-engine | VALIDATED 2026-09-04 by gtm-engine, the originating session, on the SECOND attempt.
+Recorded that way deliberately: they REFUSED the first validation with a measurement,
+the card was reopened rather than the entry touched, and this signature is over a
+different fix.
+
+WHAT THEY REFUSED. The first fix (e56fff8b) raised the log cap from 60 to 200 chars.
+They probed the boundary on a scratch card rather than confirming the commit:
+   88 chars ->  88 retained, tail survives
+  158 chars -> 158 retained, tail survives
+  208 chars -> 201 retained, TAIL LOST
+  366 chars -> 201 retained, TAIL LOST   <- their actual loss
+So the exact partial-recovery this entry describes survived the fix written for it.
+
+WHY THE TEST WAS GREEN, which is their diagnosis and the more useful half: the
+fixture was 132 characters against a 200 cap, so "head AND tail survive" was
+satisfied by any cap at or above 132. Mutating to 60 reddened it; mutating to 201,
+the shipped value, did not. A fixture that cannot cross the boundary cannot test it.
+
+THE REAL FIX, e276496c. The destroyed value is kept whole to 1800 chars (900 head +
+900 tail), and past that the MIDDLE goes with `[N chars elided]` in the gap rather
+than the tail.
+
+THEIR VERIFICATION, run independently and crossing the bound on purpose:
+  366-char inventory  head True, tail True, the fifth item True, no marker
+  2620-char value     head True, tail True, marker "[820 chars elided]"
+  2620 - 1800 = 820, so the count is arithmetically consistent, not merely present.
+
+AND THEIR CORRECTION TO MY OWN FRAMING, which is the truer statement of the fix and
+is why it is quoted rather than paraphrased: "A 366-char value came back whole under
+a 1800 cap and would have come back whole under a 500 cap too. What closes it is that
+a value past the bound now arrives MARKED INCOMPLETE instead of looking like a prefix
+that was all there was. My loss was not that four items survived; it was that nothing
+told me a fifth had existed. The elision count is the difference between a
+recoverable loss and a silent one, and it holds at any cap."
+
+Scratch cards GE-807 and GE-808 created and deleted; nothing left behind.
+Card AF-459 done.
+
+AREA: board
+SEVERITY: data-loss
+STATUS: fixed
+DATE: 2026-09-03
+SESSION: gtm-engine
+CARD: AF-459
+SYMPTOM: `amux board <status> --trigger` writes `source_ref` as a plain overwrite.
+ Only an `autofix:` prefix is protected (AMUX-3686), and that narrowness is
+ deliberate: a trigger replacing a trigger is normal. The PATCH log builds one line
+ per patch from a Vec of FIELD NAMES, so the overwrite rendered as the bare word
+ `source_ref` — that it moved, and nothing about what it moved from. `/api/history`
+ carries no row with the value either. The column being written WAS the only copy
+ in existence.
+COST: gtm-engine lost a five-item inventory dated 2026-08-09 while probing whether
+ `--trigger` works on an archived card (it does). They recovered four items from a
+ prefix they happened to have printed earlier in their own transcript; the fifth is
+ gone permanently. Second known clobber of this field on that board, so the first
+ one cost something too and nobody logged it.
+FIX: e56fff8b. One match arm. This is now the one field whose log line names the
+ DESTROYED value rather than the arriving one, because the log's own stated rule
+ ("VALUES ARE SUMMARISED, NOT COPIED ... the new value is already on the card") is
+ correct for every other field and inverts here: there is no redundancy to trade
+ against readability when the value exists nowhere else. Old value kept at 200
+ chars against 60 for arrivals, with a mutation pinning it, because the failure
+ mode is specifically PARTIAL recovery and a truncated sole copy reproduces the
+ prefix-survives-tail-dies loss exactly. Three mutations, including a negative
+ control (printing WAS unconditionally would claim data loss on every card
+ creation).

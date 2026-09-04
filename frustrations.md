@@ -2477,37 +2477,6 @@ NOTE: CAUSE CORRECTED, 2026-09-03, same session. The codesign SIGKILL is real
  background job that dies with its parent shell, while the supervisor that should
  own it is locked out of the port.
 
-## `--trigger` destroys the value it replaces and records only the field name
-
-AREA: board
-SEVERITY: data-loss
-STATUS: fixed
-DATE: 2026-09-03
-SESSION: gtm-engine
-CARD: AF-459
-SYMPTOM: `amux board <status> --trigger` writes `source_ref` as a plain overwrite.
- Only an `autofix:` prefix is protected (AMUX-3686), and that narrowness is
- deliberate: a trigger replacing a trigger is normal. The PATCH log builds one line
- per patch from a Vec of FIELD NAMES, so the overwrite rendered as the bare word
- `source_ref` — that it moved, and nothing about what it moved from. `/api/history`
- carries no row with the value either. The column being written WAS the only copy
- in existence.
-COST: gtm-engine lost a five-item inventory dated 2026-08-09 while probing whether
- `--trigger` works on an archived card (it does). They recovered four items from a
- prefix they happened to have printed earlier in their own transcript; the fifth is
- gone permanently. Second known clobber of this field on that board, so the first
- one cost something too and nobody logged it.
-FIX: e56fff8b. One match arm. This is now the one field whose log line names the
- DESTROYED value rather than the arriving one, because the log's own stated rule
- ("VALUES ARE SUMMARISED, NOT COPIED ... the new value is already on the card") is
- correct for every other field and inverts here: there is no redundancy to trade
- against readability when the value exists nowhere else. Old value kept at 200
- chars against 60 for arrivals, with a mutation pinning it, because the failure
- mode is specifically PARTIAL recovery and a truncated sole copy reproduces the
- prefix-survives-tail-dies loss exactly. Three mutations, including a negative
- control (printing WAS unconditionally would claim data loss on every card
- creation).
-
 ## An archived card is listed as actionable and refuses every closing action
 
 AREA: board
