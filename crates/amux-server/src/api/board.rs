@@ -5027,18 +5027,18 @@ fn reassign_exit(card: &str, owner: Option<&str>, caller: &str) -> Value {
     if let (false, Some(o)) = (mine, owner) {
         return json!({
             "when": format!(
-                "This card is owned by {o:?}, not by you. If the work is theirs, you do not                  need to satisfy this gate at all — hand it back."
+                "This card is owned by {o:?}, not by you. If the work is theirs, you do not need to satisfy this gate at all — hand it back."
             ),
             "how": format!("amux board assign {card} {o} && amux board todo {card}"),
             "effect": format!("dispatches to {o}, not to you"),
-            "not_a_bypass": "this does not skip the gate; it moves the card to the lane the                              gate is asking about, and they satisfy it honestly",
+            "not_a_bypass": "this does not skip the gate; it moves the card to the lane the gate is asking about, and they satisfy it honestly",
         });
     }
     json!({
-        "when": "If this card's WORK belongs to another lane, hand it over instead of acking                  a criterion you cannot truthfully claim. You own it right now, so nothing                  here can tell whether that is the case — only you can.",
+        "when": "If this card's WORK belongs to another lane, hand it over instead of acking a criterion you cannot truthfully claim. You own it right now, so nothing here can tell whether that is the case — only you can.",
         "how": format!("amux board assign {card} <owning-lane> && amux board todo {card}"),
-        "effect": "dispatches to THEM, not back to you. Moving it to `backlog` or `todo`                    while you still own it re-feeds your own auto-pickup and it returns.",
-        "not_a_bypass": "this does not skip the gate; it moves the card to the lane the                          gate is asking about, and they satisfy it honestly",
+        "effect": "dispatches to THEM, not back to you. Moving it to `backlog` or `todo` while you still own it re-feeds your own auto-pickup and it returns.",
+        "not_a_bypass": "this does not skip the gate; it moves the card to the lane the gate is asking about, and they satisfy it honestly",
     })
 }
 
@@ -5088,6 +5088,25 @@ mod reassign_exit_tests {
                 v["how"].as_str().unwrap().contains("<owning-lane>"),
                 "owner {owner:?} produced a named command: {v:#}"
             );
+        }
+    }
+
+    /// No run of spaces reaches the reader. Every string here is a Rust literal
+    /// spanning several source lines, and the difference between a continuation
+    /// that joins them and one that does not is invisible in the source and
+    /// obvious in the output — this shipped once, and it was a live probe that
+    /// showed "the                              gate is asking about".
+    #[test]
+    fn no_arm_leaks_source_indentation_into_the_text() {
+        for (owner, caller) in [(Some("peer"), "me"), (Some("me"), "me"), (None, "me")] {
+            let v = reassign_exit("AF-1", owner, caller);
+            for key in ["when", "how", "effect", "not_a_bypass"] {
+                let s = v[key].as_str().unwrap_or_default();
+                assert!(
+                    !s.contains("  "),
+                    "{owner:?}/{key} carries source indentation into the reader's text: {s:?}"
+                );
+            }
         }
     }
 
