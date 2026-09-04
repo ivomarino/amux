@@ -844,6 +844,175 @@ pub fn request_arrival_follows_boot(
     )]
 }
 
+/// A `.git/index.lock` that no process holds and that nobody is reporting
+/// (AF-504).
+///
+/// Reported by mixpeek-frustrations: a stale lock stalled a shared checkout for
+/// ~20 minutes while every lane routed around it and none said so. Each lane saw
+/// its own `git add` fail, retried, gave up, and worked another way; the LOCK was
+/// never anyone's card, so the fleet had no way to know a checkout was wedged.
+/// AF-503 shipped the half that reaches the BLOCKED lane, which is the one who
+/// can act. This is the fleet-visibility half.
+///
+/// `size` is the sharpest signal and it is free: git writes the new index INTO
+/// the lock and renames, so a live writer's lock GROWS. Zero bytes with a static
+/// mtime is the stale shape. It is reported beside the age either way, because a
+/// large lock that is old is a slow writer and a zero-byte lock that is old is
+/// abandoned, and those want opposite responses.
+///
+/// `holder` follows the guard's `_lock_holder` protocol exactly, and the reason
+/// is the whole point of that function: a probe that could not RUN must never
+/// answer "nobody holds it". Ten minutes were lost to `lsof <file> 2>/dev/null
+/// || echo no holder` printing the reassuring branch on a box with no lsof. So
+/// an unmeasured holder yields UNKNOWN here, never a pass — a green invariant
+/// over an unrunnable probe is worse than no invariant.
+pub fn git_index_lock_is_not_stale(
+    lock_exists: bool,
+    age_s: i64,
+    size_bytes: u64,
+    holder: LockHolder,
+    stale_after_s: i64,
+) -> Vec<InvariantResult> {
+    const ID: &str = "git.index_lock_not_stale";
+    if !lock_exists {
+        return vec![InvariantResult::pass(ID)];
+    }
+    let shape = if size_bytes == 0 {
+        "0 bytes and not growing, which is the STALE shape".to_string()
+    } else {
+        format!("{size_bytes} bytes, so a writer has been filling it")
+    };
+    match holder {
+        // A probe that did not run is UNKNOWN. This arm exists so that a box
+        // without lsof reports "I could not tell" rather than a clean pass, and
+        // it is the arm the whole check is shaped around.
+        LockHolder::Unmeasured(why) => vec![InvariantResult::unknown(
+            ID,
+            format!(
+                "index.lock has existed {age_s}s ({shape}), and the holder probe did NOT run \
+                 ({why}). This is UNKNOWN, not clear — do not remove the lock on the strength \
+                 of this result."
+            ),
+        )],
+        LockHolder::Held(who) => {
+            let mut r = InvariantResult::pass(ID);
+            r.observed = format!("held by a live writer ({who}), age {age_s}s");
+            vec![r]
+        }
+        LockHolder::Unheld if age_s <= stale_after_s => {
+            let mut r = InvariantResult::pass(ID);
+            r.observed =
+                format!("no holder, but only {age_s}s old ({shape}) — ordinary contention");
+            vec![r]
+        }
+        LockHolder::Unheld => vec![InvariantResult::fail(
+            ID,
+            format!("no index.lock, or one younger than {stale_after_s}s, or one with a holder"),
+            format!(
+                "index.lock has existed {age_s}s with NO process holding it open ({shape}). \
+                 Every lane's `git add`/`commit` on this checkout fails while it sits there, \
+                 and each one sees only its own failure — the lock is nobody's card, which is \
+                 why a 20-minute stall went unreported. Removing it is destructive on a shared \
+                 checkout and is a human's call, not this monitor's: confirm the mtime is still \
+                 not advancing, then remove it."
+            ),
+        )],
+    }
+}
+
+/// The holder verdict, as three states rather than a bool.
+///
+/// A bool would collapse `Unheld` and `Unmeasured`, which is the exact defect
+/// this check exists to avoid — they read identically and want opposite
+/// responses.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LockHolder {
+    Held(String),
+    Unheld,
+    Unmeasured(String),
+}
+
+#[cfg(test)]
+mod git_index_lock_tests {
+    use super::*;
+
+    fn one(
+        exists: bool, age: i64, size: u64, holder: LockHolder,
+    ) -> InvariantResult {
+        let mut v = git_index_lock_is_not_stale(exists, age, size, holder, 900);
+        assert_eq!(v.len(), 1);
+        v.pop().unwrap()
+    }
+
+    #[test]
+    fn no_lock_is_a_pass() {
+        assert_eq!(one(false, 0, 0, LockHolder::Unheld).status, Status::Pass);
+    }
+
+    /// THE CELL THIS EXISTS FOR. A lock nobody holds, older than the window, is
+    /// the 20-minute stall: every lane's git fails, each sees only its own
+    /// failure, and nothing in the fleet says a checkout is wedged.
+    #[test]
+    fn an_old_lock_with_no_holder_fails_and_says_why_nobody_reported_it() {
+        let r = one(true, 1200, 0, LockHolder::Unheld);
+        assert_eq!(r.status, Status::Fail);
+        assert!(r.observed.contains("NO process holding it open"), "{r:?}");
+        assert!(
+            r.observed.contains("nobody's card"),
+            "the result does not say why a 20m stall went unreported: {r:?}"
+        );
+        assert!(r.observed.contains("STALE shape"), "the zero-byte signal is missing: {r:?}");
+    }
+
+    /// THE ARM THE WHOLE CHECK IS SHAPED AROUND. A probe that could not RUN must
+    /// never read as clear. `lsof <file> 2>/dev/null || echo no holder` printing
+    /// the reassuring branch on a box without lsof cost ten minutes once; a
+    /// green invariant over an unrunnable probe would cost more, because
+    /// everyone reads it and nobody questions it.
+    #[test]
+    fn an_unmeasured_holder_is_unknown_and_never_a_pass() {
+        let r = one(true, 5000, 0, LockHolder::Unmeasured("lsof not found".into()));
+        assert_eq!(r.status, Status::Unknown, "an unrunnable probe passed: {r:?}");
+        assert!(r.observed.contains("UNKNOWN, not clear"), "{r:?}");
+        assert!(r.observed.contains("lsof not found"), "the reason is dropped: {r:?}");
+    }
+
+    /// A live writer is a PASS, however old. Ageing out a held lock would tell
+    /// people to delete a lock a peer is actively writing through, which is the
+    /// destructive direction.
+    #[test]
+    fn a_held_lock_passes_no_matter_how_old() {
+        let r = one(true, 99_999, 4096, LockHolder::Held("git 123 ethan".into()));
+        assert_eq!(r.status, Status::Pass);
+        assert!(r.observed.contains("held by a live writer"), "{r:?}");
+    }
+
+    /// THE CONTROL that keeps this from being "any lock is a failure". Ordinary
+    /// contention is a lock that exists for a second or two, which happens
+    /// constantly on a checkout with fifty lanes.
+    #[test]
+    fn a_young_lock_with_no_holder_is_ordinary_contention() {
+        let r = one(true, 3, 0, LockHolder::Unheld);
+        assert_eq!(r.status, Status::Pass, "routine contention was reported as a fault: {r:?}");
+        assert!(r.observed.contains("ordinary contention"), "{r:?}");
+    }
+
+    /// SIZE AND AGE ARE REPORTED TOGETHER because they disagree in a way that
+    /// matters: a large old lock is a slow writer, a zero-byte old lock is
+    /// abandoned, and the two want opposite responses.
+    #[test]
+    fn a_growing_lock_is_described_differently_from_an_empty_one() {
+        let empty = one(true, 1200, 0, LockHolder::Unheld);
+        let filled = one(true, 1200, 8192, LockHolder::Unheld);
+        assert!(empty.observed.contains("STALE shape"), "{empty:?}");
+        assert!(filled.observed.contains("8192 bytes"), "{filled:?}");
+        assert!(
+            filled.observed.contains("a writer has been filling it"),
+            "a non-empty lock reads the same as an empty one: {filled:?}"
+        );
+    }
+}
+
 pub fn config_env_reaches_process(env_file: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Vec<InvariantResult> {
     const ID: &str = "config.env_reaches_process";
     let mut out = Vec::new();
