@@ -1738,6 +1738,20 @@ mod name_search_tests {
         assert!(!exhausted);
     }
 
+
+    /// Not an assertion about speed on any particular machine — a FLOOR under
+    /// the thing that would make this route unusable. It runs on every keystroke
+    /// in the new-worker field, over the REAL home directory.
+    #[test]
+    fn a_name_search_over_the_real_home_directory_finishes_promptly() {
+        let t0 = std::time::Instant::now();
+        let roots = name_search_roots();
+        let (hits, exhausted) = dirs_matching_name("amux", &roots, 10);
+        let ms = t0.elapsed().as_millis();
+        println!("name search over {} root(s): {} hit(s), exhausted={exhausted}, {ms}ms", roots.len(), hits.len());
+        assert!(ms < 5000, "a per-keystroke search took {ms}ms over the real home dir");
+    }
+
     #[test]
     fn the_home_directory_is_always_a_root_and_the_missing_ones_are_skipped() {
         let roots = name_search_roots();
