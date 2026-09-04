@@ -1153,6 +1153,8 @@ mod report_hook_wiring_tests {
     #[test]
     fn the_extractor_selects_both_the_wired_and_the_forked_shape() {
         let wired = serde_json::json!({"hooks": {
+            "SessionStart": [{"hooks": [{"type": "command",
+                "command": "bash \"$HOME/.amux/hook-report.sh\" subagent-reset session-start-hook"}]}],
             "Stop": [{"hooks": [{"type": "command",
                 "command": "bash \"$HOME/.amux/hook-report.sh\" idle stop-hook"}]}],
             "UserPromptSubmit": [{"hooks": [{"type": "command",
@@ -1165,7 +1167,7 @@ mod report_hook_wiring_tests {
                 "command": "bash \"$HOME/.amux/hook-report.sh\" subagent-stop subagent-stop-hook"}]}]
         }});
         let got = extract_report_hooks(&wired);
-        assert_eq!(got.len(), 5, "all five report hooks must be selected");
+        assert_eq!(got.len(), 6, "all six report hooks must be selected");
         assert_eq!(
             got.iter().find(|e| e.event == "PostToolUse").unwrap().matcher.as_deref(),
             Some(".*"),

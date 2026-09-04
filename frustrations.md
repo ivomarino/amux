@@ -2818,3 +2818,56 @@ FIX: ATE-44 (this commit). Both surfaces render one shared worker-action
  inventory; peek retains its two additional controls. All three peek file entry
  controls call one canonical full-route helper, the two overflow buttons have
  unique semantic IDs, and mismatch/file-entry verdicts reach client-debug logs.
+
+## Claude's background-agent wait row had two conflicting status parsers
+AREA: status
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: Primis visibly showed the provider-owned `Waiting for 1 background
+ agent to finish` row and an active Explore agent, while the dashboard header
+ said IDLE. `backend/adapter.rs` classified the row active, but the legacy
+ session projection called a second parser that omitted it.
+COST: the user had to reconcile the terminal, agent panel, session payload and
+ status-explain output to establish that real work was still running.
+FIX: ATE-45 shares one chrome-anchored singular/plural predicate between the
+ adapter and session status path. The exact provider row overrides an idle
+ parent-prompt report; quoted prose remains a negative control.
+
+## Subagent lifecycle truth disappeared whenever the server rebuilt
+AREA: hooks
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: Primis SubagentStart and SubagentStop hooks both recorded `http=000`
+ during a server rebuild. The callbacks were one-shot, so the server retained
+ neither the active agent identity nor its final stop after coming back.
+COST: the authoritative live-agent count read zero during real work and could
+ also remain positive after a lost stop; recovery depended on a later process
+ reset rather than replaying the facts that had already happened.
+FIX: ATE-45 gives each lifecycle edge a session/agent/event identity, persists
+ it in a bounded fsynced FIFO, replays oldest-first across outages and response
+ loss, and deduplicates durably in the server. Permanent 4xx poison events
+ dead-letter with full identity; 000/5xx retry; any later hook wakes the queue.
+
+## Board-drive interrupted Codex while its background terminal was running
+AREA: board
+SEVERITY: wrong-action
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: this ATE-45 turn visibly showed Codex's `1 background terminal
+ running` provider row, but board-drive sent an Idle nudge and Codex reported
+ `Conversation interrupted`. The status adapter already understood the row;
+ the steering boundary trusted a fresh idle parent report without reading it.
+COST: the harness interrupted its own green test run, forced the model to
+ reconstruct its place, and demonstrated that dashboard truth and delivery
+ safety still disagreed on the same frame.
+FIX: ATE-45 makes the shared structured Codex pane state override an idle
+ parent report for status, board-drive and steering. The hold clears on the
+ completed `Worked for` frame, and quoted copies of the text do not match.

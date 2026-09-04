@@ -2038,7 +2038,7 @@ pub struct ReportHookEntry {
 /// ethos rule 7, certified by its own incident report.
 ///
 /// INVARIANT: every report hook configured in settings.json actually INVOKES
-/// `hook-report.sh`; all five lifecycle edges are present with the right mode;
+/// `hook-report.sh`; all six lifecycle edges are present with the right mode;
 /// and (the documented second trap, AMUX-2538) a tool event's entry carries a
 /// matcher that is a valid REGEX — `"*"` is not one, and an entry without one is
 /// silently ignored. A Stop-only config used to pass this check while prompt
@@ -2067,6 +2067,7 @@ pub fn report_hooks_wired(entries: Result<Vec<ReportHookEntry>, String>) -> Vec<
     let mut broken: Vec<String> = Vec::new();
     let mut rows: Vec<serde_json::Value> = Vec::new();
     let required = [
+        ("SessionStart", "subagent-reset session-start-hook"),
         ("UserPromptSubmit", "active prompt-hook"),
         ("PostToolUse", "active tool-hook"),
         ("Stop", "idle stop-hook"),
@@ -2145,7 +2146,7 @@ pub fn report_hooks_wired(entries: Result<Vec<ReportHookEntry>, String>) -> Vec<
     } else {
         vec![InvariantResult::fail(
             ID,
-            "all five lifecycle hooks invoke ~/.amux/hook-report.sh with canonical modes, \
+            "all six lifecycle hooks invoke ~/.amux/hook-report.sh with canonical modes, \
              and tool events carry a valid regex matcher",
             broken.join("; "),
         )
@@ -4688,6 +4689,11 @@ mod negative_controls {
         const INLINE: &str = r#"curl -sk -m 3 -X POST -H 'Content-Type: application/json' -d "{\"state\":\"idle\",\"source\":\"stop-hook\"}" "$AMUX_URL/api/sessions/$AMUX_SESSION/report""#;
 
         let healthy = report_hooks_wired(Ok(vec![
+            ent(
+                "SessionStart",
+                r#"bash "$HOME/.amux/hook-report.sh" subagent-reset session-start-hook"#,
+                None,
+            ),
             ent("Stop", r#"bash "$HOME/.amux/hook-report.sh" idle stop-hook"#, None),
             ent(
                 "UserPromptSubmit",

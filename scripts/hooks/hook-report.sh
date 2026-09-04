@@ -14,6 +14,109 @@
 # lifecycle modes. Claude Code exposes SubagentStart/SubagentStop directly;
 # routing both through this one canonical reporter keeps attribution,
 # conversation adoption, endpoint resolution and failure logging identical.
+#
+# ATE-45: lifecycle delivery is a durable FIFO. A server rebuild used to turn
+# SubagentStart/Stop into one-shot http=000 log lines, leaving the authoritative
+# live count false until the next worker restart. The detached drain below
+# survives the hook invocation, retries the SAME event identity after response
+# loss, and leaves an fsynced bounded queue for the next hook if the outage
+# outlives its retry window. The hook still always exits zero: amux must never
+# block the model.
+if [ "${1:-}" = "--drain-subagents" ]; then
+  /usr/bin/python3 - "${2:-}" "${3:-}" "${4:-}" <<'PY'
+import fcntl,json,os,ssl,sys,tempfile,time,urllib.error,urllib.request
+queue,url,session=sys.argv[1:4]
+if not queue or not url or not session: raise SystemExit(0)
+lock=queue+".drain.lock"
+os.makedirs(os.path.dirname(queue),mode=0o700,exist_ok=True)
+lf=open(lock,"a+")
+try: fcntl.flock(lf,fcntl.LOCK_EX|fcntl.LOCK_NB)
+except BlockingIOError: raise SystemExit(0)
+
+def locked_rows(change=None):
+    qlock=queue+".lock"
+    with open(qlock,"a+") as guard:
+        fcntl.flock(guard,fcntl.LOCK_EX)
+        try:
+            with open(queue) as stream: rows=json.load(stream)
+            if not isinstance(rows,list): rows=[]
+        except Exception: rows=[]
+        if change is not None:
+            rows=change(rows)
+            fd,tmp=tempfile.mkstemp(prefix="queue.",dir=os.path.dirname(queue))
+            try:
+                os.fchmod(fd,0o600)
+                with os.fdopen(fd,"w") as stream:
+                    json.dump(rows,stream,separators=(",",":")); stream.write("\n")
+                    stream.flush(); os.fsync(stream.fileno())
+                os.replace(tmp,queue)
+            except BaseException:
+                try: os.unlink(tmp)
+                except FileNotFoundError: pass
+                raise
+        return rows
+
+def note(kind,row,code,attempt):
+    path=os.path.expanduser("~/.amux/logs/hook-report-failures.log")
+    try:
+        os.makedirs(os.path.dirname(path),exist_ok=True)
+        with open(path,"a") as stream:
+            stream.write(time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())+
+                f" {session} source={row.get('body',{}).get('source','subagent-hook')} url={url} "+
+                f"http={code} lifecycle_queue={kind} attempt={attempt} "+
+                f"verdict={'non_retryable_http' if kind == 'dead_letter' else 'retryable'} "+
+                f"event_id={row.get('event_id','')} "+
+                f"lifecycle_session={row.get('body',{}).get('session_id','')} "+
+                f"agent_id={row.get('body',{}).get('agent_id','')} "+
+                f"event={row.get('body',{}).get('subagent','')}\n")
+    except Exception: pass
+
+ctx=ssl._create_unverified_context()
+for _ in range(90):
+    rows=locked_rows()
+    if not rows: raise SystemExit(0)
+    row=rows[0]
+    attempt=max(0,int(row.get("attempts",0)))+1
+    body=dict(row.get("body") or {})
+    body["delivery_attempt"]=attempt
+    code="000"
+    try:
+        req=urllib.request.Request(row.get("url") or url,
+            data=json.dumps(body,separators=(",",":")).encode(),method="POST",
+            headers={"Content-Type":"application/json","X-Amux-Session":session})
+        with urllib.request.urlopen(req,timeout=3,context=ctx) as response:
+            code=str(response.status)
+            response.read()
+    except urllib.error.HTTPError as exc:
+        code=str(exc.code)
+    except Exception:
+        code="000"
+    if code.startswith("2"):
+        event_id=row.get("event_id","")
+        def delivered(current):
+            if current and current[0].get("event_id","")==event_id: return current[1:]
+            return current
+        locked_rows(delivered)
+        continue
+    retryable_4xx={"408","409","425","429"}
+    if code.startswith("4") and code not in retryable_4xx:
+        note("dead_letter",row,code,attempt)
+        event_id=row.get("event_id","")
+        def dead_letter(current):
+            if current and current[0].get("event_id","")==event_id: return current[1:]
+            return current
+        locked_rows(dead_letter)
+        continue
+    def failed(current):
+        if current and current[0].get("event_id","")==row.get("event_id",""):
+            current[0]["attempts"]=attempt
+        return current
+    locked_rows(failed)
+    if attempt in (1,5,15,45,90): note("retrying",row,code,attempt)
+    time.sleep(2)
+PY
+  exit 0
+fi
 MODE="${1:-idle}"; SRC="${2:-stop-hook}"
 DERIVED=0
 if [ -z "$AMUX_SESSION" ]; then
@@ -126,7 +229,7 @@ case "${MODE/subagent-/subagent:}" in
     ;;
 esac
 BODY=$(printf '%s' "$IN" | /usr/bin/python3 -c '
-import json,sys,os
+import json,sys,os,time,uuid
 raw=sys.stdin.read()
 mode,src=sys.argv[1],sys.argv[2]
 norm=mode.replace("subagent-","subagent:",1)
@@ -167,6 +270,29 @@ try:
     if not sid and tp and tp.endswith(".jsonl"):
         sid=os.path.basename(tp)[:-6]
     if sid: out["session_id"]=sid
+    if "subagent" in out:
+        sub=out.get("subagent") or ""
+        aid=h.get("agent_id") or h.get("agentId") or ""
+        if aid: out["agent_id"]=str(aid)
+        out["event_ts"]=time.time()
+        native=h.get("event_id") or h.get("eventId") or ""
+        if native:
+            event_id=str(native)
+        elif sub != "reset" and sid and aid:
+            # Provider lifecycle identity: stable across a duplicate hook
+            # callback and across a response-loss retry.
+            event_id=f"{sid}:{aid}:{sub}"
+        elif sub == "reset":
+            # The same conversation may be resumed by a NEW process. Each
+            # SessionStart is therefore a distinct reset; response-loss retries
+            # keep this generated id in the durable queue row below.
+            event_id=f"{sid or os.environ.get('AMUX_SESSION','')}:reset:{time.time_ns()}"
+        else:
+            # No provider identity means no safe equivalence relation. Two
+            # empty-payload starts may be two concurrent agents, so each hook
+            # invocation gets a distinct id; retries reuse the queued body.
+            event_id=f"anonymous:{time.time_ns()}:{os.getpid()}:{uuid.uuid4().hex}"
+        out["event_id"]=event_id
 except Exception as e:
     err="payload:"+type(e).__name__
 # TRANSCRIPT READ GETS ITS OWN try (2026-08-11). It used to sit inside the outer
@@ -228,6 +354,72 @@ print(json.dumps(out))
 # be COUNTABLE in /api/logs/analyze, not something a human notices weeks later
 # by wondering why a worker stopped reporting (ethos rule 4).
 [ "$CORRECTED" = "1" ] && BODY="${BODY%\}}, \"amux_session_corrected_from\": \"$STALE_FROM\"}"
+# Lifecycle facts are ordered and durable; main-turn state remains latest-wins
+# and uses the immediate POST below. Keeping those policies separate prevents
+# an old queued idle heartbeat from overwriting a newer active turn.
+QD="$HOME/.amux/hook-report-queue"
+QF="$QD/$AMUX_SESSION.json"
+case "${MODE/subagent-/subagent:}" in
+  subagent:*)
+    mkdir -p "$QD" 2>/dev/null; chmod 700 "$QD" 2>/dev/null || true
+    QUEUE_NOTE=$(/usr/bin/python3 - "$QF" "$BODY" "$U" <<'PY'
+import fcntl,json,os,sys,tempfile
+path,raw,url=sys.argv[1:4]
+try: body=json.loads(raw)
+except Exception: raise SystemExit(0)
+event_id=str(body.get("event_id") or "")
+with open(path+".lock","a+") as guard:
+    fcntl.flock(guard,fcntl.LOCK_EX)
+    try:
+        with open(path) as stream: rows=json.load(stream)
+        if not isinstance(rows,list): rows=[]
+    except Exception: rows=[]
+    if not any(str(row.get("event_id") or "")==event_id for row in rows):
+        rows.append({"event_id":event_id,"body":body,"url":url,"attempts":0})
+    try: limit=max(1,min(128,int(os.environ.get("AMUX_HOOK_QUEUE_LIMIT","128"))))
+    except Exception: limit=128
+    dropped=max(0,len(rows)-limit)
+    if dropped: rows=rows[-limit:]
+    fd,tmp=tempfile.mkstemp(prefix="queue.",dir=os.path.dirname(path))
+    try:
+        os.fchmod(fd,0o600)
+        with os.fdopen(fd,"w") as stream:
+            json.dump(rows,stream,separators=(",",":")); stream.write("\n")
+            stream.flush(); os.fsync(stream.fileno())
+        os.replace(tmp,path)
+    except BaseException:
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
+        raise
+print(f"{len(rows)} {dropped} {limit}")
+PY
+    )
+    if [ -z "$QUEUE_NOTE" ]; then
+      D="$HOME/.amux/logs"; mkdir -p "$D" 2>/dev/null
+      printf '%s %s source=%s lifecycle_queue=enqueue_failed fallback=immediate\n' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$AMUX_SESSION" "$SRC" \
+        >> "$D/hook-report-failures.log" 2>/dev/null
+    else
+      set -- $QUEUE_NOTE
+    if [ "${2:-0}" -gt 0 ] 2>/dev/null; then
+      D="$HOME/.amux/logs"; mkdir -p "$D" 2>/dev/null
+      printf '%s %s source=%s lifecycle_queue=overflow pending=%s dropped=%s limit=%s\n' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$AMUX_SESSION" "$SRC" "${1:-0}" "${2:-0}" "${3:-128}" \
+        >> "$D/hook-report-failures.log" 2>/dev/null
+    fi
+    nohup bash "$0" --drain-subagents "$QF" "$U" "$AMUX_SESSION" \
+      </dev/null >/dev/null 2>&1 &
+    exit 0
+    fi
+    ;;
+esac
+# A durable queue may outlive the detached drain retry window. Any later hook
+# is proof the worker is alive and an opportunity to heal it; do not wait for
+# another subagent lifecycle edge that may never occur after the final stop.
+if [ -s "$QF" ]; then
+  nohup bash "$0" --drain-subagents "$QF" "$U" "$AMUX_SESSION" \
+    </dev/null >/dev/null 2>&1 &
+fi
 # X-Amux-Session stamps the write server-side (AMUX-1768). report_post's own
 # comment names its absence as the standing residual: "the shipped hooks send no
 # header, so an UNSTAMPED write is still accepted". This IS the shipped hook.

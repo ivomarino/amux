@@ -1427,7 +1427,23 @@ pub(crate) fn detect_claude_status(raw_output: &str) -> String {
         return String::new();
     }
     let n = lines.len();
+    // Codex keeps an apparently empty prompt shell on screen while a command
+    // continues in its background terminal. Its provider-owned active row is
+    // already parsed structurally by the adapter (including adjacency to the
+    // newest prompt); reuse it so quoted prose cannot become activity.
+    if crate::backend::adapter::codex_pane_generation_state(&clean) == Some(true) {
+        return "active".into();
+    }
     let reading_re = cached_re!(r"^Reading \d+ file");
+    // Claude Code yields the main composer while background agents continue,
+    // so every ordinary main-turn signal looks idle. This provider-owned row
+    // is the positive lifecycle statement; share its exact parser with the
+    // adapter rather than maintaining a second spelling here (ATE-45).
+    for l in lines[n.saturating_sub(12)..].iter().rev() {
+        if crate::backend::adapter::claude_background_agents_waiting(l) {
+            return "active".into();
+        }
+    }
     // 0. Active spinner, wide window.
     for l in lines[n.saturating_sub(30)..].iter().rev() {
         let s = l.trim();
@@ -9788,6 +9804,9 @@ pub(crate) struct LaneReport {
     /// badge uses. When false the report is evidence of nothing and the caller
     /// must fall through to the pane.
     pub applies: bool,
+    /// Identity-backed subagent count carried by the same report object. A
+    /// positive value is a hard mid-turn hold even when the main state is idle.
+    pub subagents_live: Option<i64>,
 }
 
 /// Read the report and judge it, in one place, for every mechanism that acts on
@@ -9819,7 +9838,61 @@ pub(crate) fn lane_report(state: &AppState, name: &str) -> Option<LaneReport> {
     if !applies {
         warn_stuck_report_once(name, &st, ts, now - ts);
     }
-    Some(LaneReport { state: st, age_s: (now - ts).max(0.0), applies })
+    let subagents_live = rep["subagents"]["count"].as_i64();
+    Some(LaneReport {
+        state: st,
+        age_s: (now - ts).max(0.0),
+        applies,
+        subagents_live,
+    })
+}
+
+/// Exact provider-owned evidence that work continues behind an idle-looking
+/// composer. This is intentionally narrower than generic pane activity: the
+/// Claude row is spinner-chrome anchored, and the Codex row is structurally
+/// adjacent to its newest prompt. A worker quoting either sentence in prose
+/// does not match.
+pub(crate) fn provider_background_working(raw: &str) -> bool {
+    if crate::backend::adapter::codex_pane_generation_state(raw) == Some(true) {
+        return true;
+    }
+    let clean = crate::backend::adapter::strip_ansi(raw);
+    clean
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .rev()
+        .take(12)
+        .any(crate::backend::adapter::claude_background_agents_waiting)
+}
+
+/// A trusted idle report describes the parent prompt, not background work.
+/// Kept pure because both board-drive and queued steering depend on this exact
+/// override; the live Codex interruption must be a regression cell, not an
+/// integration assumption.
+fn reported_idle_is_boundary(subagents_live: Option<i64>, raw: &str) -> bool {
+    !subagents_live.is_some_and(|count| count > 0) && !provider_background_working(raw)
+}
+
+fn warn_background_override_once(name: &str, raw: &str) {
+    use std::collections::BTreeSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    let kind = if crate::backend::adapter::codex_pane_generation_state(raw) == Some(true) {
+        "codex_background_terminal"
+    } else {
+        "claude_background_agent"
+    };
+    let key = format!("{name}:{kind}");
+    let mut seen = SEEN.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
+    if !seen.insert(key) {
+        return;
+    }
+    tracing::warn!(
+        target: "status_truth",
+        session = name,
+        provider_signal = kind,
+        "provider_background_work_overrode_idle_report: board-drive and steering are held until the provider row clears"
+    );
 }
 
 /// WARN once per lane per stuck report, so a lane held out of the drive loop by
@@ -9905,7 +9978,18 @@ pub(crate) async fn steer_lane_at_boundary(state: &AppState, name: &str) -> bool
     //    but the status badge refuses is the AMUX-3756 deadlock.
     if let Some(r) = lane_report(state, name) {
         if r.applies {
-            return r.state == "idle";
+            if r.state != "idle" {
+                return false;
+            }
+            if r.subagents_live.is_some_and(|count| count > 0) {
+                return false;
+            }
+            let raw = tmux_capture(name, 12).await;
+            if !reported_idle_is_boundary(r.subagents_live, &raw) {
+                warn_background_override_once(name, &raw);
+                return false;
+            }
+            return true;
         }
     }
     // 2. Hookless lane, or a report that no longer applies: the pane. Empty
@@ -9932,6 +10016,9 @@ pub(crate) async fn steer_lane_at_boundary(state: &AppState, name: &str) -> bool
 /// because the gate never believed the lane was busy. A view that disagrees
 /// with the mechanism it describes is worse than no view (ethos rule 1).
 pub(crate) fn pane_is_at_boundary(raw: &str) -> bool {
+    if let Some(generating) = crate::backend::adapter::codex_pane_generation_state(raw) {
+        return !generating;
+    }
     !pane_bar_says_generating(raw) && detect_claude_status(raw) == "idle"
 }
 
@@ -9942,8 +10029,15 @@ pub(crate) async fn steer_delivery_for(state: &AppState, name: &str, age_s: f64)
     // to be a second, unjudged copy of the report read (AMUX-3756). A report
     // that no longer applies is dropped to `None`, which routes to the pane
     // exactly as a hookless lane does.
-    let reported: Option<String> =
-        lane_report(state, name).filter(|r| r.applies).map(|r| r.state);
+    let report = lane_report(state, name).filter(|r| r.applies);
+    let mut reported: Option<String> = report.as_ref().map(|r| r.state.clone());
+    if let Some(r) = report.as_ref().filter(|r| r.state == "idle") {
+        let raw = tmux_capture(name, 12).await;
+        if !reported_idle_is_boundary(r.subagents_live, &raw) {
+            warn_background_override_once(name, &raw);
+            reported = Some("active".into());
+        }
+    }
     let pane_idle = if reported.is_some() {
         None
     } else {
@@ -15285,76 +15379,176 @@ pub(crate) fn context_pct_remaining(used: u64, window: u64) -> u8 {
 /// POST report (py:76238-76265) — the D1 report endpoint: harness-reported
 /// state into the SHARED prefs store Python reads at boot and
 /// sessions_legacy reads live.
-/// AMUX-3048: apply one subagent lifecycle event to the lane's live count.
+/// Maximum acknowledged lifecycle identities retained per lane. This is long
+/// enough to absorb response-loss retries and deliberately bounded so a
+/// long-lived worker cannot turn idempotency into an append-only log.
+const SUBAGENT_EVENT_HISTORY_LIMIT: usize = 128;
+
+#[derive(Clone, Debug)]
+struct SubagentApply {
+    next: Value,
+    verdict: &'static str,
+    count: i64,
+    live_ids: Vec<String>,
+    applied: bool,
+    status_changed: bool,
+}
+
+/// Apply one identity-bearing subagent lifecycle event to a stored report.
 ///
-/// Reuses the `session_reports` prefs store the main self-report already uses,
-/// under a `subagents` sub-key `{count, ts}` — no new table, and the consumer
-/// (`FleetSignals::subagents_working`) reads it straight from the `reports`
-/// Value it already loads at boot. `start` increments, `stop` decrements with a
-/// floor of 0 so a lost start cannot drive the count negative. The write touches
-/// ONLY the `subagents` sub-key, preserving state/model/tokens — a subagent
-/// starting or stopping says nothing about the main turn's state.
-async fn subagent_event_post(state: &AppState, name: &str, ev: &str) -> Response {
-    // `reset` is not a delta — it is the LEAK BOUND (AMUX-4024), and it is the
-    // "leak-safe reset" AMUX-3048's deferral said the count-authoritative "off"
-    // direction needed before it could ship.
-    //
-    // A lost SubagentStop (a lane killed mid-agent, a crashed subagent) pins the
-    // count positive, and since the count now outranks the mtime window that
-    // used to bound this at 240s, a leak would read WORKING forever — and
-    // survive a restart, because a state report carries the count forward.
-    //
-    // SESSION START is the one moment a zero is provably correct rather than a
-    // guess: a background agent belongs to the process that spawned it, so a
-    // NEW session has none by construction. That is exactly the property the
-    // deferral demanded — this cannot zero a live `run_in_background` agent,
-    // because a live one implies the session it belongs to is still the old one.
-    // The caller is responsible for not sending this on a compact, which does
-    // not restart the process (see `scripts/hooks/hook-report.sh`).
-    if ev == "reset" {
-        let name_s = name.to_string();
-        let reply = state
-            .store
-            .write_async(move |conn| {
-                ensure_fleet_tables(conn)?;
-                let mut reports: Value = conn
-                    .query_row("SELECT value FROM prefs WHERE key='session_reports'", [], |r| {
-                        r.get::<_, String>(0)
-                    })
-                    .ok()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_else(|| json!({}));
-                if !reports[&name_s].is_object() {
-                    reports[&name_s] = json!({});
-                }
-                reports[&name_s]["subagents"] = json!({"count": 0, "ts": now_f64()});
-                conn.execute(
-                    "INSERT INTO prefs(key, value) VALUES('session_reports', ?1) \
-                     ON CONFLICT(key) DO UPDATE SET value=?1",
-                    [reports.to_string()],
-                )?;
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
-            })
-            .await;
-        return match reply {
-            Ok(_) => j200(json!({"ok": true, "session": name, "subagent": "reset"})),
-            Err(e) => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
+/// `event_id` makes a retry after response loss a no-op. `agent_id` makes the
+/// live set itself idempotent even if a provider re-emits the same lifecycle
+/// edge with a new event id. The old anonymous counter remains readable during
+/// rollout, but every newly instrumented Claude agent is represented by its
+/// server-visible id instead of an untraceable delta.
+fn apply_subagent_event(
+    previous: &Value,
+    ev: &str,
+    agent_id: &str,
+    event_id: &str,
+    event_ts: f64,
+    lifecycle_session: &str,
+    now: f64,
+) -> SubagentApply {
+    let mut next = if previous.is_object() { previous.clone() } else { json!({}) };
+    let previous_count = next["count"].as_i64().unwrap_or(0).max(0);
+    let had_live_ids = next.get("live_ids").and_then(Value::as_array).is_some();
+    let mut live_ids: Vec<String> = next["live_ids"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+    live_ids.sort();
+    live_ids.dedup();
+    let mut anonymous = if had_live_ids {
+        next["anonymous"].as_i64().unwrap_or(0).max(0)
+    } else {
+        previous_count.saturating_sub(live_ids.len() as i64)
+    };
+    let mut seen: Vec<String> = next["seen_events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+
+    if !event_id.is_empty() && seen.iter().any(|id| id == event_id) {
+        return SubagentApply {
+            next,
+            verdict: "duplicate_event",
+            count: previous_count,
+            live_ids,
+            applied: false,
+            status_changed: false,
         };
     }
-    let delta: i64 = match ev {
-        "start" => 1,
-        "stop" | "done" => -1,
-        other => {
-            return jresp(
-                StatusCode::BAD_REQUEST,
-                json!({"error": format!(
-                    "subagent must be 'start', 'stop' or 'reset' (got '{other}')"
-                )}),
-            );
+
+    let reset_ts = next["reset_ts"].as_f64().unwrap_or(0.0);
+    let stored_session = next["session_id"].as_str().unwrap_or("");
+    let stale_time = reset_ts > 0.0 && event_ts > 0.0 && event_ts < reset_ts;
+    let stale_session = ev != "reset"
+        && !stored_session.is_empty()
+        && !lifecycle_session.is_empty()
+        && stored_session != lifecycle_session;
+    let mut verdict = "applied";
+
+    if stale_time || stale_session {
+        verdict = if stale_session { "stale_session" } else { "stale_event" };
+    } else {
+        match ev {
+            "reset" => {
+                live_ids.clear();
+                anonymous = 0;
+                next["reset_ts"] = json!(if event_ts > 0.0 { event_ts } else { now });
+                if !lifecycle_session.is_empty() {
+                    next["session_id"] = json!(lifecycle_session);
+                }
+            }
+            "start" => {
+                if agent_id.is_empty() {
+                    anonymous += 1;
+                } else if !live_ids.iter().any(|id| id == agent_id) {
+                    live_ids.push(agent_id.to_string());
+                    live_ids.sort();
+                } else {
+                    verdict = "duplicate_agent_start";
+                }
+                if stored_session.is_empty() && !lifecycle_session.is_empty() {
+                    next["session_id"] = json!(lifecycle_session);
+                }
+            }
+            "stop" | "done" => {
+                if agent_id.is_empty() {
+                    anonymous = anonymous.saturating_sub(1).max(0);
+                } else if let Some(pos) = live_ids.iter().position(|id| id == agent_id) {
+                    live_ids.remove(pos);
+                } else if anonymous > 0 {
+                    // Compatibility with a start recorded by the pre-identity
+                    // hook: the matching stop has an id, the carried count did not.
+                    anonymous -= 1;
+                } else {
+                    verdict = "orphan_stop";
+                }
+            }
+            _ => unreachable!("validated by subagent_event_post"),
         }
-    };
+    }
+
+    if !event_id.is_empty() {
+        seen.push(event_id.to_string());
+        if seen.len() > SUBAGENT_EVENT_HISTORY_LIMIT {
+            seen.drain(..seen.len() - SUBAGENT_EVENT_HISTORY_LIMIT);
+        }
+    }
+    let count = anonymous + live_ids.len() as i64;
+    next["count"] = json!(count);
+    next["live_ids"] = json!(live_ids);
+    next["anonymous"] = json!(anonymous);
+    next["seen_events"] = json!(seen);
+    next["ts"] = json!(now);
+    next["last_event"] = json!({
+        "event": ev,
+        "event_id": event_id,
+        "agent_id": agent_id,
+        "event_ts": event_ts,
+        "verdict": verdict,
+    });
+    let applied = &next != previous;
+    SubagentApply {
+        next,
+        verdict,
+        count,
+        live_ids,
+        applied,
+        status_changed: count != previous_count,
+    }
+}
+
+/// AMUX-3048/ATE-45: durably apply an ordered, idempotent lifecycle event.
+async fn subagent_event_post(state: &AppState, name: &str, ev: &str, body: &Value) -> Response {
+    if !matches!(ev, "start" | "stop" | "done" | "reset") {
+        return jresp(
+            StatusCode::BAD_REQUEST,
+            json!({"error": format!(
+                "subagent must be 'start', 'stop' or 'reset' (got '{ev}')"
+            )}),
+        );
+    }
     let name_s = name.to_string();
     let ev_s = ev.to_string();
+    let agent_id: String = body_str(body, "agent_id").trim().chars().take(128).collect();
+    let event_id: String = body_str(body, "event_id").trim().chars().take(200).collect();
+    let lifecycle_session: String = body_str(body, "session_id").trim().chars().take(128).collect();
+    let event_ts = body.get("event_ts").and_then(Value::as_f64).unwrap_or_else(now_f64);
+    let delivery_attempt = body.get("delivery_attempt").and_then(Value::as_u64).unwrap_or(1);
+    let result_slot = std::sync::Arc::new(std::sync::Mutex::new(None::<SubagentApply>));
+    let result_out = result_slot.clone();
+    let agent_id_write = agent_id.clone();
+    let event_id_write = event_id.clone();
+    let lifecycle_session_write = lifecycle_session.clone();
     let reply = state
         .store
         .write_async(move |conn| {
@@ -15366,41 +15560,95 @@ async fn subagent_event_post(state: &AppState, name: &str, ev: &str) -> Response
                 .ok()
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_else(|| json!({}));
-            let prev = reports[&name_s]["subagents"]["count"].as_i64().unwrap_or(0);
-            let next = (prev + delta).max(0);
-            if next == prev {
-                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
-            }
             if !reports[&name_s].is_object() {
                 reports[&name_s] = json!({});
             }
-            reports[&name_s]["subagents"] = json!({"count": next, "ts": now_f64()});
-            conn.execute(
-                "INSERT INTO prefs(key, value) VALUES('session_reports', ?1) \
-                 ON CONFLICT(key) DO UPDATE SET value=?1",
-                [reports.to_string()],
-            )?;
-            // Clear BEFORE returning the event: the store broadcasts only after
-            // this transaction commits, so the SSE-driven GET cannot race ahead
-            // of cache invalidation and render the old count for another 2s.
-            crate::api::sessions_legacy::invalidate_sessions_cache();
-            Ok(crate::db::WriteOutcome {
-                applied: true,
-                events: vec![crate::db::PendingEvent {
+            let applied = apply_subagent_event(
+                &reports[&name_s]["subagents"],
+                &ev_s,
+                &agent_id_write,
+                &event_id_write,
+                event_ts,
+                &lifecycle_session_write,
+                now_f64(),
+            );
+            if applied.applied {
+                reports[&name_s]["subagents"] = applied.next.clone();
+                conn.execute(
+                    "INSERT INTO prefs(key, value) VALUES('session_reports', ?1) \
+                     ON CONFLICT(key) DO UPDATE SET value=?1",
+                    [reports.to_string()],
+                )?;
+                crate::api::sessions_legacy::invalidate_sessions_cache();
+            }
+            let events = if applied.status_changed {
+                vec![crate::db::PendingEvent {
                     entity_type: amux_core::revision::EntityType::Session,
                     entity_id: name_s.clone(),
                     mutation: amux_core::revision::MutationKind::Updated,
                     payload: None,
-                }],
-            })
+                }]
+            } else {
+                vec![]
+            };
+            *result_out.lock().unwrap_or_else(|p| p.into_inner()) = Some(applied.clone());
+            Ok(crate::db::WriteOutcome { applied: applied.applied, events })
         })
         .await;
     match reply {
-        Ok(_) => j200(json!({"ok": true, "session": name, "subagent": ev_s})),
-        Err(e) => jresp(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({"error": e.to_string()}),
-        ),
+        Ok(_) => {
+            let applied = result_slot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+                .unwrap_or(SubagentApply {
+                    next: Value::Null,
+                    verdict: "unmeasured",
+                    count: 0,
+                    live_ids: vec![],
+                    applied: false,
+                    status_changed: false,
+                });
+            if delivery_attempt > 1 {
+                tracing::warn!(
+                    target: "subagent_lifecycle",
+                    session = name,
+                    event = ev,
+                    event_id,
+                    agent_id,
+                    delivery_attempt,
+                    verdict = applied.verdict,
+                    count = applied.count,
+                    "subagent lifecycle event replayed after an earlier delivery failure"
+                );
+            }
+            if matches!(applied.verdict, "stale_event" | "stale_session" | "orphan_stop") {
+                tracing::warn!(
+                    target: "subagent_lifecycle",
+                    session = name,
+                    event = ev,
+                    event_id,
+                    agent_id,
+                    verdict = applied.verdict,
+                    count = applied.count,
+                    "subagent lifecycle event did not change the live set"
+                );
+            }
+            j200(json!({
+                "ok": true,
+                "session": name,
+                "subagent": ev,
+                "event_id": event_id,
+                "agent_id": agent_id,
+                "applied": applied.applied,
+                "verdict": applied.verdict,
+                "count": applied.count,
+                "live_ids": applied.live_ids,
+                "history_limit": SUBAGENT_EVENT_HISTORY_LIMIT,
+                "delivery_attempt": delivery_attempt,
+            }))
+        }
+        Err(e) => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
     }
 }
 
@@ -15497,7 +15745,7 @@ pub(crate) async fn report_post(state: &AppState, name: &str, headers: &HeaderMa
     // count is a self-report like any other.
     let sub_ev = body_str(body, "subagent").trim().to_lowercase();
     if !sub_ev.is_empty() {
-        return subagent_event_post(state, name, &sub_ev).await;
+        return subagent_event_post(state, name, &sub_ev, body).await;
     }
     let st_raw = body_str(body, "state").trim().to_lowercase();
     let st = match st_raw.as_str() {
@@ -20045,6 +20293,21 @@ mod tests {
         assert_eq!(detect_claude_status(active), "active");
         let echoed = "\u{276f} [amux] VERIFY \u{2014} y\u{2026}\nmixpeek$ ";
         assert_ne!(detect_claude_status(echoed), "active");
+        // ATE-45: Claude yields its main composer while Explore agents run.
+        // The provider-owned waiting row is active for singular and plural;
+        // prose quoting the same words is not provider chrome.
+        for waiting in [
+            "\u{2736} Waiting for 1 background agent to finish\n\n\u{276f}\n\n\u{23f5}\u{23f5} bypass permissions on \u{b7} \u{2190} 2 agents",
+            "\u{273b} Waiting for 2 background agents to finish\n\n\u{276f}\n\n\u{23f5}\u{23f5} bypass permissions on",
+        ] {
+            assert_eq!(detect_claude_status(waiting), "active", "{waiting}");
+        }
+        let quoted_wait = "I am testing Waiting for 1 background agent to finish\n\n\u{276f}\n\n\u{23f5}\u{23f5} bypass permissions on";
+        assert_eq!(detect_claude_status(quoted_wait), "idle");
+        // Provider/model controls: the new Claude frame must not turn a Codex
+        // prompt or Gemini selector into active.
+        assert_eq!(detect_claude_status("\u{203a} Ask Codex to do anything"), "");
+        assert_eq!(detect_claude_status("\u{2502} \u{25cf} 1. Allow\n\u{2502}   2. Deny"), "waiting");
         // Resume picker needs the ⌕ search glyph.
         assert!(at_resume_picker("Resume Session \u{2315}\nEnter to select"));
         assert!(!at_resume_picker("Enter to select"));
@@ -21701,7 +21964,7 @@ mod steer_boundary_tests {
                 .unwrap_or(Value::Null)
         };
 
-        subagent_event_post(&state, "probe", "start").await;
+        subagent_event_post(&state, "probe", "start", &json!({})).await;
         let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
             .await
             .expect("subagent start must push a real-time session event")
@@ -21709,7 +21972,7 @@ mod steer_boundary_tests {
         assert_eq!(event.entity_type, amux_core::revision::EntityType::Session);
         assert_eq!(event.entity_id, "probe");
         assert_eq!(event.mutation, amux_core::revision::MutationKind::Updated);
-        subagent_event_post(&state, "probe", "start").await;
+        subagent_event_post(&state, "probe", "start", &json!({})).await;
         let v = read(&state);
         assert_eq!(v["probe"]["subagents"]["count"].as_i64(), Some(2), "two starts -> 2");
         assert_eq!(
@@ -21734,13 +21997,13 @@ mod steer_boundary_tests {
             "main-turn reports must preserve the live subagent count"
         );
 
-        subagent_event_post(&state, "probe", "stop").await;
+        subagent_event_post(&state, "probe", "stop", &json!({})).await;
         assert_eq!(read(&state)["probe"]["subagents"]["count"].as_i64(), Some(1), "one stop -> 1");
 
         // FLOOR: more stops than starts (a lost start event) must never underflow
         // into a negative count that would misread once a real start arrives.
-        subagent_event_post(&state, "probe", "stop").await;
-        subagent_event_post(&state, "probe", "stop").await;
+        subagent_event_post(&state, "probe", "stop", &json!({})).await;
+        subagent_event_post(&state, "probe", "stop", &json!({})).await;
         assert_eq!(
             read(&state)["probe"]["subagents"]["count"].as_i64(),
             Some(0),
@@ -21816,6 +22079,139 @@ mod steer_boundary_tests {
         // reads a message that forbids the thing the hook is being asked to send.
         let bad = report_post(&state, "probe", &h, &json!({"subagent": "sideways"})).await;
         assert_eq!(bad.status(), StatusCode::BAD_REQUEST, "an unknown subagent event must 400");
+    }
+
+    /// ATE-45: response loss and server replacement may redeliver lifecycle
+    /// events. Identity, not delivery count, is the source of truth.
+    #[tokio::test]
+    async fn subagent_lifecycle_is_idempotent_ordered_and_restart_durable() {
+        async fn post(state: &AppState, ev: &str, body: Value) -> Value {
+            let response = subagent_event_post(state, "primis", ev, &body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+        fn read(state: &AppState) -> Value {
+            let raw: String = state
+                .store
+                .read()
+                .unwrap()
+                .query_row("SELECT value FROM prefs WHERE key='session_reports'", [], |r| r.get(0))
+                .unwrap();
+            serde_json::from_str(&raw).unwrap()
+        }
+        fn state_with(path: &Path) -> AppState {
+            AppState {
+                store: std::sync::Arc::new(crate::db::Store::open(path).unwrap()),
+                started: std::time::Instant::now(),
+                build_hash: "test".into(),
+                auth_token: None,
+                reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("restart.db");
+        let state = state_with(&db);
+        let sid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        post(
+            &state,
+            "reset",
+            json!({"session_id":sid,"event_id":"reset-1","event_ts":100.0}),
+        )
+        .await;
+        for (id, ts) in [("explore-1", 101.0), ("explore-2", 102.0)] {
+            post(
+                &state,
+                "start",
+                json!({"session_id":sid,"agent_id":id,"event_id":format!("{id}:start"),"event_ts":ts}),
+            )
+            .await;
+        }
+        let duplicate = post(
+            &state,
+            "start",
+            json!({"session_id":sid,"agent_id":"explore-1","event_id":"explore-1:start","event_ts":101.0}),
+        )
+        .await;
+        assert_eq!(duplicate["verdict"], json!("duplicate_event"));
+        assert_eq!(duplicate["count"], json!(2), "response loss retry must not increment");
+        assert_eq!(duplicate["live_ids"], json!(["explore-1", "explore-2"]));
+
+        // A real Store replacement reads the durable set from SQLite. This is
+        // the server-rebuild boundary from the live Primis incident, not an
+        // in-memory clone of the first AppState.
+        drop(state);
+        let restarted = state_with(&db);
+        assert_eq!(read(&restarted)["primis"]["subagents"]["count"], json!(2));
+
+        let stale = post(
+            &restarted,
+            "start",
+            json!({"session_id":sid,"agent_id":"old","event_id":"old:start","event_ts":99.0}),
+        )
+        .await;
+        assert_eq!(stale["verdict"], json!("stale_event"));
+        assert_eq!(stale["count"], json!(2));
+
+        let wrong_session = post(
+            &restarted,
+            "stop",
+            json!({
+                "session_id":"ffffffff-1111-4222-8333-444444444444",
+                "agent_id":"explore-1","event_id":"wrong:stop","event_ts":103.0
+            }),
+        )
+        .await;
+        assert_eq!(wrong_session["verdict"], json!("stale_session"));
+        assert_eq!(wrong_session["count"], json!(2));
+
+        for (id, ts) in [("explore-1", 104.0), ("explore-2", 105.0)] {
+            let stopped = post(
+                &restarted,
+                "stop",
+                json!({"session_id":sid,"agent_id":id,"event_id":format!("{id}:stop"),"event_ts":ts}),
+            )
+            .await;
+            assert_eq!(stopped["count"], json!(if id == "explore-1" { 1 } else { 0 }));
+        }
+        let duplicate_stop = post(
+            &restarted,
+            "stop",
+            json!({"session_id":sid,"agent_id":"explore-2","event_id":"explore-2:stop","event_ts":105.0}),
+        )
+        .await;
+        assert_eq!(duplicate_stop["verdict"], json!("duplicate_event"));
+        assert_eq!(duplicate_stop["count"], json!(0), "final stop returns the lane to idle");
+
+        let stored = read(&restarted);
+        assert_eq!(stored["primis"]["subagents"]["live_ids"], json!([]));
+        assert!(
+            stored["primis"]["subagents"]["seen_events"].as_array().unwrap().len()
+                <= SUBAGENT_EVENT_HISTORY_LIMIT,
+            "server-side delivery dedupe must remain bounded"
+        );
+    }
+
+    #[test]
+    fn subagent_event_dedupe_history_is_bounded() {
+        let mut current = Value::Null;
+        for i in 0..(SUBAGENT_EVENT_HISTORY_LIMIT + 12) {
+            current = apply_subagent_event(
+                &current,
+                "start",
+                "same-live-agent",
+                &format!("event-{i:03}"),
+                100.0 + i as f64,
+                "session-one",
+                200.0 + i as f64,
+            )
+            .next;
+        }
+        let seen = current["seen_events"].as_array().unwrap();
+        assert_eq!(seen.len(), SUBAGENT_EVENT_HISTORY_LIMIT);
+        assert_eq!(seen.first(), Some(&json!("event-012")));
+        assert_eq!(current["count"], json!(1), "new ids for one agent never inflate count");
     }
 
     /// Fail-closed is the whole safety property: an unknown lane must not be
@@ -22758,6 +23154,20 @@ mod steer_freeze_tests {
   \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} esc to interrupt \u{b7} \u{2190} 2 agents
 ";
 
+    const CODEX_BACKGROUND_TERMINAL: &str = "\
+• Working (0s • esc to interrupt) · 1 background terminal running · /ps to view · /stop to close
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol xhigh · ~/Dev/amux";
+
+    const CODEX_BACKGROUND_FINISHED: &str = "\
+• Worked for 42s
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol xhigh · ~/Dev/amux";
+
     #[test]
     fn prose_about_esc_to_interrupt_is_not_a_generating_lane() {
         assert!(
@@ -22807,6 +23217,35 @@ mod steer_freeze_tests {
             steer_decide(None, Some(pane_is_at_boundary(IDLE_WITH_AGENTS_PANE)), 601.0, 600.0),
             SteerDelivery::OverdueMidTurn
         );
+    }
+
+    /// ATE-45 live cross-model incident: board-drive trusted Codex's idle
+    /// self-report while this exact provider row said a background terminal
+    /// was still running. Delivery interrupted the conversation. The shared
+    /// steering predicate must hold until the row reaches its terminal form.
+    #[test]
+    fn board_drive_and_steering_hold_for_a_codex_background_terminal() {
+        assert_eq!(detect_claude_status(CODEX_BACKGROUND_TERMINAL), "active");
+        assert!(provider_background_working(CODEX_BACKGROUND_TERMINAL));
+        assert!(
+            !reported_idle_is_boundary(Some(0), CODEX_BACKGROUND_TERMINAL),
+            "an idle parent report cannot authorize board-drive over live provider chrome"
+        );
+        assert!(!pane_is_at_boundary(CODEX_BACKGROUND_TERMINAL));
+
+        assert!(!provider_background_working(CODEX_BACKGROUND_FINISHED));
+        assert!(reported_idle_is_boundary(Some(0), CODEX_BACKGROUND_FINISHED));
+        assert!(
+            pane_is_at_boundary(CODEX_BACKGROUND_FINISHED),
+            "after the background terminal finishes, the exact same prompt is deliverable"
+        );
+
+        let quoted = "\
+› Explain the phrase: • Working (0s • esc to interrupt) · 1 background terminal running
+
+  gpt-5.6-sol xhigh · ~/Dev/amux";
+        assert!(!provider_background_working(quoted), "quoted prose is not provider chrome");
+        assert!(reported_idle_is_boundary(Some(0), quoted));
     }
 
     #[test]

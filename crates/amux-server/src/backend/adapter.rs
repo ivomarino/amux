@@ -246,7 +246,27 @@ lazy_re!(RE_READING_FILES, r"^Reading \d+ file"); // py 18512
 // blocked and it disappears when the agents land, whereas an agent COUNT can
 // linger and would pin a finished lane to Active forever — the opposite error,
 // and the worse one, since a lane stuck Active never gets picked up.
-lazy_re!(RE_BG_AGENTS_WAIT, r"(?i)waiting for \d+ background agents?");
+lazy_re!(
+    RE_BG_AGENTS_WAIT,
+    r"(?i)^waiting for [1-9]\d* background agents? to finish$"
+);
+
+/// Is this Claude Code's provider-owned "waiting on background agents" row?
+///
+/// The leading spinner glyph is the chrome anchor: accepting the sentence
+/// anywhere in pane prose makes a worker discussing this detector report
+/// active forever. Both the adapter and the legacy session-status path call
+/// this function so the two views cannot disagree about the same frame again.
+pub(crate) fn claude_background_agents_waiting(line: &str) -> bool {
+    let line = line.trim();
+    let Some(first) = line.chars().next() else { return false };
+    let provider_chrome = ('\u{2700}'..='\u{27bf}').contains(&first)
+        || matches!(first, '*' | '\u{b7}');
+    if !provider_chrome {
+        return false;
+    }
+    RE_BG_AGENTS_WAIT.is_match(line[first.len_utf8()..].trim())
+}
 
 // Bash/zsh prompt at line end — the CLI process is gone (py 8315).
 lazy_re!(RE_SHELL_PROMPT_END, r"[$%]\s*$"); // py 8315
@@ -610,7 +630,7 @@ fn claude_tui_state(clean: &str) -> TuiState {
     // the recent tail rather than the whole pane, and it looks for a positive
     // "still waiting" statement rather than the mere presence of agents.
     for s in ne.iter().rev().take(8) {
-        if RE_BG_AGENTS_WAIT.is_match(s) {
+        if claude_background_agents_waiting(s) {
             return TuiState::Active;
         }
     }
