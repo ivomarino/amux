@@ -1,4 +1,4 @@
-const CACHE = 'amux-v0.9.810';
+const CACHE = 'amux-v0.9.811';
 const SHELL_URLS = [
   '/',
   '/app.css',

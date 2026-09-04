@@ -1525,6 +1525,227 @@ pub async fn ls(method: Method, RawQuery(q): RawQuery) -> Response {
 // an empty array, never an error (the input keeps working mid-keystroke).
 // ---------------------------------------------------------------------------
 
+/// Directory names that swallow a scan and never hold a project. Skipped at
+/// every depth, so `~/Library` alone does not turn a name search into a
+/// filesystem walk. Not a security boundary — `is_path_allowed` is that.
+const SCAN_SKIP: &[&str] = &[
+    "library", "applications", "node_modules", "music", "pictures", "movies",
+    "photos", ".trash", "target", "venv", ".venv", "dist", "build",
+];
+
+/// How many directory entries one name search may look at. A budget rather
+/// than a depth alone, because one directory with 20k children costs the same
+/// as a deep tree. Hit means the answer may be incomplete, which is WARNed.
+const SCAN_BUDGET: usize = 6000;
+
+/// Roots a bare-name search starts from: the home directory itself and the
+/// conventional places a checkout lives. Missing ones are skipped silently —
+/// this is a suggestion list, not an inventory.
+fn name_search_roots() -> Vec<PathBuf> {
+    let home = home_dir();
+    let mut roots = vec![home.clone()];
+    for c in ["Dev", "dev", "Projects", "projects", "src", "code", "Code", "Documents", "repos"] {
+        let p = home.join(c);
+        if p.is_dir() {
+            roots.push(p);
+        }
+    }
+    roots
+}
+
+/// Directories whose NAME contains `needle`, found by a bounded scan.
+///
+/// AF-496's sibling (AF-501). `autocomplete_dir` above completes a PATH: it
+/// splits the query on `/`, takes the parent, and matches the last component
+/// against that parent's entries. It can therefore only help someone who
+/// already knows where the directory IS. Measured in a live onboarding session
+/// (2026-09-04): the user knew the repo's NAME and not its path, typed it, got
+/// nothing, could not find it in Finder either, and said "I should be able to
+/// do this without you" — three minutes of a one-hour call spent hunting for a
+/// string the machine could have produced. Ethan's reply was "this is table
+/// stakes".
+///
+/// Two extra sources are deliberately NOT here: the dirs of existing workers
+/// and the human's recents. The client holds both already and can match them
+/// with no round trip, so duplicating them server-side would make the fast
+/// answer wait on the slow one.
+///
+/// Returns (results, budget_exhausted) so the caller can say whether the search
+/// was complete rather than letting a truncated scan read as "nothing matched"
+/// (ethos rule 4).
+fn dirs_matching_name(needle: &str, roots: &[PathBuf], limit: usize) -> (Vec<String>, bool) {
+    dirs_matching_name_budgeted(needle, roots, limit, SCAN_BUDGET)
+}
+
+/// `dirs_matching_name` with the entry budget as an ARGUMENT.
+///
+/// It is an argument because otherwise nothing can test the exhausted arm: a
+/// cell would need 6000 real directories to reach it. Measured — the first
+/// version of this had a cell named for budget exhaustion which never exhausted
+/// anything, and a mutation flipping the truncation flag to `false` stayed
+/// GREEN. The test asserted the arm it could reach and read as covering the one
+/// it could not.
+fn dirs_matching_name_budgeted(
+    needle: &str,
+    roots: &[PathBuf],
+    limit: usize,
+    mut budget: usize,
+) -> (Vec<String>, bool) {
+    let needle = needle.to_lowercase();
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    // Breadth-first, so a match two levels down never waits behind a deep
+    // subtree: the shallow candidates are the likely ones.
+    let mut frontier: Vec<PathBuf> = roots.to_vec();
+    let mut depth = 0usize;
+    while depth < 3 && !frontier.is_empty() && out.len() < limit {
+        let mut next: Vec<PathBuf> = Vec::new();
+        for dir in frontier.drain(..) {
+            if budget == 0 {
+                return (out, true);
+            }
+            let Ok(rd) = retry_eintr(|| std::fs::read_dir(&dir)) else { continue };
+            let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+            entries.sort();
+            for item in entries {
+                if budget == 0 {
+                    return (out, true);
+                }
+                budget -= 1;
+                let name = match item.file_name() {
+                    Some(n) => n.to_string_lossy().into_owned(),
+                    None => continue,
+                };
+                let lower = name.to_lowercase();
+                if name.starts_with('.') || SCAN_SKIP.contains(&lower.as_str()) {
+                    continue;
+                }
+                if !item.is_dir() || !is_path_allowed(&item) {
+                    continue;
+                }
+                if lower.contains(&needle) && seen.insert(item.clone()) {
+                    out.push(format!("{}/", pystr(&item)));
+                    if out.len() >= limit {
+                        return (out, false);
+                    }
+                }
+                next.push(item);
+            }
+        }
+        frontier = next;
+        depth += 1;
+    }
+    (out, false)
+}
+
+
+#[cfg(test)]
+mod name_search_tests {
+    use super::*;
+
+    /// A tree shaped like the specimen: the human knows the repo is called
+    /// "amux-gtm" and does not know it lives two levels down.
+    fn tree() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        for p in [
+            "Dev/amux",
+            "Dev/amux-gtm/gtm",
+            "Dev/mixpeek",
+            "Documents/notes",
+            ".hidden/amux-gtm-secret",
+            "Library/Caches/amux-gtm-cache",
+        ] {
+            std::fs::create_dir_all(r.join(p)).unwrap();
+        }
+        d
+    }
+
+    /// THE CELL THIS EXISTS FOR: a bare NAME finds the directory. The old
+    /// path-completer returned nothing for this query, which is the whole card.
+    #[test]
+    fn a_bare_name_finds_a_directory_the_typist_could_not_locate() {
+        let d = tree();
+        let (hits, exhausted) = dirs_matching_name("amux-gtm", &[d.path().to_path_buf()], 10);
+        assert!(!exhausted);
+        assert!(
+            hits.iter().any(|h| h.ends_with("Dev/amux-gtm/")),
+            "the name search did not find Dev/amux-gtm: {hits:?}"
+        );
+    }
+
+    /// A substring, not a prefix. "gtm" is what someone types when they half
+    /// remember the name; a prefix matcher would miss `amux-gtm` entirely.
+    #[test]
+    fn matching_is_by_substring_because_people_half_remember_names() {
+        let d = tree();
+        let (hits, _) = dirs_matching_name("gtm", &[d.path().to_path_buf()], 10);
+        assert!(
+            hits.iter().any(|h| h.ends_with("Dev/amux-gtm/")),
+            "a mid-name fragment found nothing: {hits:?}"
+        );
+    }
+
+    /// Dot directories and the scan-skip list stay out. `~/Library` alone would
+    /// otherwise turn every keystroke into a filesystem walk, and a hidden dir
+    /// is not somewhere a human means to put a project.
+    #[test]
+    fn hidden_and_heavy_directories_are_never_offered() {
+        let d = tree();
+        let (hits, _) = dirs_matching_name("amux-gtm", &[d.path().to_path_buf()], 10);
+        assert!(
+            !hits.iter().any(|h| h.contains("/.hidden/")),
+            "a dot directory was offered: {hits:?}"
+        );
+        assert!(
+            !hits.iter().any(|h| h.contains("/Library/")),
+            "the scan descended into Library: {hits:?}"
+        );
+    }
+
+    /// The budget is REPORTED, not silently swallowed. A truncated scan and a
+    /// scan that genuinely found nothing both hand back a short list, and they
+    /// need opposite responses (ethos rule 4).
+    ///
+    /// Both arms, over the SAME tree, so the flag is the only thing that
+    /// differs. The first version of this cell only had the second arm and a
+    /// mutation returning `false` from the exhausted branch stayed green.
+    #[test]
+    fn exhausting_the_budget_is_distinguishable_from_finding_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        for i in 0..40 {
+            std::fs::create_dir_all(d.path().join(format!("dir{i}"))).unwrap();
+        }
+        let roots = [d.path().to_path_buf()];
+        // TRUNCATED: the scan gave up before it could have seen everything.
+        let (hits, exhausted) = dirs_matching_name_budgeted("zzzz", &roots, 10, 5);
+        assert!(hits.is_empty());
+        assert!(exhausted, "a scan that ran out of budget must say so");
+        // COMPLETE: same tree, same query, budget that covers it.
+        let (hits, exhausted) = dirs_matching_name_budgeted("zzzz", &roots, 10, 6000);
+        assert!(hits.is_empty());
+        assert!(!exhausted, "a complete search that found nothing must not claim truncation");
+    }
+
+    /// A limit that is reached is not the same as a budget that ran out: the
+    /// caller asked for 2 and got 2, so nothing is missing from its point of
+    /// view.
+    #[test]
+    fn hitting_the_result_limit_is_not_reported_as_truncation() {
+        let d = tree();
+        let (hits, exhausted) = dirs_matching_name("amux", &[d.path().to_path_buf()], 2);
+        assert_eq!(hits.len(), 2);
+        assert!(!exhausted);
+    }
+
+    #[test]
+    fn the_home_directory_is_always_a_root_and_the_missing_ones_are_skipped() {
+        let roots = name_search_roots();
+        assert_eq!(roots.first(), Some(&home_dir()), "home must be searched");
+        assert!(roots.iter().all(|r| r.is_dir()), "a root that does not exist was kept: {roots:?}");
+    }
+}
+
 pub async fn autocomplete_dir(method: Method, RawQuery(q): RawQuery) -> Response {
     if method != Method::GET {
         return not_found().await;
@@ -1533,6 +1754,32 @@ pub async fn autocomplete_dir(method: Method, RawQuery(q): RawQuery) -> Response
     let query = qs_get(&qs, "q").unwrap_or("").to_string();
     if query.is_empty() {
         return j(200, json!([]));
+    }
+    // A BARE NAME IS A SEARCH, NOT A PATH (AF-501). Everything below completes a
+    // path: it splits on `/`, takes the parent, and matches the last component
+    // against that parent's entries — which only helps someone who already knows
+    // where the directory is. A query with no `/` and no `~` is someone typing
+    // what the folder is CALLED, and that used to return [] every time.
+    if !query.contains('/') && !query.starts_with('~') && query.len() >= 2 {
+        let roots = name_search_roots();
+        let (hits, exhausted) = dirs_matching_name(&query, &roots, 10);
+        if exhausted {
+            // The contract here is a bare array whose every failure is `[]`, so
+            // a truncated search cannot announce itself IN the payload. It
+            // announces itself in the log instead, which is where a "why did it
+            // not find my repo" question gets answered.
+            tracing::warn!(
+                query = %query,
+                found = hits.len(),
+                budget = SCAN_BUDGET,
+                "autocomplete: name search hit its entry budget — results may be incomplete (AF-501)"
+            );
+        }
+        if !hits.is_empty() {
+            return j(200, json!(hits));
+        }
+        // No name match: fall through, so a bare name that IS a real relative
+        // path still completes the way it always did.
     }
     let p = expanduser(&query);
     if !is_path_allowed(&p) {

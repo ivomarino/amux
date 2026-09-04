@@ -8910,7 +8910,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.810';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.811';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -19806,6 +19806,26 @@ function _acShowSuggested() {
   el.classList.add('open');
 }
 
+// Render a set of labelled sections into the dropdown, keeping `acItems` index-
+// aligned with what is on screen so arrow keys, Tab and acPick keep working.
+function _acRenderSections(sections) {
+  const el = document.getElementById('ac-list');
+  acItems = [];
+  acSelected = -1;
+  let html = '';
+  for (const [label, items] of sections) {
+    if (!items.length) continue;
+    if (label) html += `<div class="ac-section">${esc(label)}</div>`;
+    for (const item of items) {
+      html += `<div class="ac-item" onmousedown="acPick(${acItems.length})">${esc(item)}</div>`;
+      acItems.push(item);
+    }
+  }
+  if (!acItems.length) { el.classList.remove('open'); return; }
+  el.innerHTML = html;
+  el.classList.add('open');
+}
+
 function acFetch(query) {
   clearTimeout(acTimer);
   const el = document.getElementById('ac-list');
@@ -19819,17 +19839,35 @@ function acFetch(query) {
     _acShowSuggested();
     return;
   }
-  el.classList.remove('open');
+  // A BARE NAME IS A SEARCH, NOT A PATH (AF-501). Typing used to DROP the
+  // suggested list — the one holding every directory amux already knows about —
+  // and replace it with a path completion that only answers if you already knew
+  // the path. Measured in a live onboarding session (2026-09-04): the user knew
+  // the repo's name, not its location, typed the name, got nothing, could not
+  // find it in Finder either, and spent three minutes of a one-hour call on it.
+  //
+  // Known dirs are matched HERE rather than server-side because the client
+  // already holds them: the answer is on screen before the request goes out,
+  // and the disk search fills in underneath it.
+  const bareName = query.indexOf('/') === -1 && query[0] !== '~';
+  let known = [];
+  if (bareName) {
+    const q = query.toLowerCase();
+    known = _buildSuggestedDirs().filter(d => d.toLowerCase().includes(q));
+    if (known.length) _acRenderSections([['Your directories', known]]);
+    else el.classList.remove('open');
+  } else {
+    el.classList.remove('open');
+  }
   acTimer = setTimeout(async () => {
     try {
       const r = await fetch(API + '/api/autocomplete/dir?q=' + encodeURIComponent(query));
-      acItems = await r.json();
-      acSelected = -1;
-      if (!acItems.length) { el.classList.remove('open'); return; }
-      el.innerHTML = acItems.map((item, i) =>
-        `<div class="ac-item" onmousedown="acPick(${i})">${esc(item)}</div>`
-      ).join('');
-      el.classList.add('open');
+      const found = await r.json();
+      // Deduped against what is already shown, so a directory that is both a
+      // worker's and on disk does not appear twice under two headings.
+      const fresh = found.filter(d => !known.includes(d) && !known.includes(d.replace(/\/$/, '')));
+      if (bareName) _acRenderSections([['Your directories', known], ['Found on disk', fresh]]);
+      else _acRenderSections([[null, found]]);
     } catch(e) {}
   }, 150);
 }
