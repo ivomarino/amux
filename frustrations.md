@@ -2615,3 +2615,32 @@ FIX: the pathspec paragraph in ~/.claude/CLAUDE.md now states what pathspec does
  NOT FIXED and deliberately not attempted: making the staged-guard see a cotenant it
  has no transcript for. It already reports that blind spot by name, which is the
  honest behaviour; the defect was in the guidance, not the guard.
+
+## An idle Codex prompt was labelled `UNSUBMITTED TEXT` using its model/path footer as the draft
+AREA: instruments
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-36
+SYMPTOM: the worker's stop hook said idle, Codex's structured rollout said idle,
+ zero subagents were live, and the pane visibly ended at the dim `Ask Codex to do
+ anything` placeholder. `/api/sessions/amux-testing-e2e` nevertheless returned
+ `status: waiting`, `composer_stuck_since > 0`, and
+ `composer_preview: gpt-5.6-solxhigh~/Dev/amux`; the dashboard rendered that
+ override as `UNSUBMITTED TEXT`. The composer reader stopped on Claude's border
+ and status-bar glyphs but Codex puts its model/effort/path footer directly below
+ the prompt with no border, so the footer was concatenated into the input.
+COST: the worker presented a false human-action state for roughly three hours and
+ contradicted both of its structured state sources. A human could have pressed
+ Enter to submit what the UI claimed was pending, although there was no command
+ in the composer.
+FIX: 66818693. `composer_state` now treats Codex's ANSI-styled middle-dot
+ model/path footer as a structural boundary without naming any model or version.
+ It deliberately requires the raw styling and therefore fails toward visible
+ `Typed` if Codex changes its chrome, never toward a false successful send. The
+ live-frame regression first reproduced `Typed("gpt-5.6-solxhigh~/Dev/amux")`,
+ then passed as `Placeholder`; its control keeps real typed text pending. Live
+ build `668186939734` cleared `composer_stuck_since` and `composer_preview`, and
+ the browser changed from the false badge to the worker's actual idle/working
+ state in real time.
