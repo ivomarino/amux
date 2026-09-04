@@ -2,6 +2,7 @@ import { test, expect } from './fixtures';
 
 const NAME = 'ate-44-worker';
 const ROOT = '/tmp/';
+const SESSIONS_ROUTE = '**/api/sessions';
 
 const SAMPLE = {
   name: NAME,
@@ -23,14 +24,30 @@ const SAMPLE = {
   status: 'idle',
 };
 
+const stubbedPages = new WeakSet<import('@playwright/test').Page>();
+
 async function boot(page: import('@playwright/test').Page) {
+  // Keep the app's own startup/poll fetches on the same worker as the fixture.
+  // Seeding the lexical `sessions` binding once was racy: a later real fetch
+  // could replace it with [] between rendering the menu and clicking Browse
+  // files. CI then saw the first two canonical-entry beacons, lost the worker,
+  // and never emitted the third. A route fixture models the durable API source
+  // instead of briefly overwriting one consumer's local snapshot.
+  if (!stubbedPages.has(page)) {
+    await page.route(SESSIONS_ROUTE, (route) => route.fulfill({ json: [SAMPLE] }));
+    stubbedPages.add(page);
+  }
   await page.goto('/');
   await page.waitForFunction(() => typeof (window as any)._renderWorkerActionMenu === 'function');
-  await page.evaluate(({ sample, name, root }) => {
+  await page.waitForFunction(({ name, root }) => {
+    const rows = JSON.parse(eval('JSON.stringify(sessions)'));
+    return rows.length === 1 && rows[0].name === name && rows[0].dir === root;
+  }, { name: NAME, root: ROOT });
+  await page.evaluate(({ name, root }) => {
     // These are top-level lexical bindings in the classic app bundle, not
-    // window properties. Seed the exact session/root shared by both handlers.
-    eval(`sessions = [${JSON.stringify(sample)}]; peekSession = ${JSON.stringify(name)}; peekSessionDir = ${JSON.stringify(root)}`);
-  }, { sample: SAMPLE, name: NAME, root: ROOT });
+    // window properties. Seed the exact open-peek context used by both handlers.
+    eval(`peekSession = ${JSON.stringify(name)}; peekSessionDir = ${JSON.stringify(root)}`);
+  }, { name: NAME, root: ROOT });
 }
 
 test('worker card and peek share all 25 worker actions, plus both peek-only actions', async ({ page }) => {
@@ -45,12 +62,17 @@ test('worker card and peek share all 25 worker actions, plus both peek-only acti
     peek.classList.add('open');
     const keys = (root: ParentNode) => Array.from(root.querySelectorAll('[data-worker-action]'))
       .map((el) => (el as HTMLElement).dataset.workerAction);
+    const semanticLabel = (el: Element) => {
+      const copy = el.cloneNode(true) as HTMLElement;
+      copy.querySelectorAll('.mi').forEach((icon) => icon.remove());
+      return (copy.textContent || '').trim();
+    };
     const style = getComputedStyle(peek);
     return {
       card: keys(card),
       peek: keys(peek),
       peekOnly: Array.from(peek.querySelectorAll('[data-peek-action], #peek-focus-btn'))
-        .map((el) => (el.textContent || '').trim()),
+        .map(semanticLabel),
       overflowY: style.overflowY,
       maxHeight: style.maxHeight,
       scrollHeight: peek.scrollHeight,
