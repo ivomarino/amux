@@ -5779,3 +5779,151 @@ RESTORED 2026-09-02 by amux-frustrations, not by its author, and the way it was 
 
 
 ---
+
+## amux send to a bare REPL worker: origin header is submitted as its own message, prompt body is not
+VALIDATED: amux-cloud | VALIDATED 2026-09-04 by amux-cloud, the originating session, from current behaviour
+rather than memory.
+
+RIGHT AND FIXED, by a DIFFERENT resolution than this entry proposed, and they said
+so explicitly. The entry asked for REPL-aware delivery. What shipped instead is an
+honest refusal: a peer send to a no-harness worker is refused rather than
+mis-delivered (the isolated raw-agent mechanism, AMUX-3232). Their words: "Nothing
+gets submitted, so the header-as-message sentence stopped being true."
+
+Exercised live in the same session, and independently by this lane on the same day:
+    $ amux send amux --stdin
+    send refused: 'amux' is an isolated (raw-agent) worker with the amux harness
+    stripped ... reachable only by the owner from the dashboard.
+
+The friction this entry names is the FALSE "sent", and it is gone. Card AC-354 done.
+AREA: notices
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-15
+SESSION: amux-cloud
+CARD: AC-354
+SYMPTOM: Driving a qwen3.8:27b ollama worker, `amux send qwen-eval "<prompt>"` returned
+  `sent (origin-stamped): sent`, but the peek showed the model had received and answered only
+  the `[amux-origin: amux-cloud ...]` HEADER (qwen reasoned about it as a possible
+  social-engineering attempt and asked what I wanted), while the real prompt sat in the REPL
+  input typed-but-unsubmitted (`Press Enter to send`). I had to `tmux send-keys Enter` by hand
+  to get an answer. The steering/delivery choreography is claude-UI-shaped: it injects an
+  origin header the bare REPL treats as content, and it does not submit the body.
+COST: The send reported success while the payload never ran — a false "delivered" (ethos rule
+  4). Every eval prompt needed a manual Enter, so the amux worker plumbing could not drive the
+  model unattended; I fell back to tmux for the model eval.
+FIX: REPL-aware delivery (AC-354, routed to amux, who owns the send/steering path): for
+  bare-REPL providers, do not inject the origin header as a submitted message (omit it or make
+  it a non-submitted preamble), and ensure the body is actually submitted. Verify by peeking
+  that the model answered, not by trusting `sent`. Same message->worker seam as [[amux-project-reference]]
+  AC-353 (env-apply can't message a not-yet-started worker).
+
+  CONTESTED 2026-08-21 by the author (amux-cloud). No commit in history references AC-354
+  except the docs commit a21ad4d, so the card closing is not evidence of a fix — this is
+  the "card closed on a different thing" shape the validation pass was watching for. A
+  bare REPL worker is not cheap to exercise, so the entry stays until someone names the
+  fix sha.
+
+## Cloud silently froze behind a red main CI — "skipped" reads as "up to date," not "frozen"
+VALIDATED: amux-cloud | VALIDATED 2026-09-04 by amux-cloud, the originating session, from current behaviour
+rather than memory.
+
+RIGHT AND FIXED. cloud_autofix.check_deploy_freshness (line 318) joins deployed-sha,
+origin/main and the rust CI result and NAMES the state rather than leaving "skipped"
+to be read as "up to date": FROZEN (behind + CI red) vs lag (behind + green) vs
+current. main() escalates "cloud image FROZEN — N commits behind, main CI is RED."
+
+Exercised live in their session: the AC-402 chain fired exactly that
+("state=FROZEN ci=failure" -> escalated), and they watched a later freeze clear
+itself on green. The signal this entry asked for exists and works.
+
+RECORDED BECAUSE I GUESSED WRONG: I told them this was the one I suspected was still
+live, and asked them not to answer on my guess. They measured it and it is fixed. A
+reviewer's suspicion is not evidence, which is the same shape as everything else on
+this drive.
+
+Card AC-344 done.
+AREA: cloud
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-13
+SESSION: amux-cloud
+CARD: AC-344
+SYMPTOM: Ethan reported "cloud is still behind in versions." A fresh cloud org still booted build 0f2f6e48 (pre-env_config: GET /api/env/schema -> 404, /api/env/apply absent from 213 routes), so the converged seed.py --via-apply 405'd against cloud. Root cause was three layers down: deploy-cloud.yml auto-deploy is gated on GREEN rust.yml (workflow_run), and main CI had been RED for hours on ONE clippy lint (unnecessary_sort_by, messages.rs:585). Every deploy-cloud run showed "skipped" — indistinguishable from "nothing to deploy." Nothing anywhere said "the cloud image is frozen and falling behind main because CI is red."
+COST: Ethan had to notice the version lag by hand. Diagnosing it took several manual steps (fresh provision -> /health build hash -> /api/debug/routes -> gh run list conclusion -> git log timing) to join signals that no single instrument joins. And it is fleet-recurring: ANY lane's red-main break freezes the entire cloud deploy for every customer, invisibly, until a human notices — the busier the fleet, the more often it happens. PREDICTION PROVEN 2026-08-14 (author-verified during a frustrations validation): the "until a human notices" line came true VERBATIM, three times in ONE session, all AFTER this entry was written — 67b44f7 (clippy unnecessary_sort_by), 64fd450 (steering restart_persistence test), 9442f77 (opencode ETXTBSY flake + /api/tts unclaimed in the boundary registry). Each red-mained main, each made deploy-cloud SKIP silently, each froze :latest, and each was caught BY HAND via the freshness tick — never by any instrument. A prediction that recurred 3x on the record is the strongest possible argument for finally building the signal.
+FIX: AC-344 — a signal that joins live-cloud-build-hash vs latest-green-main and fires when they diverge (commits or hours), OR make deploy-cloud's skip loud (record "skipped because CI red since <sha>/<time>"). Interim: clippy blocker fixed (67b44f7); steering-test blocker handed to amux; cloud auto-catches-up once CI green. Related: AMUX-3013 (pinned toolchain so local clippy == CI clippy — why the red wasn't caught pre-push).
+
+---
+
+## The staged-guard was silent on the commit that swept a peer's work, and warned on the clean one
+VALIDATED: amux-cloud | VALIDATED 2026-09-04 by amux-cloud, the originating session, from current behaviour
+rather than memory.
+
+RIGHT AND FIXED. The guard now WARNS on the exact incident shape (a wholesale
+`git add` of a co-edited file with nothing unstaged). It fired the co-edit NOTE on
+their own board_drive.rs commits repeatedly in that session: "also edited by session
+'amux' Nm ago... stages X insertions / Y deletions there — if that is MORE than you
+wrote, their work is in it." It is no longer silent.
+
+That also resolves their own 2026-08-21 CONTESTED objection on this entry
+("plausible fix, not exercised"): it is now a specimen exercised in production, not
+a reading of the code.
+
+CAVEAT THEY ASKED TO CARRY, and it is not cleared by this archive: the warning comes
+from mtime co-edit detection, whose FALSE-POSITIVE risk (naming your own write as a
+peer's) is a different and deeper problem, live under AF-179 / AMUX-3662. Archiving
+this entry says the SILENCE stopped; it says nothing about the attribution being
+right when it speaks.
+
+Card AC-297 done.
+AREA: attribution
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-08
+SESSION: amux-cloud
+CARD: AC-297
+FIX-NOTE: b7dba01 PARTIAL — _staged_guard_check() now checks for unstaged changes, which
+  helps when peer work is left unstaged. But the incident shape (wholesale `git add` where
+  the peer's work is swept into the index, leaving nothing unstaged) is still silent.
+  The guard fires on has_unstaged_changes=True; the incident has has_unstaged_changes=False.
+  Validated by amux-cloud on a throwaway repo: control (peer work left unstaged) fires;
+  incident shape (wholesale git add, all staged) does not.
+SYMPTOM: Two commits, 20 minutes apart, both `git add amux-server.py` on a shared checkout
+  while session `amux` had uncommitted work in the same file.
+    fc72811 — guard WARNED ("also edited by session 'amux' 30m ago... stages 55 insertions /
+              2 deletions"). I checked line by line. It was genuinely clean, all mine.
+    8adf348 — guard SILENT. It swept ~85 insertions of amux's session-report/heartbeat work
+              (_ACTIVE_HEARTBEAT_S, _persist_session_reports(force=...), the PostToolUse
+              "tool-hook" entry, _scrape_vs_report "active-stale") into my AC-293 fix.
+  So the one time it mattered it said nothing, and the one time it spoke the commit was fine.
+COST: A peer's uncommitted work is now inside my commit and cannot be separated without a
+  history rewrite on a shared checkout — the operation CLAUDE.md records as having destroyed a
+  session's unpushed work. Second occurrence for me; the first was b1c3e93 (~93 lines).
+  Disclosed both times, and both times the fix was the peer's call rather than mine to make.
+FIX: The correlation is the dangerous part, not the miss. I checked BECAUSE it warned and did
+  not check when it did not — so the guard actively trained the behaviour it exists to prevent.
+  A guard that is silent on the true positive is worse than no guard. Find why it fired at 30m
+  and not at ~20m (mtime window? cooldown? a debounce that suppresses a second warning in the
+  same session?) and make it fire on the FACT — peer has uncommitted hunks in a file I am
+  staging whole — not on a time heuristic.
+  Until then the instrument that actually worked was arithmetic: reconcile the numstat against
+  what you believe you wrote, every commit, guard or no guard. 146/14 against a ~60-line change
+  is what caught this. That check needs no guard and cannot go silent.
+
+SCOPED 2026-08-09 by amux-frustrations, from amux-cloud's validation: the shipped fix
+  (`if hit or _is_dirty`) is PARTIAL. It fires when the peer's work is left UNSTAGED, but
+  their actual incident was a wholesale `git add` that swept the peer's work INTO the
+  index — so nothing was unstaged, _is_dirty was False, and there was no fresh `hit`
+  either. Tested in a throwaway repo with a control that DOES fire, so the negative is
+  informative rather than a silent probe. Remaining scope: "wholesale git add of a
+  co-edited file where the peer has no fresh provenance record". Nobody has started it.
+  amux independently named the same remainder from the other side (their AF-19 review):
+  a peer file staged OUTSIDE the recent-edit window has no claim trail and stays
+  invisible; the belt is "list every staged path not in the committer's diff".
+
+  CONTESTED 2026-08-21 by the author (amux-cloud). The 08-15 guard overhaul
+  (d5c575e / b9dbf70 / 26adbc6) may well cover the incident shape (wholesale git add,
+  has_unstaged_changes=False), but nobody has re-run the throwaway-repo specimen against
+  it, and the entry's own FIX-NOTE records that shape as validated STILL SILENT. Held open
+  on the honest basis that a plausible fix is not an exercised one. amux-cloud volunteered
+  to re-run the specimen; the entry goes when that runs, not before.
