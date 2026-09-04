@@ -37,7 +37,7 @@ test.describe('board card details', () => {
 
     for (const artifact of [
       { kind: 'implementation', ref: '/tmp/amux-card-details/result.md', description: 'created file' },
-      { kind: 'verification', ref: 'https://example.com/amux-card-details', description: 'verification URL' },
+      { kind: 'verification', ref: 'https://127.0.0.1:1/amux-card-details', description: 'unreachable verification URL' },
     ]) {
       const response = await request.post(`/api/board/${encodeURIComponent(card)}/artifacts`, {
         headers: auth,
@@ -59,13 +59,16 @@ test.describe('board card details', () => {
     await expect(page.locator('#bd-preview')).toContainText('Visible task context from authoritative hydration.');
 
     const assets = page.locator('#bd-meta .bd-card-section', { hasText: 'Produced assets (2)' });
-    const file = assets.locator('.file-link', { hasText: '/tmp/amux-card-details/result.md' });
+    const file = assets.locator('button.file-link', { hasText: '/tmp/amux-card-details/result.md' });
     await expect(file).toHaveCount(1);
+    await expect(file).toHaveAttribute('type', 'button');
     await expect(file).toHaveAttribute('onclick', /openFilePreview/);
-    const url = assets.locator('a[href="https://example.com/amux-card-details"]');
+    await expect(assets).toContainText('missing');
+    const url = assets.locator('a[href="https://127.0.0.1:1/amux-card-details"]');
     await expect(url).toHaveCount(1);
     await expect(url).toHaveAttribute('target', '_blank');
     await expect(url).toHaveAttribute('rel', /noopener/);
+    await expect(assets).toContainText('reachability not checked');
 
     await page.locator('#bd-tab-history').click();
     await expect(page.locator('#bd-tab-history')).toHaveClass(/active/);

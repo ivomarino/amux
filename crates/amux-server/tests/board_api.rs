@@ -3563,6 +3563,183 @@ async fn an_artifact_on_a_missing_card_is_404_not_a_raw_db_error() {
     assert_eq!(st2, StatusCode::CREATED, "an artifact on a real card still lands: {b2}");
 }
 
+/// A worker-authored output is already attributed to one exact card. Capture
+/// its produced refs there once, through the common board API every provider
+/// uses, rather than scraping four provider-specific terminal formats.
+#[tokio::test]
+async fn worker_outputs_auto_register_every_provider_artifact_and_survive_done() {
+    let (app, _dir) = app();
+    let cases = [
+        ("claude", "claude-output.md"),
+        ("codex", "codex-output.png"),
+        ("gemini", "https://example.test/gemini-output"),
+        ("opencode", "53a868f"),
+    ];
+
+    for (provider, artifact_ref) in cases {
+        let lane = format!("provider-{provider}");
+        let (_st, _, made) = send_with(
+            &app,
+            "POST",
+            "/api/board",
+            Some(json!({
+                "title": format!("{provider} output capture"),
+                "status": "doing",
+                "type": "chore",
+                "session": lane,
+            })),
+            &[("X-Amux-Worker", lane.as_str())],
+        )
+        .await;
+        let id = made["id"].as_str().unwrap().to_string();
+        let update = json!({"text": format!("Produced {artifact_ref}; ready for review.")});
+
+        for _ in 0..2 {
+            let (st, _, body) = send_with(
+                &app,
+                "POST",
+                &format!("/api/board/{id}/status-update"),
+                Some(update.clone()),
+                &[("X-Amux-Worker", lane.as_str())],
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{provider} status update failed: {body}");
+        }
+
+        let (_, _, before) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+        let artifacts = before["artifacts"].as_array().unwrap();
+        assert_eq!(artifacts.len(), 1, "capture must be idempotent for {provider}: {before}");
+        assert_eq!(artifacts[0]["task_id"], json!(id), "artifact leaked off {provider}'s card");
+        assert_eq!(artifacts[0]["ref"], json!(artifact_ref));
+        assert!(
+            artifacts[0]["description"].as_str().unwrap_or("").contains(&lane),
+            "the automatic registration must retain its provider lane attribution: {before}"
+        );
+
+        let (st, _, done) = send_with(
+            &app,
+            "PATCH",
+            &format!("/api/board/{id}"),
+            Some(json!({
+                "status": "done",
+                "evidence": "ran `cargo test -p amux-server`",
+                "gate_ack": true,
+            })),
+            &[("X-Amux-Worker", lane.as_str())],
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "terminal transition failed for {provider}: {done}");
+        let (_, _, after) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+        assert_eq!(after["status"], json!("done"));
+        assert_eq!(after["artifacts"][0]["ref"], json!(artifact_ref), "done lost {provider}'s artifact");
+    }
+}
+
+/// Artifact identity is the `(task, artifact)` pair in the URL. A mismatched
+/// task must never be able to mutate or delete another task's output, and a
+/// deleted/missing artifact is a 404 rather than a 500 or a false 204 success.
+#[tokio::test]
+async fn artifact_crud_is_exact_and_missing_targets_fail_honestly() {
+    let (app, _dir) = app();
+    let first = create(&app, json!({"title": "artifact owner", "session": "amux"})).await;
+    let second = create(&app, json!({"title": "other task", "session": "amux"})).await;
+    let a = first["id"].as_str().unwrap();
+    let b = second["id"].as_str().unwrap();
+
+    let (st, _, body) = send(
+        &app,
+        "POST",
+        &format!("/api/board/{a}/artifacts"),
+        Some(json!({"kind": "implementation", "ref": "   "})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "a blank artifact cannot be clickable: {body}");
+
+    let (st, _, made) = send(
+        &app,
+        "POST",
+        &format!("/api/board/{a}/artifacts"),
+        Some(json!({"kind": "doc", "ref": "result.md", "state": "created"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{made}");
+    let aid = made["id"].as_str().unwrap();
+
+    let (st, _, wrong_patch) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{b}/artifacts/{aid}"),
+        Some(json!({"state": "submitted"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "cross-task PATCH must not become a storage 500: {wrong_patch}");
+
+    let (st, _, invalid) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{a}/artifacts/{aid}"),
+        Some(json!({"state": "teleported"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "an invalid state is a client error: {invalid}");
+
+    let (st, _, wrong_delete) = send(&app, "DELETE", &format!("/api/board/{b}/artifacts/{aid}"), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "a different task must not delete this artifact: {wrong_delete}");
+    let (_, _, still_there) = send(&app, "GET", &format!("/api/board/{a}/artifacts"), None).await;
+    assert_eq!(still_there.as_array().unwrap().len(), 1, "cross-task delete removed the artifact");
+    assert_eq!(still_there[0]["state"], json!("created"), "cross-task patch changed the artifact");
+
+    let (st, _, _) = send(&app, "DELETE", &format!("/api/board/{a}/artifacts/{aid}"), None).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (st, _, missing_delete) = send(&app, "DELETE", &format!("/api/board/{a}/artifacts/{aid}"), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "repeat delete must say the target is gone: {missing_delete}");
+    let (st, _, missing_patch) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{a}/artifacts/{aid}"),
+        Some(json!({"description": "too late"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "patching a deleted artifact must be 404: {missing_patch}");
+}
+
+/// Live controls from TUBES-2426/TUBES-2428: `.env` is a file even though its
+/// basename begins with a dot, while `1.93M` is a quantity even though it has
+/// a dot and an alphabetic suffix.
+#[tokio::test]
+async fn evidence_assets_keep_hidden_files_and_reject_decimal_measurements() {
+    let (app, _dir) = app();
+    let made = create(
+        &app,
+        json!({
+            "title": "hidden evidence asset",
+            "status": "doing",
+            "type": "chore",
+        }),
+    )
+    .await;
+    let id = made["id"].as_str().unwrap();
+    let (status, _, patched) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({
+            "evidence": "validated customers/tubescience/.env across 1.93M rows",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "evidence patch failed: {patched}");
+
+    let (_, _, detail) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    let refs = detail["asset_links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|asset| asset["ref"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(refs, vec!["customers/tubescience/.env"], "parser regressed: {detail}");
+}
+
 // AF-476. `trigger` is a CLI FLAG, not an API field. A raw PATCH of
 // {"trigger": ...} writes nothing and answers 422 all_ignored — correctly, since
 // no key sent was writable. What it did not say was what to send instead.

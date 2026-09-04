@@ -8752,7 +8752,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.799';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.800';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -26572,8 +26572,8 @@ function _bdArtifactRef(a) {
     || (!/\s/.test(refPath) && (refPath.includes('/') || /\.[a-z0-9]{1,12}$/i.test(refPath)));
   const serverResolvedPath = target !== ref && /^(?:\/|\.\.?\/)/.test(targetPath);
   if (explicitPath || serverResolvedPath) {
-    return '<span class="file-link" onclick="event.stopPropagation();openFilePreview(\''
-      + escJs(targetPath) + '\')" title="Open ' + esc(targetPath) + '">' + esc(ref) + '</span>';
+    return '<button type="button" class="file-link board-artifact-file" onclick="event.stopPropagation();openFilePreview(\''
+      + escJs(targetPath) + '\')" title="Open ' + esc(targetPath) + '">' + esc(ref) + '</button>';
   }
   return '<code>' + esc(ref) + '</code>';
 }
@@ -26720,10 +26720,17 @@ function _bdRenderMeta(item) {
     });
   if (artifacts.length) {
     html += '<section class="bd-card-section"><h4>Produced assets (' + artifacts.length + ')</h4>'
-      + artifacts.map(a => '<div class="board-detail-meta-row">' + _bdArtifactRef(a)
+      + artifacts.map(a => {
+        const availability = a && a.availability || {};
+        const availabilityText = availability.state === 'missing' ? ' · missing'
+          : availability.state === 'available' ? ' · available'
+          : availability.state === 'external' && availability.measured === false ? ' · reachability not checked'
+          : '';
+        return '<div class="board-detail-meta-row">' + _bdArtifactRef(a)
         + ' <span style="color:var(--dim)">· ' + esc(a.kind || a.source || 'artifact')
-        + (a.state ? ' · ' + esc(a.state) : '') + '</span>'
-        + (a.description ? '<div style="color:var(--dim)">' + esc(a.description) + '</div>' : '') + '</div>').join('');
+        + (a.state ? ' · ' + esc(a.state) : '') + esc(availabilityText) + '</span>'
+        + (a.description ? '<div style="color:var(--dim)">' + esc(a.description) + '</div>' : '') + '</div>';
+      }).join('');
     html += '</section>';
   }
 

@@ -831,14 +831,25 @@ pub fn asset_refs(text: &str) -> Vec<String> {
         .get_or_init(|| Regex::new(r"(?:^|\s)(#\d+)\b").expect("asset ref regex"));
 
     fn file_like_component(part: &str) -> bool {
+        if let Some(name) = part.strip_prefix('.') {
+            return !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'));
+        }
         let Some((stem, ext)) = part.rsplit_once('.') else { return false };
         !stem.is_empty()
+            && stem.chars().any(|c| c.is_ascii_alphabetic() || matches!(c, '_' | '-'))
             && (1..=12).contains(&ext.len())
             && ext.chars().all(|c| c.is_ascii_alphanumeric())
     }
     fn ambiguous_joined_files(value: &str) -> bool {
         !value.contains("://")
-            && value.split('/').filter(|part| file_like_component(part)).count() > 1
+            && value
+                .split('/')
+                .filter(|part| !part.starts_with('.') && file_like_component(part))
+                .count()
+                > 1
     }
 
     let mut out = Vec::new();
@@ -869,6 +880,12 @@ pub fn asset_refs(text: &str) -> Vec<String> {
         push(m.as_str());
     }
     for raw in text.split_whitespace() {
+        // A compiler/test flag can contain a perfectly file-shaped value, but
+        // the flag itself is not a produced asset (`--config=e2e/x.ts` was
+        // rendered as a missing file on ATE-37). Keep it out before trimming.
+        if raw.starts_with('-') || raw.contains('=') {
+            continue;
+        }
         let tok = raw.trim_matches(|c: char| {
             !c.is_ascii_alphanumeric() && c != '/' && c != '.' && c != '_' && c != '-' && c != '~'
         });
@@ -877,15 +894,24 @@ pub fn asset_refs(text: &str) -> Vec<String> {
         }
         if let Some((dir, last)) = tok.rsplit_once('/') {
             if !dir.is_empty() || tok.starts_with('/') {
-                if let Some((stem, ext)) = last.rsplit_once('.') {
-                    if !stem.is_empty()
+                let hidden_file = last.strip_prefix('.').is_some_and(|name| {
+                    !name.is_empty()
+                        && name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+                });
+                let ordinary_file = last.rsplit_once('.').is_some_and(|(stem, ext)| {
+                    !stem.is_empty()
+                        && stem
+                            .chars()
+                            .any(|c| c.is_ascii_alphabetic() || matches!(c, '_' | '-'))
                         && (1..=12).contains(&ext.len())
                         && ext.chars().all(|c| c.is_ascii_alphanumeric())
                         && ext.chars().any(|c| c.is_ascii_alphabetic())
-                    {
-                        push(tok);
-                        continue;
-                    }
+                });
+                if hidden_file || ordinary_file {
+                    push(tok);
+                    continue;
                 }
             }
         } else if file_like_component(tok)
@@ -908,6 +934,39 @@ pub fn asset_refs(text: &str) -> Vec<String> {
     for caps in number_ref.captures_iter(text) {
         if let Some(reference) = caps.get(1) {
             push(reference.as_str());
+        }
+    }
+    out
+}
+
+/// References in model-authored prose that are explicitly presented as
+/// outputs. Generic activity text routinely names input files, peer-owned
+/// dirty files, or a different card's commit; treating every path-like token
+/// as produced is the ATE-39 misattribution class.
+pub fn output_asset_refs(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    const MARKERS: [&str; 8] = [
+        "produced ",
+        "created ",
+        "artifact: ",
+        "artifacts: ",
+        "output: ",
+        "outputs: ",
+        "wrote ",
+        "generated ",
+    ];
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        for marker in MARKERS {
+            let Some(i) = lower.find(marker) else { continue };
+            let tail = &line[i + marker.len()..];
+            for reference in asset_refs(tail) {
+                if seen.insert(reference.clone()) {
+                    out.push(reference);
+                }
+            }
+            break;
         }
     }
     out
@@ -3243,6 +3302,23 @@ mod tests {
         assert!(!has_asset_link("result-a.txt/result-b.txt"));
         assert!(!has_asset_link("plan.md/result-a.txt/result-b.txt"));
         assert!(asset_refs("[ghost](plan.md/result-a.txt)").is_empty());
+        // Command flags and elapsed-time result text are not produced files.
+        // Both appeared as clickable, missing artifacts on ATE-37 because the
+        // old token parser looked only for a dotted tail.
+        assert!(!has_asset_link("--config=e2e/playwright.config.ts"));
+        assert!(!has_asset_link("3.0m"));
+        assert!(!has_asset_link("finished in 42.7s"));
+        assert!(!has_asset_link("processed 1.93M rows"));
+        assert_eq!(
+            asset_refs("customers/tubescience/.env"),
+            vec!["customers/tubescience/.env"],
+            "a hidden dotfile is still a produced file"
+        );
+        assert_eq!(
+            asset_refs("customers/.private/result.json"),
+            vec!["customers/.private/result.json"],
+            "hidden path components must not make a real file ambiguous"
+        );
 
         // The card renderer consumes the SAME parser and must receive every
         // produced asset, not just the first boolean proof that let Done pass.
@@ -3258,6 +3334,16 @@ mod tests {
                 "53a868f",
                 "#106",
             ]
+        );
+
+        assert_eq!(
+            output_asset_refs("Preserving unrelated sessions_legacy.rs while investigating"),
+            Vec::<String>::new(),
+            "an input/peer file mention is not a produced output"
+        );
+        assert_eq!(
+            output_asset_refs("Produced result.md and /tmp/screenshot.png"),
+            vec!["result.md".to_string(), "/tmp/screenshot.png".to_string()]
         );
     }
 

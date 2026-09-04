@@ -887,6 +887,7 @@
   .overlay-body a:active { color: #79c0ff; }
   .overlay-body .file-link { color: var(--cyan); text-decoration: none; border-bottom: 1px dashed var(--cyan); cursor: pointer; }
   .overlay-body .file-link:active { color: #79ead3; }
+  .overlay-body button.file-link { appearance: none; -webkit-appearance: none; background: none; border-top: 0; border-right: 0; border-left: 0; padding: 0; font: inherit; }
   .overlay-body .md-link { color: var(--yellow); text-decoration: none; border-bottom: 1px dashed var(--yellow); cursor: pointer; }
   .overlay-body .md-link:active { color: #e8c547; }
   /* A markdown link to ANOTHER file — opens IN the viewer (renderMarkdown +

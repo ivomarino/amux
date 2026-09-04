@@ -34,8 +34,8 @@
 //! - no boot board-digest briefing on start (standing instructions ARE re-sent)
 //! - no _install_amux_commit_hook / _auto_trust_dir / _ensure_memory side
 //!   effects (Python's loops still own those during coexistence)
-//! - commit-report attaches to the in-flight card but skips the cross-session
-//!   sweep notice (py:76008-76230)
+//! - commit-report records the exact task from its body/commit subject, but
+//!   skips the cross-session sweep notice (py:76008-76230)
 //! - env-explain / memory-explain answer 501 with a pointer (layered env
 //!   composition is not ported yet)
 //! - iTerm2-backed sessions (CC_ITERM2_SESSION_ID) answer 501 (0 in the fleet)
@@ -14312,8 +14312,116 @@ pub(crate) fn env_explain_verb(name: &str, qs: &[(String, String)]) -> Response 
 
 /// `commit-report` as a callable verb, for the grouped
 /// `/api/workers/{id}/git/...` surface (AF-291).
+fn commit_task_refs(subject: &str) -> Vec<String> {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"\b[A-Z][A-Z0-9]+-\d+\b").expect("commit task ref regex")
+    });
+    let mut seen = std::collections::HashSet::new();
+    re.find_iter(subject)
+        .map(|m| m.as_str().to_string())
+        .filter(|id| seen.insert(id.clone()))
+        .collect()
+}
+
+#[derive(Debug, Default)]
+struct CommitArtifactScan {
+    full_sha: Option<String>,
+    subject: Option<String>,
+    files: Vec<String>,
+    measured: bool,
+    why_unmeasured: Option<&'static str>,
+}
+
+/// Read the identity and files from the commit itself. The hook's subject is
+/// truncated for a log line, so it cannot be the authoritative source of a
+/// task id near the end of a long subject. All git arguments are passed without
+/// a shell and `sha` is validated before reaching git.
+async fn read_commit_artifacts(dir: &str, sha: &str) -> CommitArtifactScan {
+    if dir.trim().is_empty() {
+        return CommitArtifactScan {
+            why_unmeasured: Some("no repo dir in the report"),
+            ..Default::default()
+        };
+    }
+    if !commit_shape::usable_sha(sha) {
+        return CommitArtifactScan {
+            why_unmeasured: Some("sha is not a plain hex object name"),
+            ..Default::default()
+        };
+    }
+    if !std::path::Path::new(dir).is_dir() {
+        return CommitArtifactScan {
+            why_unmeasured: Some("reported dir is not a directory here"),
+            ..Default::default()
+        };
+    }
+    let git = |args: Vec<String>| {
+        let dir = dir.to_string();
+        async move {
+            tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .await
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        }
+    };
+    let Some(full_sha) = git(vec![
+        "rev-parse".into(),
+        "--verify".into(),
+        format!("{sha}^{{commit}}"),
+    ])
+    .await
+    else {
+        return CommitArtifactScan {
+            why_unmeasured: Some("git could not resolve the commit"),
+            ..Default::default()
+        };
+    };
+    let subject = git(vec!["show".into(), "-s".into(), "--format=%s".into(), full_sha.clone()])
+        .await;
+    let files = git(vec![
+        "diff-tree".into(),
+        "--no-commit-id".into(),
+        "--name-only".into(),
+        "-r".into(),
+        "--root".into(),
+        "-m".into(),
+        full_sha.clone(),
+    ])
+    .await
+    .map(|out| {
+        let mut seen = std::collections::HashSet::new();
+        out.lines()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .filter(|p| seen.insert(p.clone()))
+            .collect::<Vec<_>>()
+    });
+    match (subject, files) {
+        (Some(subject), Some(files)) => CommitArtifactScan {
+            full_sha: Some(full_sha),
+            subject: Some(subject),
+            files,
+            measured: true,
+            why_unmeasured: None,
+        },
+        _ => CommitArtifactScan {
+            full_sha: Some(full_sha),
+            why_unmeasured: Some("git could not read commit subject or files"),
+            ..Default::default()
+        },
+    }
+}
+
 pub(crate) async fn commit_report_verb(state: &AppState, name: &str, body: &Value) -> Response {
-    // Attach the commit to the in-flight card (py:76233-76246). The
+    // Attach the commit to the exact task named by the report/subject. The
     // cross-session sweep notice (py:76008-76230) is a named gap.
     let sha: String = body_str(body, "sha").trim().chars().take(16).collect();
     let subj: String = body_str(body, "subject").trim().chars().take(140).collect();
@@ -14327,6 +14435,7 @@ pub(crate) async fn commit_report_verb(state: &AppState, name: &str, body: &Valu
     // the session goes to read what it shipped.
     let dir = body_str(body, "dir");
     let shape = read_commit_shape(&dir, &sha).await;
+    let scan = read_commit_artifacts(&dir, &sha).await;
     let empty = matches!(shape, commit_shape::Shape::Empty);
     // WHAT THE HOOK SAW, held by the staged-guard (AMUX-3837).
     // amux-frustrations demonstrated the mechanism: git writes the tree
@@ -14356,7 +14465,16 @@ pub(crate) async fn commit_report_verb(state: &AppState, name: &str, body: &Valu
         );
     }
     let session = name.to_string();
-    let sha2 = sha.clone();
+    let reported_task = body_str(body, "task_id").trim().to_string();
+    let authoritative_subject = scan.subject.clone().unwrap_or_else(|| subj.clone());
+    let subject_tasks = commit_task_refs(&authoritative_subject);
+    let full_sha = scan.full_sha.clone().unwrap_or_else(|| sha.clone());
+    let files = scan.files.clone();
+    let scan_measured = scan.measured;
+    let why_unmeasured = scan.why_unmeasured;
+    let authoritative_subject_w = authoritative_subject.clone();
+    let full_sha_w = full_sha.clone();
+    let files_w = files.clone();
     // Named so the log line can say WHY it is silent: absent because
     // the commit was fine, versus absent because nothing looked.
     let shape_note = match shape {
@@ -14364,68 +14482,210 @@ pub(crate) async fn commit_report_verb(state: &AppState, name: &str, body: &Valu
         commit_shape::Shape::Unchecked(why) => format!(" (not checked for content: {why})"),
         _ => String::new(),
     };
+    #[derive(Debug)]
+    enum CommitReportOutcome {
+        Unattached,
+        Refused(StatusCode, Value),
+        Attached {
+            task: String,
+            source: &'static str,
+            artifacts: Vec<crate::db::artifact_store::ArtifactRow>,
+        },
+    }
+    let outcome: Arc<std::sync::Mutex<Option<CommitReportOutcome>>> = Default::default();
+    let outcome_w = outcome.clone();
     let reply = state
         .store
         .write_async(move |conn| {
-            let row: Option<String> = conn
-                .query_row(
-                    "SELECT id FROM issues WHERE session=? AND deleted IS NULL \
-                     AND COALESCE(archived,0)=0 AND status IN ('doing','review') \
-                     AND owner_type='agent' ORDER BY updated DESC LIMIT 1",
-                    [&session],
-                    |r| r.get(0),
-                )
-                .ok();
-            let Some(issue_id) = row else {
+            let mut active = Vec::new();
+            let mut stmt = conn.prepare(
+                "SELECT id FROM issues WHERE session=?1 AND deleted IS NULL \
+                 AND COALESCE(archived,0)=0 AND status IN ('doing','review') \
+                 AND owner_type='agent' ORDER BY id",
+            )?;
+            active.extend(stmt.query_map([&session], |r| r.get::<_, String>(0))?.flatten());
+
+            let (issue_id, source) = if !reported_task.is_empty() {
+                if !subject_tasks.is_empty() && !subject_tasks.contains(&reported_task) {
+                    *outcome_w.lock().expect("commit-report outcome poisoned") = Some(
+                        CommitReportOutcome::Refused(
+                            StatusCode::CONFLICT,
+                            json!({
+                                "error": "commit report task_id disagrees with the commit subject",
+                                "code": "commit_task_mismatch",
+                                "task_id": reported_task,
+                                "subject_tasks": subject_tasks,
+                            }),
+                        ),
+                    );
+                    return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+                }
+                (reported_task.clone(), "body")
+            } else if subject_tasks.len() == 1 {
+                (subject_tasks[0].clone(), "subject")
+            } else if subject_tasks.len() > 1 {
+                *outcome_w.lock().expect("commit-report outcome poisoned") = Some(
+                    CommitReportOutcome::Refused(
+                        StatusCode::CONFLICT,
+                        json!({
+                            "error": "commit subject names more than one task; pass task_id explicitly",
+                            "code": "commit_task_ambiguous",
+                            "subject_tasks": subject_tasks,
+                            "active_tasks": active,
+                        }),
+                    ),
+                );
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            } else if active.len() == 1 {
+                (active[0].clone(), "unique-in-flight")
+            } else if active.is_empty() {
+                *outcome_w.lock().expect("commit-report outcome poisoned") =
+                    Some(CommitReportOutcome::Unattached);
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            } else {
+                *outcome_w.lock().expect("commit-report outcome poisoned") = Some(
+                    CommitReportOutcome::Refused(
+                        StatusCode::CONFLICT,
+                        json!({
+                            "error": "commit names no task and this worker has multiple in-flight tasks",
+                            "code": "commit_task_ambiguous",
+                            "subject_tasks": [],
+                            "active_tasks": active,
+                            "how_to_fix": "include one task id in the commit subject or send task_id",
+                        }),
+                    ),
+                );
                 return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
             };
-            let log: String = conn
-                .query_row("SELECT COALESCE(log,'') FROM issues WHERE id=?", [&issue_id], |r| r.get(0))
-                .unwrap_or_default();
+            let Some(task) = crate::db::board_store::get_issue(conn, &issue_id)? else {
+                *outcome_w.lock().expect("commit-report outcome poisoned") = Some(
+                    CommitReportOutcome::Refused(
+                        StatusCode::NOT_FOUND,
+                        json!({
+                            "error": "commit names a task that does not exist",
+                            "code": "commit_task_missing",
+                            "task_id": issue_id,
+                        }),
+                    ),
+                );
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            };
             let ts = chrono::Local::now().format("%H:%M");
-            let new_log = format!("{}\n`{ts}` commit {sha2} — {subj}{shape_note}", log.trim_end())
+            let capture_desc = format!(
+                "automatically captured by commit-report from {session}; task selected by {source}"
+            );
+            let refs = files_w
+                .iter()
+                .cloned()
+                .chain(std::iter::once(full_sha_w.clone()))
+                .collect::<Vec<_>>();
+            let artifacts = crate::db::artifact_store::insert_captured_refs(
+                conn,
+                &issue_id,
+                refs,
+                &capture_desc,
+                now_i64(),
+            )?;
+            let new_log = format!(
+                "{}\n`{ts}` commit {full_sha_w} — {authoritative_subject_w}{shape_note}",
+                task.log.as_deref().unwrap_or("").trim_end()
+            )
                 .trim()
                 .to_string();
             conn.execute(
                 "UPDATE issues SET log=?, rev=COALESCE(rev,0)+1, updated=? WHERE id=?",
-                rusqlite::params![new_log, now_i64(), issue_id],
+                rusqlite::params![new_log, now_i64(), &issue_id],
             )?;
+            let mut events = vec![crate::db::PendingEvent {
+                entity_type: amux_core::revision::EntityType::Other("issue".into()),
+                entity_id: issue_id.clone(),
+                mutation: amux_core::revision::MutationKind::Updated,
+                payload: None,
+            }];
+            events.extend(artifacts.iter().map(|artifact| crate::db::PendingEvent {
+                entity_type: amux_core::revision::EntityType::Other("artifact".into()),
+                entity_id: artifact.id.clone(),
+                mutation: amux_core::revision::MutationKind::Created,
+                payload: None,
+            }));
+            *outcome_w.lock().expect("commit-report outcome poisoned") = Some(
+                CommitReportOutcome::Attached {
+                    task: issue_id,
+                    source,
+                    artifacts,
+                },
+            );
             Ok(crate::db::WriteOutcome {
                 applied: true,
-                events: vec![crate::db::PendingEvent {
-                    entity_type: amux_core::revision::EntityType::Other("issue".into()),
-                    entity_id: issue_id,
-                    mutation: amux_core::revision::MutationKind::Updated,
-                    payload: None,
-                }],
+                events,
             })
         })
         .await;
-    match reply {
-        // The emptiness verdict rides BOTH arms. A session with no
-        // in-flight card is exactly the one whose commit lands with no
-        // trail, so it is the last place the warning may be dropped.
-        Ok(r) if !r.applied => {
-            j200(json!({"ok": true, "attached": Value::Null, "empty_commit": empty,
-                       "staged_at_hook": staged_at_hook}))
+    if let Err(e) = reply {
+        return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()}));
+    }
+    let result = outcome.lock().expect("commit-report outcome poisoned").take();
+    match result {
+        Some(CommitReportOutcome::Attached { task, source, artifacts }) => {
+            tracing::info!(
+                marker = "commit_report_task_exact",
+                session = %name,
+                task = %task,
+                task_source = source,
+                sha = %full_sha,
+                artifacts_captured = artifacts.len(),
+                scan_measured,
+                why_unmeasured = why_unmeasured.unwrap_or(""),
+                "commit-report attached commit and files to the exact board task"
+            );
+            j200(json!({
+                "ok": true,
+                "attached": task,
+                "task_source": source,
+                "sha": full_sha,
+                "artifacts_captured": artifacts.len(),
+                "artifact_refs": artifacts.iter().map(|a| a.ref_value.clone()).collect::<Vec<_>>(),
+                "artifact_scan": {
+                    "measured": scan_measured,
+                    "n_considered": files.len(),
+                    "why_unmeasured": why_unmeasured,
+                },
+                "empty_commit": empty,
+                "staged_at_hook": staged_at_hook,
+            }))
         }
-        Ok(_) => {
-            // Re-read the card id for the response (the write closure
-            // cannot return it through WriteReply).
-            let attached: Option<String> = state.store.read().ok().and_then(|conn| {
-                conn.query_row(
-                    "SELECT id FROM issues WHERE session=? AND deleted IS NULL \
-                     AND COALESCE(archived,0)=0 AND status IN ('doing','review') \
-                     AND owner_type='agent' ORDER BY updated DESC LIMIT 1",
-                    [name],
-                    |r| r.get(0),
-                )
-                .ok()
-            });
-            j200(json!({"ok": true, "attached": attached, "sha": sha, "empty_commit": empty,
-                        "staged_at_hook": staged_at_hook}))
+        Some(CommitReportOutcome::Refused(status, mut body)) => {
+            tracing::warn!(
+                marker = "commit_report_task_ambiguous",
+                session = %name,
+                sha = %full_sha,
+                subject = %authoritative_subject,
+                "commit-report refused to guess which board task produced the commit"
+            );
+            body["ok"] = json!(false);
+            body["sha"] = json!(full_sha);
+            jresp(status, body)
         }
-        Err(e) => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
+        Some(CommitReportOutcome::Unattached) | None => {
+            tracing::info!(
+                marker = "commit_report_unattached",
+                session = %name,
+                sha = %full_sha,
+                "commit-report found no explicit task and no unique in-flight card"
+            );
+            j200(json!({
+                "ok": true,
+                "attached": Value::Null,
+                "sha": full_sha,
+                "artifact_scan": {
+                    "measured": scan_measured,
+                    "n_considered": files.len(),
+                    "why_unmeasured": why_unmeasured,
+                },
+                "empty_commit": empty,
+                "staged_at_hook": staged_at_hook,
+            }))
+        }
     }
 }
 

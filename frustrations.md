@@ -2697,3 +2697,46 @@ FIX: ATE-38 recognizes the exact adjacent live shapes on both supported Codex
  control. Adapter and end-to-end status-truth tests cover active, completed,
  stale-row, queued-message, and prompt-churn cases without matching arbitrary
  transcript prose.
+
+## A commit naming ATE-38 attached its outputs to the newer ATE-39 card
+AREA: attribution
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-39
+SYMPTOM: commit `be87f031` named `(ATE-38)` in its subject, but the post-commit
+ `commit-report` appended the commit activity and derived links for
+ `sessions_legacy.rs` and `be87f031` to the currently-Doing ATE-39. ATE-38 had
+ no durable artifact rows when the report landed. The endpoint ignored the
+ explicit task id and selected the worker's most recently updated in-flight card.
+COST: the board put another task's source and commit on this card and left the
+ producing task without its outputs. The user had to inspect both cards, identify
+ the wrong newest-card guess, and provide a corrective live specimen before the
+ task record could be trusted.
+FIX: ATE-39 (this commit). `commit-report` reads the full subject and changed-file
+ list from the git object, attaches by an explicit body/subject task id, and
+ refuses ambiguity instead of guessing newest. It stores the full SHA and every
+ changed file as durable rows on that exact task and emits
+ `commit_report_task_exact` / `commit_report_task_ambiguous` log markers.
+
+## Evidence hid a real .env file and rendered the 1.93M row count as a file
+AREA: board
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-39
+SYMPTOM: TUBES-2426 evidence named `customers/tubescience/.env` but Board details
+ returned no asset link. TUBES-2428 named the same file yet returned only `1.93M`,
+ a decimal measurement, as a clickable missing-file asset. The parser required a
+ non-empty stem before the final dot and accepted alphabetic measurement suffixes.
+COST: the actual customer configuration artifact disappeared from two task records,
+ while one record sent a reviewer toward a manufactured file. The user had to
+ compare the two live payloads to show that the positive and negative parser arms
+ were both backwards.
+FIX: ATE-39 (this commit). Hidden leaf files and hidden path components are
+ accepted, decimal measurement tokens are rejected, and bare/relative dotfiles
+ resolve against the producing worker directory. File rows now render as semantic
+ buttons; local availability and external reachability-not-measured verdicts make
+ missing and unreachable assets explicit.

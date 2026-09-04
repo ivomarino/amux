@@ -574,6 +574,7 @@ fn board_detail_leads_with_actionable_task_context() {
         "a.resolved_ref",
         "const explicitPath =",
         "const serverResolvedPath =",
+        "<button type=\"button\" class=\"file-link board-artifact-file\"",
         "targetPath = target.replace(/#.*$/",
         "Produced assets (",
         "Source message",

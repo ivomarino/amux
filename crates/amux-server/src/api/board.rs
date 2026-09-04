@@ -3833,6 +3833,14 @@ pub async fn create_item(
 
 fn resolve_task_asset(reference: &str, work_dir: &str) -> String {
     let reference = reference.trim();
+    if let Some(rest) = reference.strip_prefix("~/") {
+        return std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join(rest)
+            .to_string_lossy()
+            .into_owned();
+    }
     let is_external = reference.starts_with("http://")
         || reference.starts_with("https://")
         || reference.starts_with('#')
@@ -3859,6 +3867,10 @@ fn resolve_task_asset(reference: &str, work_dir: &str) -> String {
     let path_shaped = path_ref.starts_with("./")
         || path_ref.starts_with("../")
         || path_ref.contains('/')
+        || path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with('.') && name.len() > 1)
         || path.extension().is_some();
     if !path_shaped {
         return reference.to_string();
@@ -3894,6 +3906,37 @@ fn resolve_task_asset(reference: &str, work_dir: &str) -> String {
     }
 }
 
+/// Availability is measured only where doing so is local and side-effect free.
+/// Fetching an arbitrary artifact URL from this endpoint would turn a board
+/// render into an SSRF primitive; an external link therefore says explicitly
+/// that reachability was not measured instead of pretending it passed.
+fn task_asset_availability(reference: &str, resolved: &str) -> Value {
+    let external = reference.starts_with("http://") || reference.starts_with("https://");
+    let symbolic = reference.starts_with('#')
+        || ((7..=40).contains(&reference.len())
+            && reference.bytes().all(|c| c.is_ascii_hexdigit()));
+    if external {
+        json!({
+            "state": "external",
+            "measured": false,
+            "why_unmeasured": "external URLs are not fetched by the server (avoids SSRF and side effects)",
+        })
+    } else if symbolic {
+        json!({
+            "state": "symbolic",
+            "measured": false,
+            "why_unmeasured": "commit and PR references are resolved by their repository surface",
+        })
+    } else {
+        let exists = std::path::Path::new(resolved.split('#').next().unwrap_or(resolved)).exists();
+        json!({
+            "state": if exists { "available" } else { "missing" },
+            "measured": true,
+            "exists": exists,
+        })
+    }
+}
+
 #[cfg(test)]
 mod task_asset_resolution_tests {
     use super::resolve_task_asset;
@@ -3916,8 +3959,10 @@ mod task_asset_resolution_tests {
         let repo = root.path().join("mixpeek");
         let cwd = repo.join("customers/tubescience");
         let file = cwd.join("migration/mxp.py");
+        let dotenv = cwd.join(".env");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, "# asset").unwrap();
+        std::fs::write(&dotenv, "TOKEN=hidden-asset").unwrap();
 
         assert_eq!(
             resolve_task_asset("migration/mxp.py", cwd.to_str().unwrap()),
@@ -3929,6 +3974,16 @@ mod task_asset_resolution_tests {
                 cwd.to_str().unwrap()
             ),
             format!("{}#contract", file.to_string_lossy())
+        );
+        assert_eq!(
+            resolve_task_asset("customers/tubescience/.env", cwd.to_str().unwrap()),
+            dotenv.to_string_lossy(),
+            "repo-relative dotfiles resolve from the producing worker's directory"
+        );
+        assert_eq!(
+            resolve_task_asset(".env", cwd.to_str().unwrap()),
+            dotenv.to_string_lossy(),
+            "a bare dotfile resolves from the producing worker's directory"
         );
     }
 }
@@ -4011,7 +4066,9 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
             .unwrap_or_default();
         for artifact in &mut artifacts {
             if let Some(reference) = artifact.get("ref").and_then(Value::as_str) {
-                artifact["resolved_ref"] = json!(resolve_task_asset(reference, &work_dir));
+                let resolved = resolve_task_asset(reference, &work_dir);
+                artifact["availability"] = task_asset_availability(reference, &resolved);
+                artifact["resolved_ref"] = json!(resolved);
             }
         }
         let mut add_asset = |reference: String, source: &str| {
@@ -4019,6 +4076,7 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
             let resolved_ref = resolve_task_asset(&reference, &work_dir);
             asset_links.push(json!({
                 "ref": reference,
+                "availability": task_asset_availability(&reference, &resolved_ref),
                 "resolved_ref": resolved_ref,
                 "source": source,
             }));
@@ -4026,9 +4084,14 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
         for (source, text) in [
             ("evidence", row.evidence.as_deref().unwrap_or("")),
             ("last result", row.last_result.as_deref().unwrap_or("")),
-            ("activity", row.log.as_deref().unwrap_or("")),
         ] {
             for reference in bs::asset_refs(text) { add_asset(reference, source); }
+        }
+        // Activity is broad: it names inputs, peer-owned dirty files, and
+        // commits belonging to other cards. Only explicit output language may
+        // synthesize a link; commit-report registers its exact outputs below.
+        for reference in bs::output_asset_refs(row.log.as_deref().unwrap_or("")) {
+            add_asset(reference, "worker output");
         }
         let mut file_stmt = conn.prepare(
             "SELECT path FROM issue_files WHERE issue_id=?1 ORDER BY added_at, path",
@@ -8405,7 +8468,7 @@ async fn status_request(
              cannot receive, so nobody was asked"
         ),
     };
-    if let Err(e) = append_card_log(&state, &id, &line).await {
+    if let Err(e) = append_card_log(&state, &id, &line, None).await {
         return internal(e);
     }
     match queued {
@@ -8478,14 +8541,37 @@ async fn status_update(
             Err(e) => return internal(e),
         }
     }
-    if let Err(e) = append_card_log(&state, &id, &format!("STATUS ({actor}): {text}")).await {
-        return internal(e);
+    let captured = match append_card_log(
+        &state,
+        &id,
+        &format!("STATUS ({actor}): {text}"),
+        Some((
+            bs::output_asset_refs(&text),
+            format!("automatically captured from status update by {actor}"),
+        )),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return internal(e),
+    };
+    if !captured.is_empty() {
+        tracing::info!(
+            target: "amux::board",
+            task = %id,
+            worker = %actor,
+            captured = captured.len(),
+            refs = ?captured.iter().map(|a| a.ref_value.as_str()).collect::<Vec<_>>(),
+            "board task artifacts auto-captured from worker output"
+        );
     }
     let mut resp = Json(json!({
         "ok": true, "id": id, "actor": actor,
         "chars": text.chars().count(),
         "original_chars": original_chars,
         "truncated": truncated,
+        "artifacts_captured": captured.len(),
+        "artifact_refs": captured.iter().map(|a| a.ref_value.clone()).collect::<Vec<_>>(),
     }))
     .into_response();
     if truncated {
@@ -8676,18 +8762,42 @@ async fn create_artifact(
     Json(body): Json<Value>,
 ) -> Response {
     let kind = match body.get("kind").and_then(|v| v.as_str()) {
-        Some(k) => k.to_string(),
+        Some(k) if !k.trim().is_empty() => k.trim().to_string(),
         None => {
             return (StatusCode::BAD_REQUEST, Json(json!({"error": "kind required"}))).into_response()
         }
+        Some(_) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": "kind cannot be blank"}))).into_response()
+        }
     };
     let ref_value = match body.get("ref").and_then(|v| v.as_str()) {
-        Some(r) => r.to_string(),
+        Some(r) if !r.trim().is_empty() => r.trim().to_string(),
         None => {
             return (StatusCode::BAD_REQUEST, Json(json!({"error": "ref required"}))).into_response()
         }
+        Some(_) => {
+            tracing::warn!(
+                marker = "artifact_blank_ref",
+                task = %id,
+                "board artifact registration refused: a blank reference cannot be opened"
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "artifact ref cannot be blank",
+                    "code": "artifact_ref_blank",
+                    "task_id": id,
+                })),
+            )
+                .into_response();
+        }
     };
-    let state_val = body.get("state").and_then(|v| v.as_str()).unwrap_or("created").to_string();
+    let state_val = body
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("created")
+        .trim()
+        .to_string();
     let desc = body.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
     if !crate::db::artifact_store::KNOWN_KINDS.contains(&kind.as_str()) {
         return (StatusCode::BAD_REQUEST, Json(json!({
@@ -8802,19 +8912,32 @@ async fn patch_artifact(
     if new_state.is_none() && new_desc.is_none() {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "nothing to update"}))).into_response();
     }
+    if let Some(ref new_state) = new_state {
+        if !crate::db::artifact_store::ARTIFACT_STATES.contains(&new_state.as_str()) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "unknown artifact state",
+                    "state": new_state,
+                    "valid_states": crate::db::artifact_store::ARTIFACT_STATES,
+                })),
+            )
+                .into_response();
+        }
+    }
     let now = chrono::Utc::now().timestamp();
+    let task_for_log = id.clone();
+    let aid_for_log = aid.clone();
     let write = state.store.write_async(move |conn| {
+        if bs::get_issue(conn, &id)?.is_none() {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
         let existing = crate::db::artifact_store::get(conn, &aid)?
             .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
         if existing.task_id != id {
             return Err(rusqlite::Error::QueryReturnedNoRows);
         }
         if let Some(ref s) = new_state {
-            if !crate::db::artifact_store::ARTIFACT_STATES.contains(&s.as_str()) {
-                return Err(rusqlite::Error::InvalidParameterName(
-                    format!("invalid state: {s}"),
-                ));
-            }
             crate::db::artifact_store::update_state(conn, &aid, s, now)?;
         }
         if let Some(ref d) = new_desc {
@@ -8835,6 +8958,25 @@ async fn patch_artifact(
     }).await;
     match write {
         Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
+        Err(e) if is_missing_task(&e) => {
+            tracing::warn!(
+                marker = "artifact_target_missing",
+                task = %task_for_log,
+                artifact = %aid_for_log,
+                operation = "patch",
+                "board artifact mutation refused: artifact is absent or belongs to another task"
+            );
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": "artifact not found on this task",
+                    "code": "artifact_target_missing",
+                    "task_id": task_for_log,
+                    "artifact_id": aid_for_log,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -8842,26 +8984,49 @@ async fn patch_artifact(
 /// DELETE /api/board/{id}/artifacts/{aid}
 async fn delete_artifact(
     State(state): State<AppState>,
-    Path((_id, aid)): Path<(String, String)>,
+    Path((id, aid)): Path<(String, String)>,
 ) -> Response {
+    let task_for_log = id.clone();
+    let aid_for_log = aid.clone();
     let write = state.store.write_async(move |conn| {
-        let n = crate::db::artifact_store::delete(conn, &aid)?;
+        if bs::get_issue(conn, &id)?.is_none() {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        let n = crate::db::artifact_store::delete_for_task(conn, &id, &aid)?;
+        if n == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
         Ok(crate::db::WriteOutcome {
-            applied: n > 0,
-            events: if n > 0 {
-                vec![crate::db::PendingEvent {
-                    entity_type: amux_core::revision::EntityType::Other("artifact".into()),
-                    entity_id: aid.clone(),
-                    mutation: amux_core::revision::MutationKind::Deleted,
-                    payload: None,
-                }]
-            } else {
-                vec![]
-            },
+            applied: true,
+            events: vec![crate::db::PendingEvent {
+                entity_type: amux_core::revision::EntityType::Other("artifact".into()),
+                entity_id: aid.clone(),
+                mutation: amux_core::revision::MutationKind::Deleted,
+                payload: None,
+            }],
         })
     }).await;
     match write {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) if is_missing_task(&e) => {
+            tracing::warn!(
+                marker = "artifact_target_missing",
+                task = %task_for_log,
+                artifact = %aid_for_log,
+                operation = "delete",
+                "board artifact deletion refused: artifact is absent or belongs to another task"
+            );
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": "artifact not found on this task",
+                    "code": "artifact_target_missing",
+                    "task_id": task_for_log,
+                    "artifact_id": aid_for_log,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -8896,8 +9061,11 @@ async fn append_card_log(
     state: &AppState,
     id: &str,
     line: &str,
-) -> Result<(), rusqlite::Error> {
+    capture: Option<(Vec<String>, String)>,
+) -> Result<Vec<crate::db::artifact_store::ArtifactRow>, rusqlite::Error> {
     let (id, line, stamp) = (id.to_string(), line.to_string(), hhmm());
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let captured_w = captured.clone();
     state
         .store
         .write_async(move |conn| {
@@ -8907,13 +9075,37 @@ async fn append_card_log(
             let next = bs::append_log(existing.as_deref(), &stamp, &line);
             conn.execute(
                 "UPDATE issues SET log=?1 WHERE id=?2",
-                rusqlite::params![next, id],
+                rusqlite::params![next, &id],
             )?;
-            Ok(WriteOutcome { applied: true, events: vec![] })
+            let inserted = match capture {
+                Some((refs, description)) => crate::db::artifact_store::insert_captured_refs(
+                    conn,
+                    &id,
+                    refs,
+                    &description,
+                    now_secs(),
+                )?,
+                None => Vec::new(),
+            };
+            let events = inserted
+                .iter()
+                .map(|artifact| crate::db::PendingEvent {
+                    entity_type: amux_core::revision::EntityType::Other("artifact".into()),
+                    entity_id: artifact.id.clone(),
+                    mutation: amux_core::revision::MutationKind::Created,
+                    payload: None,
+                })
+                .collect();
+            *captured_w.lock().expect("artifact capture slot poisoned") = inserted;
+            Ok(WriteOutcome { applied: true, events })
         })
         .await
-        .map(|_| ())
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e.to_string()))))
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e.to_string()))))?;
+    let inserted = captured
+        .lock()
+        .expect("artifact capture slot poisoned")
+        .clone();
+    Ok(inserted)
 }
 
 #[cfg(test)]
