@@ -610,6 +610,131 @@ def _index_lock_note(cmd, run_dir):
         tail = "  No holder and recently touched: most likely ordinary contention. Retry.\n"
     return head + body + tail
 
+# A bare `git commit` with no pathspec, on a checkout whose HEAD lags origin,
+# commits the DRIFT (AF-507).
+SWEEP_THRESHOLD = int(os.environ.get("AMUX_SWEEP_COMMIT_THRESHOLD", "20") or "20")
+
+
+def _commit_has_pathspec(scrubbed):
+    """True when a `git commit` names paths, so it cannot sweep the whole index.
+
+    Only the FORM matters here, not what the paths are: `git commit <paths>`
+    takes those paths' worktree state and ignores the index for everything else,
+    which is precisely what a drift-sweep is not. Two spellings count — an
+    explicit `--` separator, and trailing bare operands after the flags.
+    """
+    m = re.search(r'\bgit\s+' + GIT_GLOBALS + r'commit\b([^\n;&|]*)', scrubbed)
+    if not m:
+        return False
+    rest = m.group(1)
+    if re.search(r'(^|\s)--(\s|$)', rest):
+        return True
+    # Flags that CONSUME the next token; anything else bare is an operand.
+    takes_arg = {"-m", "--message", "-C", "--reuse-message", "-c", "--reedit-message",
+                 "-F", "--file", "--author", "--date", "-S", "--gpg-sign",
+                 "--cleanup", "--template", "-t", "--fixup", "--squash",
+                 "--trailer", "--pathspec-from-file"}
+    toks = rest.split()
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t.startswith("-"):
+            if "=" in t:
+                i += 1
+                continue
+            if t in takes_arg:
+                i += 2
+                continue
+            i += 1
+            continue
+        return True   # a bare operand: this commit is path-scoped
+    return False
+
+
+def _sweep_commit_verdict(cmd, scrubbed, run_dir):
+    """Refuse a no-pathspec `git commit` that would sweep index-vs-frozen-HEAD drift.
+
+    Reported by `backend`, near-miss 2026-09-04. `git add <file>` hit a peer's
+    index.lock and failed, so their file was never staged. The follow-up bare
+    `git commit -m` then committed the ENTIRE index-vs-HEAD drift — 1120 files,
+    +67067/-6296 — under their message, not containing their change. Their
+    `git reset --soft HEAD~1` to undo it was then blocked by this same guard,
+    correctly. So the guard blocked the FIX and not the CAUSE, and the cause is
+    not recoverable from inside the checkout.
+
+    WHY THE COUNT IS TAKEN TWICE, AND WHY THE SECOND ONE IS THE SIGNAL.
+    `git diff --cached` is against HEAD, and graft-push freezes HEAD ~1846
+    commits behind origin while the index tracks current. So a sweep shows a
+    huge staged-vs-HEAD set whose files ALREADY MATCH ORIGIN — they are not
+    anybody's work, they are the frozen baseline. A genuine large commit is the
+    opposite: its files differ from origin too, because that is what makes them
+    work. Subtracting the origin-relative set from the HEAD-relative one leaves
+    exactly the drift, which is why a plain file-count threshold would refuse
+    real refactors and this does not.
+
+    On an ordinary checkout HEAD and origin/main agree, the drift set is empty,
+    and this never fires. That is correct: the failure needs a lagging HEAD.
+
+    Returns None to allow, or a block-reason string."""
+    if not re.search(r'\bgit\s+' + GIT_GLOBALS + r'commit\b', scrubbed):
+        return None
+    if re.search(r'\bgit\s+' + GIT_GLOBALS + r'commit\b[^\n;&|]*--amend\b', scrubbed):
+        return None   # amend has its own verdict, with its own pin
+    if _commit_has_pathspec(scrubbed):
+        return None
+    import subprocess
+
+    def _names(*args):
+        out = subprocess.run(("git", "-C", run_dir, "diff", "--cached", "--name-only") + args,
+                             capture_output=True, text=True, timeout=15).stdout
+        return {l for l in out.splitlines() if l.strip()}
+
+    staged = _names()
+    # AN EARLY-OUT, NOT A RULE. `drift` below is a SUBSET of `staged`, so
+    # `len(drift) > SWEEP_THRESHOLD` already implies this — removing this line
+    # cannot change any verdict, and a mutation that deletes it stays green BY
+    # CONSTRUCTION rather than for want of a test. It is here to skip a second
+    # `git diff` and a rev-parse loop on every ordinary small commit, which is
+    # the overwhelmingly common case for a hook on every Bash call.
+    #
+    # Written out because a reader who mutates it, sees green, and concludes the
+    # threshold is untested would be drawing the wrong lesson from a correct
+    # observation (ethos rule 7 — a green mutation can mean redundancy).
+    if len(staged) <= SWEEP_THRESHOLD:
+        return None
+    base = None
+    for ref in ("origin/main", "origin/HEAD"):
+        r = subprocess.run(("git", "-C", run_dir, "rev-parse", "--verify", "--quiet", ref),
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and r.stdout.strip():
+            base = ref
+            break
+    if base is None:
+        return None   # no origin to compare against: fail-open, as everywhere here
+    drift = staged - _names(base)
+    if len(drift) <= SWEEP_THRESHOLD:
+        return None
+    pin = os.environ.get("AMUX_ALLOW_SWEEP_COMMIT", "").strip()
+    if pin:
+        # A PIN, NOT A FLAG, for the same reason AMUX_AMEND_EXPECT is one: the
+        # number can only be supplied by someone who ran the count, so the
+        # escape requires having LOOKED. A bare on/off switch would be set once
+        # in a shell profile and never read again.
+        if pin == str(len(drift)):
+            return None
+        return (f"AMUX_ALLOW_SWEEP_COMMIT={pin} does not match the {len(drift)} drift file(s) "
+                f"this commit would sweep — re-read the count and pin THAT, or the escape is "
+                f"authorizing a commit you have not looked at")
+    return (
+        f"bare `git commit` would sweep {len(drift)} file(s) of index-vs-HEAD DRIFT "
+        f"({len(staged)} staged against HEAD, and {len(drift)} of them already match {base}). "
+        f"Those are not your work: HEAD lags {base} on this checkout, so the index carries "
+        f"the whole gap and a no-pathspec commit takes all of it under YOUR message. "
+        f"Commit your own paths instead: `git commit <your files> -m ...`. "
+        f"If you really mean to commit all {len(drift)}, pin the count you just read: "
+        f"AMUX_ALLOW_SWEEP_COMMIT={len(drift)} git commit ...")
+
+
 def _amend_verdict(cmd, scrubbed, run_dir):
     """Case 15/16 (2026-07-05 near-miss): `git commit --amend` rewrites shared
     HEAD — which may be ANOTHER session's just-landed commit (author identity
@@ -1484,6 +1609,24 @@ def main():
         sys.stderr.write(_index_lock_note(cmd, run_dir))
     except Exception:
         pass  # a note that cannot be produced must never block a command
+    # AF-507: a no-pathspec commit that would sweep index-vs-frozen-HEAD drift.
+    # Checked BEFORE the amend verdict because they are disjoint (the sweep
+    # verdict returns None for --amend) and this one is the cheaper miss to
+    # catch: an amend rewrites one commit, a sweep buries a peer's whole tree
+    # under someone else's message.
+    sweep_why = None
+    try:
+        sweep_why = _sweep_commit_verdict(cmd, scrubbed, run_dir)
+    except Exception:
+        sweep_why = None  # fail-open, same posture as the rest of the guard
+    if sweep_why:
+        if _consume_override(cmd):
+            sys.stderr.write(f"amux guard: ALLOWED once (owner-sanctioned): {sweep_why}\n")
+        else:
+            sys.stderr.write(
+                f"BLOCKED by amux shared-checkout guard: {sweep_why}.\n"
+                f"'{run_dir}' is a SHARED checkout used by multiple agent sessions.{_dir_note}\n")
+            return 2
     amend_why = None
     try:
         amend_why = _amend_verdict(cmd, scrubbed, run_dir)
