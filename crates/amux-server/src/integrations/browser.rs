@@ -122,6 +122,70 @@ pub struct ImportedChromeProfile {
     pub bytes: u64,
 }
 
+/// Turn an io error from the Chrome-profile import into something a person can
+/// act on (AF-502).
+///
+/// Every failure in this path used to surface as a bare `std::io::Error`: no
+/// paths, no statement of what was being attempted, no remedy. Measured in a
+/// live onboarding session (2026-09-04) — a user clicked "auto profile / import
+/// on first use", got a one-line error, and neither they NOR the person walking
+/// them through it could read it. The session's own words were "Error Chrome
+/// for Vanos rename" and then "What just happened?"
+///
+/// The errno is the discriminator and it is the part nobody looks up.
+/// PermissionDenied here is almost always macOS TCC rather than file modes:
+/// Chrome's user-data-dir lives under ~/Library/Application Support, which is
+/// protected, so the server needs Full Disk Access to read it. That is a
+/// two-click fix and it is invisible from the error alone.
+///
+/// Pure so the wording is testable without a filesystem.
+pub fn import_failure_message(
+    step: &str,
+    from: &Path,
+    to: &Path,
+    kind: std::io::ErrorKind,
+    raw: &str,
+) -> String {
+    let cause = match kind {
+        std::io::ErrorKind::PermissionDenied => {
+            "macOS is almost certainly refusing the read rather than the file modes being \
+             wrong: Chrome's profile lives under ~/Library/Application Support, which is \
+             TCC-protected. Give the amux server Full Disk Access — System Settings > \
+             Privacy & Security > Full Disk Access — then retry. Nothing needs to be \
+             deleted or recreated."
+        }
+        std::io::ErrorKind::NotFound => {
+            "the source profile is not where Chrome usually keeps it. Check the profile \
+             name against the directories in your Chrome user-data-dir; a display name in \
+             Chrome's profile menu is NOT the directory name (`Profile 3`, `Default`)."
+        }
+        std::io::ErrorKind::AlreadyExists => {
+            "something already occupies the destination. amux treats a complete \
+             destination as a concurrent importer winning the race, so reaching here means \
+             the destination exists but is not a usable directory. Move it aside and retry."
+        }
+        std::io::ErrorKind::StorageFull => {
+            "the disk is full. A profile import copies the whole profile, which is \
+             routinely hundreds of megabytes."
+        }
+        _ if raw.contains("Cross-device") || raw.contains("os error 18") => {
+            "the staging directory and the destination are on different filesystems, so \
+             the atomic rename cannot work. This happens when ~/.amux is a symlink onto \
+             another volume."
+        }
+        _ => {
+            "no known-cause mapping for this errno — the raw error is the whole of what \
+             amux knows, and that is worth reporting."
+        }
+    };
+    format!(
+        "Chrome profile import failed during {step}.\n  from: {}\n  to:   {}\n  error: {raw}\n\n\
+         Most likely: {cause}",
+        from.display(),
+        to.display()
+    )
+}
+
 /// Import a human Chrome profile into an isolated amux user-data-dir.
 ///
 /// Chrome's profile lock belongs to the whole user-data-dir, not the selected
@@ -180,8 +244,31 @@ pub fn import_chrome_profile(
     let (files, bytes) = match copied {
         Ok(v) => v,
         Err(e) => {
+            // AF-502: the COPY is where a fresh Mac actually fails, and it
+            // failed with a bare io error. Chrome's user-data-dir is under
+            // ~/Library/Application Support, which is TCC-protected, so reading
+            // it without Full Disk Access is a PermissionDenied that says
+            // nothing about permissions in the sense a person can act on.
+            let io_kind = e.downcast_ref::<std::io::Error>().map(std::io::Error::kind);
+            let raw = format!("{e:#}");
             let _ = std::fs::remove_dir_all(&temp);
-            return Err(e);
+            tracing::warn!(
+                profile = %name, step = "copy", kind = ?io_kind, error = %raw,
+                source = %source.display(), temp = %temp.display(),
+                "browser: Chrome profile import failed (AF-502)"
+            );
+            let Some(kind) = io_kind else {
+                // Not an io error at all (a bad Local State JSON, say). Keep it
+                // as it is rather than dressing it in a filesystem explanation
+                // that would send the reader at the wrong thing.
+                return Err(e.context(format!(
+                    "Chrome profile import failed while copying {} into place",
+                    source.display()
+                )));
+            };
+            return Err(anyhow::anyhow!(import_failure_message(
+                "the copy of the source profile", &source, &temp, kind, &raw
+            )));
         }
     };
     match std::fs::rename(&temp, &destination) {
@@ -193,8 +280,17 @@ pub fn import_chrome_profile(
             return Ok(None);
         }
         Err(e) => {
+            let kind = e.kind();
+            let raw = e.to_string();
             let _ = std::fs::remove_dir_all(&temp);
-            return Err(e.into());
+            tracing::warn!(
+                profile = %name, step = "rename", kind = ?kind, error = %raw,
+                temp = %temp.display(), destination = %destination.display(),
+                "browser: Chrome profile import failed (AF-502)"
+            );
+            return Err(anyhow::anyhow!(import_failure_message(
+                "the final rename into place", &temp, &destination, kind, &raw
+            )));
         }
     }
     // This is selected login state, not disposable scratch. Registering it
@@ -3822,6 +3918,100 @@ mod identify_tests {
                 "raising a window by pid is implemented on macOS only"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod import_error_tests {
+    use super::*;
+
+    /// THE CELL THIS EXISTS FOR. A user clicked "import on first use", got one
+    /// line, and neither they nor the person walking them through it could read
+    /// it. Every message from this path must now name what was attempted, both
+    /// paths, and a remedy.
+    #[test]
+    fn every_import_failure_names_the_step_both_paths_and_a_remedy() {
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::AlreadyExists,
+            std::io::ErrorKind::StorageFull,
+            std::io::ErrorKind::Other,
+        ] {
+            let m = import_failure_message(
+                "the final rename into place",
+                Path::new("/from/here"),
+                Path::new("/to/there"),
+                kind,
+                "some raw error",
+            );
+            assert!(m.contains("the final rename into place"), "{kind:?}: no step: {m}");
+            assert!(m.contains("/from/here"), "{kind:?}: no source path: {m}");
+            assert!(m.contains("/to/there"), "{kind:?}: no destination path: {m}");
+            assert!(m.contains("some raw error"), "{kind:?}: the raw error was swallowed: {m}");
+            assert!(m.contains("Most likely:"), "{kind:?}: no cause offered: {m}");
+        }
+    }
+
+    /// The remedy that actually resolves the common case on a fresh Mac, and the
+    /// one nobody guesses from "Permission denied": Chrome's profile lives under
+    /// ~/Library/Application Support, which is TCC-protected, so the server needs
+    /// Full Disk Access. Two clicks, invisible from the errno.
+    #[test]
+    fn a_permission_error_points_at_full_disk_access_not_at_file_modes() {
+        let m = import_failure_message(
+            "the copy of the source profile",
+            Path::new("/src"),
+            Path::new("/dst"),
+            std::io::ErrorKind::PermissionDenied,
+            "Permission denied (os error 13)",
+        );
+        assert!(m.contains("Full Disk Access"), "{m}");
+        assert!(m.contains("Privacy & Security"), "{m}");
+        assert!(
+            m.contains("Nothing needs to be deleted or recreated"),
+            "the reader is left thinking they must start over: {m}"
+        );
+    }
+
+    /// Each errno gets its OWN cause. A single generic sentence would be exactly
+    /// as green against this suite's first cell while telling every reader the
+    /// same useless thing.
+    #[test]
+    fn different_errnos_produce_different_causes() {
+        let mk = |k, raw| {
+            import_failure_message("s", Path::new("/a"), Path::new("/b"), k, raw)
+        };
+        let perm = mk(std::io::ErrorKind::PermissionDenied, "x");
+        let nf = mk(std::io::ErrorKind::NotFound, "x");
+        let ae = mk(std::io::ErrorKind::AlreadyExists, "x");
+        let full = mk(std::io::ErrorKind::StorageFull, "x");
+        let xdev = mk(std::io::ErrorKind::Other, "Cross-device link (os error 18)");
+        let unknown = mk(std::io::ErrorKind::Other, "something nobody mapped");
+        let all = [&perm, &nf, &ae, &full, &xdev, &unknown];
+        for (i, a) in all.iter().enumerate() {
+            for b in all.iter().skip(i + 1) {
+                assert_ne!(a, b, "two errnos produced the same message");
+            }
+        }
+        assert!(nf.contains("is NOT the directory name"), "{nf}");
+        assert!(xdev.contains("different filesystems"), "{xdev}");
+    }
+
+    /// An unmapped errno says it is unmapped. Presenting a guess as the likely
+    /// cause is how someone spends an hour on the wrong thing; saying "this is
+    /// all amux knows, and that is worth reporting" costs nothing and is true.
+    #[test]
+    fn an_unmapped_errno_admits_it_rather_than_guessing() {
+        let m = import_failure_message(
+            "s",
+            Path::new("/a"),
+            Path::new("/b"),
+            std::io::ErrorKind::Other,
+            "errno 12345",
+        );
+        assert!(m.contains("no known-cause mapping"), "{m}");
+        assert!(m.contains("errno 12345"), "{m}");
     }
 }
 
