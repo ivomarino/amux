@@ -3741,9 +3741,22 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
     // a stale pickup (AMUX-3052). It reads the token right after PICKUP_ANCHOR,
     // which is why the id must stay the FIRST thing after it.
     let mut prompt = format!(
+        // AF-506: this line used to say "if blocked on an owner decision, move to
+        // review". The REVIEW GATE then refuses that card, because it asks you to
+        // ack "Implemented and self-tested" / "Diff / PR is up", which a card you
+        // are parking or routing away cannot truthfully claim. So the dispatcher
+        // sent people somewhere its own gate would turn them back from: two
+        // components disagreeing about the same fact, with neither individually
+        // wrong. Reported by `backend`, hit live on MI-4155.
+        //
+        // Both real cases are named instead, because they have different exits
+        // and conflating them is what produced the loop.
         "{PICKUP_ANCHOR}{} — work it now. Card text below is historical, \
-         not a live message. If blocked on an owner decision, move to review (not todo, \
-         which re-queues after a brief cooldown):\n{}{}",
+         not a live message. If this card's WORK belongs to another lane, hand it over: \
+         `amux board assign <ID> <lane> && amux board todo <ID>` — it dispatches to THEM, \
+         not back to you. If it needs a decision only Ethan can make, `amux board needsyou \
+         <ID>` with the question. Do NOT move it to review to park it: the review gate asks \
+         you to attest work you have not done, and will refuse.\n{}{}",
         row.id,
         quoted_card_text(&row.title, &row.id),
         qnote
