@@ -81,6 +81,77 @@ async fn get_json(path: &str) -> (u16, Option<Value>) {
     (status, serde_json::from_slice(&body).ok())
 }
 
+/// THE WINDOW PARAMETER IS `since_h` ACROSS THE FAMILY, and one probe did not
+/// speak it (AF-482).
+///
+/// `/api/debug/duplicate-deliveries` read `hours` alone. `since_h` is what
+/// CLAUDE.md's observability table documents and what /api/logs/analyze,
+/// /api/logs/stats, /api/logs/writers, /api/debug/sse, the git-guard and the
+/// messages probes all take, so a caller reaching for the convention got the
+/// 24h default with no sign of it. Measured 2026-09-04: since_h=24, 72, 168 and
+/// 720 all returned `total: 7` while 26 duplicate events existed.
+///
+/// THE CHECK IS THAT THE WINDOW MOVES, not that a parameter name appears. A
+/// probe that echoes `hours` and ignores it would pass a name check and is
+/// exactly the bug. Two calls, two very different windows, and the reported
+/// window must differ; a probe that reports no window at all is out of scope
+/// rather than failing, because most diagnostics have none.
+///
+/// Enumerated from ROUTE_TABLE like the cell below it, so a new diagnostic that
+/// invents a third spelling is caught the day it mounts.
+#[tokio::test]
+async fn a_diagnostic_that_reports_a_window_honours_since_h() {
+    let paths = diagnostic_paths();
+    assert!(
+        paths.len() >= 15,
+        "the ROUTE_TABLE walk found only {} routes; a green result would mean nothing",
+        paths.len()
+    );
+
+    // The field a probe uses to report the window it actually used. `hours` is
+    // included deliberately: the offender echoed it truthfully while ignoring
+    // the request, and a true field that reads as agreement is the trap.
+    fn reported_window(v: &Value) -> Option<f64> {
+        for k in ["since_h", "hours", "window_h", "actual_window_h"] {
+            if let Some(n) = v.get(k).and_then(|x| x.as_f64()) {
+                return Some(n);
+            }
+        }
+        None
+    }
+
+    let mut offenders: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+    for p in &paths {
+        let (_s1, narrow) = get_json(&format!("{p}?since_h=1")).await;
+        let (_s2, wide) = get_json(&format!("{p}?since_h=500")).await;
+        let (Some(a), Some(b)) = (narrow, wide) else { continue };
+        let (Some(wa), Some(wb)) = (reported_window(&a), reported_window(&b)) else {
+            // Reports no window. Nothing to honour, nothing to check.
+            continue;
+        };
+        checked += 1;
+        if (wa - wb).abs() < f64::EPSILON {
+            offenders.push(format!(
+                "{p} — reports a window but since_h=1 and since_h=500 both yield {wa}"
+            ));
+        }
+    }
+
+    // POSITIVE CONTROL, and it is the whole reason this cell is not vacuous: if
+    // no diagnostic reports a window, every probe is skipped and the loop above
+    // asserts nothing. The offender itself is one of them, so this must hold.
+    assert!(
+        checked >= 2,
+        "only {checked} diagnostic(s) reported a window at all, so this cell tested          almost nothing. Either the extractor regressed or the window fields were renamed."
+    );
+    assert!(
+        offenders.is_empty(),
+        "a diagnostic reports a window it does not take from `since_h`, so a caller \n         following the fleet convention silently gets the default (AF-482):\n  {}",
+        offenders.join("\n  ")
+    );
+}
+
 /// THE CHECK. Every argument-free diagnostic GET publishes `measured` and
 /// `n_considered`.
 #[tokio::test]

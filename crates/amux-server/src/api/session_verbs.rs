@@ -4826,6 +4826,35 @@ fn gemini_composer_state(raw_lines: &[&str], stripped: &[String]) -> Option<Comp
     Some(ComposerState::Typed(plain))
 }
 
+/// Codex's model/path line is footer chrome, not a continuation of the input.
+///
+/// The current TUI draws no box rule between its composer and this footer, so
+/// the generic continuation scan cannot stop on geometry as it does for Claude
+/// Code. Match the footer's STRUCTURE and styling instead of any model/version:
+/// Codex dims only the middle-dot separator and leaves the model, effort, and
+/// working directory normally coloured. Requiring that raw ANSI evidence is
+/// deliberate. If a future Codex release changes the chrome, this fails toward
+/// `Typed` (a visible, unconfirmed send) rather than hiding real user input and
+/// falsely claiming that it was submitted.
+fn codex_model_footer_chrome(raw: &str, stripped: &str) -> bool {
+    let text = stripped.trim();
+    let Some((identity, location)) = text.rsplit_once('\u{b7}') else {
+        return false;
+    };
+    let location = location.trim();
+    if identity.trim().is_empty()
+        || !(location == "~" || location.starts_with("~/") || location.starts_with('/'))
+    {
+        return false;
+    }
+
+    let (plain, dim) = dim_mask(raw);
+    let plain_squashed: String = plain.split_whitespace().collect();
+    let expected_plain: String = format!("{identity}{location}").split_whitespace().collect();
+    let dim_squashed: String = dim.split_whitespace().collect();
+    dim_squashed == "\u{b7}" && plain_squashed == expected_plain
+}
+
 pub(crate) fn composer_state(raw_frame: &str) -> ComposerState {
     let clean = strip_ansi(raw_frame);
     // The manager view owns the keyboard: its own status bar says so. Positive
@@ -4879,7 +4908,9 @@ pub(crate) fn composer_state(raw_frame: &str) -> ComposerState {
     let mut block: Vec<&str> = vec![raw_lines[idx]];
     for (i, s) in stripped.iter().enumerate().skip(idx + 1) {
         let t = s.trim();
-        if matches!(t.chars().next(), Some('\u{2500}') | Some('\u{23f5}')) {
+        if matches!(t.chars().next(), Some('\u{2500}') | Some('\u{23f5}'))
+            || codex_model_footer_chrome(raw_lines[i], s)
+        {
             break;
         }
         block.push(raw_lines[i]);
@@ -11802,15 +11833,45 @@ fn json_str_after(blob: &str, key: &str) -> Option<String> {
 }
 
 
-/// GET /api/debug/duplicate-deliveries?hours=24 — every lane that received the
-/// SAME text twice inside the detector's window, newest first.
+/// GET /api/debug/duplicate-deliveries?since_h=24 — every lane that received
+/// the SAME text twice inside the detector's window, newest first.
 ///
 /// Reads `session_events` rows the detector writes, so it reports what actually
 /// happened rather than re-deriving a heuristic. `window_ms` is echoed so a
 /// reader knows what "duplicate" meant without going to the source.
+///
+/// `since_h` IS THE FLEET CONVENTION AND THIS ENDPOINT DID NOT SPEAK IT
+/// (AF-482). Every other diagnostic takes `since_h` — /api/logs/analyze,
+/// /api/logs/stats, /api/logs/writers, /api/debug/sse, the git-guard and
+/// messages probes, and CLAUDE.md's observability table lists them that way.
+/// This one took `hours` alone, and an unrecognised parameter fell back to the
+/// 24h default silently.
+///
+/// Measured 2026-09-04, asking this endpoint for a month:
+///     since_h=24 -> total 7      since_h=168 -> total 7
+///     since_h=72 -> total 7      since_h=720 -> total 7
+/// while 26 duplicate events existed. The number never moved because the
+/// parameter was never read, and the payload said `measured: true` beside it.
+/// This is the one endpoint a frustration sweep is told to consult for "was
+/// that a double delivery", which is always a question about a SPECIFIC old
+/// message, so a silently-24h window is wrong exactly when it is used.
+///
+/// Both names are accepted, `since_h` wins, and the response says WHICH ONE
+/// answered. Echoing the resolved window is not enough on its own: `hours: 24`
+/// in a reply to `since_h=720` is a true field that reads as agreement.
 async fn debug_duplicate_deliveries(State(state): State<AppState>, RawQuery(q): RawQuery) -> Response {
     let params = parse_qs(q.as_deref().unwrap_or(""));
-    let hours: f64 = qs_get(&params, "hours").and_then(|v| v.parse().ok()).unwrap_or(24.0);
+    let (hours, window_param) = match (
+        qs_get(&params, "since_h").and_then(|v| v.parse::<f64>().ok()),
+        qs_get(&params, "hours").and_then(|v| v.parse::<f64>().ok()),
+    ) {
+        (Some(h), _) => (h, "since_h"),
+        (None, Some(h)) => (h, "hours"),
+        (None, None) => (24.0, "default"),
+    };
+    // Same bounds as `since_h_of` in request_log.rs, so the family agrees on
+    // what an out-of-range window does instead of each probe choosing.
+    let hours = hours.clamp(0.01, 24.0 * 365.0);
     let since = now_f64() - hours * 3600.0;
     let conn = match state.store.read() {
         Ok(c) => c,
@@ -11845,6 +11906,11 @@ async fn debug_duplicate_deliveries(State(state): State<AppState>, RawQuery(q): 
     j200(crate::api::measured::measured(
         json!({
         "hours": hours,
+        // WHICH PARAMETER ANSWERED, because "hours: 24" alone cannot tell a
+        // caller who asked for 720 that their parameter was never read. A
+        // reader who typos `since_h` on any other probe would get 24h here and
+        // no way to see it (AF-482).
+        "window_param": window_param,
         "window_ms": DUP_DELIVERY_WINDOW_MS,
         "total": rows.len(),
         "by_session": by_session,
@@ -21870,6 +21936,14 @@ mod send_retry_reporting_tests {
 mod composer_state_tests {
     use super::*;
 
+    /// `amux-testing-e2e`, captured live 2026-09-04 while the lane's native
+    /// stop hook and Codex rollout both said idle. The dashboard nevertheless
+    /// showed `UNSUBMITTED TEXT` with preview `gpt-5.6-solxhigh~/Dev/amux`:
+    /// `composer_state` correctly put the dim prompt hint in `Placeholder`,
+    /// then incorrectly folded Codex's normal-colour model/path footer into
+    /// the same composer block and promoted the whole thing to `Typed`.
+    const LIVE_CODEX_IDLE: &str = "\u{1b}[1m\u{203a}\u{1b}[0m \u{1b}[2mAsk Codex to do anything\u{1b}[0m\n\n  \u{1b}[38;2;246;226;183mgpt-5.6-sol xhigh\u{1b}[2m\u{1b}[39m \u{b7} \u{1b}[0m\u{1b}[38;2;171;223;167m~/Dev/amux\u{1b}[39m\n";
+
     /// `backend`, captured 2026-08-09 while it was being reported as "holding
     /// unsubmitted text for hours". The composer is EMPTY; `continue with the
     /// queue` is Claude Code's dim suggestion. Three people pressed Enter,
@@ -22038,6 +22112,28 @@ mod composer_state_tests {
             Some("continuewiththequeue"),
             "a pre-stripped frame re-creates the blindness — callers MUST pass the raw capture"
         );
+    }
+
+    #[test]
+    fn a_codex_model_footer_is_chrome_not_unsubmitted_text() {
+        assert_eq!(
+            composer_state(LIVE_CODEX_IDLE),
+            ComposerState::Placeholder("AskCodextodoanything".into())
+        );
+        assert_eq!(
+            composer_state(LIVE_CODEX_IDLE).typed(),
+            None,
+            "an idle Codex prompt must not inherit its model/path footer as typed input"
+        );
+
+        // CONTROL: only Codex's dim placeholder is replaced. Ordinary typed
+        // text in the same live frame must remain pending; otherwise a send
+        // could falsely claim success while the user's command is still there.
+        let typed = LIVE_CODEX_IDLE.replace(
+            "\u{1b}[2mAsk Codex to do anything\u{1b}[0m",
+            "ship the current task",
+        );
+        assert_eq!(composer_state(&typed).typed(), Some("shipthecurrenttask"));
     }
 
     #[test]
