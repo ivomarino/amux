@@ -114,12 +114,13 @@ median age is now the highest of any resting queue in this file.
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-09-04
-OCCURRENCES: 4
-LAST_SEEN_NOTE: re-measured 2026-09-01, and it is GROWING
-SIGNALS: board-resting:*:needsyou
-FIX_SITE: board status gate; `needsyou` requires a typed `--ask`
-CARDS: AF-318
+LAST_SEEN: 2026-09-05
+OCCURRENCES: 5
+LAST_SEEN_NOTE: re-measured 2026-09-05 in BOTH repos for the first time; still GROWING
+SIGNALS: board-resting:*:needsyou, cross-lane-repeat
+FIX_SITE: board status gate (`needsyou` requires a typed `--ask`) AND an owner-side
+producer — nothing on either board tells the human he is the blocker
+CARDS: AF-318, AF-510
 EVIDENCE: 445 cards in `needsyou`, median 15d, and 51% match no ask-shape at all.
 Their titles are plain engineering work. The twenty that genuinely need Ethan
 are indistinguishable inside them.
@@ -150,6 +151,29 @@ keeps taking cards that ask nobody anything.
 Re-measured 2026-09-04: Mixpeek `needsyou` is 306 cards, median 16.1 days, 66%
 over a week, oldest 64.5 days, +105 against 201 seven days ago. Growth is ~15/day
 against ~13/day on 2026-09-01, so the gate still has not reached that board.
+
+Re-measured 2026-09-05, and this is the first pass that measured BOTH SIDES, which
+changes what the theme is about. Mixpeek `needsyou` is 323 cards, median 16.1 days,
+66% over a week, oldest 65.5 days, +109 against 214 seven days ago. amux is 506
+cards, median 5.6 days, p90 20.5, 179 of them over a week old. Roughly 829 cards
+across the fleet name a human as the blocker.
+
+THE SECOND FIX SITE, found by the 10am sweep the same day and not visible from the
+card counts alone: nothing on EITHER board tells that human. `board_drive.rs:4017`
+sends the only `needsyou` reminder to `target: session.to_string()` — the LANE that
+filed the ask — while its own text says "waiting on the HUMAN, not the lane". The
+comment at `board_drive.rs:4763` says AF-465's remaining split "waits on confirming
+that producer"; confirmed this pass that no such producer exists (180 schedules, 13
+mention "digest", none carries needs:you; no push/email emitter; AC-413 says the
+same). So the queue has two independent leaks — a gate that lets untyped asks in,
+and no channel that lets real ones out — and the file previously only tracked the
+first. AF-510 carries the second.
+
+What made this visible: Ethan sent "whats the status?" five times in three days to
+primis and tubescience. primis had 8 of 9 non-terminal cards in `needsyou` aged
+40-120h; tubescience 42 non-terminal, mostly blocked/needsyou at 70-259h. The
+answer to his question was "it is waiting on you", and asking a lane was the only
+way to find that out.
 
 ## Nudging is the dominant channel and the loop has no negative feedback
 SCOPE: both
