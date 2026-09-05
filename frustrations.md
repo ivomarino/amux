@@ -3249,3 +3249,21 @@ COST: One refused commit and about 5 minutes re-reading all nine staged files by
 FIX: AMUX-3249. Attribute Codex tool writes to the active agent/session, or make the
   guard distinguish absent agent edit records from affirmative peer ownership so a
   missing producer cannot be rendered as evidence that a peer authored the diff.
+
+## Delegated worker requests held the requester's WIP instead of becoming task dependencies
+AREA: scheduler
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-05
+SESSION: amux
+CARD: AMUX-4153
+SYMPTOM: `amux board request` created a durable child task and terminal callback,
+ but left the requester's active parent in `doing` with no `depends_on` edge. The
+ requester therefore occupied its WIP slot and appeared idle until the peer finished.
+COST: Delegation serialized work that should have run concurrently, hid independent
+ ready work from the requester, and left the board without a durable record of why
+ the requester was waiting.
+FIX: ccb37879 atomically adds the delegated child to the parent task's dependencies,
+ requeues the parent to `todo` to release WIP, and lets the existing ready frontier
+ wake it when the child closes. `amux::task_dependency` now logs a verdict for every
+ linked, standalone, ambiguous, invalid-parent, or cycle-refused peer request.
