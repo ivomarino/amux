@@ -3267,3 +3267,41 @@ FIX: ccb37879 atomically adds the delegated child to the parent task's dependenc
  requeues the parent to `todo` to release WIP, and lets the existing ready frontier
  wake it when the child closes. `amux::task_dependency` now logs a verdict for every
  linked, standalone, ambiguous, invalid-parent, or cycle-refused peer request.
+
+## Usage resets opened the clock gate after delivery had already been skipped
+AREA: scheduler
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-05
+SESSION: amux
+CARD: AMUX-4154
+SYMPTOM: A Claude worker with a known, elapsed reset remained protocol-level
+ `RateLimited` until its first subsequent prompt, while the legacy lane sweep could
+ roll a stale clock banner forward to the next day. The scheduler also recovered
+ rate-limited workers after command delivery and planning had already consumed a
+ stale snapshot, leaving the worker idle for another tick.
+COST: Workers could remain visibly idle after their provider said usage was
+ available, and queued work needed a manual interaction or an extra scheduler cycle
+ before it continued.
+FIX: dd57e1d5 makes an elapsed reported reset immediately deliverable, recovers
+ protocol workers before pumping and planning, and preserves the original reset
+ through stale terminal banners. `amux::usage_reset` emits `worker_recovered`,
+ `delivery_released`, and `delivery_gate_open` verdicts at each release boundary.
+
+## Settings collapsed a multi-provider fleet into one Claude quota bar
+AREA: observability
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-05
+SESSION: amux
+CARD: AMUX-4154
+SYMPTOM: The Settings usage panel exposed only Claude's two coarse percentages even
+ though the built-in registry also supports Codex, Gemini, and Ollama. Codex's API
+ supplies named buckets, exact reset times, durations, credits, and plan metadata,
+ but none of those facts reached the operator.
+COST: Operators could not tell which provider constrained a mixed fleet, how long a
+ limit would last, or whether another provider was unmetered or simply unmeasured.
+FIX: ecbf4daf derives the Settings rows from the full built-in provider registry,
+ retains every provider-reported window and exact reset, distinguishes unavailable
+ quota APIs from unlimited local inference, and logs `amux::usage_probe` verdicts
+ whenever a probe succeeds or cannot report its quota.
