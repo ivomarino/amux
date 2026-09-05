@@ -1003,6 +1003,7 @@ function showConnHistory() {
 
 // ═══════ DEVICE NAME / CLOUD IDENTITY ═══════
 let _cloudEmail = '';
+let _localMemberEmail = '';
 let _gatewayOrgs = [];
 
 async function _initIdentity() {
@@ -1019,7 +1020,8 @@ async function _initIdentity() {
     }
     if (!r.ok) return;
     const d = await r.json();
-    _cloudEmail = d.email || '';
+    _cloudEmail = d.is_cloud ? (d.email || '') : '';
+    _localMemberEmail = d.is_local_member ? (d.email || '') : '';
     if (!d.has_api_key) {
       if (d.is_cloud) {
         // Blocking modal for cloud users — must set key before using the app
@@ -1380,10 +1382,10 @@ function _applyIdentityToSettings() {
   const label = document.getElementById('settings-device-label');
   const row = document.getElementById('settings-device-row');
   const cur = document.getElementById('settings-device-current');
-  if (_cloudEmail) {
-    if (label) label.textContent = 'Account';
+  if (_cloudEmail || _localMemberEmail) {
+    if (label) label.textContent = _cloudEmail ? 'Account' : 'Member';
     if (row) row.style.display = 'none';
-    if (cur) cur.textContent = _cloudEmail;
+    if (cur) cur.textContent = _cloudEmail || _localMemberEmail;
   } else {
     if (label) label.textContent = 'Device';
     if (row) row.style.display = '';
@@ -1394,7 +1396,7 @@ _initIdentity();
 _renderInstanceSwitcher();
 
 function _getDeviceName() {
-  if (_cloudEmail) return _cloudEmail;
+  if (_cloudEmail || _localMemberEmail) return _cloudEmail || _localMemberEmail;
   const custom = localStorage.getItem('amux_device_name');
   if (custom) return custom;
   const ua = navigator.userAgent;
@@ -6189,7 +6191,7 @@ async function doSend(name, text) {
   // Slash commands (e.g. /clear, /compact) must be sent verbatim — no timestamp prefix
   const isSlashCmd = /^\/[a-z]/.test(text.trim());
   amuxTrack('message_sent', { session: name, is_slash: isSlashCmd, cmd: isSlashCmd ? text.trim().split(/\s+/)[0] : null, length: text.length });
-  const payload = isSlashCmd ? text : _stampSendTime(text, new Date(), _cloudEmail);
+  const payload = isSlashCmd ? text : _stampSendTime(text, new Date(), _cloudEmail || _localMemberEmail);
   // One msg_id per logical send, reused verbatim by the offline-queue replay:
   // the server dedups on it, so a retry after a lost response (e.g. the
   // server restarted mid-request AFTER the keys landed) can't deliver twice.
@@ -8928,7 +8930,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.813';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.814';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -30752,7 +30754,7 @@ function toggleSettings() {
     if (zd) zd.textContent = _zoomLevel + '%';
     // Apply cloud identity (email) or device name
     _applyIdentityToSettings();
-    if (!_cloudEmail) {
+    if (!_cloudEmail && !_localMemberEmail) {
       // Show effective device name and populate override input
       const effective = _getDeviceName();
       const custom = localStorage.getItem('amux_device_name') || '';
@@ -31316,22 +31318,31 @@ async function loadTeamSection() {
       list.innerHTML = html || '<span style="color:var(--dim);font-size:0.75rem;">No members yet — invite someone!</span>';
     } else {
       // Local mode: use container-level org
-      const [orgRes, membersRes] = await Promise.all([
-        fetch('/api/org'), fetch('/api/org/members')
+      const [orgRes, membersRes, invitesRes] = await Promise.all([
+        fetch('/api/org'), fetch('/api/org/members'), fetch('/api/org/invites')
       ]);
       const org = await orgRes.json();
       const members = await membersRes.json();
+      const invites = invitesRes.ok ? await invitesRes.json() : [];
       const nameEl = document.getElementById('settings-org-name');
       if (nameEl && nameEl !== document.activeElement) nameEl.value = org.name || '';
-      if (!members.length) {
-        list.innerHTML = '<span style="color:var(--dim);font-size:0.75rem;">No members yet — invite someone!</span>';
-      } else {
-        list.innerHTML = members.map(m => `
+      let html = '';
+      if (members.length) {
+        html += members.map(m => `
           <div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;border-bottom:1px solid var(--border);">
             <span>${esc(m.name || m.email)}</span>
             <span style="color:var(--dim);font-size:0.7rem;">${m.role}</span>
           </div>`).join('');
       }
+      if (invites.length) {
+        html += '<div style="margin-top:4px;font-size:0.68rem;color:var(--dim);">Pending invites:</div>';
+        html += invites.map(inv => `
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:2px 0;">
+            <span style="font-size:0.72rem;color:var(--dim);">${esc(inv.email || 'Anyone with link')} · expires ${new Date(inv.expires_at*1000).toLocaleDateString()}</span>
+            <button onclick="deleteInvite('${esc(inv.token)}')" style="background:none;border:none;color:var(--dim);cursor:pointer;font-size:0.65rem;">revoke</button>
+          </div>`).join('');
+      }
+      list.innerHTML = html || '<span style="color:var(--dim);font-size:0.75rem;">No members yet — invite someone!</span>';
     }
   } catch(e) {}
 }
@@ -31353,8 +31364,17 @@ async function saveOrgName(val) {
 
 async function openTeamInvite() {
   closeSettings();
-  const res = await fetch('/api/org/invites', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({})});
-  const data = await res.json();
+  const email = await showPrompt('Invite by email (optional)', 'person@example.com');
+  if (email === null) return;
+  let res;
+  try {
+    res = await fetch('/api/org/invites', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email})});
+  } catch (e) {
+    showAlert('Failed to create invite: network error');
+    return;
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) { showAlert('Failed to create invite: ' + (data.error || 'HTTP ' + res.status)); return; }
   if (!data.url) { showAlert('Failed to create invite: ' + (data.error || 'unknown error')); return; }
   // Show modal with copyable link
   const modal = document.createElement('div');
@@ -31363,7 +31383,7 @@ async function openTeamInvite() {
     <h3 style="margin:0 0 8px;font-size:1rem;">Invite to workspace</h3>
     <p style="color:var(--dim);font-size:0.82rem;margin:0 0 14px;">Share this link. It expires in 7 days.</p>
     <div style="display:flex;gap:8px;">
-      <input id="invite-link-input" type="text" value="${data.url}" readonly
+      <input id="invite-link-input" type="text" value="${esc(data.url)}" readonly
         style="flex:1;padding:8px 10px;border-radius:6px;border:1px solid var(--border,#333);background:var(--bg,#111);color:inherit;font-size:0.8rem;min-width:0;">
       <button onclick="(function(){var el=document.getElementById('invite-link-input');el.select();navigator.clipboard.writeText(el.value).then(()=>{this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500)})}).call(this)"
         style="padding:8px 14px;border-radius:6px;background:var(--accent,#a78bfa);color:#000;border:none;cursor:pointer;font-weight:600;white-space:nowrap;">Copy</button>

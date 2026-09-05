@@ -907,12 +907,17 @@ test('settings_team_section', async ({ page, request }, testInfo) => {
   await openSettings(page);
   await expect(page.locator('#settings-org-name')).toHaveValue('E2E Workspace');
 
-  // "+ Invite" creates a real invite and shows the shareable link modal.
+  // "+ Invite" first offers optional email binding, then creates a real
+  // invite and shows the shareable link modal.
+  await page.locator('#settings-team-section button', { hasText: '+ Invite' }).click();
+  const emailPrompt = page.locator('#modal-prompt-input');
+  await expect(emailPrompt).toBeVisible();
+  await emailPrompt.fill('invitee@example.com');
   const [invRes] = await Promise.all([
     page.waitForResponse(
       (r) => r.url().endsWith('/api/org/invites') && r.request().method() === 'POST',
     ),
-    page.locator('#settings-team-section button', { hasText: '+ Invite' }).click(),
+    page.locator('#modal-btns button', { hasText: 'OK' }).click(),
   ]);
   expect(invRes.status()).toBe(201); // create_invite answers 201 CREATED
   const linkInput = page.locator('#invite-link-input');

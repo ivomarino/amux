@@ -3230,3 +3230,22 @@ COST: The six-case focused matrix had passed, but the first full descendant CI
 FIX: The parity test now scrolls and measures the final Focus action inside the
  same synchronous render snapshot. It still proves overflow, scrollability and
  viewport reachability while eliminating the cross-rerender locator lifetime.
+
+## Staged-guard attributed this Codex task's files to two peer lanes and blocked its commit
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-05
+SESSION: amux (Codex agent; no $AMUX_SESSION in env)
+CARD: AMUX-3249
+SYMPTOM: After implementing and browser-testing local multiplayer invites, the commit
+  guard attributed the staged files to `amux-cloud` and `amux-frustrations` and refused
+  the commit even though every staged hunk was produced by this task. The shell had an
+  empty $AMUX_SESSION, but its tmux name resolved to `amux-amux` and the installed
+  MR-43 prepare-commit hook already contained that fallback, so the commit stamp and
+  the edit-record ownership used by the guard still disagreed.
+COST: One refused commit and about 5 minutes re-reading all nine staged files by hand
+  before the documented AMUX_VERIFIED_SOLO override could be used honestly.
+FIX: AMUX-3249. Attribute Codex tool writes to the active agent/session, or make the
+  guard distinguish absent agent edit records from affirmative peer ownership so a
+  missing producer cannot be rendered as evidence that a peer authored the diff.

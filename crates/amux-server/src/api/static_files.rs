@@ -3,14 +3,16 @@
 //! Files come from amux-dashboard's `static/` at compile time. index.html
 //! gets its AMUX-BOOTSTRAP block substituted at serve time — the same
 //! values the Python server injects (amux-server.py:65679), same trust
-//! model: the dashboard shell + auth token are served unauthenticated on
-//! the LAN, exactly as the Python server does today. Cloud deployments put
-//! a gateway in front of both. Parity, not a new decision.
+//! model: the owner's dashboard shell + auth token are served unauthenticated
+//! on the LAN, exactly as the Python server does today. A browser carrying a
+//! verified local-member cookie gets the shell WITHOUT the owner bearer and
+//! continues through that revocable cookie. Cloud deployments put a gateway
+//! in front of both.
 
 use super::AppState;
 use amux_dashboard::DashboardAssets;
 use axum::extract::State;
-use axum::http::{header, StatusCode, Uri};
+use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 use sha2::Digest;
@@ -90,12 +92,13 @@ fn legacy_port_of(l: Legacy) -> Option<u16> {
     l.map(|axum::Extension(crate::legacy_port::OnLegacyListener(p))| p)
 }
 
-async fn index(State(state): State<AppState>, legacy: Legacy) -> Response {
-    serve_index(&state, legacy_port_of(legacy))
+async fn index(State(state): State<AppState>, headers: HeaderMap, legacy: Legacy) -> Response {
+    serve_index(&state, legacy_port_of(legacy), super::org::is_verified_local_member(&headers))
 }
 
 async fn serve_path(
     State(state): State<AppState>,
+    headers: HeaderMap,
     method: axum::http::Method,
     uri: Uri,
     legacy: Legacy,
@@ -129,16 +132,16 @@ async fn serve_path(
         }
         // SPA fallback: unknown NON-API paths get the shell so client routing
         // works offline-first.
-        None => serve_index(&state, legacy_port_of(legacy)),
+        None => serve_index(&state, legacy_port_of(legacy), super::org::is_verified_local_member(&headers)),
     }
 }
 
-fn serve_index(state: &AppState, legacy: Option<u16>) -> Response {
+fn serve_index(state: &AppState, legacy: Option<u16>, local_member: bool) -> Response {
     let Some(index) = DashboardAssets::get("index.html") else {
         return (StatusCode::NOT_FOUND, "dashboard not embedded").into_response();
     };
     let html = String::from_utf8_lossy(&index.data).into_owned();
-    let injected = inject_bootstrap(&html, state, legacy);
+    let injected = inject_bootstrap(&html, state, legacy, local_member);
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         injected,
@@ -169,18 +172,21 @@ fn serve_index(state: &AppState, legacy: Option<u16>) -> Response {
 /// `_AMUX_LEGACY_PORT` is 0 on the canonical listener, so the SPA's check is
 /// "did the server say I am on the retired port", not "does my URL look odd" —
 /// the client never has to know either number.
-fn inject_bootstrap(html: &str, state: &AppState, legacy: Option<u16>) -> String {
+fn inject_bootstrap(html: &str, state: &AppState, legacy: Option<u16>, local_member: bool) -> String {
     const BEGIN: &str = "<!-- AMUX-BOOTSTRAP-BEGIN";
     const END: &str = "<!-- AMUX-BOOTSTRAP-END -->";
     let (Some(b), Some(e)) = (html.find(BEGIN), html.find(END)) else {
         return html.to_string(); // no markers: serve untouched, never corrupt
     };
-    let auth = state.auth_token.clone().unwrap_or_default();
-    let ui_token = if auth.is_empty() {
+    let owner_auth = state.auth_token.clone().unwrap_or_default();
+    // Invited browsers authenticate with their member cookie, never by
+    // inheriting the owner's bearer from the public SPA bootstrap.
+    let auth = if local_member { String::new() } else { owner_auth.clone() };
+    let ui_token = if owner_auth.is_empty() {
         String::new()
     } else {
         let mut h = sha2::Sha256::new();
-        h.update(format!("amux-ui-guard:{auth}"));
+        h.update(format!("amux-ui-guard:{owner_auth}"));
         hex::encode(h.finalize())[..40].to_string()
     };
     let home = std::env::var("HOME").unwrap_or_default();
@@ -268,7 +274,7 @@ mod tests {
     #[test]
     fn bootstrap_injects_auth_and_derived_ui_token() {
         let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head>";
-        let out = inject_bootstrap(html, &state(Some("tok123")), None);
+        let out = inject_bootstrap(html, &state(Some("tok123")), None, false);
         assert!(out.contains("window._AMUX_AUTH_TOKEN=\"tok123\""));
         // Python-parity UI token: sha256("amux-ui-guard:tok123")[..40]
         let mut h = sha2::Sha256::new();
@@ -279,13 +285,25 @@ mod tests {
     }
 
     #[test]
+    fn invited_member_bootstrap_withholds_owner_bearer_but_keeps_ui_guard() {
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head>";
+        let owner = inject_bootstrap(html, &state(Some("tok123")), None, false);
+        let member = inject_bootstrap(html, &state(Some("tok123")), None, true);
+        assert!(member.contains("window._AMUX_AUTH_TOKEN=\"\""), "{member}");
+        assert!(!member.contains("window._AMUX_AUTH_TOKEN=\"tok123\""), "{member}");
+        let owner_guard = owner.split("window._AMUX_UI_TOKEN=").nth(1)
+            .and_then(|value| value.split(';').next()).unwrap();
+        assert!(member.contains(&format!("window._AMUX_UI_TOKEN={owner_guard}")), "{member}");
+    }
+
+    #[test]
     fn no_update_banner_is_injected() {
         // Client adoption rides the SSE ping's `v` (sse.rs::ping_payload,
         // Python parity) — the old /health-polling banner must stay gone,
         // or a backend-only deploy shows UI Python never showed.
         let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head><body></body>";
         let s = state(Some("tok"));
-        let out = inject_bootstrap(html, &s, None);
+        let out = inject_bootstrap(html, &s, None, false);
         assert!(!out.contains("AMUX-UPDATE-WATCH"));
         assert!(!out.contains("amux-update-bar"));
         // The CRM feature-flag layer still injects.
@@ -308,14 +326,14 @@ mod tests {
         let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head><body></body>";
         let s = state(Some("tok"));
 
-        let canonical = inject_bootstrap(html, &s, None);
+        let canonical = inject_bootstrap(html, &s, None, false);
         assert!(
             canonical.contains("window._AMUX_LEGACY_PORT=0"),
             "a document served on the canonical port must report legacy 0, or every \
              already-migrated client is told to migrate: {canonical}"
         );
 
-        let from_legacy = inject_bootstrap(html, &s, Some(8822));
+        let from_legacy = inject_bootstrap(html, &s, Some(8822), false);
         assert!(
             from_legacy.contains("window._AMUX_LEGACY_PORT=8822"),
             "a document served on the retired port must say so — this is the ONLY \
@@ -336,7 +354,7 @@ mod tests {
     #[test]
     fn missing_markers_serve_untouched() {
         let html = "<head>no markers</head>";
-        assert_eq!(inject_bootstrap(html, &state(None), None), html);
+        assert_eq!(inject_bootstrap(html, &state(None), None, false), html);
     }
 
     /// AF-61: the GET-only version of this test passed for months while every
