@@ -2,6 +2,7 @@ import { test, expect } from './fixtures';
 
 const NAME = 'ate-44-worker';
 const ROOT = '/tmp/';
+const SESSIONS_ROUTE = '**/api/sessions';
 
 const SAMPLE = {
   name: NAME,
@@ -34,6 +35,17 @@ const SAMPLE = {
 // `#peek-focus-btn` between the state.evaluate() call and the later
 // `.scrollIntoViewIfNeeded()` ("Element is not attached to the DOM"). This
 // test has no reason to pay for that; only enterFiles() below does.
+//
+// origin/main independently attempted a fix for this same file (a0775e33,
+// "stabilize worker action parity") while this PR was in flight, converging
+// on a similar session/route mock but applying it (and a still-broken nested
+// eval() for peekSession/peekSessionDir) unconditionally to BOTH tests —
+// which is exactly the regression this comment describes: confirmed still
+// failing on main with the identical "Element is not attached to the DOM"
+// error at the identical line, in the identical test, after that commit
+// landed (run 33921870392). Keeping this file's own boot/bootWithPeek split
+// on merge rather than origin/main's version, since main's own CI already
+// shows it doesn't fully fix the bug.
 async function boot(page: import('@playwright/test').Page) {
   await page.goto('/');
   await page.waitForFunction(() => typeof (window as any)._renderWorkerActionMenu === 'function');
@@ -89,7 +101,7 @@ async function bootWithPeek(page: import('@playwright/test').Page) {
   const routed = page as unknown as { _sessionsRouted?: boolean };
   if (!routed._sessionsRouted) {
     routed._sessionsRouted = true;
-    await page.route('**/api/sessions', (route) => route.fulfill({ json: [SAMPLE] }));
+    await page.route(SESSIONS_ROUTE, (route) => route.fulfill({ json: [SAMPLE] }));
   }
   await page.goto('/');
   await page.waitForFunction(() => typeof (window as any)._renderWorkerActionMenu === 'function');
@@ -118,12 +130,17 @@ test('worker card and peek share all 25 worker actions, plus both peek-only acti
     peek.classList.add('open');
     const keys = (root: ParentNode) => Array.from(root.querySelectorAll('[data-worker-action]'))
       .map((el) => (el as HTMLElement).dataset.workerAction);
+    const semanticLabel = (el: Element) => {
+      const copy = el.cloneNode(true) as HTMLElement;
+      copy.querySelectorAll('.mi').forEach((icon) => icon.remove());
+      return (copy.textContent || '').trim();
+    };
     const style = getComputedStyle(peek);
     return {
       card: keys(card),
       peek: keys(peek),
       peekOnly: Array.from(peek.querySelectorAll('[data-peek-action], #peek-focus-btn'))
-        .map((el) => (el.textContent || '').trim()),
+        .map(semanticLabel),
       overflowY: style.overflowY,
       maxHeight: style.maxHeight,
       scrollHeight: peek.scrollHeight,
@@ -138,10 +155,14 @@ test('worker card and peek share all 25 worker actions, plus both peek-only acti
   expect(state.peek).toEqual(state.card);
   // Every menu item in this codebase renders an icon span before its label
   // (see _renderWorkerActionMenu's own `<span class="mi">` + label pattern),
-  // and .textContent naturally includes that child span's text — these are
-  // real DOM icon glyphs, not a CSS ::before. Bare 'File browser'/'Focus mode'
-  // was never what got rendered; it was a wrong expectation on a fresh test.
-  expect(state.peekOnly).toEqual(['\u{1F4C2}File browser', '▴Focus mode']);
+  // and .textContent naturally includes that child span's text — real DOM
+  // icon glyphs, not a CSS ::before. Bare 'File browser'/'Focus mode' was
+  // never what got rendered as raw textContent; semanticLabel() strips the
+  // icon span before reading, so this checks the label itself rather than
+  // depending on exact glyph placement (origin/main's own independent fix
+  // for the same test bug, merged in over the icon-embedding approach here
+  // originally, which broke this same assertion until reconciled).
+  expect(state.peekOnly).toEqual(['File browser', 'Focus mode']);
   expect(state.overflowY).toBe('auto');
   expect(state.maxHeight).not.toBe('none');
   expect(state.scrollHeight).toBeGreaterThan(state.clientHeight);

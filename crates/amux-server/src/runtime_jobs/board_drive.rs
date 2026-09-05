@@ -3741,9 +3741,22 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
     // a stale pickup (AMUX-3052). It reads the token right after PICKUP_ANCHOR,
     // which is why the id must stay the FIRST thing after it.
     let mut prompt = format!(
+        // AF-506: this line used to say "if blocked on an owner decision, move to
+        // review". The REVIEW GATE then refuses that card, because it asks you to
+        // ack "Implemented and self-tested" / "Diff / PR is up", which a card you
+        // are parking or routing away cannot truthfully claim. So the dispatcher
+        // sent people somewhere its own gate would turn them back from: two
+        // components disagreeing about the same fact, with neither individually
+        // wrong. Reported by `backend`, hit live on MI-4155.
+        //
+        // Both real cases are named instead, because they have different exits
+        // and conflating them is what produced the loop.
         "{PICKUP_ANCHOR}{} — work it now. Card text below is historical, \
-         not a live message. If blocked on an owner decision, move to review (not todo, \
-         which re-queues after a brief cooldown):\n{}{}",
+         not a live message. If this card's WORK belongs to another lane, hand it over: \
+         `amux board assign <ID> <lane> && amux board todo <ID>` — it dispatches to THEM, \
+         not back to you. If it needs a decision only Ethan can make, `amux board needsyou \
+         <ID>` with the question. Do NOT move it to review to park it: the review gate asks \
+         you to attest work you have not done, and will refuse.\n{}{}",
         row.id,
         quoted_card_text(&row.title, &row.id),
         qnote
@@ -3842,6 +3855,50 @@ pub fn select_advance(
     })
 }
 
+/// A newly captured prompt shell that still needs the owning model's explicit
+/// keep/split/discard judgment.
+///
+/// Capture cleanup is keyed per card (`decompose:<id>`), while the ordinary
+/// advance cooldown is keyed per lane. Letting an older real card's cooldown
+/// hide a brand-new shell leaves the shell in `doing` even after the turn has
+/// ended. Find only shells the shared pickup classifier rejects and which
+/// have never received their durable cleanup prompt; ordinary work is never
+/// promoted by this exception.
+fn unnudged_capture_cleanup(conn: &Connection, session: &str) -> Option<String> {
+    let candidates: Vec<(String, String, String, String)> = conn
+        .prepare(
+            "SELECT id,title,COALESCE(desc,''),COALESCE(log,'') FROM issues \
+             WHERE session=?1 AND status='doing' AND source='capture' \
+             AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent' \
+             ORDER BY updated DESC LIMIT 40",
+        )
+        .and_then(|mut st| {
+            st.query_map(rusqlite::params![session], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default();
+
+    candidates.into_iter().find_map(|(id, title, desc, log)| {
+        if pickup_junk_reason(&title, &desc, &log).is_empty() {
+            return None;
+        }
+        let idem = format!("decompose:{id}");
+        let already = conn
+            .query_row(
+                "SELECT 1 FROM session_events WHERE idem=?1 LIMIT 1",
+                rusqlite::params![idem],
+                |_| Ok(()),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .is_some();
+        (!already).then_some(id)
+    })
+}
+
 /// [`select_advance`] over an INJECTED "is this name a registered worker"
 /// lookup.
 ///
@@ -3862,6 +3919,7 @@ pub fn select_advance_with(
     reviewer_unreachable: &dyn Fn(&str, &str) -> Option<String>,
 ) -> Advance {
     let budget = advance_card_budget();
+    let capture_cleanup = unnudged_capture_cleanup(conn, session);
 
     // PER-SESSION COOLDOWN, with PROGRESS YIELDING IT (py:13346, AMUX-2500).
     // Ethan: "all issues should always continue driving; a worker should NOT go
@@ -3887,7 +3945,7 @@ pub fn select_advance_with(
                     .unwrap_or(false),
                 _ => false,
             };
-            if !moved {
+            if !moved && capture_cleanup.is_none() {
                 return Advance::None {
                     reason: "cooldown",
                     detail: format!(
@@ -3896,6 +3954,16 @@ pub fn select_advance_with(
                         now - last_ts
                     ),
                 };
+            }
+            if !moved {
+                tracing::warn!(
+                    target: "amux::board_drive",
+                    session,
+                    card = capture_cleanup.as_deref().unwrap_or(""),
+                    previous_card = last_card.as_deref().unwrap_or(""),
+                    verdict = "capture_cleanup_bypassed_lane_cooldown",
+                    "new per-card capture cleanup is not suppressed by an unrelated lane cooldown"
+                );
             }
         }
     }
@@ -3996,7 +4064,7 @@ pub fn select_advance_with(
     // OTHER card the lane held — and because the ordering puts `doing` first, a
     // lane that peer-reviews continuously always has a populated review tier, so
     // the lanes using reviewers most were starved hardest.
-    let cands: Vec<(String, String)> = conn
+    let mut cands: Vec<(String, String)> = conn
         .prepare(
             "SELECT id, status FROM issues WHERE session=?1 AND deleted IS NULL \
              AND COALESCE(archived,0)=0 AND status IN ('doing','review') AND owner_type='agent' \
@@ -4007,6 +4075,9 @@ pub fn select_advance_with(
                 .map(|rows| rows.flatten().collect())
         })
         .unwrap_or_default();
+    if let Some(capture_id) = capture_cleanup.as_deref() {
+        cands.sort_by_key(|(id, _)| if id == capture_id { 0 } else { 1 });
+    }
     if cands.is_empty() {
         return Advance::None {
             reason: "no-open-card",
@@ -9174,6 +9245,60 @@ mod tests {
         match select_advance(&conn, "lane", &[], now_f64()) {
             Advance::Nudge { card, .. } => assert_eq!(card, "D-1"),
             Advance::None { reason, detail } => panic!("progress must yield the cooldown, got {reason}: {detail}"),
+        }
+    }
+
+    /// ATE-45, live PRIMI-204. The preceding capture shell had just been
+    /// nudged, so its unchanged status put the whole Primis lane on cooldown.
+    /// A new prompt explicitly saying "do not create or retain a board task"
+    /// was then captured as a second `doing` card and never received the one
+    /// model-judgment prompt that could discard it. The exception is narrow:
+    /// it is per-card, only for the shared junk classifier, and the durable
+    /// idem closes it immediately after the first delivery.
+    #[test]
+    fn a_new_capture_cleanup_bypasses_an_unrelated_lane_cooldown_once() {
+        let conn = board_db();
+        let now = now_f64();
+        add_card(&conn, "PRIMI-203", "primis", "doing", "prior work", "SCOPE: real work");
+        conn.execute(
+            "INSERT INTO session_events (ts,session,type,data,source) VALUES \
+             (?1,'primis','advance.nudged',\
+              '{\"issue\":\"PRIMI-203\",\"status\":\"doing\"}','board-drive')",
+            rusqlite::params![now - 60.0],
+        )
+        .expect("prior lane nudge");
+        add_card(
+            &conn,
+            "PRIMI-204",
+            "primis",
+            "doing",
+            "Post-fix status verification only",
+            "**Prompt:** Post-fix status verification only; do not create or retain a board task.",
+        );
+        conn.execute("UPDATE issues SET source='capture' WHERE id='PRIMI-204'", [])
+            .expect("capture source");
+
+        match select_advance(&conn, "primis", &[], now) {
+            Advance::Nudge { card, kind, .. } => {
+                assert_eq!(card, "PRIMI-204", "the new shell, not the cooldown holder");
+                assert_eq!(kind, "decompose-asked");
+            }
+            Advance::None { reason, detail } => {
+                panic!("new capture cleanup must bypass unrelated cooldown: {reason}: {detail}")
+            }
+        }
+
+        conn.execute(
+            "INSERT INTO session_events (ts,session,type,data,source,idem) VALUES \
+             (?1,'primis','advance.nudged',\
+              '{\"issue\":\"PRIMI-204\",\"status\":\"doing\"}',\
+              'board-drive','decompose:PRIMI-204')",
+            rusqlite::params![now],
+        )
+        .expect("durable per-card cleanup event");
+        match select_advance(&conn, "primis", &[], now + 1.0) {
+            Advance::None { reason, .. } => assert_eq!(reason, "cooldown"),
+            Advance::Nudge { text, .. } => panic!("the same shell must not be prompted twice: {text}"),
         }
     }
 

@@ -676,8 +676,114 @@ def main():
         failures.append("lock-note: an absent lsof reported the lock UNHELD: %r" % _err[:220])
     os.unlink(_lock)
 
+    # ------------------------------------------------------------------
+    # AF-507 — a bare `git commit` that would sweep index-vs-frozen-HEAD drift
+    #
+    # backend, 2026-09-04: `git add <file>` hit a peer's index.lock and failed,
+    # so their file was never staged. The follow-up bare `git commit -m` then
+    # committed the whole index-vs-HEAD drift — 1120 files, +67067/-6296 — under
+    # their message. `git reset --soft HEAD~1` to undo it was blocked by this
+    # same guard, correctly. The guard blocked the fix and not the cause.
+    #
+    # The fixture reproduces the graft-push shape exactly: HEAD detached at an
+    # OLD commit while the index carries origin/main. That is what makes the
+    # staged set huge and its files identical to origin.
+    _sweep = 0
+    _so = os.path.join(tmp, "sweeporigin.git")
+    _sw = os.path.join(tmp, "sweepwork")
+    subprocess.run(["git", "init", "--bare", "-q", "-b", "main", _so])
+    subprocess.run(["git", "clone", "-q", _so, _sw], capture_output=True)
+    git(_sw, "config", "user.email", "t@t")
+    git(_sw, "config", "user.name", "t")
+    open(os.path.join(_sw, "base.txt"), "w").write("base\n")
+    git(_sw, "add", "base.txt")
+    git(_sw, "commit", "-q", "-m", "base")
+    _old = git(_sw, "rev-parse", "HEAD")
+    for _i in range(40):
+        open(os.path.join(_sw, f"drift{_i}.txt"), "w").write(f"{_i}\n")
+    git(_sw, "add", "-A")
+    git(_sw, "commit", "-q", "-m", "40 files that are NOT this lane's work")
+    git(_sw, "push", "-q", "origin", "main")
+
+    def _sweep_hook(cmd, cwd, env=None):
+        e = dict(os.environ, AMUX_SHARED_CHECKOUTS=cwd)
+        e.update(env or {})
+        p = subprocess.run(
+            [sys.executable, HOOK],
+            input=json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": cwd}),
+            capture_output=True, text=True, env=e, timeout=40)
+        return p.returncode, p.stderr
+
+    # THE SPECIMEN: HEAD frozen at `base`, index carrying origin/main.
+    git(_sw, "checkout", "-q", "--detach", _old)
+    git(_sw, "read-tree", "origin/main")
+
+    _sweep += 1
+    _rc, _err = _sweep_hook("git commit -m 'my one-line fix'", _sw)
+    if _rc != 2:
+        failures.append(
+            "AF-507/sweep: a bare commit over 40 drift files was ALLOWED (rc=%s). "
+            "This is the reported incident's exact shape. stderr: %r" % (_rc, _err[:300]))
+    elif "already match origin/main" not in _err:
+        failures.append(
+            "AF-507/sweep-why: the refusal does not say the files already match origin, "
+            "which is the whole reason they are not the caller's work: %r" % _err[:300])
+
+    # RULE 1 ALONE — a PATHSPEC commit over the same index must PASS. `git commit
+    # <paths>` ignores the index for everything it does not name, so the drift
+    # cannot ride along. Without this cell the guard is a ban on committing at
+    # all while HEAD lags, which is the state every graft-push lane is in.
+    _sweep += 1
+    _rc, _err = _sweep_hook("git commit base.txt -m 'my one-line fix'", _sw)
+    if _rc != 0:
+        failures.append(
+            "AF-507/pathspec: a path-scoped commit was blocked (rc=%s). The drift cannot "
+            "ride along on a pathspec commit. stderr: %r" % (_rc, _err[:300]))
+
+    _sweep += 1
+    _rc, _err = _sweep_hook("git commit -m x -- base.txt", _sw)
+    if _rc != 0:
+        failures.append(
+            "AF-507/dashdash: an explicit `-- <path>` commit was blocked (rc=%s): %r"
+            % (_rc, _err[:300]))
+
+    # THE PIN. A number, not a switch, so the escape requires having run the
+    # count — the same protocol as AMUX_AMEND_EXPECT.
+    _sweep += 1
+    _rc, _err = _sweep_hook("git commit -m x", _sw,
+                            env={"AMUX_ALLOW_SWEEP_COMMIT": "40"})
+    if _rc != 0:
+        failures.append(
+            "AF-507/pin: the correct drift count did not release the commit (rc=%s): %r"
+            % (_rc, _err[:300]))
+
+    _sweep += 1
+    _rc, _err = _sweep_hook("git commit -m x", _sw,
+                            env={"AMUX_ALLOW_SWEEP_COMMIT": "1"})
+    if _rc != 2 or "does not match" not in _err:
+        failures.append(
+            "AF-507/pin-wrong: a WRONG pin was accepted (rc=%s). A pin that any number "
+            "satisfies is a switch, and a switch gets set once and never read: %r"
+            % (_rc, _err[:300]))
+
+    # RULE 2 ALONE — THE CONTROL, and the cell that keeps this from being a
+    # file-count ban. HEAD == origin/main, 40 genuinely NEW files staged. Same
+    # size, no drift, and it must PASS. Without it, a real 40-file refactor is
+    # refused and the guard trains people to set the pin reflexively.
+    _sweep += 1
+    git(_sw, "checkout", "-q", "main")
+    git(_sw, "reset", "-q", "--hard", "origin/main")
+    for _i in range(40):
+        open(os.path.join(_sw, f"mine{_i}.txt"), "w").write(f"real work {_i}\n")
+    git(_sw, "add", "-A")
+    _rc, _err = _sweep_hook("git commit -m 'a genuine 40-file change'", _sw)
+    if _rc != 0:
+        failures.append(
+            "AF-507/control: a genuine 40-file commit with NO drift was blocked (rc=%s). "
+            "The signal is drift, not size. stderr: %r" % (_rc, _err[:300]))
+
     total = (len(cases) + len(trio) + len(quad) + len(matrix) + _bodies + 1
-             + len(redir_cases) + _mr101 + _subst + _lockcases)
+             + len(redir_cases) + _mr101 + _subst + _lockcases + _sweep)
     if failures:
         print(f"FAIL {len(failures)}/{total}:")
         for f in failures:

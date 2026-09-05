@@ -83,6 +83,53 @@ fn the_app_bundle_still_contains_an_app() {
 /// CLAUDE.md: "Client JS changes need APP_VER and the CACHE version bumped
 /// together, or a browser holding the cached script never receives the fix."
 /// Enforced here rather than remembered.
+/// A WORKER BRANCH IS ISOLATION, NOT DELIVERY (AF-495).
+///
+/// From the 2026-09-04 Doron session. His worker was off main with nothing
+/// pushed, and Ethan read both facts off the screen while Doron could not:
+///
+///   Ethan: "First off, your amux worker is in a different branch."
+///   Doron: "No, I don't know. I don't know why that is."
+///   Ethan (later): "It says it's in a different branch. It says nothing is
+///                   pushed yet."
+///   Doron: "Still. No, I think I'm on main again."   (he was not)
+///
+/// The branch popover's verdict for that exact state was a GREEN TICK reading
+/// "Isolated on worker branch". True, and it is a reassuring signal over the
+/// question that mattered: whether anything on the branch had ever left. The
+/// popover has no push data and should not pretend to, so the fix is to stop the
+/// green line from reading as "all good" and say what isolation does NOT cover.
+///
+/// Pinned here because it is a CLAIM the UI makes, and this file already holds
+/// the auto-compact copy to the threshold the server really uses. Prose in a
+/// template is exactly what rots silently.
+#[test]
+fn the_branch_popover_does_not_read_isolation_as_delivery() {
+    let js = asset("app.js");
+    assert!(
+        js.contains("Isolation is not delivery."),
+        "the branch popover must say what being on a worker branch does NOT mean; \
+         a bare green tick over an unmeasured condition is the defect (AF-495)"
+    );
+    assert!(
+        js.contains("nothing here reaches anyone until it is merged or pushed"),
+        "and name the consequence in the reader's terms, not as jargon"
+    );
+    // NEGATIVE: the old copy asserted a state it had not measured. If it comes
+    // back, so does the false verdict.
+    assert!(
+        !js.contains("Isolated on worker branch"),
+        "the old verdict is back: it reads as 'all good' for a branch nothing has \
+         ever left"
+    );
+    // CONTROL: the conflict warning is a DIFFERENT and genuinely measured signal
+    // (another worker shares the branch) and must survive untouched.
+    assert!(
+        js.contains("Another worker shares this branch"),
+        "the conflict warning is measured and must not be lost to this change"
+    );
+}
+
 #[test]
 fn app_ver_and_the_sw_cache_version_agree() {
     let app_ver = const_str(&asset("app.js"), "APP_VER")

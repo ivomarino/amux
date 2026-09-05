@@ -327,6 +327,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0055_issue_callbacks",
         sql: include_str!("../../migrations/0055_issue_callbacks.sql"),
     },
+    Migration {
+        version: 56,
+        name: "0056_search_prompts",
+        sql: include_str!("../../migrations/0056_search_prompts.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.

@@ -4056,7 +4056,7 @@ function showBranchPopover(name, e) {
   if (hasBranch) {
     pop.innerHTML = `
       <div style="font-size:0.75rem;color:var(--dim);margin-bottom:6px;font-weight:600;">⎇ ${esc(displayBranch)}</div>
-      ${gi._conflict ? '<div style="font-size:0.78rem;color:var(--red);margin-bottom:6px;">⚠ Another worker shares this branch — conflicts possible</div>' : '<div style="font-size:0.78rem;color:var(--green);margin-bottom:6px;">✓ Isolated on worker branch</div>'}
+      ${gi._conflict ? '<div style="font-size:0.78rem;color:var(--red);margin-bottom:6px;">⚠ Another worker shares this branch — conflicts possible</div>' : '<div style="font-size:0.78rem;color:var(--green);margin-bottom:6px;">✓ Isolated from other workers</div><div style="font-size:0.75rem;color:var(--dim);margin-bottom:6px;">Not on main, so nothing here reaches anyone until it is merged or pushed. Isolation is not delivery.</div>'}
       <button class="btn" style="width:100%;" onclick="document.querySelectorAll('.branch-popover').forEach(p=>p.remove())">Close</button>`;
   } else {
     const suggested = 'session/' + name;
@@ -8898,7 +8898,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.803';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.812';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -19980,6 +19980,26 @@ function _acShowSuggested() {
   el.classList.add('open');
 }
 
+// Render a set of labelled sections into the dropdown, keeping `acItems` index-
+// aligned with what is on screen so arrow keys, Tab and acPick keep working.
+function _acRenderSections(sections) {
+  const el = document.getElementById('ac-list');
+  acItems = [];
+  acSelected = -1;
+  let html = '';
+  for (const [label, items] of sections) {
+    if (!items.length) continue;
+    if (label) html += `<div class="ac-section">${esc(label)}</div>`;
+    for (const item of items) {
+      html += `<div class="ac-item" onmousedown="acPick(${acItems.length})">${esc(item)}</div>`;
+      acItems.push(item);
+    }
+  }
+  if (!acItems.length) { el.classList.remove('open'); return; }
+  el.innerHTML = html;
+  el.classList.add('open');
+}
+
 function acFetch(query) {
   clearTimeout(acTimer);
   const el = document.getElementById('ac-list');
@@ -19993,17 +20013,35 @@ function acFetch(query) {
     _acShowSuggested();
     return;
   }
-  el.classList.remove('open');
+  // A BARE NAME IS A SEARCH, NOT A PATH (AF-501). Typing used to DROP the
+  // suggested list — the one holding every directory amux already knows about —
+  // and replace it with a path completion that only answers if you already knew
+  // the path. Measured in a live onboarding session (2026-09-04): the user knew
+  // the repo's name, not its location, typed the name, got nothing, could not
+  // find it in Finder either, and spent three minutes of a one-hour call on it.
+  //
+  // Known dirs are matched HERE rather than server-side because the client
+  // already holds them: the answer is on screen before the request goes out,
+  // and the disk search fills in underneath it.
+  const bareName = query.indexOf('/') === -1 && query[0] !== '~';
+  let known = [];
+  if (bareName) {
+    const q = query.toLowerCase();
+    known = _buildSuggestedDirs().filter(d => d.toLowerCase().includes(q));
+    if (known.length) _acRenderSections([['Your directories', known]]);
+    else el.classList.remove('open');
+  } else {
+    el.classList.remove('open');
+  }
   acTimer = setTimeout(async () => {
     try {
       const r = await fetch(API + '/api/autocomplete/dir?q=' + encodeURIComponent(query));
-      acItems = await r.json();
-      acSelected = -1;
-      if (!acItems.length) { el.classList.remove('open'); return; }
-      el.innerHTML = acItems.map((item, i) =>
-        `<div class="ac-item" onmousedown="acPick(${i})">${esc(item)}</div>`
-      ).join('');
-      el.classList.add('open');
+      const found = await r.json();
+      // Deduped against what is already shown, so a directory that is both a
+      // worker's and on disk does not appear twice under two headings.
+      const fresh = found.filter(d => !known.includes(d) && !known.includes(d.replace(/\/$/, '')));
+      if (bareName) _acRenderSections([['Your directories', known], ['Found on disk', fresh]]);
+      else _acRenderSections([[null, found]]);
     } catch(e) {}
   }, 150);
 }
@@ -36401,6 +36439,30 @@ async function _bwClearInspect() {
 // reCAPTCHA — many sites do. A human completing the challenge once in a real
 // window is the only thing that works, and closing the window is what flushes
 // the session to the profile for the API to reuse.
+// AF-496. amux launches Chrome into its own --user-data-dir, so the window it
+// opens sits beside the human's own Chrome and looks identical: same icon, same
+// frame, no badge. Measured in a live onboarding session (2026-09-04) — the user
+// signed into the wrong window and was corrected three times, and asked "should
+// I trust it, it does look like two different browsers?".
+//
+// amux held the answer the whole time (pid, port, profile, starting lane) and
+// had no way to SHOW it. This button puts it where the person is looking: it
+// raises the amux window and draws a bar across it. A Chrome window WITHOUT a
+// bar is their own, which is what makes the multi-window case answerable.
+async function _bwIdentify() {
+  _bwStatus('identifying the amux window\u2026');
+  try {
+    const r = await fetch('/api/browser/identify', { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' });
+    const d = await r.json();
+    if (d.error) { _bwStatus(d.error + (d.running_profiles ? ' (running: ' + d.running_profiles.join(', ') + ')' : '')); return; }
+    // Report the OUTCOME, not the request. `labeled/pages` is the pair that
+    // says whether a 0 means "no tabs" or "every tab refused" (ethos rule 4).
+    const names = (d.identified || []).map(b => b.profile).join(', ');
+    if (!d.identified || !d.identified.length) { _bwStatus(d.verdict || 'no amux browser is running'); return; }
+    _bwStatus(d.verdict + ' \u2014 ' + names + ' (' + d.labeled + '/' + d.pages + ' tab(s) labelled)');
+  } catch (e) { _bwStatus('identify failed: ' + e); }
+}
+
 async function _bwNewProfile() {
   const url = (document.getElementById('bw-url').value || '').trim();
   const suggested = (() => {

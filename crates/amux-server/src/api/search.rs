@@ -82,6 +82,12 @@ const FAMILIES: &[(&str, &str, &str)] = &[
     ("memory", "_amux_memories", "deleted_at IS NULL"),
     ("message", "_amux_messages", "1=1"),
     ("worker", "_amux_workers", "1=1"),
+    // AF-499. Only type='user': the rest of cmd_history is machine traffic
+    // (auto-pickup dispatches, peer relays, scheduler commands) and indexing it
+    // would turn the corpus into a log. The predicate is repeated in
+    // 0056_search_prompts.sql's trigger and backfill; this table is what makes
+    // the status view describe the SAME population the index holds.
+    ("prompt", "cmd_history", "type = 'user'"),
 ];
 
 #[derive(Deserialize, Default)]
@@ -499,6 +505,16 @@ pub const BACKFILL_SQL: &[(&str, &str)] = &[
                 json_object('thread', thread, 'from', from_actor, 'target', target),
                 COALESCE(CAST(strftime('%s', created_at) AS INTEGER), 0)
          FROM _amux_messages",
+    ),
+    (
+        "prompt",
+        "INSERT OR IGNORE INTO search_docs (doc_id, entity_type, entity_id, title, body, scope, task_id, worker_id, link, meta, updated_at)
+         SELECT 'prompt:'||id, 'prompt', id,
+                substr(replace(text, char(10), ' '), 1, 80), text,
+                session, card_id, session, '#history/'||id,
+                json_object('session', session, 'origin', origin, 'card_id', card_id),
+                ts
+         FROM cmd_history WHERE type = 'user'",
     ),
     (
         "worker",
