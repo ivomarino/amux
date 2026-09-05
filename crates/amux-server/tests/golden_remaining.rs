@@ -86,6 +86,7 @@ fn rig() -> Rig {
     std::env::set_var("AMUX_BLOCKED_NEEDS_WATCH", "0");
     std::env::set_var("AMUX_NEEDSYOU_ASK_REQUIRED", "0");
     std::env::set_var("AMUX_TODO_WIP_LIMIT", "0");
+    std::env::set_var("AMUX_CONTINUATION_REQUIRED", "0");
     let dir = tempfile::tempdir().unwrap();
     let store: SharedStore = Arc::new(Store::open(&dir.path().join("golden.db")).unwrap());
     let state = AppState {
