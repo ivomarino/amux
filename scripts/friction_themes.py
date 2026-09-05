@@ -394,6 +394,8 @@ class Signal:
         self.active = False
         self.evidence = []
         self.detail = {}
+        # AF-511: computed over the FULL matching set, not `evidence`.
+        self.concentration = None
 
     def to_dict(self):
         return {
@@ -407,9 +409,57 @@ class Signal:
             "baseline": self.baseline,
             "baseline_means": self.baseline_label,
             "active": self.active,
+            "concentration": self.concentration,
             "evidence": self.evidence[:MAX_PER_SIGNAL],
             "detail": self.detail,
         }
+
+
+def concentration(pairs):
+    """How CONCENTRATED a signal's evidence is, over the FULL set (AF-511).
+
+    `n` alone cannot separate a recurring class from one long incident: n=11
+    spread over eleven lane-days and n=11 from one lane in one hour print
+    identically, and only the first is a theme. Measured 2026-09-05, the three
+    loudest signals of the day — idle-stall (7.5x baseline), deploy-live (13x)
+    and verification — were ALL amux-testing-e2e on 2026-09-04, one
+    ATE-44/ATE-45 incident. Ranked by n they were the day's top themes.
+
+    That matters more here than in an ordinary dashboard because
+    docs/friction-themes.md increments OCCURRENCES from these signals, and its
+    own header calls an inflated OCCURRENCES the one way the file can corrupt
+    itself. The LAST_SEEN guard does not catch this, because a run that sees one
+    incident is legitimately a new run.
+
+    No threshold and no judgement call: this prints the three numbers and lets
+    the reading session discriminate. A verdict computed here would be a second
+    opinion the reader cannot audit, and `incident_shaped` below is deliberately
+    a DESCRIPTION of the numbers rather than a filter that hides anything.
+
+    `pairs` is [(session, ts_ms)] over EVERY matching row, never the displayed
+    sample — the evidence list truncates at MAX_PER_SIGNAL, so computing this
+    from it would measure the truncation.
+    """
+    pairs = [(sess or "?", ts) for sess, ts in pairs if ts is not None]
+    if not pairs:
+        return None
+    lanes = Counter(sess for sess, _ in pairs)
+    lane_days = {(sess, time.strftime("%Y-%m-%d", time.localtime(ts / 1000)))
+                 for sess, ts in pairs}
+    days = {d for _, d in lane_days}
+    top_lane, top_n = lanes.most_common(1)[0]
+    share = top_n / len(pairs)
+    return {
+        "sampled_over": len(pairs),
+        "distinct_lanes": len(lanes),
+        "distinct_lane_days": len(lane_days),
+        "distinct_days": len(days),
+        "top_lane": top_lane,
+        "top_lane_share": round(share, 2),
+        # One lane, one day, and more than a couple of messages. Stated as what
+        # the numbers ARE, so a reader who disagrees can see why.
+        "incident_shaped": bool(len(lanes) == 1 and len(days) == 1 and len(pairs) >= 3),
+    }
 
 
 def db_connect():
@@ -515,6 +565,10 @@ def signal_rule_restatement(con, now_ms, prompts_doc):
         # ordinary conversation, and at n>=1 every class fired every day.
         s.active = (s.value > max(2.0, baseline_rate * 1.5)) or (
             already_written and s.value >= 2)
+        # OVER `in_win`, THE FULL SET — `evidence` below truncates at
+        # MAX_PER_SIGNAL, and computing concentration from it would measure the
+        # truncation rather than the signal (AF-511).
+        s.concentration = concentration([(r["session"], r["ts"]) for r in in_win])
         s.evidence = [
             {"msg": f"MSG-{r['id']}", "session": r["session"],
              "ts": time.strftime("%Y-%m-%d %H:%M", time.localtime(r["ts"] / 1000)),
@@ -959,6 +1013,13 @@ def main():
                  if s.baseline is not None else "")
               + f", considered {s.n_considered})")
         print(f"  {s.headline}")
+        c = s.concentration
+        if c:
+            flag = "  <-- INCIDENT-SHAPED: one lane, one day" if c["incident_shaped"] else ""
+            print(f"  concentration: {c['distinct_lanes']} lane(s), "
+                  f"{c['distinct_lane_days']} lane-day(s), "
+                  f"top lane {c['top_lane']} {int(c['top_lane_share']*100)}% "
+                  f"(over all {c['sampled_over']}){flag}")
         if s.detail:
             print(f"  detail: {json.dumps(s.detail)}")
         for e in s.evidence[:MAX_PER_SIGNAL]:
