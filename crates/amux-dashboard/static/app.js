@@ -8930,7 +8930,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.814';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.815';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -30781,10 +30781,103 @@ function toggleSettings() {
     loadUsage();
   }
 }
-// Subscription usage — model-agnostic. The server proxies Claude's OAuth usage
-// endpoint and returns limits[]: session (5h), weekly_all, and per-model
-// weekly_scoped entries (scope.model.display_name). We render remaining =
-// 100 − percent for each, colouring by how close to the cap it is.
+// Subscription usage across every provider amux ships. Keep the four provider
+// summaries visible, then put the provider API's detailed windows one tap
+// away. That makes "what can still run?" scannable in the tiny Settings menu
+// without hiding model-specific limits, exact reset clocks, credits, or auth
+// states when somebody needs the full answer (AMUX-4154).
+function usageResetText(raw) {
+  if (raw === null || raw === undefined || raw === '') return '';
+  const dt = new Date(typeof raw === 'number' && raw < 1e12 ? raw * 1000 : raw);
+  if (isNaN(dt.getTime())) return '';
+  const diff = dt.getTime() - Date.now();
+  const exact = dt.toLocaleString([], {
+    weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+  });
+  if (diff <= 0) return 'due now · ' + exact;
+  let seconds = Math.ceil(diff / 1000);
+  const days = Math.floor(seconds / 86400); seconds -= days * 86400;
+  const hours = Math.floor(seconds / 3600); seconds -= hours * 3600;
+  const minutes = Math.floor(seconds / 60); seconds -= minutes * 60;
+  const parts = [];
+  if (days) parts.push(days + 'd');
+  if (hours) parts.push(hours + 'h');
+  if (minutes) parts.push(minutes + 'm');
+  if (!parts.length) parts.push(Math.max(1, seconds) + 's');
+  return 'in ' + parts.slice(0, 2).join(' ') + ' · ' + exact;
+}
+function usagePercent(n) {
+  const value = Math.max(0, Math.min(100, Number(n) || 0));
+  return (Math.round(value * 10) / 10).toLocaleString([], { maximumFractionDigits: 1 });
+}
+function usageProviderMeta(provider) {
+  const bits = [];
+  const resetCredits = provider.reset_credits;
+  if (resetCredits && typeof resetCredits.availableCount === 'number') {
+    bits.push(resetCredits.availableCount + ' reset credit' + (resetCredits.availableCount === 1 ? '' : 's'));
+    const first = Array.isArray(resetCredits.credits) ? resetCredits.credits[0] : null;
+    const expiry = first && usageResetText(first.expiresAt || first.expires_at);
+    if (expiry) bits.push('next reset credit expires ' + expiry);
+  }
+  const buckets = Array.isArray(provider.buckets) ? provider.buckets : [];
+  buckets.forEach(bucket => {
+    const credits = bucket && bucket.credits;
+    if (!credits) return;
+    const name = bucket.name && bucket.name !== 'codex' ? bucket.name + ': ' : '';
+    if (credits.unlimited) bits.push(name + 'unlimited credits');
+    else if (credits.balance !== null && credits.balance !== undefined) bits.push(name + credits.balance + ' credits');
+    if (bucket.individual_limit) bits.push(name + 'individual limit');
+    if (bucket.spend_control_reached) bits.push(name + 'spend control reached');
+    if (bucket.rate_limit_reached_type) bits.push(name + String(bucket.rate_limit_reached_type).replace(/_/g, ' '));
+  });
+  if (provider.extra_usage) {
+    const extra = provider.extra_usage;
+    if (extra.is_enabled) {
+      let label = 'extra usage on';
+      if (extra.used_credits !== null && extra.used_credits !== undefined) label += ' · ' + extra.used_credits + ' used';
+      if (extra.monthly_limit !== null && extra.monthly_limit !== undefined) label += ' / ' + extra.monthly_limit;
+      bits.push(label);
+    } else {
+      bits.push('extra usage off');
+    }
+  }
+  if (provider.spend && provider.spend.enabled) {
+    const spend = provider.spend;
+    const used = spend.used && spend.used.amount_minor;
+    const exponent = spend.used && spend.used.exponent;
+    const currency = spend.used && spend.used.currency;
+    if (typeof used === 'number' && typeof exponent === 'number') {
+      bits.push((currency || '') + ' ' + (used / Math.pow(10, exponent)).toFixed(exponent));
+    }
+    if (spend.cap !== null && spend.cap !== undefined) bits.push('spend cap ' + spend.cap);
+  }
+  if (provider.credits !== null && provider.credits !== undefined) {
+    if (typeof provider.credits === 'number' || typeof provider.credits === 'string') {
+      bits.push(provider.credits + ' credits');
+    } else if (provider.credits.availableCredits !== undefined) {
+      bits.push(provider.credits.availableCredits + ' credits');
+    }
+  }
+  if (provider.auth_type) bits.push(String(provider.auth_type).replace(/-/g, ' '));
+  return [...new Set(bits)];
+}
+function usageWindowRow(window) {
+  const used = Math.max(0, Math.min(100, Number(window.used_percent) || 0));
+  const remaining = window.remaining_percent === null || window.remaining_percent === undefined
+    ? 100 - used : Number(window.remaining_percent);
+  const colour = used >= 90 ? 'var(--red)' : (used >= 70 ? '#f0a020' : 'var(--green)');
+  let amount = usagePercent(remaining) + '% left';
+  if (window.remaining_amount !== null && window.remaining_amount !== undefined) {
+    amount += ' · ' + window.remaining_amount + ' requests';
+  }
+  const reset = usageResetText(window.resets_at);
+  return '<div class="usage-window" data-usage-window>'
+    + '<div class="usage-window-line"><span class="usage-window-label" title="' + esc(window.label || 'Limit') + '">' + esc(window.label || 'Limit') + '</span>'
+    + '<span class="usage-window-value">' + esc(amount) + '</span></div>'
+    + '<div class="usage-bar" aria-label="' + esc(amount) + '"><span style="width:' + used + '%;background:' + colour + '"></span></div>'
+    + (reset ? '<div class="usage-reset">Resets ' + esc(reset) + '</div>' : '')
+    + '</div>';
+}
 async function loadUsage() {
   const el = document.getElementById('settings-usage-body');
   if (!el) return;
@@ -30792,56 +30885,40 @@ async function loadUsage() {
   try {
     const r = await fetch(API + '/api/usage');
     const d = await r.json();
-    if (!d.available) { el.innerHTML = '<span style="color:var(--dim);">' + esc(d.reason || 'Usage unavailable') + '</span>'; return; }
-    const limits = (d.limits || []).filter(l => typeof l.percent === 'number');
-    if (!limits.length) { el.innerHTML = '<span style="color:var(--dim);">No usage limits reported</span>'; return; }
-    // Anthropic renamed this limit's kind from 'worker' to 'session'. Accept
-    // BOTH: a client that hard-codes today's spelling breaks on the next
-    // rename, and an older server still sends the old one. Two call sites key
-    // on this — the label AND the sort order below, whose comment already said
-    // "session first" while its predicate had stopped matching, so the 5-hour
-    // row silently lost its place as well as its name.
-    const isSession = l => l.kind === 'session' || l.kind === 'worker';
-    const label = l => {
-      // "session", not "worker": in amux a worker is a lane, and this limit is
-      // the account's 5-hour window, not any one lane's.
-      if (isSession(l)) return '5-hour session';
-      const m = l.scope && l.scope.model && l.scope.model.display_name;
-      if (m) return m + ' · weekly';
-      if (l.group === 'weekly' || l.kind.indexOf('weekly') === 0) return 'Weekly (all models)';
-      return l.kind;
-    };
-    const resetTxt = iso => {
-      if (!iso) return '';
-      const dt = new Date(iso); if (isNaN(dt)) return '';
-      const now = Date.now(), diff = dt - now;
-      if (diff <= 0) return 'resets soon';
-      const h = Math.floor(diff / 3600000), dys = Math.floor(h / 24);
-      return 'resets ' + (dys >= 1 ? 'in ' + dys + 'd' : (h >= 1 ? 'in ' + h + 'h' : 'in <1h'));
-    };
-    // session first, then weekly-all, then per-model scoped
-    const order = l => isSession(l) ? 0 : (l.scope && l.scope.model ? 2 : 1);
-    limits.sort((a, b) => order(a) - order(b));
-    el.innerHTML = limits.map(l => {
-      const used = Math.max(0, Math.min(100, Math.round(l.percent)));
-      const rem = 100 - used;
-      const col = used >= 90 ? 'var(--red)' : (used >= 70 ? '#f0a020' : 'var(--green)');
-      return '<div style="margin-bottom:9px;">'
-        + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:3px;">'
-        // THE LABEL SHRINKS, THE NUMBER DOES NOT. Capping the menu width alone
-        // would clip these rows one layer in: both spans were nowrap by default
-        // in a space-between flex, so the row's intrinsic width was 445px on a
-        // 375px screen and something had to be cut. The reading order decides
-        // WHICH: "78% left · resets in <1h" is the answer, "5-hour session" is
-        // the question and is recoverable from position. So the label gets
-        // min-width:0 + ellipsis (a flex item will not shrink below its content
-        // without min-width:0) and the value gets flex-shrink:0.
-        +   '<span style="font-size:0.8rem;color:var(--fg);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(label(l)) + '</span>'
-        +   '<span style="font-size:0.74rem;color:var(--dim);flex-shrink:0;white-space:nowrap;">' + rem + '% left · ' + esc(resetTxt(l.resets_at)) + '</span>'
-        + '</div>'
-        + '<div style="height:6px;border-radius:4px;background:var(--border);overflow:hidden;">'
-        +   '<div style="height:100%;width:' + used + '%;background:' + col + ';"></div>'
-        + '</div></div>';
+    // Old servers remain usable during a rolling deploy: synthesize their
+    // Claude-only body into the provider collection the new renderer expects.
+    let providers = Array.isArray(d.providers) ? d.providers : [{
+      id: 'claude', label: 'Claude', available: !!d.available,
+      reason: d.reason, metered: true,
+      windows: (d.limits || []).filter(l => typeof l.percent === 'number').map(l => ({
+        label: (l.kind === 'session' || l.kind === 'worker') ? '5-hour session'
+          : (l.scope && l.scope.model ? l.scope.model.display_name + ' · weekly' : 'Weekly · all models'),
+        used_percent: l.percent, remaining_percent: 100 - l.percent, resets_at: l.resets_at,
+      })),
+    }];
+    const constrained = providers
+      .filter(p => p.available && Array.isArray(p.windows) && p.windows.length)
+      .sort((a, b) => Math.min(...a.windows.map(w => Number(w.remaining_percent) || 0))
+        - Math.min(...b.windows.map(w => Number(w.remaining_percent) || 0)))[0];
+    el.innerHTML = providers.map(provider => {
+      const windows = Array.isArray(provider.windows) ? provider.windows : [];
+      const minimum = windows.length ? Math.min(...windows.map(w => Number(w.remaining_percent) || 0)) : null;
+      const status = !provider.available ? 'Unavailable'
+        : provider.metered === false ? 'Unlimited'
+        : minimum === null ? 'No active limits' : usagePercent(minimum) + '% left';
+      const meta = usageProviderMeta(provider);
+      const detail = !provider.available
+        ? '<div class="usage-unavailable">' + esc(provider.reason || 'Usage unavailable') + '</div>'
+        : windows.length ? windows.map(usageWindowRow).join('')
+        : '<div class="usage-unavailable">' + esc(provider.summary || 'No active limits reported') + '</div>';
+      return '<details class="usage-provider" data-provider="' + esc(provider.id || '') + '"'
+        + (constrained && constrained.id === provider.id ? ' open' : '') + '>'
+        + '<summary><span class="usage-provider-name">' + esc(provider.label || provider.id || 'Provider') + '</span>'
+        + (provider.plan ? '<span class="usage-provider-plan">' + esc(String(provider.plan).replace(/_/g, ' ')) + '</span>' : '')
+        + '<span class="usage-provider-status">' + esc(status) + '</span></summary>'
+        + '<div class="usage-provider-detail">' + detail
+        + (meta.length ? '<div class="usage-provider-meta">' + meta.map(bit => '<span>' + esc(bit) + '</span>').join('') + '</div>' : '')
+        + '</div></details>';
     }).join('');
   } catch (e) {
     el.innerHTML = '<span style="color:var(--dim);">Could not load usage</span>';

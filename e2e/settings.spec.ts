@@ -763,14 +763,11 @@ test('settings_cloud_only_sections_stay_hidden', async ({ page }, testInfo) => {
 // Promoted from a fixme on 2026-08-09: /api/usage is ported (api/usage.rs) and
 // the probe below fired exactly as designed.
 //
-// This test is deliberately HOST-CONDITIONAL, and that is not a weakness. The
-// meter's content depends on a real macOS keychain credential and a live call
-// to api.anthropic.com, so asserting "bars are rendered" unconditionally would
-// be a check that fails on CI for a reason that has nothing to do with the
-// code. Instead it asserts the UI AGREES WITH THE WIRE — whichever branch the
-// host is in — and, on the degraded branch, that the reason is one of the
-// DISCRIMINATED causes rather than the old catch-all sentence that collapsed
-// no-token / expired / rate-limited into one useless string.
+// Provider probes are deliberately host-conditional: CI may have none of the
+// three subscription credentials. The invariant is wider than any one host:
+// all four shipped providers have a compact row, and every number/reset the
+// API measured is reachable by expanding that row. Degradation belongs to one
+// provider and must never hide the others.
 test('settings_usage_meter', async ({ page, request }) => {
   await settle(page);
   const token = await appToken(page);
@@ -783,6 +780,11 @@ test('settings_usage_meter', async ({ page, request }) => {
   // ask for is a reading you cannot trust (the meter is cached by design).
   expect(typeof wire.cache_age_s, 'usage response must state its own age').toBe('number');
   expect(typeof wire.cache_ttl_s).toBe('number');
+  expect(Array.isArray(wire.providers), 'usage response must enumerate providers').toBe(true);
+  expect(wire.provider_count).toBe(wire.providers.length);
+  expect(wire.providers.map((provider: any) => provider.id).sort()).toEqual([
+    'claude', 'codex', 'gemini', 'ollama',
+  ]);
 
   await openSettings(page);
   const body = page.locator('#settings-usage-body');
@@ -795,42 +797,44 @@ test('settings_usage_meter', async ({ page, request }) => {
   // parse-failure message: that is what an unported endpoint produced.
   expect(text, 'the SPA could not parse /api/usage').not.toMatch(/Could not load usage/i);
 
-  if (wire.available) {
-    const limits = (wire.limits || []).filter((l: any) => typeof l.percent === 'number');
-    expect(limits.length, 'available:true with no numeric limits is a shape regression').toBeGreaterThan(0);
-    // One rendered row per limit, each with a bar and a "% left" readout.
-    await expect(body.locator('> div')).toHaveCount(limits.length);
-    expect(await body.locator('div[style*="width:"]').count()).toBeGreaterThanOrEqual(limits.length);
-    expect(text).toMatch(/%\s*left/);
-    expect(text).not.toMatch(/unavailable on this host/i);
-    // Per-model rows are why the endpoint passes Anthropic's body through
-    // instead of normalizing it: scope.model.display_name has no
-    // representation in a normalized usage window.
-    for (const l of limits) {
-      const model = l.scope?.model?.display_name;
-      if (model) expect(text).toContain(model);
+  await expect(body.locator('.usage-provider')).toHaveCount(wire.providers.length);
+  // Four summary lines fit without opening any detail; at most the provider
+  // with the least remaining quota opens automatically.
+  expect(await body.locator('.usage-provider[open]').count()).toBeLessThanOrEqual(1);
+
+  for (const provider of wire.providers) {
+    const row = body.locator(`.usage-provider[data-provider="${provider.id}"]`);
+    await expect(row, `missing ${provider.id} summary`).toHaveCount(1);
+    const summary = row.locator('summary');
+    await expect(summary).toContainText(provider.label);
+    if (!provider.available) await expect(summary).toContainText('Unavailable');
+    if (provider.metered === false) await expect(summary).toContainText('Unlimited');
+
+    if (!(await row.evaluate((element) => element.hasAttribute('open')))) await summary.click();
+    if (!provider.available) {
+      expect(provider.cause, `${provider.id} degradation must name its cause`).toBeTruthy();
+      await expect(row).toContainText(String(provider.reason));
+      continue;
     }
-  } else {
-    // Honest degradation — but it must say WHICH failure, with a stable
-    // machine tag beside the sentence.
-    expect(wire.cause, 'a degraded usage response must name its cause').toBeTruthy();
-    expect(
-      ['no_token', 'expired_token', 'token_rejected', 'rate_limited', 'probe_failed', 'unexpected_shape'],
-      `unknown degraded cause "${wire.cause}"`,
-    ).toContain(wire.cause);
-    expect(
-      wire.reason,
-      'the collapsed catch-all reason is the defect this endpoint was fixed for',
-    ).not.toMatch(/no token, expired token, or probe failed/i);
-    // The reason reaches the user, not just the wire.
-    expect(text).toContain(String(wire.reason));
-    // Nothing invented on a degraded path.
-    expect(wire.limits, 'degraded responses must not carry limits').toBeUndefined();
+    const windows = (provider.windows || []).filter((window: any) =>
+      typeof window.remaining_percent === 'number');
+    await expect(row.locator('[data-usage-window]')).toHaveCount(windows.length);
+    for (const window of windows) {
+      await expect(row).toContainText(window.label);
+    }
+    if (windows.length) {
+      await expect(row).toContainText(/%\s*left/);
+      if (windows.some((window: any) => window.resets_at)) {
+        // Relative duration plus a local wall clock: "in 1d 6h · Sun, Sep 7,
+        // 10:00 PM". Either half alone is the coarse UI being replaced.
+        await expect(row).toContainText(/Resets (?:in \d+[dhms](?: \d+[hms])? ·|due now ·) /);
+      }
+    }
   }
 
   // No credential material may ever reach the client on any branch.
   const wireText = JSON.stringify(wire);
-  expect(wireText).not.toMatch(/sk-ant|Bearer /);
+  expect(wireText).not.toMatch(/sk-ant|Bearer |accountId/);
 });
 
 // UN-FIXME'd 2026-08-11 (AMUX-2621). Both fixmes asserted these endpoints were
