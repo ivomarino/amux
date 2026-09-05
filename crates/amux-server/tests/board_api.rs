@@ -4954,3 +4954,97 @@ async fn the_needsyou_queue_ranks_a_passed_deadline_above_an_older_undated_card(
     // for live work the view dropped. That misreading is what this card came in as.
     assert!(v["archived_excluded"].is_number(), "excluded population is stated: {v}");
 }
+
+/// AF-506 — a gate refusal names the reassignment exit, not only the gate.
+///
+/// THE WIRING, not the wording. `reassign_exit`'s own cells read the STRINGS and
+/// all of them stay green if `gate_409` never calls it — the same shape that let
+/// two suites earlier today pass over a deleted call site. This drives a real
+/// refusal through the real handler and reads the response.
+///
+/// Reported by `backend` on MI-4155: a lane holding a card that is not its work
+/// had no honest state to move it to, and the refusal taught exactly one exit.
+#[tokio::test]
+async fn a_gate_refusal_offers_the_reassignment_exit_and_says_it_is_not_a_bypass() {
+    let (app, _dir) = app();
+    let card = create(&app, json!({
+        "title": "a card whose work belongs elsewhere", "status": "doing",
+        "desc": "artifact: crates/amux-server/src/api/board.rs",
+        "session": "mvs-infra",
+    })).await;
+    let id = card["id"].as_str().unwrap().to_string();
+
+    // A DIFFERENT lane trips the gate: the exit can name the owner.
+    let (st, _, v) = send_with(
+        &app, "PATCH", &format!("/api/board/{id}"),
+        Some(json!({ "status": "done", "evidence": EV })),
+        &[("X-Amux-Session", "backend")],
+    ).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let ex = &v["or_reassign"];
+    assert!(!ex.is_null(), "the refusal offers no reassignment exit at all: {v}");
+    assert!(
+        ex["how"].as_str().unwrap_or("").contains("mvs-infra"),
+        "the exit does not name the owning lane it could see: {v}"
+    );
+    assert!(
+        ex["not_a_bypass"].as_str().unwrap_or("").contains("does not skip the gate"),
+        "the exit reads as a way around the gate: {v}"
+    );
+    // The gate itself is untouched: this is offered BESIDE the refusal.
+    assert_eq!(v["kind"], json!("gate_blocked"), "{v}");
+    assert!(v["how_to_ack"]["gate_ack"] == json!(true), "{v}");
+}
+
+/// AF-506, second pass — EVERY refusal that blocks closing or reviewing a card
+/// offers the reassignment exit, not just the one it was written for.
+///
+/// Found by probing the LIVE server on the commit that added the exit to
+/// `gate_409`: `done_requires_asset_link` fires first, then
+/// `done_requires_evidence`, and only then the gate ack. A lane routing a card
+/// away hits whichever comes first and never reaches the one that had been
+/// taught. A fix verified only through the path it was written for would have
+/// shipped looking complete — the live probe is what caught it.
+///
+/// SCOPE, deliberately: refusals that block CLOSING or REVIEWING. The needs-you,
+/// blocked-must-name and todo-capacity refusals are excluded because supplying
+/// the ask or the reason IS their exit; reassignment there would be noise.
+#[tokio::test]
+async fn every_close_refusal_offers_the_reassignment_exit() {
+    let (app, _dir) = app();
+
+    // Each tuple walks one card further along the ladder, so a DIFFERENT
+    // refusal answers each time. The order is the order the server applies.
+    let cases: Vec<(&str, Value, &str)> = vec![
+        // No desc artifact at all -> the asset-link gate answers first.
+        ("done_requires_asset_link", json!({ "status": "done" }), ""),
+        // Artifact present, evidence missing -> the evidence gate answers.
+        (
+            "done_requires_evidence",
+            json!({ "status": "done" }),
+            "artifact: crates/amux-server/src/api/board.rs",
+        ),
+    ];
+
+    for (want_code, patch, desc) in cases {
+        let card = create(&app, json!({
+            "title": format!("card for {want_code}"), "status": "doing",
+            "desc": desc, "session": "mvs-infra",
+        })).await;
+        let id = card["id"].as_str().unwrap().to_string();
+        let (st, _, v) = send_with(
+            &app, "PATCH", &format!("/api/board/{id}"), Some(patch.clone()),
+            &[("X-Amux-Session", "backend")],
+        ).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{want_code}: {v}");
+        assert_eq!(v["code"], json!(want_code), "wrong refusal answered: {v}");
+        assert!(
+            v["or_reassign"]["how"].as_str().unwrap_or("").contains("mvs-infra"),
+            "{want_code} teaches only its own exit: {v}"
+        );
+        assert!(
+            v["or_reassign"]["not_a_bypass"].as_str().unwrap_or("").contains("does not skip"),
+            "{want_code}: the exit reads as a way around the refusal: {v}"
+        );
+    }
+}

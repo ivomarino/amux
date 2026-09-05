@@ -5000,12 +5000,138 @@ fn criterion_wants_a_name(c: &str) -> bool {
     c.to_lowercase().contains("name them")
 }
 
+/// The exit for a card whose WORK belongs to another lane (AF-506).
+///
+/// Reported by `backend`, hit live on MI-4155 during autonomous backlog triage.
+/// A lane holding a card that is not its work has no honest state to move it to:
+/// `backlog` re-feeds that same lane's auto-pickup, `todo` re-queues after a
+/// cooldown, `needsyou` reads as blocked on Ethan rather than on a peer, and
+/// `review` — which the DISPATCHER's own card text recommends — gates on acking
+/// "Implemented and self-tested" / "Diff / PR is up", which a card you are
+/// ROUTING AWAY cannot truthfully claim. Every move is a lie or a loop, which is
+/// ethos rule 3: a legitimate state with no truthful path forward.
+///
+/// The gate is RIGHT to refuse; what was missing is that the refusal knew only
+/// one way out. Reassignment is not a bypass and is deliberately kept out of the
+/// `or_force` family: it does not skip the gate, it moves the card to whoever
+/// the gate is asking about, and that lane satisfies it honestly.
+///
+/// Two wordings because two different things are true. When the caller is not
+/// the owner, the owner can be NAMED. When the caller IS the owner — backend's
+/// case, since the pickup had already assigned it to them — nothing here can
+/// tell whether the work belongs elsewhere, so it is stated as a conditional
+/// and the loop is spelled out. Neither wording asserts the card is misassigned
+/// (AF-169: a hint that cannot apply must not print as though it does).
+fn reassign_exit(card: &str, owner: Option<&str>, caller: &str) -> Value {
+    let owner = owner.map(str::trim).filter(|o| !o.is_empty());
+    let mine = owner.is_none_or(|o| o == caller);
+    if let (false, Some(o)) = (mine, owner) {
+        return json!({
+            "when": format!(
+                "This card is owned by {o:?}, not by you. If the work is theirs, you do not need to satisfy this gate at all — hand it back."
+            ),
+            "how": format!("amux board assign {card} {o} && amux board todo {card}"),
+            "effect": format!("dispatches to {o}, not to you"),
+            "not_a_bypass": "this does not skip the gate; it moves the card to the lane the gate is asking about, and they satisfy it honestly",
+        });
+    }
+    json!({
+        "when": "If this card's WORK belongs to another lane, hand it over instead of acking a criterion you cannot truthfully claim. You own it right now, so nothing here can tell whether that is the case — only you can.",
+        "how": format!("amux board assign {card} <owning-lane> && amux board todo {card}"),
+        "effect": "dispatches to THEM, not back to you. Moving it to `backlog` or `todo` while you still own it re-feeds your own auto-pickup and it returns.",
+        "not_a_bypass": "this does not skip the gate; it moves the card to the lane the gate is asking about, and they satisfy it honestly",
+    })
+}
+
+#[cfg(test)]
+mod reassign_exit_tests {
+    use super::*;
+
+    /// A card owned by someone else NAMES them, so the reader can evaluate the
+    /// advice without another call. This is the case the caller can act on
+    /// immediately.
+    #[test]
+    fn a_card_owned_by_a_peer_names_that_peer_in_the_command() {
+        let v = reassign_exit("MI-4155", Some("mvs-infra"), "backend");
+        assert!(v["when"].as_str().unwrap().contains("\"mvs-infra\""), "{v:#}");
+        assert!(
+            v["how"].as_str().unwrap() == "amux board assign MI-4155 mvs-infra && amux board todo MI-4155",
+            "{v:#}"
+        );
+        assert!(v["effect"].as_str().unwrap().contains("dispatches to mvs-infra"), "{v:#}");
+    }
+
+    /// THE REPORTED CASE. The pickup had already assigned MI-4155 to backend, so
+    /// they OWNED the card they needed to hand away. Nothing here can tell
+    /// whether the work belongs elsewhere, so it must be a conditional the
+    /// reader resolves — and it must name the loop, which is the part that cost
+    /// them two round trips.
+    #[test]
+    fn a_card_you_already_own_states_the_condition_and_names_the_loop() {
+        let v = reassign_exit("MI-4155", Some("backend"), "backend");
+        assert!(v["when"].as_str().unwrap().starts_with("If this card's WORK belongs"), "{v:#}");
+        assert!(v["when"].as_str().unwrap().contains("only you can"), "{v:#}");
+        assert!(
+            v["effect"].as_str().unwrap().contains("re-feeds your own auto-pickup"),
+            "the loop that sent the card back twice is not named: {v:#}"
+        );
+        assert!(v["how"].as_str().unwrap().contains("<owning-lane>"), "{v:#}");
+    }
+
+    /// An unowned card behaves like one you own: amux cannot name a peer, so it
+    /// must not pretend to. An empty or whitespace owner is the same state as
+    /// none, not a lane called "".
+    #[test]
+    fn an_unowned_card_never_invents_an_owner() {
+        for owner in [None, Some(""), Some("   ")] {
+            let v = reassign_exit("AF-1", owner, "amux-frustrations");
+            assert!(
+                v["how"].as_str().unwrap().contains("<owning-lane>"),
+                "owner {owner:?} produced a named command: {v:#}"
+            );
+        }
+    }
+
+    /// No run of spaces reaches the reader. Every string here is a Rust literal
+    /// spanning several source lines, and the difference between a continuation
+    /// that joins them and one that does not is invisible in the source and
+    /// obvious in the output — this shipped once, and it was a live probe that
+    /// showed "the                              gate is asking about".
+    #[test]
+    fn no_arm_leaks_source_indentation_into_the_text() {
+        for (owner, caller) in [(Some("peer"), "me"), (Some("me"), "me"), (None, "me")] {
+            let v = reassign_exit("AF-1", owner, caller);
+            for key in ["when", "how", "effect", "not_a_bypass"] {
+                let s = v[key].as_str().unwrap_or_default();
+                assert!(
+                    !s.contains("  "),
+                    "{owner:?}/{key} carries source indentation into the reader's text: {s:?}"
+                );
+            }
+        }
+    }
+
+    /// It is NOT a bypass, and every arm says so. The `force` family skips the
+    /// gate; this moves the card to the lane the gate is asking about, and that
+    /// distinction is the whole reason this can be offered beside a refusal
+    /// without weakening it.
+    #[test]
+    fn every_arm_says_it_is_not_a_bypass() {
+        for (owner, caller) in [(Some("peer"), "me"), (Some("me"), "me"), (None, "me")] {
+            let v = reassign_exit("AF-1", owner, caller);
+            let s = v["not_a_bypass"].as_str().unwrap_or("");
+            assert!(s.contains("does not skip the gate"), "{owner:?}: {v:#}");
+        }
+    }
+}
+
 fn gate_409(
     row: &IssueRow,
     eff_gate: &[String],
     target_raw: &str,
     wb: &[amux_core::board::WhyBlocked],
     gate_source: Option<&bs::GateSource>,
+    caller_lane: &str,
 ) -> Value {
     let checked_args = eff_gate
         .iter()
@@ -5063,6 +5189,11 @@ fn gate_409(
         "item": row.id,
         "item_type": row.item_type,
         "how_to_ack": how_to_ack,
+        // AF-506. The refusal used to teach exactly one exit — satisfy the gate —
+        // so a lane holding someone else's card had to rediscover reassignment or
+        // pick a dead end. Same mechanism as `how_to_ack`: the response already
+        // knows how to teach a CLI invocation.
+        "or_reassign": reassign_exit(&row.id, row.session.as_deref(), caller_lane),
         "cli": format!("amux board {target_raw} {} --checked {checked_args}", row.id),
         "valid_types": bs::KNOWN_TYPES,
         "kind": "gate_blocked",
@@ -6236,7 +6367,7 @@ pub async fn patch_item(
                                 &slot_w,
                                 PatchOut::Refused(
                                     StatusCode::CONFLICT,
-                                    gate_409(&next, &eff_gate, &target_raw, &[], None),
+                                    gate_409(&next, &eff_gate, &target_raw, &[], None, &caller_lane),
                                 ),
                                 no_write(),
                             );
@@ -6397,6 +6528,9 @@ pub async fn patch_item(
                                             "blocked": true,
                                             "item": next.id,
                                             "detail": msg,
+                                            "or_reassign": reassign_exit(
+                                                &next.id, next.session.as_deref(), &caller_lane,
+                                            ),
                                         }),
                                     ),
                                     no_write(),
@@ -6499,6 +6633,9 @@ pub async fn patch_item(
                                         "blocked": true,
                                         "item": next.id,
                                         "attempted_status": target_raw,
+                                        "or_reassign": reassign_exit(
+                                            &next.id, next.session.as_deref(), &caller_lane,
+                                        ),
                                         "why": "A card cannot be marked done without pointing at the artifact it produced: a URL, a repo file path, a commit sha, or a #PR/issue. This is a global constraint and gate_ack cannot satisfy it.",
                                         "how_to_fix": {
                                             "add_link": "PATCH /api/board/<id> with a desc containing the URL / file path / commit / #PR, then retry done.",
@@ -6586,6 +6723,18 @@ pub async fn patch_item(
                                         "attempted_status": target_raw,
                                         "why": why,
                                         "recorded_evidence": next.evidence,
+                                        // AF-506, second pass. This refusal fires
+                                        // BEFORE the gate-ack one, so a lane routing
+                                        // a card away hits it FIRST and never sees the
+                                        // exit added to gate_409 — measured against the
+                                        // live server on the very commit that added it.
+                                        // Same friction (a refusal that teaches one way
+                                        // out), same remedy: if the work is another
+                                        // lane's, you should not be closing this card at
+                                        // all.
+                                        "or_reassign": reassign_exit(
+                                            &next.id, next.session.as_deref(), &caller_lane,
+                                        ),
                                         "how_to_fix": {
                                             "cli": format!("amux board done {} --evidence-stdin  (heredoc; inline text is evaluated by YOUR shell)", next.id),
                                             "api": "PATCH /api/board/<id> with {\"evidence\": \"...\"} — writable on its own, so record it first and the transition cannot discard it",
@@ -7100,7 +7249,7 @@ pub async fn patch_item(
                                     &slot_w,
                                     PatchOut::Refused(
                                         StatusCode::CONFLICT,
-                                        gate_409(&next, &eff_gate, &target_raw, &wb, gate_src.as_ref()),
+                                        gate_409(&next, &eff_gate, &target_raw, &wb, gate_src.as_ref(), &caller_lane),
                                     ),
                                     no_write(),
                                 );
@@ -7212,7 +7361,7 @@ pub async fn patch_item(
                                 &slot_w,
                                 PatchOut::Refused(
                                     StatusCode::CONFLICT,
-                                    gate_409(&next, &eff_gate, &target_raw, &wb, gate_src.as_ref()),
+                                    gate_409(&next, &eff_gate, &target_raw, &wb, gate_src.as_ref(), &caller_lane),
                                 ),
                                 no_write(),
                             );
@@ -7322,7 +7471,7 @@ pub async fn patch_item(
                                 &slot_w,
                                 PatchOut::Refused(
                                     StatusCode::CONFLICT,
-                                    gate_409(&next, &eff_gate, &target_raw, &blocked, gate_src.as_ref()),
+                                    gate_409(&next, &eff_gate, &target_raw, &blocked, gate_src.as_ref(), &caller_lane),
                                 ),
                                 no_write(),
                             );

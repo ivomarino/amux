@@ -580,6 +580,10 @@ async fn async_main() {
         );
     }
 
+    // Captured BEFORE the router takes `state` by value: the browser reaper is
+    // spawned further down (after the listener is up) and now needs the store to
+    // tell a lane its browser was released (AF-497).
+    let reaper_store = state.store.clone();
     let app = api::router(state);
 
     // SNI dual-cert: Tailscale LE cert for the tailnet hostname, self-signed
@@ -816,7 +820,7 @@ async fn async_main() {
     // RELEASE IDLE BROWSERS (AMUX-3829, Ethan: "it should clean up
     // automatically after idle use"). Nothing reaped one before, which is how a
     // browser sat 18.1h with zero tabs and blocked him.
-    runtime_jobs::browser_reaper::spawn();
+    runtime_jobs::browser_reaper::spawn(reaper_store);
 
     // MAC PROCESS HEALTH (2026-08-30). Reaps orphaned Ray workers and logs
     // when the claude-process count exceeds the ceiling. Neither the browser

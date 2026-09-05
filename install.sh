@@ -563,6 +563,20 @@ if [[ "${AMUX_NO_FLEET_START:-}" != "1" ]]; then
 PLIST
   launchctl_reload_agent "$FLEET_LABEL" "$FLEET_PLIST"
   say "launchd agent loaded: $FLEET_LABEL (starts every non-archived worker at login; log: $AMUX_HOME/logs/fleet-boot.log)"
+  # AF-498: say what "at login" EXCLUDES. A LaunchAgent loads when a human logs
+  # into the GUI, so an UNATTENDED reboot — an OS auto-update at 2am is the
+  # specimen — brings the machine back with the whole fleet down and starts
+  # nothing until someone sits down. Reported live: "an iOS update automatically
+  # at like 2 a.m. So everything stopped." Nobody reading "starts at login" hears
+  # "and not after an overnight update", so it is said here rather than left to
+  # be discovered. Automatic login is the fix and it is a MACHINE setting with a
+  # real trade-off (an unattended Mac boots to an unlocked desktop), so it is
+  # named as the human's choice, not turned on.
+  say "  NOTE: launchd agents load at GUI LOGIN, not at boot. After an unattended"
+  say "  reboot (an overnight OS update) the fleet stays down until you log in."
+  say "  fleet-boot logs the size of that window every time it runs. To close it,"
+  say "  enable automatic login in System Settings > Users & Groups — your call:"
+  say "  it means this Mac boots to an unlocked desktop."
 fi
 
 # ── 6. Wait for /health ─────────────────────────────────────────────────────

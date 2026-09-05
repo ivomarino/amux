@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 
 HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "git-shared-guard.py")
 
@@ -194,6 +195,66 @@ def main():
         # a matrix that never names the flag cannot see it.
         ("amend unpushed unpinned -C HEAD", "git commit --amend -C HEAD", True),
         ("amend unpushed unpinned -C sha", f"git commit --amend --no-verify -C {head}", True),
+        # A GLOBAL FLAG BEFORE THE SUBCOMMAND HID IT ENTIRELY (AF-489). The two
+        # cases above fixed the run_dir RESOLVER; the amend DETECTOR still
+        # allowed only `(?:-C\s+\S+\s+)?` in front of `commit`, so any other
+        # global flag meant the regex never matched and the verdict never ran.
+        # A resolver that mis-resolves gives a wrong answer; a detector that
+        # misses is a silent pass. Same reason the flag survived above: every
+        # case in this matrix spelled the amend with NO global flag at all.
+        ("amend unpushed, -c before subcommand",
+         "git -c user.name=x commit --amend --no-edit", True),
+        ("amend unpushed, repeated -c",
+         "git -c a=b -c c=d commit --amend --no-edit", True),
+        ("amend unpushed, --no-pager global",
+         "git --no-pager commit --amend --no-edit", True),
+        ("amend unpushed, -c then -C",
+         f"git -c a=b -C {work} commit --amend --no-edit", True),
+        ("amend unpushed, --git-dir= attached",
+         f"git --git-dir={work}/.git commit --amend --no-edit", True),
+        # NEGATIVE CONTROLS for the widened prefix. It must not start matching a
+        # command that is not an amend, or the guard blocks ordinary reads.
+        ("plain commit is not an amend", "git commit -m 'no amend here'", False),
+        ("git log is not an amend", "git -c a=b log --oneline", False),
+        ("diff -C is copy detection, not a global", "git diff -C -- a b", False),
+        # THE CELL THAT PINS "STOPS AT THE FIRST BARE WORD". The three negatives
+        # above are held by the literal `commit` anchor, not by the prefix, so a
+        # prefix loosened to accept ANY token still passes them — measured, by
+        # mutating `--?[A-Za-z]...` to `\S+` and watching all 126 stay green.
+        # Only a case where a DIFFERENT subcommand precedes the anchor can tell
+        # the two apart, which is what this is. git's own grammar ends the global
+        # section at the first bare word, and the comment in the guard claims
+        # exactly that; without this cell the claim is unenforced prose.
+        ("a different subcommand is not a global flag",
+         "git log commit --amend", False),
+        # THE TREE-WIDE TABLE, which the first GIT_GLOBALS pass left on the
+        # narrow prefix (AF-490). Reported by mixpeek-frustrations and
+        # reproduced against the live hook before the fix: one global flag and
+        # the tree-wide discard of ~50 lanes' uncommitted work was unguarded.
+        #   git --no-pager reset --hard          exit 0
+        #   git -c a=b reset --hard              exit 0
+        #   git --literal-pathspecs reset --hard exit 0
+        #   git --no-pager clean -fd             exit 0
+        #   git --no-pager checkout -- .         exit 0
+        ("reset --hard behind --no-pager", "git --no-pager reset --hard", True),
+        ("reset --hard behind -c", "git -c a=b reset --hard", True),
+        ("reset --hard behind --literal-pathspecs",
+         "git --literal-pathspecs reset --hard", True),
+        ("clean -fd behind --no-pager", "git --no-pager clean -fd", True),
+        ("checkout -- . behind --no-pager", "git --no-pager checkout -- .", True),
+        ("stash drop behind -c", "git -c a=b stash drop", True),
+        ("add . behind --no-pager", "git --no-pager add .", True),
+        # THE LOOKAHEAD DIRECTION mixpeek-frustrations flagged: GIT_GLOBALS ends
+        # in a general dash-token arm that can also match a SUBCOMMAND flag, so
+        # `git stash --quiet pop` could have the prefix eat `--quiet` before the
+        # negative lookahead reads the verb. The failure direction there is a
+        # FALSE REFUSAL on `pop`, which is the one verb people use to RECOVER
+        # work, so it gets its own cells rather than a note.
+        ("stash pop still passes", "git stash pop", False),
+        ("stash pop behind a global still passes", "git --no-pager stash pop", False),
+        ("stash pop behind a subcommand flag still passes",
+         "git stash --quiet pop", False),
+        ("stash apply still passes", "git -c a=b stash apply", False),
         ("amend unpushed pinned -C HEAD", f"AMUX_AMEND_EXPECT={head} git commit --amend -C HEAD", False),
         # Copy detection is the same collision on a read-only verb: harmless in
         # itself, and it proves the fix is about WHERE -C sits, not about amend.
@@ -544,8 +605,185 @@ def main():
                    "BLOCK" if _rc != 0 else "ALLOW", _cmd))
     _subst = len(subst)
 
+    # ---- .git/index.lock is REPORTED on the ordinary path (AF-503 / MF-842) ----
+    # A stale zero-byte lock blocked every index write on ~/Dev/mixpeek for 15+
+    # minutes and nothing detected it; two lanes routed around it with temp-index
+    # grafts before anyone understood the cause. The guard reports; it never
+    # blocks or removes, because removing a lock on a shared checkout is the
+    # human's call.
+    _lock = os.path.join(work, ".git", "index.lock")
+    _lockcases = 0
+
+    def _note_for(command):
+        _rc, _err = run_hook(command, work, tmp)
+        return _rc, _err
+
+    # 1. NO LOCK: silent. Otherwise every commit on a healthy checkout gets noise.
+    _lockcases += 1
+    _rc, _err = _note_for("git commit -m x")
+    if "index.lock" in _err:
+        failures.append("lock-note: fired with no lock present: %r" % _err[:160])
+
+    # 2. STALE (0 bytes, aged past the threshold, no holder): full verdict.
+    open(_lock, "w").close()
+    _old = time.time() - 1200
+    os.utime(_lock, (_old, _old))
+    for _n, _c, _want in (
+        ("commit sees it", "git commit -m x", True),
+        ("add sees it", "git add f.txt", True),
+        # A command that does NOT write the index must stay silent, or the note
+        # becomes noise on every push in a repo with a live commit in flight.
+        ("push does not", "git push origin main", False),
+        ("log does not", "git log --oneline", False),
+    ):
+        _lockcases += 1
+        _rc, _err = _note_for(_c)
+        if ("index.lock" in _err) != _want:
+            failures.append("lock-note/%s: expected note=%s for %r, got %r"
+                            % (_n, _want, _c, _err[:160]))
+
+    # 3. THE VERDICT NAMES ITS EVIDENCE, or it is just a restatement of git's own
+    #    generic message, which is the thing being fixed.
+    _lockcases += 1
+    _rc, _err = _note_for("git commit -m x")
+    for _needle in ("age ", "0 bytes", "holder:", "YOUR call"):
+        if _needle not in _err:
+            failures.append("lock-note: verdict omits %r: %r" % (_needle, _err[:220]))
+    _lockcases += 1
+    if _rc != 0:
+        failures.append("lock-note must REPORT, never block: rc=%s" % _rc)
+
+    # 4. A HOLDER PROBE THAT CANNOT RUN MUST SAY SO. mixpeek-frustrations lost ten
+    #    minutes to `lsof f 2>/dev/null || echo no holder`, which printed the
+    #    reassuring branch because lsof is not on PATH here. An absent tool's
+    #    negative must never read as "unheld", or a future reaper deletes live
+    #    locks on a box without lsof.
+    _lockcases += 1
+    _rc, _err = _note_for("git commit -m x")
+    if "unheld" in _err and "no process holds it open" not in _err:
+        failures.append("lock-note: claimed unheld without the probe having run")
+
+    # 5. THE ABSENT-TOOL BRANCH, reached with AMUX_LSOF pointed at nothing. It
+    #    cannot be reached any other way on a box that HAS lsof, and it is the
+    #    branch that decides whether a future reaper deletes a LIVE lock. It must
+    #    say `unmeasured` and must NOT say `unheld`.
+    _lockcases += 1
+    _rc, _err = run_hook("git commit -m x", work, tmp,
+                         extra_env={"AMUX_LSOF": "/nonexistent/lsof"})
+    if "unmeasured" not in _err or "did NOT run" not in _err:
+        failures.append("lock-note: an absent lsof did not report unmeasured: %r" % _err[:220])
+    if "no process holds it open" in _err:
+        failures.append("lock-note: an absent lsof reported the lock UNHELD: %r" % _err[:220])
+    os.unlink(_lock)
+
+    # ------------------------------------------------------------------
+    # AF-507 — a bare `git commit` that would sweep index-vs-frozen-HEAD drift
+    #
+    # backend, 2026-09-04: `git add <file>` hit a peer's index.lock and failed,
+    # so their file was never staged. The follow-up bare `git commit -m` then
+    # committed the whole index-vs-HEAD drift — 1120 files, +67067/-6296 — under
+    # their message. `git reset --soft HEAD~1` to undo it was blocked by this
+    # same guard, correctly. The guard blocked the fix and not the cause.
+    #
+    # The fixture reproduces the graft-push shape exactly: HEAD detached at an
+    # OLD commit while the index carries origin/main. That is what makes the
+    # staged set huge and its files identical to origin.
+    _sweep = 0
+    _so = os.path.join(tmp, "sweeporigin.git")
+    _sw = os.path.join(tmp, "sweepwork")
+    subprocess.run(["git", "init", "--bare", "-q", "-b", "main", _so])
+    subprocess.run(["git", "clone", "-q", _so, _sw], capture_output=True)
+    git(_sw, "config", "user.email", "t@t")
+    git(_sw, "config", "user.name", "t")
+    open(os.path.join(_sw, "base.txt"), "w").write("base\n")
+    git(_sw, "add", "base.txt")
+    git(_sw, "commit", "-q", "-m", "base")
+    _old = git(_sw, "rev-parse", "HEAD")
+    for _i in range(40):
+        open(os.path.join(_sw, f"drift{_i}.txt"), "w").write(f"{_i}\n")
+    git(_sw, "add", "-A")
+    git(_sw, "commit", "-q", "-m", "40 files that are NOT this lane's work")
+    git(_sw, "push", "-q", "origin", "main")
+
+    def _sweep_hook(cmd, cwd, env=None):
+        e = dict(os.environ, AMUX_SHARED_CHECKOUTS=cwd)
+        e.update(env or {})
+        p = subprocess.run(
+            [sys.executable, HOOK],
+            input=json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": cwd}),
+            capture_output=True, text=True, env=e, timeout=40)
+        return p.returncode, p.stderr
+
+    # THE SPECIMEN: HEAD frozen at `base`, index carrying origin/main.
+    git(_sw, "checkout", "-q", "--detach", _old)
+    git(_sw, "read-tree", "origin/main")
+
+    _sweep += 1
+    _rc, _err = _sweep_hook("git commit -m 'my one-line fix'", _sw)
+    if _rc != 2:
+        failures.append(
+            "AF-507/sweep: a bare commit over 40 drift files was ALLOWED (rc=%s). "
+            "This is the reported incident's exact shape. stderr: %r" % (_rc, _err[:300]))
+    elif "already match origin/main" not in _err:
+        failures.append(
+            "AF-507/sweep-why: the refusal does not say the files already match origin, "
+            "which is the whole reason they are not the caller's work: %r" % _err[:300])
+
+    # RULE 1 ALONE — a PATHSPEC commit over the same index must PASS. `git commit
+    # <paths>` ignores the index for everything it does not name, so the drift
+    # cannot ride along. Without this cell the guard is a ban on committing at
+    # all while HEAD lags, which is the state every graft-push lane is in.
+    _sweep += 1
+    _rc, _err = _sweep_hook("git commit base.txt -m 'my one-line fix'", _sw)
+    if _rc != 0:
+        failures.append(
+            "AF-507/pathspec: a path-scoped commit was blocked (rc=%s). The drift cannot "
+            "ride along on a pathspec commit. stderr: %r" % (_rc, _err[:300]))
+
+    _sweep += 1
+    _rc, _err = _sweep_hook("git commit -m x -- base.txt", _sw)
+    if _rc != 0:
+        failures.append(
+            "AF-507/dashdash: an explicit `-- <path>` commit was blocked (rc=%s): %r"
+            % (_rc, _err[:300]))
+
+    # THE PIN. A number, not a switch, so the escape requires having run the
+    # count — the same protocol as AMUX_AMEND_EXPECT.
+    _sweep += 1
+    _rc, _err = _sweep_hook("git commit -m x", _sw,
+                            env={"AMUX_ALLOW_SWEEP_COMMIT": "40"})
+    if _rc != 0:
+        failures.append(
+            "AF-507/pin: the correct drift count did not release the commit (rc=%s): %r"
+            % (_rc, _err[:300]))
+
+    _sweep += 1
+    _rc, _err = _sweep_hook("git commit -m x", _sw,
+                            env={"AMUX_ALLOW_SWEEP_COMMIT": "1"})
+    if _rc != 2 or "does not match" not in _err:
+        failures.append(
+            "AF-507/pin-wrong: a WRONG pin was accepted (rc=%s). A pin that any number "
+            "satisfies is a switch, and a switch gets set once and never read: %r"
+            % (_rc, _err[:300]))
+
+    # RULE 2 ALONE — THE CONTROL, and the cell that keeps this from being a
+    # file-count ban. HEAD == origin/main, 40 genuinely NEW files staged. Same
+    # size, no drift, and it must PASS. Without it, a real 40-file refactor is
+    # refused and the guard trains people to set the pin reflexively.
+    _sweep += 1
+    git(_sw, "checkout", "-q", "main")
+    git(_sw, "reset", "-q", "--hard", "origin/main")
+    for _i in range(40):
+        open(os.path.join(_sw, f"mine{_i}.txt"), "w").write(f"real work {_i}\n")
+    git(_sw, "add", "-A")
+    _rc, _err = _sweep_hook("git commit -m 'a genuine 40-file change'", _sw)
+    if _rc != 0:
+        failures.append(
+            "AF-507/control: a genuine 40-file commit with NO drift was blocked (rc=%s). "
+            "The signal is drift, not size. stderr: %r" % (_rc, _err[:300]))
+
     total = (len(cases) + len(trio) + len(quad) + len(matrix) + _bodies + 1
-             + len(redir_cases) + _mr101 + _subst)
+             + len(redir_cases) + _mr101 + _subst + _lockcases + _sweep)
     if failures:
         print(f"FAIL {len(failures)}/{total}:")
         for f in failures:

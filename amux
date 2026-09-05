@@ -2640,6 +2640,37 @@ depends_on contains 1-based indexes of earlier tasks. Priority is p0 (highest) t
           *) die "amux board artifact: unexpected argument '$1'" ;;
         esac
       done
+      # A BARE COMMIT SHA IS A TOKEN NOBODY CAN OPEN (AF-493).
+      #
+      # Ethan, watching Doron hunt for a file a task had produced: "every task
+      # should have some kind of output ... Produced asset. So that's just an ID.
+      # But in an ideal world that has, like, a path to the actual file that was
+      # produced."
+      #
+      # Measured on the live board: 783 artifacts, and 399 of them (51%) render
+      # as a token with nothing to open. 301 are bare commit shas. The dashboard
+      # renderer is not at fault — it already links a URL and opens a path — the
+      # REF is simply not a thing you can open.
+      #
+      # A sha is resolvable, unlike an opaque id, so resolve it HERE where the
+      # repo context exists and put the subject and the touched paths in the
+      # description, which the card already renders under the ref. One artifact,
+      # not N: registering a row per file would turn one commit into fifty rows
+      # and bury the card's other assets.
+      #
+      # Only when the caller supplied no description of their own, and only when
+      # the ref really resolves to a commit in this repo. Anything else leaves
+      # the artifact exactly as it was.
+      if [[ -z "$description" ]] && [[ "$ref" =~ ^[0-9a-f]{7,40}$ ]]          && git rev-parse --verify --quiet "${ref}^{commit}" >/dev/null 2>&1; then
+        local _subj _files _n
+        _subj=$(git log -1 --format=%s "$ref" 2>/dev/null)
+        _n=$(git show --stat --format= --name-only "$ref" 2>/dev/null | grep -c . || true)
+        # `paste -sd', '` alternates the two delimiter chars rather than using
+        # both, so it yields `a,b c,d`. One delimiter, then space it.
+        _files=$(git show --stat --format= --name-only "$ref" 2>/dev/null | head -6 | paste -sd'|' - | sed 's/|/, /g')
+        [[ "$_n" -gt 6 ]] && _files="$_files, +$((_n - 6)) more"
+        [[ -n "$_files" ]] && description="$_subj — $_n file(s): $_files"
+      fi
       local body result
       body=$(R="$ref" K="$kind" S="$state" D="$description" python3 -c 'import json,os
 b={"ref":os.environ["R"],"kind":os.environ["K"],"state":os.environ["S"]}
@@ -3968,6 +3999,64 @@ EOH
   esac
 }
 
+cmd_browser() {
+  # AF-496. amux launches Chrome into its own --user-data-dir, so the window it
+  # opens sits beside the human's own Chrome and looks identical. Measured in a
+  # live onboarding session (2026-09-04): the user signed into the wrong window
+  # and was corrected three times. amux knows which window is its own — pid, CDP
+  # port, profile, starting lane — and had no way to SHOW it.
+  local AMUX_API="${AMUX_API:-$(cmd_url)}"
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    identify|id|which)
+      local profile="${1:-}"
+      local body='{}'
+      [[ -n "$profile" ]] && body=$(printf '{"profile":"%s"}' "$profile")
+      local resp
+      resp=$(_curl -sk -m 30 -X POST -H 'Content-Type: application/json' \
+        -H "X-Amux-Session: ${AMUX_SESSION:-}" -d "$body" \
+        "$AMUX_API/api/browser/identify" 2>/dev/null) || resp=""
+      [[ -z "$resp" ]] && die "amux server unreachable at ${AMUX_API}"
+      RESP="$resp" python3 - <<'PYEOF'
+import json, os, sys
+try:
+    d = json.loads(os.environ["RESP"])
+except Exception:
+    print(os.environ["RESP"]); sys.exit(1)
+if d.get("error"):
+    print("identify FAILED:", d["error"])
+    if d.get("running_profiles"):
+        print("  running profiles:", ", ".join(d["running_profiles"]))
+    if d.get("hint"):
+        print(" ", d["hint"])
+    sys.exit(1)
+for b in d.get("identified", []):
+    raised = "raised" if b.get("raised") else (
+        b.get("raise_error") or ("not raised (several windows)" if not d.get("raised") else "raise not supported here"))
+    print(f"  {b['profile']}  pid={b['pid']}  cdp={b['cdp_port']}  "
+          f"started-by={b.get('started_by') or '?'}  "
+          f"labelled {b.get('labeled', 0)}/{b.get('pages', 0)} tab(s)  [{raised}]")
+    for e in b.get("errors", []):
+        print("    !", e)
+print(d.get("verdict", ""))
+PYEOF
+      ;;
+    ""|help|-h|--help)
+      cat <<'EOF'
+amux browser identify [profile]   — make the amux Chrome window say it is the amux window
+
+  With no profile: every running amux browser draws a blue bar naming its
+  profile, and none is raised. A Chrome window WITHOUT a bar is the human's own.
+  With a profile:  that one is labelled AND brought to the front.
+
+  Use it before asking anyone to sign in. amux opens a second Chrome beside
+  their own and the two are visually identical.
+EOF
+      ;;
+    *) die "amux browser: unknown subcommand '$sub' (try: identify)" ;;
+  esac
+}
+
 cmd_help() {
   cat <<EOF
 ${BOLD}amux${RESET} — phone-friendly Claude Code worker manager ${DIM}v${CC_VERSION}${RESET}
@@ -4034,6 +4123,13 @@ ${BOLD}Board:${RESET}
   amux board doing <ID>          Mark issue as in progress
   amux board todo <ID>           Mark issue as todo
   amux board status <ID> <s>     Set any status
+
+${BOLD}Browser:${RESET}
+  amux browser identify [prof]   Make the amux Chrome window say it IS the amux
+                                 window: a blue bar naming the profile, and the
+                                 window raised when you name one. ${DIM}Run it before${RESET}
+                                 ${DIM}asking anyone to sign in — amux opens a SECOND${RESET}
+                                 ${DIM}Chrome beside their own and they look identical.${RESET}
 
 ${BOLD}Tunnel (public HTTPS URL for any localhost port — needs amux cloud):${RESET}
   amux tunnel status             Show tunnel state and public URL
@@ -4505,6 +4601,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     stop-all)         cmd_stop_all ;;
     serve|web)        shift; cmd_serve "$@" ;;
     board|b)          shift; cmd_board "$@" ;;
+    browser|br)      shift; cmd_browser "$@" ;;
     crm)              shift; cmd_crm "$@" ;;
     tunnel|t)         shift; cmd_tunnel "$@" ;;
     alert)            shift; cmd_alert "$@" ;;

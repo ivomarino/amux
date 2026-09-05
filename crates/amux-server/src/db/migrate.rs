@@ -327,15 +327,20 @@ const MIGRATIONS: &[Migration] = &[
         name: "0055_issue_callbacks",
         sql: include_str!("../../migrations/0055_issue_callbacks.sql"),
     },
-    // Renumbered from 0033/0035/0049/0050/0054/0055 across successive
-    // rebases onto main (last: 2026-09-04): main's own migrations kept
-    // claiming those slots first (most recently 0055_issue_callbacks), so
+    Migration {
+        version: 56,
+        name: "0056_search_prompts",
+        sql: include_str!("../../migrations/0056_search_prompts.sql"),
+    },
+    // Renumbered from 0033/0035/0049/0050/0054/0055/0056 across successive
+    // rebases onto main (last: 2026-09-05): main's own migrations kept
+    // claiming those slots first (most recently 0056_search_prompts), so
     // this PR's secret_metadata migration keeps moving to the next free
     // version.
     Migration {
-        version: 56,
-        name: "0056_secret_metadata",
-        sql: include_str!("../../migrations/0056_secret_metadata.sql"),
+        version: 57,
+        name: "0057_secret_metadata",
+        sql: include_str!("../../migrations/0057_secret_metadata.sql"),
     },
 ];
 

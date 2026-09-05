@@ -358,6 +358,14 @@ jobs:
           # is the control that keeps A honest (agreement must stay silent and
           # green), and F separates a genuine `0 started` from a failed parse.
           ./scripts/test-fleet-boot-divergence.sh
+          # AF-498: a LaunchAgent loads at GUI LOGIN, not at boot, so an
+          # unattended reboot (an OS auto-update overnight) leaves every worker
+          # down until a human sits down. fleet-boot's log begins when it RUNS,
+          # so that window used to leave no trace anywhere. The three cells drive
+          # the arms through AMUX_FLEET_BOOT_EPOCH; cell 2 is the control that
+          # keeps the warning from becoming a constant, and cell 3 keeps an
+          # unreadable boot time from reading as zero.
+          ./scripts/test-fleet-boot-login-gap.sh
           # AMUX-3989: the playwright-mcp wrapper must name a VERSION. `@latest`
           # put an upstream release on the fleet with no amux commit behind it —
           # measured 08-31, the npx cache held 0.0.68 while @latest resolved to

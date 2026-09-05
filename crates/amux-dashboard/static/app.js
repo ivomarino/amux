@@ -2957,6 +2957,7 @@ function updatePeekStatus() {
   if (!el || !peekSession) { if (el) el.innerHTML = ''; return; }
   const s = sessions.find(s => s.name === peekSession);
   if (!s) { el.innerHTML = ''; return; }
+  _renderPeekWorkerActions(s);
   let badge = '';
   // NAME · STATUS · MODEL, and nothing else (Ethan, 2026-08-11: "top we only
   // need the task name, status and model"). `_liveWorkLine` used to append the
@@ -3230,6 +3231,147 @@ async function _grpSchedFetch(g) {
   } catch (e) {}
 }
 
+// One inventory for every worker-level action/configuration entry point. The
+// card and peek used to carry independent menus: 25 actions on the card, two in
+// peek, including two different meanings of "File browser". Keep dynamic
+// labels and provider/running predicates here so adding or removing an action
+// changes both surfaces in the same edit.
+function _workerActionDefinitions(s) {
+  const name = escJs(s.name);
+  const provider = sessionProvider(s);
+  const model = sessionConfiguredModel(s);
+  const effort = provider === 'claude' ? flagValue(s.flags || '', '--effort') : '';
+  return [
+    { key: 'task-label', icon: '&#x270F;', label: 'Task label' + (s.task_override ? '' : ' (none)'),
+      run: "editField('" + name + "','task','" + escJs(s.task_override || '') + "')" },
+    { separator: true },
+    { key: 'peek-terminal', icon: '&#x1F4BB;', label: 'Peek terminal',
+      run: "closeAllMenus();openPeek('" + name + "')" },
+    { key: 'read-latest', icon: '&#x1F50A;', label: 'Read latest message',
+      run: "closeAllMenus();_readLatestMessage('" + name + "')" },
+    s.dir ? { key: 'browse-files', icon: '&#x1F4C1;', label: 'Browse files',
+      run: "_browseWorkerFiles('" + name + "','worker-menu')" } : null,
+    { key: 'info', icon: '&#x2139;', label: 'Info',
+      run: "closeAllMenus();showSessionInfo('" + name + "')" },
+    { key: 'pin', icon: '&#x1F4CC;', label: s.pinned ? 'Unpin' : 'Pin to top',
+      run: "togglePin('" + name + "')" },
+    { key: 'rename', icon: '&#x270E;', label: 'Rename',
+      run: "editField('" + name + "','name','" + name + "')" },
+    { key: 'provider', icon: '&#x21C4;', label: 'Provider: ' + providerLabel(provider),
+      run: "editField('" + name + "','provider','" + escJs(provider) + "')" },
+    { key: 'model', icon: '&#x2699;', label: 'Model' + (model ? ': ' + model : ''),
+      run: "editField('" + name + "','model','" + escJs(model || '') + "','" + escJs(provider) + "')" },
+    provider === 'claude' ? { key: 'effort', icon: '&#x1F9E0;',
+      label: 'Effort' + (effort ? ': ' + effort : ' (default)'),
+      run: "editField('" + name + "','effort','" + escJs(effort || '') + "','" + escJs(provider) + "')" } : null,
+    { key: 'yolo', icon: s.yolo ? '&#x2611;' : '&#x2610;', label: 'YOLO mode',
+      run: "toggleYolo('" + name + "')" },
+    { key: 'isolated', icon: s.isolated ? '&#x2611;' : '&#x2610;',
+      label: 'Isolated (raw agent, no amux harness)',
+      title: 'Run as a raw agent: just tmux plus the CLI, no amux harness, hidden from peers. The owner can still peek and send.',
+      run: "toggleIsolated('" + name + "')" },
+    { key: 'description', icon: '&#x1F4DD;', label: 'Description',
+      run: "editField('" + name + "','desc','" + escJs(s.desc || '') + "')" },
+    // `tags` is the API field. "Groups" is only the display vocabulary; using
+    // the label as the field name once made Save silently do nothing.
+    { key: 'groups', icon: '&#x1F3F7;', label: 'Groups',
+      run: "editField('" + name + "','tags','" + escJs((s.tags || []).join(', ')) + "')" },
+    { key: 'auto-drain', icon: s.auto_drain_backlog ? '&#x2611;' : '&#x2610;', label: 'Auto-drain backlog',
+      title: 'When this worker runs out of todo cards, pull its oldest eligible backlog card into todo automatically. Human, trigger, and dependency blocks stay parked.',
+      run: "toggleAutoDrain('" + name + "')" },
+    { key: 'spans-groups', icon: s.spans_groups ? '&#x2611;' : '&#x2610;',
+      labelHtml: 'Spans groups' + _spansLabel(s),
+      title: 'Let this worker message workers in other groups according to its resolved cross-group configuration.',
+      run: "toggleSpansGroups('" + name + "')" },
+    { key: 'directory', icon: '&#x1F4C1;', label: 'Directory',
+      run: "editField('" + name + "','dir','" + escJs(s.dir || '') + "')" },
+    s.running ? { key: 'restart', icon: '&#x21BB;', label: 'Restart',
+      run: "closeAllMenus();doRestart('" + name + "')" } : null,
+    s.running ? { key: 'stop', icon: '&#x23F9;', label: 'Stop',
+      run: "closeAllMenus();doStop('" + name + "')" } : null,
+    s.running ? { key: 'clear-scrollback', icon: '&#x239A;', label: 'Clear scrollback',
+      run: "clearScrollback('" + name + "')" } : null,
+    { key: 'duplicate', icon: '&#x2398;', label: 'Duplicate',
+      run: "duplicateSession('" + name + "')" },
+    { key: 'new-conversation', icon: '&#x1F195;', label: 'New conversation',
+      run: "newConversation('" + name + "'," + (s.running ? 'true' : 'false') + ")" },
+    { key: 'share', icon: '&#x1F517;', label: 'Share link',
+      run: "closeAllMenus();shareSession('" + name + "')" },
+    { key: 'archive', icon: '&#x1F4E6;', label: 'Archive',
+      run: "archiveSession('" + name + "')" },
+    { separator: true },
+    { key: 'delete', icon: '&#x2716;', label: 'Delete', danger: true,
+      run: "deleteSession('" + name + "')" },
+  ].filter(Boolean);
+}
+
+function _renderWorkerActionMenu(s, surface) {
+  const peek = surface === 'peek';
+  const itemClass = peek ? 'peek-more-item' : 'card-menu-item';
+  return _workerActionDefinitions(s).map(action => {
+    if (action.separator) return '<div class="' + (peek ? 'peek-more-sep' : 'card-menu-sep') + '"></div>';
+    const classes = itemClass + (action.danger ? ' danger' : '');
+    const close = peek ? '_closePeekMore();' : '';
+    const title = action.title ? ' title="' + esc(action.title) + '"' : '';
+    return '<div class="' + classes + '" role="menuitem" data-worker-action="' + action.key
+      + '" onclick="event.stopPropagation();' + close + action.run + '"' + title + '>'
+      + '<span class="mi">' + action.icon + '</span>'
+      + (action.labelHtml || esc(action.label)) + '</div>';
+  }).join('');
+}
+
+function _renderPeekWorkerActions(s) {
+  const menu = document.getElementById('peek-more-dropdown');
+  if (!menu) return;
+  const html = _renderWorkerActionMenu(s, 'peek')
+    + '<div class="peek-more-sep"></div>'
+    + '<div class="peek-more-item" id="peek-file-browser-btn" data-peek-action="file-browser" role="menuitem" '
+    + 'onclick="event.stopPropagation();_closePeekMore();_browseWorkerFiles(peekSession,\'peek-file-browser\')">'
+    + '<span class="mi">&#x1F4C2;</span>File browser</div>'
+    + '<div class="peek-more-item" id="peek-focus-btn" role="menuitem" '
+    + 'onclick="event.stopPropagation();_closePeekMore();togglePeekFocus()">'
+    + '<span class="mi">&#x25B4;</span>Focus mode</div>';
+  if (menu.innerHTML !== html) menu.innerHTML = html;
+}
+
+// Both menu Browse actions and the displayed directory path land here. One
+// function owns the session/root selection and always enters the full Files
+// route; the old peek-only branch toggled an unrelated split pane on desktop.
+function _browseWorkerFiles(name, source) {
+  const s = (sessions || []).find(row => row.name === name);
+  const root = (peekSession === name && peekSessionDir) || (s && s.dir) || '';
+  if (!root) { showToast('This worker has no directory to browse'); return; }
+  closeAllMenus();
+  _closePeekMore();
+  try {
+    fetch(API + '/api/client-debug', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
+      body: JSON.stringify({ kind: 'worker-file-entry', verdict: 'canonical-files-route',
+        source: source || 'unknown', session: name, root, measured: true,
+        n_considered: 1, ver: APP_VER }),
+    }).catch(() => {});
+  } catch (e) {}
+  openExplore(root, name);
+}
+
+function _reportWorkerActionParity(s) {
+  const menu = document.getElementById('peek-more-dropdown');
+  if (!menu) return;
+  const expected = _workerActionDefinitions(s).filter(a => !a.separator).map(a => a.key);
+  const actual = Array.from(menu.querySelectorAll('[data-worker-action]')).map(el => el.dataset.workerAction);
+  const duplicateIds = document.querySelectorAll('#peek-worker-menu-btn').length !== 1
+    || document.querySelectorAll('#peek-composer-more-btn').length !== 1;
+  if (expected.join('|') === actual.join('|') && !duplicateIds) return;
+  try {
+    fetch(API + '/api/client-debug', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
+      body: JSON.stringify({ kind: 'worker-action-menu-parity', verdict: 'mismatch',
+        session: s.name, expected, actual, duplicate_ids: duplicateIds,
+        measured: true, n_considered: expected.length, ver: APP_VER }),
+    }).catch(() => {});
+  } catch (e) {}
+}
+
 function render() {
   // THE PEEK HEADER UPDATES FIRST, ahead of the card-clobbering guard below.
   //
@@ -3413,39 +3555,7 @@ function render() {
           <div class="card-name">${s.pinned ? '<span class="pin-icon">&#x1F4CC;</span> ' : ''}${s.isolated ? '<span class="card-isolated" title="ISOLATED (raw agent): tmux plus the CLI, no amux harness — no AMUX_SESSION/AMUX_URL, no MCP config, no self-report hooks. Undiscoverable to peers: hidden from their fleet list and roster, and peer sends are refused. You can still peek and send from here. Applies at the next spawn.">ISOLATED</span> ' : ''}${esc(s.name)}${offCached ? ' <span class="card-offline-dot" title="Scrollback saved on this device — readable offline">&#x2B07;</span>' : ''}</div>
           <button class="card-menu-btn" onclick="event.stopPropagation();toggleMenu('${s.name}')" title="Options">&#x22EF;</button>
           <div class="card-menu" id="menu-${s.name}">
-          <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','task','${escJs(s.task_override||"")}')"><span class="mi">&#x270F;</span> Task label${s.task_override ? '' : ' (none)'}</div>
-          <div class="card-menu-sep"></div>
-          <div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();openPeek('${s.name}')"><span class="mi">&#x1F4BB;</span> Peek terminal</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();_readLatestMessage('${s.name}')"><span class="mi">&#x1F50A;</span> Read latest message</div>
-          ${s.dir ? `<div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();openExplore('${s.dir.replace(/'/g,"\\'")}','${s.name.replace(/'/g,"\\'")}')"><span class="mi">&#x1F4C1;</span> Browse files</div>` : ''}
-          <div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();showSessionInfo('${s.name}')"><span class="mi">&#x2139;</span> Info</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();togglePin('${s.name}')"><span class="mi">${s.pinned?'&#x1F4CC;':'&#x1F4CC;'}</span> ${s.pinned ? 'Unpin' : 'Pin to top'}</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','name','${escJs(s.name)}')"><span class="mi">&#x270E;</span> Rename</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','provider','${escJs(provider)}')"><span class="mi">&#x21C4;</span> Provider: ${pLabel}</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','model','${escJs(model||"")}','${escJs(provider)}')"><span class="mi">&#x2699;</span> Model${model ? ': '+esc(model) : ''}</div>
-          ${provider === 'claude' ? `<div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','effort','${escJs(effort||"")}','${escJs(provider)}')"><span class="mi">&#x1F9E0;</span> Effort${effort ? ': '+esc(effort) : ' (default)'}</div>` : ''}
-          <div class="card-menu-item" onclick="event.stopPropagation();toggleYolo('${s.name}')"><span class="mi">${isYolo?'&#x2611;':'&#x2610;'}</span> YOLO mode</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();toggleIsolated('${s.name}')" title="Run as a raw agent: just tmux plus the CLI, no amux harness, hidden from peers. The owner can still peek and send."><span class="mi">${s.isolated?'&#x2611;':'&#x2610;'}</span> Isolated (raw agent, no amux harness)</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','desc','${escJs(s.desc||"")}')"><span class="mi">&#x1F4DD;</span> Description</div>
-          ${/* field is 'tags', the INTERNAL name — b009f6e's vocab pass renamed
-               this argument to 'groups' as if it were a display string, and
-               every branch in editField/submitEdit tests 'tags', so the Groups
-               editor opened as a bare text box and Save silently did nothing
-               (AMUX-2559, "I cant add a worker to a group"). The label is the
-               vocab; the field is the contract. */ ''}
-          <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','tags','${escJs(s.tags.join(", "))}')"><span class="mi">&#x1F3F7;</span> Groups</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();toggleAutoDrain('${s.name}')" title="When this worker runs out of todo cards, pull its oldest eligible backlog card into todo automatically. On by default for every worker. Cards parked on a human (needs:you) or on a live trigger are always skipped; a worker, group, or global configuration can opt out."><span class="mi">${s.auto_drain_backlog?'&#x2611;':'&#x2610;'}</span> Auto-drain backlog</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();toggleSpansGroups('${s.name}')" title="Let this worker message workers in OTHER groups with no per-message approval. Writes CC_SEND_ALLOW on this worker; a group or global layer can also grant it from Configurations."><span class="mi">${s.spans_groups?'&#x2611;':'&#x2610;'}</span> Spans groups${_spansLabel(s)}</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','dir','${esc(s.dir)}')"><span class="mi">&#x1F4C1;</span> Directory</div>
-          ${s.running ? `<div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();doRestart('${s.name}')"><span class="mi">&#x21BB;</span> Restart</div>` : ''}
-          ${s.running ? `<div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();doStop('${s.name}')"><span class="mi">&#x23F9;</span> Stop</div>` : ''}
-          ${s.running ? `<div class="card-menu-item" onclick="event.stopPropagation();clearScrollback('${s.name}')"><span class="mi">&#x239A;</span> Clear scrollback</div>` : ''}
-          <div class="card-menu-item" onclick="event.stopPropagation();duplicateSession('${s.name}')"><span class="mi">&#x2398;</span> Duplicate</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();newConversation('${s.name}', ${s.running ? 'true' : 'false'})"><span class="mi">&#x1F195;</span> New conversation</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();shareSession('${s.name}')"><span class="mi">&#x1F517;</span> Share link</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();archiveSession('${s.name}')"><span class="mi">&#x1F4E6;</span> Archive</div>
-          <div class="card-menu-sep"></div>
-          <div class="card-menu-item danger" onclick="event.stopPropagation();deleteSession('${s.name}')"><span class="mi">&#x2716;</span> Delete</div>
+          ${_renderWorkerActionMenu(s, 'card')}
         </div>
         </div>
         ${(s.status || s.tokens || s.last_activity || s.rate_limited_until || s.credit_limited || s.sched_on || s.sched_off || !online) ? `<div class="card-header-meta">
@@ -3946,7 +4056,7 @@ function showBranchPopover(name, e) {
   if (hasBranch) {
     pop.innerHTML = `
       <div style="font-size:0.75rem;color:var(--dim);margin-bottom:6px;font-weight:600;">⎇ ${esc(displayBranch)}</div>
-      ${gi._conflict ? '<div style="font-size:0.78rem;color:var(--red);margin-bottom:6px;">⚠ Another worker shares this branch — conflicts possible</div>' : '<div style="font-size:0.78rem;color:var(--green);margin-bottom:6px;">✓ Isolated on worker branch</div>'}
+      ${gi._conflict ? '<div style="font-size:0.78rem;color:var(--red);margin-bottom:6px;">⚠ Another worker shares this branch — conflicts possible</div>' : '<div style="font-size:0.78rem;color:var(--green);margin-bottom:6px;">✓ Isolated from other workers</div><div style="font-size:0.75rem;color:var(--dim);margin-bottom:6px;">Not on main, so nothing here reaches anyone until it is merged or pushed. Isolation is not delivery.</div>'}
       <button class="btn" style="width:100%;" onclick="document.querySelectorAll('.branch-popover').forEach(p=>p.remove())">Close</button>`;
   } else {
     const suggested = 'session/' + name;
@@ -8788,7 +8898,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.802';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.813';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -10623,9 +10733,14 @@ function peekSearchPrev() {
 function togglePeekMoreMenu() {
   const dd = document.getElementById('peek-more-dropdown');
   if (!dd) return;
+  const s = (sessions || []).find(row => row.name === peekSession);
+  if (s) _renderPeekWorkerActions(s);
   const opening = !dd.classList.contains('open');
   dd.classList.toggle('open');
-  if (opening) setTimeout(() => document.addEventListener('click', _closePeekMore, {once: true}), 0);
+  if (opening) {
+    if (s) requestAnimationFrame(() => _reportWorkerActionParity(s));
+    setTimeout(() => document.addEventListener('click', _closePeekMore, {once: true}), 0);
+  }
 }
 function _closePeekMore() {
   const dd = document.getElementById('peek-more-dropdown');
@@ -19865,6 +19980,26 @@ function _acShowSuggested() {
   el.classList.add('open');
 }
 
+// Render a set of labelled sections into the dropdown, keeping `acItems` index-
+// aligned with what is on screen so arrow keys, Tab and acPick keep working.
+function _acRenderSections(sections) {
+  const el = document.getElementById('ac-list');
+  acItems = [];
+  acSelected = -1;
+  let html = '';
+  for (const [label, items] of sections) {
+    if (!items.length) continue;
+    if (label) html += `<div class="ac-section">${esc(label)}</div>`;
+    for (const item of items) {
+      html += `<div class="ac-item" onmousedown="acPick(${acItems.length})">${esc(item)}</div>`;
+      acItems.push(item);
+    }
+  }
+  if (!acItems.length) { el.classList.remove('open'); return; }
+  el.innerHTML = html;
+  el.classList.add('open');
+}
+
 function acFetch(query) {
   clearTimeout(acTimer);
   const el = document.getElementById('ac-list');
@@ -19878,17 +20013,35 @@ function acFetch(query) {
     _acShowSuggested();
     return;
   }
-  el.classList.remove('open');
+  // A BARE NAME IS A SEARCH, NOT A PATH (AF-501). Typing used to DROP the
+  // suggested list — the one holding every directory amux already knows about —
+  // and replace it with a path completion that only answers if you already knew
+  // the path. Measured in a live onboarding session (2026-09-04): the user knew
+  // the repo's name, not its location, typed the name, got nothing, could not
+  // find it in Finder either, and spent three minutes of a one-hour call on it.
+  //
+  // Known dirs are matched HERE rather than server-side because the client
+  // already holds them: the answer is on screen before the request goes out,
+  // and the disk search fills in underneath it.
+  const bareName = query.indexOf('/') === -1 && query[0] !== '~';
+  let known = [];
+  if (bareName) {
+    const q = query.toLowerCase();
+    known = _buildSuggestedDirs().filter(d => d.toLowerCase().includes(q));
+    if (known.length) _acRenderSections([['Your directories', known]]);
+    else el.classList.remove('open');
+  } else {
+    el.classList.remove('open');
+  }
   acTimer = setTimeout(async () => {
     try {
       const r = await fetch(API + '/api/autocomplete/dir?q=' + encodeURIComponent(query));
-      acItems = await r.json();
-      acSelected = -1;
-      if (!acItems.length) { el.classList.remove('open'); return; }
-      el.innerHTML = acItems.map((item, i) =>
-        `<div class="ac-item" onmousedown="acPick(${i})">${esc(item)}</div>`
-      ).join('');
-      el.classList.add('open');
+      const found = await r.json();
+      // Deduped against what is already shown, so a directory that is both a
+      // worker's and on disk does not appear twice under two headings.
+      const fresh = found.filter(d => !known.includes(d) && !known.includes(d.replace(/\/$/, '')));
+      if (bareName) _acRenderSections([['Your directories', known], ['Found on disk', fresh]]);
+      else _acRenderSections([[null, found]]);
     } catch(e) {}
   }, 150);
 }
@@ -32235,7 +32388,7 @@ function _costBars(rows, labelKey, opts) {
 function _costRender(d, opts) {
   opts = opts || {};
   const cards = `<div class="cost-cards">
-    <div class="cost-card"><div class="cost-card-v">${_fmtUsd(d.total_cost)}</div><div class="cost-card-l">est. cost${opts.perSession?'':' \u00B7 on Max'}</div></div>
+    <div class="cost-card" title="What these tokens would cost at LIST PRICE with no plan. On a Claude plan this is not money you spend, it is the value of the usage. Doron read &quot;est. cost&quot; as a bill and changed what plan he was going to buy on the strength of it (AF-494)."><div class="cost-card-v">${_fmtUsd(d.total_cost)}</div><div class="cost-card-l">est. list price${opts.perSession?'':' \u00B7 on Max'}</div></div>
     <div class="cost-card"><div class="cost-card-v">${_fmtTok(d.total_tokens)}</div><div class="cost-card-l">tokens</div></div>
     <div class="cost-card"><div class="cost-card-v">${(d.total_turns||0).toLocaleString()}</div><div class="cost-card-l">turns</div></div>
     <div class="cost-card"><div class="cost-card-v">${d.cache_hit_pct||0}%</div><div class="cost-card-l">cache hit</div></div>
@@ -36292,6 +36445,30 @@ async function _bwClearInspect() {
 // reCAPTCHA — many sites do. A human completing the challenge once in a real
 // window is the only thing that works, and closing the window is what flushes
 // the session to the profile for the API to reuse.
+// AF-496. amux launches Chrome into its own --user-data-dir, so the window it
+// opens sits beside the human's own Chrome and looks identical: same icon, same
+// frame, no badge. Measured in a live onboarding session (2026-09-04) — the user
+// signed into the wrong window and was corrected three times, and asked "should
+// I trust it, it does look like two different browsers?".
+//
+// amux held the answer the whole time (pid, port, profile, starting lane) and
+// had no way to SHOW it. This button puts it where the person is looking: it
+// raises the amux window and draws a bar across it. A Chrome window WITHOUT a
+// bar is their own, which is what makes the multi-window case answerable.
+async function _bwIdentify() {
+  _bwStatus('identifying the amux window\u2026');
+  try {
+    const r = await fetch('/api/browser/identify', { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' });
+    const d = await r.json();
+    if (d.error) { _bwStatus(d.error + (d.running_profiles ? ' (running: ' + d.running_profiles.join(', ') + ')' : '')); return; }
+    // Report the OUTCOME, not the request. `labeled/pages` is the pair that
+    // says whether a 0 means "no tabs" or "every tab refused" (ethos rule 4).
+    const names = (d.identified || []).map(b => b.profile).join(', ');
+    if (!d.identified || !d.identified.length) { _bwStatus(d.verdict || 'no amux browser is running'); return; }
+    _bwStatus(d.verdict + ' \u2014 ' + names + ' (' + d.labeled + '/' + d.pages + ' tab(s) labelled)');
+  } catch (e) { _bwStatus('identify failed: ' + e); }
+}
+
 async function _bwNewProfile() {
   const url = (document.getElementById('bw-url').value || '').trim();
   const suggested = (() => {
