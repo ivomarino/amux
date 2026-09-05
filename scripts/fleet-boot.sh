@@ -46,6 +46,42 @@ log() { printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >> "$LOG"; }
 
 log "=== fleet-boot starting (uptime: $(uptime | sed 's/^ *//')) ==="
 
+# HOW LONG THE FLEET WAS DOWN BEFORE ANYONE LOGGED IN (AF-498).
+#
+# This agent lives in ~/Library/LaunchAgents, and a LaunchAgent loads at GUI
+# LOGIN, not at boot. So an UNATTENDED reboot — a macOS auto-update at 2am is
+# the specimen — brings the machine back with every worker down, and nothing
+# starts until a human sits down and logs in. Reported live: "an iOS update
+# automatically at like 2 a.m. So everything stopped."
+#
+# Nothing was broken and nothing could have said so: this script's log begins
+# when it RUNS, so the hours before it ran left no trace anywhere. The gap is
+# computed, never asserted — an unreadable boot time says UNMEASURED rather than
+# letting a missing number read as zero (ethos rule 4).
+# AMUX_FLEET_BOOT_EPOCH overrides the source so all three arms below are
+# reachable in a test. Without it the gap branch is only exercisable by actually
+# rebooting the machine, which means it would ship unverified — the same reason
+# the LSOF override exists in the git guard.
+boot_epoch="${AMUX_FLEET_BOOT_EPOCH:-}"
+if [[ -n "$boot_epoch" ]]; then
+  :
+elif [[ -r /proc/stat ]]; then
+  boot_epoch="$(awk '/^btime /{print $2}' /proc/stat 2>/dev/null)"
+elif [[ -x /usr/sbin/sysctl ]]; then
+  boot_epoch="$(/usr/sbin/sysctl -n kern.boottime 2>/dev/null | sed -n 's/^{ sec = \([0-9]*\).*/\1/p')"
+fi
+if [[ "$boot_epoch" =~ ^[0-9]+$ ]] && (( boot_epoch > 0 )); then
+  _gap=$(( $(date +%s) - boot_epoch ))
+  (( _gap < 0 )) && _gap=0
+  if (( _gap > 300 )); then
+    log "LOGIN GAP: the machine booted $(( _gap / 60 ))m before this agent ran, so the fleet was DOWN for that whole window. A LaunchAgent loads at GUI login, not at boot — an unattended reboot (an OS auto-update overnight) leaves every worker down until a human logs in. Enable automatic login if that window matters more than an unlocked desktop; it is a machine setting, not an amux one."
+  else
+    log "login gap: ${_gap}s between machine boot and this agent — a login followed the boot promptly"
+  fi
+else
+  log "LOGIN GAP UNMEASURED: could not read the machine's boot time, so the window between boot and this agent is unknown rather than zero"
+fi
+
 if [[ ! -x "$AMUX_BIN" ]]; then
   log "FATAL: amux CLI not executable at $AMUX_BIN — fleet NOT started"
   exit 1

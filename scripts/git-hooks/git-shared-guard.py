@@ -20,6 +20,55 @@ Configure guarded roots via AMUX_SHARED_CHECKOUTS (colon-separated; default
 """
 import sys, json, os, re, time, pathlib
 
+# GIT'S GLOBAL-OPTION PREFIX, shared by every detector that must find a
+# SUBCOMMAND in command text (AF-489).
+#
+# mixpeek-frustrations fixed the run_dir resolver on 2026-09-04 (2815f442) after
+# `-C` was read as git's global `-C <dir>` when it was `git commit -C <commit>`,
+# and handed the rest of the file over. Two DETECTORS had the mirror defect: they
+# allowed only `' + GIT_GLOBALS + r'` before the subcommand, so any OTHER global flag
+# hid the subcommand and the guard never fired at all. Measured before the fix:
+#
+#   git -c user.name=x commit --amend         amend detector MISS
+#   git -c a=b -c c=d commit --amend          MISS
+#   git --no-pager commit --amend             MISS
+#   git -c a=b -C /repo commit --amend        MISS
+#   git -c protocol.version=2 checkout -- .   discard detector MISS
+#   git --literal-pathspecs checkout -- .     MISS
+#
+# A resolver that mis-resolves gives a wrong answer. A DETECTOR that misses is a
+# SILENT PASS, which is the worse direction and the one this closes.
+#
+# Arg-taking globals are enumerated because they consume the next token; every
+# other leading dash-token is a no-arg global. The group stops at the first bare
+# word, which is git's own rule for where the subcommand begins, so `git log
+# --oneline` and `git diff -C -- a b` still do not match.
+GIT_GLOBALS = (
+    r'(?:'
+    r'-(?:c|C)\s+\S+\s+'
+    r'|--(?:exec-path|git-dir|work-tree|namespace|super-prefix)(?:=\S+|\s+\S+)\s+'
+    r'|--?[A-Za-z][-A-Za-z0-9]*\s+'
+    r')*'
+)
+
+# The same prefix MINUS `-C`, for the resolver that must CAPTURE the `-C <dir>`.
+# GIT_GLOBALS contains a `-C` arm, so reusing it there lets the prefix eat the
+# very flag being captured. The lookahead keeps a bare `-C` out of the no-arg arm
+# for the same reason.
+# A SUBCOMMAND FLAG BETWEEN THE VERB AND ITS OBJECT (AF-490). The bare-stash
+# rule's negative lookahead required the recovery verb IMMEDIATELY after `stash`,
+# so `git stash --quiet pop` and `git stash -q apply` were REFUSED. Pre-existing,
+# measured against the unfixed copy, and the worst direction this guard has: a
+# false refusal on `pop`, the one verb people reach for to RECOVER work they
+# thought they had lost. The lookahead now steps over `-flag` tokens.
+GIT_GLOBALS_NOT_C = (
+    r'(?:'
+    r'-c\s+\S+\s+'
+    r'|--(?:exec-path|git-dir|work-tree|namespace|super-prefix)(?:=\S+|\s+\S+)\s+'
+    r'|--?(?!C\b)[A-Za-z][-A-Za-z0-9]*\s+'
+    r')*'
+)
+
 # Entries are (pattern, why) or (pattern, why, remedy).
 #
 # The 3-tuple exists because the shared refusal tail below hard-codes ONE hazard
@@ -31,7 +80,7 @@ import sys, json, os, re, time, pathlib
 # people to stop reading it. When a rule supplies a remedy, it replaces that
 # paragraph rather than being appended to it.
 DANGER = [
-    (r'\bgit\s+(?:-C\s+\S+\s+)?reset\s+--hard\b',
+    (r'\bgit\s+' + GIT_GLOBALS + r'reset\s+--hard\b',
      'git reset --hard — discards ALL uncommitted tracked changes tree-wide'),
     # 2026-07-05: a MIXED `git reset HEAD~2` slipped this guard (not --hard) and
     # decapitated another session's two PUSHED commits from the shared branch
@@ -39,19 +88,19 @@ DANGER = [
     # HEAD — bare/--soft/--mixed/--keep/--merge/<commit-ish> — rewrites every
     # session's branch state. Only the explicit path form (` -- <paths>`) is
     # safe, and it is the only form allowed through.
-    (r'\bgit\s+(?:-C\s+\S+\s+)?reset\b(?![^;&|\n]*\s--\s)',
+    (r'\bgit\s+' + GIT_GLOBALS + r'reset\b(?![^;&|\n]*\s--\s)',
      "git reset (HEAD-moving or bare) — moves/unstages the SHARED branch state for every "
      "session (a mixed `reset HEAD~N` decapitates other sessions' commits). Unstage only "
      "your paths with `git reset -- <your files>`; never move shared HEAD"),
-    (r'\bgit\s+(?:-C\s+\S+\s+)?checkout\s+(?:\S+\s+)?--\s+\.(?=\s|$|[;&|])',
+    (r'\bgit\s+' + GIT_GLOBALS + r'checkout\s+(?:\S+\s+)?--\s+\.(?=\s|$|[;&|])',
      'git checkout -- . — discards ALL working-tree changes'),
-    (r'\bgit\s+(?:-C\s+\S+\s+)?checkout\s+\.(?=\s|$|[;&|])',
+    (r'\bgit\s+' + GIT_GLOBALS + r'checkout\s+\.(?=\s|$|[;&|])',
      'git checkout . — discards ALL working-tree changes'),
-    (r'\bgit\s+(?:-C\s+\S+\s+)?restore\s+(?:--\S+\s+)*\.(?=\s|$|[;&|])',
+    (r'\bgit\s+' + GIT_GLOBALS + r'restore\s+(?:--\S+\s+)*\.(?=\s|$|[;&|])',
      'git restore . — discards ALL working-tree changes'),
-    (r'\bgit\s+(?:-C\s+\S+\s+)?clean\s+-[a-wyz]*f',
+    (r'\bgit\s+' + GIT_GLOBALS + r'clean\s+-[a-wyz]*f',
      'git clean -f — deletes untracked files tree-wide'),
-    (r'\bgit\s+(?:-C\s+\S+\s+)?stash\s+(?:drop|clear)\b',
+    (r'\bgit\s+' + GIT_GLOBALS + r'stash\s+(?:drop|clear)\b',
      "git stash drop/clear — permanently discards a stash that may hold OTHER sessions' work"),
     # 2026-07-07 CASE 21 (fleet reset incident): bare/un-scoped `git stash` was
     # deliberately allowed as "recoverable" — invalidated in practice: stash
@@ -59,7 +108,7 @@ DANGER = [
     # moving to HEAD" signature), sweeping every session's uncommitted work;
     # a conflicted pop strands the sweep and mid-flight readers see a wiped
     # tree. Allow only pathspec-scoped pushes + non-destructive subcommands.
-    (r'\bgit\s+(?:-C\s+\S+\s+)?stash\b(?!\s+(?:pop\b|apply\b|list\b|show\b|branch\b|drop\b|clear\b|push\b[^;&|\n]*\s--\s))',
+    (r'\bgit\s+' + GIT_GLOBALS + r'stash\b(?!(?:\s+-\S+)*\s+(?:pop\b|apply\b|list\b|show\b|branch\b|drop\b|clear\b|push\b[^;&|\n]*\s--\s))',
      "bare/un-scoped git stash — internally reset --hards the WHOLE shared tree "
      "(sweeps every session's uncommitted work; a conflicted pop strands it). "
      "Scope it: `git stash push -- <your paths>`"),
@@ -67,7 +116,7 @@ DANGER = [
     # in the one shared tree, sweeping up other sessions' unstaged edits into your
     # commit (wrong-attribution incidents). Bare `git commit` (no -a) is NOT blocked
     # here — too frequent to gate fleet-wide — but the fix is the same: name paths.
-    (r'\bgit\s+(?:-C\s+\S+\s+)?commit\b[^\n;&|]*?(?:\s--all\b|\s-[a-zA-Z]*a[a-zA-Z]*(?=[\s;&|]|$))',
+    (r'\bgit\s+' + GIT_GLOBALS + r'commit\b[^\n;&|]*?(?:\s--all\b|\s-[a-zA-Z]*a[a-zA-Z]*(?=[\s;&|]|$))',
      'git commit -a/--all — commits EVERY modified tracked file in this SHARED tree, '
      'sweeping up other sessions\' edits; commit only your paths: `git commit -m "msg" -- <your files>`'),
     # THE SHARED INDEX, staged half (AF-316). `git commit -a` is blocked above;
@@ -87,7 +136,7 @@ DANGER = [
     # TWO RULES, because one regex could not keep `-A -- <path>` legal.
     # `git add -A -- src/foo.rs` is SCOPED and must pass: the flag is bounded by
     # the pathspec. Only the unbounded forms are the hazard.
-    (r'\bgit\s+(?:-C\s+\S+\s+)?add\b(?![^;&|\n]*\s--\s+\S)[^\n;&|]*?'
+    (r'\bgit\s+' + GIT_GLOBALS + r'add\b(?![^;&|\n]*\s--\s+\S)[^\n;&|]*?'
      r'(?:\s-A\b|\s--all\b|\s--no-ignore-removal\b)',
      'git add -A/--all — stages EVERY modified file in this SHARED checkout, '
      'including other sessions\' in-flight edits, and leaves them staged for the '
@@ -97,7 +146,7 @@ DANGER = [
     # command as `git add .` and would otherwise read as "scoped" to the rule
     # above — the obvious next thing to type after being refused once.
     # `git add ./src/foo.rs` is a real path and is NOT matched.
-    (r'\bgit\s+(?:-C\s+\S+\s+)?add\b[^\n;&|]*?\s(?:--\s+)?\.(?=[\s;&|]|$)',
+    (r'\bgit\s+' + GIT_GLOBALS + r'add\b[^\n;&|]*?\s(?:--\s+)?\.(?=[\s;&|]|$)',
      'git add . — stages EVERY modified file under this directory in a SHARED '
      'checkout, including other sessions\' in-flight edits. Name your own paths: '
      '`git add <your files>` (AF-316)'),
@@ -135,7 +184,7 @@ DANGER = [
     #   * `--unshallow` and `--deepen` stay allowed — they are the remedy, and
     #     "deepen" does not contain "depth" so there is no overlap.
     #   * `[^;&|\n]*?` keeps the match inside one command, like the tuples above.
-    (r'\bgit\s+(?:-C\s+\S+\s+)?(?:fetch|pull)\b[^;&|\n]*?\s(?:--depth[=\s]|--shallow-since\b|--shallow-exclude\b)',
+    (r'\bgit\s+' + GIT_GLOBALS + r'(?:fetch|pull)\b[^;&|\n]*?\s(?:--depth[=\s]|--shallow-since\b|--shallow-exclude\b)',
      "git fetch/pull --depth (or --shallow-since/--shallow-exclude) — truncates history in "
      "this SHARED checkout, and every `merge-base --is-ancestor` past the cut then returns a "
      "bare exit 1 with no error, which is indistinguishable from a real 'not an ancestor'",
@@ -474,6 +523,218 @@ def _audit_override(rec):
     except Exception:
         pass
 
+
+# Commands that take the index lock. `push`, `log`, `show` and friends are absent
+# on purpose: they do not write the index, so a lock is irrelevant to them and a
+# note there is noise.
+_INDEX_WRITERS = ("commit", "add", "stash", "reset", "checkout", "restore",
+                  "rm", "mv", "merge", "rebase", "pull", "am", "cherry-pick",
+                  "revert", "apply", "read-tree", "update-index")
+
+
+def _lock_holder(lock):
+    """(verdict, detail) for whether anything holds `lock` open.
+
+    NEVER returns "nobody" from a probe that could not run. mixpeek-frustrations
+    lost ten minutes to exactly that: `lsof <file> 2>/dev/null || echo no holder`
+    printed the reassuring branch because `lsof` IS NOT ON PATH on this box and
+    the `command not found` went to the suppressed stderr. A negative from an
+    absent tool reads identically to a negative from a working one.
+
+    So: absolute path, and a POSITIVE CONTROL. If lsof cannot see this very
+    process, it cannot see anything, and the answer is `unmeasured`.
+    """
+    import subprocess
+    # AMUX_LSOF exists so the ABSENT-TOOL branch is reachable in a test. It is the
+    # branch that decides whether a future reaper deletes live locks on a box
+    # without lsof, and on a box that HAS lsof there is no other way to reach it.
+    # Same idiom as AMUX_SHARED_CHECKOUTS and AMUX_AMEND_EXPECT elsewhere here.
+    cands = [os.environ["AMUX_LSOF"]] if os.environ.get("AMUX_LSOF") else [
+        "/usr/sbin/lsof", "/usr/bin/lsof", "/bin/lsof"]
+    exe = next((c for c in cands if os.path.exists(c)), None)
+    if exe is None:
+        return ("unmeasured", "lsof not found; holder unknown, NOT unheld")
+    try:
+        ctl = subprocess.run([exe, "-p", str(os.getpid())],
+                             capture_output=True, text=True, timeout=5)
+        if not (ctl.stdout or "").strip():
+            return ("unmeasured", "lsof produced nothing for this very process, "
+                                  "so a negative on the lock means nothing")
+        out = subprocess.run([exe, "--", lock],
+                             capture_output=True, text=True, timeout=5)
+        holders = [l for l in (out.stdout or "").splitlines()[1:] if l.strip()]
+        if holders:
+            return ("held", holders[0][:120])
+        return ("unheld", "no process holds it open")
+    except Exception as e:
+        return ("unmeasured", f"holder probe failed: {e}")
+
+
+def _index_lock_note(cmd, run_dir):
+    """A verdict on .git/index.lock for a command that would take it."""
+    if not re.search(r"\bgit\s+" + GIT_GLOBALS + r"(?:" + "|".join(_INDEX_WRITERS) + r")\b", cmd):
+        return ""
+    import subprocess
+    try:
+        gd = subprocess.run(["git", "-C", run_dir, "rev-parse", "--absolute-git-dir"],
+                            capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return ""
+    lock = os.path.join(gd, "index.lock") if gd else ""
+    if not lock or not os.path.exists(lock):
+        return ""
+    try:
+        st = os.stat(lock)
+    except Exception:
+        return ""
+    age = int(time.time() - st.st_mtime)
+    verdict, detail = _lock_holder(lock)
+    # SIZE IS THE SHARPEST SIGNAL AND IT IS FREE. git writes the new index INTO
+    # the lock and then renames, so a LIVE writer's lock grows. Zero bytes with a
+    # static mtime is the stale shape.
+    shape = ("0 bytes and not growing, which is the STALE shape"
+             if st.st_size == 0 else f"{st.st_size} bytes, so a writer has been filling it")
+    head = ("amux guard: NOTE — .git/index.lock exists and your command writes the index.\n")
+    body = (f"  age {age}s · {shape} · holder: {verdict} ({detail})\n")
+    if verdict == "held":
+        tail = "  A live writer holds it. Wait; it will clear when their command finishes.\n"
+    elif verdict == "unheld" and age > 900:
+        tail = ("  Older than 15m with no holder: this looks STALE, not contention. Removing it\n"
+                "  is destructive on a shared checkout and is YOUR call, not this guard's:\n"
+                f"    ls -l {lock}   # confirm the mtime is still not advancing\n"
+                f"    rm {lock}\n")
+    elif verdict == "unmeasured":
+        tail = ("  The holder probe did NOT run, so this is unknown rather than unheld.\n"
+                "  Do not remove the lock on the strength of this line.\n")
+    else:
+        tail = "  No holder and recently touched: most likely ordinary contention. Retry.\n"
+    return head + body + tail
+
+# A bare `git commit` with no pathspec, on a checkout whose HEAD lags origin,
+# commits the DRIFT (AF-507).
+SWEEP_THRESHOLD = int(os.environ.get("AMUX_SWEEP_COMMIT_THRESHOLD", "20") or "20")
+
+
+def _commit_has_pathspec(scrubbed):
+    """True when a `git commit` names paths, so it cannot sweep the whole index.
+
+    Only the FORM matters here, not what the paths are: `git commit <paths>`
+    takes those paths' worktree state and ignores the index for everything else,
+    which is precisely what a drift-sweep is not. Two spellings count — an
+    explicit `--` separator, and trailing bare operands after the flags.
+    """
+    m = re.search(r'\bgit\s+' + GIT_GLOBALS + r'commit\b([^\n;&|]*)', scrubbed)
+    if not m:
+        return False
+    rest = m.group(1)
+    if re.search(r'(^|\s)--(\s|$)', rest):
+        return True
+    # Flags that CONSUME the next token; anything else bare is an operand.
+    takes_arg = {"-m", "--message", "-C", "--reuse-message", "-c", "--reedit-message",
+                 "-F", "--file", "--author", "--date", "-S", "--gpg-sign",
+                 "--cleanup", "--template", "-t", "--fixup", "--squash",
+                 "--trailer", "--pathspec-from-file"}
+    toks = rest.split()
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t.startswith("-"):
+            if "=" in t:
+                i += 1
+                continue
+            if t in takes_arg:
+                i += 2
+                continue
+            i += 1
+            continue
+        return True   # a bare operand: this commit is path-scoped
+    return False
+
+
+def _sweep_commit_verdict(cmd, scrubbed, run_dir):
+    """Refuse a no-pathspec `git commit` that would sweep index-vs-frozen-HEAD drift.
+
+    Reported by `backend`, near-miss 2026-09-04. `git add <file>` hit a peer's
+    index.lock and failed, so their file was never staged. The follow-up bare
+    `git commit -m` then committed the ENTIRE index-vs-HEAD drift — 1120 files,
+    +67067/-6296 — under their message, not containing their change. Their
+    `git reset --soft HEAD~1` to undo it was then blocked by this same guard,
+    correctly. So the guard blocked the FIX and not the CAUSE, and the cause is
+    not recoverable from inside the checkout.
+
+    WHY THE COUNT IS TAKEN TWICE, AND WHY THE SECOND ONE IS THE SIGNAL.
+    `git diff --cached` is against HEAD, and graft-push freezes HEAD ~1846
+    commits behind origin while the index tracks current. So a sweep shows a
+    huge staged-vs-HEAD set whose files ALREADY MATCH ORIGIN — they are not
+    anybody's work, they are the frozen baseline. A genuine large commit is the
+    opposite: its files differ from origin too, because that is what makes them
+    work. Subtracting the origin-relative set from the HEAD-relative one leaves
+    exactly the drift, which is why a plain file-count threshold would refuse
+    real refactors and this does not.
+
+    On an ordinary checkout HEAD and origin/main agree, the drift set is empty,
+    and this never fires. That is correct: the failure needs a lagging HEAD.
+
+    Returns None to allow, or a block-reason string."""
+    if not re.search(r'\bgit\s+' + GIT_GLOBALS + r'commit\b', scrubbed):
+        return None
+    if re.search(r'\bgit\s+' + GIT_GLOBALS + r'commit\b[^\n;&|]*--amend\b', scrubbed):
+        return None   # amend has its own verdict, with its own pin
+    if _commit_has_pathspec(scrubbed):
+        return None
+    import subprocess
+
+    def _names(*args):
+        out = subprocess.run(("git", "-C", run_dir, "diff", "--cached", "--name-only") + args,
+                             capture_output=True, text=True, timeout=15).stdout
+        return {l for l in out.splitlines() if l.strip()}
+
+    staged = _names()
+    # AN EARLY-OUT, NOT A RULE. `drift` below is a SUBSET of `staged`, so
+    # `len(drift) > SWEEP_THRESHOLD` already implies this — removing this line
+    # cannot change any verdict, and a mutation that deletes it stays green BY
+    # CONSTRUCTION rather than for want of a test. It is here to skip a second
+    # `git diff` and a rev-parse loop on every ordinary small commit, which is
+    # the overwhelmingly common case for a hook on every Bash call.
+    #
+    # Written out because a reader who mutates it, sees green, and concludes the
+    # threshold is untested would be drawing the wrong lesson from a correct
+    # observation (ethos rule 7 — a green mutation can mean redundancy).
+    if len(staged) <= SWEEP_THRESHOLD:
+        return None
+    base = None
+    for ref in ("origin/main", "origin/HEAD"):
+        r = subprocess.run(("git", "-C", run_dir, "rev-parse", "--verify", "--quiet", ref),
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and r.stdout.strip():
+            base = ref
+            break
+    if base is None:
+        return None   # no origin to compare against: fail-open, as everywhere here
+    drift = staged - _names(base)
+    if len(drift) <= SWEEP_THRESHOLD:
+        return None
+    pin = os.environ.get("AMUX_ALLOW_SWEEP_COMMIT", "").strip()
+    if pin:
+        # A PIN, NOT A FLAG, for the same reason AMUX_AMEND_EXPECT is one: the
+        # number can only be supplied by someone who ran the count, so the
+        # escape requires having LOOKED. A bare on/off switch would be set once
+        # in a shell profile and never read again.
+        if pin == str(len(drift)):
+            return None
+        return (f"AMUX_ALLOW_SWEEP_COMMIT={pin} does not match the {len(drift)} drift file(s) "
+                f"this commit would sweep — re-read the count and pin THAT, or the escape is "
+                f"authorizing a commit you have not looked at")
+    return (
+        f"bare `git commit` would sweep {len(drift)} file(s) of index-vs-HEAD DRIFT "
+        f"({len(staged)} staged against HEAD, and {len(drift)} of them already match {base}). "
+        f"Those are not your work: HEAD lags {base} on this checkout, so the index carries "
+        f"the whole gap and a no-pathspec commit takes all of it under YOUR message. "
+        f"Commit your own paths instead: `git commit <your files> -m ...`. "
+        f"If you really mean to commit all {len(drift)}, pin the count you just read: "
+        f"AMUX_ALLOW_SWEEP_COMMIT={len(drift)} git commit ...")
+
+
 def _amend_verdict(cmd, scrubbed, run_dir):
     """Case 15/16 (2026-07-05 near-miss): `git commit --amend` rewrites shared
     HEAD — which may be ANOTHER session's just-landed commit (author identity
@@ -502,7 +763,7 @@ def _amend_verdict(cmd, scrubbed, run_dir):
     compare-and-amend to build it from. Do not restore the "kills the race"
     wording.
     Returns None to allow, or a block-reason string."""
-    if not re.search(r'\bgit\s+(?:-C\s+\S+\s+)?commit\b[^\n;&|]*--amend\b', scrubbed):
+    if not re.search(r'\bgit\s+' + GIT_GLOBALS + r'commit\b[^\n;&|]*--amend\b', scrubbed):
         return None
     import subprocess
     def _git(*args):
@@ -844,7 +1105,7 @@ def _discard_operands(cmd):
     import shlex
     paths = []
     src_refs = set()
-    for m in re.finditer(r'\bgit\s+(?:-C\s+\S+\s+)?(checkout|restore)\b([^\n;&|]*)', cmd):
+    for m in re.finditer(r'\bgit\s+' + GIT_GLOBALS + r'(checkout|restore)\b([^\n;&|]*)', cmd):
         sub, tail = m.group(1), m.group(2)
         try:
             toks = shlex.split(tail)
@@ -923,7 +1184,7 @@ def _discard_verdict(cmd, scrubbed, run_dir):
     Fail-open on anything unexpected, same posture as the rest of this guard.
     Returns a block-reason string, or None to allow."""
     import urllib.request, ssl, subprocess
-    if not re.search(r'\bgit\s+(?:-C\s+\S+\s+)?(?:checkout|restore)\b', scrubbed):
+    if not re.search(r'\bgit\s+' + GIT_GLOBALS + r'(?:checkout|restore)\b', scrubbed):
         return None
     # Detect on `scrubbed` (so prose/docs that merely mention the command never
     # match), but extract the operands from the ORIGINAL cmd — scrubbing removes
@@ -1198,7 +1459,7 @@ def main():
     # not list (`git --no-pager -C /x ...`) falls back to cwd inference, which
     # is the safe direction: a false refusal naming the escape hatch, never a
     # silent pass.
-    mC = re.search(r'\bgit\s+(?:-c\s+\S+\s+)*-C\s+(\S+)', scrubbed)
+    mC = re.search(r'\bgit\s+' + GIT_GLOBALS_NOT_C + r'-C\s+(\S+)', scrubbed)
     # AMUX-3462 (MF-703): this hook reads the command TEXT, before the shell
     # expands it. A -C path spelled with a variable (`git -C $S/wipetest ...`)
     # therefore cannot be resolved here — the old code realpath'd the raw
@@ -1331,6 +1592,41 @@ def main():
     if not any(d == s or d.startswith(s + os.sep) for d in _scope_dirs for s in shared):
         if not _has_cotenants(run_dir):
             return 0
+    # THE LOCK IS REPORTED ON THE ORDINARY PATH, not only inside the amend
+    # verdict (AF-503, reported by mixpeek-frustrations as MF-842).
+    #
+    # A stale zero-byte .git/index.lock blocked every index write on ~/Dev/mixpeek
+    # for 15+ minutes on 2026-09-04. Git's own message is generic and correct, and
+    # on a 50-lane checkout it is indistinguishable from healthy contention, so
+    # two lanes routed around it with GIT_INDEX_FILE temp-index grafts before
+    # anyone understood the cause. Routing around a blockage is rational and it is
+    # also how a 15-minute fleet stall produces no report.
+    #
+    # This REPORTS and never blocks or removes. Removing a lock is destructive on
+    # a shared checkout and is the human's call (ethos rule 8); what the guard can
+    # do is turn a generic message into a verdict, which costs one stat.
+    try:
+        sys.stderr.write(_index_lock_note(cmd, run_dir))
+    except Exception:
+        pass  # a note that cannot be produced must never block a command
+    # AF-507: a no-pathspec commit that would sweep index-vs-frozen-HEAD drift.
+    # Checked BEFORE the amend verdict because they are disjoint (the sweep
+    # verdict returns None for --amend) and this one is the cheaper miss to
+    # catch: an amend rewrites one commit, a sweep buries a peer's whole tree
+    # under someone else's message.
+    sweep_why = None
+    try:
+        sweep_why = _sweep_commit_verdict(cmd, scrubbed, run_dir)
+    except Exception:
+        sweep_why = None  # fail-open, same posture as the rest of the guard
+    if sweep_why:
+        if _consume_override(cmd):
+            sys.stderr.write(f"amux guard: ALLOWED once (owner-sanctioned): {sweep_why}\n")
+        else:
+            sys.stderr.write(
+                f"BLOCKED by amux shared-checkout guard: {sweep_why}.\n"
+                f"'{run_dir}' is a SHARED checkout used by multiple agent sessions.{_dir_note}\n")
+            return 2
     amend_why = None
     try:
         amend_why = _amend_verdict(cmd, scrubbed, run_dir)

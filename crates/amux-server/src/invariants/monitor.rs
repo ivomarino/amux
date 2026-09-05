@@ -228,6 +228,14 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
         )),
     }
 
+    // AF-504: a stale index.lock is nobody's card, so a 20-minute stall went
+    // unreported while every lane routed around it. This is the fleet-visible
+    // half; AF-503 shipped the half that reaches the blocked lane.
+    out.extend(git_index_lock_check(std::path::Path::new(
+        &std::env::var("AMUX_REPO_ROOT").unwrap_or_else(|_| "/Users/ethan/Dev/amux".into()),
+    ))
+    .await);
+
     tm.mark(&out, "2. config provenance");
     // -- 3. queue liveness: is anything queued in front of an IDLE target?
     out.extend(steering_queue_check(state).await);
@@ -910,6 +918,88 @@ fn timestamp_units_check(state: &AppState) -> Vec<InvariantResult> {
     checks::timestamp_units_are_what_readers_assume(&observed, &undeclared, now, SAMPLE)
 }
 
+/// Probe this checkout's `.git/index.lock` for [`checks::git_index_lock_is_not_stale`]
+/// (AF-504).
+///
+/// The lsof protocol here is a deliberate mirror of `_lock_holder` in
+/// `scripts/git-hooks/git-shared-guard.py`, including the POSITIVE CONTROL: if
+/// lsof cannot see THIS process it cannot see anything, so its silence about the
+/// lock means nothing. `lsof <file> 2>/dev/null || echo no holder` printing the
+/// reassuring branch on a box with no lsof is the specimen that produced the
+/// protocol, and a monitor is the worst place to repeat it — a green invariant
+/// over an unrunnable probe is read by everyone and questioned by nobody.
+///
+/// AMUX_LSOF overrides the binary so the absent-tool arm is reachable in a test.
+async fn git_index_lock_check(repo: &std::path::Path) -> Vec<InvariantResult> {
+    use checks::LockHolder;
+    let git_dir = repo.join(".git");
+    let lock = git_dir.join("index.lock");
+    let Ok(meta) = std::fs::metadata(&lock) else {
+        return checks::git_index_lock_is_not_stale(false, 0, 0, LockHolder::Unheld, 0);
+    };
+    let age_s = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.elapsed().ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let holder = lsof_holder(&lock).await;
+    checks::git_index_lock_is_not_stale(true, age_s, meta.len(), holder, LOCK_STALE_AFTER_S)
+}
+
+/// Older than this with no holder is stale rather than contention. Fifteen
+/// minutes because the reported stall ran ~20 and ordinary contention on this
+/// checkout clears in seconds.
+const LOCK_STALE_AFTER_S: i64 = 900;
+
+async fn lsof_holder(path: &std::path::Path) -> checks::LockHolder {
+    use checks::LockHolder;
+    let exe = std::env::var("AMUX_LSOF").ok().filter(|s| !s.is_empty()).or_else(|| {
+        ["/usr/sbin/lsof", "/usr/bin/lsof", "/bin/lsof"]
+            .iter()
+            .find(|c| std::path::Path::new(c).exists())
+            .map(|c| (*c).to_string())
+    });
+    let Some(exe) = exe else {
+        return LockHolder::Unmeasured("lsof not found; holder unknown, NOT unheld".into());
+    };
+    let run = |args: Vec<String>| {
+        let exe = exe.clone();
+        async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                tokio::process::Command::new(&exe).args(&args).kill_on_drop(true).output(),
+            )
+            .await
+        }
+    };
+    // POSITIVE CONTROL FIRST. Without it, "lsof said nothing" and "lsof cannot
+    // run here" are the same observation.
+    match run(vec!["-p".into(), std::process::id().to_string()]).await {
+        Ok(Ok(o)) if !String::from_utf8_lossy(&o.stdout).trim().is_empty() => {}
+        Ok(Ok(_)) => {
+            return LockHolder::Unmeasured(
+                "lsof produced nothing for this very process, so a negative on the lock means \
+                 nothing"
+                    .into(),
+            )
+        }
+        Ok(Err(e)) => return LockHolder::Unmeasured(format!("holder probe failed: {e}")),
+        Err(_) => return LockHolder::Unmeasured("holder probe timed out".into()),
+    }
+    match run(vec!["--".into(), path.display().to_string()]).await {
+        Ok(Ok(o)) => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            match out.lines().skip(1).find(|l| !l.trim().is_empty()) {
+                Some(first) => LockHolder::Held(first.chars().take(120).collect()),
+                None => LockHolder::Unheld,
+            }
+        }
+        Ok(Err(e)) => LockHolder::Unmeasured(format!("holder probe failed: {e}")),
+        Err(_) => LockHolder::Unmeasured("holder probe timed out".into()),
+    }
+}
+
 /// Gather what [`checks::request_arrival_follows_boot`] needs (AMUX-3647).
 ///
 /// ONE query, both numbers, over the indexed `ts` range. Counting the rows that
@@ -1153,6 +1243,8 @@ mod report_hook_wiring_tests {
     #[test]
     fn the_extractor_selects_both_the_wired_and_the_forked_shape() {
         let wired = serde_json::json!({"hooks": {
+            "SessionStart": [{"hooks": [{"type": "command",
+                "command": "bash \"$HOME/.amux/hook-report.sh\" subagent-reset session-start-hook"}]}],
             "Stop": [{"hooks": [{"type": "command",
                 "command": "bash \"$HOME/.amux/hook-report.sh\" idle stop-hook"}]}],
             "UserPromptSubmit": [{"hooks": [{"type": "command",
@@ -1165,7 +1257,7 @@ mod report_hook_wiring_tests {
                 "command": "bash \"$HOME/.amux/hook-report.sh\" subagent-stop subagent-stop-hook"}]}]
         }});
         let got = extract_report_hooks(&wired);
-        assert_eq!(got.len(), 5, "all five report hooks must be selected");
+        assert_eq!(got.len(), 6, "all six report hooks must be selected");
         assert_eq!(
             got.iter().find(|e| e.event == "PostToolUse").unwrap().matcher.as_deref(),
             Some(".*"),

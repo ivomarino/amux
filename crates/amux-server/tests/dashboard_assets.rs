@@ -83,6 +83,53 @@ fn the_app_bundle_still_contains_an_app() {
 /// CLAUDE.md: "Client JS changes need APP_VER and the CACHE version bumped
 /// together, or a browser holding the cached script never receives the fix."
 /// Enforced here rather than remembered.
+/// A WORKER BRANCH IS ISOLATION, NOT DELIVERY (AF-495).
+///
+/// From the 2026-09-04 Doron session. His worker was off main with nothing
+/// pushed, and Ethan read both facts off the screen while Doron could not:
+///
+///   Ethan: "First off, your amux worker is in a different branch."
+///   Doron: "No, I don't know. I don't know why that is."
+///   Ethan (later): "It says it's in a different branch. It says nothing is
+///                   pushed yet."
+///   Doron: "Still. No, I think I'm on main again."   (he was not)
+///
+/// The branch popover's verdict for that exact state was a GREEN TICK reading
+/// "Isolated on worker branch". True, and it is a reassuring signal over the
+/// question that mattered: whether anything on the branch had ever left. The
+/// popover has no push data and should not pretend to, so the fix is to stop the
+/// green line from reading as "all good" and say what isolation does NOT cover.
+///
+/// Pinned here because it is a CLAIM the UI makes, and this file already holds
+/// the auto-compact copy to the threshold the server really uses. Prose in a
+/// template is exactly what rots silently.
+#[test]
+fn the_branch_popover_does_not_read_isolation_as_delivery() {
+    let js = asset("app.js");
+    assert!(
+        js.contains("Isolation is not delivery."),
+        "the branch popover must say what being on a worker branch does NOT mean; \
+         a bare green tick over an unmeasured condition is the defect (AF-495)"
+    );
+    assert!(
+        js.contains("nothing here reaches anyone until it is merged or pushed"),
+        "and name the consequence in the reader's terms, not as jargon"
+    );
+    // NEGATIVE: the old copy asserted a state it had not measured. If it comes
+    // back, so does the false verdict.
+    assert!(
+        !js.contains("Isolated on worker branch"),
+        "the old verdict is back: it reads as 'all good' for a branch nothing has \
+         ever left"
+    );
+    // CONTROL: the conflict warning is a DIFFERENT and genuinely measured signal
+    // (another worker shares the branch) and must survive untouched.
+    assert!(
+        js.contains("Another worker shares this branch"),
+        "the conflict warning is measured and must not be lost to this change"
+    );
+}
+
 #[test]
 fn app_ver_and_the_sw_cache_version_agree() {
     let app_ver = const_str(&asset("app.js"), "APP_VER")
@@ -113,6 +160,58 @@ fn idle_ready_work_names_the_queue_and_keeps_real_stalls_distinct() {
     assert!(chip.contains("queued-behind-wip"), "healthy WIP waits need a logged verdict");
     assert!(chip.contains("'stalled'"), "the no-holding control must preserve real stalled detection");
     assert!(chip.contains("no current work explains the block"), "stalled must say why it is alarming");
+}
+
+#[test]
+fn worker_card_and_peek_share_actions_and_the_canonical_file_entry() {
+    let app = asset("app.js");
+    let html = asset("index.html");
+    let css = asset("app.css");
+
+    for required in [
+        "function _workerActionDefinitions(s)",
+        "function _renderWorkerActionMenu(s, surface)",
+        "_renderWorkerActionMenu(s, 'card')",
+        "_renderWorkerActionMenu(s, 'peek')",
+        "data-worker-action",
+        "data-peek-action=\"file-browser\"",
+        "id=\"peek-focus-btn\"",
+        "worker-action-menu-parity",
+        "worker-file-entry",
+    ] {
+        assert!(app.contains(required), "shared worker-action contract lost `{required}`");
+    }
+    let inventory_start = app.find("function _workerActionDefinitions(s)")
+        .expect("shared worker-action inventory must exist");
+    let inventory_tail = &app[inventory_start..];
+    let inventory_end = inventory_tail.find("function _renderWorkerActionMenu")
+        .expect("the shared renderer must follow its inventory");
+    let inventory = &inventory_tail[..inventory_end];
+    assert_eq!(
+        inventory.matches("{ key: '").count(),
+        25,
+        "the full running Claude worker fixture has 25 shared worker actions"
+    );
+
+    let browse_start = app.find("function _browseWorkerFiles(name, source)")
+        .expect("canonical worker file entry must exist");
+    let browse_tail = &app[browse_start..];
+    let browse_end = browse_tail.find("function _reportWorkerActionParity")
+        .expect("file entry must precede the parity diagnostic");
+    let browse = &browse_tail[..browse_end];
+    assert!(browse.contains("openExplore(root, name)"), "worker file entry must use full Files route");
+    assert!(!browse.contains("togglePeekSplit"), "worker file entry must not retain the split-pane fork");
+    assert!(
+        html.contains("_browseWorkerFiles(peekSession,'peek-directory')"),
+        "the displayed directory must use the canonical worker file entry"
+    );
+    assert_eq!(html.matches("id=\"peek-worker-menu-btn\"").count(), 1, "peek header action id must be unique");
+    assert_eq!(html.matches("id=\"peek-composer-more-btn\"").count(), 1, "peek composer action id must be unique");
+    assert_eq!(html.matches("id=\"peek-more-btn\"").count(), 0, "ambiguous duplicate peek-more-btn returned");
+    assert!(
+        css.contains(".peek-more-dropdown") && css.contains("overflow-y:auto") && css.contains("max-height:min(500px"),
+        "the complete peek menu must remain scrollable on desktop and mobile"
+    );
 }
 
 #[test]

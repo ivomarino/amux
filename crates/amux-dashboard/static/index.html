@@ -1499,6 +1499,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="bw-btn primary" onclick="_bwGo()">Go</button>
     <button id="bw-live-btn" class="bw-btn" onclick="_bwToggleLive()" title="Live auto-refresh">&#9658; Live</button>
     <button class="bw-btn" onclick="_bwScreenshot()" title="Snapshot">&#128247;</button>
+    <button class="bw-btn" onclick="_bwIdentify()" title="AF-496 — amux opens a SECOND Chrome beside your own and they look identical. This raises the amux one and draws a blue bar across it naming its profile.">&#128269; Which window?</button>
     <button class="bw-btn" onclick="_bwNewProfile()" title="Create a profile and sign in to it">&#43; Profile</button>
     <button class="bw-btn" onclick="_bwSaveProfile()" title="Register current site to a profile">&#128190; Save</button>
   </div>
@@ -2188,11 +2189,8 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <button class="peek-nav-btn" onclick="peekMsgNext()" title="Next message">&#x2193;</button>
       </div>
       <div class="peek-more-wrap">
-        <button class="btn" onclick="togglePeekMoreMenu()" id="peek-more-btn" title="More options">&#x22EE;</button>
-        <div class="peek-more-dropdown" id="peek-more-dropdown">
-          <div class="peek-more-item" id="peek-split-toggle" onclick="togglePeekMoreMenu();togglePeekSplit()"><span class="mi">&#x1F4C2;</span> File browser</div>
-          <div class="peek-more-item" id="peek-focus-btn" onclick="togglePeekMoreMenu();togglePeekFocus()"><span class="mi">&#x25B4;</span> Focus mode</div>
-        </div>
+        <button class="btn" onclick="togglePeekMoreMenu()" id="peek-worker-menu-btn" title="Worker actions">&#x22EE;</button>
+        <div class="peek-more-dropdown" id="peek-more-dropdown" role="menu"></div>
       </div>
       <button class="btn" id="peek-close-btn" onclick="closePeek()" title="Close" style="font-size:1.1rem;line-height:1;padding:4px 8px;">&#x2715;</button>
     </div>
@@ -2230,7 +2228,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <!-- Working directory bar -->
   <div class="peek-dir-bar">
     <span style="flex-shrink:0;opacity:0.6;">&#x1F4C1;</span>
-    <span id="peek-dir-text" onclick="peekSessionDir&&openExplore(peekSessionDir,peekSession)" title="Browse directory" style="cursor:pointer;text-decoration:underline;text-decoration-color:var(--dim);text-underline-offset:2px;"></span>
+    <span id="peek-dir-text" onclick="peekSession&&_browseWorkerFiles(peekSession,'peek-directory')" title="Browse directory" style="cursor:pointer;text-decoration:underline;text-decoration-color:var(--dim);text-underline-offset:2px;"></span>
     <span id="peek-dir-branch" class="peek-dir-branch" style="display:none;"></span>
     <span class="card-dir-edit" onclick="peekSessionDir&&_copyFileDeeplink(peekSessionDir)" title="Copy link to this directory" style="opacity:0.6;font-size:0.85rem;">&#x1F517;</span>
     <span class="card-dir-edit" id="peek-dir-edit" onclick="editField(peekSession,'dir',peekSessionDir)" title="Change directory">&#x270E;</span>
@@ -2297,7 +2295,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <input type="file" id="peek-file-input" multiple
           style="position:absolute;width:0;height:0;opacity:0;overflow:hidden;pointer-events:none;" onchange="handlePeekFileInput(event)">
         <div class="peek-more-wrap">
-          <button class="peek-attach-btn" id="peek-more-btn" title="Attach / history" onclick="_togglePeekMore(event)">&#x22EE;</button>
+          <button class="peek-attach-btn" id="peek-composer-more-btn" title="Attach / history" onclick="_togglePeekMore(event)">&#x22EE;</button>
           <div class="peek-more-menu" id="peek-more-menu">
             <button type="button" onclick="_peekMoreClose();document.getElementById('peek-file-input').click()">&#128206; Attach file</button>
             <button type="button" onclick="_peekMoreClose();openCmdHistoryModal(peekSession||'')">&#x1F551; Message history</button>

@@ -458,6 +458,51 @@ pub(crate) enum PathFate {
 /// Pure, because the wording is the product here and the branch it sits in is a
 /// 60-line async block nothing could reach — the same reason `victim_path_line`
 /// below was pulled out.
+/// The notice BODY, which must not prescribe a check the verdict then retracts
+/// (AF-505).
+///
+/// The body was unconditional: "If those are edits you had staged or in flight…",
+/// then "Check with: git log -2 --stat -- <path>", then "If your work was
+/// absorbed, do not rewrite shared history…", and only THEN the verdict, which
+/// for a settled set says "Nothing here needs reconciling."
+///
+/// Measured across both server logs: 154 victim notices sent, 69 of them (45%)
+/// carrying `all paths settled/absorbed/landed`. Every one of those 69 told its
+/// reader to run a check and what to do if their work was absorbed, before
+/// telling them nothing was at risk. Two lanes paid that check repeatedly in one
+/// day — mixpeek-frustrations twice on one file, this lane five times — and every
+/// instance came back "nothing to reconcile".
+///
+/// Same shape as the DIVERGED nudge's generated-file carve-out (AF-428): a caveat
+/// placed UNDER a command is read after the command. The fix there was to stop
+/// handing the recipe to the class it is wrong for, and it is the fix here.
+///
+/// The unsettled arm is unchanged. That is the direction that must never get
+/// quieter.
+pub(crate) fn victim_body(all_settled: bool) -> &'static str {
+    if all_settled {
+        "This fires on EDIT RECORDS, and an edit record is not authorship on a shared \
+         checkout. Nothing below needs action from you; the per-path lines say why."
+    } else {
+        "This is the mirror of the warning they got. If those are edits you had \
+         staged or in flight, they may land under THEIR commit message — the code \
+         usually survives, the reasoning does not."
+    }
+}
+
+/// The remedy block, which only a set with something at risk should receive.
+pub(crate) fn victim_remedy(all_settled: bool, first_path: &str) -> String {
+    if all_settled {
+        String::new()
+    } else {
+        format!(
+            "\n\nCheck with:  git log -2 --stat -- {first_path}\n\
+             If your work was absorbed, do not rewrite shared history — record the \
+             reasoning where it belongs (a follow-up commit, or the card) and say so."
+        )
+    }
+}
+
 pub(crate) fn victim_verdict(all_settled: bool, all_mine: bool) -> &'static str {
     if all_settled && all_mine {
         "\n\nEVERY path above is already committed by you, so this is almost certainly \
@@ -3540,18 +3585,17 @@ pub async fn staged_guard_inner(
                 let text = format!(
                     "[amux staged-guard] Session `{}` is committing in {} and the staged set \
                      includes {} file(s) whose edit records are YOURS:\n{}{}\n\n\
-                     This is the mirror of the warning they got. If those are edits you had \
-                     staged or in flight, they may land under THEIR commit message — the code \
-                     usually survives, the reasoning does not.\n\n\
-                     Check with:  git log -2 --stat -- {}\n\
-                     If your work was absorbed, do not rewrite shared history — record the \
-                     reasoning where it belongs (a follow-up commit, or the card) and say so.{}",
+                     {}{}{}",
                     session,
                     wd_root,
                     paths.len(),
                     list,
                     if more > 0 { format!("\n  … and {more} more") } else { String::new() },
-                    path_names.first().cloned().unwrap_or_default(),
+                    victim_body(all_settled),
+                    victim_remedy(
+                        all_settled,
+                        &path_names.first().cloned().unwrap_or_default()
+                    ),
                     verdict,
                 );
                 let _ = crate::api::session_verbs::steer_enqueue(st, &owner, &text, "staged-guard", "")
@@ -4211,6 +4255,68 @@ mod tests {
             PathFate::SettledByOwner("def5678".into()),
         ];
         assert!(victim_flags(&mine, &[false, false]).1, "all-SettledByOwner is the reader's own");
+    }
+
+    /// A SETTLED NOTICE MUST NOT PRESCRIBE A CHECK ITS OWN VERDICT RETRACTS
+    /// (AF-505).
+    ///
+    /// The body was unconditional: "If those are edits you had staged or in
+    /// flight…", then "Check with: git log -2 --stat", then "If your work was
+    /// absorbed, do not rewrite shared history…", and only THEN the verdict,
+    /// which for a settled set reads "Nothing here needs reconciling."
+    ///
+    /// Measured across both server logs: 154 notices, 69 of them (45%) carrying
+    /// `all paths settled/absorbed/landed`. Every one told its reader to run a
+    /// check before telling them nothing was at risk. Two lanes paid it
+    /// repeatedly in one day and every instance came back "nothing to reconcile".
+    ///
+    /// Same shape as AF-428's generated-file carve-out: a caveat placed UNDER a
+    /// command is read after the command.
+    #[test]
+    fn a_settled_victim_notice_asks_for_no_check() {
+        let body = victim_body(true);
+        let remedy = victim_remedy(true, "src/x.rs");
+        assert!(
+            remedy.is_empty(),
+            "a settled set must get no remedy block; it was told to run git log and \
+             then told nothing was at risk: {remedy:?}"
+        );
+        assert!(
+            !body.contains("may land under THEIR commit message"),
+            "the settled body must not open with the at-risk framing: {body:?}"
+        );
+        assert!(
+            body.contains("edit record is not authorship"),
+            "it must still say WHY it fired, or it is a notice with no content: {body:?}"
+        );
+    }
+
+    /// THE DIRECTION THAT MUST NEVER GET QUIETER. Everything above is a
+    /// suppression, so the unsettled arm needs its own cell: a set with real
+    /// risk keeps the framing, the command, and the do-not-rewrite instruction.
+    #[test]
+    fn an_at_risk_victim_notice_keeps_its_remedy() {
+        let body = victim_body(false);
+        let remedy = victim_remedy(false, "src/x.rs");
+        assert!(
+            body.contains("may land under THEIR commit message"),
+            "the at-risk framing is the point of the notice: {body:?}"
+        );
+        assert!(
+            remedy.contains("git log -2 --stat -- src/x.rs"),
+            "the check must name the actual path, not a placeholder: {remedy:?}"
+        );
+        assert!(
+            remedy.contains("do not rewrite shared history"),
+            "the remedy must keep the instruction that stops the worse repair: {remedy:?}"
+        );
+    }
+
+    /// The two arms must not be the same string, or the split is decorative.
+    #[test]
+    fn the_two_victim_bodies_actually_differ() {
+        assert_ne!(victim_body(true), victim_body(false));
+        assert_ne!(victim_remedy(true, "a"), victim_remedy(false, "a"));
     }
 
     /// An EMPTY fate list must not read as "everything above is yours". `all()`

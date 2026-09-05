@@ -39,6 +39,7 @@
 //! - `POST /start {profile?, url?}`     — launch Chrome on a profile
 //! - `GET  /status`                     — running child + CDP tab list
 //! - `POST /stop`                       — SIGTERM, wait, clean stale locks
+//! - `POST /identify {profile?}`       — label/raise the amux window (AF-496)
 //! - `GET  /profiles?sizes=1`           — profile inventory
 //! - `POST /profile/create {name,url?}` — create profile dir (+ sign-in window)
 //! - `DELETE /profile/{name}`           — delete an amux-owned profile
@@ -74,6 +75,7 @@ pub fn routes() -> Router<AppState> {
         .route("/start", post(start))
         .route("/status", get(status))
         .route("/stop", post(stop))
+        .route("/identify", post(identify))
         .route("/profiles", get(profiles))
         .route("/profile/create", post(profile_create))
         .route("/profile/{name}", delete(profile_delete))
@@ -1018,6 +1020,9 @@ async fn start(
                     }
                 }
             }
+            if let Some(p) = headed_launch_pointer(body.headless.unwrap_or(false), &body.profile) {
+                v["tell_the_human"] = json!(p);
+            }
             // Echo what was dropped (AMUX-3403): an accepted-and-ignored
             // field reads as "the feature does not work" to every caller who
             // guessed the contract. Same pattern as the board API's
@@ -1236,6 +1241,322 @@ async fn status() -> Response {
         "dead_browser_recoveries_note":
             "verbs that found the registry naming a browser whose process was gone, cleared it, \
              and answered 409 rather than 502. In-memory; a server restart resets it to 0.",
+    }))
+    .into_response()
+}
+
+/// What the lane that just started a browser should tell the human (AF-496).
+///
+/// amux launches Chrome into its OWN `--user-data-dir`, so a headed start puts a
+/// SECOND, visually identical Chrome beside the human's — same icon, same frame,
+/// no badge. Measured in a live onboarding session (2026-09-04): the user signed
+/// into the wrong window, was corrected three times, and asked the question the
+/// product could not answer ("it does look like two different browsers").
+///
+/// It goes in the reply to `start` because that is the moment the caller is
+/// about to write "please log in" to a person, and it is the surface every
+/// caller already reads without opting in (ethos rule 1).
+///
+/// `None` for a headless launch: there is no window, so the sentence would be a
+/// lie about the one state where it is easiest to believe.
+fn headed_launch_pointer(headless: bool, profile: &str) -> Option<String> {
+    if headless {
+        return None;
+    }
+    Some(format!(
+        "This opened a SECOND Chrome window beside their own and the two look identical. \
+         Before asking anyone to sign in, run `amux browser identify` (or POST \
+         /api/browser/identify) — it raises the amux window and draws a blue bar across it \
+         naming profile {profile:?}. A Chrome window WITHOUT that bar is theirs."
+    ))
+}
+
+#[cfg(test)]
+mod headed_pointer_tests {
+    use super::*;
+
+    #[test]
+    fn a_headed_start_is_told_how_to_point_at_the_window_it_opened() {
+        let p = headed_launch_pointer(false, "hubspot").expect("a headed start opens a window");
+        assert!(p.contains("amux browser identify"), "the pointer names no verb: {p}");
+        assert!(p.contains("hubspot"), "the pointer does not name the profile: {p}");
+        assert!(
+            p.contains("WITHOUT that bar is theirs"),
+            "the pointer never says what an unlabelled window means, which is the answer"
+        );
+    }
+
+    /// The one cell that can catch this being pasted everywhere: a headless
+    /// launch has no window at all, and "run identify to see it" would be a
+    /// confident instruction to look at nothing.
+    #[test]
+    fn a_headless_start_is_told_nothing_because_there_is_no_window() {
+        assert_eq!(headed_launch_pointer(true, "hubspot"), None);
+    }
+}
+
+/// Which running browsers an `identify` addresses (AF-496).
+///
+/// Pure, because the interesting failure is the CHOICE, not the CDP call: a
+/// caller with three browsers running and no profile named must not get one
+/// arbitrary window raised, and a caller naming a profile that is not running
+/// must be told WHICH are, or the refusal sends them back to the same two
+/// identical windows they could not tell apart.
+#[derive(Debug, PartialEq)]
+pub(crate) enum IdentifyScope {
+    /// No amux browser is running at all — so every Chrome on screen is the
+    /// human's own, which is itself the answer.
+    NothingRunning,
+    /// A named profile that IS running: label it and raise it.
+    Named(String),
+    /// A named profile that is not running, plus what is.
+    NotRunning { asked: String, running: Vec<String> },
+    /// No profile named: label them ALL, so the windows sort themselves out by
+    /// elimination. Raise only when there is exactly one — raising three in
+    /// sequence leaves the LAST one in front, which answers the question
+    /// wrongly rather than not answering it.
+    All { profiles: Vec<String>, raise: bool },
+}
+
+fn identify_scope(asked: Option<&str>, running: &[String]) -> IdentifyScope {
+    let asked = asked.map(str::trim).filter(|s| !s.is_empty());
+    if running.is_empty() {
+        return IdentifyScope::NothingRunning;
+    }
+    match asked {
+        Some(a) if running.iter().any(|r| r == a) => IdentifyScope::Named(a.to_string()),
+        Some(a) => IdentifyScope::NotRunning {
+            asked: a.to_string(),
+            running: running.to_vec(),
+        },
+        None => IdentifyScope::All {
+            profiles: running.to_vec(),
+            raise: running.len() == 1,
+        },
+    }
+}
+
+#[cfg(test)]
+mod identify_scope_tests {
+    use super::*;
+
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn nothing_running_is_its_own_answer_and_never_an_error() {
+        assert_eq!(identify_scope(None, &[]), IdentifyScope::NothingRunning);
+        assert_eq!(identify_scope(Some("default"), &[]), IdentifyScope::NothingRunning);
+    }
+
+    #[test]
+    fn a_named_running_profile_is_the_one_addressed() {
+        assert_eq!(
+            identify_scope(Some("hubspot"), &v(&["default", "hubspot"])),
+            IdentifyScope::Named("hubspot".into())
+        );
+    }
+
+    /// The refusal has to carry the inventory. Doron's whole problem was that
+    /// he could not name the window; "no such profile" alone hands him back the
+    /// same question.
+    #[test]
+    fn a_named_profile_that_is_not_running_still_names_what_is() {
+        assert_eq!(
+            identify_scope(Some("hubspot"), &v(&["default"])),
+            IdentifyScope::NotRunning { asked: "hubspot".into(), running: v(&["default"]) }
+        );
+    }
+
+    #[test]
+    fn one_browser_and_no_name_is_labelled_and_raised() {
+        assert_eq!(
+            identify_scope(None, &v(&["default"])),
+            IdentifyScope::All { profiles: v(&["default"]), raise: true }
+        );
+    }
+
+    /// THE CELL THIS FUNCTION EXISTS FOR. With several running, raising one is
+    /// worse than raising none: the human asked "which is amux's" and a raise
+    /// asserts a single answer to a question that has three. Label them all and
+    /// let the unlabelled window be the human's by elimination.
+    #[test]
+    fn several_browsers_and_no_name_labels_every_one_and_raises_none() {
+        assert_eq!(
+            identify_scope(None, &v(&["default", "hubspot", "gmail"])),
+            IdentifyScope::All { profiles: v(&["default", "hubspot", "gmail"]), raise: false }
+        );
+    }
+
+    /// A blank or whitespace `profile` is "no profile", not a profile named "".
+    /// A JSON client that sends `{"profile": ""}` for "unset" would otherwise
+    /// get the NotRunning refusal every time.
+    #[test]
+    fn a_blank_profile_reads_as_unset() {
+        assert_eq!(
+            identify_scope(Some("   "), &v(&["default"])),
+            IdentifyScope::All { profiles: v(&["default"]), raise: true }
+        );
+    }
+}
+
+/// The one-line answer, computed from what actually HAPPENED (AF-496).
+///
+/// Every argument is an outcome. The first live call of this endpoint said "the
+/// amux window is now in front" over a raise that had failed with a real error,
+/// because the verdict read the REQUEST (`raise` was asked for) rather than the
+/// RESULT (`raised` came back 0). A summary a reader takes as the result of the
+/// lines above must be computed from those lines, or it is an independent claim
+/// sitting beside them that cannot disagree with them.
+fn identify_verdict(labeled: usize, browsers: usize, raised: usize, raise_attempted: bool) -> String {
+    if labeled == 0 {
+        return "no window could be labelled — read `errors` on each browser below".into();
+    }
+    let bar = if browsers == 1 {
+        "the amux window now carries a blue bar naming its profile".to_string()
+    } else {
+        format!("all {browsers} amux windows now carry a blue bar naming their profile")
+    };
+    let tail = "; a Chrome window WITHOUT one is your own";
+    match (raise_attempted, raised) {
+        (false, _) => format!("{bar}{tail}"),
+        (true, 0) => format!(
+            "{bar}{tail}. It could NOT be brought to the front — see `raise_error`; \
+             find it by the bar instead"
+        ),
+        (true, n) => format!("{bar}{tail}. {n} of them raised to the front"),
+    }
+}
+
+#[cfg(test)]
+mod identify_verdict_tests {
+    use super::*;
+
+    /// THE CELL THIS FUNCTION EXISTS FOR, and the bug it was written over: the
+    /// verdict must not claim a window is in front when the raise failed. The
+    /// endpoint shipped saying exactly that, over a `raise_error` in the same
+    /// payload.
+    #[test]
+    fn a_failed_raise_is_never_reported_as_a_window_in_front() {
+        let v = identify_verdict(1, 1, 0, true);
+        assert!(!v.contains("in front,"), "{v}");
+        assert!(v.contains("could NOT be brought to the front"), "{v}");
+        assert!(v.contains("raise_error"), "the reader is not told where the reason is: {v}");
+    }
+
+    #[test]
+    fn a_raise_that_worked_says_so() {
+        let v = identify_verdict(1, 1, 1, true);
+        assert!(v.contains("raised to the front"), "{v}");
+        assert!(!v.contains("could NOT"), "{v}");
+    }
+
+    /// The multi-window case never attempts a raise, so its verdict must not
+    /// mention one either way — the bar and the elimination rule ARE the answer.
+    #[test]
+    fn several_windows_are_answered_by_the_bar_and_the_elimination_rule() {
+        let v = identify_verdict(3, 3, 0, false);
+        assert!(v.contains("all 3 amux windows"), "{v}");
+        assert!(v.contains("WITHOUT one is your own"), "{v}");
+        assert!(!v.contains("front"), "no raise was attempted, so none should be mentioned: {v}");
+    }
+
+    #[test]
+    fn labelling_nothing_points_at_the_errors_rather_than_claiming_success() {
+        let v = identify_verdict(0, 2, 0, false);
+        assert!(v.contains("no window could be labelled"), "{v}");
+        assert!(v.contains("errors"), "{v}");
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct IdentifyBody {
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    session: Option<String>,
+}
+
+/// POST /api/browser/identify — make the amux window say that it is the amux
+/// window (AF-496).
+async fn identify(headers: HeaderMap, body: Option<Json<IdentifyBody>>) -> Response {
+    let body = body.map(|Json(v)| v).unwrap_or_default();
+    let asked_by = resolve_session(body.session.as_deref(), &headers);
+    // Same reason `status` adopts first: a browser that survived a server
+    // restart is not in this process's registry until something adopts it, and
+    // "no browser is running" is the single most misleading answer this verb
+    // could give a human looking straight at one.
+    chrome::adopt_if_orphaned(&chrome::amux_home()).await;
+    let all = chrome::running_all();
+    let profiles: Vec<String> = all.iter().map(|(p, ..)| p.clone()).collect();
+    let scope = identify_scope(body.profile.as_deref(), &profiles);
+
+    let (targets, raise) = match &scope {
+        IdentifyScope::NothingRunning => {
+            return Json(json!({
+                "ok": true,
+                "identified": [],
+                "running": 0,
+                "verdict": "no amux browser is running, so every Chrome window on screen is your \
+                            own. POST /api/browser/start {\"profile\":\"...\"} opens one.",
+            }))
+            .into_response();
+        }
+        IdentifyScope::NotRunning { asked, running } => {
+            return err(
+                StatusCode::NOT_FOUND,
+                json!({
+                    "error": format!("no amux browser is running on profile {asked:?}"),
+                    "running_profiles": running,
+                    "hint": "POST with no profile to label every amux window at once",
+                }),
+            );
+        }
+        IdentifyScope::Named(p) => (vec![p.clone()], true),
+        IdentifyScope::All { profiles, raise } => (profiles.clone(), *raise),
+    };
+
+    let mut identified = Vec::new();
+    for name in &targets {
+        let Some((_, started_by, _, pid, port, _)) =
+            all.iter().find(|(p, ..)| p == name).cloned()
+        else {
+            continue;
+        };
+        identified.push(chrome::identify_one(name, &started_by, pid, port, raise).await);
+    }
+    let labeled: usize = identified.iter().map(|i| i.labeled).sum();
+    let pages: usize = identified.iter().map(|i| i.pages).sum();
+    let raised: usize = identified.iter().filter(|i| i.raised).count();
+    tracing::info!(
+        asked_by,
+        browsers = identified.len(),
+        labeled,
+        pages,
+        raise_attempted = raise,
+        raised,
+        "browser: identify labelled the amux window(s) (AF-496)"
+    );
+    Json(json!({
+        "ok": true,
+        "identified": identified,
+        "running": all.len(),
+        // The number is the claim; `pages` is the denominator that says whether
+        // it could have been higher (ethos rule 4). `labeled: 0, pages: 0` is a
+        // browser with no page tab, which is a different fact from every tab
+        // refusing the banner.
+        "labeled": labeled,
+        "pages": pages,
+        // ATTEMPT AND OUTCOME, NAMED APART. The first live call of this endpoint
+        // returned `raised: true` beside a per-browser `raised: false` and a
+        // real `raise_error`, because the top-level field carried the REQUEST
+        // and the nested one carried the RESULT under one name. Same word, same
+        // payload, opposite meanings.
+        "raise_attempted": raise,
+        "raised": raised,
+        "verdict": identify_verdict(labeled, identified.len(), raised, raise),
+        "banner_ms": chrome::identify_banner_ms(),
     }))
     .into_response()
 }

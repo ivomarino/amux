@@ -1921,12 +1921,14 @@
   .peek-msg-count { font-size: 0.62rem; color: var(--dim); white-space: nowrap; line-height: 1; padding: 1px 0; min-width: 16px; text-align: center; user-select: none; }
   .peek-prompt.peek-msg-current { outline: 2px solid var(--accent); outline-offset: 1px; border-radius: 3px; }
   .peek-more-wrap { position: relative; }
-  .peek-more-dropdown { display: none; position: absolute; top: calc(100% + 4px); right: 0; background: var(--card); border: 1px solid var(--border); border-radius: 8px; min-width: 160px; z-index: 60; box-shadow: 0 6px 20px rgba(0,0,0,0.3); }
+  .peek-more-dropdown { display: none; position: absolute; top: calc(100% + 4px); right: 0; background: var(--card); border: 1px solid var(--border); border-radius: 8px; min-width: 260px; max-width:min(340px,calc(100vw - 16px)); max-height:min(500px,calc(100dvh - 120px)); overflow-x:hidden; overflow-y:auto; z-index: 60; box-shadow: 0 6px 20px rgba(0,0,0,0.3); }
   .peek-more-dropdown.open { display: block; }
   .peek-more-item { display: flex; align-items: center; gap: 8px; padding: 10px 14px; cursor: pointer; font-size: 0.85rem; color: var(--text); border-bottom: 1px solid var(--border); -webkit-tap-highlight-color: transparent; }
   .peek-more-item:last-child { border-bottom: none; }
   .peek-more-item:active { background: var(--border); }
   .peek-more-item .mi { width: 18px; text-align: center; flex-shrink: 0; }
+  .peek-more-item.danger { color: var(--red); }
+  .peek-more-sep { height:1px; background:var(--border); }
   /* Peek search highlight */
   .peek-highlight { background: rgba(210,153,34,0.35); color: #fff; border-radius: 2px; }
   .peek-highlight.current { background: rgba(210,153,34,0.85); color: #000; }
