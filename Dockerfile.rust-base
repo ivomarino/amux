@@ -9,6 +9,12 @@
 # enough that the cached deps are meaningfully stale:
 #   docker --context <host> build -t amux-rust-base -f Dockerfile.rust-base .
 #
+# Across all 3 real Woodpecker build hosts at once (build-02.baar,
+# build.home, build.northstage — the last a 2026-09-04 rename of what was
+# build.virt04, confirmed live via /api/agents), use
+# scripts/rebuild-rust-base.sh instead — this is amux's own job as of
+# 2026-09-05, see docs/woodpecker-setup.md.
+#
 # Deliberately a REAL build of the actual current source, not a
 # dependency-only dummy-crate trick — simpler, always correct, and this
 # only runs occasionally, not on the hot path. Docker's own layer/filesystem
