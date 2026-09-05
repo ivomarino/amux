@@ -3302,6 +3302,7 @@ SYMPTOM: The Settings usage panel exposed only Claude's two coarse percentages e
 COST: Operators could not tell which provider constrained a mixed fleet, how long a
  limit would last, or whether another provider was unmetered or simply unmeasured.
 FIX: ecbf4daf derives the Settings rows from the full built-in provider registry,
- retains every provider-reported window and exact reset, distinguishes unavailable
- quota APIs from unlimited local inference, and logs `amux::usage_probe` verdicts
- whenever a probe succeeds or cannot report its quota.
+ retains every provider-reported window and exact reset, and distinguishes unavailable
+ quota APIs from unlimited local inference. 6bdf9999 also resolves Codex through the
+ same login-shell path as a real worker, rather than launchd's stale-but-executable
+ shim. `amux::usage_probe` logs whenever a probe succeeds or cannot report its quota.
