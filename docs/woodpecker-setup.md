@@ -34,7 +34,23 @@ docker --context <name> build -t amux-rust-base -f Dockerfile.rust-base .
 
 See `Dockerfile.rust-base`'s own header for the full reasoning. Rebuild it
 whenever `Cargo.lock` changes enough that the cached deps go meaningfully
-stale — there's no automation for this yet; it's a manual, occasional step.
+stale — still a manually-triggered, occasional step, but as of 2026-09-05
+this is amux's own job across all three real build hosts (build-02.baar,
+build.home, build.northstage — the last a rename of what was build.virt04),
+not infra's: `scripts/rebuild-rust-base.sh` fans the same `docker build`
+out to every host at once (via pre-created `docker context`s, one per
+host — see that script's own header for the env var it reads). Note the
+transport is TCP + mutual TLS on port 2376 now (infra's `tofu/docker-mtls/`
+module replaced plain SSH fleet-wide), not the `ssh://` form the example
+above shows — that example predates the mTLS rollout and is only accurate
+for a host that hasn't been migrated to it. Infra provisioned the hosts
+and still owns Woodpecker itself (server/agents, see below); infra had
+also been rebuilding this one image incidentally as part of that, via a
+`docker_image` Tofu resource per host. Not yet operational from this repo
+as of 2026-09-05 (this box has no client cert for the mTLS transport yet,
+asked infra for one) — those 3 Tofu resources stay in place, deliberately,
+until `rebuild-rust-base.sh` has been verified working against all three
+hosts at least once.
 
 **If the toolchain download itself is flaky on the target host** (this hit
 one of this session's remote hosts specifically — its uplink handles
