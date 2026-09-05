@@ -374,9 +374,26 @@ async fn get_usage(
 /// Read Codex's supported account/rateLimits/read JSON-RPC surface. The
 /// app-server receives no prompt and no mutation method; only the usage result
 /// crosses this boundary, never account identity.
+fn codex_probe_process(shell: &str) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(shell);
+    command.args([
+        "-lc",
+        "exec codex app-server --stdio --disable remote_control",
+    ]);
+    command
+}
+
 async fn probe_codex_usage() -> ProviderProbe {
-    let mut child = match tokio::process::Command::new("codex")
-        .args(["app-server", "--stdio", "--disable", "remote_control"])
+    // The server is normally launched by launchd/systemd, whose PATH is not
+    // the user's interactive PATH. On this machine launchd found an abandoned
+    // `/usr/local/bin/codex` wrapper first; the wrapper itself existed, so
+    // spawn succeeded, but its packaged native binary did not. Every worker
+    // launched from amux runs through the user's login shell and found the
+    // current nvm-installed Codex instead. Do the same here: the usage probe
+    // must measure the provider binary the user actually runs, not whichever
+    // stale shim the service manager happens to put first (AMUX-4154).
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let mut child = match codex_probe_process(&shell)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -385,7 +402,7 @@ async fn probe_codex_usage() -> ProviderProbe {
     {
         Ok(child) => child,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return provider_probe_unavailable(
-            "codex", "cli_missing", "Codex CLI is not installed on this host.",
+            "codex", "shell_missing", "The user's login shell is unavailable, so Codex usage cannot be read.",
         ),
         Err(_) => return provider_probe_unavailable(
             "codex", "probe_failed", "Codex account usage probe could not start.",
@@ -1002,6 +1019,19 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
+
+    /// The service manager's PATH may contain a stale but executable shim.
+    /// Keep the probe on the same login-shell resolution path as a real worker.
+    #[test]
+    fn codex_usage_probe_resolves_the_users_login_shell_binary() {
+        let command = codex_probe_process("/bin/example-shell");
+        let command = command.as_std();
+        assert_eq!(command.get_program(), "/bin/example-shell");
+        assert_eq!(
+            command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+            ["-lc", "exec codex app-server --stdio --disable remote_control"]
+        );
+    }
 
     /// AMUX-3544. Spend is attributed to WHY the turn happened, and the window
     /// proves it filtered.
