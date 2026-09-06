@@ -13560,6 +13560,21 @@ pub(crate) fn session_is_isolated(name: &str) -> bool {
     env_flag_on(parse_env(name).get("CC_ISOLATED"))
 }
 
+/// The footer telling a recipient they cannot reply to this sender, or None.
+///
+/// The isolation flag is a PARAMETER, not read here. `session_is_isolated` goes to
+/// the filesystem for the lane's env file, so a test written against it would pass
+/// or fail depending on which box ran it — the defect AF-529 fixed in google_sa,
+/// and the reason that seam exists.
+pub(crate) fn no_reply_path_stamp(origin: &str, is_isolated: bool) -> Option<String> {
+    if origin.is_empty() || !is_isolated {
+        return None;
+    }
+    Some(format!(
+        "\n\n[no reply path: `{origin}` is an isolated (raw-agent) worker. A peer send back to it is REFUSED — it is reachable only by its owner from the dashboard. If this message asks you something, answer via Ethan or relay through a lane that is not isolated; do not write a reply you cannot deliver.]"
+    ))
+}
+
 /// A lane's groups, from `CC_TAGS` in its env file.
 pub(crate) fn lane_groups(lane: &str) -> std::collections::BTreeSet<String> {
     parse_env(lane)
@@ -14016,6 +14031,27 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
         }
     }
     let mut text = body_str(body, "text");
+    // AF-534 / AF-352, twice in five days. The isolation boundary is enforced at
+    // REPLY time, on the peer: `cross_group_send_ok` refuses a send TO an
+    // isolated worker. Nothing refuses a send FROM one, so an isolated lane can
+    // ask a peer a blocking question and the peer discovers only at reply time
+    // — after writing the reply — that no path back exists. From the asker's
+    // side the question simply goes unanswered, which is indistinguishable from
+    // being ignored.
+    //
+    // Measured cost: on 2026-09-06 the `amux` lane sent a pre-push audit ending
+    // "Reply READY ... or HOLD with the reason" while a push Ethan had ordered
+    // waited on it. The answer had to be relayed through a third lane. On
+    // 2026-09-02 the same shape cost a handoff.
+    //
+    // STAMPED, NOT REFUSED. A one-way notification from an isolated lane is
+    // legitimate and common; refusing it would break the fleet's bug channel to
+    // fix a reply problem. What was missing is that the recipient could not SEE
+    // the asymmetry, so it is put where they read it (ethos rule 4: the fact
+    // belongs beside the answer, not in a payload nobody opens).
+    if let Some(stamp) = no_reply_path_stamp(&send_origin, session_is_isolated(&send_origin)) {
+        text.push_str(&stamp);
+    }
     let msg_id: String = body_str(body, "msg_id").trim().chars().take(64).collect();
     if !msg_id.is_empty() && send_dedup_seen(state, name, &msg_id).await {
         // Same `id` as the original response — see send_response_id. A retry
@@ -18396,6 +18432,37 @@ mod tests {
         std::fs::write(sessions.join("raw.env"), "CC_TAGS=\"b\"\nCC_ISOLATED=1\n").unwrap();
         let err = cross_group_send_ok("roamer", "raw").expect_err("isolation must hold");
         assert!(err.contains("isolated"), "and must say why: {err}");
+    }
+
+    /// AF-534 / AF-352, the same shape twice in five days. Isolation is enforced
+    /// at REPLY time, on the peer; nothing stopped an isolated lane from ASKING.
+    /// On 2026-09-06 that gated a push Ethan had ordered — the answer had to be
+    /// relayed through a third lane.
+    #[test]
+    fn a_message_from_an_isolated_lane_says_there_is_no_way_back() {
+        let stamp = no_reply_path_stamp("amux", true).expect("an isolated sender must be stamped");
+        assert!(stamp.contains("no reply path"), "{stamp}");
+        assert!(stamp.contains("amux"), "it must name the sender, or the reader cannot act: {stamp}");
+        assert!(
+            stamp.contains("REFUSED"),
+            "it must say the send is refused, not merely discouraged: {stamp}"
+        );
+        assert!(
+            stamp.contains("do not write a reply you cannot deliver"),
+            "the cost being prevented is a reply written and then rejected: {stamp}"
+        );
+    }
+
+    /// THE CONTROLS. Without them the rule is satisfiable by stamping every
+    /// message, which would put a false "you cannot reply to this" on the 900-odd
+    /// ordinary worker sends a day.
+    #[test]
+    fn an_ordinary_sender_is_not_stamped() {
+        assert_eq!(no_reply_path_stamp("gtm-ticker", false), None);
+        // The OWNER sends with an empty origin. Stamping that would tell Ethan he
+        // cannot reply to himself.
+        assert_eq!(no_reply_path_stamp("", true), None);
+        assert_eq!(no_reply_path_stamp("", false), None);
     }
 
     #[test]
