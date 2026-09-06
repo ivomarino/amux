@@ -368,6 +368,7 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // halves reporting success for 11 days).
     out.extend(autofix_dispatchable_check(state));
     out.extend(todo_reachable_check(state));
+    out.extend(repeat_offer_check(state));
     out.extend(card_type_vocabulary_check(state));
     out.extend(board_list_read_check(state));
 
@@ -1734,6 +1735,45 @@ fn frustration_ledger_check(state: &AppState) -> Vec<InvariantResult> {
 /// filters its lane list with, so the check and the mechanism cannot drift.
 /// It is not expressible in SQL, hence the group-then-filter rather than one
 /// query.
+/// AF-543. The re-offer history is already in `task.claimed`; nothing counted it.
+///
+/// Window and threshold are consts rather than settings on purpose: this REPORTS
+/// and does not throttle, so neither number changes behaviour, and a knob nobody
+/// sets is a knob that drifts from the measurement that justified it.
+const REPEAT_OFFER_WINDOW_S: i64 = 7 * 86_400;
+/// Measured, not picked — see `checks::repeat_offers_are_visible`. Over 7 days:
+/// 867 pairs claimed once, 104 twice, 39 three times, 9 at four, tail to 9x. The
+/// distribution knees between 3 and 4.
+const REPEAT_OFFER_THRESHOLD: i64 = 4;
+
+fn repeat_offer_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "board.repeat_offers_are_visible";
+    let Ok(conn) = state.store.read() else {
+        return vec![InvariantResult::unknown(ID, "store unreadable")];
+    };
+    let cut = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0) - REPEAT_OFFER_WINDOW_S as f64;
+    // json_extract in SQL rather than pulling 1279 rows into Rust to group them:
+    // the store can do this, and ethos rule 2 says not to spend the process on
+    // string manipulation a GROUP BY already does.
+    let rows: Result<Vec<(String, String, i64)>, _> = conn
+        .prepare(
+            "SELECT session, json_extract(data, '$.issue') AS issue, COUNT(*) AS n              FROM session_events              WHERE type='task.claimed' AND ts > ?1 AND issue IS NOT NULL              GROUP BY session, issue ORDER BY n DESC",
+        )
+        .and_then(|mut st| {
+            st.query_map([cut], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            })
+            .map(|it| it.flatten().collect())
+        });
+    let Ok(all) = rows else {
+        return vec![InvariantResult::unknown(ID, "task.claimed query failed")];
+    };
+    let total = all.len() as i64;
+    let offenders: Vec<(String, String, i64)> =
+        all.into_iter().filter(|(_, _, n)| *n >= REPEAT_OFFER_THRESHOLD).collect();
+    checks::repeat_offers_are_visible(&offenders, total, REPEAT_OFFER_THRESHOLD)
+}
+
 fn todo_reachable_check(state: &AppState) -> Vec<InvariantResult> {
     const ID: &str = "board.todo_is_reachable_by_dispatch";
     let Ok(conn) = state.store.read() else {

@@ -1998,6 +1998,69 @@ pub fn todo_is_reachable_by_dispatch(
     }))]
 }
 
+/// Is a lane being handed the same card over and over? (AF-543)
+///
+/// The drain re-offers a card a lane has already declined, and until now nobody
+/// could see it happening — a lane cannot tell "I have never seen this card"
+/// from "I have re-parked it eleven times", and neither can anyone reading the
+/// board. `backend` turned their drain OFF over this, and the thing they could
+/// not see was a GROUP BY away the whole time.
+///
+/// THE HISTORY WAS NEVER MISSING, which is the part worth stating because the
+/// originating card got it wrong. `task.claimed` events carry the issue id and
+/// the session. `AMUX_RECLAIM_COOLDOWN_S` is their only consumer and reads them
+/// as a RATE LIMIT — anything newer than the cut is excluded — which discards
+/// the count. A cooldown asks "was this recently?"; the loop needs "how many
+/// times?", and nothing asked.
+///
+/// THE THRESHOLD IS MEASURED, NOT PICKED. Over 7 days, 1027 (lane, card) pairs:
+/// 867 claimed once, 104 twice, 39 three times, then 9 at four and a tail to 9x.
+/// A second claim is ordinary — claim, park, reclaim. The distribution knees
+/// between 3 and 4, and >= 4 is 17 pairs, 1.7%, which is small enough to act on
+/// and large enough to be real.
+///
+/// It REPORTS and does not throttle. Whether a repeat should trigger backoff, a
+/// defer marker, or a re-park refresh is an open decision (AF-514) that belongs
+/// to Ethan; publishing the number does not presuppose any of them, and it is
+/// the number all three would need.
+pub fn repeat_offers_are_visible(
+    offenders: &[(String, String, i64)],
+    total_pairs: i64,
+    threshold: i64,
+) -> Vec<InvariantResult> {
+    const ID: &str = "board.repeat_offers_are_visible";
+    if offenders.is_empty() {
+        // The population, beside the zero: "no lane is being cycled" and "no
+        // claim events were readable" are different facts (ethos rule 4).
+        return vec![InvariantResult::pass(ID).evidence(json!({
+            "over_threshold": 0,
+            "threshold": threshold,
+            "pairs_considered": total_pairs,
+        }))];
+    }
+    let worst = offenders.iter().map(|(_, _, n)| *n).max().unwrap_or(0);
+    let named: Vec<String> =
+        offenders.iter().take(5).map(|(l, c, n)| format!("{l}/{c} {n}x")).collect();
+    vec![InvariantResult::fail(
+        ID,
+        "no lane is being re-offered the same card past the threshold".to_string(),
+        format!(
+            "{} (lane, card) pair(s) of {total_pairs} were claimed {threshold}+ times in the              window, worst {worst}x: {}. The drain is serving a card its lane has already              declined, repeatedly, and the cooldown cannot see it because it reads              task.claimed as a rate limit rather than a count. This REPORTS only — what a              repeat should mean is AF-514's open decision.",
+            offenders.len(),
+            named.join(", "),
+        ),
+    )
+    .evidence(json!({
+        "over_threshold": offenders.len(),
+        "threshold": threshold,
+        "pairs_considered": total_pairs,
+        "worst": worst,
+        "top": offenders.iter().take(10)
+            .map(|(l, c, n)| json!({"lane": l, "card": c, "claims": n}))
+            .collect::<Vec<_>>(),
+    }))]
+}
+
 /// Every open card's type is IN THE VOCABULARY (AMUX-3552).
 ///
 /// An unknown type is not inert: `core_item_type` maps anything it does not
@@ -6021,5 +6084,56 @@ mod todo_reachable_tests {
         let clean = todo_is_reachable_by_dispatch(&[], 209);
         let d = format!("{:?}", clean[0]);
         assert!(d.contains("209"), "a pass must say how big the population was: {d}");
+    }
+}
+
+#[cfg(test)]
+mod repeat_offer_tests {
+    use super::*;
+
+    fn pair(l: &str, c: &str, n: i64) -> (String, String, i64) {
+        (l.to_string(), c.to_string(), n)
+    }
+
+    /// AF-543. The failing arm must NAME the pairs, because the remedy is a
+    /// human decision about a specific lane's queue and a bare count cannot be
+    /// acted on.
+    #[test]
+    fn a_cycled_card_is_named_with_its_lane_and_its_count() {
+        let bad = repeat_offers_are_visible(
+            &[pair("backend", "BACKE-3550", 9), pair("mvs-research", "MR-111", 8)],
+            1027,
+            4,
+        );
+        assert_eq!(bad[0].status, Status::Fail);
+        let d = format!("{:?}", bad[0]);
+        assert!(d.contains("backend/BACKE-3550 9x"), "must name lane, card and count: {d}");
+        assert!(d.contains("of 1027"), "a count with no denominator is not a finding: {d}");
+        assert!(d.contains("worst 9x"), "the worst case is the one that argues: {d}");
+    }
+
+    /// It REPORTS. If this ever starts telling the drain what to do, the wording
+    /// is the first thing that will drift, so it is pinned.
+    #[test]
+    fn it_says_it_is_a_report_and_points_at_the_open_decision() {
+        let bad = repeat_offers_are_visible(&[pair("backend", "BACKE-3550", 9)], 1027, 4);
+        let d = format!("{:?}", bad[0]);
+        assert!(d.contains("REPORTS only"), "{d}");
+        assert!(d.contains("AF-514"), "the open decision must be named, not implied: {d}");
+    }
+
+    /// THE CONTROL, and the one that matters: a healthy fleet must PASS, and its
+    /// pass must still carry the population. Without this the check is
+    /// satisfiable by always failing, and "0 pairs over threshold" would be
+    /// indistinguishable from "no claim events were readable" (ethos rule 4).
+    #[test]
+    fn a_clean_fleet_passes_and_still_says_what_it_counted() {
+        let ok = repeat_offers_are_visible(&[], 1027, 4);
+        assert_eq!(ok[0].status, Status::Pass);
+        let d = format!("{:?}", ok[0]);
+        assert!(d.contains("1027"), "a pass must publish the population it looked at: {d}");
+        // ...and the threshold, or a later reader cannot tell whether the zero
+        // means "nothing cycled" or "the bar was set impossibly high".
+        assert!(d.contains("threshold"), "{d}");
     }
 }
