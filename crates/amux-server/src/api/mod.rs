@@ -132,6 +132,7 @@ pub fn router(state: AppState) -> Router {
             "/api/ollama/models",
             axum::routing::get(workers::ollama_models),
         )
+        .route("/api/models", axum::routing::get(workers::model_catalog))
         .nest("/api/memories", memories::routes())
         .nest("/api/messages", messages::routes())
         .nest("/api/schedules", schedules::routes())

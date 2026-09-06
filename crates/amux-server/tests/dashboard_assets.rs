@@ -145,6 +145,41 @@ fn app_ver_and_the_sw_cache_version_agree() {
     );
 }
 
+/// Model choices used to be copied into app.js and two index.html selects,
+/// which is how current OpenAI, Claude, and Gemini releases each appeared in
+/// only part of the UI. Pin the one-source shape as well as the custom-id exit.
+#[test]
+fn every_dashboard_model_control_uses_the_shared_open_catalog() {
+    let app = asset("app.js");
+    let html = asset("index.html");
+    assert!(
+        app.contains("/api/models"),
+        "dashboard never loads the shared catalog"
+    );
+    assert!(
+        app.contains("_fillWorkerModelSelect"),
+        "worker controls bypass the catalog helper"
+    );
+    assert!(
+        app.contains("Custom model ID"),
+        "future model ids have no open-string escape hatch"
+    );
+    for duplicate in ["const claudeModels", "const codexModels", "const geminiModels"] {
+        assert!(
+            !app.contains(duplicate),
+            "duplicated provider list returned: {duplicate}"
+        );
+    }
+    assert!(
+        html.contains("settings-default-model-options"),
+        "Claude default lost catalog-backed suggestions"
+    );
+    assert!(
+        html.contains("create-model-custom"),
+        "create-worker flow lost custom model ids"
+    );
+}
+
 #[test]
 fn idle_ready_work_names_the_queue_and_keeps_real_stalls_distinct() {
     let app = asset("app.js");

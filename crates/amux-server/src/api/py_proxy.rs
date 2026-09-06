@@ -96,6 +96,10 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/memory", "global memory document"),
     ("/api/review", "weekly trends engine + digest markdown"),
     ("/api/workers", "modern worker API (+dead-letters)"),
+    (
+        "/api/models",
+        "typed OpenAI, Claude, and Gemini model catalog shared by provider adapters and every worker picker (api/workers.rs)",
+    ),
     ("/api/sessions", "python-SHAPE session list (rust-derived) + per-name verbs — peek/send/config/start/stop/… native over the fleet substrate (api/session_verbs.rs, AMUX-2598)"),
     ("/api/identity", "cloud user + auth-config introspection over server.env/.claude.json (mod.rs)"),
     ("/api/sessions-git", "bulk {session: {branch, repo}} map for the session cards — REUSES the session list's branch (one answer, not two) and adds repo, one rev-parse per DISTINCT dir, 30s TTL (api/sessions_git.rs, AMUX-2599)"),

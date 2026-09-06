@@ -49,8 +49,7 @@ impl ProviderAdapter for GeminiAdapter {
     }
 
     async fn models(&self) -> Vec<String> {
-        // The CLI's own selectable tiers; no listing endpoint to query.
-        vec!["gemini-2.5-pro".into(), "gemini-2.5-flash".into()]
+        crate::provider::model_catalog::worker_model_ids("gemini")
     }
 
     fn build_command(&self, prompt_mode: PromptMode) -> Vec<String> {
@@ -100,9 +99,10 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     async fn models(&self) -> Vec<String> {
-        // No enumerable model surface from the CLI; empty is honest — the
-        // configured model rides in WorkerConfig, not here.
-        Vec::new()
+        // Codex itself has no subscription model-listing command. The dated
+        // official fallback is therefore the enumerable surface, while the
+        // configured model remains an unrestricted open string.
+        crate::provider::model_catalog::worker_model_ids("codex")
     }
 
     fn build_command(&self, prompt_mode: PromptMode) -> Vec<String> {

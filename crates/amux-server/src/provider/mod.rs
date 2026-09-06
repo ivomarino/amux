@@ -19,6 +19,7 @@
 //! only to the `ProviderUsage` values collected from them.
 
 pub mod claude;
+pub mod model_catalog;
 pub mod routing;
 pub mod static_providers;
 

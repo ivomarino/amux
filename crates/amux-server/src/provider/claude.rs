@@ -105,12 +105,10 @@ impl ProviderAdapter for ClaudeAdapter {
     }
 
     async fn models(&self) -> Vec<String> {
-        // Static tier aliases, deliberately: the Claude Code CLI resolves
-        // these to concrete model ids itself (`--model opus`), and the
-        // subscription OAuth surface exposes no model-listing endpoint — so a
-        // live listing would require an API that does not exist for this auth
-        // mode. Static is the honest, sufficient answer.
-        vec!["opus".into(), "sonnet".into(), "haiku".into()]
+        // Subscription OAuth has no listing endpoint. Use the same typed,
+        // dated fallback the dashboard serves; explicit future ids remain
+        // legal because WorkerConfig.model is an open string.
+        crate::provider::model_catalog::worker_model_ids("claude")
     }
 
     fn build_command(&self, prompt_mode: PromptMode) -> Vec<String> {

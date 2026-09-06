@@ -133,6 +133,48 @@ pub async fn ollama_models() -> impl IntoResponse {
     Json(json!({ "models": models }))
 }
 
+/// `GET /api/models` — the typed, provider-aware model catalog used by every
+/// dashboard picker. The age signal is intentional: static fallbacks are the
+/// honest answer for subscription CLIs without model-listing APIs, but a
+/// fallback that nobody revisits becomes silent drift. One WARN per process
+/// makes an overdue catalog visible to the ordinary log/autofix sweep.
+pub async fn model_catalog() -> impl IntoResponse {
+    use crate::provider::model_catalog::{catalog, CATALOG_UPDATED_AT};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let models = catalog();
+    let updated = chrono::NaiveDate::parse_from_str(CATALOG_UPDATED_AT, "%Y-%m-%d").ok();
+    let age_days = updated.map(|date| (chrono::Utc::now().date_naive() - date).num_days());
+    let review_due = age_days.is_none_or(|days| days > 45);
+    static WARNED_STALE: AtomicBool = AtomicBool::new(false);
+    if review_due && !WARNED_STALE.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            kind = "provider_model_catalog_stale",
+            verdict = "review_required",
+            measured = true,
+            n_considered = models.len(),
+            catalog_updated_at = CATALOG_UPDATED_AT,
+            age_days = age_days.unwrap_or(-1),
+            "provider model catalog is overdue for comparison with vendor catalogs"
+        );
+    }
+
+    Json(json!({
+        "models": models,
+        "catalog_updated_at": CATALOG_UPDATED_AT,
+        "custom_model_ids": true,
+        "review_due": review_due,
+        "measured": true,
+        "n_considered": models.len(),
+        "why_unmeasured": null,
+        "sources": {
+            "openai": "https://developers.openai.com/api/docs/models/all",
+            "anthropic": "https://platform.claude.com/docs/en/models/overview",
+            "google": "https://ai.google.dev/gemini-api/docs/models"
+        }
+    }))
+}
+
 // ---- shared helpers -----------------------------------------------------
 
 fn err(status: StatusCode, body: Value) -> Response {
@@ -1634,6 +1676,40 @@ mod tests {
     }
 
     // ---- RR-0034 test list ----------------------------------------------
+
+    /// The UI contract for the shared catalog: the route is really mounted,
+    /// its population is measured, all three hosted providers are present,
+    /// and an incompatible modality is typed without being offered to a
+    /// coding worker. Removing `/api/models`, one provider, or the guard bit
+    /// makes a different assertion fail.
+    #[tokio::test]
+    async fn typed_model_catalog_route_is_complete_and_discriminating() {
+        let (app, _dir) = app();
+        let (status, _, body) = send(&app, "GET", "/api/models", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let models = body["models"].as_array().expect("models array");
+        assert_eq!(body["measured"], true, "{body}");
+        assert_eq!(body["n_considered"], models.len(), "{body}");
+        assert_eq!(body["custom_model_ids"], true, "{body}");
+        for provider in ["codex", "claude", "gemini"] {
+            assert!(
+                models.iter().any(|model| model["provider"] == provider),
+                "provider {provider} missing from catalog"
+            );
+        }
+        let image = models
+            .iter()
+            .find(|model| model["id"] == "gpt-image-2")
+            .expect("OpenAI image model must be represented");
+        assert_eq!(image["model_type"], "image");
+        assert_eq!(image["worker_selectable"], false);
+        let flagship = models
+            .iter()
+            .find(|model| model["id"] == "gpt-6-astra")
+            .expect("current OpenAI flagship must be represented");
+        assert_eq!(flagship["model_type"], "flagship");
+        assert_eq!(flagship["worker_selectable"], true);
+    }
 
     /// A stored `display_name` cannot walk out of the sessions directory.
     ///

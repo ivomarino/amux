@@ -613,12 +613,116 @@ function _sessStatusKey(s) {
   if (s.status === 'waiting') return 'waiting';
   return 'idle';
 }
-let filterModels = new Set();      // coarse model class: opus/sonnet/haiku/gpt/gemini/...
-// Coarse model class for a model string, so "claude-opus-4-8" and a future
-// "claude-opus-5" both filter as "opus".
+let filterModels = new Set();      // typed model family/capability from /api/models
+let _modelCatalog = [];
+let _modelCatalogLoad = null;
+
+// One provider catalog feeds create, edit, settings, and model filters. The
+// server's WorkerConfig.model remains an open string: the catalog is guidance,
+// never a gate on a model released after this client was built.
+function _loadModelCatalog() {
+  if (_modelCatalogLoad) return _modelCatalogLoad;
+  _modelCatalogLoad = fetch(API + '/api/models', { headers: _authHeaders() })
+    .then(async r => {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const d = await r.json();
+      _modelCatalog = Array.isArray(d.models) ? d.models : [];
+      if (!d.measured || d.n_considered !== _modelCatalog.length) {
+        throw new Error('catalog measurement contract failed');
+      }
+      return _modelCatalog;
+    })
+    .catch(e => {
+      _modelCatalogLoad = null; // a later open retries after a transient failure
+      try {
+        fetch(API + '/api/client-debug', {
+          method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }), keepalive: true,
+          body: JSON.stringify({ kind: 'model-catalog-load-failed', error: String(e).slice(0, 200),
+            ver: (typeof APP_VER !== 'undefined' ? APP_VER : '?') })
+        }).catch(() => {});
+      } catch (_) {}
+      throw e;
+    });
+  return _modelCatalogLoad;
+}
+
+function _modelTypeLabel(value) {
+  return String(value || 'other').split('-').map(x => x ? x[0].toUpperCase() + x.slice(1) : '').join(' ');
+}
+
+async function _workerModelsFor(provider) {
+  if (provider === 'ollama') {
+    const r = await fetch(API + '/api/ollama/models', { headers: _authHeaders() });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    return (d.models || []).filter(Boolean).map(id => ({ id, model_type: 'local' }));
+  }
+  const models = await _loadModelCatalog();
+  return models.filter(m => m.provider === provider && m.worker_selectable);
+}
+
+async function _fillWorkerModelSelect(sel, provider, current, defaultLabel, allowCustom) {
+  if (!sel) return;
+  const request = (sel._amuxModelRequest || 0) + 1;
+  sel._amuxModelRequest = request;
+  sel.innerHTML = '<option value="">Loading models…</option>';
+  try {
+    const models = await _workerModelsFor(provider);
+    // Ollama is fetched independently. If the user changes provider while it
+    // is in flight, its late response must not repaint the new provider's list.
+    if (sel._amuxModelRequest !== request) return;
+    sel.innerHTML = '';
+    const def = document.createElement('option');
+    def.value = '';
+    def.textContent = defaultLabel || 'Default';
+    if (sel.id === 'edit-select') def.id = 'model-default-opt';
+    sel.appendChild(def);
+    const groups = new Map();
+    models.forEach(model => {
+      const type = model.model_type || 'other';
+      let group = groups.get(type);
+      if (!group) {
+        group = document.createElement('optgroup');
+        group.label = _modelTypeLabel(type);
+        groups.set(type, group);
+        sel.appendChild(group);
+      }
+      const option = document.createElement('option');
+      option.value = model.id;
+      option.textContent = model.id;
+      group.appendChild(option);
+    });
+    if (allowCustom) {
+      const custom = document.createElement('option');
+      custom.value = '__custom__';
+      custom.textContent = 'Custom model ID…';
+      sel.appendChild(custom);
+    }
+    const known = Array.from(sel.options).some(option => option.value === current);
+    sel.value = known ? (current || '') : (current && allowCustom ? '__custom__' : '');
+    if (current && !known && allowCustom) {
+      const input = document.getElementById('edit-input');
+      if (input) input.value = current;
+    }
+  } catch (e) {
+    if (sel._amuxModelRequest !== request) return;
+    sel.innerHTML = '';
+    const custom = document.createElement('option');
+    custom.value = '__custom__';
+    custom.textContent = 'Catalog unavailable — enter model ID';
+    sel.appendChild(custom);
+    sel.value = '__custom__';
+    if (editState && editState.field === 'model') _editSelectChanged();
+  }
+}
+
+// Prefer the catalog's explicit type. The fallback is intentionally open-ended
+// for saved/custom ids newer than this build.
 function _modelClass(m) {
   m = (m || '').toLowerCase();
   if (!m) return 'other';
+  const typed = _modelCatalog.find(model => String(model.id).toLowerCase() === m);
+  if (typed && typed.model_type) return typed.model_type;
   if (m.includes('opus')) return 'opus';
   if (m.includes('sonnet')) return 'sonnet';
   if (m.includes('haiku')) return 'haiku';
@@ -5383,62 +5487,13 @@ function editField(session, field, current, provider) {
     sel.style.display = 'block';
     sel.value = (current || 'claude').toLowerCase();
   } else if (field === 'model') {
-    const claudeModels = [
-      {v:'',l:'Default'},{v:'opus',l:'opus'},{v:'sonnet',l:'sonnet'},{v:'haiku',l:'haiku'},
-      {v:'claude-opus-5',l:'claude-opus-5'},{v:'claude-opus-5[1m]',l:'claude-opus-5 [1M]'},
-      {v:'claude-fable-5-1',l:'claude-fable-5-1'},{v:'claude-fable-5',l:'claude-fable-5'},
-      {v:'claude-opus-4-8',l:'claude-opus-4-8'},{v:'claude-opus-4-8[1m]',l:'claude-opus-4-8 [1M]'},
-      {v:'claude-opus-4-7',l:'claude-opus-4-7'},{v:'claude-opus-4-7[1m]',l:'claude-opus-4-7 [1M]'},
-      {v:'claude-opus-4-6',l:'claude-opus-4-6'},{v:'claude-opus-4-6[1m]',l:'claude-opus-4-6 [1M]'},
-      {v:'claude-sonnet-4-6',l:'claude-sonnet-4-6'},{v:'claude-sonnet-4-6[1m]',l:'claude-sonnet-4-6 [1M]'},
-      {v:'claude-haiku-4-5-20251001',l:'claude-haiku-4-5-20251001'}
-    ];
-    const codexModels = [
-      {v:'',l:'Default'},
-      {v:'gpt-5.6-sol',l:'GPT-5.6 Sol'},{v:'gpt-5.6-terra',l:'GPT-5.6 Terra'},
-      {v:'gpt-5.6-luna',l:'GPT-5.6 Luna'},{v:'gpt-5.5',l:'GPT-5.5'},
-      {v:'gpt-5.4',l:'GPT-5.4'},{v:'gpt-5.4-mini',l:'GPT-5.4 Mini'},
-      {v:'gpt-5.3-codex-spark',l:'GPT-5.3 Codex Spark'},
-      {v:'o3',l:'o3'},{v:'o4-mini',l:'o4-mini'},
-      {v:'gpt-4o',l:'gpt-4o'},{v:'gpt-4.1',l:'gpt-4.1'},{v:'gpt-4.1-mini',l:'gpt-4.1-mini'}
-    ];
-    const geminiModels = [
-      {v:'',l:'Default'},{v:'auto',l:'auto'},{v:'gemini-2.5-pro',l:'gemini-2.5-pro'},
-      {v:'gemini-2.5-flash',l:'gemini-2.5-flash'},{v:'gemini-2.5-flash-lite',l:'gemini-2.5-flash-lite'},
-      {v:'gemini-3-pro-preview',l:'gemini-3-pro-preview'},{v:'gemini-3-flash-preview',l:'gemini-3-flash-preview'}
-    ];
-    if (provider === 'ollama') {
-      sel.innerHTML = '<option value="">Loading local models…</option>';
-      inpWrap.style.display = 'none';
-      sel.style.display = 'block';
-      fetch(API + '/api/ollama/models', { headers: _authHeaders() })
-        .then(r => r.json())
-        .then(d => {
-          sel.innerHTML = '';
-          const mlist = d.models || [];
-          if (!mlist.length) {
-            const o = document.createElement('option'); o.value = ''; o.textContent = 'No local models found'; sel.appendChild(o);
-          }
-          mlist.forEach(name => {
-            const o = document.createElement('option'); o.value = name; o.textContent = name; sel.appendChild(o);
-          });
-          sel.value = current || (mlist[0] || '');
-        })
-        .catch(() => { sel.innerHTML = '<option value="">Could not reach Ollama</option>'; });
-    } else {
-    const models = provider === 'codex' ? codexModels : (provider === 'gemini' ? geminiModels : claudeModels);
-    sel.innerHTML = '';
-    models.forEach(m => { const o = document.createElement('option'); o.value = m.v; o.textContent = m.l; sel.appendChild(o); });
     inpWrap.style.display = 'none';
     sel.style.display = 'block';
-    sel.value = current || '';
-    if (current && !Array.from(sel.options).some(o => o.value === current)) {
-      const opt = document.createElement('option');
-      opt.value = current; opt.textContent = current;
-      sel.appendChild(opt);
-      sel.value = current;
-    }
-    }
+    inp.value = '';
+    const catalogProvider = provider === 'claude-code' || !provider ? 'claude' : provider;
+    _fillWorkerModelSelect(sel, catalogProvider, current || '', 'Default', true).then(() => {
+      if (sel.value === '__custom__') _editSelectChanged();
+    });
     // Reasoning effort — Claude only. Pre-fill from the session's current --effort flag.
     const effortWrap = document.getElementById('edit-effort-wrap');
     if (effortWrap) {
@@ -5526,14 +5581,27 @@ function closeEdit() {
 // edit-select auto-submits for quick single-select fields (provider), but the
 // model field pairs with the reasoning-effort dial, so it waits for Save.
 function _editSelectChanged() {
-  if (editState && editState.field === 'model') return;
+  if (editState && editState.field === 'model') {
+    const custom = document.getElementById('edit-select').value === '__custom__';
+    const wrap = document.getElementById('edit-input-wrap');
+    const input = document.getElementById('edit-input');
+    if (wrap) wrap.style.display = custom ? '' : 'none';
+    if (input && custom) {
+      input.placeholder = 'Exact model ID';
+      setTimeout(() => input.focus({ preventScroll: true }), 0);
+    }
+    return;
+  }
   submitEdit();
 }
 async function submitEdit() {
   if (!editState) return;
-  const val = (editState.field === 'model' || editState.field === 'provider' || editState.field === 'effort' || editState.field === 'mcp')
+  let val = (editState.field === 'model' || editState.field === 'provider' || editState.field === 'effort' || editState.field === 'mcp')
     ? document.getElementById('edit-select').value.trim()
     : document.getElementById('edit-input').value.trim();
+  if (editState.field === 'model' && val === '__custom__') {
+    val = document.getElementById('edit-input').value.trim();
+  }
   if (!val && !['desc','tags','model','task','effort','branch','mcp','send_allow'].includes(editState.field)) return;
   const { session, field } = editState;
   // Capture the reasoning-effort dial before closeEdit() tears the dialog down.
@@ -8930,7 +8998,11 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.817';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.818';   // bump together with the sw.js CACHE version
+// Warm the shared catalog so model-type filters are exact on first use. A
+// failure is non-fatal (custom ids and the open-string fallback still work)
+// and is already reported by _loadModelCatalog.
+_loadModelCatalog().then(() => { if (!_initialLoad) render(); }).catch(() => {});
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -19573,40 +19645,28 @@ function _selectProvider(p) {
   document.getElementById('create-branch-enabled').closest('.field-group').style.display = isClaude ? '' : 'none';
   document.getElementById('create-worktree-field').style.display = isClaude && _createDirIsGit ? '' : 'none';
   document.getElementById('create-template-field').style.display = isClaude ? '' : 'none';
-  // Ollama runs `codex --oss --local-provider ollama --model <model>` — the ONLY
-  // provider that needs a model chosen at create time (the others default), so
-  // surface the installed-model picker here rather than making the user create
-  // then edit. Missing this option was why an ollama worker could not be made
-  // from the create modal at all (AMUX-3182).
-  const _omField = document.getElementById('create-ollama-model-field');
-  if (_omField) {
-    _omField.style.display = p === 'ollama' ? '' : 'none';
-    if (p === 'ollama') _loadOllamaModelsForCreate();
+  // Every provider uses the same model surface. Blank delegates to that CLI's
+  // own default; custom keeps tomorrow's model usable before this catalog is
+  // refreshed.
+  _loadModelsForCreate(p);
+}
+function _createModelChanged() {
+  const sel = document.getElementById('create-model');
+  const custom = document.getElementById('create-model-custom');
+  if (custom) {
+    custom.style.display = sel && sel.value === '__custom__' ? '' : 'none';
+    if (sel && sel.value === '__custom__') custom.focus({ preventScroll: true });
   }
 }
-// Populate the create modal's local-model picker from the same endpoint the
-// edit-provider menu uses. Re-fetched on each select so a freshly `ollama pull`ed
-// model appears without a page reload; prefers a qwen build (the box default).
-function _loadOllamaModelsForCreate() {
-  const sel = document.getElementById('create-ollama-model');
+// Re-fetched for Ollama so a freshly pulled local model appears immediately;
+// hosted providers share the server's one typed fallback.
+function _loadModelsForCreate(provider) {
+  const sel = document.getElementById('create-model');
   if (!sel) return;
-  sel.innerHTML = '<option value="">Loading local models…</option>';
-  fetch(API + '/api/ollama/models', { headers: _authHeaders() })
-    .then(r => r.json())
-    .then(d => {
-      const mlist = d.models || [];
-      sel.innerHTML = '';
-      if (!mlist.length) {
-        const o = document.createElement('option');
-        o.value = ''; o.textContent = 'No local models — run: ollama pull qwen3.8:27b';
-        sel.appendChild(o);
-        return;
-      }
-      mlist.forEach(name => { const o = document.createElement('option'); o.value = name; o.textContent = name; sel.appendChild(o); });
-      const qwen = mlist.find(m => m.toLowerCase().includes('qwen'));
-      sel.value = qwen || mlist[0];
-    })
-    .catch(() => { sel.innerHTML = '<option value="">Could not reach Ollama</option>'; });
+  const custom = document.getElementById('create-model-custom');
+  if (custom) { custom.value = ''; custom.style.display = 'none'; }
+  _fillWorkerModelSelect(sel, provider, '', 'Default (provider decides)', true)
+    .then(_createModelChanged);
 }
 function openCreate() {
   _createProvider = 'claude';
@@ -19617,8 +19677,7 @@ function openCreate() {
   if (_iso0) { _iso0.checked = false; _toggleIsolated(false); }
   const _ollamaBtn0 = document.getElementById('create-provider-ollama');
   if (_ollamaBtn0) _ollamaBtn0.classList.remove('selected');
-  const _omField0 = document.getElementById('create-ollama-model-field');
-  if (_omField0) _omField0.style.display = 'none';
+  _loadModelsForCreate('claude');
   document.getElementById('create-branch-enabled').closest('.field-group').style.display = '';
   document.getElementById('create-template-field').style.display = '';
   document.getElementById('create-name').value = '';
@@ -19879,14 +19938,12 @@ async function submitCreate() {
   // open to fix — apiCall would pop a generic "Error: 409" with the form gone.
   const createBody = { name, dir, creator: _getDeviceName() };
   if (_createProvider !== 'claude') createBody.provider = _createProvider;
-  // Ollama needs its model chosen now — the server routes it to CC_MODEL and
-  // builds `--model` at launch. Without it the create path defaulted to the
-  // CLAUDE default model, mislabelling the worker (AMUX-3182).
-  if (_createProvider === 'ollama') {
-    const _om = document.getElementById('create-ollama-model');
-    const _m = _om && _om.value ? _om.value.trim() : '';
-    if (_m) createBody.model = _m;
-  }
+  const _modelSel = document.getElementById('create-model');
+  const _modelCustom = document.getElementById('create-model-custom');
+  const _model = _modelSel && _modelSel.value === '__custom__'
+    ? ((_modelCustom && _modelCustom.value) || '').trim()
+    : ((_modelSel && _modelSel.value) || '').trim();
+  if (_model) createBody.model = _model;
   if (worktreeEnabled) createBody.worktree = true;
   // ISOLATED (Ethan, 2026-08-27). Sent only when true: the server writes
   // CC_ISOLATED=1 and absence already means "not isolated" to every reader, so
@@ -31178,16 +31235,23 @@ document.addEventListener('click', function(e) {
 });
 
 // ── Default Model ────────────────────────────────────────────────────────────
-function loadDefaultModel() {
-  const sel = document.getElementById('settings-default-model');
-  if (sel && window._AMUX_DEFAULT_MODEL) {
-    if (!Array.from(sel.options).some(o => o.value === window._AMUX_DEFAULT_MODEL)) {
-      const opt = document.createElement('option');
-      opt.value = window._AMUX_DEFAULT_MODEL;
-      opt.textContent = window._AMUX_DEFAULT_MODEL;
-      sel.appendChild(opt);
-    }
-    sel.value = window._AMUX_DEFAULT_MODEL;
+async function loadDefaultModel() {
+  const input = document.getElementById('settings-default-model');
+  const list = document.getElementById('settings-default-model-options');
+  if (!input || !list) return;
+  input.value = window._AMUX_DEFAULT_MODEL || 'sonnet';
+  try {
+    const models = await _workerModelsFor('claude');
+    list.innerHTML = '';
+    models.forEach(model => {
+      const option = document.createElement('option');
+      option.value = model.id;
+      option.label = _modelTypeLabel(model.model_type);
+      list.appendChild(option);
+    });
+  } catch (e) {
+    // The input stays fully usable with an exact custom id. The shared loader
+    // already emitted the server-visible failure signal.
   }
 }
 async function saveDefaultModel(val) {
@@ -31213,6 +31277,19 @@ async function saveDefaultModel(val) {
 async function loadHelperModel() {
   const sel = document.getElementById('settings-helper-model');
   if (!sel) return;
+  try {
+    const models = await _workerModelsFor('claude');
+    const og = document.getElementById('settings-helper-model-claude');
+    if (og) {
+      og.innerHTML = '';
+      models.forEach(model => {
+        const option = document.createElement('option');
+        option.value = model.id;
+        option.textContent = model.id;
+        og.appendChild(option);
+      });
+    }
+  } catch (e) {}
   try {
     const r = await fetch(API + '/api/ollama/models', { headers: _authHeaders() });
     if (r.ok) {
