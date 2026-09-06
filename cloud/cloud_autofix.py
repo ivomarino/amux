@@ -53,7 +53,7 @@ def ssh(script, timeout=90):
     """Run a python3 script on the cloud host via stdin. Returns stdout or ''."""
     try:
         r = subprocess.run(
-            ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=15",
+            ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=30",
              "-i", SSH_KEY, "root@%s" % HOST, "python3 -"],
             input=script, capture_output=True, text=True, timeout=timeout)
         return r.stdout.strip()
