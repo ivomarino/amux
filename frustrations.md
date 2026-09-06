@@ -3434,32 +3434,32 @@ FIX: Dependency-cleared promotions now carry a narrow todo-ceiling exemption whi
 ## A successful trigger PATCH immediately puts parked work back in todo
 AREA: board
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-09-06
 SESSION: amux
 CARD: AMUX-4168
 SYMPTOM: The 48-hour worker audit found explicit source_ref updates retaining an older last_verified_at. GCA-157 was parked at 12:51 and auto-drained at 12:51; its new condition did not start a new parking window. The API returned success plus an advisory instead of completing the parking operation.
 COST: Repeated park/drain cycles and a fleet audit to discover why the workers still looked idle over todo cards.
-FIX: Record parking time in the PATCH transaction for explicit trigger writes, including reassertions and autofix diversions; preserve explicit timestamps/null. Regression and live verification tracked on AMUX-4168.
+FIX: Record parking time in the PATCH transaction for explicit trigger writes, including reassertions and autofix diversions; preserve explicit timestamps/null. Fixed in af53a6bb (AMUX-4168). The PATCH/selector regression fails with timestamp zeroed; live AF-298, AG-39 and GCA-157 reassertions passed and emitted trigger_timestamp_repaired.
 
 ## Historical dependency prose prevents the worker from reconciling its own queue
 AREA: scheduler
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-09-06
 SESSION: amux
 CARD: AMUX-4168
 SYMPTOM: Six idle workers had nine todo candidates refused by the prose dependency regex. MS-1253 was blocked by its own ID; MR-21's first historical blocker outranked its newer description of the remaining work. No reconciliation prompt reached these workers.
 COST: Six live worker queues stayed unclaimable while their board cards still said todo; the user had to request another fleet investigation.
-FIX: Keep structured dependencies authoritative and deliver ambiguous prose as a dependency-recheck prompt, with a named WARN verdict, instead of vetoing pickup. Regression and live verification tracked on AMUX-4168.
+FIX: Keep structured dependencies authoritative and deliver ambiguous prose as a dependency-recheck prompt, with a named WARN verdict, instead of vetoing pickup. Fixed in af53a6bb (AMUX-4168). The nine-card/six-worker regression fails when the veto returns. Scheduled live deliveries reached all six workers; all nine cards were reconciled against current dependencies or handed onward.
 
 ## Stale-WIP recovery immediately assigns the same card again
 AREA: scheduler
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-09-06
 SESSION: amux
 CARD: AMUX-4168
 SYMPTOM: BR-51 was reclaimed at 04:25 and picked again at 04:26, then reclaimed at 10:26 and picked again at 10:27. Selection ignores pickup.reclaimed_stale when applying its per-card cooldown, so recovery does not yield to the other queued work.
 COST: Two six-hour recovery cycles left byo-ray holding the same WIP slot over eight/nine eligible todo candidates.
-FIX: Apply the existing bounded per-card cooldown to the reclaim event too, and log stale_reclaim_yields_to_next_card. Regression and live verification tracked on AMUX-4168.
+FIX: Apply the existing bounded per-card cooldown to the reclaim event too, and log stale_reclaim_yields_to_next_card. Fixed in af53a6bb (AMUX-4168). The regression fails without the reclaim event in the cooldown. The actual byo-ray snapshot selected BR-137 after reclaiming BR-51; its live current CI run remains in progress, so no live reclaim was forced.
