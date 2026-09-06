@@ -282,13 +282,28 @@ mod tests {
             "must read the server.env of the home it was given"
         );
 
+        // A DIFFERENT home must not see the first one's values. This is the
+        // "and no other" in this test's name, and it holds on every machine.
+        //
+        // THE TEMPTING ASSERTION HERE IS `sa_config_in(bare) == None`, AND IT IS
+        // NOT SAFE (AF-532). It is only meaningful when the ambient env actually
+        // carries GOOGLE_SA_*, and whether it does is decided by a SIBLING test:
+        // `settings::test_env::set_home` strips every key found in the real
+        // ~/.amux/server.env for as long as its guard is held, and cargo runs
+        // these threads in parallel. So the assertion passed in a group run and
+        // failed alone, on identical bytes — I spent hours blaming
+        // scripts/mutate.sh for that, which was innocent. It is also machine
+        // dependent: on CI there is no ~/.amux/server.env, so nothing is
+        // stripped and it would have meant something different again.
+        //
+        // The ambient-suppression rule is asserted where it CAN be deterministic:
+        // `the_ambient_env_is_consulted_only_when_it_is_handed_in`, which injects
+        // the lookup instead of reading the machine's.
         let bare = tempfile::tempdir().unwrap();
-        assert_eq!(
+        assert_ne!(
             sa_config_in(bare.path()),
-            None,
-            "a home with no server.env must resolve to None regardless of what \
-             this machine exports — GOOGLE_SA_* in the ambient env belongs to a \
-             different installation than the one this caller named"
+            Some(("/tmp/af529-key.json".into(), "svc@example.com".into())),
+            "a home with no server.env must not answer with a DIFFERENT home's values"
         );
     }
 
