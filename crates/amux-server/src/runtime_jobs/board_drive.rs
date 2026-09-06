@@ -1611,6 +1611,7 @@ fn drainable_backlog_ids(conn: &Connection, session: &str, now: f64) -> Vec<Stri
            AND NOT EXISTS (SELECT 1 FROM session_events e WHERE e.type='task.claimed' \
                            AND e.ts > ?2 AND e.data LIKE '%\"' || i.id || '\"%') \
            AND NOT (COALESCE(i.source_ref,'') <> '' AND COALESCE(i.last_verified_at,0) > ?3) \
+           AND COALESCE(i.blocked_on,'') = '' \
          ORDER BY COALESCE(i.created,0) ASC, i.id ASC",
         )
         .and_then(|mut st| {
@@ -1652,6 +1653,24 @@ fn drainable_backlog_count(conn: &Connection, session: &str, now: f64) -> usize 
 /// `last_verified_at` is a card whose owner said "not yet, and here is the
 /// condition"; draining it would override that, which is the MG-1388 mistake
 /// this module already carries a scar from.
+///
+/// Cards with `blocked_on` SET are excluded too (AF-516). `amux board block
+/// <ID> --on <cause>` sets that field and deliberately does NOT change status,
+/// "so its lifecycle position survives" — its own help says the card is
+/// "Excluded from `amux board ready` until unblocked". It was: `ready` honours
+/// the field and this predicate never read it, so a lane that blocked a backlog
+/// card correctly still had it claimed and moved to `doing` with `blocked_on`
+/// untouched. Reported by backend on BACKE-3548, 2026-09-05.
+///
+/// Two mechanisms disagreeing about the same field, which is the only kind of
+/// bug where both sides look right in isolation.
+///
+/// SAFE TO EXCLUDE because it is rare BY CONSTRUCTION: `--on` is required and
+/// must name a cause, so nothing defaults it. Measured 2026-09-06: 25 of 438
+/// backlog cards, 5%. The comparison that matters is against the fields that
+/// CANNOT serve this purpose — `source_ref` is on 93% of backlog cards and a
+/// future `due` on 65%, because both are auto-populated, so excluding on either
+/// would silence ~65% of the drain (AF-514).
 fn oldest_drainable_backlog(conn: &Connection, session: &str, now: f64) -> Option<String> {
     drainable_backlog_ids(conn, session, now).into_iter().next()
 }
@@ -3143,7 +3162,11 @@ fn stale_backlog_candidates(
 fn backlog_candidates(conn: &Connection, session: &str, now: i64) -> Vec<(String, String, i64)> {
     // DRAINABLE only — mirror the exclusions in the idle_drain gate so the cards
     // the nudge lists are exactly the ones it claims are un-worked: no dormant
-    // types (tripwire/watch) and no card parked on a LIVE source_ref trigger.
+    // types (tripwire/watch), no card parked on a LIVE source_ref trigger, and
+    // no card with `blocked_on` set (AF-516 — added to BOTH predicates in the
+    // same commit, because a nudge listing a card the drain will not take is the
+    // same disagreement one surface along, and this comment's promise to mirror
+    // is the only thing keeping them together).
     // "Live" means re-verified within SOURCE_REF_STALE_S — a trigger nobody has
     // re-checked in 24h+ is treated as if it were never set, so `--trigger`
     // cannot be used to permanently exit the drain nudge on a card the owner
@@ -3157,6 +3180,7 @@ fn backlog_candidates(conn: &Connection, session: &str, now: i64) -> Vec<(String
          AND COALESCE(archived,0)=0 AND owner_type='agent' \
          AND type NOT IN ('tripwire','watch','epic') \
          AND (COALESCE(source_ref,'')='' OR COALESCE(last_verified_at,0) < ?2) \
+         AND COALESCE(blocked_on,'')='' \
          ORDER BY created ASC LIMIT 8",
     )
     .and_then(|mut st| {
@@ -7355,6 +7379,53 @@ mod tests {
     /// case — board-drive dispatches `todo`, so that queue never moves on its own.
     /// The discriminator is the drain INPUTS: backlog candidates exist AND
     /// eligible_todo_count is 0. A lane with a todo is dispatched, not drained.
+    /// AF-516 — a card BLOCKED with a named cause must not be drained.
+    ///
+    /// `amux board block <ID> --on <cause>` sets `blocked_on` and deliberately
+    /// leaves status alone ("so its lifecycle position survives"), and its own
+    /// help promises the card is "Excluded from `amux board ready` until
+    /// unblocked". `ready` honoured that field; the drain predicates did not, so
+    /// backend's BACKE-3548 was claimed and moved to `doing` with `blocked_on`
+    /// still set. Two mechanisms disagreeing about the same field.
+    ///
+    /// Its own test, not appended to the drain-candidate test: fixtures added
+    /// mid-body leak into that test's later assertions, which is how the first
+    /// version of this cell broke an unrelated one.
+    #[test]
+    fn a_card_blocked_on_a_named_cause_is_not_drainable() {
+        let conn = board_db();
+        let now = now_f64();
+        conn.execute(
+            "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type,blocked_on) \
+             VALUES ('BL-1','waiting on a peer reply','x','backlog','blk',?1,?1,'agent','code','mvs-infra: partition eviction')",
+            rusqlite::params![now as i64],
+        )
+        .unwrap();
+        let listed: Vec<String> =
+            backlog_candidates(&conn, "blk", now as i64).into_iter().map(|c| c.0).collect();
+        assert!(listed.is_empty(), "the drain NUDGE offered a blocked card: {listed:?}");
+        assert!(
+            drainable_backlog_ids(&conn, "blk", now).is_empty(),
+            "the DRAIN itself offered a blocked card"
+        );
+
+        // THE CONTROL, and it is what keeps the clause from being a ban on
+        // draining: an EMPTY blocked_on is the overwhelmingly common state — 413
+        // of 438 backlog cards when measured — and must stay drainable. Without
+        // it, excluding on `blocked_on IS NOT NULL` rather than `= ''` would
+        // silence the entire drain and still pass the assertions above.
+        conn.execute(
+            "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type,blocked_on) \
+             VALUES ('BL-2','ordinary parked work','x','backlog','blk',?1,?1,'agent','code','')",
+            rusqlite::params![now as i64],
+        )
+        .unwrap();
+        let listed: Vec<String> =
+            backlog_candidates(&conn, "blk", now as i64).into_iter().map(|c| c.0).collect();
+        assert_eq!(listed, vec!["BL-2".to_string()], "an unblocked card must still drain");
+        assert_eq!(drainable_backlog_ids(&conn, "blk", now), vec!["BL-2".to_string()]);
+    }
+
     #[test]
     fn a_lane_with_only_backlog_is_a_drain_candidate_a_lane_with_a_todo_is_not() {
         let conn = board_db();
@@ -7406,6 +7477,7 @@ mod tests {
             parked.is_empty(),
             "a tripwire and a FRESHLY-verified source_ref-triggered card are correctly parked, not drainable: {parked:?}"
         );
+
 
         // SOURCE_REF_STALE_S: a trigger nobody has re-checked in 24h+ is NOT a
         // live park — it must return as a drain candidate exactly like an
