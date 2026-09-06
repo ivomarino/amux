@@ -203,11 +203,14 @@ async fn capture_decomposition_is_atomic_ordered_and_keeps_the_message_on_the_ep
 
     let plan = json!({"tasks":[
         {"title":"Implement the change","description":"Build the requested behavior.",
-         "type":"code","priority":0,"depends_on":[],"next_action":"Implement the requested behavior"},
+         "type":"code","priority":0,"depends_on":[],"next_action":"Implement the requested behavior",
+         "acceptance_criteria":["The focused regression test passes"]},
         {"title":"Verify the change","description":"Exercise the complete flow.",
-         "type":"investigation","priority":1,"depends_on":[1],"next_action":"Run the end to end verification"},
+         "type":"investigation","priority":1,"depends_on":[1],"next_action":"Run the end to end verification",
+         "acceptance_criteria":["The end to end flow reaches done"]},
         {"title":"Document the result","description":"Record the verified outcome.",
-         "type":"doc","priority":2,"depends_on":[2],"next_action":"Write the final result summary"}
+         "type":"doc","priority":2,"depends_on":[2],"next_action":"Write the final result summary",
+         "acceptance_criteria":["The final summary names every verified result"]}
     ]});
     let (st, _, made) = send_with(
         &app,
@@ -228,6 +231,39 @@ async fn capture_decomposition_is_atomic_ordered_and_keeps_the_message_on_the_ep
     assert_eq!(tasks[0]["tags"], json!(["p0"]));
     assert_eq!(tasks[1]["epic"], json!("ATE-1"));
     assert_eq!(tasks[0]["session"], json!("amux-testing-e2e"));
+    assert_eq!(tasks[0]["desc"], json!("Build the requested behavior."));
+    assert_eq!(
+        tasks[0]["acceptance_criteria"],
+        json!(["The focused regression test passes"])
+    );
+    assert_eq!(made["plan_sha256"].as_str().unwrap().len(), 64, "{made}");
+
+    // Chaos: an explicit claim must not bypass the dependency graph merely
+    // because backlog is otherwise manually claimable.
+    let second_id = tasks[1]["id"].as_str().unwrap();
+    let (st, _, blocked) = send_with(
+        &app,
+        "POST",
+        &format!("/api/board/{second_id}/claim"),
+        Some(json!({})),
+        &[("X-Amux-Session", "amux-testing-e2e")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{blocked}");
+    assert_eq!(blocked["code"], json!("dependency_blocked"), "{blocked}");
+    assert_eq!(blocked["blocking"], json!([tasks[0]["id"].clone()]));
+    assert_eq!(blocked["measured"], json!(true));
+    assert_eq!(blocked["n_considered"], json!(1));
+    let blocked_events: i64 = store
+        .read()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM session_events WHERE type='claim.dependency_blocked'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(blocked_events, 1, "the refused dependency bypass must survive a log sweep");
 
     let (st, _, detail) = send(&app, "GET", "/api/board/ATE-1", None).await;
     assert_eq!(st, StatusCode::OK);
@@ -259,13 +295,114 @@ async fn capture_decomposition_is_atomic_ordered_and_keeps_the_message_on_the_ep
         &app,
         "POST",
         "/api/board/ATE-1/decompose",
-        Some(plan),
+        Some(plan.clone()),
         &[("X-Amux-Worker", "amux-testing-e2e")],
     )
     .await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(retried["idempotent"], json!(true));
+    assert_eq!(retried["idempotency_measured"], json!(true));
+    assert_eq!(retried["plan_sha256"], made["plan_sha256"]);
     assert_eq!(retried["tasks"].as_array().unwrap().len(), 3);
+
+    // Chaos: a retry carrying a DIFFERENT plan is a conflict, not an
+    // idempotent success over whichever plan happened to win first.
+    let mut changed = plan;
+    changed["tasks"][1]["next_action"] = json!("Run a materially different verification");
+    let (st, _, conflict) = send_with(
+        &app,
+        "POST",
+        "/api/board/ATE-1/decompose",
+        Some(changed),
+        &[("X-Amux-Worker", "amux-testing-e2e")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{conflict}");
+    assert_eq!(conflict["code"], json!("decomposition_plan_conflict"));
+    assert_eq!(conflict["idempotency_measured"], json!(true));
+    assert_ne!(
+        conflict["existing_plan_sha256"], conflict["submitted_plan_sha256"],
+        "the discriminator must prove which plans differed: {conflict}"
+    );
+}
+
+#[tokio::test]
+async fn incomplete_or_ambiguous_decomposition_is_rejected_atomically_with_a_measured_verdict() {
+    let (app, store, _dir) = app_with_store();
+    store
+        .write(|conn| {
+            conn.execute(
+                "INSERT INTO issues \
+                 (id,title,desc,status,session,type,creator,owner_type,source,created,updated) \
+                 VALUES ('ATE-8','Captured request','**Prompt:** chaos plan','doing','lane', \
+                         'code','amux','agent','capture',1,1)",
+                [],
+            )?;
+            Ok(amux_server::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .unwrap();
+
+    let complete = |title: &str| json!({
+        "title": title,
+        "description": "Implement one independently testable behavior.",
+        "type": "code",
+        "priority": 0,
+        "depends_on": [],
+        "next_action": "Implement the focused behavior now",
+        "acceptance_criteria": ["The focused regression test passes"]
+    });
+    let mut cases = Vec::new();
+
+    let mut no_desc = complete("Missing description");
+    no_desc["description"] = json!("");
+    cases.push(("description", json!({"tasks":[no_desc, complete("Control one")]})));
+
+    let mut no_criteria = complete("Missing criteria");
+    no_criteria["acceptance_criteria"] = json!([]);
+    cases.push(("acceptance_criteria", json!({"tasks":[no_criteria, complete("Control two")]})));
+
+    let mut wrong_criteria = complete("Wrong criteria type");
+    wrong_criteria["acceptance_criteria"] = json!([{"looks":"plausible"}]);
+    cases.push(("must be a string", json!({"tasks":[wrong_criteria, complete("Control three")]})));
+
+    cases.push((
+        "repeats the title",
+        json!({"tasks":[complete("Duplicate title"), complete(" duplicate TITLE ")]}),
+    ));
+
+    let mut duplicate_criteria = complete("Duplicate criteria");
+    duplicate_criteria["acceptance_criteria"] = json!([
+        "The focused regression test passes",
+        " the FOCUSED regression test passes ",
+    ]);
+    cases.push(("repeats acceptance criterion", json!({
+        "tasks":[duplicate_criteria, complete("Control four")]
+    })));
+
+    for (expected, plan) in cases {
+        let (st, _, body) = send_with(
+            &app,
+            "POST",
+            "/api/board/ATE-8/decompose",
+            Some(plan),
+            &[("X-Amux-Worker", "lane")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{expected}: {body}");
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains(expected),
+            "{expected}: {body}"
+        );
+        assert_eq!(body["verdict"], json!("invalid_plan"));
+        assert_eq!(body["measured"], json!(true));
+        assert_eq!(body["n_considered"], json!(2));
+        let children: i64 = store
+            .read()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM issues WHERE epic='ATE-8'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(children, 0, "{expected}: a refused plan must create nothing");
+    }
 }
 
 #[tokio::test]
@@ -291,8 +428,8 @@ async fn invalid_decomposition_creates_no_partial_children() {
         "POST",
         "/api/board/ATE-9/decompose",
         Some(json!({"tasks":[
-            {"title":"First","priority":0,"depends_on":[],"next_action":"Implement the first step"},
-            {"title":"Second","priority":1,"depends_on":[2],"next_action":"Implement the second step"}
+            {"title":"First","description":"Implement the first planned step.","priority":0,"depends_on":[],"next_action":"Implement the first step","acceptance_criteria":["The first focused test passes"]},
+            {"title":"Second","description":"Implement the dependent planned step.","priority":1,"depends_on":[2],"next_action":"Implement the second step","acceptance_criteria":["The second focused test passes"]}
         ]})),
         &[("X-Amux-Worker", "lane")],
     )
@@ -345,10 +482,10 @@ async fn a_depends_on_that_is_not_an_index_is_refused_by_the_board_not_by_serde(
         "POST",
         "/api/board/ATE-7/decompose",
         Some(json!({"tasks":[
-            {"title":"First","priority":0,"depends_on":[],"next_action":"Implement the first step"},
-            {"title":"Second","priority":1,
+            {"title":"First","description":"Implement the first planned step.","priority":0,"depends_on":[],"next_action":"Implement the first step","acceptance_criteria":["The first focused test passes"]},
+            {"title":"Second","description":"Implement the dependent planned step.","priority":1,
              "depends_on":["[incident] RCA doc: interactions data loss"],
-             "next_action":"Implement the second step"}
+             "next_action":"Implement the second step","acceptance_criteria":["The second focused test passes"]}
         ]})),
         &[("X-Amux-Worker", "lane")],
     )
@@ -376,8 +513,8 @@ async fn a_depends_on_that_is_not_an_index_is_refused_by_the_board_not_by_serde(
         "POST",
         "/api/board/ATE-7/decompose",
         Some(json!({"tasks":[
-            {"title":"First","priority":0,"depends_on":[],"next_action":"Implement the first step"},
-            {"title":"Second","priority":1,"depends_on":[0],"next_action":"Implement the second step"}
+            {"title":"First","description":"Implement the first planned step.","priority":0,"depends_on":[],"next_action":"Implement the first step","acceptance_criteria":["The first focused test passes"]},
+            {"title":"Second","description":"Implement the dependent planned step.","priority":1,"depends_on":[0],"next_action":"Implement the second step","acceptance_criteria":["The second focused test passes"]}
         ]})),
         &[("X-Amux-Worker", "lane")],
     )
@@ -404,8 +541,8 @@ async fn a_depends_on_that_is_not_an_index_is_refused_by_the_board_not_by_serde(
         "POST",
         "/api/board/ATE-7/decompose",
         Some(json!({"tasks":[
-            {"title":"First","priority":0,"depends_on":[],"next_action":"Implement the first step"},
-            {"title":"Second","priority":1,"depends_on":[1],"next_action":"Implement the second step"}
+            {"title":"First","description":"Implement the first planned step.","priority":0,"depends_on":[],"next_action":"Implement the first step","acceptance_criteria":["The first focused test passes"]},
+            {"title":"Second","description":"Implement the dependent planned step.","priority":1,"depends_on":[1],"next_action":"Implement the second step","acceptance_criteria":["The second focused test passes"]}
         ]})),
         &[("X-Amux-Worker", "lane")],
     )

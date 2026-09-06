@@ -1089,6 +1089,14 @@ async fn get_contract(
             "visibility": "the initial request and terminal callback are Messages rows linked to the same task id; the card carries requester, callback state, action log and produced assets",
             "security": "a callback can return only to the server-verified requester; isolated raw workers remain outside harness delivery",
         },
+        "capture_decomposition": {
+            "cli": "amux board decompose <capture-id> --stdin",
+            "atomicity": "the root becomes an epic and all 2-50 children are created in one SQLite writer transaction; any invalid child creates zero",
+            "required_per_child": ["unique title", "concrete description", "non-epic type", "p0-p3 priority", "earlier-task dependency indexes", "concrete next_action", "1-12 falsifiable acceptance_criteria"],
+            "idempotency": "the normalized plan SHA-256 is durable on the root epic; an identical retry returns idempotent=true and a different retry returns 409 decomposition_plan_conflict",
+            "dependency_execution": "todo/backlog claims are refused while any dependency is open; board-drive promotes dependency-backed backlog only after every dependency is done or verified",
+            "completion": "when every child is done, verified, discarded, or quarantined, board-drive closes the root epic and records the child-status summary as evidence",
+        },
         // AMUX-2933 (ts-gke). The list filters WORK and were documented
         // NOWHERE — "discoverable only by guessing", and the cap was worse than
         // undocumented: silent. A lane auditing its own board got the 100
@@ -4598,6 +4606,13 @@ struct DecomposeTask {
     #[serde(default)]
     depends_on: Vec<DepRef>,
     next_action: String,
+    /// Plain-language success conditions carried on the card itself. These are
+    /// deliberately not the typed `_amux_criteria` verifier objects: a
+    /// decomposition is authored by the worker that will execute it, while
+    /// typed criteria enforce independent authorship. This field is the
+    /// worker-visible draft the independent reviewer can turn into verifiers.
+    #[serde(default)]
+    acceptance_criteria: Vec<TextRef>,
 }
 
 /// One `depends_on` entry AS THE CALLER WROTE IT (AF-523).
@@ -4629,6 +4644,25 @@ enum DepRef {
     Other(serde_json::Value),
 }
 
+/// Preserve a malformed criterion until amux can explain the expected shape.
+/// A `Vec<String>` would let serde answer first with an opaque 422, the exact
+/// failure AF-523 fixed for `depends_on` one field above.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum TextRef {
+    Text(String),
+    Other(serde_json::Value),
+}
+
+impl TextRef {
+    fn shown(&self) -> String {
+        match self {
+            TextRef::Text(s) => format!("{s:?}"),
+            TextRef::Other(v) => v.to_string(),
+        }
+    }
+}
+
 impl DepRef {
     /// How the caller wrote it, for an error message that quotes them back.
     fn shown(&self) -> String {
@@ -4648,21 +4682,41 @@ struct DecomposeBody {
     tasks: Vec<DecomposeTask>,
 }
 
+#[derive(Debug)]
+struct ValidatedDecomposition {
+    dependencies: Vec<Vec<usize>>,
+    acceptance_criteria: Vec<Vec<String>>,
+    plan_sha256: String,
+}
+
 /// Validate, and return the NORMALIZED 1-based dependency indices per task.
 ///
 /// Returning them rather than re-reading `depends_on` downstream is what makes
 /// the "not an index" branch impossible to reach twice: after this returns Ok
 /// there is no `DepRef::Other` left in play, so the child-creation loop has no
 /// can't-happen arm to guess at (AF-523).
-fn validate_decomposition(tasks: &[DecomposeTask]) -> Result<Vec<Vec<usize>>, String> {
+fn validate_decomposition(tasks: &[DecomposeTask]) -> Result<ValidatedDecomposition, String> {
     if !(2..=50).contains(&tasks.len()) {
         return Err("decomposition requires 2 to 50 child tasks".into());
     }
     let mut out: Vec<Vec<usize>> = Vec::with_capacity(tasks.len());
+    let mut all_criteria: Vec<Vec<String>> = Vec::with_capacity(tasks.len());
+    let mut titles = std::collections::HashSet::new();
     for (idx, task) in tasks.iter().enumerate() {
         let n = idx + 1;
         if task.title.trim().is_empty() {
             return Err(format!("task {n} has an empty title"));
+        }
+        if !titles.insert(task.title.trim().to_ascii_lowercase()) {
+            return Err(format!(
+                "task {n} repeats the title {:?}; every child must be independently identifiable",
+                task.title.trim()
+            ));
+        }
+        if bs::continuation_verdict(&task.description) != bs::ContinuationVerdict::Ok {
+            return Err(format!(
+                "task {n} needs a concrete description of at least three words"
+            ));
         }
         if !bs::KNOWN_TYPES.contains(&task.item_type.as_str()) || task.item_type == "epic" {
             return Err(format!(
@@ -4677,6 +4731,36 @@ fn validate_decomposition(tasks: &[DecomposeTask]) -> Result<Vec<Vec<usize>>, St
             return Err(format!(
                 "task {n} needs a concrete next_action of at least three words"
             ));
+        }
+        if task.acceptance_criteria.is_empty() || task.acceptance_criteria.len() > 12 {
+            return Err(format!(
+                "task {n} needs 1 to 12 acceptance_criteria so its terminal state is falsifiable"
+            ));
+        }
+        let mut criteria = Vec::with_capacity(task.acceptance_criteria.len());
+        let mut seen_criteria = std::collections::HashSet::new();
+        for (criterion_idx, criterion) in task.acceptance_criteria.iter().enumerate() {
+            let TextRef::Text(text) = criterion else {
+                return Err(format!(
+                    "task {n} acceptance_criteria entry {} must be a string, got {}",
+                    criterion_idx + 1,
+                    criterion.shown()
+                ));
+            };
+            let text = text.trim();
+            if bs::continuation_verdict(text) != bs::ContinuationVerdict::Ok {
+                return Err(format!(
+                    "task {n} acceptance_criteria entry {} must be a concrete condition of at least three words",
+                    criterion_idx + 1
+                ));
+            }
+            if !seen_criteria.insert(text.to_ascii_lowercase()) {
+                return Err(format!(
+                    "task {n} repeats acceptance criterion {:?}",
+                    text
+                ));
+            }
+            criteria.push(text.to_string());
         }
         let mut seen = std::collections::HashSet::new();
         let mut deps: Vec<usize> = Vec::with_capacity(task.depends_on.len());
@@ -4700,8 +4784,47 @@ fn validate_decomposition(tasks: &[DecomposeTask]) -> Result<Vec<Vec<usize>>, St
             deps.push(*dep);
         }
         out.push(deps);
+        all_criteria.push(criteria);
     }
-    Ok(out)
+
+    // A retry is idempotent only when the normalized PLAN is the same. The
+    // hash is written on the root epic before the transaction commits, so a
+    // lost response, a restart, and a concurrent retry all share one durable
+    // discriminator. Mutable child prose/status never participates.
+    let canonical = tasks
+        .iter()
+        .enumerate()
+        .map(|(idx, task)| {
+            json!({
+                "title": task.title.trim(),
+                "description": task.description.trim(),
+                "type": task.item_type,
+                "priority": task.priority,
+                "depends_on": out[idx],
+                "next_action": task.next_action.trim(),
+                "acceptance_criteria": all_criteria[idx],
+            })
+        })
+        .collect::<Vec<_>>();
+    use sha2::Digest as _;
+    let mut digest = sha2::Sha256::new();
+    digest.update(serde_json::to_vec(&canonical).expect("JSON values always serialize"));
+    let plan_sha256 = format!("{:x}", digest.finalize());
+
+    Ok(ValidatedDecomposition {
+        dependencies: out,
+        acceptance_criteria: all_criteria,
+        plan_sha256,
+    })
+}
+
+fn decomposition_plan_sha256(log: Option<&str>) -> Option<String> {
+    log.unwrap_or_default()
+        .split_whitespace()
+        .rev()
+        .find_map(|token| token.strip_prefix("plan_sha256="))
+        .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_string)
 }
 
 /// POST /api/board/{id}/decompose — atomically turn a capture shell into an
@@ -4712,9 +4835,26 @@ async fn decompose_item(
     headers: HeaderMap,
     Json(body): Json<DecomposeBody>,
 ) -> Response {
-    let dep_indices = match validate_decomposition(&body.tasks) {
+    let validated = match validate_decomposition(&body.tasks) {
         Ok(d) => d,
-        Err(why) => return err(StatusCode::BAD_REQUEST, json!({"error": why, "item": id})),
+        Err(why) => {
+            tracing::warn!(
+                target: "amux::board",
+                epic = %id,
+                verdict = "invalid_plan",
+                measured = true,
+                n_considered = body.tasks.len(),
+                reason = %why,
+                "board capture decomposition refused"
+            );
+            return err(StatusCode::BAD_REQUEST, json!({
+                "error": why,
+                "item": id,
+                "verdict": "invalid_plan",
+                "measured": true,
+                "n_considered": body.tasks.len(),
+            }));
+        }
     };
     let (_, actor) = actor_from_headers(&headers);
     if actor == "api-anonymous" {
@@ -4728,10 +4868,14 @@ async fn decompose_item(
         Missing,
         NotCapture,
         WrongOwner(String),
-        Already(IssueRow, Vec<IssueRow>),
+        Already(IssueRow, Vec<IssueRow>, Option<String>),
         Created(IssueRow, Vec<IssueRow>),
     }
     let tasks = body.tasks;
+    let dep_indices = validated.dependencies;
+    let acceptance_criteria = validated.acceptance_criteria;
+    let plan_sha256 = validated.plan_sha256;
+    let submitted_plan_sha256 = plan_sha256.clone();
     let id_w = id.clone();
     let actor_w = actor.clone();
     let slot: Arc<Mutex<Option<Out>>> = Arc::new(Mutex::new(None));
@@ -4757,7 +4901,12 @@ async fn decompose_item(
                     .iter()
                     .filter_map(|child| bs::get_issue(conn, child).ok().flatten())
                     .collect();
-                return finish(&slot_w, Out::Already(parent, children), no_write());
+                let existing_plan_sha256 = decomposition_plan_sha256(parent.log.as_deref());
+                return finish(
+                    &slot_w,
+                    Out::Already(parent, children, existing_plan_sha256),
+                    no_write(),
+                );
             }
             if parent.source.as_deref() != Some("capture")
                 && !parent.desc.trim_start().starts_with("**Prompt:**")
@@ -4786,8 +4935,8 @@ async fn decompose_item(
                 parent.log.as_deref(),
                 &stamp,
                 &format!(
-                    "decomposed by {actor_w} into {} ordered child task(s)",
-                    tasks.len()
+                    "decomposed by {actor_w} into {} ordered child task(s) plan_sha256={plan_sha256}",
+                    tasks.len(),
                 ),
             ));
             bs::save_patched(conn, &mut parent)?;
@@ -4829,6 +4978,10 @@ async fn decompose_item(
                 let mut child = bs::create_issue(conn, &new, now)?;
                 child.epic = Some(parent.id.clone());
                 child.next_action = Some(task.next_action.trim().to_string());
+                child.acceptance_criteria = Some(
+                    serde_json::to_string(&acceptance_criteria[idx])
+                        .expect("validated string criteria always serialize"),
+                );
                 child.log = Some(bs::append_log(
                     child.log.as_deref(),
                     &stamp,
@@ -4870,15 +5023,59 @@ async fn decompose_item(
             StatusCode::FORBIDDEN,
             json!({"error":"capture belongs to another worker", "item":id, "owner":owner, "caller":actor}),
         ),
-        Some(Out::Already(parent, children)) => Json(json!({
-            "ok": true,
-            "id": parent.id,
-            "status": parent.status,
-            "epic": detail_body(&parent),
-            "tasks": children.iter().map(detail_body).collect::<Vec<_>>(),
-            "idempotent": true,
-        }))
-        .into_response(),
+        Some(Out::Already(parent, children, existing_plan_sha256)) => {
+            match existing_plan_sha256 {
+                Some(existing) if existing == submitted_plan_sha256 => Json(json!({
+                    "ok": true,
+                    "id": parent.id,
+                    "status": parent.status,
+                    "epic": detail_body(&parent),
+                    "tasks": children.iter().map(detail_body).collect::<Vec<_>>(),
+                    "idempotent": true,
+                    "idempotency_measured": true,
+                    "plan_sha256": existing,
+                }))
+                .into_response(),
+                Some(existing) => {
+                    tracing::warn!(
+                        target: "amux::board",
+                        epic = %parent.id,
+                        verdict = "plan_conflict",
+                        measured = true,
+                        n_considered = children.len(),
+                        existing_plan_sha256 = %existing,
+                        submitted_plan_sha256 = %submitted_plan_sha256,
+                        "board capture decomposition retry differs from committed plan"
+                    );
+                    err(StatusCode::CONFLICT, json!({
+                        "error": "capture already has a different decomposition plan",
+                        "code": "decomposition_plan_conflict",
+                        "item": parent.id,
+                        "idempotent": false,
+                        "idempotency_measured": true,
+                        "measured": true,
+                        "n_considered": children.len(),
+                        "existing_plan_sha256": existing,
+                        "submitted_plan_sha256": submitted_plan_sha256,
+                        "existing_tasks": children.iter().map(|c| &c.id).collect::<Vec<_>>(),
+                    }))
+                }
+                // Legacy decompositions predate the durable discriminator. Do
+                // not pretend their payload was compared; preserve retry
+                // compatibility and say exactly what could not be measured.
+                None => Json(json!({
+                    "ok": true,
+                    "id": parent.id,
+                    "status": parent.status,
+                    "epic": detail_body(&parent),
+                    "tasks": children.iter().map(detail_body).collect::<Vec<_>>(),
+                    "idempotent": true,
+                    "idempotency_measured": false,
+                    "why_unmeasured": "this decomposition predates the durable plan fingerprint",
+                }))
+                .into_response(),
+            }
+        }
         Some(Out::Created(parent, children)) => {
             tracing::info!(
                 target: "amux::board",
@@ -4897,6 +5094,7 @@ async fn decompose_item(
                     "status": parent.status,
                     "epic": detail_body(&parent),
                     "tasks": children.iter().map(detail_body).collect::<Vec<_>>(),
+                    "plan_sha256": submitted_plan_sha256,
                 })),
             )
                 .into_response()
@@ -4984,26 +5182,48 @@ pub async fn claim_item(
                 )
                     .into_response();
             }
-            if crate::runtime_jobs::board_drive::claim_card_from(&state, &session, &id, from).await
+            match crate::runtime_jobs::board_drive::claim_card_from_outcome(
+                &state, &session, &id, from,
+            )
+            .await
             {
-                (
+                crate::runtime_jobs::board_drive::ClaimCardOutcome::Claimed => (
                     StatusCode::OK,
                     Json(json!({
                         "ok": true, "id": id, "status": "doing", "session": session, "claimed": true,
                     })),
                 )
-                    .into_response()
-            } else {
-                // Raced out of the status we read between the read above and
-                // the swap (owner closed it, or a peer claimed first).
-                (
+                    .into_response(),
+                crate::runtime_jobs::board_drive::ClaimCardOutcome::DependencyBlocked(blocking) => (
                     StatusCode::CONFLICT,
                     Json(json!({
-                        "error": format!("claim raced — the card left '{from}' between read and write; re-check its status"),
+                        "error": "card has unfinished dependencies and cannot be claimed yet",
+                        "code": "dependency_blocked",
+                        "ok": false,
+                        "blocked": true,
                         "id": id,
+                        "status": from,
+                        "session": owner,
+                        "depends_on": row.depends_on,
+                        "blocking": blocking,
+                        "measured": true,
+                        "n_considered": row.depends_on.len(),
+                        "how_to_fix": "finish or explicitly resolve the blocking tasks; board-drive promotes a dependency-backed backlog card after every dependency is done or verified",
                     })),
                 )
-                    .into_response()
+                    .into_response(),
+                crate::runtime_jobs::board_drive::ClaimCardOutcome::NotApplied => {
+                // Raced out of the status we read between the read above and
+                // the swap (owner closed it, or a peer claimed first).
+                    (
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "error": format!("claim raced — the card left '{from}' between read and write; re-check its status"),
+                            "id": id,
+                        })),
+                    )
+                        .into_response()
+                }
             }
         }
         "doing" if owner == session => (

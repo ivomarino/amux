@@ -2547,6 +2547,225 @@ pub fn user_prompts_produce_cards(
     out
 }
 
+// ---------------------------------------------------------------------------
+// 7b. Decomposed task detail is sufficient to execute and close honestly.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct DecompositionDetailRow {
+    pub id: String,
+    pub title: String,
+    pub desc: String,
+    pub status: String,
+    pub session: Option<String>,
+    pub creator: String,
+    pub item_type: String,
+    pub epic: Option<String>,
+    pub depends_on: Option<String>,
+    pub next_action: Option<String>,
+    pub acceptance_criteria: Option<String>,
+    pub tags: Vec<String>,
+    pub evidence: Option<String>,
+    pub last_result: Option<String>,
+    pub closed_at: Option<i64>,
+}
+
+fn concrete_sentence(text: &str) -> bool {
+    text.split_whitespace().count() >= 3
+}
+
+fn plain_criteria_valid(raw: Option<&str>) -> bool {
+    let Some(raw) = raw else { return false };
+    serde_json::from_str::<Vec<String>>(raw).is_ok_and(|criteria| {
+        let mut seen = std::collections::HashSet::new();
+        (1..=12).contains(&criteria.len())
+            && criteria.iter().all(|criterion| concrete_sentence(criterion.trim()))
+            && criteria
+                .iter()
+                .all(|criterion| seen.insert(criterion.trim().to_ascii_lowercase()))
+    })
+}
+
+fn dependency_list_valid(id: &str, raw: Option<&str>) -> bool {
+    let Some(raw) = raw else { return true };
+    serde_json::from_str::<Vec<String>>(raw).is_ok_and(|dependencies| {
+        let mut seen = std::collections::HashSet::new();
+        dependencies.iter().all(|dependency| {
+            let dependency = dependency.trim();
+            !dependency.is_empty() && dependency != id && seen.insert(dependency.to_string())
+        })
+    })
+}
+
+/// A decompose endpoint that requires detail only at write time can still
+/// regress through a second producer or a partial legacy write. This reads the
+/// durable rows the board actually serves. Its negative test injects every
+/// missing field independently, so a green result cannot come from checking
+/// only one convenient proxy such as `next_action`.
+pub fn decomposed_tasks_have_comprehensive_details(
+    rows: &[DecompositionDetailRow],
+) -> Vec<InvariantResult> {
+    const ID: &str = "board.decomposed_tasks_have_comprehensive_details";
+    let mut incomplete = Vec::new();
+    for row in rows {
+        let mut gaps = Vec::new();
+        if row.title.trim().is_empty() {
+            gaps.push("title");
+        }
+        if !concrete_sentence(row.desc.trim()) {
+            gaps.push("description");
+        }
+        if row.session.as_deref().is_none_or(|v| v.trim().is_empty()) {
+            gaps.push("session");
+        }
+        if row.creator.trim().is_empty() {
+            gaps.push("creator");
+        }
+        if row.epic.as_deref().is_none_or(|v| v.trim().is_empty()) {
+            gaps.push("epic");
+        }
+        if !dependency_list_valid(&row.id, row.depends_on.as_deref()) {
+            gaps.push("dependencies");
+        }
+        if !crate::db::board_store::KNOWN_TYPES.contains(&row.item_type.as_str())
+            || row.item_type == "epic"
+        {
+            gaps.push("leaf_type");
+        }
+        if row
+            .next_action
+            .as_deref()
+            .is_none_or(|v| !concrete_sentence(v.trim()))
+        {
+            gaps.push("next_action");
+        }
+        if !plain_criteria_valid(row.acceptance_criteria.as_deref()) {
+            gaps.push("acceptance_criteria");
+        }
+        let priorities = row
+            .tags
+            .iter()
+            .filter(|tag| matches!(tag.as_str(), "p0" | "p1" | "p2" | "p3"))
+            .count();
+        if priorities != 1 {
+            gaps.push("priority");
+        }
+        if matches!(row.status.as_str(), "done" | "verified") {
+            if row.evidence.as_deref().is_none_or(|v| v.trim().is_empty()) {
+                gaps.push("terminal_evidence");
+            }
+            if row
+                .last_result
+                .as_deref()
+                .is_none_or(|v| !concrete_sentence(v.trim()))
+            {
+                gaps.push("terminal_result");
+            }
+            if row.closed_at.is_none() {
+                gaps.push("closed_at");
+            }
+        }
+        if !gaps.is_empty() {
+            incomplete.push(json!({
+                "id": row.id,
+                "status": row.status,
+                "session": row.session,
+                "gaps": gaps,
+            }));
+        }
+    }
+    let evidence = json!({
+        "n_considered": rows.len(),
+        "incomplete": incomplete.len(),
+        "sample": incomplete.iter().take(10).collect::<Vec<_>>(),
+        "scope": "every live source=decomposition child, including terminal rows",
+    });
+    if incomplete.is_empty() {
+        vec![InvariantResult::pass(ID).evidence(evidence)]
+    } else {
+        vec![InvariantResult::fail(
+            ID,
+            "every decomposed task carries execution, lineage, priority, acceptance, and terminal evidence detail",
+            format!(
+                "{} of {} decomposed task(s) are incomplete; see evidence.sample for per-card gaps",
+                incomplete.len(),
+                rows.len()
+            ),
+        )
+        .evidence(evidence)]
+    }
+}
+
+#[cfg(test)]
+mod decomposition_detail_tests {
+    use super::*;
+
+    fn complete() -> DecompositionDetailRow {
+        DecompositionDetailRow {
+            id: "ATE-1".into(),
+            title: "Exercise the complete flow".into(),
+            desc: "Drive the real board lifecycle.".into(),
+            status: "done".into(),
+            session: Some("lane".into()),
+            creator: "lane".into(),
+            item_type: "code".into(),
+            epic: Some("ATE-0".into()),
+            depends_on: Some("[]".into()),
+            next_action: Some("Run the complete flow".into()),
+            acceptance_criteria: Some(
+                serde_json::to_string(&vec!["The complete flow passes"]).unwrap(),
+            ),
+            tags: vec!["p0".into()],
+            evidence: Some("crates/amux-server/tests/board_api.rs".into()),
+            last_result: Some("The complete flow passed.".into()),
+            closed_at: Some(1),
+        }
+    }
+
+    #[test]
+    fn complete_decomposed_rows_pass_with_the_population_beside_the_verdict() {
+        let out = decomposed_tasks_have_comprehensive_details(&[complete()]);
+        assert_eq!(out[0].status, Status::Pass);
+        assert_eq!(out[0].evidence["n_considered"], json!(1));
+        assert_eq!(out[0].evidence["incomplete"], json!(0));
+    }
+
+    #[test]
+    fn every_required_detail_can_independently_make_the_invariant_fail() {
+        type RemoveDetail = fn(&mut DecompositionDetailRow);
+        let cases: [(&str, RemoveDetail); 13] = [
+            ("title", |r| r.title.clear()),
+            ("description", |r| r.desc = "thin".into()),
+            ("session", |r| r.session = None),
+            ("creator", |r| r.creator.clear()),
+            ("epic", |r| r.epic = None),
+            ("dependencies", |r| r.depends_on = Some("[\"ATE-1\"]".into())),
+            ("leaf_type", |r| r.item_type = "epic".into()),
+            ("next_action", |r| r.next_action = Some("continue".into())),
+            ("acceptance_criteria", |r| r.acceptance_criteria = Some("[]".into())),
+            ("priority", |r| r.tags.clear()),
+            ("terminal_evidence", |r| r.evidence = None),
+            ("terminal_result", |r| r.last_result = Some("done".into())),
+            ("closed_at", |r| r.closed_at = None),
+        ];
+        for (expected, mutate) in cases {
+            let mut row = complete();
+            mutate(&mut row);
+            let out = decomposed_tasks_have_comprehensive_details(&[row]);
+            assert_eq!(out[0].status, Status::Fail, "{expected}");
+            assert!(
+                out[0].evidence["sample"][0]["gaps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|gap| gap == expected),
+                "the failure must name the exact missing dimension {expected}: {:?}",
+                out[0].evidence
+            );
+        }
+    }
+}
+
 /// How far back the capture-pipeline check looks, in seconds: bounded by the
 /// CURRENT BUILD's uptime, capped at `ceiling_s`.
 ///

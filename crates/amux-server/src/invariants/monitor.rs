@@ -392,6 +392,12 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     out.extend(capture_pipeline_check(state));
 
     tm.mark(&out, "7. capture pipeline");
+    // -- 7b. did decomposition produce cards a stranger can execute and close?
+    // The endpoint validates the write; this independent read catches any
+    // second producer, legacy partial row, or later destructive edit.
+    out.extend(decomposition_detail_check(state));
+
+    tm.mark(&out, "7b. decomposition detail");
     // -- 8. provider launch agrees with its adapter (RR-0043 / AMUX-3153): does
     // the server launch each provider with the same binary its adapter — and its
     // capability report — describes? The launcher and the adapter are two
@@ -455,6 +461,52 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
 
     tm.finish();
     out
+}
+
+fn decomposition_detail_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "board.decomposed_tasks_have_comprehensive_details";
+    let Ok(conn) = state.store.read() else {
+        return vec![InvariantResult::unknown(ID, "store unreadable")];
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT id,title,desc,status,session,creator,COALESCE(type,'code'),epic, \
+                depends_on,next_action,acceptance_criteria,tags,evidence,last_result,closed_at \
+         FROM issues WHERE source='decomposition' AND deleted IS NULL \
+              AND COALESCE(archived,0)=0 ORDER BY created,id",
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => return vec![InvariantResult::unknown(ID, format!("query prepare failed: {e}"))],
+    };
+    let rows = match stmt
+        .query_map([], |r| {
+            let tags_raw: Option<String> = r.get(11)?;
+            Ok(checks::DecompositionDetailRow {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                desc: r.get(2)?,
+                status: r.get(3)?,
+                session: r.get(4)?,
+                creator: r.get(5)?,
+                item_type: r.get(6)?,
+                epic: r.get(7)?,
+                depends_on: r.get(8)?,
+                next_action: r.get(9)?,
+                acceptance_criteria: r.get(10)?,
+                tags: tags_raw
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str(raw).ok())
+                    .unwrap_or_default(),
+                evidence: r.get(12)?,
+                last_result: r.get(13)?,
+                closed_at: r.get(14)?,
+            })
+        })
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+    {
+        Ok(rows) => rows,
+        Err(e) => return vec![InvariantResult::unknown(ID, format!("query failed: {e}"))],
+    };
+    checks::decomposed_tasks_have_comprehensive_details(&rows)
 }
 
 /// AMUX-3203. Reads the SAME config keys and `push_subscriptions` table

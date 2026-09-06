@@ -3354,3 +3354,58 @@ FIX: 6bce0158 removes isolation from owner-prompt capture while preserving its
 harness, peer-discovery, and automation boundaries. Capture logs now include
 `owner_isolated`, the health invariant evaluates isolated-owner prompts, and an exact
 regression fixture proves the confirmed live prompt shape mints and links a card.
+
+## Decomposition accepted child cards that did not say how to execute or verify them
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-06
+SESSION: amux
+CARD: AMUX-4161
+SYMPTOM: The capture decomposition endpoint required a title, priority, dependency
+ indexes, and next action, but accepted an empty description and no acceptance
+ criteria. All 24 live decomposition children predate the corrected contract and
+ lack acceptance criteria, yet no health invariant reported that incomplete
+ population.
+COST: A worker could receive a syntactically valid child without enough durable
+ detail to determine scope or falsify completion; terminal evidence then depended
+ on conversational context outside the board.
+FIX: The endpoint now rejects vague descriptions and missing, malformed, or duplicate
+ acceptance criteria atomically, and the board health sweep reports every incomplete
+ live decomposition row with `measured`, `n_considered`, and per-card gap names.
+
+## Manual claim bypassed a decomposed task's dependency graph
+AREA: board
+SEVERITY: corrupts
+STATUS: fixed
+DATE: 2026-09-06
+SESSION: amux
+CARD: AMUX-4161
+SYMPTOM: Board-drive held dependency-backed children in backlog, but the public claim
+ endpoint could force a backlog child directly to doing without consulting those
+ dependencies. The chaos journey reproduced the bypass by claiming plan step two
+ while step one was still open.
+COST: Two workers could execute an ordered plan out of sequence, consuming work whose
+ prerequisite had not produced its result while the board still displayed a valid
+ dependency edge.
+FIX: The claim primitive now checks dependencies in the same SQLite writer transaction
+ as its status compare-and-swap. A refusal returns `dependency_blocked` with the exact
+ blockers and writes both a WARN verdict and a durable `claim.dependency_blocked`
+ session event.
+
+## A different decomposition retry was reported as idempotent
+AREA: board
+SEVERITY: corrupts
+STATUS: fixed
+DATE: 2026-09-06
+SESSION: amux
+CARD: AMUX-4161
+SYMPTOM: Once an epic had children, every later decomposition request returned
+ `idempotent: true` without comparing the submitted plan to the committed one. A
+ retried or racing caller could therefore believe its changed plan won even though
+ the board retained a different child set.
+COST: The API acknowledged work it did not store and gave the caller no discriminator
+ for recovering after a lost response or concurrent decomposition.
+FIX: Decomposition now persists a normalized plan SHA-256 on the root epic. Exact
+ retries return measured idempotent success; divergent retries return a measured 409
+ with both hashes and emit a greppable `plan_conflict` WARN verdict.

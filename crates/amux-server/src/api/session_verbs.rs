@@ -19840,6 +19840,219 @@ mod tests {
         );
     }
 
+    /// AMUX-4161. One hermetic chaos journey through the shipped seams:
+    /// delivered owner message -> capture card -> concurrent decomposition
+    /// retry -> dependency-gated execution -> terminal children -> terminal
+    /// root epic. The assertions inspect every board item's durable detail,
+    /// not just the HTTP statuses that moved it.
+    #[tokio::test]
+    async fn message_decomposition_chaos_reaches_terminal_states_with_complete_cards() {
+        let (st, _dir) = state();
+        let lane = "chaos-lane";
+        cmd_hist_record_full(
+            &st,
+            lane,
+            "Build the message pipeline, exercise dependency failures, and validate every task detail",
+            "user",
+            "",
+            false,
+            DeliveryMeta::direct(),
+        )
+        .await;
+        let root: String = st
+            .store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT card_id FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1",
+                [lane],
+                |r| r.get(0),
+            )
+            .expect("the delivered message must have a linked capture card");
+        let app = crate::api::router(st.clone());
+        let plan = json!({"tasks":[
+            {
+                "title":"Implement the captured behavior",
+                "description":"Implement the independently testable message behavior.",
+                "type":"code","priority":0,"depends_on":[],
+                "next_action":"Implement the focused message behavior",
+                "acceptance_criteria":[
+                    "The focused message regression test passes",
+                    "The produced implementation artifact is recorded"
+                ]
+            },
+            {
+                "title":"Exercise dependency and retry faults",
+                "description":"Inject dependency and idempotency failures through the real API.",
+                "type":"investigation","priority":1,"depends_on":[1],
+                "next_action":"Run the dependency chaos matrix",
+                "acceptance_criteria":[
+                    "An early dependent claim returns dependency_blocked",
+                    "A duplicate plan creates exactly one child set"
+                ]
+            },
+            {
+                "title":"Validate terminal board detail",
+                "description":"Inspect every child and the completed root epic.",
+                "type":"doc","priority":2,"depends_on":[2],
+                "next_action":"Record the terminal validation results",
+                "acceptance_criteria":[
+                    "Every child records evidence and a close timestamp",
+                    "The root epic records every terminal child status"
+                ]
+            }
+        ]});
+        let path = format!("/api/board/{root}/decompose");
+        let worker_headers = [("X-Amux-Worker", lane)];
+
+        // Two clients lose sight of each other and submit the identical plan
+        // together. SQLite serialization plus the durable plan hash must yield
+        // one creation and one measured idempotent retry, never six children.
+        let a = call_with(
+            &app,
+            "POST",
+            &path,
+            Some(plan.clone()),
+            &worker_headers,
+        );
+        let b = call_with(
+            &app,
+            "POST",
+            &path,
+            Some(plan.clone()),
+            &worker_headers,
+        );
+        let ((sa, va), (sb, vb)) = tokio::join!(a, b);
+        let mut statuses = [sa, sb];
+        statuses.sort();
+        assert_eq!(statuses, [StatusCode::OK, StatusCode::CREATED], "{va} / {vb}");
+        let (created, retried) = if sa == StatusCode::CREATED { (&va, &vb) } else { (&vb, &va) };
+        assert_eq!(retried["idempotent"], json!(true), "{retried}");
+        assert_eq!(retried["idempotency_measured"], json!(true), "{retried}");
+        assert_eq!(created["plan_sha256"], retried["plan_sha256"]);
+        let children = created["tasks"].as_array().unwrap().clone();
+        assert_eq!(children.len(), 3);
+        let child_count: i64 = st
+            .store
+            .read()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM issues WHERE epic=?1", [&root], |r| r.get(0))
+            .unwrap();
+        assert_eq!(child_count, 3, "a concurrent retry must not duplicate the plan");
+
+        for (idx, child) in children.iter().enumerate() {
+            assert!(!child["title"].as_str().unwrap_or_default().trim().is_empty());
+            assert!(child["desc"].as_str().unwrap_or_default().split_whitespace().count() >= 3);
+            assert_eq!(child["session"], json!(lane));
+            assert_eq!(child["creator"], json!(lane));
+            assert_eq!(child["source"], json!("decomposition"));
+            assert_eq!(child["epic"], json!(root));
+            assert_eq!(child["tags"], json!([format!("p{idx}")]));
+            assert!(child["next_action"].as_str().unwrap_or_default().split_whitespace().count() >= 3);
+            assert!(child["acceptance_criteria"].as_array().is_some_and(|v| !v.is_empty()));
+        }
+
+        let ids = children
+            .iter()
+            .map(|c| c["id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(children[1]["depends_on"], json!([ids[0].clone()]));
+        assert_eq!(children[2]["depends_on"], json!([ids[1].clone()]));
+
+        // Fault: try to leapfrog the plan.
+        let (blocked_status, blocked) = call_with(
+            &app,
+            "POST",
+            &format!("/api/board/{}/claim", ids[1]),
+            Some(json!({})),
+            &[("X-Amux-Session", lane)],
+        )
+        .await;
+        assert_eq!(blocked_status, StatusCode::CONFLICT, "{blocked}");
+        assert_eq!(blocked["code"], json!("dependency_blocked"));
+        assert_eq!(blocked["blocking"], json!([ids[0].clone()]));
+        assert_eq!(blocked["measured"], json!(true));
+
+        for (idx, id) in ids.iter().enumerate() {
+            if idx > 0 {
+                let (promoted, held) = crate::runtime_jobs::board_drive::promote_ready_backlog(&st).await;
+                assert_eq!((promoted, held), (1, 0), "step {idx} did not become runnable");
+            }
+            let (claim_status, claim) = call_with(
+                &app,
+                "POST",
+                &format!("/api/board/{id}/claim"),
+                Some(json!({})),
+                &[("X-Amux-Session", lane)],
+            )
+            .await;
+            assert_eq!(claim_status, StatusCode::OK, "step {idx}: {claim}");
+            assert_eq!(claim["status"], json!("doing"));
+
+            let terminal = json!({
+                "status":"done",
+                "gate_ack":true,
+                "evidence":"crates/amux-server/tests/board_api.rs",
+                "last_result":format!("Chaos step {} reached its expected terminal state.", idx + 1)
+            });
+            if idx == 2 {
+                // Two finishers race on the last step. Exactly one transition
+                // applies; the replay is an honest 200 no-op with rev intact.
+                let terminal_path = format!("/api/board/{id}");
+                let terminal_headers = [("X-Amux-Session", lane)];
+                let x = call_with(
+                    &app,
+                    "PATCH",
+                    &terminal_path,
+                    Some(terminal.clone()),
+                    &terminal_headers,
+                );
+                let y = call_with(
+                    &app,
+                    "PATCH",
+                    &terminal_path,
+                    Some(terminal),
+                    &terminal_headers,
+                );
+                let ((sx, vx), (sy, vy)) = tokio::join!(x, y);
+                assert_eq!((sx, sy), (StatusCode::OK, StatusCode::OK), "{vx} / {vy}");
+                let applied = [vx["applied"].as_bool(), vy["applied"].as_bool()];
+                assert_eq!(applied.iter().filter(|v| **v == Some(true)).count(), 1, "{applied:?}");
+                assert_eq!(applied.iter().filter(|v| **v == Some(false)).count(), 1, "{applied:?}");
+            } else {
+                let (done_status, done) = call_with(
+                    &app,
+                    "PATCH",
+                    &format!("/api/board/{id}"),
+                    Some(terminal),
+                    &[("X-Amux-Session", lane)],
+                )
+                .await;
+                assert_eq!(done_status, StatusCode::OK, "step {idx}: {done}");
+                assert_eq!(done["status"], json!("done"));
+                assert_eq!(done["applied"], json!(true));
+            }
+        }
+
+        assert_eq!(crate::runtime_jobs::board_drive::complete_finished_epics(&st).await, 1);
+        let (root_status, root_detail) = call(&app, "GET", &format!("/api/board/{root}"), None).await;
+        assert_eq!(root_status, StatusCode::OK);
+        assert_eq!(root_detail["status"], json!("done"));
+        assert!(root_detail["evidence"].as_str().unwrap_or_default().contains(&ids[0]));
+        assert!(root_detail["evidence"].as_str().unwrap_or_default().contains(&ids[2]));
+        assert!(root_detail["last_result"].as_str().unwrap_or_default().contains("Completed child plan"));
+        assert_eq!(root_detail["messages"][0]["card_id"], json!(root));
+
+        for id in &ids {
+            let (_, child) = call(&app, "GET", &format!("/api/board/{id}"), None).await;
+            assert_eq!(child["status"], json!("done"));
+            assert!(child["closed_at"].as_i64().is_some());
+            assert!(child["evidence"].as_str().is_some_and(|v| v.contains("board_api.rs")));
+            assert!(child["last_result"].as_str().is_some_and(|v| v.contains("terminal state")));
+            assert_eq!(child["messages"][0]["card_id"], json!(root));
+        }
+    }
+
     /// AMUX-4159: `CC_ISOLATED` strips the agent-side harness; it must not strip
     /// the owner's work from the shared ledger. This is the exact prompt shape
     /// that was delivered to the live isolated `amux` lane with
@@ -20359,7 +20572,20 @@ mod tests {
         path: &str,
         body: Option<Value>,
     ) -> (StatusCode, Value) {
+        call_with(app, method, path, body, &[]).await
+    }
+
+    async fn call_with(
+        app: &Router,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, Value) {
         let mut req = Request::builder().method(method).uri(path);
+        for (key, value) in headers {
+            req = req.header(*key, *value);
+        }
         let body = match body {
             Some(v) => {
                 req = req.header("content-type", "application/json");

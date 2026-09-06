@@ -2630,8 +2630,9 @@ Usage: amux board epic $id <EPIC-ID> | none"
       local id="${1:-}"
       _board_id_guard "decompose" "$id"
       [[ -n "$id" ]] || die "Usage: amux board decompose <CAPTURE-ID> --stdin | --file <plan.json>
-The plan is JSON: {\"tasks\":[{\"title\":\"...\",\"description\":\"...\",\"type\":\"code\",\"priority\":0,\"depends_on\":[],\"next_action\":\"Implement ...\"}, ...]}
-depends_on contains 1-based indexes of earlier tasks. Priority is p0 (highest) through p3."
+The plan is JSON: {\"tasks\":[{\"title\":\"...\",\"description\":\"...\",\"type\":\"code\",\"priority\":0,\"depends_on\":[],\"next_action\":\"Implement ...\",\"acceptance_criteria\":[\"The focused test fails before and passes after the change\"]}, ...]}
+depends_on contains 1-based indexes of earlier tasks. Priority is p0 (highest) through p3.
+Every child needs a concrete description, next action, and 1-12 falsifiable acceptance criteria."
       shift
       local plan=""
       case "${1:-}" in

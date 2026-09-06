@@ -2085,7 +2085,7 @@ fn backlog_dep_promotions(conn: &Connection) -> (Vec<(String, Vec<String>)>, usi
 /// dispatchable, and writes a greppable INFO line naming the card and the deps
 /// that cleared it (two-fixes: the next promotion — or a wrongful one — is
 /// self-announcing).
-async fn promote_ready_backlog(state: &AppState) -> (usize, usize) {
+pub(crate) async fn promote_ready_backlog(state: &AppState) -> (usize, usize) {
     let (candidates, held_on_trigger) = match state.store.read() {
         Ok(conn) => backlog_dep_promotions(&conn),
         Err(_) => return (0, 0),
@@ -2151,7 +2151,7 @@ fn epic_completion_candidates(conn: &Connection) -> Vec<(String, Vec<(String, St
 /// the id stored on the original message, so completing it is what makes the
 /// message's task chip report the state of the whole command rather than the
 /// state of whichever leaf happened to be created first.
-async fn complete_finished_epics(state: &AppState) -> usize {
+pub(crate) async fn complete_finished_epics(state: &AppState) -> usize {
     let candidates = match state.store.read() {
         Ok(conn) => epic_completion_candidates(&conn),
         Err(_) => return 0,
@@ -4245,7 +4245,8 @@ pub fn select_advance_with(
              One task? `amux board retitle {card_id} \"<title>\" --desc-stdin`\n\
              Several? Produce the ordered JSON plan and run \
              `amux board decompose {card_id} --stdin`. That single write preserves this \
-             message link and requires each child's dependencies, p0-p3 priority, and next action."
+             message link and requires each child's description, dependencies, p0-p3 priority, \
+             next action, and falsifiable acceptance criteria."
         );
         return Advance::Nudge {
             target: session.to_string(),
@@ -5790,6 +5791,13 @@ pub async fn claim_card(state: &AppState, session: &str, card: &str) -> bool {
     claim_card_from(state, session, card, "todo").await
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClaimCardOutcome {
+    Claimed,
+    DependencyBlocked(Vec<String>),
+    NotApplied,
+}
+
 /// `claim_card` with the expected PRIOR status as a parameter. Auto-pickup and
 /// every drive-loop path stay on `claim_card` ("todo"): a card parked
 /// todo->backlog mid-race must DEFEAT a racing pickup, so widening that CAS to
@@ -5803,6 +5811,22 @@ pub async fn claim_card_from(
     card: &str,
     from: &'static str,
 ) -> bool {
+    matches!(
+        claim_card_from_outcome(state, session, card, from).await,
+        ClaimCardOutcome::Claimed
+    )
+}
+
+/// The detailed claim primitive used by the HTTP door. Dependency checking
+/// lives INSIDE the same writer transaction as the status CAS: a preflight in
+/// the handler would leave a window where an open prerequisite could appear
+/// after the read and before the forced claim.
+pub(crate) async fn claim_card_from_outcome(
+    state: &AppState,
+    session: &str,
+    card: &str,
+    from: &'static str,
+) -> ClaimCardOutcome {
     let card_s = card.to_string();
     // Assign the claimer as part of the swap. For auto-pickup this is a no-op
     // (the card is already `i.session=lane`), but it makes a MANUAL claim
@@ -5824,6 +5848,8 @@ pub async fn claim_card_from(
     // raw-tmux-fallback and corrected.
     let cross_owner = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
     let cross_owner_w = cross_owner.clone();
+    let dependency_blockers = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let dependency_blockers_w = dependency_blockers.clone();
     let reply = state
         .store
         .write_async(move |conn| {
@@ -5831,14 +5857,20 @@ pub async fn claim_card_from(
             // log must be able to answer "which lane claimed this, and did it
             // already own it", because that is the exact question AF-79 could
             // NOT answer (AMUX-3776).
-            let prior_owner: String = conn
-                .query_row(
-                    "SELECT COALESCE(session,'') FROM issues WHERE id=?1 AND status=?2",
-                    rusqlite::params![card_s, from],
-                    |r| r.get(0),
-                )
-                .optional()?
-                .unwrap_or_default();
+            let Some(row) = bs::get_issue(conn, &card_s)? else {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            };
+            if row.status != from {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            }
+            let blockers = deps_blocking(conn, &row);
+            if !blockers.is_empty() {
+                if let Ok(mut g) = dependency_blockers_w.lock() {
+                    *g = blockers;
+                }
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            }
+            let prior_owner = row.session.unwrap_or_default();
 
             let reassigned = !prior_owner.is_empty() && prior_owner != session_s;
             let entry = if reassigned {
@@ -5874,6 +5906,39 @@ pub async fn claim_card_from(
             }
         })
         .await;
+    let blockers = dependency_blockers.lock().ok().map(|g| g.clone()).unwrap_or_default();
+    if !blockers.is_empty() {
+        let n_considered = blockers.len();
+        tracing::warn!(
+            target: "amux::board_drive",
+            %session,
+            %card,
+            %from,
+            blocking = %blockers.join(","),
+            measured = true,
+            n_considered,
+            verdict = "dependency_blocked",
+            "claim refused — prerequisite tasks are still open"
+        );
+        crate::api::session_verbs::emit_event(
+            state,
+            session,
+            "claim.dependency_blocked",
+            Some(json!({
+                "issue": card,
+                "claimer": session,
+                "from": from,
+                "blocking": blockers.clone(),
+                "measured": true,
+                "n_considered": n_considered,
+                "verdict": "dependency_blocked",
+            })),
+            None,
+            "board-drive",
+        )
+        .await;
+        return ClaimCardOutcome::DependencyBlocked(blockers);
+    }
     let claimed = matches!(reply, Ok(r) if r.applied);
     if !claimed {
         tracing::info!(
@@ -5882,7 +5947,7 @@ pub async fn claim_card_from(
             "claim NOT applied — card left the expected status between select and claim \
              (raced to a terminal/doing state, or store unreadable); prompt NOT dispatched"
         );
-        return false;
+        return ClaimCardOutcome::NotApplied;
     }
     // THE VIOLATION GETS ITS OWN TYPE, and it is emitted BEFORE `task.claimed`
     // so the ledger reads in causal order: the guard fired, then the claim
@@ -5914,7 +5979,7 @@ pub async fn claim_card_from(
         "board-drive",
     )
     .await;
-    true
+    ClaimCardOutcome::Claimed
 }
 
 /// Background driver.
