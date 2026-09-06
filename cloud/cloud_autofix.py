@@ -553,6 +553,25 @@ def main():
                 _disk = check_disk(); result["disk"] = _disk
                 trace("disk_preventive", "after truncate: %.1f%% used, %.1fGB free (was %.1fGB)"
                       % (_disk.get("pct", 0), _disk.get("free_gb", 0), _fb), _disk.get("pct", 100) < 95)
+            # AC-414 (2026-09-06 outage): a full disk crash-loops the gateway (exit
+            # 120 — it cannot write startup files), and the loop itself eats any space
+            # freed, so reclaiming WHILE it loops never breaks it. If the gateway is
+            # down, stop the loop, reclaim with it stopped, then restart — the exact
+            # hand recovery from today's 502, now automatic in the 30-min guard so a
+            # disk-induced outage self-heals instead of waiting for a human.
+            if not no_fix:
+                # Trigger on a real PROD PROBE, not systemctl is-active: a crash-looping
+                # unit flashes 'active' between restarts and raced the is-active check
+                # (AC-414 2026-09-06). 502/000 = down.
+                _st = probe_cloud()
+                if _st not in (200, 301, 302, 401, 403):
+                    ssh("import subprocess; subprocess.run(['systemctl','stop','amux-gateway'])", timeout=30)
+                    fix_logs(emergency=True)
+                    ok = restart_gateway()
+                    _st2 = probe_cloud()
+                    trace("gateway_recover", "prod was %d -> stop+reclaim+restart ok=%s, reprobe %d"
+                          % (_st, ok, _st2), _st2 in (200, 301, 302, 401, 403))
+                    result["gateway_recovered"] = _st2 in (200, 301, 302, 401, 403)
             result["healthy"] = _disk.get("pct", 100) < 98
         ssh("import json; open('/var/log/cloud-autofix.jsonl','a').write(%r+chr(10))"
             % json.dumps({"ts": int(time.time()), "disk_only": True, "trace": TRACE}), timeout=20)
