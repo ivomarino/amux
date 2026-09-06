@@ -424,9 +424,40 @@ if [[ "${1:-}" == "run" ]]; then
   # the shape this repo keeps filing, so it does not ship in the tool that exists
   # to prevent it.
   trap 'trap - EXIT INT TERM; "$self" revert "$file" "$old" "$new" >&2' EXIT INT TERM
-  "$@"
-  rc=$?
-  echo "mutate run: command exited $rc; reverting" >&2
+  # THE STATUS OF A PIPELINE IS ITS LAST ELEMENT'S, AND THAT IS HOW THIS TOOL
+  # GETS USED (AF-532). Raw `cargo test` output is enormous, so the natural
+  # invocation is
+  #     -- bash -c 'cargo test ... | grep -E "test result"'
+  # and there `rc` is grep's. Measured 2026-09-06: a run whose cargo was cut off
+  # mid-build printed one `Compiling` line, no test lines at all, and this script
+  # reported `command exited 0`. After a mutation, "exited 0" reads as THE
+  # MUTATION SURVIVED — i.e. the check cannot fail — which is the single most
+  # damaging thing a mutation tool can say wrongly.
+  #
+  # Cannot be fixed by inspecting "$@": the pipe lives inside a string this
+  # script hands to bash. So report what IS knowable — whether the command
+  # produced any output at all — beside the status, and refuse to let a silent
+  # exit 0 read as a survival. `tee` keeps the output streaming for long builds.
+  # A real pipe, not process substitution: `>(tee ..)` is not synchronised, so
+  # the line count could be read before tee flushed. PIPESTATUS[0] keeps THIS
+  # pipe from swallowing the command's status — it does NOT recover a status
+  # from a pipe INSIDE "$@" (there, `bash -c 'cargo | grep'` still exits as
+  # grep, and nothing out here can see past it). That is precisely why the
+  # no-output check below exists rather than a cleverer status check.
+  out_log=$(mktemp -t mutate-run)
+  "$@" 2>&1 | tee "$out_log"
+  rc=${PIPESTATUS[0]}
+  n_out=$(wc -l < "$out_log" | tr -d ' ')
+  rm -f "$out_log"
+  if [[ "$rc" -eq 0 && "$n_out" -eq 0 ]]; then
+    echo "mutate run: command exited 0 having produced NO OUTPUT — this is NOT" >&2
+    echo "mutate run: evidence the mutation survived. A pipeline's status is its" >&2
+    echo "mutate run: LAST element's, so a \`| grep\` masks a build that never ran." >&2
+    echo "mutate run: re-run with the pipe removed, or with \`set -o pipefail;\`" >&2
+    echo "mutate run: in front of it, before believing this result. Reverting." >&2
+  else
+    echo "mutate run: command exited $rc after $n_out line(s) of output; reverting" >&2
+  fi
   exit "$rc"
 fi
 
