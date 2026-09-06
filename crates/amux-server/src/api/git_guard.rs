@@ -180,7 +180,10 @@ pub fn notify_once(key: &str) -> bool {
 }
 
 fn now_epoch() -> f64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 use crate::config::env_f64;
@@ -191,7 +194,11 @@ fn window_secs() -> f64 {
 
 fn guard_enabled() -> bool {
     !matches!(
-        std::env::var("AMUX_STAGED_GUARD").unwrap_or_default().trim().to_ascii_lowercase().as_str(),
+        std::env::var("AMUX_STAGED_GUARD")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
         "0" | "false" | "off" | "no"
     )
 }
@@ -210,7 +217,9 @@ fn realpath(p: &Path) -> String {
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     let mut cur = p.to_path_buf();
     while let Some(parent) = cur.parent().map(Path::to_path_buf) {
-        let Some(fname) = cur.file_name().map(|f| f.to_os_string()) else { break };
+        let Some(fname) = cur.file_name().map(|f| f.to_os_string()) else {
+            break;
+        };
         tail.push(fname);
         if let Ok(c) = parent.canonicalize() {
             let mut out = c;
@@ -240,8 +249,13 @@ async fn git_out(dir: &str, args: &[&str]) -> Option<String> {
     // git runs constantly here (a shared checkout, ~50 lanes), so this site is
     // the highest-frequency one that was missing it (DESKT-30).
     cmd.kill_on_drop(true);
-    let out = tokio::time::timeout(GIT_TIMEOUT, cmd.output()).await.ok()?.ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    let out = tokio::time::timeout(GIT_TIMEOUT, cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Has `owner` already COMMITTED their work on `path`, more recently than the
@@ -305,8 +319,16 @@ async fn owner_never_wrote(dir: &str, path: &str, owner: &str) -> Option<bool> {
     // nonzero exit, so the fallback is what runs when the ref is missing.
     let out = match git_out(
         dir,
-        &["log", "-n", "200", "--format=%(trailers:key=Amux-Session,valueonly,separator=,)",
-          "HEAD", "origin/main", "--", path],
+        &[
+            "log",
+            "-n",
+            "200",
+            "--format=%(trailers:key=Amux-Session,valueonly,separator=,)",
+            "HEAD",
+            "origin/main",
+            "--",
+            path,
+        ],
     )
     .await
     {
@@ -314,14 +336,23 @@ async fn owner_never_wrote(dir: &str, path: &str, owner: &str) -> Option<bool> {
         None => {
             git_out(
                 dir,
-                &["log", "-n", "200",
-                  "--format=%(trailers:key=Amux-Session,valueonly,separator=,)", "--", path],
+                &[
+                    "log",
+                    "-n",
+                    "200",
+                    "--format=%(trailers:key=Amux-Session,valueonly,separator=,)",
+                    "--",
+                    path,
+                ],
             )
             .await?
         }
     };
-    let attributed: Vec<&str> =
-        out.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let attributed: Vec<&str> = out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
     if attributed.is_empty() {
         return None; // no history, or none of it carries a trailer
     }
@@ -334,7 +365,13 @@ async fn owner_never_wrote(dir: &str, path: &str, owner: &str) -> Option<bool> {
 async fn owner_owns_newest_commit(dir: &str, path: &str, owner: &str) -> Option<String> {
     let out = git_out(
         dir,
-        &["log", "-1", "--format=%h%x09%(trailers:key=Amux-Session,valueonly,separator=)", "--", path],
+        &[
+            "log",
+            "-1",
+            "--format=%h%x09%(trailers:key=Amux-Session,valueonly,separator=)",
+            "--",
+            path,
+        ],
     )
     .await?;
     let mut it = out.trim().split('\t');
@@ -375,7 +412,13 @@ pub(crate) async fn owner_committed_since(
     );
     let out = git_out(
         dir,
-        &["log", "-8", "--format=%h%x09%ct%x09%(trailers:key=Amux-Session,valueonly,separator=)", "--", path],
+        &[
+            "log",
+            "-8",
+            "--format=%h%x09%ct%x09%(trailers:key=Amux-Session,valueonly,separator=)",
+            "--",
+            path,
+        ],
     )
     .await?;
     let now = now_epoch() as i64;
@@ -547,10 +590,56 @@ pub(crate) fn victim_verdict(all_settled: bool, all_mine: bool) -> &'static str 
 /// provenance (a `restore` touch is downgraded), so recomputing it here from
 /// the fate alone would be a second, quietly different implementation of the
 /// question — which is the drift this card is about, one layer down.
+/// The clause after "includes N file(s)" in the victim notice's HEADLINE.
+///
+/// AF-539. The headline used to be the fixed string "whose edit records are
+/// YOURS", printed above per-path lines that could each retract it — including
+/// `AbsorbedBy`, which says "committed by `X` ... not by you", and
+/// `NotTheirWork`, which exists to say exactly that. mixpeek-cicd received two
+/// notices with opposite per-path verdicts under an identical headline and
+/// reported the guard as unable to tell them apart; the per-path lines had told
+/// them apart correctly both times. What they actually read was the envelope,
+/// because the demotion lives one line BELOW the claim it demotes and the
+/// capitalised assertion is what makes you look.
+///
+/// The fleet CLAUDE.md already names this shape: a summary line must be
+/// COMPUTED, never written, because the eye reads a summary as the RESULT of the
+/// lines under it rather than as an independent claim sitting beside them. The
+/// test for it is what input would change this output — for a constant, none.
+///
+/// So it is derived from the same `fates` the per-path lines are. A path is
+/// DISOWNED when the notice is about to attribute it to someone else; when every
+/// path is disowned the headline may not say YOURS.
+pub(crate) fn victim_headline(fates: &[PathFate], owner: &str) -> String {
+    let disowned = fates
+        .iter()
+        .filter(|f| match f {
+            PathFate::NotTheirWork(_) => true,
+            PathFate::AbsorbedBy(_, who) => who != owner,
+            _ => false,
+        })
+        .count();
+    if fates.is_empty() || disowned == 0 {
+        "whose edit records are YOURS".to_string()
+    } else if disowned == fates.len() {
+        "that carry an edit record of yours — but NONE of them look like your work, \
+         per the lines below"
+            .to_string()
+    } else {
+        format!(
+            "that carry an edit record of yours — {disowned} of {} attributed to another \
+             session, per the lines below",
+            fates.len()
+        )
+    }
+}
+
 pub(crate) fn victim_flags(fates: &[PathFate], at_risk: &[bool]) -> (bool, bool) {
     let all_settled = !at_risk.iter().any(|r| *r);
     let all_mine = !fates.is_empty()
-        && fates.iter().all(|f| matches!(f, PathFate::SettledByOwner(_)));
+        && fates
+            .iter()
+            .all(|f| matches!(f, PathFate::SettledByOwner(_)));
     (all_settled, all_mine)
 }
 
@@ -561,9 +650,10 @@ pub(crate) fn victim_path_line(
     owner: &str,
 ) -> (String, bool) {
     match fate {
-        PathFate::SettledByOwner(sha) => {
-            (format!("  {pth}  — already committed by you in {sha}; nothing at risk"), false)
-        }
+        PathFate::SettledByOwner(sha) => (
+            format!("  {pth}  — already committed by you in {sha}; nothing at risk"),
+            false,
+        ),
         // Absorbed but SAFE. The bytes are in HEAD under someone else's
         // commit, so the code is fine and only the reasoning is stranded —
         // point at the card, do not send anyone hunting for lost work.
@@ -675,7 +765,11 @@ pub(crate) fn victim_path_line(
             format!(
                 "  {pth}  — byte-identical to origin/main{}; nothing can be absorbed or \
                  reverted (local HEAD is just behind — graft-push lane)",
-                if sha.is_empty() { String::new() } else { format!(" (as of {sha})") }
+                if sha.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (as of {sha})")
+                }
             ),
             false,
         ),
@@ -839,20 +933,29 @@ pub(crate) async fn path_fate(
         // `git diff --cached --quiet HEAD` exits nonzero when there IS a staged
         // change, and `git_out` is None on nonzero exit, so `is_none()` reads as
         // "this path is staged".
-        let path_is_staged =
-            git_out(dir, &["diff", "--cached", "--quiet", "HEAD", "--", path]).await.is_none();
+        let path_is_staged = git_out(dir, &["diff", "--cached", "--quiet", "HEAD", "--", path])
+            .await
+            .is_none();
         let index_ok = !path_is_staged
-            || git_out(dir, &["diff", "--quiet", "--cached", "origin/main", "--", path])
-                .await
-                .is_some();
-        if git_out(dir, &["diff", "--quiet", "origin/main", "--", path]).await.is_some()
+            || git_out(
+                dir,
+                &["diff", "--quiet", "--cached", "origin/main", "--", path],
+            )
+            .await
+            .is_some();
+        if git_out(dir, &["diff", "--quiet", "origin/main", "--", path])
+            .await
+            .is_some()
             && index_ok
         {
-            let sha = git_out(dir, &["log", "origin/main", "-1", "--format=%h", "--", path])
-                .await
-                .unwrap_or_default()
-                .trim()
-                .to_string();
+            let sha = git_out(
+                dir,
+                &["log", "origin/main", "-1", "--format=%h", "--", path],
+            )
+            .await
+            .unwrap_or_default()
+            .trim()
+            .to_string();
             return PathFate::LandedOnOrigin(sha);
         }
         // AF-420: before claiming their WORK is at risk, ask whether they have
@@ -863,7 +966,14 @@ pub(crate) async fn path_fate(
         if let Some(true) = owner_never_wrote(dir, path, owner).await {
             let writers = git_out(
                 dir,
-                &["log", "-n", "50", "--format=%(trailers:key=Amux-Session,valueonly,separator=,)", "--", path],
+                &[
+                    "log",
+                    "-n",
+                    "50",
+                    "--format=%(trailers:key=Amux-Session,valueonly,separator=,)",
+                    "--",
+                    path,
+                ],
             )
             .await
             .map(|o| {
@@ -885,7 +995,13 @@ pub(crate) async fn path_fate(
     }
     let last = git_out(
         dir,
-        &["log", "-1", "--format=%h%x09%(trailers:key=Amux-Session,valueonly,separator=)", "--", path],
+        &[
+            "log",
+            "-1",
+            "--format=%h%x09%(trailers:key=Amux-Session,valueonly,separator=)",
+            "--",
+            path,
+        ],
     )
     .await
     .unwrap_or_default();
@@ -905,7 +1021,14 @@ pub(crate) async fn path_fate(
     if who == owner {
         return PathFate::SettledByOwner(sha);
     }
-    PathFate::AbsorbedBy(sha, if who.is_empty() { "(untrailered)".into() } else { who })
+    PathFate::AbsorbedBy(
+        sha,
+        if who.is_empty() {
+            "(untrailered)".into()
+        } else {
+            who
+        },
+    )
 }
 
 /// py:19380 `_repo_root`, memoized — a commit is latency-sensitive and this is
@@ -931,7 +1054,8 @@ async fn repo_root(dir: &str) -> Option<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())?;
     if let Ok(mut g) = REPO_ROOT_MEMO.lock() {
-        g.get_or_insert_with(BTreeMap::new).insert(dir.to_string(), root.clone());
+        g.get_or_insert_with(BTreeMap::new)
+            .insert(dir.to_string(), root.clone());
     }
     Some(root)
 }
@@ -1034,11 +1158,43 @@ fn has_output_redirection(cmd: &str) -> bool {
 /// exactly as before, so no real inferred WRITE loses its attribution — only the
 /// unambiguous readers are excluded.
 const READ_ONLY_VERBS: &[&str] = &[
-    "ls", "cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep",
-    "rg", "ag", "wc", "stat", "file", "find", "cmp", "diff", "sort", "uniq",
-    "cut", "column", "od", "xxd", "hexdump", "tree", "du", "basename",
-    "dirname", "realpath", "readlink", "sha256sum", "md5sum", "nl", "tac",
-    "pwd", "echo", "printf",
+    "ls",
+    "cat",
+    "head",
+    "tail",
+    "less",
+    "more",
+    "grep",
+    "egrep",
+    "fgrep",
+    "rg",
+    "ag",
+    "wc",
+    "stat",
+    "file",
+    "find",
+    "cmp",
+    "diff",
+    "sort",
+    "uniq",
+    "cut",
+    "column",
+    "od",
+    "xxd",
+    "hexdump",
+    "tree",
+    "du",
+    "basename",
+    "dirname",
+    "realpath",
+    "readlink",
+    "sha256sum",
+    "md5sum",
+    "nl",
+    "tac",
+    "pwd",
+    "echo",
+    "printf",
     // `read` consumes stdin into a shell variable and cannot touch a file.
     // Reached via `while read -r l; do ...; done`, where stripping `while` leaves
     // it as the segment's verb (AMUX-2841 fix, 2026-09-04).
@@ -1055,12 +1211,28 @@ const READ_ONLY_VERBS: &[&str] = &[
     // `cd x && cat > f <<EOF` all remain non-read, and the test below pins
     // exactly that.
     "cd",
-    ];
+];
 const GIT_READ_SUBCMDS: &[&str] = &[
-    "show", "log", "diff", "status", "blame", "grep", "cat-file", "shortlog",
-    "describe", "rev-parse", "rev-list", "ls-files", "ls-tree", "reflog",
-    "whatchanged", "annotate", "name-rev", "show-ref", "for-each-ref",
-    ];
+    "show",
+    "log",
+    "diff",
+    "status",
+    "blame",
+    "grep",
+    "cat-file",
+    "shortlog",
+    "describe",
+    "rev-parse",
+    "rev-list",
+    "ls-files",
+    "ls-tree",
+    "reflog",
+    "whatchanged",
+    "annotate",
+    "name-rev",
+    "show-ref",
+    "for-each-ref",
+];
 fn is_pure_read_command(cmd: &str) -> bool {
     if has_output_redirection(cmd) {
         return false;
@@ -1152,14 +1324,20 @@ fn is_pure_read_command(cmd: &str) -> bool {
         // examined the `rm`. Structure must not be able to hide a command behind
         // it, which is the entire safety property here.
         let mut toks = seg.split_whitespace().skip_while(|t| {
-            let v = Path::new(t).file_name().and_then(|x| x.to_str()).unwrap_or(t);
+            let v = Path::new(t)
+                .file_name()
+                .and_then(|x| x.to_str())
+                .unwrap_or(t);
             SHELL_STRUCTURE.contains(&v)
         });
         let verb = match toks.next() {
             // Nothing but structure (`done`, `fi`, `esac`). Reads nothing, writes
             // nothing, decides nothing.
             None => continue,
-            Some(t) => Path::new(t).file_name().and_then(|x| x.to_str()).unwrap_or(t),
+            Some(t) => Path::new(t)
+                .file_name()
+                .and_then(|x| x.to_str())
+                .unwrap_or(t),
         };
         // Inside a test expression. `if [ -f a.md ]; then cat a.md; fi` leaves
         // `-f a.md ]` once `if` and `[` are stripped, and a command never begins
@@ -1225,9 +1403,8 @@ fn is_pure_read_command(cmd: &str) -> bool {
 /// that reads", and `done` reads nothing. Keeping them apart is what makes the
 /// safety argument legible — structure is skipped, commands are checked.
 const SHELL_STRUCTURE: &[&str] = &[
-    "for", "do", "done", "while", "until", "if", "then", "elif", "else", "fi",
-    "case", "esac", "in", "select", "function", "time", "!", ":", "true",
-    "[", "[[", "]]", "test",
+    "for", "do", "done", "while", "until", "if", "then", "elif", "else", "fi", "case", "esac",
+    "in", "select", "function", "time", "!", ":", "true", "[", "[[", "]]", "test",
 ];
 
 /// `sed -n '1,50p' <file>` is a READ, and it is the read this fleet is TOLD to
@@ -1384,7 +1561,10 @@ fn is_restore_only_command(cmd: &str) -> bool {
         let Some(tok) = seg.split_whitespace().next() else {
             return false;
         };
-        let verb = Path::new(tok).file_name().and_then(|s| s.to_str()).unwrap_or(tok);
+        let verb = Path::new(tok)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(tok);
         if verb != "git" {
             return false;
         }
@@ -1487,7 +1667,9 @@ pub async fn observed_edits(
     if session.is_empty() || session == "api-anonymous" {
         return (
             StatusCode::BAD_REQUEST,
-            axum::Json(json!({"error": "X-Amux-Session required — an unattributed observation attributes nothing"})),
+            axum::Json(
+                json!({"error": "X-Amux-Session required — an unattributed observation attributes nothing"}),
+            ),
         );
     }
     let now = now_epoch();
@@ -1526,7 +1708,10 @@ pub async fn observed_edits(
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             rusqlite::params![key, serde_json::to_string(&merged).unwrap_or_default()],
         )?;
-        Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        Ok(crate::db::WriteOutcome {
+            applied: true,
+            events: vec![],
+        })
     });
     match write.await {
         Ok(_) => (StatusCode::OK, axum::Json(json!({"ok": true, "stored": n}))),
@@ -1547,7 +1732,11 @@ fn load_observed(conn: &rusqlite::Connection, session: &str, window: f64) -> Has
     )
     .ok()
     .and_then(|v| serde_json::from_str::<HashMap<String, f64>>(&v).ok())
-    .map(|m| m.into_iter().filter(|(_, ts)| now - *ts <= window).collect())
+    .map(|m| {
+        m.into_iter()
+            .filter(|(_, ts)| now - *ts <= window)
+            .collect()
+    })
     .unwrap_or_default()
 }
 
@@ -1650,18 +1839,31 @@ pub(crate) fn apply_observed(
 /// session cannot balloon a request. This is what staged hunks are accounted
 /// against: peer records expire, the committer's own content at commit time
 /// does not (you commit right after editing).
-fn firsthand_edit_content(name: &str, since_secs: f64, cap_per_file: usize) -> HashMap<String, String> {
+fn firsthand_edit_content(
+    name: &str,
+    since_secs: f64,
+    cap_per_file: usize,
+) -> HashMap<String, String> {
     let mut out: HashMap<String, String> = HashMap::new();
-    let Some(jf) = session_jsonl_path(name) else { return out };
+    let Some(jf) = session_jsonl_path(name) else {
+        return out;
+    };
     let cutoff = now_epoch() - since_secs;
     for e in iter_jsonl_tail(&jf, JSONL_TAIL_BYTES) {
-        let Some(ts) = e.get("timestamp").and_then(Value::as_str).and_then(parse_ts) else {
+        let Some(ts) = e
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_ts)
+        else {
             continue;
         };
         if ts < cutoff {
             continue;
         }
-        let Some(content) = e.get("message").and_then(|m| m.get("content")).and_then(Value::as_array)
+        let Some(content) = e
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array)
         else {
             continue;
         };
@@ -1686,7 +1888,11 @@ fn firsthand_edit_content(name: &str, since_secs: f64, cap_per_file: usize) -> H
             let mut push = |s: &str| {
                 if slot.len() < cap_per_file && !s.is_empty() {
                     slot.push('\n');
-                    slot.push_str(&s.chars().take(cap_per_file - slot.len().min(cap_per_file)).collect::<String>());
+                    slot.push_str(
+                        &s.chars()
+                            .take(cap_per_file - slot.len().min(cap_per_file))
+                            .collect::<String>(),
+                    );
                 }
             };
             if let Some(i) = inp {
@@ -1879,7 +2085,9 @@ fn strip_heredoc_bodies(cmd: &str) -> String {
     let mut lines = cmd.lines();
     while let Some(line) = lines.next() {
         out.push(line);
-        let Some(delim) = heredoc_delimiter(line) else { continue };
+        let Some(delim) = heredoc_delimiter(line) else {
+            continue;
+        };
         // Skip to the terminator. An UNTERMINATED heredoc consumes the rest,
         // which is correct: everything after the opener is body.
         for body in lines.by_ref() {
@@ -1934,8 +2142,11 @@ fn first_blocking_verb(cmd: &str) -> Option<String> {
         let Some(tok) = seg.split_whitespace().next() else {
             return Some("?".into());
         };
-        let verb =
-            Path::new(tok).file_name().and_then(|s| s.to_str()).unwrap_or(tok).to_string();
+        let verb = Path::new(tok)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(tok)
+            .to_string();
         if verb == "git" {
             let mut rest = seg.split_whitespace().skip(1);
             let mut sub = None;
@@ -2026,7 +2237,12 @@ fn warn_inferred_edit(session: &str, abs_path: &str, cmd: &str) {
         .split(['|', ';', '&', '\n', '(', ')', '`'])
         .filter_map(|s| s.split_whitespace().next())
         .next()
-        .map(|t| Path::new(t).file_name().and_then(|s| s.to_str()).unwrap_or(t))
+        .map(|t| {
+            Path::new(t)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(t)
+        })
         .unwrap_or("?");
     // The segment that FAILED the read test — the sentence below is about
     // THIS one, not the first (AF-126). `verb=` stays for grep continuity.
@@ -2069,8 +2285,7 @@ fn warn_inferred_edit(session: &str, abs_path: &str, cmd: &str) {
     // it could not be. Redacting at the LOG SITE rather than at the extractor is
     // deliberate: it covers every shape a token can take, including the ones
     // nobody has thought of, and it keeps working if the extractor changes.
-    let (safe_base, safe_verb, safe_blocked_by) =
-        inferred_warn_fields(base, verb, &blocked_by);
+    let (safe_base, safe_verb, safe_blocked_by) = inferred_warn_fields(base, verb, &blocked_by);
     tracing::warn!(
         target: "staged_guard",
         "[staged-guard/inferred-edit AMUX-3128] session={} path={} verb={} blocked_by={} \
@@ -2113,13 +2328,20 @@ fn recent_edit_paths(name: &str, since_secs: f64, firsthand_only: bool) -> EditS
         scan.transcript_found = true;
         let cutoff = now - since_secs;
         for e in iter_jsonl_tail(&jf, JSONL_TAIL_BYTES) {
-            let Some(ts) = e.get("timestamp").and_then(Value::as_str).and_then(parse_ts) else {
+            let Some(ts) = e
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(parse_ts)
+            else {
                 continue;
             };
             if ts < cutoff {
                 continue;
             }
-            let Some(content) = e.get("message").and_then(|m| m.get("content")).and_then(Value::as_array)
+            let Some(content) = e
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_array)
             else {
                 continue;
             };
@@ -2155,7 +2377,7 @@ fn recent_edit_paths(name: &str, since_secs: f64, firsthand_only: bool) -> EditS
                         let abs = if Path::new(cand).is_absolute() {
                             PathBuf::from(cand)
                         } else if work_hint.is_empty() {
-                            continue
+                            continue;
                         } else {
                             Path::new(&work_hint).join(cand)
                         };
@@ -2163,7 +2385,9 @@ fn recent_edit_paths(name: &str, since_secs: f64, firsthand_only: bool) -> EditS
                         // writing it. `grep x foo.rs` mentions foo.rs and changes
                         // nothing, so a path is only claimed if the file actually
                         // moved while the command ran.
-                        let Ok(md) = std::fs::metadata(&abs) else { continue };
+                        let Ok(md) = std::fs::metadata(&abs) else {
+                            continue;
+                        };
                         if !md.is_file() {
                             continue;
                         }
@@ -2210,7 +2434,8 @@ fn recent_edit_paths(name: &str, since_secs: f64, firsthand_only: bool) -> EditS
         }
     }
     if let Ok(mut g) = EDIT_CACHE.lock() {
-        g.get_or_insert_with(HashMap::new).insert(key, (now, scan.clone()));
+        g.get_or_insert_with(HashMap::new)
+            .insert(key, (now, scan.clone()));
     }
     scan
 }
@@ -2401,8 +2626,11 @@ pub(crate) fn classify(
                 // THIS path, ts is the peer's to THIS path (not a set-wide newest —
                 // that asymmetry would under-block). Fresher by MORE than the
                 // clock-skew margin only; a within-skew lead is a coin toss and blocks.
-                let committer_fresher =
-                    inp.mine.get(ap).map(|m| *m > *ts + RECENCY_SKEW_MARGIN_S).unwrap_or(false);
+                let committer_fresher = inp
+                    .mine
+                    .get(ap)
+                    .map(|m| *m > *ts + RECENCY_SKEW_MARGIN_S)
+                    .unwrap_or(false);
                 if inp.theirs_firsthand.contains(ap) && !committer_fresher {
                     v.foreign.push(json!({
                         "path": rel,
@@ -2587,7 +2815,8 @@ pub(crate) fn classify(
         if !inp.blind_cotenant {
             // Fully-attributed checkout: nobody's, but nobody is hidden either.
             // Stays a warning, as before.
-            v.unclaimed.push(json!({"path": rel, "has_unstaged_changes": is_dirty}));
+            v.unclaimed
+                .push(json!({"path": rel, "has_unstaged_changes": is_dirty}));
             continue;
         }
         v.foreign.push(json!({
@@ -2704,7 +2933,11 @@ fn split_risk(paths: &[(String, String)], inp: &GuardInputs, v: &mut Verdict) {
                  Nothing else here checks that, because `cargo check` and the pre-commit gate \
                  both build the TREE. Either include their files, or leave their lines out of \
                  yours (`git add -p`), or confirm with them.",
-                staged_rels.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+                staged_rels
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 left.len()
             )
         } else {
@@ -2717,7 +2950,11 @@ fn split_risk(paths: &[(String, String)], inp: &GuardInputs, v: &mut Verdict) {
                  write caught in their Bash window — so this names the files and stops there \
                  rather than calling them that lane's work. Check the paths; do not go ask \
                  '{owner}' on the strength of this line.",
-                staged_rels.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+                staged_rels
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 left.len()
             )
         };
@@ -2917,8 +3154,9 @@ pub async fn staged_guard(
 /// leaving it to be reconstructed from request-log timestamps, which is what it
 /// cost this time.
 fn staged_seen_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, (f64, usize)>> {
-    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (f64, usize)>>> =
-        std::sync::OnceLock::new();
+    static M: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (f64, usize)>>,
+    > = std::sync::OnceLock::new();
     M.get_or_init(Default::default)
 }
 
@@ -2963,20 +3201,36 @@ pub async fn staged_guard_inner(
     let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let obj = parsed.as_object();
     let get_str = |k: &str| -> String {
-        obj.and_then(|o| o.get(k)).and_then(Value::as_str).unwrap_or("").trim().to_string()
+        obj.and_then(|o| o.get(k))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string()
     };
 
     // Server-verified origin wins over the claimed body session (AMUX-1768).
     let origin = super::alerts::hdr_worker(&headers);
-    let session: String =
-        if origin.is_empty() { get_str("session") } else { origin }.chars().take(64).collect();
+    let session: String = if origin.is_empty() {
+        get_str("session")
+    } else {
+        origin
+    }
+    .chars()
+    .take(64)
+    .collect();
     let wd_raw = get_str("dir");
     let op_raw = get_str("op");
     let op: String = {
-        if op_raw.is_empty() { "commit".into() } else { op_raw.chars().take(24).collect() }
+        if op_raw.is_empty() {
+            "commit".into()
+        } else {
+            op_raw.chars().take(24).collect()
+        }
     };
-    let guard_version =
-        obj.and_then(|o| o.get("guard_version")).and_then(Value::as_i64).unwrap_or(0);
+    let guard_version = obj
+        .and_then(|o| o.get("guard_version"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
     let hook_outdated = hook_is_outdated(guard_version, !op_raw.is_empty());
     if hook_outdated {
         warn_outdated_hook(&session, &wd_raw);
@@ -2984,11 +3238,19 @@ pub async fn staged_guard_inner(
 
     if wd_raw.is_empty() {
         // py:71821 — the one non-200, kept byte-compatible.
-        return (StatusCode::BAD_REQUEST, Json(json!({"ok": false, "error": "dir required"})));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "dir required"})),
+        );
     }
     let window = window_secs();
     if !guard_enabled() {
-        let mut v = Envelope { window, hook_outdated, ..Default::default() }.json();
+        let mut v = Envelope {
+            window,
+            hook_outdated,
+            ..Default::default()
+        }
+        .json();
         v["enabled"] = json!(false);
         return (StatusCode::OK, Json(v));
     }
@@ -2996,7 +3258,12 @@ pub async fn staged_guard_inner(
     let raw_paths: Vec<String> = obj
         .and_then(|o| o.get("paths"))
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default();
 
     // Hold what the hook saw, for the commit report to compare against
@@ -3061,7 +3328,16 @@ pub async fn staged_guard_inner(
     if cotenants.is_empty() || raw_paths.is_empty() {
         return (
             StatusCode::OK,
-            Json(Envelope { cotenants, window, degraded, hook_outdated, ..Default::default() }.json()),
+            Json(
+                Envelope {
+                    cotenants,
+                    window,
+                    degraded,
+                    hook_outdated,
+                    ..Default::default()
+                }
+                .json(),
+            ),
         );
     }
 
@@ -3287,13 +3563,13 @@ pub async fn staged_guard_inner(
         theirs_observed_only: HashSet::new(), // filled by apply_observed
         theirs_restore,
         dirty,
-            // Live or stopped alike: a stopped lane's PRE-STOP staged work is exactly
+        // Live or stopped alike: a stopped lane's PRE-STOP staged work is exactly
         // what gets swept, and the degraded message already admits those edits are
         // invisible. Liveness answers "can they be editing now", which is a
         // different question from "could this staged file be theirs".
         // BLIND only — absent lanes are excluded (see the partition above).
         blind_cotenant: gates_unclaimed(&blind_live),
-};
+    };
     // AF-123: merge OBSERVED records (the Bash hook pair's mtime reports) at
     // firsthand rank, for the committer and every cotenant. This is what ends
     // the structural firsthand=0 penalty on Bash-editing lanes: their writes
@@ -3584,13 +3860,18 @@ pub async fn staged_guard_inner(
                 let verdict = victim_verdict(all_settled, all_mine);
                 let text = format!(
                     "[amux staged-guard] Session `{}` is committing in {} and the staged set \
-                     includes {} file(s) whose edit records are YOURS:\n{}{}\n\n\
+                     includes {} file(s) {}:\n{}{}\n\n\
                      {}{}{}",
                     session,
                     wd_root,
                     paths.len(),
+                    victim_headline(&fates, &owner),
                     list,
-                    if more > 0 { format!("\n  … and {more} more") } else { String::new() },
+                    if more > 0 {
+                        format!("\n  … and {more} more")
+                    } else {
+                        String::new()
+                    },
                     victim_body(all_settled),
                     victim_remedy(
                         all_settled,
@@ -3598,8 +3879,9 @@ pub async fn staged_guard_inner(
                     ),
                     verdict,
                 );
-                let _ = crate::api::session_verbs::steer_enqueue(st, &owner, &text, "staged-guard", "")
-                    .await;
+                let _ =
+                    crate::api::session_verbs::steer_enqueue(st, &owner, &text, "staged-guard", "")
+                        .await;
                 tracing::warn!(
                     target: "staged_guard",
                     "[staged-guard/AMUX-2923] notified {owner}: {session} is staging {} of their path(s) in {}",
@@ -3617,9 +3899,17 @@ pub async fn staged_guard_inner(
     // outcome half is filled by POST /api/git/guard-outcome.
     let mut verdict_id: Option<i64> = None;
     if let Some(st) = state.as_ref() {
-        let vk = if v.foreign.is_empty() { "allow" } else { "block" };
+        let vk = if v.foreign.is_empty() {
+            "allow"
+        } else {
+            "block"
+        };
         let paths_json = serde_json::to_string(
-            &v.foreign.iter().filter_map(|f| f["path"].as_str()).take(40).collect::<Vec<_>>(),
+            &v.foreign
+                .iter()
+                .filter_map(|f| f["path"].as_str())
+                .take(40)
+                .collect::<Vec<_>>(),
         )
         .unwrap_or_default();
         let mut prov: HashMap<String, i64> = HashMap::new();
@@ -3629,8 +3919,11 @@ pub async fn staged_guard_inner(
                 .or_insert(0) += 1;
         }
         let prov_json = serde_json::to_string(&prov).unwrap_or_default();
-        let (n_f, n_s, n_u) =
-            (v.foreign.len() as i64, v.shared.len() as i64, v.unclaimed.len() as i64);
+        let (n_f, n_s, n_u) = (
+            v.foreign.len() as i64,
+            v.shared.len() as i64,
+            v.unclaimed.len() as i64,
+        );
         let (sess_c, dir_c, vk_s) = (session.clone(), wd_root.clone(), vk.to_string());
         let id_slot = std::sync::Arc::new(Mutex::new(None::<i64>));
         let id_w = id_slot.clone();
@@ -3649,7 +3942,10 @@ pub async fn staged_guard_inner(
                     ],
                 )?;
                 *id_w.lock().unwrap() = Some(conn.last_insert_rowid());
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                Ok(crate::db::WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await;
         verdict_id = *id_slot.lock().unwrap();
@@ -3658,8 +3954,18 @@ pub async fn staged_guard_inner(
     (
         StatusCode::OK,
         Json(
-            Envelope { verdict: v, cotenants, window, degraded, hook_outdated, unaccounted: unaccounted_rows, unaccounted_undecidable, verdict_id, ..Default::default() }
-                .json(),
+            Envelope {
+                verdict: v,
+                cotenants,
+                window,
+                degraded,
+                hook_outdated,
+                unaccounted: unaccounted_rows,
+                unaccounted_undecidable,
+                verdict_id,
+                ..Default::default()
+            }
+            .json(),
         ),
     )
 }
@@ -3683,10 +3989,17 @@ pub async fn guard_outcome(
     if session.is_empty() || session == "api-anonymous" {
         return (
             StatusCode::BAD_REQUEST,
-            axum::Json(json!({"error": "X-Amux-Session required — an unattributed outcome audits nothing"})),
+            axum::Json(
+                json!({"error": "X-Amux-Session required — an unattributed outcome audits nothing"}),
+            ),
         );
     }
-    let s = |k: &str| body.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let s = |k: &str| {
+        body.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
     let resolution = s("resolution");
     if !matches!(resolution.as_str(), "proceeded" | "trimmed" | "reallowed") {
         return (
@@ -3715,7 +4028,9 @@ pub async fn guard_outcome(
     if !matches!(basis.as_str(), "declared" | "observed") {
         return (
             StatusCode::BAD_REQUEST,
-            axum::Json(json!({"error": "basis must be declared|observed (inferred is server-assigned)"})),
+            axum::Json(
+                json!({"error": "basis must be declared|observed (inferred is server-assigned)"}),
+            ),
         );
     }
     let verdict_id = body.get("verdict_id").and_then(Value::as_i64);
@@ -3723,13 +4038,19 @@ pub async fn guard_outcome(
     if verdict_id.is_none() && dir.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            axum::Json(json!({"error": "need verdict_id or dir (for the nearest unresolved block)"})),
+            axum::Json(
+                json!({"error": "need verdict_id or dir (for the nearest unresolved block)"}),
+            ),
         );
     }
     let elapsed = body.get("elapsed_s").and_then(Value::as_f64);
     let now = now_epoch();
-    let (sess_c, res_c, ov_c, basis_c) =
-        (session.clone(), resolution.clone(), override_used.clone(), basis.clone());
+    let (sess_c, res_c, ov_c, basis_c) = (
+        session.clone(),
+        resolution.clone(),
+        override_used.clone(),
+        basis.clone(),
+    );
     let linked = std::sync::Arc::new(Mutex::new((0usize, String::new())));
     let linked_w = linked.clone();
     let write = state.store.write_async(move |conn| {
@@ -3790,7 +4111,10 @@ pub async fn guard_outcome(
             )?;
         }
         *linked_w.lock().unwrap() = (n, link.to_string());
-        Ok(crate::db::WriteOutcome { applied: n > 0, events: vec![] })
+        Ok(crate::db::WriteOutcome {
+            applied: n > 0,
+            events: vec![],
+        })
     });
     match write.await {
         Ok(_) => {
@@ -3818,9 +4142,10 @@ pub async fn guard_outcome(
                 })),
             )
         }
-        Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error": e.to_string()})))
-        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"error": e.to_string()})),
+        ),
     }
 }
 
@@ -3832,7 +4157,10 @@ pub async fn guard_outcomes_debug(
     axum::extract::State(state): axum::extract::State<super::AppState>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> (StatusCode, axum::Json<Value>) {
-    let since_h: f64 = q.get("since_h").and_then(|v| v.parse().ok()).unwrap_or(24.0);
+    let since_h: f64 = q
+        .get("since_h")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24.0);
     let now = now_epoch();
     let cutoff = now - since_h * 3600.0;
     let conn = match state.store.read() {
@@ -3879,31 +4207,31 @@ pub async fn guard_outcomes_debug(
         }
     }
     let body = json!({
-            "since_h": since_h,
-            "verdicts": {
-                "allow": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='allow'", &[c]),
-                "block": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='block'", &[c]),
-            },
-            "block_outcomes": {
-                "proceeded_verified_solo": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='block' AND resolution='proceeded' AND override_used='verified_solo'", &[c]),
-                "proceeded_allow_foreign": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='block' AND resolution='proceeded' AND override_used='allow_foreign'", &[c]),
-                "trimmed": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='block' AND resolution='trimmed'", &[c]),
-                "reallowed": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='block' AND resolution='reallowed'", &[c]),
-                "superseded": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='block' AND resolution='superseded'", &[c]),
-                // COMPUTED, labeled with its own uncertainty: no report and
-                // past the window. A pending block (recent, unresolved) is a
-                // different cell — collapsing them would manufacture aborts
-                // out of every block younger than the window.
-                "aborted_or_walked_away_inferred": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='block' AND resolution IS NULL AND ts < ?2", &[c, a]),
-                "pending": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='block' AND resolution IS NULL AND ts >= ?2", &[c, a]),
-            },
-            "links": {
-                "marker": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND outcome_link='marker'", &[c]),
-                "nearest": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND outcome_link='nearest'", &[c]),
-            },
-            "recent_blocks": recent,
-            "note": "proceeded cells are DECLARED (the committer's own override env var); trimmed/reallowed are hook-OBSERVED staged-set comparisons; aborted is inferred at read time and named so. -1 = query failed, never silently 0.",
-        });
+        "since_h": since_h,
+        "verdicts": {
+            "allow": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='allow'", &[c]),
+            "block": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='block'", &[c]),
+        },
+        "block_outcomes": {
+            "proceeded_verified_solo": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='block' AND resolution='proceeded' AND override_used='verified_solo'", &[c]),
+            "proceeded_allow_foreign": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='block' AND resolution='proceeded' AND override_used='allow_foreign'", &[c]),
+            "trimmed": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='block' AND resolution='trimmed'", &[c]),
+            "reallowed": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='block' AND resolution='reallowed'", &[c]),
+            "superseded": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='block' AND resolution='superseded'", &[c]),
+            // COMPUTED, labeled with its own uncertainty: no report and
+            // past the window. A pending block (recent, unresolved) is a
+            // different cell — collapsing them would manufacture aborts
+            // out of every block younger than the window.
+            "aborted_or_walked_away_inferred": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='block' AND resolution IS NULL AND ts < ?2", &[c, a]),
+            "pending": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='block' AND resolution IS NULL AND ts >= ?2", &[c, a]),
+        },
+        "links": {
+            "marker": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND outcome_link='marker'", &[c]),
+            "nearest": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND outcome_link='nearest'", &[c]),
+        },
+        "recent_blocks": recent,
+        "note": "proceeded cells are DECLARED (the committer's own override env var); trimmed/reallowed are hook-OBSERVED staged-set comparisons; aborted is inferred at read time and named so. -1 = query failed, never silently 0.",
+    });
     // AF-320 makes the `-1 = query failed` convention machine-readable. That
     // sentinel is in a NOTE, so a reader has to know to look for it; a caller
     // summing the cells gets a plausible number either way. `window_verdicts`
@@ -3956,7 +4284,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().to_string_lossy().to_string();
         let git = |args: &[&str]| {
-            std::process::Command::new("git").args(args).current_dir(&d).output().unwrap()
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&d)
+                .output()
+                .unwrap()
         };
         git(&["init", "-q"]);
         git(&["config", "user.email", "t@t"]);
@@ -3978,21 +4310,28 @@ mod tests {
         }
 
         match path_fate(&d, "absorbed.txt", "alice", 3600, "firsthand").await {
-            PathFate::AbsorbedBy(_, who) => assert_eq!(who, "bob",
-                "must name WHO absorbed it, so the victim knows where the reasoning went"),
+            PathFate::AbsorbedBy(_, who) => assert_eq!(
+                who, "bob",
+                "must name WHO absorbed it, so the victim knows where the reasoning went"
+            ),
             other => panic!("expected AbsorbedBy, got {other:?} — this is the cry-wolf case"),
         }
 
         // alice's work that is NOT in HEAD: genuinely at risk.
         std::fs::write(dir.path().join("atrisk.txt"), "uncommitted\n").unwrap();
-        assert_eq!(path_fate(&d, "atrisk.txt", "alice", 3600, "firsthand").await, PathFate::AtRisk);
+        assert_eq!(
+            path_fate(&d, "atrisk.txt", "alice", 3600, "firsthand").await,
+            PathFate::AtRisk
+        );
 
         // and a file alice committed herself stays settled.
         std::fs::write(dir.path().join("mine.txt"), "alice\n").unwrap();
         git(&["add", "mine.txt"]);
         git(&["commit", "-q", "-m", "alice\n\nAmux-Session: alice"]);
-        assert!(matches!(path_fate(&d, "mine.txt", "alice", 3600, "firsthand").await,
-                         PathFate::SettledByOwner(_)));
+        assert!(matches!(
+            path_fate(&d, "mine.txt", "alice", 3600, "firsthand").await,
+            PathFate::SettledByOwner(_)
+        ));
 
         // AMUX-3445, the graft-push shape: backend's work landed on ORIGIN via
         // a dangling commit, local HEAD never advanced, worktree carries the
@@ -4006,11 +4345,17 @@ mod tests {
         std::fs::write(dir.path().join("grafted.txt"), "v1\n").unwrap();
         git(&["add", "grafted.txt"]);
         git(&["commit", "-q", "-m", "base\n\nAmux-Session: alice"]);
-        let base = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout).unwrap().trim().to_string();
+        let base = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
         std::fs::write(dir.path().join("grafted.txt"), "landed v2\n").unwrap();
         git(&["add", "grafted.txt"]);
         git(&["commit", "-q", "-m", "graft\n\nAmux-Session: backend"]);
-        let graft = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout).unwrap().trim().to_string();
+        let graft = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
         git(&["update-ref", "refs/remotes/origin/main", &graft]);
         git(&["reset", "-q", "--hard", &base]);
         // AF-421: THE TRAP ARM NOW STAGES, because backend's real case did.
@@ -4037,7 +4382,11 @@ mod tests {
         // So: stage a blob that differs from BOTH head and origin, which is
         // backend's measured state, and the trap keeps biting exactly where the
         // amendment intended.
-        std::fs::write(dir.path().join("grafted.txt"), "pre-graft copy, 44 lines behind\n").unwrap();
+        std::fs::write(
+            dir.path().join("grafted.txt"),
+            "pre-graft copy, 44 lines behind\n",
+        )
+        .unwrap();
         git(&["add", "grafted.txt"]);
         std::fs::write(dir.path().join("grafted.txt"), "landed v2\n").unwrap();
         assert_eq!(
@@ -4056,7 +4405,10 @@ mod tests {
         // Control: worktree differing from BOTH HEAD and origin is the real
         // at-risk case, and it must stay loud.
         std::fs::write(dir.path().join("grafted.txt"), "novel v3, uncommitted\n").unwrap();
-        assert_eq!(path_fate(&d, "grafted.txt", "backend", 0, "firsthand").await, PathFate::AtRisk);
+        assert_eq!(
+            path_fate(&d, "grafted.txt", "backend", 0, "firsthand").await,
+            PathFate::AtRisk
+        );
     }
 
     /// AF-444, reported by mixpeek-cicd: answer the question instead of
@@ -4071,12 +4423,22 @@ mod tests {
     #[test]
     fn an_absorption_whose_trailer_names_a_peer_says_so_instead_of_asking() {
         let fate = PathFate::AbsorbedBy("9394ee7".into(), "mixpeek-funnel".into());
-        let (line, at_risk) = victim_path_line("FRUSTRATIONS.md", &fate, "observed", "mixpeek-cicd");
+        let (line, at_risk) =
+            victim_path_line("FRUSTRATIONS.md", &fate, "observed", "mixpeek-cicd");
         assert!(!at_risk, "an absorption is never lost work: {line}");
-        assert!(line.contains("mixpeek-funnel"), "name the real author: {line}");
-        assert!(line.contains("Amux-Session trailer"), "say WHERE that name came from: {line}");
+        assert!(
+            line.contains("mixpeek-funnel"),
+            "name the real author: {line}"
+        );
+        assert!(
+            line.contains("Amux-Session trailer"),
+            "say WHERE that name came from: {line}"
+        );
         assert!(line.contains("9394ee7"), "name the commit: {line}");
-        assert!(line.contains("not by you"), "state the conclusion the reader was deriving: {line}");
+        assert!(
+            line.contains("not by you"),
+            "state the conclusion the reader was deriving: {line}"
+        );
         assert!(
             !line.contains("Check whether you actually wrote this"),
             "the whole point is that it no longer assigns that check: {line}"
@@ -4118,8 +4480,7 @@ mod tests {
 
         // CONTROL 3: a FIRSTHAND claim is a recorded edit, not an mtime, so the
         // reasoning genuinely is the reader's to record and this must not fire.
-        let (first, _) =
-            victim_path_line("FRUSTRATIONS.md", &fate, "firsthand", "mixpeek-cicd");
+        let (first, _) = victim_path_line("FRUSTRATIONS.md", &fate, "firsthand", "mixpeek-cicd");
         assert!(
             first.contains("record the REASONING"),
             "a recorded edit keeps the original prompt: {first}"
@@ -4147,12 +4508,18 @@ mod tests {
         // the hedged text is the honest one.
         let (line, at_risk) = victim_path_line("_helpers.tpl", &fate, "observed", "byo-ray");
         assert!(!at_risk, "absorption is not lost work, in any arm: {line}");
-        assert!(line.contains("absorbed into 3cb19fd"), "still says what happened: {line}");
+        assert!(
+            line.contains("absorbed into 3cb19fd"),
+            "still says what happened: {line}"
+        );
         assert!(
             !line.contains("record the REASONING"),
             "an mtime claim must not presume reasoning: {line}"
         );
-        assert!(line.contains("OBSERVED"), "say what the claim actually is: {line}");
+        assert!(
+            line.contains("OBSERVED"),
+            "say what the claim actually is: {line}"
+        );
 
         // A RESTORE carries no authored content at all (MG-1484), so it is even
         // more certain there is nothing to record.
@@ -4189,7 +4556,10 @@ mod tests {
             !theirs.contains("committed by you"),
             "must not claim authorship from an edit record: {theirs}"
         );
-        assert!(theirs.contains("NOT all yours"), "say whose they are instead: {theirs}");
+        assert!(
+            theirs.contains("NOT all yours"),
+            "say whose they are instead: {theirs}"
+        );
         assert!(
             theirs.contains("Nothing here needs reconciling"),
             "still tell them there is no action, or the softening is lost: {theirs}"
@@ -4218,13 +4588,16 @@ mod tests {
     /// to remove. Both passed, on a fix whose quiet arm was carefully pinned.
     #[test]
     fn the_loud_mirror_notice_stays_loud_when_any_path_is_at_risk() {
-        let fates = vec![
-            PathFate::SettledByOwner("abc1234".into()),
-            PathFate::AtRisk,
-        ];
+        let fates = vec![PathFate::SettledByOwner("abc1234".into()), PathFate::AtRisk];
         let (all_settled, all_mine) = victim_flags(&fates, &[false, true]);
-        assert!(!all_settled, "one at-risk path must defeat the settled verdict");
-        assert!(!all_mine, "a set containing AtRisk is not all the reader's own work");
+        assert!(
+            !all_settled,
+            "one at-risk path must defeat the settled verdict"
+        );
+        assert!(
+            !all_mine,
+            "a set containing AtRisk is not all the reader's own work"
+        );
         // And the control: with nothing at risk it IS the quiet form, or the
         // assertion above would pass on a function that always says "loud".
         let (settled2, _) = victim_flags(&fates, &[false, false]);
@@ -4254,7 +4627,10 @@ mod tests {
             PathFate::SettledByOwner("abc1234".into()),
             PathFate::SettledByOwner("def5678".into()),
         ];
-        assert!(victim_flags(&mine, &[false, false]).1, "all-SettledByOwner is the reader's own");
+        assert!(
+            victim_flags(&mine, &[false, false]).1,
+            "all-SettledByOwner is the reader's own"
+        );
     }
 
     /// A SETTLED NOTICE MUST NOT PRESCRIBE A CHECK ITS OWN VERDICT RETRACTS
@@ -4323,11 +4699,96 @@ mod tests {
     /// on an empty iterator is true, which is the vacuous-pass shape this
     /// module keeps filing, and here it would put a possessive claim under a
     /// notice listing no paths at all.
+    /// AF-539: the HEADLINE must be computed from the same fates the per-path
+    /// lines are. mixpeek-cicd read two notices with opposite per-path verdicts
+    /// under an identical capitalised headline and concluded the guard could not
+    /// tell them apart — it could, one line further down.
+    #[test]
+    fn the_headline_stops_saying_yours_when_every_path_is_disowned() {
+        let owner = "mixpeek-cicd";
+
+        // All committed by the owner: the possessive is TRUE, keep it.
+        let mine = vec![
+            PathFate::SettledByOwner("abc1234".into()),
+            PathFate::SettledByOwner("def5678".into()),
+        ];
+        assert_eq!(victim_headline(&mine, owner), "whose edit records are YOURS");
+
+        // Every path attributed to somebody else — the exact shape of
+        // mixpeek-cicd's instance 1, where the per-path line already said
+        // "committed by `mvs-infra` ... not by you".
+        let theirs = vec![
+            PathFate::AbsorbedBy("ed4187d1".into(), "mvs-infra".into()),
+            PathFate::NotTheirWork(vec!["mvs-infra".into()]),
+        ];
+        let h = victim_headline(&theirs, owner);
+        assert!(
+            !h.contains("YOURS"),
+            "the headline still claims ownership over paths the body disowns: {h}"
+        );
+        assert!(h.contains("NONE"), "it must say so plainly, not merely soften: {h}");
+
+        // Mixed: name how many, so the reader knows the headline is not a verdict.
+        let mixed = vec![
+            PathFate::SettledByOwner("abc1234".into()),
+            PathFate::AbsorbedBy("ed4187d1".into(), "mvs-infra".into()),
+        ];
+        let m = victim_headline(&mixed, owner);
+        assert!(!m.contains("YOURS"), "a mixed set is not wholly yours: {m}");
+        assert!(m.contains("1 of 2"), "a count beside the claim is the whole point: {m}");
+    }
+
+    /// The two tests above call `victim_headline` DIRECTLY, so they stay green
+    /// if the notice never calls it — measured: reverting the call site to the
+    /// old constant reddened nothing. A check pinning the wrong layer is exactly
+    /// as green as one pinning the right layer, so this pins the layer that
+    /// actually reaches a reader: the notice's format string must INTERPOLATE
+    /// the headline, not carry it.
+    #[test]
+    fn the_notice_interpolates_the_headline_rather_than_hardcoding_it() {
+        let src = include_str!("git_guard.rs");
+        let hay = src
+            .split("[amux staged-guard] Session")
+            .nth(1)
+            .expect("the victim notice format string moved or was renamed");
+        // Look only at the format string itself, up to the closing quote of the
+        // template — not the whole rest of the file.
+        let tmpl: String = hay.chars().take(400).collect();
+        assert!(
+            !tmpl.contains("whose edit records are YOURS"),
+            "the headline is hardcoded in the notice again; it must come from \
+             victim_headline() or it cannot disagree with the per-path lines: {tmpl}"
+        );
+        assert!(
+            src.contains("victim_headline(&fates, &owner)"),
+            "victim_headline is no longer called from the notice"
+        );
+    }
+
+    /// The CONTROL that keeps the above from being satisfied by never saying
+    /// YOURS. An absorption BY THE OWNER is not a disownment — same variant,
+    /// opposite meaning — and AtRisk/LandedOnOrigin are not disownments either.
+    #[test]
+    fn absorption_by_the_owner_themselves_is_not_a_disownment() {
+        let owner = "mixpeek-cicd";
+        let by_self = vec![PathFate::AbsorbedBy("abc1234".into(), owner.into())];
+        assert_eq!(victim_headline(&by_self, owner), "whose edit records are YOURS");
+
+        let risky = vec![PathFate::AtRisk, PathFate::LandedOnOrigin("f00".into())];
+        assert_eq!(victim_headline(&risky, owner), "whose edit records are YOURS");
+
+        // Empty is not a claim about anything; it must not crash or accuse.
+        assert_eq!(victim_headline(&[], owner), "whose edit records are YOURS");
+    }
+
     #[test]
     fn no_paths_is_not_a_possessive_claim() {
         let (all_settled, all_mine) = victim_flags(&[], &[]);
         assert!(all_settled, "nothing listed is nothing at risk");
-        assert!(!all_mine, "nothing listed is not 'every path above is yours'");
+        assert!(
+            !all_mine,
+            "nothing listed is not 'every path above is yours'"
+        );
     }
 
     /// never learned it.
@@ -4336,7 +4797,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().to_string_lossy().to_string();
         let git = |args: &[&str]| {
-            std::process::Command::new("git").args(args).current_dir(&d).output().unwrap()
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&d)
+                .output()
+                .unwrap()
         };
         git(&["init", "-q"]);
         git(&["config", "user.email", "t@t"]);
@@ -4360,7 +4825,10 @@ mod tests {
 
         match path_fate(&d, "tick.md", "mixpeek-general", 0, "firsthand").await {
             PathFate::NotTheirWork(writers) => {
-                assert!(writers.contains(&"tubescience".to_string()), "name the real writers: {writers:?}");
+                assert!(
+                    writers.contains(&"tubescience".to_string()),
+                    "name the real writers: {writers:?}"
+                );
             }
             other => panic!("a lane that never wrote this path has no work to lose: {other:?}"),
         }
@@ -4381,7 +4849,11 @@ mod tests {
         let dir3 = tempfile::tempdir().unwrap();
         let d3 = dir3.path().to_string_lossy().to_string();
         let git3 = |args: &[&str]| {
-            std::process::Command::new("git").args(args).current_dir(&d3).output().unwrap()
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&d3)
+                .output()
+                .unwrap()
         };
         git3(&["init", "-q"]);
         git3(&["config", "user.email", "t@t"]);
@@ -4389,7 +4861,10 @@ mod tests {
         std::fs::write(dir3.path().join("g.md"), "v1\n").unwrap();
         git3(&["add", "g.md"]);
         git3(&["commit", "-q", "-m", "base\n\nAmux-Session: someone-else"]);
-        let base3 = String::from_utf8(git3(&["rev-parse", "HEAD"]).stdout).unwrap().trim().to_string();
+        let base3 = String::from_utf8(git3(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
         std::fs::write(dir3.path().join("g.md"), "v2\n").unwrap();
         git3(&["add", "g.md"]);
         git3(&["commit", "-q", "-m", "landed\n\nAmux-Session: grafter"]);
@@ -4408,7 +4883,11 @@ mod tests {
         let dir2 = tempfile::tempdir().unwrap();
         let d2 = dir2.path().to_string_lossy().to_string();
         let git2 = |args: &[&str]| {
-            std::process::Command::new("git").args(args).current_dir(&d2).output().unwrap()
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&d2)
+                .output()
+                .unwrap()
         };
         git2(&["init", "-q"]);
         git2(&["config", "user.email", "t@t"]);
@@ -4443,7 +4922,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().to_string_lossy().to_string();
         let git = |args: &[&str]| {
-            std::process::Command::new("git").args(args).current_dir(&d).output().unwrap()
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&d)
+                .output()
+                .unwrap()
         };
         git(&["init", "-q"]);
         git(&["config", "user.email", "t@t"]);
@@ -4459,8 +4942,8 @@ mod tests {
         git(&["commit", "-q", "-m", "landed"]);
         git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
         git(&["reset", "-q", "--hard", "HEAD~1"]); // local HEAD back to `old`
-        // The worktree carries origin's bytes; the index is NOT touched, so it
-        // mirrors local HEAD. This is the untouched-file state, not a staged one.
+                                                   // The worktree carries origin's bytes; the index is NOT touched, so it
+                                                   // mirrors local HEAD. This is the untouched-file state, not a staged one.
         std::fs::write(dir.path().join("doc.md"), "landed\n").unwrap();
 
         // PREMISES, asserted so the arms below cannot be vacuously green.
@@ -4472,18 +4955,25 @@ mod tests {
             "fixture must be dirty vs local HEAD, or AtRisk is never reached"
         );
         assert!(
-            git_out(&d, &["diff", "--quiet", "origin/main", "--", "doc.md"]).await.is_some(),
+            git_out(&d, &["diff", "--quiet", "origin/main", "--", "doc.md"])
+                .await
+                .is_some(),
             "fixture worktree must equal origin/main"
         );
         assert!(
-            git_out(&d, &["diff", "--quiet", "--cached", "origin/main", "--", "doc.md"])
-                .await
-                .is_none(),
+            git_out(
+                &d,
+                &["diff", "--quiet", "--cached", "origin/main", "--", "doc.md"]
+            )
+            .await
+            .is_none(),
             "fixture INDEX must differ from origin — that is the whole defect"
         );
 
         match path_fate(&d, "doc.md", "peer", 0, "firsthand").await {
-            PathFate::LandedOnOrigin(sha) => assert!(!sha.is_empty(), "receipt carries origin's sha"),
+            PathFate::LandedOnOrigin(sha) => {
+                assert!(!sha.is_empty(), "receipt carries origin's sha")
+            }
             other => panic!("landed and unstaged is a receipt, not an alarm: {other:?}"),
         }
 
@@ -4504,7 +4994,10 @@ mod tests {
         // at-risk case, staged or not.
         git(&["reset", "-q"]);
         std::fs::write(dir.path().join("doc.md"), "novel local work\n").unwrap();
-        assert_eq!(path_fate(&d, "doc.md", "peer", 0, "firsthand").await, PathFate::AtRisk);
+        assert_eq!(
+            path_fate(&d, "doc.md", "peer", 0, "firsthand").await,
+            PathFate::AtRisk
+        );
     }
 
     /// AMUX-3677, rebuilt from the notice's own text and the repo state that
@@ -4524,7 +5017,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().to_string_lossy().to_string();
         let git = |args: &[&str]| {
-            std::process::Command::new("git").args(args).current_dir(&d).output().unwrap()
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&d)
+                .output()
+                .unwrap()
         };
         git(&["init", "-q"]);
         git(&["config", "user.email", "t@t"]);
@@ -4533,7 +5030,12 @@ mod tests {
         // alice commits the file — this is the work the notice claims is at risk.
         std::fs::write(dir.path().join("shared.rs"), "alice's work\n").unwrap();
         git(&["add", "shared.rs"]);
-        git(&["commit", "-q", "-m", "alice's change\n\nAmux-Session: alice"]);
+        git(&[
+            "commit",
+            "-q",
+            "-m",
+            "alice's change\n\nAmux-Session: alice",
+        ]);
 
         // bob is mid-commit: the path is dirty against HEAD right now.
         std::fs::write(dir.path().join("shared.rs"), "alice's work\nbob's line\n").unwrap();
@@ -4547,14 +5049,18 @@ mod tests {
                 .unwrap_or(false),
             "fixture must be dirty, or AtRisk is never reached"
         );
-        assert!(owner_owns_newest_commit(&d, "shared.rs", "alice").await.is_some());
+        assert!(owner_owns_newest_commit(&d, "shared.rs", "alice")
+            .await
+            .is_some());
 
         // TREATMENT: alice's record is INFERRED — an mtime that moved when bob
         // wrote. edit_age 0 makes `owner_committed_since` certainly miss, which
         // is what the peer's refresh does in the real case.
         match path_fate(&d, "shared.rs", "alice", 0, "inferred").await {
             PathFate::SettledByOwner(sha) => assert!(!sha.is_empty()),
-            other => panic!("inferred record over alice's own newest commit must be settled: {other:?}"),
+            other => {
+                panic!("inferred record over alice's own newest commit must be settled: {other:?}")
+            }
         }
 
         // CONTROL 1, AND THE ONE THAT MATTERS. A FIRSTHAND record is a real
@@ -4562,7 +5068,10 @@ mod tests {
         // risk. Trading a false alarm for a missed one is the only way this
         // change can do harm, so it is asserted rather than reasoned about.
         assert!(
-            matches!(path_fate(&d, "shared.rs", "alice", 0, "firsthand").await, PathFate::AtRisk),
+            matches!(
+                path_fate(&d, "shared.rs", "alice", 0, "firsthand").await,
+                PathFate::AtRisk
+            ),
             "a recorded edit newer than the owner's commit must STILL be at risk"
         );
 
@@ -4570,9 +5079,15 @@ mod tests {
         // been changed by it and only she can judge — no receipt.
         git(&["add", "shared.rs"]);
         git(&["commit", "-q", "-m", "bob's change\n\nAmux-Session: bob"]);
-        std::fs::write(dir.path().join("shared.rs"), "alice's work\nbob's line\nmore\n").unwrap();
+        std::fs::write(
+            dir.path().join("shared.rs"),
+            "alice's work\nbob's line\nmore\n",
+        )
+        .unwrap();
         assert!(
-            owner_owns_newest_commit(&d, "shared.rs", "alice").await.is_none(),
+            owner_owns_newest_commit(&d, "shared.rs", "alice")
+                .await
+                .is_none(),
             "alice no longer owns the newest commit"
         );
 
@@ -4581,7 +5096,9 @@ mod tests {
         std::fs::write(dir.path().join("other.rs"), "x\n").unwrap();
         git(&["add", "other.rs"]);
         git(&["commit", "-q", "-m", "no trailer here"]);
-        assert!(owner_owns_newest_commit(&d, "other.rs", "alice").await.is_none());
+        assert!(owner_owns_newest_commit(&d, "other.rs", "alice")
+            .await
+            .is_none());
         assert!(owner_owns_newest_commit(&d, "other.rs", "").await.is_none());
     }
 
@@ -4628,7 +5145,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().to_string_lossy().to_string();
         let git = |args: &[&str]| {
-            std::process::Command::new("git").args(args).current_dir(&d).output().unwrap()
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&d)
+                .output()
+                .unwrap()
         };
         git(&["init", "-q"]);
         git(&["config", "user.email", "t@t"]);
@@ -4643,24 +5164,33 @@ mod tests {
 
         // alice edited a.txt 3600s ago and HAS committed since -> settled.
         assert!(
-            owner_committed_since(&d, "a.txt", "alice", 3600).await.is_some(),
+            owner_committed_since(&d, "a.txt", "alice", 3600)
+                .await
+                .is_some(),
             "alice committed a.txt after her edit; the notice must say nothing is at risk"
         );
         // bob has no commit touching a.txt at all -> unsettled, must NOT reassure.
         assert!(
-            owner_committed_since(&d, "a.txt", "bob", 3600).await.is_none(),
+            owner_committed_since(&d, "a.txt", "bob", 3600)
+                .await
+                .is_none(),
             "bob never committed a.txt — reassuring him would be the dangerous direction"
         );
         // alice's commit is OLDER than a 0-second-old edit: she edited again
         // just now and has not committed it. Must not reassure.
         assert!(
-            owner_committed_since(&d, "a.txt", "alice", 0).await.is_none(),
+            owner_committed_since(&d, "a.txt", "alice", 0)
+                .await
+                .is_none(),
             "an edit newer than the last commit is exactly the at-risk case"
         );
         // %an is identical for both lanes, so a name-based check would pass all
         // three above; the trailer is what makes this discriminate.
         let log = String::from_utf8(git(&["log", "--format=%an"]).stdout).unwrap();
-        assert!(log.lines().all(|l| l == "Shared Name"), "fixture must share %an: {log:?}");
+        assert!(
+            log.lines().all(|l| l == "Shared Name"),
+            "fixture must share %an: {log:?}"
+        );
     }
 
     use super::*;
@@ -4718,8 +5248,10 @@ mod tests {
             "/repo/crates/amux-server/src/db/board_store.rs".into(),
             ("amux".into(), 100.0),
         );
-        g.dirty.insert("/repo/crates/amux-server/src/db/board_store.rs".into());
-        g.mine_firsthand.insert("/repo/crates/amux-server/src/api/board.rs".into());
+        g.dirty
+            .insert("/repo/crates/amux-server/src/db/board_store.rs".into());
+        g.mine_firsthand
+            .insert("/repo/crates/amux-server/src/api/board.rs".into());
 
         let staged = [pair("crates/amux-server/src/api/board.rs")];
         let v = classify(&staged, 200.0, 3600.0, &g);
@@ -4752,9 +5284,13 @@ mod tests {
 
         // CONTROL 1: the peer has nothing dirty outside the commit.
         let mut quiet = peer_wrote("crates/amux-server/src/api/board.rs", "amux", 100.0);
-        quiet.mine_firsthand.insert("/repo/crates/amux-server/src/api/board.rs".into());
+        quiet
+            .mine_firsthand
+            .insert("/repo/crates/amux-server/src/api/board.rs".into());
         assert!(
-            classify(&staged, 200.0, 3600.0, &quiet).split_risk.is_empty(),
+            classify(&staged, 200.0, 3600.0, &quiet)
+                .split_risk
+                .is_empty(),
             "a co-edited staged file alone is not a split — every commit on this checkout \
              would warn, and a warning that always fires is one nobody reads"
         );
@@ -4774,11 +5310,17 @@ mod tests {
         // across one lane's work; unrelated dirt from a third lane is noise, and
         // attributing it here would make the message wrong as well as loud.
         let mut other = peer_wrote("crates/amux-server/src/api/board.rs", "amux", 100.0);
-        other.mine_firsthand.insert("/repo/crates/amux-server/src/api/board.rs".into());
-        other.theirs.insert("/repo/unrelated.rs".into(), ("desktop".into(), 100.0));
+        other
+            .mine_firsthand
+            .insert("/repo/crates/amux-server/src/api/board.rs".into());
+        other
+            .theirs
+            .insert("/repo/unrelated.rs".into(), ("desktop".into(), 100.0));
         other.dirty.insert("/repo/unrelated.rs".into());
         assert!(
-            classify(&staged, 200.0, 3600.0, &other).split_risk.is_empty(),
+            classify(&staged, 200.0, 3600.0, &other)
+                .split_risk
+                .is_empty(),
             "only the co-editor's OWN dirty files can split their own symbol"
         );
     }
@@ -4794,29 +5336,55 @@ mod tests {
     fn an_mtime_only_record_names_the_files_without_claiming_they_are_the_peers() {
         // MTIME ONLY on both sides: a record exists, no authored content does.
         let mut g = peer_touched("crates/amux-server/src/api/board.rs", "amux", 100.0);
-        g.theirs.insert("/repo/crates/amux-server/src/db/board_store.rs".into(), ("amux".into(), 100.0));
-        g.theirs_firsthand.insert("/repo/crates/amux-server/src/db/board_store.rs".into());
-        g.dirty.insert("/repo/crates/amux-server/src/db/board_store.rs".into());
-        g.mine_firsthand.insert("/repo/crates/amux-server/src/api/board.rs".into());
+        g.theirs.insert(
+            "/repo/crates/amux-server/src/db/board_store.rs".into(),
+            ("amux".into(), 100.0),
+        );
+        g.theirs_firsthand
+            .insert("/repo/crates/amux-server/src/db/board_store.rs".into());
+        g.dirty
+            .insert("/repo/crates/amux-server/src/db/board_store.rs".into());
+        g.mine_firsthand
+            .insert("/repo/crates/amux-server/src/api/board.rs".into());
 
         let staged = [pair("crates/amux-server/src/api/board.rs")];
         let v = classify(&staged, 200.0, 3600.0, &g);
 
         // DOWNGRADE, NEVER SUPPRESS: the build hazard is real whoever owns the
         // bytes, so the row must still be here and still name the file.
-        assert_eq!(v.split_risk.len(), 1, "the BUILD warning must survive: {:?}", v.split_risk);
+        assert_eq!(
+            v.split_risk.len(),
+            1,
+            "the BUILD warning must survive: {:?}",
+            v.split_risk
+        );
         let r = &v.split_risk[0];
         assert_eq!(r["authored"], json!(false), "{r}");
         assert!(
-            r["left_dirty"].as_array().unwrap()[0].as_str().unwrap().ends_with("db/board_store.rs"),
+            r["left_dirty"].as_array().unwrap()[0]
+                .as_str()
+                .unwrap()
+                .ends_with("db/board_store.rs"),
             "still names the file left behind: {r}"
         );
         let why = r["why"].as_str().unwrap();
-        assert!(why.contains("fail to build"), "the hazard still stated: {why}");
+        assert!(
+            why.contains("fail to build"),
+            "the hazard still stated: {why}"
+        );
         // ...and the possessive is gone, with the remedy that sends you to a peer.
-        assert!(!why.contains("THEIR files"), "no ownership assertion from an mtime: {why}");
-        assert!(!why.contains("confirm with them"), "do not send them to a peer: {why}");
-        assert!(why.contains("mtime"), "say what the record actually is: {why}");
+        assert!(
+            !why.contains("THEIR files"),
+            "no ownership assertion from an mtime: {why}"
+        );
+        assert!(
+            !why.contains("confirm with them"),
+            "do not send them to a peer: {why}"
+        );
+        assert!(
+            why.contains("mtime"),
+            "say what the record actually is: {why}"
+        );
         assert!(
             !why.contains('?'),
             "STATE A FACT, never ask the committer a question (the rule the authored arm keeps): {why}"
@@ -4826,23 +5394,39 @@ mod tests {
         // on both sides the claim is supportable and the full wording returns.
         // Without this cell, deleting the possessive unconditionally would pass.
         let mut a = peer_wrote("crates/amux-server/src/api/board.rs", "amux", 100.0);
-        a.theirs.insert("/repo/crates/amux-server/src/db/board_store.rs".into(), ("amux".into(), 100.0));
-        a.theirs_firsthand.insert("/repo/crates/amux-server/src/db/board_store.rs".into());
-        a.theirs_transcript.insert("/repo/crates/amux-server/src/db/board_store.rs".into());
-        a.dirty.insert("/repo/crates/amux-server/src/db/board_store.rs".into());
-        a.mine_firsthand.insert("/repo/crates/amux-server/src/api/board.rs".into());
+        a.theirs.insert(
+            "/repo/crates/amux-server/src/db/board_store.rs".into(),
+            ("amux".into(), 100.0),
+        );
+        a.theirs_firsthand
+            .insert("/repo/crates/amux-server/src/db/board_store.rs".into());
+        a.theirs_transcript
+            .insert("/repo/crates/amux-server/src/db/board_store.rs".into());
+        a.dirty
+            .insert("/repo/crates/amux-server/src/db/board_store.rs".into());
+        a.mine_firsthand
+            .insert("/repo/crates/amux-server/src/api/board.rs".into());
         let v2 = classify(&staged, 200.0, 3600.0, &a);
         assert_eq!(v2.split_risk[0]["authored"], json!(true));
-        assert!(v2.split_risk[0]["why"].as_str().unwrap().contains("THEIR files"));
+        assert!(v2.split_risk[0]["why"]
+            .as_str()
+            .unwrap()
+            .contains("THEIR files"));
 
         // CONTROL 2: transcript on ONE side only is not a split of their work.
         // The hazard is a symbol split ACROSS the two halves, so one authored
         // side plus one mtime side must stay downgraded.
         let mut half = peer_wrote("crates/amux-server/src/api/board.rs", "amux", 100.0);
-        half.theirs.insert("/repo/crates/amux-server/src/db/board_store.rs".into(), ("amux".into(), 100.0));
-        half.theirs_firsthand.insert("/repo/crates/amux-server/src/db/board_store.rs".into());
-        half.dirty.insert("/repo/crates/amux-server/src/db/board_store.rs".into());
-        half.mine_firsthand.insert("/repo/crates/amux-server/src/api/board.rs".into());
+        half.theirs.insert(
+            "/repo/crates/amux-server/src/db/board_store.rs".into(),
+            ("amux".into(), 100.0),
+        );
+        half.theirs_firsthand
+            .insert("/repo/crates/amux-server/src/db/board_store.rs".into());
+        half.dirty
+            .insert("/repo/crates/amux-server/src/db/board_store.rs".into());
+        half.mine_firsthand
+            .insert("/repo/crates/amux-server/src/api/board.rs".into());
         assert_eq!(
             classify(&staged, 200.0, 3600.0, &half).split_risk[0]["authored"],
             json!(false),
@@ -4867,7 +5451,11 @@ mod tests {
         g.mine_firsthand.insert("/repo/board_store.rs".into());
         let mut probe_lane = HashMap::new();
         probe_lane.insert("/repo/board_store.rs".to_string(), 1002.0);
-        apply_observed(&mut g, &HashMap::new(), &[("amux-cloud".to_string(), probe_lane)]);
+        apply_observed(
+            &mut g,
+            &HashMap::new(),
+            &[("amux-cloud".to_string(), probe_lane)],
+        );
         let v = classify(&[pair("board_store.rs")], 2000.0, 3600.0, &g);
         assert!(v.foreign.is_empty());
         assert!(
@@ -4884,7 +5472,11 @@ mod tests {
         g.mine_firsthand.insert("/repo/board_store.rs".into());
         let mut real_edit = HashMap::new();
         real_edit.insert("/repo/board_store.rs".to_string(), 1900.0);
-        apply_observed(&mut g, &HashMap::new(), &[("amux-cloud".to_string(), real_edit)]);
+        apply_observed(
+            &mut g,
+            &HashMap::new(),
+            &[("amux-cloud".to_string(), real_edit)],
+        );
         let v = classify(&[pair("board_store.rs")], 2000.0, 3600.0, &g);
         assert_eq!(v.shared.len(), 1, "a real later write must still warn");
 
@@ -4896,7 +5488,11 @@ mod tests {
         my_echo.insert("/repo/theirs.rs".to_string(), 1001.0);
         apply_observed(&mut g, &my_echo, &[]);
         let v = classify(&[pair("theirs.rs")], 2000.0, 3600.0, &g);
-        assert_eq!(v.foreign.len(), 1, "my echo of alice's write is not a claim");
+        assert_eq!(
+            v.foreign.len(),
+            1,
+            "my echo of alice's write is not a claim"
+        );
         assert!(v.shared.is_empty());
 
         // (d) OBSERVED-vs-OBSERVED coincidence cannot be resolved server-side
@@ -4912,7 +5508,10 @@ mod tests {
         let v = classify(&[pair("both.rs")], 2000.0, 3600.0, &g);
         assert_eq!(v.shared.len(), 1);
         assert!(
-            v.shared[0]["co_signal"].as_str().unwrap_or("").contains("AMUX-3497"),
+            v.shared[0]["co_signal"]
+                .as_str()
+                .unwrap_or("")
+                .contains("AMUX-3497"),
             "ambiguous mtime co-signal must name itself: {:?}",
             v.shared[0]
         );
@@ -4979,7 +5578,11 @@ mod tests {
             "a write I RECORDED must never read as inferred: {:?}",
             v.shared[0]
         );
-        assert_eq!(v.shared[0]["their_provenance"], "observed", "{:?}", v.shared[0]);
+        assert_eq!(
+            v.shared[0]["their_provenance"], "observed",
+            "{:?}",
+            v.shared[0]
+        );
 
         // CONTROL 2, AND IT IS THE LOAD-BEARING ONE. I hold a transcript record
         // AND my own Bash window also caught the mtime — the ordinary case when
@@ -5066,7 +5669,10 @@ mod tests {
         apply_observed(&mut g, &mine, &[("amux-frustrations".to_string(), peer)]);
         let v = classify(&[pair("token-baseline.py")], 3100.0, 3600.0, &g);
         assert!(
-            v.shared[0]["co_signal"].as_str().unwrap_or("").contains("1000s NEWER"),
+            v.shared[0]["co_signal"]
+                .as_str()
+                .unwrap_or("")
+                .contains("1000s NEWER"),
             "quote the real gap so the reader can weigh it: {:?}",
             v.shared[0]
         );
@@ -5171,7 +5777,10 @@ mod tests {
             "sed 's/a/b/' notes.md",
             "cat a | sed --in-place s/a/b/ notes.md",
         ] {
-            assert!(!is_pure_read_command(cmd), "a file-reaching sed read as pure: {cmd}");
+            assert!(
+                !is_pure_read_command(cmd),
+                "a file-reaching sed read as pure: {cmd}"
+            );
         }
     }
 
@@ -5191,7 +5800,10 @@ mod tests {
             "for c in 1 2; do git add frustrations.md; done",
             "echo \"$(git commit -am wip)\"",
         ] {
-            assert!(!is_pure_read_command(cmd), "structure laundered a write: {cmd}");
+            assert!(
+                !is_pure_read_command(cmd),
+                "structure laundered a write: {cmd}"
+            );
         }
     }
 
@@ -5206,7 +5818,11 @@ mod tests {
         // Without observed: peer firsthand vs committer NOTHING -> foreign block.
         let g = peer_wrote("f.rs", "alice", 1000.0);
         let v = classify(&[pair("f.rs")], 2000.0, 3600.0, &g);
-        assert_eq!(v.foreign.len(), 1, "control: the bash lane is blocked today");
+        assert_eq!(
+            v.foreign.len(),
+            1,
+            "control: the bash lane is blocked today"
+        );
 
         // With an observed record 900s fresher than alice's claim: firsthand
         // rank + the AF-27 recency rule -> shared (warned), never blocked.
@@ -5216,7 +5832,11 @@ mod tests {
         apply_observed(&mut g, &mine_obs, &[]);
         let v = classify(&[pair("f.rs")], 2000.0, 3600.0, &g);
         assert!(v.foreign.is_empty(), "{:?}", v.foreign);
-        assert_eq!(v.shared.len(), 1, "both claims real -> shared, warned not blocked");
+        assert_eq!(
+            v.shared.len(),
+            1,
+            "both claims real -> shared, warned not blocked"
+        );
 
         // AF-125, the cell where ONLY RANK decides — written across the
         // reverse-recency case amux-frustrations' mutation exposed. The
@@ -5236,7 +5856,11 @@ mod tests {
             "rank must carry the staler-self cell — recency alone blocks it: {:?}",
             v.foreign
         );
-        assert_eq!(v.shared.len(), 1, "two real claims are a contest, not a sweep");
+        assert_eq!(
+            v.shared.len(),
+            1,
+            "two real claims are a contest, not a sweep"
+        );
         // Mechanism check, deliberately BELOW the cell (amux-frustrations'
         // AF-125 correction, 2026-08-21): asserting the insert directly is the
         // mutation's own inverse, and placed above the behavioral cell it
@@ -5283,11 +5907,17 @@ mod tests {
         // Bare string (older installed hook copy): hook-time stamp, i.e. the
         // pre-AF-130 behavior — degraded toward over-warning, never silence.
         let body = serde_json::json!({"paths": ["/repo/y.rs"]});
-        assert_eq!(parse_observed_reports(&body, now), vec![("/repo/y.rs".to_string(), now)]);
+        assert_eq!(
+            parse_observed_reports(&body, now),
+            vec![("/repo/y.rs".to_string(), now)]
+        );
         // A future mtime clamps to now: a skewed clock must not mint a record
         // that outlives the pruning window.
         let body = serde_json::json!({"paths": [{"path": "/repo/z.rs", "mtime": 99999.0}]});
-        assert_eq!(parse_observed_reports(&body, now), vec![("/repo/z.rs".to_string(), now)]);
+        assert_eq!(
+            parse_observed_reports(&body, now),
+            vec![("/repo/z.rs".to_string(), now)]
+        );
         // Junk rows (no path, wrong types, empty) are skipped, not defaulted.
         let body = serde_json::json!({"paths": [{"mtime": 1.0}, 42, "", {"path": "  "}]});
         assert!(parse_observed_reports(&body, now).is_empty());
@@ -5298,8 +5928,10 @@ mod tests {
     /// `false` direction re-opens the exact bug — unclaimed paths never block).
     #[test]
     fn a_live_blind_cotenant_gates_unclaimed_paths() {
-        assert!(gates_unclaimed(&["blind-lane".into()]),
-                "a live blind cotenant must force unclaimed paths to block — UNKNOWN as SAFE is AC-355");
+        assert!(
+            gates_unclaimed(&["blind-lane".into()]),
+            "a live blind cotenant must force unclaimed paths to block — UNKNOWN as SAFE is AC-355"
+        );
         assert!(!gates_unclaimed(&[]),
                 "no blind cotenant, no gate — forcing this true would block every unclaimed path everywhere");
     }
@@ -5312,14 +5944,13 @@ mod tests {
     #[tokio::test]
     async fn observed_store_prunes_the_window_and_the_cap_drops_oldest_first() {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            std::sync::Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
+        let store = std::sync::Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
         let mk_state = || crate::api::AppState {
             store: store.clone(),
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
-        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let hdrs = || {
             let mut h = HeaderMap::new();
@@ -5348,7 +5979,8 @@ mod tests {
         // Window prune (L726): a record far beyond OBSERVED_WINDOW_S is
         // dropped from the PRIOR map on the next write. Without the retain it
         // lives forever and a stale observation vetoes AF-27 indefinitely.
-        let _ = post(json!({"paths": [{"path": "/repo-obs/ancient.rs", "mtime": now - 30_000.0}]})).await;
+        let _ = post(json!({"paths": [{"path": "/repo-obs/ancient.rs", "mtime": now - 30_000.0}]}))
+            .await;
         let _ = post(json!({"paths": [{"path": "/repo-obs/fresh.rs", "mtime": now}]})).await;
         let m = read_map();
         assert!(m.contains_key("/repo-obs/fresh.rs"));
@@ -5387,14 +6019,13 @@ mod tests {
     #[tokio::test]
     async fn guard_outcome_takes_declared_overrides_and_closes_the_episode() {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            std::sync::Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
+        let store = std::sync::Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
         let mk_state = || crate::api::AppState {
             store: store.clone(),
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
-        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let now = now_epoch();
         store
@@ -5420,9 +6051,7 @@ mod tests {
         let call = |sess: &str, body: Value| {
             let st = mk_state();
             let h = hdrs(sess);
-            async move {
-                guard_outcome(axum::extract::State(st), h, axum::Json(body)).await
-            }
+            async move { guard_outcome(axum::extract::State(st), h, axum::Json(body)).await }
         };
         // Refusal 1: proceeded without the declared override.
         let (code, _) = call(
@@ -5430,7 +6059,11 @@ mod tests {
             json!({"resolution": "proceeded", "basis": "declared", "verdict_id": 2}),
         )
         .await;
-        assert_eq!(code, StatusCode::BAD_REQUEST, "proceeded must carry the declared override");
+        assert_eq!(
+            code,
+            StatusCode::BAD_REQUEST,
+            "proceeded must carry the declared override"
+        );
         // Refusal 1b (amux-frustrations' review gap): a CLIENT may not claim
         // basis="inferred" — that label is server-assigned only, and it is
         // the property the read-time arithmetic leans on. Before this cell,
@@ -5440,7 +6073,11 @@ mod tests {
             json!({"resolution": "trimmed", "basis": "inferred", "verdict_id": 2}),
         )
         .await;
-        assert_eq!(code, StatusCode::BAD_REQUEST, "inferred is server-assigned, never client-claimed");
+        assert_eq!(
+            code,
+            StatusCode::BAD_REQUEST,
+            "inferred is server-assigned, never client-claimed"
+        );
         // Refusal 2: bob cannot close alice's row.
         let (code, body) = call(
             "bob",
@@ -5449,7 +6086,10 @@ mod tests {
         )
         .await;
         assert_eq!(code, StatusCode::OK);
-        assert_eq!(body.0["attached"], false, "a peer must not close someone else's block");
+        assert_eq!(
+            body.0["attached"], false,
+            "a peer must not close someone else's block"
+        );
         // The real attach: alice, by id, SOLO declared.
         let (code, body) = call(
             "alice",
@@ -5473,7 +6113,11 @@ mod tests {
         };
         assert_eq!(
             row(2),
-            (Some("proceeded".into()), Some("verified_solo".into()), Some("marker".into())),
+            (
+                Some("proceeded".into()),
+                Some("verified_solo".into()),
+                Some("marker".into())
+            ),
             "the declared override is the record — SOLO and ALLOW_FOREIGN are different claims"
         );
         assert_eq!(
@@ -5497,7 +6141,10 @@ mod tests {
                      VALUES (4, ?1, 'alice', '/repo', 'allow', 6)",
                     rusqlite::params![now_epoch() - 10.0],
                 )?;
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                Ok(crate::db::WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .unwrap();
         let (code, body) = call(
@@ -5507,7 +6154,10 @@ mod tests {
         )
         .await;
         assert_eq!(code, StatusCode::OK);
-        assert_eq!(body.0["attached"], false, "an allow row must never take an outcome by id");
+        assert_eq!(
+            body.0["attached"], false,
+            "an allow row must never take an outcome by id"
+        );
         assert_eq!(row(4).0, None, "the allow row stays outcome-free");
         // Clause 2, `AND resolution IS NULL`: a resolved block must not be
         // closed twice — a late or duplicate report must not overwrite the
@@ -5518,10 +6168,17 @@ mod tests {
         )
         .await;
         assert_eq!(code, StatusCode::OK);
-        assert_eq!(body.0["attached"], false, "a resolved block must refuse a second outcome");
+        assert_eq!(
+            body.0["attached"], false,
+            "a resolved block must refuse a second outcome"
+        );
         assert_eq!(
             row(2),
-            (Some("proceeded".into()), Some("verified_solo".into()), Some("marker".into())),
+            (
+                Some("proceeded".into()),
+                Some("verified_solo".into()),
+                Some("marker".into())
+            ),
             "the first outcome survives — a duplicate report must not rewrite history"
         );
     }
@@ -5535,8 +6192,10 @@ mod tests {
     #[test]
     fn content_accounting_names_the_swept_peer_hunk_without_peer_records() {
         let added = vec![
-            r#"    RouteEntry { path: "/api/connectors/accounts", methods: &["GET"] },"#.to_string(),
-            r#"    RouteEntry { path: "/api/reclaim/skipped", methods: &["GET", "DELETE"] },"#.to_string(),
+            r#"    RouteEntry { path: "/api/connectors/accounts", methods: &["GET"] },"#
+                .to_string(),
+            r#"    RouteEntry { path: "/api/reclaim/skipped", methods: &["GET", "DELETE"] },"#
+                .to_string(),
             "}".to_string(), // trivial: auto-accounted
         ];
         let my_edit_content = r#"
@@ -5599,8 +6258,14 @@ mod tests {
         // Pre-existing AMUX-3446 behaviour, unchanged: an all-shell file has
         // no content to compare against and is skipped without a claim.
         for peer in [true, false] {
-            assert_eq!(line_accounting_mode(false, true, peer), LineAccounting::Skip);
-            assert_eq!(line_accounting_mode(false, false, peer), LineAccounting::Skip);
+            assert_eq!(
+                line_accounting_mode(false, true, peer),
+                LineAccounting::Skip
+            );
+            assert_eq!(
+                line_accounting_mode(false, false, peer),
+                LineAccounting::Skip
+            );
         }
     }
 
@@ -5626,7 +6291,10 @@ mod tests {
         // And the field must still SAY something: a redactor that blanked the
         // line would pass the assertion above while destroying the diagnostic
         // this WARN exists to provide.
-        assert!(verb.contains("MXPKEY"), "the non-secret part must survive: {verb}");
+        assert!(
+            verb.contains("MXPKEY"),
+            "the non-secret part must survive: {verb}"
+        );
         // An ordinary token is untouched, or every WARN becomes unreadable.
         assert_eq!(base, "notes.md");
         let (_, plain, _) = inferred_warn_fields("a", "sed", "sed");
@@ -5723,7 +6391,10 @@ mod tests {
             "cd /repo && git checkout origin/main -- a.md b.md",
             "git -C /repo checkout origin/main -- f.md && git status",
         ] {
-            assert!(is_restore_only_command(cmd), "should be restore-only: {cmd}");
+            assert!(
+                is_restore_only_command(cmd),
+                "should be restore-only: {cmd}"
+            );
         }
         for cmd in [
             // The incident's own remedy paragraph names this shape: restore
@@ -5732,9 +6403,12 @@ mod tests {
             "sed -i 's/a/b/' f.rs",
             "git commit -m x",
             "git checkout origin/main -- f.md > out.log",
-            "head -3 f.md",     // pure read, restores nothing
+            "head -3 f.md", // pure read, restores nothing
         ] {
-            assert!(!is_restore_only_command(cmd), "should NOT be restore-only: {cmd}");
+            assert!(
+                !is_restore_only_command(cmd),
+                "should NOT be restore-only: {cmd}"
+            );
         }
     }
 
@@ -5742,7 +6416,8 @@ mod tests {
     /// risk" — the remedy that line prescribes operates on an empty set.
     #[test]
     fn a_restore_only_touch_is_never_reported_as_work_at_risk() {
-        let (line, at_risk) = victim_path_line("docs/openapi.json", &PathFate::AtRisk, "restore", "me");
+        let (line, at_risk) =
+            victim_path_line("docs/openapi.json", &PathFate::AtRisk, "restore", "me");
         assert!(!at_risk, "a restore carries no authored content");
         assert!(line.contains("RESTORE"), "{line}");
         assert!(!line.contains("CHECK THIS ONE"), "{line}");
@@ -5751,15 +6426,26 @@ mod tests {
         assert!(at_risk);
         assert!(line.contains("CHECK THIS ONE"), "{line}");
         // Settled and absorbed keep their calm wording regardless.
-        let (line, at_risk) =
-            victim_path_line("a.rs", &PathFate::SettledByOwner("abc123".into()), "restore", "me");
+        let (line, at_risk) = victim_path_line(
+            "a.rs",
+            &PathFate::SettledByOwner("abc123".into()),
+            "restore",
+            "me",
+        );
         assert!(!at_risk);
         assert!(line.contains("nothing at risk"), "{line}");
         // AMUX-3445: landed-on-origin is a receipt, never a warning.
-        let (line, at_risk) =
-            victim_path_line("g.rs", &PathFate::LandedOnOrigin("def456".into()), "firsthand", "me");
+        let (line, at_risk) = victim_path_line(
+            "g.rs",
+            &PathFate::LandedOnOrigin("def456".into()),
+            "firsthand",
+            "me",
+        );
         assert!(!at_risk, "identical-to-origin cannot be at risk");
-        assert!(line.contains("origin/main") && line.contains("def456"), "{line}");
+        assert!(
+            line.contains("origin/main") && line.contains("def456"),
+            "{line}"
+        );
     }
 
     /// MG-1484: the foreign verdict carries the owner's claim PROVENANCE so
@@ -5792,7 +6478,10 @@ mod tests {
         );
 
         let (line, at_risk) = victim_path_line("s04_faces.py", &PathFate::AtRisk, "observed", "me");
-        assert!(at_risk, "it is still flagged — under-warning is the expensive direction");
+        assert!(
+            at_risk,
+            "it is still flagged — under-warning is the expensive direction"
+        );
         assert!(
             line.contains("OBSERVED"),
             "the notice must say how the claim was learned: {line}"
@@ -5809,7 +6498,8 @@ mod tests {
         let mut inp2 = GuardInputs::default();
         inp2.theirs_firsthand.insert(p.clone());
         assert_eq!(provenance_of(&inp2, &p), "firsthand");
-        let (line2, at_risk2) = victim_path_line("s04_faces.py", &PathFate::AtRisk, "firsthand", "me");
+        let (line2, at_risk2) =
+            victim_path_line("s04_faces.py", &PathFate::AtRisk, "firsthand", "me");
         assert!(at_risk2);
         assert!(
             line2.contains("the WORK ITSELF is at risk"),
@@ -5847,7 +6537,12 @@ mod tests {
         g.mine.insert("/repo/f.md".into(), 1500.0);
         g.mine_firsthand.insert("/repo/f.md".into());
         let v = classify(&[pair("f.md")], 2000.0, 3600.0, &g);
-        assert_eq!(v.shared.len(), 1, "both firsthand -> shared: {:?}", v.foreign);
+        assert_eq!(
+            v.shared.len(),
+            1,
+            "both firsthand -> shared: {:?}",
+            v.foreign
+        );
         assert_eq!(v.shared[0]["mine_age_secs"], serde_json::json!(500));
     }
 
@@ -5925,12 +6620,21 @@ mod tests {
                    EOF\n\
                    git commit -F /tmp/msg.txt";
         let stripped = strip_heredoc_bodies(cmd);
-        assert!(!stripped.contains("fix(board-drive)"), "body must be gone: {stripped}");
+        assert!(
+            !stripped.contains("fix(board-drive)"),
+            "body must be gone: {stripped}"
+        );
         // THE OPENER SURVIVES. `cat > f <<EOF` is a real write and must still
         // read as one — dropping the whole line would turn a write into a
         // silent no-op, which is the opposite and worse failure.
-        assert!(stripped.contains("cat > /tmp/msg.txt"), "the opener is command: {stripped}");
-        assert!(stripped.contains("git commit"), "and so is everything after the terminator");
+        assert!(
+            stripped.contains("cat > /tmp/msg.txt"),
+            "the opener is command: {stripped}"
+        );
+        assert!(
+            stripped.contains("git commit"),
+            "and so is everything after the terminator"
+        );
         // The verb must no longer be a word from the message.
         let v = first_blocking_verb(cmd).unwrap_or_default();
         assert_ne!(v, "fix", "the commit subject is not a shell verb");
@@ -5940,7 +6644,10 @@ mod tests {
         // 1. A herestring has no body; treating it as a heredoc would swallow
         //    the rest of the command and hide real writes.
         let hs = "grep -q x <<< \"$VAR\"\ncat > f.md";
-        assert!(strip_heredoc_bodies(hs).contains("cat > f.md"), "`<<<` is not a heredoc");
+        assert!(
+            strip_heredoc_bodies(hs).contains("cat > f.md"),
+            "`<<<` is not a heredoc"
+        );
         // 2. Quoted, unquoted and dash forms all parse.
         assert_eq!(heredoc_delimiter("cat <<'PY'").as_deref(), Some("PY"));
         assert_eq!(heredoc_delimiter("cat <<\"PY\"").as_deref(), Some("PY"));
@@ -6003,11 +6710,20 @@ mod tests {
     /// token to classify (AMUX-3822). `unknown` is a real third answer.
     #[test]
     fn the_read_verb_vocabulary_separates_classifiable_from_unmeasured() {
-        assert!(is_known_read_verb("cat"), "a read verb is the specimen case");
-        assert!(is_known_read_verb("blame"), "git read subcommands count too");
+        assert!(
+            is_known_read_verb("cat"),
+            "a read verb is the specimen case"
+        );
+        assert!(
+            is_known_read_verb("blame"),
+            "git read subcommands count too"
+        );
         // THE CONTROLS: neither a write verb nor a commit-subject word may
         // classify as a read, or the WARN would name the wrong verdict.
-        assert!(!is_known_read_verb("fix"), "a commit subject word is not a verb");
+        assert!(
+            !is_known_read_verb("fix"),
+            "a commit subject word is not a verb"
+        );
         assert!(!is_known_read_verb("feat"));
         assert!(!is_known_read_verb("cp"), "a write verb is not a read verb");
     }
@@ -6031,7 +6747,10 @@ mod tests {
             "git cat-file -p HEAD:a.md",
             "git show X | grep -n row",
         ] {
-            assert!(is_pure_read_command(cmd), "git read should attribute nothing: {cmd}");
+            assert!(
+                is_pure_read_command(cmd),
+                "git read should attribute nothing: {cmd}"
+            );
         }
         for cmd in [
             "git add digests/2026-08-15.md",
@@ -6044,7 +6763,10 @@ mod tests {
             "git",
             "git show X && git add Y",
         ] {
-            assert!(!is_pure_read_command(cmd), "git write/unknown must fall through: {cmd}");
+            assert!(
+                !is_pure_read_command(cmd),
+                "git write/unknown must fall through: {cmd}"
+            );
         }
     }
 
@@ -6075,8 +6797,14 @@ mod tests {
         // is inferred" even with an EMPTY claim set — which is what the message
         // is for: telling the reader what was actually compared.
         let why = v.foreign[0]["why"].as_str().unwrap();
-        assert!(why.contains("no edit record on this path"), "misleading why: {why}");
-        assert!(why.contains("edit records, not the staged diff"), "why: {why}");
+        assert!(
+            why.contains("no edit record on this path"),
+            "misleading why: {why}"
+        );
+        assert!(
+            why.contains("edit records, not the staged diff"),
+            "why: {why}"
+        );
         assert!(v.shared.is_empty() && v.unclaimed.is_empty());
     }
 
@@ -6086,7 +6814,11 @@ mod tests {
     fn peer_deleted_path_still_blocks() {
         let inp = peer_wrote("gone.rs", "peer-lane", 1500.0);
         let v = classify(&[pair("gone.rs")], 1600.0, 21600.0, &inp);
-        assert_eq!(v.foreign.len(), 1, "a staged deletion of a peer's file MUST block");
+        assert_eq!(
+            v.foreign.len(),
+            1,
+            "a staged deletion of a peer's file MUST block"
+        );
     }
 
     /// AF-19, the regression that let 762e06e through: an INFERRED self-claim (a
@@ -6116,8 +6848,14 @@ mod tests {
         let prev = std::env::var("AMUX_REPO").ok();
         std::env::set_var("AMUX_REPO", "/Users/ethan/Dev/amux");
         let r = super::outdated_hook_remedy(d);
-        assert_eq!(r, format!("/Users/ethan/Dev/amux/scripts/install-hooks.sh {d}"));
-        assert!(r.contains(d), "the remedy must name the dir it is fixing: {r}");
+        assert_eq!(
+            r,
+            format!("/Users/ethan/Dev/amux/scripts/install-hooks.sh {d}")
+        );
+        assert!(
+            r.contains(d),
+            "the remedy must name the dir it is fixing: {r}"
+        );
 
         std::env::remove_var("AMUX_REPO");
         let bare = super::outdated_hook_remedy(d);
@@ -6126,7 +6864,10 @@ mod tests {
             "with no AMUX_REPO the path must be visibly unfilled, not a plausible \
              relative path that resolves nowhere: {bare}"
         );
-        assert!(bare.contains(d), "and it must still name the target dir: {bare}");
+        assert!(
+            bare.contains(d),
+            "and it must still name the target dir: {bare}"
+        );
         match prev {
             Some(v) => std::env::set_var("AMUX_REPO", v),
             None => std::env::remove_var("AMUX_REPO"),
@@ -6138,8 +6879,15 @@ mod tests {
         let mut inp = peer_wrote("test_x.py", "peer-lane", 1000.0);
         inp.mine.insert("/repo/test_x.py".into(), 1000.0); // inferred, same instant as the peer
         let v = classify(&[pair("test_x.py")], 1600.0, 21600.0, &inp);
-        assert_eq!(v.foreign.len(), 1, "an inferred self-claim no fresher than the peer must still block");
-        assert!(v.foreign[0]["why"].as_str().unwrap().contains("your claim is inferred"));
+        assert_eq!(
+            v.foreign.len(),
+            1,
+            "an inferred self-claim no fresher than the peer must still block"
+        );
+        assert!(v.foreign[0]["why"]
+            .as_str()
+            .unwrap()
+            .contains("your claim is inferred"));
     }
 
     /// AF-27: the committer's OWN edit is clearly fresher than the peer's stale
@@ -6153,7 +6901,11 @@ mod tests {
         let mut inp = peer_wrote("hand_raiser.py", "peer-lane", 1000.0); // peer, older
         inp.mine.insert("/repo/hand_raiser.py".into(), 1580.0); // committer, clearly fresher
         let v = classify(&[pair("hand_raiser.py")], 1600.0, 21600.0, &inp);
-        assert!(v.foreign.is_empty(), "a clearly fresher self-edit must not block: {:?}", v.foreign);
+        assert!(
+            v.foreign.is_empty(),
+            "a clearly fresher self-edit must not block: {:?}",
+            v.foreign
+        );
         assert_eq!(v.shared.len(), 1, "it is shared (warned), not foreign");
         assert_eq!(v.shared[0]["peer"], json!(true));
     }
@@ -6166,9 +6918,16 @@ mod tests {
     fn a_within_skew_fresher_self_edit_still_blocks() {
         let mut inp = peer_wrote("coincident.rs", "peer-lane", 1000.0);
         // Fresher by (margin - 1)s — inside the skew, so it does NOT count.
-        inp.mine.insert("/repo/coincident.rs".into(), 1000.0 + RECENCY_SKEW_MARGIN_S - 1.0);
+        inp.mine.insert(
+            "/repo/coincident.rs".into(),
+            1000.0 + RECENCY_SKEW_MARGIN_S - 1.0,
+        );
         let v = classify(&[pair("coincident.rs")], 1600.0, 21600.0, &inp);
-        assert_eq!(v.foreign.len(), 1, "a within-skew freshness lead must still block");
+        assert_eq!(
+            v.foreign.len(),
+            1,
+            "a within-skew freshness lead must still block"
+        );
     }
 
     /// The legitimate claim: both sessions really edited it. Warned, never
@@ -6213,38 +6972,85 @@ mod tests {
         // Kept and inverted rather than deleted, so the change of contract is
         // visible in the diff to anyone who wonders why unclaimed now blocks.
         // Blind cotenant present: this is the sweep case, and it must BLOCK.
-        let blind = GuardInputs { blind_cotenant: true, ..Default::default() };
+        let blind = GuardInputs {
+            blind_cotenant: true,
+            ..Default::default()
+        };
         let v = classify(&[pair("mystery.txt")], 1600.0, 21600.0, &blind);
-        assert_eq!(v.foreign.len(), 1, "an unattributable staged path must BLOCK");
+        assert_eq!(
+            v.foreign.len(),
+            1,
+            "an unattributable staged path must BLOCK"
+        );
         assert_eq!(v.foreign[0]["path"], json!("mystery.txt"));
-        assert_eq!(v.foreign[0]["owner"], json!(""), "no owner can be named — that IS the finding");
+        assert_eq!(
+            v.foreign[0]["owner"],
+            json!(""),
+            "no owner can be named — that IS the finding"
+        );
         // The refusal must be actionable or it gets routed around: name the
         // escape and the exact diff command (the AMUX-2325 lesson).
         let why = v.foreign[0]["why"].as_str().unwrap();
-        assert!(why.contains("AMUX_VERIFIED_SOLO"), "escape not named: {why}");
-        assert!(why.contains("git diff --cached"), "no way to check it: {why}");
+        assert!(
+            why.contains("AMUX_VERIFIED_SOLO"),
+            "escape not named: {why}"
+        );
+        assert!(
+            why.contains("git diff --cached"),
+            "no way to check it: {why}"
+        );
         // It blocks via `foreign` specifically, because that is the only field
         // installed hooks act on (module docs). A new key would be ignored by
         // every hook already on disk.
-        assert!(v.unclaimed.is_empty(), "must not ALSO sit in the non-blocking list");
+        assert!(
+            v.unclaimed.is_empty(),
+            "must not ALSO sit in the non-blocking list"
+        );
 
         // FULLY ATTRIBUTED checkout: nobody is hidden, so the same path is NOT a
         // sweep — it is most often the committer's own pre-window or generated
         // work. It stays a warning. Without this scoping the block adds a class
         // to a guard already refusing ~18/hour, which AMUX-2936 measured and
         // named as what gets the guard disabled outright.
-        let clear = classify(&[pair("mystery.txt")], 1600.0, 21600.0, &GuardInputs::default());
-        assert!(clear.foreign.is_empty(), "must NOT block when every cotenant is visible");
-        assert_eq!(clear.unclaimed.len(), 1, "still disclosed, just not blocking");
+        let clear = classify(
+            &[pair("mystery.txt")],
+            1600.0,
+            21600.0,
+            &GuardInputs::default(),
+        );
+        assert!(
+            clear.foreign.is_empty(),
+            "must NOT block when every cotenant is visible"
+        );
+        assert_eq!(
+            clear.unclaimed.len(),
+            1,
+            "still disclosed, just not blocking"
+        );
     }
 
     /// The envelope shape the installed hooks parse. Every key on every path,
     /// including the short circuits: a hook reading `d["shared"]` gets `[]`.
     #[test]
     fn envelope_carries_every_key_the_hook_reads() {
-        let v = Envelope { window: 21600.0, hook_outdated: true, ..Default::default() }.json();
-        for k in ["ok", "foreign", "shared", "unclaimed", "cotenants", "window_secs"] {
-            assert!(v.get(k).is_some(), "missing key the installed hook reads: {k}");
+        let v = Envelope {
+            window: 21600.0,
+            hook_outdated: true,
+            ..Default::default()
+        }
+        .json();
+        for k in [
+            "ok",
+            "foreign",
+            "shared",
+            "unclaimed",
+            "cotenants",
+            "window_secs",
+        ] {
+            assert!(
+                v.get(k).is_some(),
+                "missing key the installed hook reads: {k}"
+            );
         }
         assert!(v["foreign"].is_array() && v["shared"].is_array() && v["unclaimed"].is_array());
         assert_eq!(v["undecided"], json!(false));
@@ -6273,7 +7079,12 @@ mod tests {
         let dir = std::env::temp_dir();
         let real_dir = dir.canonicalize().unwrap();
         let got = realpath(&dir.join("definitely-not-here-amux-guard.rs"));
-        assert_eq!(got, real_dir.join("definitely-not-here-amux-guard.rs").to_string_lossy());
+        assert_eq!(
+            got,
+            real_dir
+                .join("definitely-not-here-amux-guard.rs")
+                .to_string_lossy()
+        );
     }
 
     #[test]
@@ -6323,11 +7134,11 @@ mod cd_is_not_a_mutation {
         // SAFETY — every one of these still mutates, and must still be attributed.
         // `cd` must not launder the mutation that follows it.
         for cmd in [
-            "cd /tmp && echo hi > f.md",              // output redirection
-            "cd /tmp && cat > f.md <<'EOF'\nx\nEOF",  // heredoc write
-            "cd /tmp && rm f.md",                     // non-read verb
-            "cd /tmp && sed -i '' s/a/b/ f.md",       // in-place edit
-            "cd /repo && git commit -am x",           // git WRITE subcommand
+            "cd /tmp && echo hi > f.md",             // output redirection
+            "cd /tmp && cat > f.md <<'EOF'\nx\nEOF", // heredoc write
+            "cd /tmp && rm f.md",                    // non-read verb
+            "cd /tmp && sed -i '' s/a/b/ f.md",      // in-place edit
+            "cd /repo && git commit -am x",          // git WRITE subcommand
             "cd /repo && git add -A",
         ] {
             assert!(!is_pure_read_command(cmd), "must NOT be a pure read: {cmd}");
@@ -6349,7 +7160,11 @@ mod staged_seen_tests {
         record_staged_seen("lane-a", "/repo/two", 1, now);
 
         assert_eq!(staged_seen("lane-a", "/repo/one", now, 300.0), Some(3));
-        assert_eq!(staged_seen("LANE-A", "/repo/one", now, 300.0), Some(3), "lane name is case-folded");
+        assert_eq!(
+            staged_seen("LANE-A", "/repo/one", now, 300.0),
+            Some(3),
+            "lane name is case-folded"
+        );
         // SCOPED BOTH WAYS. Another lane in the same checkout, and the same lane
         // in another checkout, are different commits — reading either as this
         // one's staged count would manufacture the discrepancy this detects.
@@ -6359,13 +7174,29 @@ mod staged_seen_tests {
         // NEVER MEASURED IS NOT ZERO. A lane that did not report must come back
         // None, or a missing measurement becomes evidence that nothing was
         // staged (ethos rule 4).
-        assert_eq!(staged_seen("lane-c", "/repo/one", now, 300.0), None, "never reported");
-        assert_eq!(staged_seen("lane-a", "/repo/nope", now, 300.0), None, "different checkout");
+        assert_eq!(
+            staged_seen("lane-c", "/repo/one", now, 300.0),
+            None,
+            "never reported"
+        );
+        assert_eq!(
+            staged_seen("lane-a", "/repo/nope", now, 300.0),
+            None,
+            "different checkout"
+        );
 
         // STALE IS ALSO NOT AN ANSWER. The window is a pre-commit build, so a
         // record from an hour ago belongs to a different commit entirely.
-        assert_eq!(staged_seen("lane-a", "/repo/one", now + 301.0, 300.0), None, "past the window");
-        assert_eq!(staged_seen("lane-a", "/repo/one", now + 299.0, 300.0), Some(3), "inside it");
+        assert_eq!(
+            staged_seen("lane-a", "/repo/one", now + 301.0, 300.0),
+            None,
+            "past the window"
+        );
+        assert_eq!(
+            staged_seen("lane-a", "/repo/one", now + 299.0, 300.0),
+            Some(3),
+            "inside it"
+        );
 
         // A hook that genuinely saw nothing is Some(0), distinct from None.
         record_staged_seen("lane-d", "/repo/one", 0, now);
@@ -6377,7 +7208,6 @@ mod staged_seen_tests {
         assert_eq!(staged_seen("", "/repo/one", now, 300.0), None);
         assert_eq!(staged_seen("lane-e", "", now, 300.0), None);
     }
-
 
     /// AMUX-2841: the read idiom the fleet is INSTRUCTED to use must not mint an
     /// inferred edit claim.
@@ -6425,5 +7255,4 @@ mod staged_seen_tests {
             );
         }
     }
-
 }
