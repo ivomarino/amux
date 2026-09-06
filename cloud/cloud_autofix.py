@@ -578,7 +578,11 @@ def main():
                     trace("gateway_recover", "prod was %d -> stop+reclaim+restart ok=%s, reprobe %d"
                           % (_st, ok, _st2), _st2 in (200, 301, 302, 401, 403))
                     result["gateway_recovered"] = _st2 in (200, 301, 302, 401, 403)
-            result["healthy"] = _disk.get("pct", 100) < 98
+            # Verdict on ABSOLUTE free space, not pct: this is a 49G disk, so 98% used
+            # is still ~1GB free — plenty for the gateway to serve — yet `pct < 98`
+            # cried CRITICAL every cycle at healthy headroom (AC-414). The gateway
+            # crash-loops near 0 and serves fine at ~1GB, so 500MB is the honest floor.
+            result["healthy"] = _disk.get("free_gb", 0) >= 0.5
         ssh("import json; open('/var/log/cloud-autofix.jsonl','a').write(%r+chr(10))"
             % json.dumps({"ts": int(time.time()), "disk_only": True, "trace": TRACE}), timeout=20)
         if as_json:
