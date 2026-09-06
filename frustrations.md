@@ -3333,3 +3333,24 @@ FIX: Two cheap discriminators the guard already has the inputs for. (1) If the m
   ADD to origin's history, so the stale-republish reading does not apply there at all.
   A line-set difference cannot see an EDIT any more than it can see a MOVE, which is
   the failure mode this file's own contract already names one layer up.
+
+## Isolated workers hid confirmed owner work from the shared board
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-06
+SESSION: amux
+CARD: AMUX-4159
+SYMPTOM: The live `amux` worker has `CC_ISOLATED=1`. Its first task prompt in this
+session was recorded in `cmd_history` row 44634 as `delivery=direct`,
+`submit_verdict=confirmed`, but `card_id=NULL`; there was no capture verdict in the
+server log. Direct prompt capture deliberately excluded every isolated worker, and
+the capture health invariant deliberately excluded the same population, so mechanism
+and monitor agreed on invisible work.
+COST: The user had to point at the Workers board to establish that the task ledger
+was still incomplete, and the first linked implementation request had no card or
+task-local evidence even though the worker had received and was executing it.
+FIX: 6bce0158 removes isolation from owner-prompt capture while preserving its
+harness, peer-discovery, and automation boundaries. Capture logs now include
+`owner_isolated`, the health invariant evaluates isolated-owner prompts, and an exact
+regression fixture proves the confirmed live prompt shape mints and links a card.
