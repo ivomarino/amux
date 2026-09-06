@@ -100,7 +100,7 @@ async function main() {
 
   // Helper: call API from the cloud.amux.io origin
   const api = (method, path, body) => page.evaluate(async ({ method, path, body }) => {
-    const opts = { method, credentials: 'include', headers: {} };
+    const opts = { method, credentials: 'include', headers: { 'Accept': 'application/json' } };
     if (body) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
     const r = await fetch(path, opts);
     let json; try { json = await r.json(); } catch { json = null; }
@@ -164,7 +164,8 @@ async function main() {
   // ── Test: Switch org ──
   await test('Switch to new organization', async () => {
     const r = await api('POST', '/api/gateway/switch-org', { org_id: orgId });
-    // This returns a redirect, but fetch follows it
+    assert(r.status === 200 && r.json?.ok === true,
+      `switch was not acknowledged: ${r.status} ${JSON.stringify(r.json)}`);
     const orgs = await api('GET', '/api/gateway/orgs');
     const active = orgs.json?.find(o => o.active);
     assert(active?.id === orgId, `active org: ${active?.id}`);
@@ -213,7 +214,9 @@ async function main() {
 
   // ── Test: Switch back ──
   await test('Switch back to personal', async () => {
-    await api('POST', '/api/gateway/switch-org', { org_id: '' });
+    const switched = await api('POST', '/api/gateway/switch-org', { org_id: '' });
+    assert(switched.status === 200 && switched.json?.ok === true,
+      `personal switch was not acknowledged: ${switched.status} ${JSON.stringify(switched.json)}`);
     const orgs = await api('GET', '/api/gateway/orgs');
     const active = orgs.json?.find(o => o.active);
     assert(active?.is_personal, `not personal: ${active?.name}`);

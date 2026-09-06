@@ -1,9 +1,14 @@
-//! GET /api/usage — subscription usage for the Settings meter (port of
-//! Python's `_fetch_claude_usage`, amux-server.py ~:3189).
+//! GET /api/usage — provider subscription usage for the Settings meter.
 //!
-//! # Why this does not go through `ProviderAdapter::usage()`
+//! The legacy top-level response remains Anthropic's body plus `available`, so
+//! older clients keep working. The `providers[]` collection is the complete
+//! Settings contract: Claude, Codex, Gemini, and the honest unmetered state for
+//! local Ollama. Provider-specific fields stay under their provider row rather
+//! than being collapsed into a lowest-common-denominator percentage.
 //!
-//! It used to, and that is why the meter was dark. The adapter returns
+//! # Why the detailed rows do not go through `ProviderAdapter::usage()`
+//!
+//! The Claude meter used to, and that is why it was dark. The adapter returns
 //! NORMALIZED [`UsageWindow`]s for capacity routing, which is a deliberately
 //! lossy view: it keeps kind/percent/reset and discards the provider-specific
 //! fields this SPA renders — `limits[].scope.model.display_name` (the
@@ -33,13 +38,13 @@
 //!
 //! # Secrets
 //!
-//! No response on any path can contain the token: [`UsageProbe`] cannot carry
-//! it, failure reasons are built from a status code or a fixed word, and the
-//! upstream response BODY is never echoed on a failure — only on 2xx, where
-//! it is the usage report itself.
+//! No response on any path can contain a token. Claude's [`UsageProbe`] cannot
+//! carry one, and the Codex/Gemini shapers allow-list quota, plan, and credit
+//! fields instead of forwarding either provider's account envelope.
 
 use std::future::Future;
 use std::pin::Pin;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -48,6 +53,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json, Router};
 use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use super::AppState;
 use crate::provider::claude::{probe_usage_raw, UsageProbe};
@@ -245,6 +251,22 @@ fn usage_stale_window() -> Duration {
 pub type ProbeFn =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = UsageProbe> + Send>> + Send + Sync>;
 
+#[derive(Debug, Clone)]
+enum ProviderProbe {
+    Ok(Value),
+    Unavailable { cause: &'static str, reason: String },
+}
+
+type ProviderProbeFn =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ProviderProbe> + Send>> + Send + Sync>;
+
+#[derive(Clone)]
+struct UsageProbes {
+    claude: ProbeFn,
+    codex: ProviderProbeFn,
+    gemini: ProviderProbeFn,
+}
+
 #[derive(Default)]
 struct UsageCache {
     /// The shaped body WITHOUT its age field — age is stamped per response,
@@ -257,24 +279,43 @@ struct UsageCache {
     last_good_at: Option<Instant>,
 }
 
-/// Production wiring: the real read-only probe from the Claude adapter.
+/// Production wiring: every provider's real read-only usage surface.
 pub fn routes() -> Router<AppState> {
-    routes_with(Arc::new(|| Box::pin(probe_usage_raw())))
+    routes_with_probes(UsageProbes {
+        claude: Arc::new(|| Box::pin(probe_usage_raw())),
+        codex: Arc::new(|| Box::pin(probe_codex_usage())),
+        gemini: Arc::new(|| Box::pin(probe_gemini_usage())),
+    })
 }
 
-/// Test seam.
+/// Existing Claude-focused test seam. Other providers degrade explicitly so
+/// old tests stay hermetic while the response still proves total coverage.
 pub fn routes_with(probe: ProbeFn) -> Router<AppState> {
+    let unavailable = |provider: &'static str| -> ProviderProbeFn {
+        Arc::new(move || Box::pin(async move { ProviderProbe::Unavailable {
+            cause: "test_probe_not_configured",
+            reason: format!("{provider} usage test probe is not configured"),
+        }}))
+    };
+    routes_with_probes(UsageProbes {
+        claude: probe,
+        codex: unavailable("Codex"),
+        gemini: unavailable("Gemini"),
+    })
+}
+
+fn routes_with_probes(probes: UsageProbes) -> Router<AppState> {
     Router::new()
         .route("/", axum::routing::get(get_usage))
         .route("/attribution", axum::routing::get(get_attribution))
-        .layer(Extension(probe))
+        .layer(Extension(probes))
         .layer(Extension(Arc::new(tokio::sync::Mutex::new(
             UsageCache::default(),
         ))))
 }
 
 async fn get_usage(
-    Extension(probe): Extension<ProbeFn>,
+    Extension(probes): Extension<UsageProbes>,
     Extension(cache): Extension<Arc<tokio::sync::Mutex<UsageCache>>>,
 ) -> Response {
     let ttl = usage_ttl();
@@ -285,7 +326,9 @@ async fn get_usage(
     // is the behaviour that provokes the rate limit in the first place.
     let fresh = matches!((&c.data, c.at), (Some(_), Some(at)) if at.elapsed() < ttl);
     if !fresh {
-        let shaped = shape_probe(probe().await);
+        let (claude, codex, gemini) =
+            tokio::join!((probes.claude)(), (probes.codex)(), (probes.gemini)());
+        let shaped = shape_all_providers(claude, codex, gemini);
         if shaped.get("available") == Some(&json!(true)) {
             c.last_good = Some(shaped.clone());
             c.last_good_at = Some(Instant::now());
@@ -326,6 +369,332 @@ async fn get_usage(
         }
     }
     Json(body).into_response()
+}
+
+/// Read Codex's supported account/rateLimits/read JSON-RPC surface. The
+/// app-server receives no prompt and no mutation method; only the usage result
+/// crosses this boundary, never account identity.
+fn codex_probe_process(shell: &str) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(shell);
+    command.args([
+        "-lc",
+        "exec codex app-server --stdio --disable remote_control",
+    ]);
+    command
+}
+
+async fn probe_codex_usage() -> ProviderProbe {
+    // The server is normally launched by launchd/systemd, whose PATH is not
+    // the user's interactive PATH. On this machine launchd found an abandoned
+    // `/usr/local/bin/codex` wrapper first; the wrapper itself existed, so
+    // spawn succeeded, but its packaged native binary did not. Every worker
+    // launched from amux runs through the user's login shell and found the
+    // current nvm-installed Codex instead. Do the same here: the usage probe
+    // must measure the provider binary the user actually runs, not whichever
+    // stale shim the service manager happens to put first (AMUX-4154).
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let mut child = match codex_probe_process(&shell)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return provider_probe_unavailable(
+            "codex", "shell_missing", "The user's login shell is unavailable, so Codex usage cannot be read.",
+        ),
+        Err(_) => return provider_probe_unavailable(
+            "codex", "probe_failed", "Codex account usage probe could not start.",
+        ),
+    };
+    let request = concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":",
+        "{\"clientInfo\":{\"name\":\"amux-usage-probe\",\"version\":\"1\"},",
+        "\"capabilities\":{\"experimentalApi\":true}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"account/rateLimits/read\",\"params\":null}\n",
+    );
+    let Some(mut stdin) = child.stdin.take() else { return provider_probe_unavailable(
+        "codex", "probe_failed", "Codex account usage probe has no input channel.",
+    ) };
+    let Some(stdout) = child.stdout.take() else { return provider_probe_unavailable(
+        "codex", "probe_failed", "Codex account usage probe has no output channel.",
+    ) };
+    if stdin.write_all(request.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
+        let _ = child.kill().await;
+        return provider_probe_unavailable(
+            "codex", "probe_failed", "Codex account usage request could not be sent.",
+        );
+    }
+    let read = async {
+        let mut lines = BufReader::new(stdout).lines();
+        while let Some(line) = lines.next_line().await? {
+            let Ok(message) = serde_json::from_str::<Value>(&line) else { continue };
+            if message.get("id") == Some(&json!(2)) {
+                return Ok::<Option<Value>, std::io::Error>(message.get("result").cloned());
+            }
+        }
+        Ok(None)
+    };
+    let result = tokio::time::timeout(Duration::from_secs(12), read).await;
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    match result {
+        Ok(Ok(Some(body))) => {
+            tracing::debug!(target: "amux::usage_probe", provider = "codex", verdict = "measured",
+                "subscription usage probe succeeded");
+            ProviderProbe::Ok(body)
+        }
+        Ok(Ok(None)) => provider_probe_unavailable(
+            "codex", "unexpected_shape", "Codex account usage returned no rate-limit snapshot.",
+        ),
+        Ok(Err(_)) | Err(_) => provider_probe_unavailable(
+            "codex", "probe_failed", "Codex account usage probe timed out or disconnected.",
+        ),
+    }
+}
+
+/// Run the Gemini helper through Node stdin so the installed CLI's own OAuth
+/// client is reused without adding its private implementation as a Rust API.
+async fn probe_gemini_usage() -> ProviderProbe {
+    let mut child = match tokio::process::Command::new("node")
+        .args(["--input-type=module", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return provider_probe_unavailable(
+            "gemini", "runtime_missing", "Node.js is not installed, so Gemini CLI quota cannot be read.",
+        ),
+        Err(_) => return provider_probe_unavailable(
+            "gemini", "probe_failed", "Gemini account usage probe could not start.",
+        ),
+    };
+    let script = include_str!("../../../../scripts/provider-usage-gemini.mjs");
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(script.as_bytes()).await.is_err() {
+            let _ = child.kill().await;
+            return provider_probe_unavailable(
+                "gemini", "probe_failed", "Gemini account usage request could not be sent.",
+            );
+        }
+    }
+    let output = tokio::time::timeout(Duration::from_secs(15), child.wait_with_output()).await;
+    match output {
+        Ok(Ok(output)) => match serde_json::from_slice::<Value>(&output.stdout) {
+            Ok(body) if body.get("available") == Some(&json!(true)) => {
+                tracing::debug!(target: "amux::usage_probe", provider = "gemini", verdict = "measured",
+                    "subscription usage probe succeeded");
+                ProviderProbe::Ok(body)
+            }
+            Ok(body) => {
+                let cause = match body.get("cause").and_then(Value::as_str) {
+                    Some("account_quota_not_reported") => "account_quota_not_reported",
+                    Some("cli_missing") => "cli_missing",
+                    Some("unsupported_cli") => "unsupported_cli",
+                    Some("quota_project_unavailable") => "quota_project_unavailable",
+                    _ => "probe_failed",
+                };
+                let reason = body.get("reason").and_then(Value::as_str)
+                    .unwrap_or("Gemini account usage is unavailable.");
+                provider_probe_unavailable("gemini", cause, reason)
+            }
+            Err(_) => provider_probe_unavailable(
+                "gemini", "unexpected_shape", "Gemini account usage returned an unexpected response.",
+            ),
+        },
+        Ok(Err(_)) | Err(_) => provider_probe_unavailable(
+            "gemini", "probe_failed", "Gemini account usage probe timed out or disconnected.",
+        ),
+    }
+}
+
+fn provider_probe_unavailable(
+    provider: &'static str,
+    cause: &'static str,
+    reason: &str,
+) -> ProviderProbe {
+    tracing::warn!(target: "amux::usage_probe", provider, cause, verdict = "unavailable", "{reason}");
+    ProviderProbe::Unavailable { cause, reason: reason.to_string() }
+}
+
+fn shape_all_providers(
+    claude_probe: UsageProbe,
+    codex_probe: ProviderProbe,
+    gemini_probe: ProviderProbe,
+) -> Value {
+    let mut body = shape_probe(claude_probe);
+    let providers = vec![
+        shape_claude_provider(&body),
+        shape_codex_provider(codex_probe),
+        shape_gemini_provider(gemini_probe),
+        json!({
+            "id": "ollama", "label": "Ollama", "available": true,
+            "measured": true, "n_considered": 0, "metered": false, "local": true,
+            "summary": "Local models have no subscription limit", "windows": [],
+        }),
+    ];
+    if let Some(obj) = body.as_object_mut() {
+        let measured = providers.iter()
+            .filter(|provider| provider.get("metered") != Some(&json!(false)))
+            .any(|provider| provider.get("measured") == Some(&json!(true)));
+        let n_considered = providers.iter()
+            .filter_map(|provider| provider.get("n_considered").and_then(Value::as_u64))
+            .sum::<u64>();
+        obj.insert("measured".into(), json!(measured));
+        obj.insert("n_considered".into(), json!(n_considered));
+        obj.insert("provider_count".into(), json!(providers.len()));
+        obj.insert("providers".into(), Value::Array(providers));
+    }
+    body
+}
+
+fn shape_claude_provider(body: &Value) -> Value {
+    if body.get("available") != Some(&json!(true)) {
+        return json!({
+            "id": "claude", "label": "Claude", "available": false,
+            "measured": false, "n_considered": 0,
+            "cause": body.get("cause").cloned().unwrap_or(Value::Null),
+            "reason": body.get("reason").cloned()
+                .unwrap_or_else(|| json!("Claude usage is unavailable.")),
+            "windows": [],
+        });
+    }
+    let windows = body.get("limits").and_then(Value::as_array).into_iter().flatten()
+        .filter_map(|limit| {
+            let used = limit.get("percent")?.as_f64()?;
+            let kind = limit.get("kind").and_then(Value::as_str).unwrap_or("limit");
+            let model = limit.pointer("/scope/model/display_name").and_then(Value::as_str);
+            let label = if kind == "session" || kind == "worker" {
+                "5-hour session".to_string()
+            } else if let Some(model) = model {
+                format!("{model} · weekly")
+            } else if kind.starts_with("weekly")
+                || limit.get("group").and_then(Value::as_str) == Some("weekly") {
+                "Weekly · all models".to_string()
+            } else {
+                kind.replace('_', " ")
+            };
+            Some(json!({
+                "label": label, "kind": kind,
+                "group": limit.get("group").cloned().unwrap_or(Value::Null),
+                "scope": limit.get("scope").cloned().unwrap_or(Value::Null),
+                "used_percent": used, "remaining_percent": (100.0 - used).max(0.0),
+                "resets_at": limit.get("resets_at").cloned().unwrap_or(Value::Null),
+                "severity": limit.get("severity").cloned().unwrap_or(Value::Null),
+                "active": limit.get("is_active").cloned().unwrap_or(Value::Null),
+            }))
+        }).collect::<Vec<_>>();
+    json!({
+        "id": "claude", "label": "Claude", "available": true, "measured": true,
+        "n_considered": windows.len(), "metered": true,
+        "source": "Anthropic subscription API", "windows": windows,
+        "spend": body.get("spend").cloned().unwrap_or(Value::Null),
+        "extra_usage": body.get("extra_usage").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn shape_codex_provider(probe: ProviderProbe) -> Value {
+    let body = match probe {
+        ProviderProbe::Ok(body) => body,
+        ProviderProbe::Unavailable { cause, reason } => return json!({
+            "id": "codex", "label": "Codex", "available": false,
+            "measured": false, "n_considered": 0,
+            "cause": cause, "reason": reason, "windows": [],
+        }),
+    };
+    let fallback;
+    let buckets = if let Some(map) = body.get("rateLimitsByLimitId").and_then(Value::as_object)
+        .filter(|map| !map.is_empty()) {
+        map
+    } else {
+        fallback = serde_json::Map::from_iter([(
+            "codex".to_string(), body.get("rateLimits").cloned().unwrap_or_else(|| json!({})),
+        )]);
+        &fallback
+    };
+    let mut windows = Vec::new();
+    let mut details = Vec::new();
+    for (bucket_id, snapshot) in buckets {
+        let name = snapshot.get("limitName").and_then(Value::as_str).unwrap_or(bucket_id);
+        for (position, key) in [("primary", "primary"), ("secondary", "secondary")] {
+            let Some(window) = snapshot.get(key).and_then(Value::as_object) else { continue };
+            let Some(used) = window.get("usedPercent").and_then(Value::as_f64) else { continue };
+            let minutes = window.get("windowDurationMins").and_then(Value::as_i64);
+            let duration = match minutes {
+                Some(300) => "5-hour".to_string(),
+                Some(10_080) => "7-day".to_string(),
+                Some(mins) if mins % 1_440 == 0 => format!("{}-day", mins / 1_440),
+                Some(mins) if mins % 60 == 0 => format!("{}-hour", mins / 60),
+                Some(mins) => format!("{mins}-minute"),
+                None => position.to_string(),
+            };
+            let label = if name == "codex" { duration } else { format!("{name} · {duration}") };
+            windows.push(json!({
+                "label": label, "kind": position, "limit_id": bucket_id,
+                "limit_name": snapshot.get("limitName").cloned().unwrap_or(Value::Null),
+                "used_percent": used, "remaining_percent": (100.0 - used).max(0.0),
+                "window_minutes": minutes,
+                "resets_at": window.get("resetsAt").cloned().unwrap_or(Value::Null),
+            }));
+        }
+        details.push(json!({
+            "id": bucket_id,
+            "name": snapshot.get("limitName").cloned().unwrap_or(Value::Null),
+            "plan_type": snapshot.get("planType").cloned().unwrap_or(Value::Null),
+            "credits": snapshot.get("credits").cloned().unwrap_or(Value::Null),
+            "individual_limit": snapshot.get("individualLimit").cloned().unwrap_or(Value::Null),
+            "spend_control_reached": snapshot.get("spendControlReached").cloned().unwrap_or(Value::Null),
+            "rate_limit_reached_type": snapshot.get("rateLimitReachedType").cloned().unwrap_or(Value::Null),
+        }));
+    }
+    let plan = body.pointer("/rateLimits/planType").cloned()
+        .or_else(|| details.iter().find_map(|bucket| bucket.get("plan_type").cloned()))
+        .unwrap_or(Value::Null);
+    json!({
+        "id": "codex", "label": "Codex", "available": true, "measured": true,
+        "n_considered": windows.len(), "metered": true, "source": "Codex account API",
+        "plan": plan, "windows": windows, "buckets": details,
+        "reset_credits": body.get("rateLimitResetCredits").cloned().unwrap_or(Value::Null),
+        "upsell": body.get("rateLimitUpsell").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn shape_gemini_provider(probe: ProviderProbe) -> Value {
+    let body = match probe {
+        ProviderProbe::Ok(body) => body,
+        ProviderProbe::Unavailable { cause, reason } => return json!({
+            "id": "gemini", "label": "Gemini", "available": false,
+            "measured": false, "n_considered": 0,
+            "cause": cause, "reason": reason, "windows": [],
+        }),
+    };
+    let windows = body.pointer("/quota/buckets").and_then(Value::as_array).into_iter().flatten()
+        .filter_map(|bucket| {
+            let remaining = bucket.get("remainingFraction")?.as_f64()?.clamp(0.0, 1.0);
+            let model = bucket.get("modelId").and_then(Value::as_str).unwrap_or("Model");
+            Some(json!({
+                "label": model, "kind": "model",
+                "used_percent": (1.0 - remaining) * 100.0,
+                "remaining_percent": remaining * 100.0,
+                "remaining_amount": bucket.get("remainingAmount").cloned().unwrap_or(Value::Null),
+                "resets_at": bucket.get("resetTime").cloned().unwrap_or(Value::Null),
+            }))
+        }).collect::<Vec<_>>();
+    json!({
+        "id": "gemini", "label": "Gemini", "available": true, "measured": true,
+        "n_considered": windows.len(), "metered": true,
+        "source": "Gemini Code Assist quota API",
+        "auth_type": body.get("auth_type").cloned().unwrap_or(Value::Null),
+        "plan": body.pointer("/tier/name").cloned().unwrap_or(Value::Null),
+        "tier": body.get("tier").cloned().unwrap_or(Value::Null),
+        "credits": body.get("credits").cloned().unwrap_or(Value::Null),
+        "windows": windows,
+    })
 }
 
 /// One probe outcome -> the wire body the SPA consumes.
@@ -425,10 +794,10 @@ fn degraded(cause: &str, reason: String) -> Value {
 ///
 /// # Why a separate endpoint rather than a field on /api/usage
 ///
-/// This module's contract is that `/api/usage` returns Anthropic's body
-/// VERBATIM plus `available` — the SPA's `loadUsage()` sees byte-identical
-/// fields to the Python server. Adding keys there would erode the one property
-/// that makes the passthrough safe to reason about.
+/// The provider report and this local attribution ledger have independent
+/// clocks and failure modes. Keeping attribution separate lets Settings still
+/// show every provider limit if the token ledger is unreadable, and vice versa;
+/// the legacy Anthropic fields at the top level remain byte-identical.
 ///
 /// # The millisecond trap, stated because it already bit
 ///
@@ -650,6 +1019,19 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
+
+    /// The service manager's PATH may contain a stale but executable shim.
+    /// Keep the probe on the same login-shell resolution path as a real worker.
+    #[test]
+    fn codex_usage_probe_resolves_the_users_login_shell_binary() {
+        let command = codex_probe_process("/bin/example-shell");
+        let command = command.as_std();
+        assert_eq!(command.get_program(), "/bin/example-shell");
+        assert_eq!(
+            command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+            ["-lc", "exec codex app-server --stdio --disable remote_control"]
+        );
+    }
 
     /// AMUX-3544. Spend is attributed to WHY the turn happened, and the window
     /// proves it filtered.
@@ -892,6 +1274,104 @@ mod tests {
                  "resets_at": "2026-08-12T00:00:00Z"}
             ]
         })
+    }
+
+    /// AMUX-4154: "all provider usage" is a totalizing claim. Compare the
+    /// response against the production registry, not a second hand-written
+    /// list, so provider five makes this fail until Settings covers it too.
+    #[test]
+    fn settings_usage_covers_every_default_provider_with_full_windows() {
+        let codex = json!({
+            "accountId": "must-never-reach-settings",
+            "rateLimits": {"planType": "pro"},
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "limitName": "codex", "planType": "pro",
+                    "primary": {"usedPercent": 45, "windowDurationMins": 300, "resetsAt": 1788652800},
+                    "secondary": {"usedPercent": 61, "windowDurationMins": 10080, "resetsAt": 1789084800},
+                    "credits": {"hasCredits": true, "unlimited": false, "balance": "12.50"}
+                },
+                "codex_bengalfox": {
+                    "limitName": "Spark", "planType": "pro",
+                    "primary": {"usedPercent": 3, "windowDurationMins": 300, "resetsAt": 1788656400},
+                    "secondary": {"usedPercent": 7, "windowDurationMins": 10080, "resetsAt": 1789088400}
+                }
+            },
+            "rateLimitResetCredits": {"availableCount": 2, "credits": [{"expiresAt": 1789257600}]},
+            "rateLimitUpsell": {"eligible": false}
+        });
+        let gemini = json!({
+            "available": true, "auth_type": "oauth-personal",
+            "tier": {"id": "standard", "name": "Google AI Pro"}, "credits": 1000,
+            "quota": {"buckets": [
+                {"modelId": "gemini-3.5-pro", "remainingFraction": 0.72,
+                 "remainingAmount": 144, "resetTime": "2026-09-06T20:00:00Z"},
+                {"modelId": "gemini-3.5-flash", "remainingFraction": 0.91,
+                 "remainingAmount": 910, "resetTime": "2026-09-06T20:00:00Z"}
+            ]}
+        });
+        let body = shape_all_providers(
+            UsageProbe::Ok(live_shaped_body()),
+            ProviderProbe::Ok(codex),
+            ProviderProbe::Ok(gemini),
+        );
+        let providers = body["providers"].as_array().expect("provider rows");
+        let mut response_ids = providers.iter()
+            .map(|provider| provider["id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        response_ids.sort();
+        let mut registry_ids = crate::provider::default_registry().ids().into_iter()
+            .map(|id| match id.as_str() {
+                "claude-code" => "claude".to_string(),
+                other => other.to_string(),
+            }).collect::<Vec<_>>();
+        registry_ids.sort();
+        assert_eq!(response_ids, registry_ids, "every shipped provider needs a Settings row");
+        assert_eq!(body["provider_count"], json!(providers.len()));
+
+        let provider = |id: &str| providers.iter().find(|provider| provider["id"] == id)
+            .unwrap_or_else(|| panic!("missing {id}: {body}"));
+        let codex = provider("codex");
+        assert_eq!(codex["windows"].as_array().unwrap().len(), 4);
+        assert!(codex["windows"].as_array().unwrap().iter().any(|window| {
+            window["label"] == "Spark · 7-day"
+                && window["remaining_percent"].as_f64() == Some(93.0)
+                && window["resets_at"].as_i64() == Some(1789088400i64)
+        }));
+        assert_eq!(codex["reset_credits"]["availableCount"], 2);
+        assert_eq!(codex["buckets"][0]["credits"]["balance"], "12.50");
+        let gemini = provider("gemini");
+        assert_eq!(gemini["plan"], "Google AI Pro");
+        assert_eq!(gemini["windows"].as_array().unwrap().len(), 2);
+        assert_eq!(gemini["windows"][0]["remaining_amount"], 144);
+        assert_eq!(provider("ollama")["metered"], false);
+        assert_eq!(body["n_considered"], 9);
+        let wire = serde_json::to_string(&body).unwrap();
+        assert!(!wire.contains("must-never-reach-settings"), "account identity leaked: {wire}");
+        assert!(!wire.contains("accountId"), "account identity field leaked: {wire}");
+    }
+
+    #[test]
+    fn one_unavailable_probe_does_not_hide_the_other_provider_rows() {
+        let body = shape_all_providers(
+            UsageProbe::NoToken,
+            ProviderProbe::Unavailable {
+                cause: "cli_missing",
+                reason: "Codex CLI is not installed on this host.".into(),
+            },
+            ProviderProbe::Unavailable {
+                cause: "account_quota_not_reported",
+                reason: "This Gemini authentication mode has no account-wide quota.".into(),
+            },
+        );
+        let providers = body["providers"].as_array().unwrap();
+        assert_eq!(providers.len(), 4);
+        assert_eq!(providers.iter().filter(|p| p["available"] == false).count(), 3);
+        assert_eq!(
+            providers.iter().find(|p| p["id"] == "ollama").unwrap()["available"],
+            true,
+            "local usage remains truthful when every subscription probe is unavailable"
+        );
     }
 
     #[tokio::test]

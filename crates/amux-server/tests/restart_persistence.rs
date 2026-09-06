@@ -385,7 +385,15 @@ async fn every_durable_subsystem_survives_a_hard_restart() {
     //    IS clear and the owner IS this suite.
     let (c, v) = rig.get(&format!("/api/board/{board_id}")).await;
     let survived = (200..300).contains(&c) && v["title"] == "rr0150 board row";
-    let (mut pc, mut pv) = rig.patch(&format!("/api/board/{board_id}"), json!({"status": "doing"})).await;
+    let (mut pc, mut pv) = rig
+        .patch(
+            &format!("/api/board/{board_id}"),
+            json!({
+                "status": "doing",
+                "next_action": "Prove the restarted board still accepts a lifecycle transition",
+            }),
+        )
+        .await;
     let mut gate_note = String::new();
     if pc == 409 {
         let criteria = pv["gate"].as_array().cloned().unwrap_or_default();
@@ -393,7 +401,11 @@ async fn every_durable_subsystem_survives_a_hard_restart() {
         (pc, pv) = rig
             .patch(
                 &format!("/api/board/{board_id}"),
-                json!({"status": "doing", "gate_checked": criteria}),
+                json!({
+                    "status": "doing",
+                    "gate_checked": criteria,
+                    "next_action": "Prove the restarted board still accepts a lifecycle transition",
+                }),
             )
             .await;
     }

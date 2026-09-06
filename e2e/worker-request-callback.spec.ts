@@ -12,6 +12,8 @@ test('worker request stays on one card and returns one terminal callback', async
   const requester = `callback-a-${suffix}`;
   const worker = `callback-b-${suffix}`;
   let card = '';
+  let parent = '';
+  let independent = '';
 
   try {
     // Different groups are deliberate: fresh installs are open for peer
@@ -25,6 +27,36 @@ test('worker request stays on one card and returns one terminal callback', async
       expect(made.status(), `create ${name}`).toBe(201);
     }
 
+    const parentMade = await request.post('/api/board', {
+      headers: { ...auth, 'X-Amux-Worker': requester },
+      data: {
+        title: 'Assemble the callback acceptance result',
+        desc: 'Use the delegated artifact, then finish the requester workflow.',
+        status: 'doing', session: requester, type: 'chore',
+      },
+    });
+    expect(parentMade.status()).toBe(201);
+    parent = (await parentMade.json()).id;
+    const independentMade = await request.post('/api/board', {
+      headers: { ...auth, 'X-Amux-Worker': requester },
+      data: {
+        title: 'Independent callback acceptance work',
+        desc: 'This remains ready while the delegated result is open.',
+        status: 'todo', session: requester, type: 'chore',
+      },
+    });
+    expect(independentMade.status()).toBe(201);
+    independent = (await independentMade.json()).id;
+    for (const [id, next_action] of [
+      [parent, 'Integrate the returned dependency into the requester result.'],
+      [independent, 'Run the independent callback verification.'],
+    ]) {
+      const progressed = await request.patch(`/api/board/${encodeURIComponent(id)}`, {
+        headers: { ...auth, 'X-Amux-Worker': requester }, data: { next_action },
+      });
+      expect(progressed.ok(), `record continuation for ${id}`).toBeTruthy();
+    }
+
     const made = await request.post('/api/board', {
       headers: { ...auth, 'X-Amux-Worker': requester },
       data: {
@@ -33,6 +65,7 @@ test('worker request stays on one card and returns one terminal callback', async
         status: 'todo',
         session: worker,
         type: 'chore',
+        request_parent: parent,
         callback: { prompt: 'Continue the requester workflow from the recorded result.' },
       },
     });
@@ -41,6 +74,22 @@ test('worker request stays on one card and returns one terminal callback', async
     card = initial.id;
     expect(initial.requested_by).toBe(requester);
     expect(initial.callback).toMatchObject({ session: requester, state: 'armed' });
+    expect(initial.request_dependency).toEqual({
+      verdict: 'parent_requeued', linked: true, parent, child: card,
+      parent_status: 'todo', prior_parent_status: 'doing',
+    });
+
+    const parentWaiting = await request.get(`/api/board/${encodeURIComponent(parent)}`, { headers: auth });
+    expect(parentWaiting.ok()).toBeTruthy();
+    expect(await parentWaiting.json()).toMatchObject({ status: 'todo', depends_on: [card] });
+    const waitingFrontier = await request.get(`/api/board/ready?session=${encodeURIComponent(requester)}`, {
+      headers: auth,
+    });
+    expect(waitingFrontier.ok()).toBeTruthy();
+    const waitingState = await waitingFrontier.json();
+    expect(waitingState.wip).toMatchObject({ doing: 0, holding: [] });
+    expect(waitingState.ready.map((row: any) => row.id)).toContain(independent);
+    expect(waitingState.ready.map((row: any) => row.id)).not.toContain(parent);
 
     const finished = await request.patch(`/api/board/${encodeURIComponent(card)}`, {
       headers: { ...auth, 'X-Amux-Worker': worker },
@@ -60,6 +109,12 @@ test('worker request stays on one card and returns one terminal callback', async
       state: 'queued',
       message_id: `task-callback-${card}`,
     });
+
+    const resumedFrontier = await request.get(`/api/board/ready?session=${encodeURIComponent(requester)}`, {
+      headers: auth,
+    });
+    expect(resumedFrontier.ok()).toBeTruthy();
+    expect((await resumedFrontier.json()).ready.map((row: any) => row.id)).toContain(parent);
 
     // Retrying the terminal update is a chaos/replay cell. The stable outbox id
     // must keep both the steering queue and Messages ledger at one callback.
@@ -93,6 +148,8 @@ test('worker request stays on one card and returns one terminal callback', async
     await expect(meta.locator('button', { hasText: /^MSG-/ })).toHaveCount(2);
   } finally {
     if (card) await request.delete(`/api/board/${encodeURIComponent(card)}`, { headers: auth }).catch(() => {});
+    if (parent) await request.delete(`/api/board/${encodeURIComponent(parent)}`, { headers: auth }).catch(() => {});
+    if (independent) await request.delete(`/api/board/${encodeURIComponent(independent)}`, { headers: auth }).catch(() => {});
     await request.delete(`/api/sessions/${requester}`, { headers: auth }).catch(() => {});
     await request.delete(`/api/sessions/${worker}`, { headers: auth }).catch(() => {});
   }

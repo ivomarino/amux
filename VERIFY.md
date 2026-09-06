@@ -73,7 +73,7 @@ surface, and layout breaks live at 375px.
 ## e2e (`e2e/`)
 
 ```bash
-npx playwright test e2e/<spec>.spec.ts
+npx playwright test --config=e2e/playwright.config.ts e2e/<spec>.spec.ts
 ```
 
 Pass: the spec name and `N passed`. If e2e infra is genuinely unavailable, say
