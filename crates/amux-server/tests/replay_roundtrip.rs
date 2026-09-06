@@ -125,7 +125,11 @@ async fn write_then_replay_round_trip() {
         &r.app,
         "PATCH",
         &format!("/api/board/{cid}"),
-        Some(json!({ "status": "doing", "gate_ack": true })),
+        Some(json!({
+            "status": "doing",
+            "gate_ack": true,
+            "next_action": "Advance the replay fixture to its terminal state",
+        })),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{body}");

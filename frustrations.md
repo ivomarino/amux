@@ -3150,3 +3150,159 @@ FIX: ATE-44 validates every browser PID at the signed OS boundary, refuses
  `kill`, and emits `invalid_process_id_refused`. The original
  4294967295 fixture remains as an end-to-end regression, with boundary controls
  for PID 0, PID 1, ordinary positive PIDs, and the signed maximum.
+
+## Multiplayer workspace switching was replayed later as offline work
+AREA: cloud
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-codex
+CARD: AC-416
+SYMPTOM: In three simultaneous saved browser profiles, switching workspaces
+ returned synthetic HTTP 202 `queued/offline`, reloaded as though it succeeded,
+ and either stayed in the old workspace or changed context later when the
+ outbox replayed. The god-mode account's switcher also rendered all 62 inherited
+ workspaces as a giant green invitation banner, and chrome-cdp's shared
+ `pages.json` made listing profile C erase the target lookup for profiles A/B.
+COST: Ethan, god mode, and the Gmail participant could not be kept in one
+ workspace long enough to prove cross-user board/log visibility; retries
+ created delayed context switches, and the operator-facing page exposed the
+ whole customer directory above the actual dashboard.
+FIX: Workspace switching is now explicitly non-replayable, requires a real
+ JSON acknowledgement, and reports `workspace_switch_failed` instead of
+ reloading on failure. The gateway acknowledges JSON clients before entering a
+ tenant container and logs `[org-switch] ... verdict=switched`. Org rows say
+ `via_god_mode`, so inherited access remains in Settings without becoming an
+ invite banner. chrome-cdp now scopes targets/sockets by profile or port and
+ selects the requested profile from the multi-browser status array.
+
+## Three-user cloud test saturated on minute-long workspace requests
+AREA: cloud
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-04
+SESSION: amux-codex
+CARD: AC-416
+SYMPTOM: The Gmail workspace stayed on "Starting your workspace" for several
+ minutes while board/session reads in the other two profiles took 50-135s.
+ The local 8824 control plane simultaneously repeated its known failure mode:
+ TCP accepted, but TLS `/health` handshakes timed out until the watchdog or a
+ manual launchd restart replaced the process.
+COST: A browser-created Backlog canary existed only in Ethan's optimistic page
+ state; after more than a minute the owner profile still had an empty board, so
+ real cross-user observation and actor attribution could not be certified.
+FIX: AC-416. The saved profiles and exact three-identity browser path now
+ reproduce it without credentials, and the watchdog/server log records the TLS
+ hang. Diagnose tenant wake latency and the local request-path stalls before
+ claiming realtime multiplayer from a cached shell.
+
+## A CLI negative control assumed its specimen was globally unique
+AREA: tests
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-44
+SYMPTOM: Fresh descendant CI completed the full Rust workspace suite after the
+ PID-safety fix, then `scripts/test-cli-launch-unbound.sh` refused to build its
+ broken fixture because a second command legitimately gained the same local
+ AMUX_API declaration used by cmd_start.
+COST: The otherwise-valid ATE-44 descendant run stayed red after all 1,947
+ amux-server library tests and every integration binary passed; the failure was
+ attributed from the job log only after the old runner-shutdown defect cleared.
+FIX: The negative control now counts and removes the declaration only within
+ cmd_start, preserving the independent declaration in cmd_open_browser while
+ still proving the broken fixture fails with an unbound variable. Its failure
+ output names the scoped occurrence count.
+
+## An async menu-reachability assertion raced the app's normal rerender
+AREA: tests
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-44
+SYMPTOM: The full Playwright run passed 300 scenarios, then the ATE-44 iOS
+ Safari parity case failed because `scrollIntoViewIfNeeded` acquired the Focus
+ action before a session poll rerendered the peek menu and detached that node.
+COST: The six-case focused matrix had passed, but the first full descendant CI
+ run stayed red after 16.7 minutes and could not satisfy ATE-44's final gate.
+FIX: The parity test now scrolls and measures the final Focus action inside the
+ same synchronous render snapshot. It still proves overflow, scrollability and
+ viewport reachability while eliminating the cross-rerender locator lifetime.
+
+## Staged-guard attributed this Codex task's files to two peer lanes and blocked its commit
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-05
+SESSION: amux (Codex agent; no $AMUX_SESSION in env)
+CARD: AMUX-3249
+SYMPTOM: After implementing and browser-testing local multiplayer invites, the commit
+  guard attributed the staged files to `amux-cloud` and `amux-frustrations` and refused
+  the commit even though every staged hunk was produced by this task. The shell had an
+  empty $AMUX_SESSION, but its tmux name resolved to `amux-amux` and the installed
+  MR-43 prepare-commit hook already contained that fallback, so the commit stamp and
+  the edit-record ownership used by the guard still disagreed.
+COST: One refused commit and about 5 minutes re-reading all nine staged files by hand
+  before the documented AMUX_VERIFIED_SOLO override could be used honestly.
+FIX: AMUX-3249. Attribute Codex tool writes to the active agent/session, or make the
+  guard distinguish absent agent edit records from affirmative peer ownership so a
+  missing producer cannot be rendered as evidence that a peer authored the diff.
+
+## Delegated worker requests held the requester's WIP instead of becoming task dependencies
+AREA: scheduler
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-05
+SESSION: amux
+CARD: AMUX-4153
+SYMPTOM: `amux board request` created a durable child task and terminal callback,
+ but left the requester's active parent in `doing` with no `depends_on` edge. The
+ requester therefore occupied its WIP slot and appeared idle until the peer finished.
+COST: Delegation serialized work that should have run concurrently, hid independent
+ ready work from the requester, and left the board without a durable record of why
+ the requester was waiting.
+FIX: ccb37879 atomically adds the delegated child to the parent task's dependencies,
+ requeues the parent to `todo` to release WIP, and lets the existing ready frontier
+ wake it when the child closes. `amux::task_dependency` now logs a verdict for every
+ linked, standalone, ambiguous, invalid-parent, or cycle-refused peer request.
+
+## Usage resets opened the clock gate after delivery had already been skipped
+AREA: scheduler
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-05
+SESSION: amux
+CARD: AMUX-4154
+SYMPTOM: A Claude worker with a known, elapsed reset remained protocol-level
+ `RateLimited` until its first subsequent prompt, while the legacy lane sweep could
+ roll a stale clock banner forward to the next day. The scheduler also recovered
+ rate-limited workers after command delivery and planning had already consumed a
+ stale snapshot, leaving the worker idle for another tick.
+COST: Workers could remain visibly idle after their provider said usage was
+ available, and queued work needed a manual interaction or an extra scheduler cycle
+ before it continued.
+FIX: dd57e1d5 makes an elapsed reported reset immediately deliverable, recovers
+ protocol workers before pumping and planning, and preserves the original reset
+ through stale terminal banners. `amux::usage_reset` emits `worker_recovered`,
+ `delivery_released`, and `delivery_gate_open` verdicts at each release boundary.
+
+## Settings collapsed a multi-provider fleet into one Claude quota bar
+AREA: observability
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-05
+SESSION: amux
+CARD: AMUX-4154
+SYMPTOM: The Settings usage panel exposed only Claude's two coarse percentages even
+ though the built-in registry also supports Codex, Gemini, and Ollama. Codex's API
+ supplies named buckets, exact reset times, durations, credits, and plan metadata,
+ but none of those facts reached the operator.
+COST: Operators could not tell which provider constrained a mixed fleet, how long a
+ limit would last, or whether another provider was unmetered or simply unmeasured.
+FIX: ecbf4daf derives the Settings rows from the full built-in provider registry,
+ retains every provider-reported window and exact reset, and distinguishes unavailable
+ quota APIs from unlimited local inference. 6bdf9999 also resolves Codex through the
+ same login-shell path as a real worker, rather than launchd's stale-but-executable
+ shim. `amux::usage_probe` logs whenever a probe succeeds or cannot report its quota.

@@ -1080,9 +1080,10 @@ async fn get_contract(
             "wrong_type": "If the item has no code, set its type first — the gate is DERIVED                            from the type. CLI: `amux board type <id> <type>`. API: PATCH                            /api/board/<id> with {\"type\": \"investigation\"} — the field is                            `type`, NOT `item_type` (that one is ignored and reported in                            `ignored_fields`). Settable at creation too: POST /api/board with                            {\"title\": ..., \"type\": ...}.",
         },
         "worker_requests": {
-            "cli": "amux board request <worker> <title> [--desc ...] [--callback-prompt ...] [--no-callback]",
-            "api": "POST /api/board with a different session plus callback:true, a prompt string, or {prompt}; X-Amux-Worker is the verified requester",
-            "lifecycle": "created in backlog, advanced by board-drive through the same dependencies, priorities, gates and terminal states as every other task",
+            "cli": "amux board request <worker> <title> [--for <PARENT-TASK>] [--desc ...] [--callback-prompt ...] [--no-callback]",
+            "api": "POST /api/board with a different session plus optional request_parent and callback:true, a prompt string, or {prompt}; X-Amux-Worker is the verified requester",
+            "lifecycle": "the delegated child is created in backlog and added to the requester task's depends_on; the parent moves doing -> todo so it releases WIP, stays dependency-blocked while the child is open, and becomes ready automatically when the child closes",
+            "parent_resolution": "request_parent/--for is authoritative. Otherwise the latest durable message->task link identifies the current task, with a unique doing task as fallback. No active task creates an intentional standalone request; multiple doing tasks are refused rather than linked incorrectly",
             "callback": "optional; request CLI arms it by default. It fires exactly when the card first enters done, verified, or discarded and queues a durable message to the verified requester",
             "durability": "requested_by, callback target/prompt/state/message id/fired time/error live on the task. A stable steering id makes restart recovery idempotent; model/provider context is not involved",
             "visibility": "the initial request and terminal callback are Messages rows linked to the same task id; the card carries requester, callback state, action log and produced assets",
@@ -3345,6 +3346,133 @@ fn needsyou_ask_refusal(verdict: bs::AskVerdict, id: &str, session: Option<&str>
     )
 }
 
+#[derive(Debug)]
+struct RequestParentRefusal {
+    code: &'static str,
+    why: String,
+    candidates: Vec<String>,
+}
+
+#[derive(Debug)]
+enum RequestParentResolution {
+    /// A peer request may intentionally be standalone. Preserve that existing
+    /// use when the requester has no active task rather than inventing a
+    /// parent from an unrelated todo.
+    Standalone,
+    Linked(Box<IssueRow>),
+    Refused(RequestParentRefusal),
+}
+
+fn request_parent_is_owned(row: &IssueRow, requester: &str) -> bool {
+    row.session.as_deref() == Some(requester)
+        && row.owner_type == "agent"
+        && row.archived == 0
+}
+
+/// A todo parent is considered current only when this requester already
+/// delegated one of its open dependencies. That is the multiple-fanout case:
+/// the first request requeues the parent, then subsequent requests in the same
+/// turn must append to that same task instead of becoming standalone siblings.
+fn is_open_delegation_parent(conn: &rusqlite::Connection, row: &IssueRow, requester: &str) -> bool {
+    row.status == "todo"
+        && row.depends_on.iter().any(|id| {
+            conn.query_row(
+                "SELECT requested_by, status FROM issues \
+                 WHERE id=?1 AND deleted IS NULL AND COALESCE(archived,0)=0",
+                rusqlite::params![id],
+                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)),
+            )
+            .ok()
+            .is_some_and(|(requested_by, status)| {
+                requested_by.as_deref() == Some(requester) && !bs::is_terminal_status(&status)
+            })
+        })
+}
+
+/// Resolve which requester task a peer request belongs to.
+///
+/// Explicit `request_parent` is authoritative. Without it, the latest durable
+/// message->task link is the current-task signal; only when that is absent do
+/// we accept a unique `doing` card. Multiple doing cards are refused because
+/// silently selecting the wrong task would corrupt the dependency graph.
+fn resolve_request_parent(
+    conn: &rusqlite::Connection,
+    requester: &str,
+    explicit: Option<&str>,
+) -> rusqlite::Result<RequestParentResolution> {
+    if let Some(id) = explicit {
+        let Some(row) = bs::get_issue(conn, id)? else {
+            return Ok(RequestParentResolution::Refused(RequestParentRefusal {
+                code: "task_request_parent_not_found",
+                why: format!("request_parent {id} does not name a live task"),
+                candidates: Vec::new(),
+            }));
+        };
+        if !request_parent_is_owned(&row, requester) {
+            return Ok(RequestParentResolution::Refused(RequestParentRefusal {
+                code: "task_request_parent_not_owned",
+                why: format!(
+                    "request_parent {id} is not a live agent task owned by requester {requester}"
+                ),
+                candidates: Vec::new(),
+            }));
+        }
+        if !matches!(row.status.as_str(), "doing" | "todo") {
+            return Ok(RequestParentResolution::Refused(RequestParentRefusal {
+                code: "task_request_parent_not_active",
+                why: format!(
+                    "request_parent {id} is {}, but delegation can attach only to doing or todo work",
+                    row.status
+                ),
+                candidates: Vec::new(),
+            }));
+        }
+        return Ok(RequestParentResolution::Linked(Box::new(row)));
+    }
+
+    let linked_ids: Vec<String> = conn
+        .prepare(
+            "SELECT i.id FROM cmd_history h JOIN issues i ON i.id=h.card_id \
+             WHERE h.session=?1 AND i.session=?1 AND i.owner_type='agent' \
+               AND i.deleted IS NULL AND COALESCE(i.archived,0)=0 \
+               AND i.status IN ('doing','todo') \
+             ORDER BY h.id DESC LIMIT 32",
+        )?
+        .query_map(rusqlite::params![requester], |r| r.get::<_, String>(0))?
+        .filter_map(Result::ok)
+        .collect();
+    for id in linked_ids {
+        if let Some(row) = bs::get_issue(conn, &id)? {
+            if row.status == "doing" || is_open_delegation_parent(conn, &row, requester) {
+                return Ok(RequestParentResolution::Linked(Box::new(row)));
+            }
+        }
+    }
+
+    let doing: Vec<String> = conn
+        .prepare(
+            "SELECT id FROM issues WHERE session=?1 AND status='doing' \
+             AND owner_type='agent' AND deleted IS NULL AND COALESCE(archived,0)=0 \
+             ORDER BY updated DESC,id",
+        )?
+        .query_map(rusqlite::params![requester], |r| r.get::<_, String>(0))?
+        .filter_map(Result::ok)
+        .collect();
+    match doing.as_slice() {
+        [] => Ok(RequestParentResolution::Standalone),
+        [id] => Ok(RequestParentResolution::Linked(Box::new(
+            bs::get_issue(conn, id)?.expect("selected live parent disappeared inside one write"),
+        ))),
+        _ => Ok(RequestParentResolution::Refused(RequestParentRefusal {
+            code: "task_request_parent_ambiguous",
+            why: format!(
+                "requester {requester} has multiple doing tasks; refusing to attach the delegated work to the wrong one"
+            ),
+            candidates: doing,
+        })),
+    }
+}
+
 pub async fn create_item(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3522,6 +3650,31 @@ pub async fn create_item(
             );
         }
     }
+    let request_parent = match map.get("request_parent") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) if !id.trim().is_empty() => Some(id.trim().to_string()),
+        Some(Value::String(_)) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "request_parent must be a non-empty task id"}),
+            )
+        }
+        Some(_) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "request_parent must be a task id string"}),
+            )
+        }
+    };
+    if request_parent.is_some() && !is_peer_request {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": "request_parent is valid only for a worker-to-worker task request",
+                "code": "task_request_parent_without_peer_request",
+            }),
+        );
+    }
     let requested_by = is_peer_request.then(|| hdr_session.clone());
     let callback_specified = map.contains_key("callback");
     let (callback_session, callback_prompt) = match map.get("callback") {
@@ -3579,7 +3732,7 @@ pub async fn create_item(
     let known_keys = [
         "title", "desc", "status", "session", "type", "depends_on", "tags", "creator",
         "reviewer", "shepherd", "gate", "owner_type", "due", "due_time", "callback",
-        "ask_actor", "ask_type", "ask_question", "ask_unblocks",
+        "ask_actor", "ask_type", "ask_question", "ask_unblocks", "request_parent",
     ];
     let ignored: Vec<String> = map
         .keys()
@@ -3647,7 +3800,7 @@ pub async fn create_item(
         title,
         desc: body_str(&map, "desc").unwrap_or_default(),
         status: status_raw,
-        session: Some(session).filter(|s| !s.is_empty()),
+        session: Some(session.clone()).filter(|s| !s.is_empty()),
         item_type,
         creator,
         owner_type,
@@ -3670,9 +3823,14 @@ pub async fn create_item(
         callback_prompt,
     };
 
+    enum DependencyLink {
+        Standalone,
+        ParentRequeued { parent: String, prior_status: String },
+    }
     enum Out {
         Cycle(Vec<String>),
-        Created(Box<IssueRow>),
+        ParentRefused(RequestParentRefusal),
+        Created(Box<IssueRow>, DependencyLink),
     }
     let slot: Arc<Mutex<Option<Out>>> = Arc::new(Mutex::new(None));
     let slot_w = slot.clone();
@@ -3680,9 +3838,25 @@ pub async fn create_item(
     // response can name it and it can be reported without re-querying.
     let folded: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let folded_w = folded.clone();
+    let requester_for_parent = hdr_session.clone();
     let write = state
         .store
         .write_async(move |conn| {
+            let mut parent = if new.requested_by.is_some() {
+                match resolve_request_parent(
+                    conn,
+                    &requester_for_parent,
+                    request_parent.as_deref(),
+                )? {
+                    RequestParentResolution::Standalone => None,
+                    RequestParentResolution::Linked(row) => Some(row),
+                    RequestParentResolution::Refused(refusal) => {
+                        return finish(&slot_w, Out::ParentRefused(refusal), no_write())
+                    }
+                }
+            } else {
+                None
+            };
             // Acyclicity is validated INSIDE the write so no interleaved
             // create can slip a cycle between check and insert. The new id
             // does not exist yet, so a placeholder self id is fine — only
@@ -3710,9 +3884,69 @@ pub async fn create_item(
                 if let Some(cycle) = bs::depends_on_cycle(conn, NEW_CARD_SELF_ID, &new.depends_on)? {
                     return finish(&slot_w, Out::Cycle(cycle), no_write());
                 }
+                // Adding parent -> new-child at the same time would close a
+                // cycle when any child dependency already reaches the parent.
+                // Validate that hypothetical edge before minting either side
+                // of the relationship; no partial child may survive refusal.
+                if let Some(parent) = parent.as_deref() {
+                    if let Some(path) =
+                        bs::dependency_path(conn, &new.depends_on, &parent.id)?
+                    {
+                        let mut cycle = vec![parent.id.clone(), NEW_CARD_SELF_ID.to_string()];
+                        cycle.extend(path);
+                        return finish(&slot_w, Out::Cycle(cycle), no_write());
+                    }
+                }
             }
-            let row = bs::create_issue(conn, &new, now_secs())?;
+            let now = now_secs();
+            let row = bs::create_issue(conn, &new, now)?;
             let mut events = vec![ev_snap(&row, MutationKind::Created)];
+            let dependency_link = if let Some(mut parent) = parent.take() {
+                let prior_status = parent.status.clone();
+                if !parent.depends_on.iter().any(|id| id == &row.id) {
+                    parent.depends_on.push(row.id.clone());
+                }
+                // The delegated child is work the parent must wait for. Put
+                // the parent back on the ready queue, where depends_on keeps it
+                // blocked until the child closes, instead of letting `doing`
+                // consume the requester's sole WIP slot while it cannot move.
+                parent.status = "todo".into();
+                parent.updated = now;
+                parent.rev += 1;
+                parent.version += 1;
+                // A trigger got this task into doing; delegation means that
+                // trigger has been consumed. Leaving it fresh would keep the
+                // now-todo parent undispatchable even after its child closes.
+                parent.source_ref = None;
+                parent.last_verified_at = None;
+                parent.log = Some(bs::append_log(
+                    parent.log.as_deref(),
+                    &hhmm(),
+                    &format!(
+                        "{requester_for_parent} delegated dependency {} to {}; parent requeued until it completes",
+                        row.id,
+                        row.session.as_deref().unwrap_or("(unassigned)")
+                    ),
+                ));
+                if bs::save_patched(conn, &mut parent)? != 1 {
+                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                }
+                let mutation = if prior_status == parent.status {
+                    MutationKind::Updated
+                } else {
+                    MutationKind::StatusChanged {
+                        from: prior_status.clone(),
+                        to: parent.status.clone(),
+                    }
+                };
+                events.push(ev_snap(&parent, mutation));
+                DependencyLink::ParentRequeued {
+                    parent: parent.id.clone(),
+                    prior_status,
+                }
+            } else {
+                DependencyLink::Standalone
+            };
             // The Messages ledger carries the SAME task id. Delivery is
             // `board`, not `direct` or `queued`: the recipient consumes this
             // request through board-drive and the card is the source of truth.
@@ -3751,7 +3985,7 @@ pub async fn create_item(
             }
             finish(
                 &slot_w,
-                Out::Created(Box::new(row)),
+                Out::Created(Box::new(row), dependency_link),
                 WriteOutcome {
                     applied: true,
                     events,
@@ -3766,8 +4000,44 @@ pub async fn create_item(
     let outcome = slot.lock().expect("outcome slot poisoned").take();
     match outcome {
         None => internal("create produced no outcome"),
-        Some(Out::Cycle(cycle)) => cycle_response(&cycle),
-        Some(Out::Created(row)) => {
+        Some(Out::Cycle(cycle)) => {
+            if is_peer_request {
+                tracing::warn!(
+                    target: "amux::task_dependency",
+                    verdict = "dependency_cycle",
+                    requester = %hdr_session,
+                    target = %session,
+                    cycle = %cycle.join(" -> "),
+                    "peer task dependency refused: cycle"
+                );
+            }
+            cycle_response(&cycle)
+        }
+        Some(Out::ParentRefused(refusal)) => {
+            tracing::warn!(
+                target: "amux::task_dependency",
+                verdict = refusal.code,
+                requester = %hdr_session,
+                target = %session,
+                candidates = %refusal.candidates.join(","),
+                "peer task dependency refused: {}",
+                refusal.why
+            );
+            err(
+                StatusCode::CONFLICT,
+                json!({
+                    "error": refusal.why,
+                    "code": refusal.code,
+                    "ok": false,
+                    "blocked": true,
+                    "requester": hdr_session,
+                    "target": session,
+                    "candidates": refusal.candidates,
+                    "how_to_fix": "pass the intended active requester task with `amux board request <worker> --for <TASK-ID> ...` or request_parent in the API body",
+                }),
+            )
+        }
+        Some(Out::Created(row, dependency_link)) => {
             let mut v = detail_body(&row);
             v["rev"] = json!(row.rev);
             v["global_rev"] = json!(reply.rev.0);
@@ -3778,6 +4048,44 @@ pub async fn create_item(
             // so a worker sees the reconcile happened and never hand-discards it.
             if let Some(cap_id) = folded.lock().expect("folded slot poisoned").take() {
                 v["folded_capture"] = json!(cap_id);
+            }
+            match dependency_link {
+                DependencyLink::ParentRequeued { parent, prior_status } => {
+                    v["request_dependency"] = json!({
+                        "verdict": "parent_requeued",
+                        "linked": true,
+                        "parent": parent.clone(),
+                        "child": row.id,
+                        "parent_status": "todo",
+                        "prior_parent_status": prior_status,
+                    });
+                    tracing::info!(
+                        target: "amux::task_dependency",
+                        verdict = "parent_requeued",
+                        parent = %parent,
+                        child = %row.id,
+                        requester = %row.requested_by.as_deref().unwrap_or("(none)"),
+                        delegate = %row.session.as_deref().unwrap_or("(none)"),
+                        "peer task dependency linked; requester WIP released"
+                    );
+                }
+                DependencyLink::Standalone => {
+                    if row.requested_by.is_some() {
+                        v["request_dependency"] = json!({
+                            "verdict": "standalone_no_active_parent",
+                            "linked": false,
+                            "child": row.id,
+                        });
+                        tracing::info!(
+                            target: "amux::task_dependency",
+                            verdict = "standalone_no_active_parent",
+                            child = %row.id,
+                            requester = %row.requested_by.as_deref().unwrap_or("(none)"),
+                            delegate = %row.session.as_deref().unwrap_or("(none)"),
+                            "peer task request created without an active requester task"
+                        );
+                    }
+                }
             }
             // AF-366: RECORD WHO CALLED, not only what the row now says.
             //

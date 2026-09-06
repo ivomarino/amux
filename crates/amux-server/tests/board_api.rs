@@ -1050,6 +1050,245 @@ async fn archive_restore_round_trip_preserves_every_field() {
 
 // ---- circular depends_on -------------------------------------------------
 
+/// Delegation is dependency work on the requester task, not a reason for the
+/// requester lane to sit in `doing` while another worker runs. The create must
+/// atomically mint the child, attach it to the parent, and release the WIP slot;
+/// the existing ready query then proves the parent wakes up when the child
+/// closes without a second promotion mechanism.
+#[tokio::test]
+async fn peer_request_requeues_its_parent_and_unblocks_it_when_the_child_finishes() {
+    let (app, store, _dir) = app_with_store();
+    let requester = "dependency-requester";
+    let delegate = "dependency-worker";
+
+    let parent = create(
+        &app,
+        json!({
+            "title": "Assemble the multiplayer result",
+            "desc": "SCOPE: combine the delegated result\n- [ ] integrate the returned artifact",
+            "status": "doing",
+            "session": requester,
+            "type": "chore",
+        }),
+    )
+    .await;
+    let parent_id = parent["id"].as_str().unwrap().to_string();
+    let independent = create(
+        &app,
+        json!({
+            "title": "Independent requester work",
+            "status": "todo",
+            "session": requester,
+            "type": "chore",
+        }),
+    )
+    .await;
+    let independent_id = independent["id"].as_str().unwrap().to_string();
+
+    // A consumed trigger on the active task must not keep the requeued parent
+    // parked after the new dependency closes.
+    let parent_for_db = parent_id.clone();
+    let independent_for_db = independent_id.clone();
+    store
+        .write(move |conn| {
+            conn.execute(
+                "UPDATE issues SET source_ref='upstream event arrived', last_verified_at=9999999999, \
+                    next_action='Integrate the returned dependency into the final result' \
+                 WHERE id=?1",
+                [&parent_for_db],
+            )?;
+            conn.execute(
+                "UPDATE issues SET next_action='Run the independent verification while the dependency is open' \
+                 WHERE id=?1",
+                [&independent_for_db],
+            )?;
+            Ok(amux_server::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .unwrap();
+
+    let (st, _, made) = send_with(
+        &app,
+        "POST",
+        "/api/board",
+        Some(json!({
+            "title": "Produce the dependency artifact",
+            "desc": "Write the input the requester needs.",
+            "status": "backlog",
+            "session": delegate,
+            "type": "chore",
+            "callback": true,
+        })),
+        &[("X-Amux-Worker", requester)],
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "peer request failed: {made}");
+    let child_id = made["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        made["request_dependency"],
+        json!({
+            "verdict": "parent_requeued",
+            "linked": true,
+            "parent": parent_id,
+            "child": child_id,
+            "parent_status": "todo",
+            "prior_parent_status": "doing",
+        }),
+        "the response must announce the lifecycle change: {made}"
+    );
+
+    let (_, _, parent_after) =
+        send(&app, "GET", &format!("/api/board/{parent_id}"), None).await;
+    assert_eq!(parent_after["status"], json!("todo"));
+    assert_eq!(parent_after["depends_on"], json!([child_id.clone()]));
+    assert_eq!(parent_after["source_ref"], Value::Null);
+    assert_eq!(parent_after["last_verified_at"], Value::Null);
+    assert!(
+        parent_after["log"].as_str().unwrap_or("").contains("parent requeued"),
+        "the card itself must explain why it moved: {parent_after}"
+    );
+
+    let (_, _, waiting) = send(
+        &app,
+        "GET",
+        &format!("/api/board/ready?session={requester}"),
+        None,
+    )
+    .await;
+    assert_eq!(waiting["wip"]["holding"], json!([]), "delegation must release WIP: {waiting}");
+    assert_eq!(waiting["excluded"]["blocked_by_deps"], json!(1), "{waiting}");
+    let ready_while_waiting: Vec<&str> = waiting["ready"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["id"].as_str())
+        .collect();
+    assert_eq!(ready_while_waiting, vec![independent_id.as_str()], "{waiting}");
+
+    let (st, _, finished) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{child_id}"),
+        Some(json!({
+            "status": "done",
+            "force": true,
+            "reason": "This test exercises dependency release, not the unrelated type gate.",
+            "evidence": "none: in-memory API lifecycle test",
+        })),
+        &[("X-Amux-Worker", delegate)],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "closing delegated child failed: {finished}");
+
+    let (_, _, resumed) = send(
+        &app,
+        "GET",
+        &format!("/api/board/ready?session={requester}"),
+        None,
+    )
+    .await;
+    let resumed_ids: Vec<&str> = resumed["ready"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["id"].as_str())
+        .collect();
+    assert!(resumed_ids.contains(&parent_id.as_str()), "parent did not wake after child: {resumed}");
+    assert_eq!(resumed["excluded"]["blocked_by_deps"], json!(0), "{resumed}");
+}
+
+#[tokio::test]
+async fn peer_request_dependency_cycle_is_refused_without_a_partial_child() {
+    let (app, _dir) = app();
+    let requester = "cycle-requester";
+    let parent = create(
+        &app,
+        json!({"title":"active parent", "status":"doing", "session":requester, "type":"chore"}),
+    )
+    .await;
+    let parent_id = parent["id"].as_str().unwrap().to_string();
+
+    let (st, _, refused) = send_with(
+        &app,
+        "POST",
+        "/api/board",
+        Some(json!({
+            "title": "child that points back at its parent",
+            "status": "backlog",
+            "session": "cycle-worker",
+            "type": "chore",
+            "request_parent": parent_id,
+            "depends_on": [parent_id],
+        })),
+        &[("X-Amux-Worker", requester)],
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "cycle must refuse: {refused}");
+    assert!(refused["error"].as_str().unwrap().contains("circular depends_on"), "{refused}");
+
+    let (_, _, parent_after) =
+        send(&app, "GET", &format!("/api/board/{parent_id}"), None).await;
+    assert_eq!(parent_after["status"], json!("doing"));
+    assert_eq!(parent_after["depends_on"], json!([]));
+    let (_, _, all) = send(&app, "GET", "/api/board?all=1", None).await;
+    assert!(
+        !all.as_array().unwrap().iter().any(|row| row["title"] == "child that points back at its parent"),
+        "a refused transaction leaked its child: {all}"
+    );
+}
+
+#[tokio::test]
+async fn peer_request_prefers_the_durable_message_task_over_other_doing_cards() {
+    let (app, store, _dir) = app_with_store();
+    let requester = "linked-requester";
+    let intended = create(
+        &app,
+        json!({"title":"task linked to the current prompt", "status":"doing", "session":requester, "type":"chore"}),
+    )
+    .await;
+    let intended_id = intended["id"].as_str().unwrap().to_string();
+    let stale = create(
+        &app,
+        json!({"title":"older stale doing card", "status":"doing", "session":requester, "type":"chore"}),
+    )
+    .await;
+    let stale_id = stale["id"].as_str().unwrap().to_string();
+    let linked_for_db = intended_id.clone();
+    store
+        .write(move |conn| {
+            conn.execute(
+                "INSERT INTO cmd_history(text,type,session,ts,origin,card_id) \
+                 VALUES('current prompt','user',?1,9999999999999,'browser',?2)",
+                rusqlite::params![requester, linked_for_db],
+            )?;
+            Ok(amux_server::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .unwrap();
+
+    let (st, _, child) = send_with(
+        &app,
+        "POST",
+        "/api/board",
+        Some(json!({
+            "title":"delegated from the current prompt",
+            "status":"backlog",
+            "session":"linked-worker",
+            "type":"chore",
+        })),
+        &[("X-Amux-Worker", requester)],
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{child}");
+    assert_eq!(child["request_dependency"]["parent"], json!(intended_id));
+
+    let (_, _, linked_after) =
+        send(&app, "GET", &format!("/api/board/{intended_id}"), None).await;
+    let (_, _, stale_after) = send(&app, "GET", &format!("/api/board/{stale_id}"), None).await;
+    assert_eq!(linked_after["status"], json!("todo"));
+    assert_eq!(linked_after["depends_on"], json!([child["id"].clone()]));
+    assert_eq!(stale_after["status"], json!("doing"), "an unrelated task was mutated");
+    assert_eq!(stale_after["depends_on"], json!([]));
+}
+
 #[tokio::test]
 async fn circular_depends_on_is_rejected_with_the_cycle_path() {
     let (app, _dir) = app();
@@ -1901,11 +2140,15 @@ async fn lifecycle_todo_doing_review_done_verified_via_state_machine() {
         ("done", "done"),
         ("verified", "verified"),
     ] {
+        let mut body = json!({ "status": target, "gate_ack": true, "evidence": EV });
+        if target == "doing" {
+            body["next_action"] = json!("Advance this lifecycle fixture to review");
+        }
         let (st, _, v) = send_with(
             &app,
             "PATCH",
             &format!("/api/board/{id}"),
-            Some(json!({ "status": target, "gate_ack": true, "evidence": EV })),
+            Some(body),
             &[("X-Amux-Session", "runner")],
         )
         .await;
@@ -1996,7 +2239,11 @@ async fn python_shaped_row_round_trips_without_corruption() {
         &app,
         "PATCH",
         "/api/board/ORCH-42",
-        Some(json!({ "status": "doing", "gate_ack": true })),
+        Some(json!({
+            "status": "doing",
+            "gate_ack": true,
+            "next_action": "Resume the interoperable Python-authored task",
+        })),
         &[("X-Amux-Session", "orch")],
     )
     .await;
@@ -2113,7 +2360,10 @@ async fn second_doing_for_same_session_is_refused_with_named_escape() {
         &app,
         "PATCH",
         &format!("/api/board/{id2}"),
-        Some(json!({ "status": "doing" })),
+        Some(json!({
+            "status": "doing",
+            "next_action": "Start the queued task after the current work closes",
+        })),
         &[("X-Amux-Session", "lane-a")],
     )
     .await;
@@ -2128,7 +2378,12 @@ async fn second_doing_for_same_session_is_refused_with_named_escape() {
         &app,
         "PATCH",
         &format!("/api/board/{id2}"),
-        Some(json!({ "status": "doing", "override_doing": true, "gate_ack": true })),
+        Some(json!({
+            "status": "doing",
+            "override_doing": true,
+            "gate_ack": true,
+            "next_action": "Exercise the explicit WIP override",
+        })),
         &[("X-Amux-Session", "lane-a")],
     )
     .await;
@@ -2145,7 +2400,11 @@ async fn second_doing_for_same_session_is_refused_with_named_escape() {
         &app,
         "PATCH",
         &format!("/api/board/{id3}"),
-        Some(json!({ "status": "doing", "gate_ack": true })),
+        Some(json!({
+            "status": "doing",
+            "gate_ack": true,
+            "next_action": "Prove another lane is not capped",
+        })),
         &[("X-Amux-Session", "lane-b")],
     )
     .await;
@@ -4363,6 +4622,9 @@ async fn statuses_that_have_a_next_actor_are_not_stamped() {
         // carry an asset link, evidence and a typed ask. The gate has its own
         // coverage in `blocked_refuses_a_card_that_names_no_watch`.
         let mut body = json!({ "status": status, "gate_ack": true });
+        if status == "doing" {
+            body["next_action"] = json!("Check that active statuses receive no due stamp");
+        }
         if status == "blocked" {
             let dep = create(&app, json!({ "title": "the thing that must land first" })).await;
             body["depends_on"] = json!([dep["id"].as_str().unwrap()]);

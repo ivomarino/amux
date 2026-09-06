@@ -16,25 +16,30 @@
 //!   invites list hides used AND expired rows.
 //! - DELETE member/invite answer `{"ok": true}` without existence checks
 //!   (Python does not 404 there).
-//! - NOT ported (named deviation): the public `/invite/{token}` HTML
-//!   landing page and its POST mark-used/join flow. Those live outside
-//!   `/api/org` and outside auth; this module is the API surface only, so
-//!   accepting an invite still needs the Python server (or a follow-up
-//!   port of `/invite/*` onto the public router).
+//! - `/invite/{token}` is the public landing + accept flow. Acceptance mints
+//!   an HttpOnly member cookie backed by the USED invite row; deleting the
+//!   member therefore revokes every later request without another session
+//!   table or auth primitive.
 
 use super::calendar::query_rows_json;
 use super::AppState;
 use crate::db::{PendingEvent, WriteOutcome};
 use crate::integrations::email::base64url_nopad;
 use amux_core::revision::{EntityType, MutationKind};
-use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Form, Path, Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use p256::elliptic_curve::rand_core::{OsRng, RngCore};
+use rusqlite::OptionalExtension;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
+
+const MEMBER_COOKIE: &str = "amux_member";
+const VERIFIED_MEMBER_HEADER: &str = "x-amux-local-member-verified";
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -43,6 +48,91 @@ pub fn routes() -> Router<AppState> {
         .route("/members/{id}", axum::routing::delete(delete_member))
         .route("/invites", get(list_invites).post(create_invite))
         .route("/invites/{token}", axum::routing::delete(delete_invite))
+}
+
+/// Public invite acceptance is mounted outside `require_bearer`.
+pub fn public_routes() -> Router<AppState> {
+    Router::new().route("/invite/{token}", get(invite_page).post(accept_invite))
+}
+
+/// True only for the internal marker inserted by [`local_member_identity`].
+/// The middleware removes an inbound copy before doing its database lookup, so
+/// this cannot be asserted by a Tailscale/LAN client itself.
+pub(crate) fn is_verified_local_member(headers: &HeaderMap) -> bool {
+    headers.get(VERIFIED_MEMBER_HEADER).and_then(|v| v.to_str().ok()) == Some("1")
+}
+
+#[derive(Debug)]
+struct MemberIdentity {
+    id: String,
+    email: String,
+}
+
+fn member_cookie(headers: &HeaderMap) -> Option<&str> {
+    headers.get(header::COOKIE).and_then(|v| v.to_str().ok()).and_then(|cookies| {
+        cookies.split(';').find_map(|part| {
+            let (name, value) = part.trim().split_once('=')?;
+            (name == MEMBER_COOKIE && !value.is_empty()).then_some(value)
+        })
+    })
+}
+
+/// Resolve a local invitee before auth and before the request logger.
+///
+/// A used invite is the durable session capability. Joining through
+/// `org_members` on every request makes member deletion immediate revocation.
+/// Verified headers then feed both `/api/identity` and the existing request-log
+/// caller resolution; no parallel identity/logging substrate is introduced.
+pub async fn local_member_identity(
+    State(state): State<AppState>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    // Never trust the internal marker from the wire.
+    req.headers_mut().remove(VERIFIED_MEMBER_HEADER);
+    let Some(token) = member_cookie(req.headers()).map(str::to_string) else {
+        return next.run(req).await;
+    };
+    let store = state.store.clone();
+    let identity = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemberIdentity>> {
+        let conn = store.read()?;
+        Ok(conn.query_row(
+            "SELECT m.id, m.email FROM org_invites i \
+             JOIN org_members m ON m.id=i.used_by \
+             WHERE i.token=?1 AND i.used_at IS NOT NULL",
+            [&token],
+            |row| Ok(MemberIdentity { id: row.get(0)?, email: row.get(1)? }),
+        ).optional()?)
+    }).await;
+    let member = match identity {
+        Ok(Ok(Some(member))) => member,
+        Ok(Ok(None)) => return next.run(req).await,
+        Ok(Err(e)) => {
+            tracing::warn!(target: "amux::local_invite", verdict = "identity_lookup_failed", error = %e, "local member cookie could not be verified");
+            return next.run(req).await;
+        }
+        Err(e) => {
+            tracing::warn!(target: "amux::local_invite", verdict = "identity_lookup_failed", error = %e, "local member identity task failed");
+            return next.run(req).await;
+        }
+    };
+    let Ok(id) = HeaderValue::from_str(&member.id) else {
+        tracing::warn!(target: "amux::local_invite", verdict = "member_header_rejected", field = "id", "stored local member identity is not a valid HTTP header");
+        return next.run(req).await;
+    };
+    let Ok(email) = HeaderValue::from_str(&member.email) else {
+        tracing::warn!(target: "amux::local_invite", verdict = "member_header_rejected", field = "email", member_id = %member.id, "stored local member identity is not a valid HTTP header");
+        return next.run(req).await;
+    };
+    req.headers_mut().insert(VERIFIED_MEMBER_HEADER, HeaderValue::from_static("1"));
+    req.headers_mut().insert("x-amux-user-id", id);
+    req.headers_mut().insert("x-amux-user-email", email);
+    if !req.headers().contains_key("x-amux-worker") && !req.headers().contains_key("x-amux-session") {
+        if let Ok(actor) = HeaderValue::from_str(&format!("member:{}", member.email)) {
+            req.headers_mut().insert("x-amux-session", actor);
+        }
+    }
+    next.run(req).await
 }
 
 // ---- shared helpers -------------------------------------------------------
@@ -104,6 +194,207 @@ fn ensure_org(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
         return Ok(true);
     }
     Ok(false)
+}
+
+fn html_escape(value: &str) -> String {
+    value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        .replace('"', "&quot;").replace('\'', "&#39;")
+}
+
+fn valid_email(email: &str) -> bool {
+    email.len() <= 254
+        && !email.is_empty()
+        && !email.chars().any(char::is_whitespace)
+        && email.matches('@').count() == 1
+        && email.split_once('@').is_some_and(|(local, domain)| !local.is_empty() && !domain.is_empty())
+}
+
+fn invite_fingerprint(token: &str) -> String {
+    use sha2::Digest as _;
+    hex::encode(sha2::Sha256::digest(token.as_bytes()))[..12].to_string()
+}
+
+#[derive(Debug)]
+struct InviteView { workspace: String, email: Option<String> }
+
+#[derive(Debug)]
+enum InviteLookup { Live(InviteView), Missing, Used, Expired }
+
+fn lookup_invite(conn: &rusqlite::Connection, token: &str) -> rusqlite::Result<InviteLookup> {
+    let row: Option<(Option<String>, i64, Option<i64>)> = conn.query_row(
+        "SELECT email, expires_at, used_at FROM org_invites WHERE token=?1", [token],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).optional()?;
+    let Some((email, expires_at, used_at)) = row else { return Ok(InviteLookup::Missing) };
+    if used_at.is_some() { return Ok(InviteLookup::Used); }
+    if expires_at <= chrono::Utc::now().timestamp() { return Ok(InviteLookup::Expired); }
+    let workspace = conn.query_row("SELECT name FROM org WHERE id='default'", [], |row| row.get(0))
+        .optional()?.unwrap_or_else(|| "My Workspace".to_string());
+    Ok(InviteLookup::Live(InviteView { workspace, email }))
+}
+
+fn invite_error(status: StatusCode, title: &str, detail: &str) -> Response {
+    let body = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><style>{}</style></head><body><main><div class=\"mark\">A</div><h1>{}</h1><p>{}</p></main></body></html>",
+        html_escape(title), INVITE_CSS, html_escape(title), html_escape(detail),
+    );
+    (status, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response()
+}
+
+const INVITE_CSS: &str = r#"
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:20px;
+background:#0b0b0e;color:#eee;font:15px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif}
+main{width:min(440px,100%);padding:32px;border:1px solid #303038;border-radius:16px;background:#15151a;
+box-shadow:0 24px 80px #0008}.mark{display:grid;place-items:center;width:38px;height:38px;border-radius:10px;
+background:#a78bfa;color:#0b0b0e;font-weight:800;margin-bottom:22px}h1{font-size:24px;line-height:1.2;margin:0 0 10px}
+p{color:#aaa;margin:0 0 22px}label{display:block;color:#bbb;font-size:13px;margin:14px 0 6px}
+input{width:100%;padding:11px 12px;border:1px solid #3b3b45;border-radius:8px;background:#0d0d11;color:#eee;font:inherit}
+input:focus{outline:2px solid #a78bfa55;border-color:#a78bfa}button{width:100%;margin-top:22px;padding:12px;
+border:0;border-radius:8px;background:#a78bfa;color:#0b0b0e;font:700 15px inherit;cursor:pointer}.note{font-size:12px;color:#777;margin-top:14px}
+"#;
+
+/// Public invite landing page. Tokens never appear in logs; rejected links use
+/// a short one-way fingerprint so a sweep can group repeated failures without
+/// turning the log into a credential store.
+async fn invite_page(State(state): State<AppState>, Path(token): Path<String>) -> Response {
+    let token_read = token.clone();
+    let store = state.store.clone();
+    let found = tokio::task::spawn_blocking(move || -> anyhow::Result<InviteLookup> {
+        let conn = store.read()?;
+        Ok(lookup_invite(&conn, &token_read)?)
+    }).await;
+    match found {
+        Ok(Ok(InviteLookup::Live(invite))) => {
+            let email = invite.email.as_deref().unwrap_or("");
+            let readonly = if invite.email.is_some() { " readonly" } else { "" };
+            let body = format!(
+                "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Join {workspace}</title><style>{css}</style></head><body><main><div class=\"mark\">A</div><h1>Join {workspace}</h1><p>You were invited to collaborate in this Amux workspace.</p><form method=\"post\"><label for=\"email\">Email</label><input id=\"email\" name=\"email\" type=\"email\" maxlength=\"254\" required autocomplete=\"email\" value=\"{email}\"{readonly}><label for=\"name\">Name</label><input id=\"name\" name=\"name\" maxlength=\"80\" autocomplete=\"name\" placeholder=\"How teammates will see you\"><button type=\"submit\">Join workspace</button></form><div class=\"note\">This signs this browser into this local Amux instance.</div></main></body></html>",
+                workspace = html_escape(&invite.workspace), css = INVITE_CSS, email = html_escape(email),
+            );
+            (StatusCode::OK, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response()
+        }
+        Ok(Ok(InviteLookup::Missing)) => {
+            tracing::warn!(target: "amux::local_invite", verdict = "rejected", reason = "missing", invite = %invite_fingerprint(&token), "local invite rejected");
+            invite_error(StatusCode::GONE, "Invite not found", "Ask the workspace owner for a new link.")
+        }
+        Ok(Ok(InviteLookup::Used)) => {
+            tracing::warn!(target: "amux::local_invite", verdict = "rejected", reason = "used", invite = %invite_fingerprint(&token), "local invite rejected");
+            invite_error(StatusCode::GONE, "Invite already used", "Ask the workspace owner for a new link.")
+        }
+        Ok(Ok(InviteLookup::Expired)) => {
+            tracing::warn!(target: "amux::local_invite", verdict = "rejected", reason = "expired", invite = %invite_fingerprint(&token), "local invite rejected");
+            invite_error(StatusCode::GONE, "Invite expired", "Ask the workspace owner for a new link.")
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(target: "amux::local_invite", verdict = "landing_failed", error = %e, "local invite landing failed");
+            internal(e)
+        }
+        Err(e) => {
+            tracing::warn!(target: "amux::local_invite", verdict = "landing_failed", error = %e, "local invite landing task failed");
+            internal(e)
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct InviteAcceptForm {
+    #[serde(default)] email: String,
+    #[serde(default)] name: String,
+}
+
+#[derive(Debug)]
+enum AcceptOutcome {
+    Accepted { member_id: String, email: String }, Missing, Used, Expired, EmailMismatch,
+}
+
+async fn accept_invite(
+    State(state): State<AppState>, Path(token): Path<String>, Form(form): Form<InviteAcceptForm>,
+) -> Response {
+    let email = form.email.trim().to_lowercase();
+    let name: String = form.name.trim().chars().take(80).collect();
+    if !valid_email(&email) {
+        tracing::warn!(target: "amux::local_invite", verdict = "rejected", reason = "invalid_email", invite = %invite_fingerprint(&token), "local invite rejected");
+        return invite_error(StatusCode::BAD_REQUEST, "Valid email required", "Enter the email address you want teammates to see.");
+    }
+    let member_id_candidate = ulid::Ulid::new().to_string().to_lowercase();
+    let token_w = token.clone();
+    let email_w = email.clone();
+    let name_w = name.clone();
+    let outcome: Arc<Mutex<Option<AcceptOutcome>>> = Arc::new(Mutex::new(None));
+    let outcome_w = outcome.clone();
+    let write = state.store.write_async(move |conn| {
+        let now = chrono::Utc::now().timestamp();
+        let row: Option<(Option<String>, i64, Option<i64>)> = conn.query_row(
+            "SELECT email, expires_at, used_at FROM org_invites WHERE token=?1", [&token_w],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional()?;
+        let Some((bound_email, expires_at, used_at)) = row else {
+            *outcome_w.lock().expect("accept outcome") = Some(AcceptOutcome::Missing);
+            return Ok(WriteOutcome { applied: false, events: vec![] });
+        };
+        if used_at.is_some() {
+            *outcome_w.lock().expect("accept outcome") = Some(AcceptOutcome::Used);
+            return Ok(WriteOutcome { applied: false, events: vec![] });
+        }
+        if expires_at <= now {
+            *outcome_w.lock().expect("accept outcome") = Some(AcceptOutcome::Expired);
+            return Ok(WriteOutcome { applied: false, events: vec![] });
+        }
+        if bound_email.as_deref().is_some_and(|bound| bound != email_w) {
+            *outcome_w.lock().expect("accept outcome") = Some(AcceptOutcome::EmailMismatch);
+            return Ok(WriteOutcome { applied: false, events: vec![] });
+        }
+        let existing: Option<String> = conn.query_row(
+            "SELECT id FROM org_members WHERE email=?1", [&email_w], |row| row.get(0),
+        ).optional()?;
+        let (member_id, created) = match existing {
+            Some(id) => {
+                if !name_w.is_empty() {
+                    conn.execute("UPDATE org_members SET name=?1 WHERE id=?2", rusqlite::params![name_w, id])?;
+                }
+                (id, false)
+            }
+            None => {
+                let display_name = if name_w.is_empty() {
+                    email_w.split('@').next().unwrap_or(&email_w).to_string()
+                } else { name_w.clone() };
+                conn.execute(
+                    "INSERT INTO org_members (id,email,name,role,joined_at) VALUES (?1,?2,?3,'member',?4)",
+                    rusqlite::params![member_id_candidate, email_w, display_name, now],
+                )?;
+                (member_id_candidate, true)
+            }
+        };
+        conn.execute("UPDATE org_invites SET used_at=?1, used_by=?2 WHERE token=?3",
+            rusqlite::params![now, member_id, token_w])?;
+        let mut events = vec![ev("org_invite", &token_w, MutationKind::Updated)];
+        events.push(ev("org_member", &member_id,
+            if created { MutationKind::Created } else { MutationKind::Updated }));
+        *outcome_w.lock().expect("accept outcome") = Some(AcceptOutcome::Accepted {
+            member_id, email: email_w,
+        });
+        Ok(WriteOutcome { applied: true, events })
+    }).await;
+    if let Err(e) = write {
+        tracing::warn!(target: "amux::local_invite", verdict = "accept_failed", error = %e, "local invite acceptance write failed");
+        return internal(e);
+    }
+    let verdict = outcome.lock().expect("accept outcome").take();
+    match verdict {
+        Some(AcceptOutcome::Accepted { member_id, email }) => {
+            tracing::info!(target: "amux::local_invite", verdict = "accepted", member_id = %member_id, email = %email, "local invite accepted");
+            let cookie = format!("{MEMBER_COOKIE}={token}; Path=/; Max-Age=31536000; HttpOnly; Secure; SameSite=Lax");
+            (StatusCode::SEE_OTHER, [(header::LOCATION, "/"), (header::SET_COOKIE, cookie.as_str())], "").into_response()
+        }
+        Some(AcceptOutcome::Missing) => invite_error(StatusCode::GONE, "Invite not found", "Ask the workspace owner for a new link."),
+        Some(AcceptOutcome::Used) => invite_error(StatusCode::GONE, "Invite already used", "Ask the workspace owner for a new link."),
+        Some(AcceptOutcome::Expired) => invite_error(StatusCode::GONE, "Invite expired", "Ask the workspace owner for a new link."),
+        Some(AcceptOutcome::EmailMismatch) => {
+            tracing::warn!(target: "amux::local_invite", verdict = "rejected", reason = "email_mismatch", invite = %invite_fingerprint(&token), "local invite rejected");
+            invite_error(StatusCode::FORBIDDEN, "Different email required", "This invitation is tied to another email address.")
+        }
+        None => internal("invite acceptance completed without a verdict"),
+    }
 }
 
 // ---- GET /api/org ---------------------------------------------------------
@@ -260,16 +551,21 @@ pub async fn create_invite(
         .and_then(Value::as_str)
         .map(|e| e.trim().to_lowercase())
         .filter(|e| !e.is_empty());
+    if email.as_deref().is_some_and(|value| !valid_email(value)) {
+        tracing::warn!(target: "amux::local_invite", verdict = "create_rejected", reason = "invalid_email", "local invite creation rejected");
+        return err(StatusCode::BAD_REQUEST, json!({ "error": "valid email required" }));
+    }
     let token = token_urlsafe(24);
     let now = chrono::Utc::now().timestamp();
     let expires = now + 7 * 86400;
     let token_w = token.clone();
+    let email_w = email.clone();
     let write = state
         .store
         .write_async(move |conn| {
             conn.execute(
                 "INSERT INTO org_invites (token, email, created_at, expires_at) VALUES (?1,?2,?3,?4)",
-                rusqlite::params![token_w, email, now, expires],
+                rusqlite::params![token_w, email_w, now, expires],
             )?;
             Ok(WriteOutcome {
                 applied: true,
@@ -279,6 +575,9 @@ pub async fn create_invite(
         .await;
     match write {
         Ok(_) => {
+            tracing::info!(target: "amux::local_invite", verdict = "created",
+                bound_email = email.as_deref().unwrap_or("open"), expires_at = expires,
+                "local invite created");
             let url = format!("{}/invite/{token}", base_url(&headers));
             (
                 StatusCode::CREATED,
@@ -321,7 +620,7 @@ mod tests {
     use super::*;
     use crate::db::Store;
     use axum::body::Body;
-    use axum::http::Request;
+    use axum::http::{header, HeaderMap, Request};
     use tower::ServiceExt;
 
     fn app() -> (axum::Router, tempfile::TempDir) {
@@ -363,6 +662,32 @@ mod tests {
         let v = serde_json::from_slice(&bytes)
             .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
         (status, v)
+    }
+
+    fn full_app() -> (axum::Router, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("org-full-test.db")).unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: Some("owner-token".into()),
+            secrets: std::sync::Arc::new(crate::secrets::SecretStore::new(std::path::PathBuf::new(), std::path::PathBuf::new())),
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        (crate::api::router(state), dir)
+    }
+
+    async fn raw_send(
+        app: &axum::Router, method: &str, path: &str, body: &str, headers: &[(&str, &str)],
+    ) -> (StatusCode, HeaderMap, String) {
+        let mut request = Request::builder().method(method).uri(path);
+        for (name, value) in headers { request = request.header(*name, *value); }
+        let response = app.clone().oneshot(request.body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, headers, String::from_utf8_lossy(&bytes).into_owned())
     }
 
     #[tokio::test]
@@ -562,5 +887,86 @@ mod tests {
         let m: i64 = conn.query_row("SELECT COUNT(*) FROM org_members", [], |r| r.get(0)).unwrap();
         let i: i64 = conn.query_row("SELECT COUNT(*) FROM org_invites", [], |r| r.get(0)).unwrap();
         assert_eq!((m, i), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn invite_acceptance_authenticates_attributes_and_revokes_a_local_member() {
+        let (app, dir) = full_app();
+        let (created, _, body) = raw_send(&app, "POST", "/api/org/invites",
+            r#"{"email":"guest@example.com"}"#,
+            &[("authorization", "Bearer owner-token"), ("content-type", "application/json"),
+              ("host", "tailnet-host:8824"), ("x-forwarded-proto", "https")]).await;
+        assert_eq!(created, StatusCode::CREATED, "{body}");
+        let invitation: Value = serde_json::from_str(&body).unwrap();
+        let token = invitation["token"].as_str().unwrap();
+        assert_eq!(invitation["url"], json!(format!("https://tailnet-host:8824/invite/{token}")));
+
+        let (landing, _, html) = raw_send(&app, "GET", &format!("/invite/{token}"), "", &[]).await;
+        assert_eq!(landing, StatusCode::OK, "{html}");
+        assert!(html.contains("guest@example.com") && html.contains("Join My Workspace"), "{html}");
+
+        let (accepted, headers, _) = raw_send(&app, "POST", &format!("/invite/{token}"),
+            "email=guest%40example.com&name=Guest+User",
+            &[("content-type", "application/x-www-form-urlencoded")]).await;
+        assert_eq!(accepted, StatusCode::SEE_OTHER);
+        assert_eq!(headers[header::LOCATION], "/");
+        let set_cookie = headers[header::SET_COOKIE].to_str().unwrap();
+        assert!(set_cookie.contains("HttpOnly") && set_cookie.contains("Secure") && set_cookie.contains("SameSite=Lax"), "{set_cookie}");
+        let cookie = set_cookie.split(';').next().unwrap();
+
+        let (identity_status, _, identity_body) = raw_send(&app, "GET", "/api/identity", "", &[("cookie", cookie)]).await;
+        assert_eq!(identity_status, StatusCode::OK, "{identity_body}");
+        let identity: Value = serde_json::from_str(&identity_body).unwrap();
+        assert_eq!(identity["email"], "guest@example.com");
+        assert_eq!(identity["is_local_member"], true);
+        assert_eq!(identity["is_cloud"], false);
+
+        // The member shell cannot inherit the owner's bearer: real browser API
+        // calls must continue to exercise the cookie boundary.
+        let (shell_status, _, shell) = raw_send(&app, "GET", "/", "", &[("cookie", cookie)]).await;
+        assert_eq!(shell_status, StatusCode::OK);
+        assert!(shell.contains("window._AMUX_AUTH_TOKEN=\"\""), "{shell}");
+        assert!(!shell.contains("window._AMUX_AUTH_TOKEN=\"owner-token\""), "{shell}");
+
+        let (members_status, _, members_body) = raw_send(&app, "GET", "/api/org/members", "", &[("cookie", cookie)]).await;
+        assert_eq!(members_status, StatusCode::OK, "{members_body}");
+        assert!(members_body.contains("guest@example.com"), "{members_body}");
+
+        let db = dir.path().join("org-full-test.db");
+        let mut actor = String::new();
+        for _ in 0..50 {
+            actor = rusqlite::Connection::open(&db).unwrap().query_row(
+                "SELECT amux_session FROM _amux_request_log WHERE path='/api/org/members' ORDER BY ts DESC LIMIT 1",
+                [], |row| row.get(0)).optional().unwrap().unwrap_or_default();
+            if !actor.is_empty() { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(actor, "member:guest@example.com");
+
+        let member_id: String = rusqlite::Connection::open(&db).unwrap().query_row(
+            "SELECT id FROM org_members WHERE email='guest@example.com'", [], |row| row.get(0)).unwrap();
+        let (deleted, _, body) = raw_send(&app, "DELETE", &format!("/api/org/members/{member_id}"), "",
+            &[("authorization", "Bearer owner-token")]).await;
+        assert_eq!(deleted, StatusCode::OK, "{body}");
+        let (revoked, _, _) = raw_send(&app, "GET", "/api/org/members", "", &[("cookie", cookie)]).await;
+        assert_eq!(revoked, StatusCode::UNAUTHORIZED);
+        let (replay, _, _) = raw_send(&app, "GET", &format!("/invite/{token}"), "", &[]).await;
+        assert_eq!(replay, StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn email_bound_invite_refuses_a_different_email_without_consuming_it() {
+        let (app, _dir) = full_app();
+        let (_, _, body) = raw_send(&app, "POST", "/api/org/invites",
+            r#"{"email":"right@example.com"}"#,
+            &[("authorization", "Bearer owner-token"), ("content-type", "application/json")]).await;
+        let invitation: Value = serde_json::from_str(&body).unwrap();
+        let token = invitation["token"].as_str().unwrap();
+        let (wrong, _, _) = raw_send(&app, "POST", &format!("/invite/{token}"),
+            "email=wrong%40example.com&name=Wrong",
+            &[("content-type", "application/x-www-form-urlencoded")]).await;
+        assert_eq!(wrong, StatusCode::FORBIDDEN);
+        let (still_live, _, _) = raw_send(&app, "GET", &format!("/invite/{token}"), "", &[]).await;
+        assert_eq!(still_live, StatusCode::OK);
     }
 }

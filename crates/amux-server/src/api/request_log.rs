@@ -1118,6 +1118,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/health/invariants", methods: &["GET"] },
     RouteEntry { path: "/api/debug/invariants", methods: &["GET"] },
     RouteEntry { path: "/api/gmail/callback", methods: &["GET"] },
+    RouteEntry { path: "/invite/{token}", methods: &["GET", "POST"] },
     // -- core state
     RouteEntry { path: "/api/sync", methods: &["GET"] },
     RouteEntry { path: "/api/events", methods: &["GET"] },

@@ -9488,6 +9488,24 @@ pub(crate) fn lane_block_reason_from(
     None
 }
 
+/// A time-window limit blocks only until its provider-reported reset. Limits
+/// with no clock (notably credit caps) remain parked until their banner clears.
+fn rate_limit_still_blocks(since: i64, reset_at: i64, now: i64) -> bool {
+    since > 0 && (reset_at <= 0 || now < reset_at)
+}
+
+/// Keep an arrived reset stable when Claude's old clock-only banner remains on
+/// screen. Re-parsing "4:10pm" at 4:11pm rolls it to tomorrow; that used to
+/// postpone every queued message by a full day. Before arrival, a refreshed
+/// provider clock wins, while a transient parse miss keeps the known clock.
+fn effective_rate_limit_reset(recorded: i64, parsed: i64, now: i64) -> i64 {
+    if recorded > 0 && (recorded <= now || parsed <= 0) {
+        recorded
+    } else {
+        parsed
+    }
+}
+
 /// [`lane_block_reason_from`] against the real filesystem and tmux.
 ///
 /// ONE predicate, shared by the drain loop, the point of send, the queue
@@ -9515,18 +9533,19 @@ pub(crate) async fn lane_block_reason(name: &str) -> Option<&'static str> {
     let archived = lane_is_archived(name);
     // Don't pay a tmux query for a lane already known unreachable.
     let running = env_exists && !archived && is_running(name).await;
-    // CONFIRMED RELEASE, NOT A CLOCK — which is what the card asks for and what
-    // makes this implementable at all.
-    //
-    // `rate_limited_since` is maintained by the rate-limit sweep and is
-    // PRESENCE-BASED in both directions: it is stamped when the limit menu or
-    // the credit banner is on screen, and CLEARED on the first tick where
-    // neither is. So a non-zero value means the lane is limited right now, and
-    // zero is a live observation that it is not. No reset timestamp is
-    // consulted, which is why this also covers credit caps — they have no reset
-    // clock at all, and the design was stuck on that until the sweep gained the
-    // presence-based clear.
-    let rate_limited = env_exists && !archived && meta_i64(&load_meta(name), "rate_limited_since") > 0;
+    let meta = load_meta(name);
+    let since = meta_i64(&meta, "rate_limited_since");
+    let reset_at = meta_i64(&meta, "rate_limited_until");
+    let kind = meta_str(&meta, "rate_limited_by");
+    // A known provider clock opens the queue gate exactly at reset; requiring
+    // the banner to disappear first stranded headless lanes whose first new
+    // prompt is what makes Claude move again. Credit caps still have no clock
+    // and remain presence-gated until payment/banner clear.
+    let rate_limited = env_exists && !archived && if kind == "credit-banner" {
+        since > 0
+    } else {
+        rate_limit_still_blocks(since, reset_at, now_i64())
+    };
     lane_block_reason_from(env_exists, archived, running, rate_limited)
 }
 
@@ -9534,10 +9553,8 @@ pub(crate) async fn lane_block_reason(name: &str) -> Option<&'static str> {
 ///
 /// The companion to [`lane_block_reason`]'s `rate-limited`, kept separate
 /// because that predicate returns a `&'static str` by design — one shared
-/// answer, no per-lane text. This is the WHEN, and it is deliberately NOT part
-/// of the block decision: the sweep's presence-based `rate_limited_since` is
-/// what says the lane is limited RIGHT NOW, and gating delivery on a clock
-/// instead would resurrect the bug the presence-based clear fixed.
+/// answer, no per-lane text. This is the WHEN used by the block decision for a
+/// time-window limit; a credit cap has no reset and stays presence-gated.
 ///
 /// 0 means "no reset time known", never "resets at the epoch". A credit cap has
 /// no clock at all, so a caller that reads 0 as a past time would treat every
@@ -9695,17 +9712,15 @@ pub(crate) fn block_reason_explain(reason: &str, name: &str) -> String {
              skips stopped lanes, so it waits for the lane to be STARTED, not for it to be free. \
              No deadline will force it through."
         ),
-        // AMUX-2238. Says WHEN it goes, not merely that it is stuck: the
-        // release is observed (the banner leaving the lane's screen), so a
-        // sender knows waiting is the correct action here, unlike the three
-        // above where waiting helps only after someone does something.
+        // AMUX-2238 + AMUX-4154. Says WHEN it goes, not merely that it is
+        // stuck: time windows release on the provider's own clock, while a
+        // clockless credit cap still waits for direct observation.
         "rate-limited" => format!(
             "HELD — '{name}' is rate-limited. The message is queued and will deliver once the limit \
-             is CONFIRMED released, which amux observes directly: the rate-limit sweep clears the \
-             lane the first tick its limit menu and credit banner are both off screen. No clock is \
-             consulted, so this also covers credit caps, which have no reset time. Nothing is \
-             required of you; the deadline that normally forces a message into a running turn does \
-             not apply, because a rate-limited lane cannot act on it."
+             reaches its provider-reported reset. If the provider reports no clock — such as credit \
+             caps — amux waits until the sweep confirms the banner is gone. Nothing is required of \
+             you; the deadline that normally forces a message into a running turn does not apply, \
+             because a rate-limited lane cannot act on it."
         ),
         other => format!("NOT DELIVERABLE — '{name}': {other}."),
     }
@@ -10974,8 +10989,8 @@ async fn warn_on_stalled_lanes(state: &AppState) {
                     queued = count,
                     oldest_min = (age / 60.0) as i64,
                     last_skip = %reason,
-                    "steering queue HELD — the lane is rate-limited; delivery resumes when the \
-                     sweep observes the limit released (AMUX-2238). This is the designed \
+                    "steering queue HELD — the lane is rate-limited; delivery resumes at its \
+                     provider-reported reset, or after a clockless cap clears (AMUX-4154). This is the designed \
                      behaviour, not a stall."
                 );
             } else {
@@ -11608,6 +11623,7 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
                         ("rate_limited_since", json!(0)),
                         ("rate_limited_until", json!(0)),
                         ("rate_limited_by", json!("")),
+                        ("rate_limit_resume_announced_for", json!(0)),
                     ],
                 );
             }
@@ -11620,7 +11636,14 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
         // be refreshed is worse than none once it goes stale. `None` stays 0 —
         // a credit cap has no reset clock, and callers must be able to tell
         // "no reset time" from "resets at the epoch".
-        let reset = parse_rate_limit_reset(&footer).unwrap_or(0);
+        let observed_now = now_i64();
+        let parsed_reset = parse_rate_limit_reset(&footer).unwrap_or(0);
+        let recorded_reset = meta_i64(&load_meta(name), "rate_limited_until");
+        let reset = if menu {
+            effective_rate_limit_reset(recorded_reset, parsed_reset, observed_now)
+        } else {
+            0
+        };
         if meta_i64(&load_meta(name), "rate_limited_until") != reset {
             update_meta(name, &[("rate_limited_until", json!(reset))]);
         }
@@ -11657,6 +11680,38 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
                 "session.rate_limited",
                 Some(json!({"detected_by": if menu { "menu" } else { "credit-banner" }})),
                 Some(format!("rl:{name}:{}", now_i64() / 3600)),
+                "rate-limit",
+            )
+            .await;
+        }
+        // The provider's reset re-opens the existing delivery primitive, so
+        // queued messages and durable tasks resume without a bespoke ninth
+        // queue. We deliberately do not type here: Claude's own banner says it
+        // continues automatically, and injecting Enter into a turn that
+        // restarted between capture and send corrupts the user's input. The
+        // normal delivery path does the boundary check.
+        if reset > 0
+            && reset <= observed_now
+            && meta_i64(&load_meta(name), "rate_limit_resume_announced_for") != reset
+        {
+            update_meta(name, &[("rate_limit_resume_announced_for", json!(reset))]);
+            tracing::info!(
+                target: "amux::usage_reset",
+                verdict = "delivery_gate_open",
+                session = %name,
+                reset_at = reset,
+                "Claude usage reset passed; queued messages and board work may continue"
+            );
+            emit_event(
+                state,
+                name,
+                "session.rate_limit_reset",
+                Some(json!({
+                    "reset_at": reset,
+                    "verdict": "delivery_gate_open",
+                    "detected_by": "sweep",
+                })),
+                Some(format!("rl-reset:{name}:{reset}")),
                 "rate-limit",
             )
             .await;
@@ -23950,6 +24005,44 @@ mod steer_max_age_tests {
         assert_eq!(parse_rate_limit_reset_at("resets soon", noon), None, "no digits");
     }
 
+    #[test]
+    fn every_claude_lane_releases_at_its_known_usage_reset() {
+        let now = 1_788_639_000i64;
+        let reset = now;
+        let lanes = [
+            ("backend", now - 600),
+            ("mixpeek-cicd", now - 300),
+            ("tubescience", now - 1),
+            ("mvs-infra", now),
+        ];
+        assert!(
+            lanes.iter().all(|(_, since)| !rate_limit_still_blocks(*since, reset, now)),
+            "every stamped lane at the shared provider reset must resume"
+        );
+        assert!(rate_limit_still_blocks(now - 1, now + 1, now));
+        assert!(rate_limit_still_blocks(now - 1, 0, now));
+        assert!(!rate_limit_still_blocks(0, now + 1, now));
+    }
+
+    #[test]
+    fn an_arrived_reset_is_not_rolled_to_tomorrow_by_a_stale_banner() {
+        let now = 1_788_639_060i64;
+        let recorded_today = now - 60;
+        let stale_reparse_tomorrow = recorded_today + 86_400;
+        assert_eq!(
+            effective_rate_limit_reset(recorded_today, stale_reparse_tomorrow, now),
+            recorded_today,
+            "the recorded reset disambiguates the stale clock-only terminal frame"
+        );
+        assert_eq!(effective_rate_limit_reset(now + 60, now + 120, now), now + 120);
+        assert_eq!(
+            effective_rate_limit_reset(now + 60, 0, now),
+            now + 60,
+            "a transient parse miss must not erase a known future reset"
+        );
+        assert_eq!(effective_rate_limit_reset(0, now + 120, now), now + 120);
+    }
+
 
     /// The policy is the human's, set once (D2). Default is `wait` — press 1 —
     /// because a human pressing 1 on sixty lanes is not a workflow and the
@@ -24076,9 +24169,9 @@ mod steer_max_age_tests {
 
     /// AMUX-2238: a send to a rate-limited lane HOLDS, and is never dropped.
     ///
-    /// Ethan, 2026-08-03: "commands sent to a rate-limited session must queue
-    /// and deliver only after the limit is confirmed released — keyed on the
-    /// limit passing + a live confirmation, not just the clock."
+    /// Ethan, 2026-08-03: commands sent to a rate-limited session must queue;
+    /// AMUX-4154 adds that every Claude lane continues at the provider's known
+    /// reset rather than waiting for an unrelated screen change.
     ///
     /// THE ORDER IS THE CLAIM, and it is the trap I flagged when triaging this.
     /// A lane that is not running is `not-running` whether or not it is also
@@ -24086,13 +24179,8 @@ mod steer_max_age_tests {
     /// never reach a lane before the lane is up. The two cells below pin that
     /// precedence, so a later reorder cannot quietly invert it.
     ///
-    /// The delivery-order half of the design question resolves BY CONSTRUCTION
-    /// rather than by ordering logic, which is why there is no queue-position
-    /// code here to test: the resume that clears a limit is a direct tmux key
-    /// (`send_keys_op(name, "Enter")` in the sweep), not a steering row. So the
-    /// resume cannot be queued behind a held send, and the queue does not drain
-    /// until the sweep observes the banner gone — which is downstream of the
-    /// lane actually working again.
+    /// Delivery order resolves by construction: the provider reset opens the
+    /// existing queue gate and the normal turn-boundary sender drains it.
     #[test]
     fn a_rate_limited_lane_holds_its_queue_and_never_dead_letters() {
         assert_eq!(
@@ -24139,8 +24227,8 @@ mod steer_max_age_tests {
         let msg = block_reason_explain("rate-limited", "busy-lane");
         assert!(msg.contains("busy-lane"), "{msg}");
         assert!(
-            msg.contains("CONFIRMED released"),
-            "the card's own words: confirmed, not a clock: {msg}"
+            msg.contains("provider-reported reset"),
+            "a known provider clock is the automatic release boundary: {msg}"
         );
         assert!(
             msg.contains("credit caps"),

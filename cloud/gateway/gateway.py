@@ -2046,12 +2046,14 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write(f"[gateway] {self.client_address[0]} {fmt % args}\n")
         sys.stderr.flush()
 
-    def _json(self, d, code=200):
+    def _json(self, d, code=200, extra_cookies=None):
         body = json.dumps(d).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
+        for cookie in (extra_cookies or []):
+            self.send_header("Set-Cookie", cookie)
         self.end_headers()
         self.wfile.write(body)
 
@@ -2763,9 +2765,9 @@ class Handler(BaseHTTPRequestHandler):
             # DETAIL rather than inventing a second rule: same _is_admin_email /
             # is_e2e_admin predicate, no membership rows created, nothing else
             # about the request changes. Admins get role 'admin' for orgs they do
-            # not belong to so the UI can tell "mine" from "god mode", and
-            # is_personal stays keyed to the user's OWN id so a customer's org is
-            # never mislabelled as theirs.
+            # not belong to, and `via_god_mode` carries the actual distinction
+            # from an explicit admin membership. `is_personal` stays keyed to
+            # the user's OWN id so a customer's org is never mislabelled as theirs.
             # ORDERING IS LOAD-BEARING FOR ADMINS, in a way it never was for a
             # normal user with two or three orgs. Widening the list turned a
             # 1-row switcher into a 62-row one, and `ORDER BY created_at` put
@@ -2784,7 +2786,8 @@ class Handler(BaseHTTPRequestHandler):
             if is_admin:
                 rows = db.execute(
                     "SELECT o.id, o.name, o.slug, o.owner_id, o.plan, "
-                    "       COALESCE(m.role, 'admin') AS role "
+                    "       COALESCE(m.role, 'admin') AS role, "
+                    "       m.user_id AS membership_user_id "
                     "FROM orgs o "
                     "LEFT JOIN org_memberships m "
                     "       ON m.org_id = o.id AND m.user_id = ? "
@@ -2793,7 +2796,8 @@ class Handler(BaseHTTPRequestHandler):
                 ).fetchall()
             else:
                 rows = db.execute(
-                    "SELECT o.id, o.name, o.slug, o.owner_id, o.plan, m.role "
+                    "SELECT o.id, o.name, o.slug, o.owner_id, o.plan, m.role, "
+                    "       m.user_id AS membership_user_id "
                     "FROM org_memberships m JOIN orgs o ON m.org_id = o.id "
                     "WHERE m.user_id=? ORDER BY o.created_at",
                     (user_id,)
@@ -2805,6 +2809,7 @@ class Handler(BaseHTTPRequestHandler):
                 "owner_id": r["owner_id"], "plan": r["plan"], "role": r["role"],
                 "is_personal": r["id"] == user_id,
                 "active": r["id"] == active,
+                "via_god_mode": bool(is_admin and r["membership_user_id"] is None),
             } for r in rows])
 
         # GET /api/gateway/orgs/<org_id> → org details
@@ -2929,11 +2934,30 @@ class Handler(BaseHTTPRequestHandler):
             body = self._read_body()
             org_id = body.get("org_id", "").strip()
             sec = self._secure_cookie_flags()
+            wants_json = "application/json" in self.headers.get("Accept", "")
+
+            def switched(cookie, target):
+                # Browser fetch used to follow the redirect below into the
+                # selected tenant container. A sleeping tenant then made this
+                # CONTROL-PLANE write hang/fail, after its Set-Cookie had
+                # already changed the context. JSON acknowledgement lets the
+                # client reload deliberately and show the gateway's normal
+                # starting screen without coupling the switch to tenant health.
+                print(f"[org-switch] actor={user_email or user_id} target={target} "
+                      f"verdict=switched response={'json' if wants_json else 'redirect'}",
+                      flush=True)
+                if wants_json:
+                    return self._json(
+                        {"ok": True, "org_id": target},
+                        extra_cookies=[cookie],
+                    )
+                return self._redirect(self._base_url() + "/", extra_cookies=[cookie])
+
             if org_id == user_id or not org_id:
                 # Switch back to personal workspace
-                return self._redirect(
-                    self._base_url() + "/",
-                    extra_cookies=[f"amux_org=; Max-Age=0; Path=/; HttpOnly{sec}; SameSite=Lax"]
+                return switched(
+                    f"amux_org=; Max-Age=0; Path=/; HttpOnly{sec}; SameSite=Lax",
+                    user_id,
                 )
             member_row = db.execute(
                 "SELECT 1 FROM org_memberships WHERE org_id=? AND user_id=?",
@@ -2941,9 +2965,9 @@ class Handler(BaseHTTPRequestHandler):
             ).fetchone()
             if not member_row and not (is_admin and db.execute("SELECT 1 FROM orgs WHERE id=?", (org_id,)).fetchone()):
                 return self._json({"error": "not a member of this workspace"}, 403)
-            return self._redirect(
-                self._base_url() + "/",
-                extra_cookies=[f"amux_org={org_id}; HttpOnly{sec}; SameSite=Lax; Path=/"]
+            return switched(
+                f"amux_org={org_id}; HttpOnly{sec}; SameSite=Lax; Path=/",
+                org_id,
             )
 
         # GET /api/gateway/members → list members of active org (backward compat)

@@ -122,6 +122,7 @@ pub fn router(state: AppState) -> Router {
     // For the request-log layer below — `state` itself is consumed by
     // `.with_state` before the outermost wrap.
     let store_for_reqlog = state.store.clone();
+    let state_for_member_identity = state.clone();
     let protected = Router::new()
         .route("/api/sync", axum::routing::get(sync::delta_sync))
         .route("/api/events", axum::routing::get(sse::events))
@@ -458,6 +459,10 @@ pub fn router(state: AppState) -> Router {
         // Same rationale: the connectors broker's callback receives provider
         // redirects (Google/Slack), which cannot carry a bearer.
         .merge(connectors::callback_routes())
+        // Public local invite landing + acceptance. A successful POST installs
+        // a revocable member cookie; the outer identity layer below resolves
+        // it before auth and request logging.
+        .merge(org::public_routes())
         .merge(static_files::routes())
         .merge(protected)
         .with_state(state);
@@ -497,7 +502,15 @@ pub fn router(state: AppState) -> Router {
     // request — including alias-rewritten and fallback paths — is recorded
     // with the RAW path the client sent. Never blocks or fails a request
     // (rows ride a bounded channel to the single-writer store).
-    request_log::layer(app, store_for_reqlog)
+    let app = request_log::layer(app, store_for_reqlog);
+
+    // Outermost so verified member headers exist before BOTH auth and the
+    // request logger inspect the request. The middleware strips its internal
+    // marker before validating the cookie, so clients cannot self-assert it.
+    app.layer(axum::middleware::from_fn_with_state(
+        state_for_member_identity,
+        org::local_member_identity,
+    ))
 }
 
 /// Give an empty 405 a body that names the verb it wanted (AF-211).
@@ -869,9 +882,11 @@ async fn identity(headers: axum::http::HeaderMap) -> axum::Json<serde_json::Valu
     // (_api_key_status). This server runs no validator, so it answers what
     // python answers before its first validation — null/"" — rather than
     // inventing a verdict (Invariant 20: never invent state).
+    let is_local_member = org::is_verified_local_member(&headers);
     axum::Json(serde_json::json!({
         "email": email,
-        "is_cloud": !email.is_empty(),
+        "is_cloud": !email.is_empty() && !is_local_member,
+        "is_local_member": is_local_member,
         "has_api_key": has_key_in_env || has_oauth || has_proxy,
         "has_oauth": has_oauth,
         "managed_upstream": has_proxy,

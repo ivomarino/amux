@@ -86,6 +86,7 @@ fn rig() -> Rig {
     std::env::set_var("AMUX_BLOCKED_NEEDS_WATCH", "0");
     std::env::set_var("AMUX_NEEDSYOU_ASK_REQUIRED", "0");
     std::env::set_var("AMUX_TODO_WIP_LIMIT", "0");
+    std::env::set_var("AMUX_CONTINUATION_REQUIRED", "0");
     let dir = tempfile::tempdir().unwrap();
     let store: SharedStore = Arc::new(Store::open(&dir.path().join("golden.db")).unwrap());
     let state = AppState {
@@ -538,15 +539,10 @@ async fn golden_rate_limit_recovery() {
         .count();
     assert_eq!(recoveries, 1, "exactly one recovery edge in the journal");
 
-    // Agent-side seam: the DURABLE recovery above is the runtime's own; the
-    // protocol state is the scripted mock, standing in for a fresh provider
-    // session that accepts prompts again (Invariant 22).
-    rig.protocol.set_state(&wid, AgentState::Idle, None);
-
-    // Recovery tick planned with the pre-recovery worker snapshot, so the
-    // lease lands next tick, and the pump delivers it the tick after —
-    // delivery RESUMES on the same loop that starved it.
-    rt.tick_once(false).await.unwrap();
+    // Recovery and planning share one post-recovery snapshot, so the lease
+    // lands on the reset tick. Crucially, the mock protocol is STILL
+    // RateLimited: a real headless provider has no reason to emit Idle while
+    // parked. The next prompt is what proves the reset and moves it again.
     assert_eq!(
         live_leases(&rig.store),
         vec![(tid_b.to_string(), wid.as_str().to_string())],
