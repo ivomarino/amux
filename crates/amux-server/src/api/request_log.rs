@@ -1274,6 +1274,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/browser/inspect/clear", methods: &["POST"] },
     RouteEntry { path: "/api/browser/search", methods: &["GET"] },
     RouteEntry { path: "/api/browser/sessions", methods: &["GET"] },
+    RouteEntry { path: "/api/browser/history", methods: &["GET"] },
     RouteEntry { path: "/api/browser/pw-profiles", methods: &["GET"] },
     RouteEntry { path: "/api/browser/save-profile", methods: &["POST"] },
     RouteEntry { path: "/api/browser/agent", methods: &["POST"] },
