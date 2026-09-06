@@ -6653,54 +6653,30 @@ pub async fn patch_item(
                     }
                     _ => set_opt("source_ref", &mut next.source_ref, &mut changed),
                 }
-                // A TRIGGER WITH NO VERIFICATION TIME RE-DRAINS FOREVER, SILENTLY.
-                //
-                // board_drive's idle-drain gate is
-                //   COALESCE(source_ref,'')='' OR COALESCE(last_verified_at,0) < now-24h
-                // so a card parked with a source_ref and NO last_verified_at reads as
-                // "trigger nobody has re-checked" on every tick and is offered again,
-                // forever. `amux board <status> --trigger` stamps both. A raw PATCH —
-                // which is the shape ~/.claude/CLAUDE.md's board recipes teach — sets
-                // only the one field, and nothing said so.
-                //
-                // Measured 2026-09-04 by ts-gke, on themselves. They parked TG-3239 by
-                // raw PATCH and eleven other cards with the CLI. The drain served
-                // TG-3239 four times in one session while the eleven stayed quiet, and
-                // they filed a dispatch-ORDERING report against amux on the strength of
-                // it: wrong population, wrong conclusion, wrong recommendation, sent to
-                // a peer. The two calls do the same visible thing and only one stamps.
-                //
-                // TELL THE CALLER, not just the card (AMUX-3791, same reasoning as the
-                // autofix diversion above): the operator saw a 200 and a card that
-                // looked parked. This is the only signal that reaches the person who
-                // can fix it, at the moment they can.
-                if changed.iter().any(|c| c == "source_ref")
-                    && next.source_ref.as_deref().is_some_and(|v| !v.trim().is_empty())
-                    && !map.contains_key("last_verified_at")
+                // An explicit trigger write is the same parking action through
+                // PATCH as through `amux board backlog --trigger`. Requiring the
+                // caller to know about a second field made a successful park
+                // immediately drain again (AMUX-4168). Stamp the action here,
+                // including reasserting the same trigger and autofix diversions.
+                // Explicit timestamps/null still win; unrelated edits never
+                // refresh a trigger and cannot keep a backlog parked forever.
+                if body_str(&map, "source_ref").is_some_and(|v| {
+                    !v.trim().is_empty() && !v.starts_with("autofix:")
+                }) && !map.contains_key("last_verified_at")
                 {
-                    // ITS OWN FIELD, NOT `diverted`. A diversion means "the key
-                    // you named is deliberately not the key that changed"
-                    // (AMUX-3791). Nothing was diverted here: source_ref landed
-                    // exactly where the caller asked. This is an ADVISORY about a
-                    // companion field they did not send.
-                    //
-                    // Overloading `diverted` cost a real regression the same day:
-                    // a_trigger_cannot_overwrite_an_autofix_signature_but_can_
-                    // replace_a_trigger carries a CONTROL asserting an ordinary
-                    // trigger write reports NO diversion, written precisely so
-                    // "a version that emitted the advisory on every source_ref
-                    // write would pass every cell above and train readers to
-                    // ignore a line that cries wolf". It caught this, correctly,
-                    // and the control was right.
+                    next.last_verified_at = Some(now_secs());
+                    if !changed.iter().any(|c| c == "last_verified_at") {
+                        changed.push("last_verified_at".into());
+                    }
+                    tracing::warn!(
+                        card = %next.id,
+                        verdict = "trigger_timestamp_repaired",
+                        "board: explicit trigger write supplied no timestamp; recorded parking time to prevent immediate re-drain"
+                    );
                     advisories.push(json!({
                         "field": "last_verified_at",
-                        "not_set": true,
-                        "why": "source_ref was set without last_verified_at, so board-drive \
-                                reads this card as a trigger nobody has re-checked and will \
-                                re-offer it on every idle tick. `amux board <status> <id> \
-                                --trigger \"...\"` stamps both; a raw PATCH sets only \
-                                source_ref. Send last_verified_at (unix seconds) alongside \
-                                it, or park with the CLI.",
+                        "set_to": next.last_verified_at,
+                        "why": "Recorded the explicit trigger write's parking time, as the CLI does, so auto-drain waits for the trigger recheck window.",
                     }));
                 }
             }

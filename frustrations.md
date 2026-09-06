@@ -3429,3 +3429,37 @@ FIX: Dependency-cleared promotions now carry a narrow todo-ceiling exemption whi
  retaining transition, archive, and gate checks; revisit and ordinary queue additions
  remain capped. Any selected promotion still refused by the transition engine now
  emits a measured `promotion_refused` WARN naming the card and exact refusal.
+
+
+## A successful trigger PATCH immediately puts parked work back in todo
+AREA: board
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-06
+SESSION: amux
+CARD: AMUX-4168
+SYMPTOM: The 48-hour worker audit found explicit source_ref updates retaining an older last_verified_at. GCA-157 was parked at 12:51 and auto-drained at 12:51; its new condition did not start a new parking window. The API returned success plus an advisory instead of completing the parking operation.
+COST: Repeated park/drain cycles and a fleet audit to discover why the workers still looked idle over todo cards.
+FIX: Record parking time in the PATCH transaction for explicit trigger writes, including reassertions and autofix diversions; preserve explicit timestamps/null. Regression and live verification tracked on AMUX-4168.
+
+## Historical dependency prose prevents the worker from reconciling its own queue
+AREA: scheduler
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-06
+SESSION: amux
+CARD: AMUX-4168
+SYMPTOM: Six idle workers had nine todo candidates refused by the prose dependency regex. MS-1253 was blocked by its own ID; MR-21's first historical blocker outranked its newer description of the remaining work. No reconciliation prompt reached these workers.
+COST: Six live worker queues stayed unclaimable while their board cards still said todo; the user had to request another fleet investigation.
+FIX: Keep structured dependencies authoritative and deliver ambiguous prose as a dependency-recheck prompt, with a named WARN verdict, instead of vetoing pickup. Regression and live verification tracked on AMUX-4168.
+
+## Stale-WIP recovery immediately assigns the same card again
+AREA: scheduler
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-06
+SESSION: amux
+CARD: AMUX-4168
+SYMPTOM: BR-51 was reclaimed at 04:25 and picked again at 04:26, then reclaimed at 10:26 and picked again at 10:27. Selection ignores pickup.reclaimed_stale when applying its per-card cooldown, so recovery does not yield to the other queued work.
+COST: Two six-hour recovery cycles left byo-ray holding the same WIP slot over eight/nine eligible todo candidates.
+FIX: Apply the existing bounded per-card cooldown to the reclaim event too, and log stale_reclaim_yields_to_next_card. Regression and live verification tracked on AMUX-4168.

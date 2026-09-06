@@ -939,10 +939,9 @@ pub fn irreversible_op(blob: &str) -> Option<String> {
     re.find(blob).map(|m| m.as_str().trim().to_string())
 }
 
-/// py:14566 — the PROSE dependency fallback. Fires ONLY when `depends_on` is
-/// empty: a card id in prose is ambiguous by nature (MG-1363's blocker names a
-/// card in words while the only ID in it is the EPIC it cites for authority), so
-/// a prose match can be the right answer via the wrong mechanism.
+/// Find a possible dependency mention for a worker-facing recheck hint only.
+/// Never use prose to veto pickup: historical logs, self-references and citations
+/// cannot establish the current dependency graph. `depends_on` is authoritative.
 pub fn prose_dependency(blob: &str) -> Option<String> {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
@@ -975,9 +974,8 @@ pub fn prose_dependency(blob: &str) -> Option<String> {
     //
     // `this`/`these`/`the above` between the phrase and the id is the tell: the
     // subject of the dependency is THIS card, so the id named is the dependent,
-    // not the blocker. Deliberately narrow — it rejects a reversed reading
-    // rather than trying to parse the sentence, and when it is unsure it still
-    // blocks, which is the safe direction for a dispatch gate.
+    // not the blocker. This narrows the hint without making a dispatch
+    // decision: ambiguous prose remains context for the worker to reconcile.
     let c = re.captures(blob)?;
     let whole = c.get(0)?.as_str();
     let id = c.get(1)?.as_str();
@@ -1055,11 +1053,10 @@ mod prose_direction_tests {
         );
     }
 
-    /// The forward direction must still block, or the fix trades a stalled lane
-    /// for a dispatch that ignores real dependencies — strictly worse, and
-    /// invisible until something ships out of order.
+    /// Forward dependency language remains useful context for a recheck hint.
+    /// The selector tests below cover the structured execution gate separately.
     #[test]
-    fn a_real_blocker_still_blocks() {
+    fn forward_dependency_language_is_reported_as_a_hint() {
         // AMUX-2950 closed both gaps these fixtures originally mis-asserted:
         // the phrase match is now case-insensitive (scoped, so the ID class is
         // not) and takes "waiting" as well as "wait/waits". Widened only after
@@ -1076,7 +1073,7 @@ mod prose_direction_tests {
             assert_eq!(
                 prose_dependency(blob),
                 Some("BACKE-3276".to_string()),
-                "must still block: {blob:?}"
+                "must still surface the hint: {blob:?}"
             );
         }
     }
@@ -1356,11 +1353,11 @@ const DISPATCHABLE_WHERE: &str = "i.session=?1 AND i.status='todo' \
      AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id \
                      AND lower(t.tag) LIKE 'needs:you%') \
      AND i.updated >= ?2 \
-     AND NOT EXISTS (SELECT 1 FROM session_events e WHERE e.type='task.claimed' \
+     AND NOT EXISTS (SELECT 1 FROM session_events e WHERE e.type IN ('task.claimed','pickup.reclaimed_stale') \
                      AND e.ts > ?3 AND e.data LIKE '%\"' || i.id || '\"%')";
 
 /// py:14403 — the count over EXACTLY the rows pickup selects from, via
-/// [`DISPATCHABLE_WHERE`]. Per-card refusals (junk shells, prose deps) still
+/// [`DISPATCHABLE_WHERE`]. Per-card refusals (junk shells, structured deps) still
 /// happen inside the loop and surface as `all-candidates-refused` — an honest
 /// difference, since those are judgments about a card, not queue membership.
 fn eligible_todo_count(conn: &Connection, session: &str, now: f64) -> i64 {
@@ -2942,32 +2939,6 @@ pub fn select_pickup_with(
             skipped.push(format!("{id} has no next_action (continuation gate)"));
             continue;
         }
-        // Prose fallback fires ONLY when the structured field is empty.
-        if row.depends_on.is_empty() {
-            let hay = format!("{}\n{}", row.title, blob_desc);
-            if let Some(dep) = prose_dependency(&hay) {
-                let dep_status: Option<String> = conn
-                    .query_row(
-                        "SELECT status FROM issues WHERE id=?1 AND deleted IS NULL",
-                        rusqlite::params![dep],
-                        |r| r.get(0),
-                    )
-                    .optional()
-                    .ok()
-                    .flatten();
-                let open = matches!(
-                    dep_status.as_deref().map(bs::parse_status),
-                    Some(Some(s)) if !matches!(s, TaskStatus::Done | TaskStatus::Verified | TaskStatus::Discarded)
-                );
-                if open {
-                    skipped.push(format!(
-                        "{id} prose-blocked by {dep} — POPULATE depends_on (prose cannot \
-                         distinguish a dependency from a citation)"
-                    ));
-                    continue;
-                }
-            }
-        }
         let junk = pickup_junk_reason(&row.title, &row.desc, row.log.as_deref().unwrap_or(""));
         if !junk.is_empty() {
             shells.push((id.clone(), row.title.chars().take(70).collect()));
@@ -2979,10 +2950,31 @@ pub fn select_pickup_with(
             skipped.push(format!("{id} declined — names an irreversible operation ('{op}')"));
             continue;
         }
-        return Pickup::Claim {
-            card: id.clone(),
-            prompt: pickup_prompt(conn, session, &row),
-        };
+        let mut prompt = pickup_prompt(conn, session, &row);
+        // Prose is evidence for the worker to assess, not a dependency graph.
+        // The old veto stranded six live lanes, including MS-1253 "blocked"
+        // by itself and MR-21 held by a superseded note (AMUX-4168). Structured
+        // dependencies above still gate execution. Give ambiguous cards a turn
+        // to reconcile their current blocker instead of withholding them forever.
+        if row.depends_on.is_empty() {
+            let hay = format!("{}\n{}", row.title, blob_desc);
+            if let Some(dep) = prose_dependency(&hay) {
+                tracing::warn!(
+                    session, card = %id, mentioned = %dep,
+                    verdict = "prose_dependency_requires_recheck",
+                    "board_drive: historical dependency text requires worker judgment; dispatching reconciliation instead of silently vetoing the card"
+                );
+                prompt.push_str(&format!(
+                    "\n\n[dependency recheck] Historical text mentions {dep}, but this card has no \
+                     structured depends_on. Read the full card and its latest updates before acting. \
+                     Establish the CURRENT blocker; do not execute work whose prerequisite is unmet. \
+                     Record actual board dependencies in depends_on. For an external wait, use \
+                     `amux board backlog {id} --trigger \"<current condition>\"`, then continue \
+                     independent ready work. A citation, self-reference or superseded note is not a blocker."
+                ));
+            }
+        }
+        return Pickup::Claim { card: id.clone(), prompt };
     }
 
     // Every candidate was refused. If the refusals were capture shells, dispatch
@@ -5284,11 +5276,17 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                         "board-drive",
                     )
                     .await;
+                    tracing::warn!(
+                        session = lane, card = %card, blocking,
+                        cooldown_s = reclaim_cooldown_s(),
+                        verdict = "stale_reclaim_yields_to_next_card",
+                        "board_drive: stale WIP released; reclaimed card is cooling down so another card can run"
+                    );
                     LaneTrace::acted(
                         lane,
                         "reclaim-stale",
                         &card,
-                        format!("{card} untouched {held_h:.1}h -> todo; {blocking} card(s) unblocked"),
+                        format!("{card} untouched {held_h:.1}h -> todo; cooling down for {:.0}s so {blocking} other card(s) can run", reclaim_cooldown_s()),
                     )
                     .with_counts(eligible, open)
                 }
@@ -7351,6 +7349,67 @@ mod tests {
             Pickup::Claim { card, .. } => Some(card),
             _ => None,
         }
+    }
+
+    #[test]
+    fn historical_prose_reaches_each_stranded_worker_for_dependency_recheck() {
+        // Real refusal identities from the 48h audit. Keep the text small and
+        // exercise selection, not the regex in isolation: its match is a hint.
+        for (lane, card, dep) in [
+            ("amux-frustrations", "AF-298", "AF-398"),
+            ("amux-gtm", "AG-39", "AG-41"),
+            ("general-canvas-apps", "GCA-157", "CO-237"),
+            ("mixpeek-frustrations", "MF-841", "BACKE-3872"),
+            ("mixpeek-security", "MS-1253", "MS-1253"),
+            ("mixpeek-security", "MS-1273", "MG-1578"),
+            ("mvs-research", "MR-21", "MR-17"),
+            ("mvs-research", "MR-112", "MI-5201"),
+            ("mvs-research", "MR-148", "BACKE-3836"),
+        ] {
+            let conn = board_db();
+            if dep != card {
+                add_card(&conn, dep, "peer", "needsyou", "Owner decision", "SCOPE: decide");
+            }
+            add_card(&conn, card, lane, "todo", "Recheck remaining work",
+                &format!("SCOPE: reconcile current prerequisites. Historically blocked by {dep}."));
+            match select_pickup_with(&conn, lane, now_f64(), false) {
+                Pickup::Claim { card: picked, prompt } => {
+                    assert_eq!(picked, card, "{lane}");
+                    assert!(prompt.contains("[dependency recheck]"), "{lane}: {prompt}");
+                    assert!(prompt.contains("do not execute work whose prerequisite is unmet"), "{lane}");
+                    assert!(prompt.contains("independent ready work"), "{lane}");
+                }
+                other => panic!("{lane}/{card} must receive a reconciliation turn: {other:?}"),
+            }
+            if dep != card {
+                // The SAME board with an explicit dependency still refuses it.
+                conn.execute("UPDATE issues SET depends_on=?1 WHERE id=?2",
+                    rusqlite::params![json!([dep]).to_string(), card]).unwrap();
+                assert!(matches!(select_pickup_with(&conn, lane, now_f64(), false),
+                    Pickup::None { reason: "all-candidates-refused", .. }),
+                    "{lane}: an unresolved structured dependency must still block");
+            }
+        }
+    }
+
+    #[test]
+    fn stale_reclaim_cools_the_reclaimed_card_so_the_next_card_runs() {
+        let conn = board_db();
+        let now = now_f64();
+        add_card(&conn, "BR-51", "byo-ray", "todo", "Reclaimed old card", "SCOPE: x");
+        add_card(&conn, "BR-142", "byo-ray", "todo", "Independent queued work", "SCOPE: y");
+        conn.execute("UPDATE issues SET pos=-100 WHERE id='BR-51'", []).unwrap();
+        assert_eq!(claimed(&select_pickup_with(&conn, "byo-ray", now, false)), Some("BR-51"),
+            "control: without the reclaim event the old card wins");
+        conn.execute("INSERT INTO session_events (ts,session,type,data) VALUES (?1,'byo-ray', \
+            'pickup.reclaimed_stale','{\"issue\":\"BR-51\"}')", [now]).unwrap();
+        assert_eq!(eligible_todo_count(&conn, "byo-ray", now), 1);
+        assert_eq!(claimed(&select_pickup_with(&conn, "byo-ray", now, false)), Some("BR-142"),
+            "recovery must unblock different work, not immediately reclaim the same card");
+        let later = now + reclaim_cooldown_s() + 1.0;
+        assert_eq!(eligible_todo_count(&conn, "byo-ray", later), 2);
+        assert_eq!(claimed(&select_pickup_with(&conn, "byo-ray", later, false)), Some("BR-51"),
+            "reclaimed work stays reachable after its bounded cooldown");
     }
 
     // ---- pickup scoring (AMUX-3779) --------------------------------------

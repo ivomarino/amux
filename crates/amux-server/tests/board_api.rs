@@ -3968,71 +3968,59 @@ async fn overwriting_a_trigger_records_the_value_it_destroyed() {
     );
 }
 
-// AF-469. A trigger with no verification time re-drains FOREVER, and nothing said
-// so. board_drive's idle gate is "source_ref is empty OR last_verified_at is older
-// than 24h", so a card parked with source_ref alone reads as a trigger nobody has
-// re-checked on every single tick.
-//
-// `amux board <status> --trigger` stamps BOTH fields. A raw PATCH — the shape the
-// CLAUDE.md board recipes teach — sets only source_ref. The two calls do the same
-// visible thing and the operator sees a 200 either way.
-//
-// Measured 2026-09-04 by ts-gke on themselves: TG-3239 parked by raw PATCH was
-// served four times in one session while eleven cards parked with the CLI stayed
-// quiet. They filed a dispatch-ORDERING report on the strength of it — wrong
-// population, wrong conclusion, wrong recommendation, sent to a peer — and the
-// whole split was which call recorded the same act.
+// AMUX-4168: a successful parking PATCH must have the same drain behavior as
+// the CLI. An advisory alone left the card immediately dispatchable.
 #[tokio::test]
-async fn parking_with_a_trigger_and_no_verification_time_warns_the_caller() {
-    let (app, _dir) = app();
-    let mk = |title: &str| {
-        let app = &app;
-        let t = title.to_string();
-        async move {
-            let (_s, _h, c) = send_with(app, "POST", "/api/board",
-                Some(json!({"title": t, "status": "todo", "session": "amux"})),
-                &[("X-Amux-Session", "amux")]).await;
-            c["id"].as_str().unwrap().to_string()
-        }
-    };
+async fn parking_with_a_trigger_records_time_and_prevents_immediate_redrain() {
+    use amux_server::runtime_jobs::board_drive::{select_pickup_with, Pickup};
+    let (app, store, _dir) = app_with_store();
+    let lane = "trigger-repair-fixture";
+    let (_, _, card) = send_with(&app, "POST", "/api/board",
+        Some(json!({"title": "Verify the next engine rollout", "status": "backlog",
+            "session": lane, "owner_type": "agent", "desc": "SCOPE: verify the rollout"})),
+        &[("X-Amux-Session", lane)]).await;
+    let id = card["id"].as_str().expect("created card");
+    let path = format!("/api/board/{id}");
+    let now = amux_server::config::now_f64();
+    let (st, _, body) = send_with(&app, "PATCH", &path,
+        Some(json!({"source_ref": "the next engine rollout"})),
+        &[("X-Amux-Session", lane)]).await;
+    assert!(st.is_success(), "{body}");
+    assert!(body["last_verified_at"].as_i64().unwrap_or(0) >= now as i64, "{body}");
+    assert!(body["advisories"].as_array().unwrap().iter().any(|a|
+        a["field"] == "last_verified_at" && a["set_to"].is_i64()), "{body}");
+    let conn = store.read().unwrap();
+    assert!(matches!(select_pickup_with(&conn, lane, now, false),
+        Pickup::None { reason: "no-eligible-card", .. }), "a parked card must stay parked");
+    drop(conn);
 
-    // THE FOOT-GUN: source_ref alone, exactly as a raw curl PATCH sends it.
-    let id = mk("parked by raw patch").await;
-    let (st, _h, body) = send_with(&app, "PATCH", &format!("/api/board/{id}"),
-        Some(json!({"source_ref": "the next ts-engine roll"})),
-        &[("X-Amux-Session", "amux")]).await;
-    assert!(st.is_success(), "the write must still succeed: {body}");
-    // `advisories`, NOT `diverted_fields`. The first version of this fix put the
-    // note in `diverted`, and the control in
-    // a_trigger_cannot_overwrite_an_autofix_signature_but_can_replace_a_trigger
-    // caught it — that control asserts an ordinary trigger write reports NO
-    // diversion, and exists so an advisory cannot fire on every source_ref write
-    // and train readers to ignore it. A diversion means "the key you named is not
-    // the key that changed"; nothing was diverted here.
-    let warned = body["advisories"].as_array().map(|a| a.iter().any(|d| {
-        d["field"] == "last_verified_at" && d["why"].as_str().unwrap_or("").contains("re-offer it")
-    })).unwrap_or(false);
-    assert!(warned, "a trigger with no last_verified_at must warn the caller: {body}");
+    // Reasserting the SAME condition must repair an old/missing timestamp too.
+    let (_, _, body) = send_with(&app, "PATCH", &path,
+        Some(json!({"last_verified_at": 1})), &[("X-Amux-Session", lane)]).await;
+    assert_eq!(body["last_verified_at"], 1);
+    let (_, _, body) = send_with(&app, "PATCH", &path,
+        Some(json!({"source_ref": "the next engine rollout"})),
+        &[("X-Amux-Session", lane)]).await;
+    assert!(body["last_verified_at"].as_i64().unwrap_or(0) >= now as i64, "{body}");
 
-    // AND IT NAMES THE FIX, because a warning that does not is a warning that gets
-    // read once and ignored.
-    let why = body["advisories"][0]["why"].as_str().unwrap_or("");
-    assert!(why.contains("--trigger"), "the warning must name the verb that stamps both: {why}");
-
-    // THE CLI's SHAPE: both fields together. Must stay SILENT, or the warning fires
-    // on the correct path and becomes noise on every park.
-    let id2 = mk("parked by the CLI").await;
-    let (_s, _h, body2) = send_with(&app, "PATCH", &format!("/api/board/{id2}"),
-        Some(json!({"source_ref": "the next ts-engine roll", "last_verified_at": 1788510477i64})),
-        &[("X-Amux-Session", "amux")]).await;
-    let quiet = body2["advisories"].as_array().map(|a| a.iter().all(|d| d["field"] != "last_verified_at")).unwrap_or(true);
-    assert!(quiet, "the CLI shape stamps both and must not warn: {body2}");
-
-    // CLEARING a trigger is not parking, so it must stay silent too.
-    let (_s, _h, body3) = send_with(&app, "PATCH", &format!("/api/board/{id}"),
-        Some(json!({"source_ref": ""})), &[("X-Amux-Session", "amux")]).await;
-    let quiet3 = body3["advisories"].as_array().map(|a| a.iter().all(|d| d["field"] != "last_verified_at")).unwrap_or(true);
-    assert!(quiet3, "clearing a trigger must not warn about verification time: {body3}");
+    // Explicit timestamps (including null) are intentional and stay authoritative.
+    for explicit in [json!(1788510477i64), Value::Null] {
+        let (_, _, body) = send_with(&app, "PATCH", &path,
+            Some(json!({"source_ref": "the next engine rollout", "last_verified_at": explicit})),
+            &[("X-Amux-Session", lane)]).await;
+        assert_eq!(body["last_verified_at"], explicit, "{body}");
+        assert!(body["advisories"].as_array().is_none_or(|a|
+            a.iter().all(|a| a["field"] != "last_verified_at")), "{body}");
+    }
+    // Updating prose is not re-verifying a trigger. Clearing it is not parking.
+    for patch in [json!({"desc_append": "An unrelated progress note."}), json!({"source_ref": ""})] {
+        let (_, _, body) = send_with(&app, "PATCH", &path, Some(patch),
+            &[("X-Amux-Session", lane)]).await;
+        assert_eq!(body["last_verified_at"], Value::Null, "{body}");
+    }
+    let conn = store.read().unwrap();
+    assert!(matches!(select_pickup_with(&conn, lane, now, false), Pickup::DrainBacklog { .. }),
+        "control: clearing the trigger must make the backlog drainable again");
 }
 
 // AF-475. Posting an artifact to a card that does not exist answered
