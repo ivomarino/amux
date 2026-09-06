@@ -4765,6 +4765,23 @@ mod tests {
         );
     }
 
+    /// MC-1627's REPORTED INSTANCE, encoded so the specific report cannot
+    /// regress silently. mixpeek-cicd received a notice naming them on
+    /// `server/tests/unit/scripts/mvs/test_mvs_write_phase_governor.py`, a file
+    /// they had never opened; `git log --all` showed ONE commit, ed4187d169,
+    /// trailer mvs-infra. The per-path line was already correct — it named the
+    /// trailer, the sha and the peer. The HEADLINE above it said the staged set
+    /// held files "whose edit records are YOURS", and that is the line they read.
+    #[test]
+    fn mc_1627s_reported_instance_no_longer_gets_a_possessive_headline() {
+        let h = victim_headline(
+            &[PathFate::AbsorbedBy("ed4187d1".into(), "mvs-infra".into())],
+            "mixpeek-cicd",
+        );
+        assert!(!h.contains("YOURS"), "the reported instance still over-claims: {h}");
+        assert!(h.contains("NONE"), "one path, all disowned, must say so plainly: {h}");
+    }
+
     /// The CONTROL that keeps the above from being satisfied by never saying
     /// YOURS. An absorption BY THE OWNER is not a disownment — same variant,
     /// opposite meaning — and AtRisk/LandedOnOrigin are not disownments either.
