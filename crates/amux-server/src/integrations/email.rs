@@ -1794,6 +1794,47 @@ pub fn email_log(home: &Path, mut record: Value) {
 /// Read the ledger (GET /api/email/log): `days` window, `limit` cap,
 /// optional session filter (`unattributed` matches records sent without the
 /// header). Response shape identical to Python.
+/// Did this row's email actually DEPART? (AF-538)
+///
+/// The ledger records an attempt and a departure in the same stream, and until
+/// now the ONLY thing separating them was the ABSENCE of a `blocked` key. That
+/// is the one shape a defensive reader never probes: `row.get("blocked")` on a
+/// departed row returns None, correctly, and `row.get("delivered")` returned
+/// None on BOTH, so nobody reached for it. Four consumers across three lanes got
+/// it wrong independently, and one of them recorded a lead as contacted who had
+/// received nothing.
+///
+/// DERIVED AT READ TIME, deliberately, and this is the whole design. A field
+/// stamped at write time would be absent on every historical row, and absent is
+/// falsy, so the entire backlog would read as NOT delivered — the exact
+/// inversion, silently, on the population nobody checks (gtm-ticker's point, and
+/// it is the difference between the fix and the same bug one layer down).
+///
+/// Measured over the live store, 500 rows / 90 days, the four arms partition it
+/// exactly: 382 departed, 18 approved-then-departed, 63 parked, 37 rejected, and
+/// ZERO carrying none of the discriminators. The `unknown` arm has never fired;
+/// it exists so that if it ever does, the count in the envelope says so rather
+/// than the row quietly reading as not-delivered.
+pub fn row_delivered(rec: &Value) -> (bool, &'static str) {
+    // A refusal writes `via: "refused"` AND `refused: true`, so it has a `via`
+    // and must be checked BEFORE the via arm or it reads as a departure.
+    if rec.get("refused").and_then(Value::as_bool) == Some(true)
+        || rec.get("via").and_then(Value::as_str) == Some("refused")
+    {
+        return (false, "refused");
+    }
+    if rec.get("rejected").and_then(Value::as_bool) == Some(true) {
+        return (false, "rejected");
+    }
+    if rec.get("blocked").and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty()) {
+        return (false, "parked");
+    }
+    match rec.get("via").and_then(Value::as_str) {
+        Some(v) if !v.trim().is_empty() => (true, "departed"),
+        _ => (false, "unknown"),
+    }
+}
+
 pub fn read_email_log(home: &Path, days: i64, limit: usize, session_filter: &str) -> Value {
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(days))
         .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
@@ -1816,8 +1857,40 @@ pub fn read_email_log(home: &Path, days: i64, limit: usize, session_filter: &str
             out.push(rec);
         }
     }
-    let keep: Vec<Value> = out.iter().rev().take(limit).cloned().collect();
-    json!({ "count": keep.len(), "days": days, "log": keep })
+    let total = out.len();
+    let mut keep: Vec<Value> = out.iter().rev().take(limit).cloned().collect();
+    // Every row carries the verdict, on BOTH shapes, so a naive read is right by
+    // default and a wrong one is a missing key rather than a silent None.
+    let mut undetermined = 0usize;
+    let mut departed = 0usize;
+    for rec in &mut keep {
+        let (ok, why) = row_delivered(rec);
+        if why == "unknown" {
+            undetermined += 1;
+        }
+        if ok {
+            departed += 1;
+        }
+        rec["delivered"] = json!(ok);
+        rec["delivered_reason"] = json!(why);
+    }
+    json!({
+        "count": keep.len(),
+        "days": days,
+        // AF-538 constraint 7: 500 is a HARD CAP, not a default, and `count`
+        // agreed with the truncation — so the number confirmed the wrong answer
+        // and the only way to find the ceiling was to ask twice and notice it
+        // stopped moving. In the BODY, not a header: every consumer of this
+        // endpoint pipes the body into python, where a header cannot reach them.
+        "total": total,
+        "truncated": total > keep.len(),
+        "delivered_count": departed,
+        // Has never been non-zero. If it is, the derivation has met a row shape
+        // it cannot classify, and that must be visible beside the answer rather
+        // than collapsing into `delivered: false`.
+        "undetermined": undetermined,
+        "log": keep,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1827,6 +1900,106 @@ pub fn read_email_log(home: &Path, days: i64, limit: usize, session_filter: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AF-538. The four arms measured over the live store, 500 rows / 90 days:
+    /// 382 departed, 18 approved-then-departed, 63 parked, 37 rejected, ZERO
+    /// with no discriminator. Each arm is asserted, because a rule that only
+    /// ever sees one shape is not a rule.
+    #[test]
+    fn every_ledger_row_shape_gets_a_delivery_verdict() {
+        // Departure: the 310-row shape.
+        let dep = json!({"via":"gmail","thread_id":"t","body_chars":42,"endpoint":"send"});
+        assert_eq!(row_delivered(&dep), (true, "departed"));
+
+        // Approved, then departed: carries approval_id AND via. Must NOT be
+        // read as a park just because an approval was involved.
+        let app = json!({"via":"gmail","approved":true,"approval_id":"apr_1","thread_id":"t"});
+        assert_eq!(row_delivered(&app), (true, "departed"));
+
+        // Park: the shape that four consumers read as a send.
+        let park = json!({"blocked":"approval_required","approval_id":"apr_1","endpoint":"send"});
+        assert_eq!(row_delivered(&park), (false, "parked"));
+
+        // Rejected by a human: no via, no blocked.
+        let rej = json!({"rejected":true,"rejected_by":"dashboard","approval_id":"apr_1"});
+        assert_eq!(row_delivered(&rej), (false, "rejected"));
+    }
+
+    /// A refusal carries `via: "refused"` AND `refused: true`, so it HAS a via
+    /// and reads as a departure if the via arm runs first. Ordering, asserted.
+    #[test]
+    fn a_refusal_is_not_a_departure_even_though_it_carries_a_via() {
+        let by_flag = json!({"via":"refused","refused":true,"endpoint":"send"});
+        assert_eq!(row_delivered(&by_flag), (false, "refused"));
+        // Either marker alone is enough; neither is load-bearing on the other.
+        assert_eq!(row_delivered(&json!({"via":"refused"})), (false, "refused"));
+        assert_eq!(
+            row_delivered(&json!({"refused":true,"via":"gmail"})),
+            (false, "refused"),
+            "the explicit flag must win over a via that says otherwise"
+        );
+    }
+
+    /// The arm that has never fired. It must NOT collapse into a plain
+    /// `delivered: false`, because that is indistinguishable from a real park
+    /// and is the direction that loses information silently (ethos rule 4).
+    #[test]
+    fn a_row_with_no_discriminator_is_unknown_and_not_quietly_undelivered() {
+        let (ok, why) = row_delivered(&json!({"endpoint":"send","ts":"2026-01-01"}));
+        assert!(!ok);
+        assert_eq!(why, "unknown", "an unclassifiable row must say so, not read as parked");
+        // An empty via is not a departure either.
+        assert_eq!(row_delivered(&json!({"via":"  "})), (false, "unknown"));
+        // ...and a blank `blocked` is not a park.
+        assert_eq!(row_delivered(&json!({"blocked":"","via":"gmail"})), (true, "departed"));
+    }
+
+    /// The envelope must disclose its own truncation. 500 is a HARD CAP and
+    /// `count` agreed with it, so the number confirmed the wrong answer.
+    #[test]
+    fn the_envelope_says_when_it_truncated_and_how_many_it_had() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let mut lines = String::new();
+        // A MIX, deliberately. A fixture of departures only lets `delivered = true`
+        // and `reason = "departed"` be hardcoded and still pass — measured: both
+        // mutations survived until this fixture stopped being uniform.
+        for i in 0..7 {
+            lines.push_str(&format!(
+                "{}
+",
+                json!({"ts": now, "via":"gmail", "session":"s", "id": i})
+            ));
+        }
+        for i in 7..10 {
+            lines.push_str(&format!(
+                "{}
+",
+                json!({"ts": now, "blocked":"approval_required", "session":"s", "id": i})
+            ));
+        }
+        std::fs::write(email_log_path(dir.path()), lines).unwrap();
+
+        let all = read_email_log(dir.path(), 7, 100, "");
+        assert_eq!(all["total"], json!(10));
+        assert_eq!(all["truncated"], json!(false), "not truncated when the limit is not reached");
+        assert_eq!(all["delivered_count"], json!(7), "3 of the 10 are parks, not sends");
+        let parked = all["log"].as_array().unwrap().iter()
+            .filter(|r| r["delivered"] == json!(false)).count();
+        assert_eq!(parked, 3, "each park carries its OWN delivered:false, not just a count");
+        assert_eq!(all["undetermined"], json!(0));
+
+        let cut = read_email_log(dir.path(), 7, 3, "");
+        assert_eq!(cut["count"], json!(3));
+        assert_eq!(cut["total"], json!(10), "total must survive the limit, or truncation is invisible");
+        assert_eq!(cut["truncated"], json!(true));
+        // And every returned row carries the verdict, not just the envelope.
+        for r in cut["log"].as_array().unwrap() {
+            assert_eq!(r["delivered"], json!(false), "newest-first, so a limit of 3 returns the parks");
+            assert_eq!(r["delivered_reason"], json!("parked"));
+        }
+    }
 
     /// AMUX-3203 / amux-cloud 2026-08-16: the alert email picked the FIRST-
     /// ALPHABETICAL account, whose refresh_token was dead, while a fresh account

@@ -553,7 +553,8 @@ pub async fn send(
                     }),
                 );
                 Json(json!({
-                    "ok": true, "to": to, "subject": subject, "from": from_acct,
+                    "ok": true, "delivered": true, "delivered_reason": "departed",
+                    "to": to, "subject": subject, "from": from_acct,
                     "cc": if cc.is_empty() { Value::Null } else { json!(cc) },
                     "via": "gmail",
                     "id": res.get("id").cloned().unwrap_or(Value::Null),
@@ -626,7 +627,8 @@ pub async fn reply(
     }
     if dry_run {
         return Json(json!({
-            "ok": true, "dry_run": true, "would_reply_to": message_id,
+            "ok": true, "delivered": false, "delivered_reason": "dry_run",
+            "dry_run": true, "would_reply_to": message_id,
             "resolved": resolved,
             "note": "no email sent — repeat without dry_run to send",
         }))
@@ -732,7 +734,8 @@ pub async fn reply(
                     }),
                 );
                 Json(json!({
-                    "ok": true, "message_id": message_id, "reply_all": reply_all,
+                    "ok": true, "delivered": true, "delivered_reason": "departed",
+                    "message_id": message_id, "reply_all": reply_all,
                     "to": res.get("to").cloned().unwrap_or(Value::Null),
                     "subject": res.get("subject").cloned().unwrap_or(Value::Null),
                     "from": gmail_from, "via": "gmail",
@@ -758,6 +761,13 @@ fn approval_required_response(id: &str, preview: Value) -> Response {
         StatusCode::FORBIDDEN,
         Json(json!({
             "ok": false,
+            // AF-538. This shape carried `blocked`/`code` and NO `error`, so
+            // `if d.get("error")` waved a PARKED send through as a send —
+            // that is exactly how a parked founder email was appended to a
+            // SENT ledger. `delivered` is present on BOTH shapes so the naive
+            // read is right by default rather than reading an absent key.
+            "delivered": false,
+            "delivered_reason": "parked",
             "code": "approval_required",
             "approval_id": id,
             "preview": preview,
@@ -835,7 +845,8 @@ pub async fn reject(
             );
             (
                 StatusCode::OK,
-                Json(json!({ "ok": true, "rejected": true, "approval_id": id,
+                Json(json!({ "ok": true, "delivered": false,
+                    "delivered_reason": "rejected", "rejected": true, "approval_id": id,
                              "was_for_session": session })),
             )
                 .into_response()
@@ -1065,7 +1076,8 @@ pub async fn approve(
                 }),
             );
             Json(json!({
-                "ok": true, "approved": true, "approval_id": id,
+                "ok": true, "delivered": true, "delivered_reason": "departed",
+                "approved": true, "approval_id": id,
                 "sent_for_session": session,
                 "id": res.get("id").cloned().unwrap_or(Value::Null),
                 "thread_id": res.get("thread_id").cloned().unwrap_or(Value::Null),
