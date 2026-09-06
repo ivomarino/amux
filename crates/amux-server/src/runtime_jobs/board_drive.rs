@@ -8666,7 +8666,10 @@ mod tests {
         add_card(&conn2, "D-2", "lane", "doing", "waiting on a decision", "SCOPE: x");
         tag(&conn2, "D-2", "needs:you:decision", now);
         add_card(&conn2, "T-2", "lane", "todo", "next", "SCOPE: x\n- [ ] y");
-        assert_eq!(claimed(&select_pickup(&conn2, "lane", now)), Some("T-2"));
+        assert_eq!(
+            claimed(&select_pickup_with(&conn2, "lane", now, false)),
+            Some("T-2")
+        );
     }
 
     /// An armed tripwire "costs nothing until it fires" and can never be
@@ -9370,7 +9373,9 @@ mod tests {
         // this test is measuring the filter and not a prompt that never quotes.
         let conn2 = board_db();
         add_card(&conn2, "T-2", "lane", "todo", "Fix the logo", "SCOPE: real work\n- [ ] do it");
-        let Pickup::Claim { prompt: p2, .. } = select_pickup(&conn2, "lane", now_f64()) else {
+        let Pickup::Claim { prompt: p2, .. } =
+            select_pickup_with(&conn2, "lane", now_f64(), false)
+        else {
             panic!("expected a claim");
         };
         assert!(p2.contains("- [ ] do it"), "ordinary card text must be quoted: {p2}");

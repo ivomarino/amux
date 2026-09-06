@@ -21,11 +21,23 @@ const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
 const IS_WINDOWS = process.platform === 'win32';
 if (!IS_WINDOWS) process.umask(0o077);
-const RUNTIME_DIR = IS_WINDOWS
+const RUNTIME_BASE = IS_WINDOWS
   ? resolve(homedir(), '.cache', 'cdp')
   : process.env.XDG_RUNTIME_DIR
     ? resolve(process.env.XDG_RUNTIME_DIR, 'cdp')
     : resolve(homedir(), '.cache', 'cdp');
+// One cache/socket namespace per explicitly selected browser. `pages.json`
+// used to be shared across every CDP_PORT, so `list` on profile C overwrote
+// the targets that the next command for profiles A/B resolved against. That
+// made the documented AMUX_PROFILE/CDP_PORT path single-browser in practice.
+// Default Chrome keeps the historical path; only explicit multi-browser
+// callers get a scoped directory.
+const RUNTIME_SCOPE = process.env.CDP_PORT
+  ? `port-${String(process.env.CDP_PORT).replace(/[^0-9]/g, '')}`
+  : process.env.AMUX_PROFILE
+    ? `amux-${process.env.AMUX_PROFILE.replace(/[^a-zA-Z0-9_.-]/g, '_')}`
+    : '';
+const RUNTIME_DIR = RUNTIME_SCOPE ? resolve(RUNTIME_BASE, RUNTIME_SCOPE) : RUNTIME_BASE;
 try { mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 }); } catch {}
 const PAGES_CACHE = resolve(RUNTIME_DIR, 'pages.json');
 
@@ -73,23 +85,30 @@ function amuxCdpPort() {
   }
   let st;
   try { st = JSON.parse(body); } catch { throw new Error(`AMUX_PROFILE=${want}: amux returned non-JSON: ${body.slice(0, 200)}`); }
-  if (!st.running || !st.cdp_port) {
+  const browsers = Array.isArray(st.browsers) && st.browsers.length
+    ? st.browsers
+    : (st.running && st.cdp_port ? [st] : []);
+  if (!browsers.length) {
     throw new Error(
       `AMUX_PROFILE=${want}: no amux browser is running. Start one:\n` +
       `  curl -sk -X POST -H 'Content-Type: application/json' -H "X-Amux-Session: $AMUX_SESSION" \\\n` +
       `       -d '{"profile":"${want}","url":"about:blank"}' ${base}/api/browser/start`);
   }
-  // NAME THE MISMATCH rather than driving the wrong profile. One browser runs
-  // at a time, so asking for `netsuite` while `lob` is up must not silently
-  // hand you `lob`'s logged-in session — that is somebody else's staged state.
-  if (st.profile && st.profile !== want) {
+  const selected = browsers.find(b => b.profile === want);
+  // NAME THE MISMATCH rather than driving the wrong profile. The server now
+  // supports multiple simultaneous saved profiles; the legacy top-level
+  // `profile`/`cdp_port` fields describe only one of them and therefore cannot
+  // answer this lookup safely.
+  if (!selected) {
+    const available = browsers.map(b => b.profile || '(unnamed)').join(', ');
     throw new Error(
-      `AMUX_PROFILE=${want}: the running amux browser is profile '${st.profile}' ` +
-      `(started by ${st.started_by || 'unknown'}). Refusing to drive a different profile ` +
-      `than you asked for. Use AMUX_PROFILE=${st.profile}, or take it over deliberately ` +
-      `with {"profile":"${want}","takeover":true} on /api/browser/start.`);
+      `AMUX_PROFILE=${want}: no running browser matches that profile. ` +
+      `Running profiles: ${available}. Refusing to drive a different saved login.`);
   }
-  return Number(st.cdp_port);
+  if (!selected.cdp_port) {
+    throw new Error(`AMUX_PROFILE=${want}: the matching browser reported no cdp_port`);
+  }
+  return Number(selected.cdp_port);
 }
 
 function getWsUrl() {

@@ -154,7 +154,7 @@ print("restored %%d keys" %% len(merged))
     return ok
 
 
-def fix_logs():
+def fix_logs(emergency=False):
     # `truncate -s 0`, NOT open(f,"w").close(). Replacing the file contents out
     # from under the docker daemon WEDGES `docker logs` for that container until
     # it is restarted — measured 2026-08-27: an open()-truncate of 7 live json
@@ -167,18 +167,32 @@ def fix_logs():
     # disk kept climbing (AC-414). truncate -s 0 is inode-safe here too: a process
     # holding the fd open for append keeps writing at its old offset (sparse
     # regrow), and df is relieved immediately.
-    out = ssh(r'''
+    #
+    # EMERGENCY (AC-414, 2026-09-05): at the 0-bytes-free cliff the >20MB floor
+    # reclaims NOTHING — there are no large logs left, so the automatic guard was
+    # useless exactly when it mattered and the disk truncated gateway.env. In
+    # emergency mode drop the size floor (truncate EVERY log), vacuum the journal
+    # hard, and clear the apt cache. All non-customer-data and regenerable; this
+    # is the hand reclaim that pulled the host back from 0KB, now automatic.
+    min_size = "0" if emergency else str(20 * 1024 * 1024)
+    journal_keep = "30M" if emergency else "100M"
+    apt_line = ("subprocess.run(['apt-get','clean'],capture_output=True,timeout=30)"
+                if emergency else "pass")
+    script = r'''
 import subprocess, glob, os
 n = 0
+MIN = __MIN__
 for f in glob.glob("/var/lib/docker/containers/*/*-json.log") + glob.glob("/var/log/*.log"):
     try:
-        if os.path.getsize(f) > 20*1024*1024:
+        if os.path.getsize(f) > MIN:
             subprocess.run(["truncate", "-s", "0", f], timeout=10); n += 1
     except Exception: pass
-subprocess.run(["journalctl", "--vacuum-size=100M"], capture_output=True)
+subprocess.run(["journalctl", "--vacuum-size=__JOURNAL__"], capture_output=True)
+__APT__
 print("truncated %d logs" % n)
-''')
-    trace("truncate_logs", out[:60], "truncated" in out)
+'''.replace("__MIN__", min_size).replace("__JOURNAL__", journal_keep).replace("__APT__", apt_line)
+    out = ssh(script)
+    trace("truncate_logs" + ("(emergency)" if emergency else ""), out[:60], "truncated" in out)
     return "truncated" in out
 
 
@@ -533,7 +547,9 @@ def main():
                   _disk.get("pct", 0) < 90)
             if _disk.get("pct", 0) >= 95 and not no_fix:
                 _fb = _disk.get("free_gb", 0)
-                fix_logs()
+                # At the cliff (<~300MB free) drop the 20MB log floor and clear the
+                # journal + apt cache too, or the guard reclaims 0 (AC-414 2026-09-05).
+                fix_logs(emergency=_fb < 0.3)
                 _disk = check_disk(); result["disk"] = _disk
                 trace("disk_preventive", "after truncate: %.1f%% used, %.1fGB free (was %.1fGB)"
                       % (_disk.get("pct", 0), _disk.get("free_gb", 0), _fb), _disk.get("pct", 100) < 95)
@@ -645,7 +661,8 @@ def main():
             _truncated_this_tick = False
             if _disk.get("pct", 0) >= 95 and not no_fix:
                 _free_before = _disk.get("free_gb", 0)
-                _truncated_this_tick = fix_logs()
+                # At the cliff (<~300MB free), emergency mode: all logs + journal + apt.
+                _truncated_this_tick = fix_logs(emergency=_free_before < 0.3)
                 _disk = check_disk()
                 result["disk"] = _disk
                 trace("disk_preventive", "after truncate: %.1f%% used, %.1fGB free (was %.1fGB)"
