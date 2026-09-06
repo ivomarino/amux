@@ -1328,6 +1328,56 @@ pub fn finish_manual_shell_run(
     )
 }
 
+/// Replace a cron fire's provisional row with what delivery actually did (AF-515).
+///
+/// Guarded on `status='running'` so it cannot overwrite a row a reconciler has
+/// already failed, and cannot resurrect one another path finished. Returns the
+/// rows updated: 0 means the provisional row is gone and the caller must insert,
+/// rather than drop the outcome.
+pub fn finish_cron_run(
+    conn: &Connection,
+    run_id: i64,
+    outcome: &RunOutcome,
+    extra_note: Option<&str>,
+) -> rusqlite::Result<usize> {
+    let note: Option<String> = match (extra_note.filter(|s| !s.is_empty()), outcome.note()) {
+        (Some(a), Some(b)) => Some(format!("{a} · {b}")),
+        (Some(a), None) => Some(a.to_string()),
+        (None, b) => b,
+    }
+    .map(|s| s.chars().take(500).collect());
+    conn.execute(
+        "UPDATE schedule_runs SET status=?1, note=?2, delivery=?3, submission=?4 \
+         WHERE id=?5 AND status='running'",
+        rusqlite::params![
+            outcome.status(),
+            note,
+            outcome.delivery(),
+            outcome.submission(),
+            run_id,
+        ],
+    )
+}
+
+/// A cron fire's provisional row cannot survive the process that was delivering
+/// it (AF-515). Reconcile on startup, so a restart mid-delivery leaves a row
+/// saying what is actually known — the fire happened, the outcome is not — and
+/// never a permanent `running`.
+///
+/// Distinguished from the shell reconciler by `delivery IS NULL`: a provisional
+/// cron row has no delivery verdict yet, a shell row is stamped `'shell'` at
+/// insert. Without that, one reconciler would claim the other's rows.
+pub fn fail_orphaned_cron_runs(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE schedule_runs \
+         SET status='error', \
+             note='server restarted before this fire recorded a delivery outcome', \
+             delivery='unknown', submission=NULL \
+         WHERE status='running' AND delivery IS NULL",
+        [],
+    )
+}
+
 /// A provisional manual shell row cannot survive the server process that owns
 /// its child. Reconcile those rows on scheduler startup so a restart never
 /// leaves a permanent yellow "running" dot.
@@ -1754,6 +1804,10 @@ pub async fn scheduler_tick(
 struct Claim {
     sched: DurableSchedule,
     notes: Vec<Option<String>>,
+    /// AF-515: the `schedule_runs` row inserted for each occurrence INSIDE the
+    /// claim transaction, so the fire is on record before delivery is
+    /// attempted. RECORD updates these by id instead of inserting.
+    run_ids: Vec<i64>,
 }
 
 /// Fire one due schedule: CLAIM the occurrence, DELIVER outside the write
@@ -1895,7 +1949,43 @@ async fn fire_one(
                     payload: None,
                 });
             }
-            *slot_w.lock().expect("claim slot poisoned") = Some(Claim { sched, notes });
+            // AF-515: RECORD THE FIRE BEFORE ATTEMPTING DELIVERY.
+            //
+            // `last_run`/`next_run`/`run_count` are advanced above, in THIS
+            // transaction. The run row used to be inserted in a SECOND
+            // transaction after delivery, so anything between the two — a lost
+            // delivery, a panic, a restart — left the clock advanced and the
+            // ledger silent, and every readable surface then said the schedule
+            // ran. Measured on SCHED-321, 2026-09-05: last_run advanced to
+            // 10:26:23Z, zero run rows for that schedule that day, 192 rows for
+            // other schedules the same day. Nothing was lost; the row was never
+            // written.
+            //
+            // A schedule that never fires goes visibly stale. One that fires and
+            // drops its turn looked HEALTHIER than one that refused, which is
+            // why it took a human noticing a missing daily doc to catch it.
+            //
+            // Provisional first, updated in place after — the exact protocol
+            // `claim_manual_shell_run` / `finish_manual_shell_run` already use
+            // for shell runs, applied to the cron path that lacked it. Status
+            // `running` reuses the vocabulary the runs endpoint already renders
+            // distinctly from `delivered`, and `fail_orphaned_cron_runs` below
+            // reconciles rows whose process died mid-delivery.
+            let mut run_ids = Vec::with_capacity(notes.len());
+            for note in &notes {
+                conn.execute(
+                    "INSERT INTO schedule_runs \
+                         (schedule_id, ran_at, status, note, source, delivery, submission) \
+                     VALUES (?1, ?2, 'running', ?3, 'cron-rs', NULL, NULL)",
+                    rusqlite::params![
+                        sched.id(),
+                        now_ts,
+                        note.clone().unwrap_or_else(|| "fired; delivery pending".into()),
+                    ],
+                )?;
+                run_ids.push(conn.last_insert_rowid());
+            }
+            *slot_w.lock().expect("claim slot poisoned") = Some(Claim { sched, notes, run_ids });
             Ok(WriteOutcome { applied: true, events })
         })
         .await?;
@@ -1917,13 +2007,28 @@ async fn fire_one(
     // ---- RECORD what actually happened ----
     let sid = claim.sched.id().to_string();
     let notes = claim.notes;
+    let run_ids = claim.run_ids;
     let all_lost = should_warn_undelivered(&outcomes);
     let statuses: Vec<&'static str> = outcomes.iter().map(|o| o.status()).collect();
     store
         .write_async(move |conn| {
             let now_ts = chrono::Utc::now().timestamp();
-            for (outcome, note) in outcomes.iter().zip(notes.iter()) {
-                insert_run(conn, &sid, now_ts, outcome, "cron-rs", note.as_deref())?;
+            for (i, (outcome, note)) in outcomes.iter().zip(notes.iter()).enumerate() {
+                // UPDATE the provisional row this fire already wrote. Guarded on
+                // `status='running'` so a reconciler that already failed the row
+                // is not overwritten, and so this cannot resurrect a row some
+                // other path finished.
+                let updated = match run_ids.get(i) {
+                    Some(id) => finish_cron_run(conn, *id, outcome, note.as_deref())?,
+                    None => 0,
+                };
+                // Fall back to an INSERT only if the provisional row is gone —
+                // never silently drop the outcome. Without this a reconciled row
+                // would leave the real verdict unrecorded, which is the same
+                // silence one layer along.
+                if updated == 0 {
+                    insert_run(conn, &sid, now_ts, outcome, "cron-rs", note.as_deref())?;
+                }
             }
             Ok(WriteOutcome { applied: true, events: vec![] })
         })
@@ -1954,14 +2059,27 @@ pub async fn run_scheduler(
     let reconciled = store
         .write_async(|conn| {
             let n = fail_orphaned_manual_shell_runs(conn)?;
-            Ok(WriteOutcome { applied: n > 0, events: vec![] })
+            // AF-515: cron fires now write a provisional row too, so a restart
+            // mid-delivery can orphan one of those as well. Counted separately
+            // because the two mean different things: a shell orphan lost a child
+            // process, a cron orphan lost a DELIVERY, and only the second says a
+            // lane may not have received its turn.
+            let c = fail_orphaned_cron_runs(conn)?;
+            if c > 0 {
+                tracing::warn!(
+                    orphaned_cron_runs = c,
+                    "scheduler startup: fires whose delivery outcome was never recorded — \
+                     each is a turn that may not have reached its lane (AF-515)"
+                );
+            }
+            Ok(WriteOutcome { applied: n > 0 || c > 0, events: vec![] })
         })
         .await;
     match reconciled {
         Ok(r) if r.applied => {
-            tracing::warn!("scheduler startup marked orphaned manual shell runs as failed")
+            tracing::warn!("scheduler startup marked orphaned provisional runs as failed")
         }
-        Err(e) => tracing::error!(error = %e, "scheduler could not reconcile manual shell runs"),
+        Err(e) => tracing::error!(error = %e, "scheduler could not reconcile orphaned runs"),
         _ => {}
     }
     let policy = missed_policy_from_env();
@@ -2497,6 +2615,219 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM schedule_audit WHERE schedule_id=?1", [&id], |r| r.get(0))
             .unwrap();
         assert_eq!(audit_n, 3); // created + enabled + deleted
+    }
+
+    /// A deliverer that looks at `schedule_runs` FROM INSIDE `deliver()` — the
+    /// window between CLAIM and RECORD, which is the only place the claim-time
+    /// insert is observable and the exact window a lost delivery falls into.
+    struct ObservingDeliverer {
+        store: SharedStore,
+        seen: std::sync::Mutex<Vec<(i64, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Deliverer for ObservingDeliverer {
+        async fn deliver(&self, _sched: &DurableSchedule, _source: &str) -> RunOutcome {
+            let conn = self.store.read().unwrap();
+            let rows: Vec<(i64, String)> = conn
+                .prepare("SELECT id, status FROM schedule_runs WHERE schedule_id='SCHED-2'")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .flatten()
+                .collect();
+            *self.seen.lock().unwrap() = rows;
+            RunOutcome::Delivered { submission: "confirmed".into(), detail: "sent".into() }
+        }
+    }
+
+    /// THE WIRING, not the wording. Every other cell here passes with the
+    /// claim-time insert DELETED, because RECORD falls back to an insert and the
+    /// end state is identical — measured: removing the provisional insert left
+    /// 29/29 green. The whole change is about WHEN the row appears, so the only
+    /// cell that can prove it looks during delivery.
+    #[tokio::test]
+    async fn the_fire_is_on_record_before_delivery_is_attempted() {
+        let (store, _dir) = store();
+        store
+            .write_async(|conn| {
+                let row = make_row("SCHED-2", "alpha", Some("every 10m"), "2020-01-01T00:00");
+                insert_schedule(conn, &row)?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+        let obs = ObservingDeliverer { store: store.clone(), seen: std::sync::Mutex::new(vec![]) };
+        let mut seen = HashMap::new();
+        scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &obs).await.unwrap();
+
+        let during = obs.seen.lock().unwrap().clone();
+        assert_eq!(
+            during.len(),
+            1,
+            "at delivery time the fire had {} row(s); a delivery lost here would leave \
+             last_run advanced and the ledger silent, which is AF-515 exactly",
+            during.len()
+        );
+        assert_eq!(during[0].1, "running", "the row must be provisional during delivery");
+
+        // And afterwards it is the SAME row, updated — not a second one.
+        let conn = store.read().unwrap();
+        let after: Vec<(i64, String)> = conn
+            .prepare("SELECT id, status FROM schedule_runs WHERE schedule_id='SCHED-2'")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(after.len(), 1, "record inserted a second row instead of updating");
+        assert_eq!(after[0].0, during[0].0, "record wrote a DIFFERENT row than the claim");
+        assert_eq!(after[0].1, "delivered");
+    }
+
+    /// AF-515 — THE REGRESSION THIS CHANGE RISKS. The fire now writes a
+    /// provisional row at CLAIM and updates it at RECORD. If RECORD inserted
+    /// instead of updating, every fire would leave TWO rows and every count
+    /// built on this table would double. One fire, one row.
+    #[tokio::test]
+    async fn a_delivered_fire_leaves_exactly_one_row_not_two() {
+        let (store, _dir) = store();
+        store
+            .write_async(|conn| {
+                let row = make_row("SCHED-1", "alpha", Some("every 10m"), "2020-01-01T00:00");
+                insert_schedule(conn, &row)?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+        let mut seen = HashMap::new();
+        scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &StubDeliverer::confirmed())
+            .await
+            .unwrap();
+
+        let conn = store.read().unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schedule_runs WHERE schedule_id='SCHED-1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 1, "the fire left {n} rows; claim-insert + record-insert double-writes");
+        let (status, delivery): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, delivery FROM schedule_runs WHERE schedule_id='SCHED-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "delivered", "the provisional row was never updated");
+        assert_eq!(delivery.as_deref(), Some("direct"));
+    }
+
+    /// THE CELL THIS CARD EXISTS FOR. A fire whose delivery outcome is never
+    /// recorded — the process dies between DELIVER and RECORD — must leave a row
+    /// saying so. Before this change `last_run` advanced and the ledger stayed
+    /// silent, so the schedule read as having run: measured on SCHED-321,
+    /// 2026-09-05, last_run at 10:26:23Z with zero rows for that schedule and
+    /// 192 rows for others the same day.
+    ///
+    /// The crash is simulated the only honest way available in-process: the
+    /// provisional row is what the claim leaves behind, and the startup
+    /// reconciler is what a restart runs.
+    #[tokio::test]
+    async fn a_fire_whose_delivery_is_never_recorded_is_visible_afterwards() {
+        let (store, _dir) = store();
+        store
+            .write_async(|conn| {
+                let row = make_row("SCHED-9", "alpha", Some("every 10m"), "2020-01-01T00:00");
+                insert_schedule(conn, &row)?;
+                // Exactly what the claim transaction writes, with RECORD never
+                // reached.
+                conn.execute(
+                    "INSERT INTO schedule_runs \
+                        (schedule_id, ran_at, status, note, source, delivery, submission) \
+                     VALUES ('SCHED-9', 1000, 'running', 'fired; delivery pending', \
+                             'cron-rs', NULL, NULL)",
+                    [],
+                )?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+
+        // BEFORE the reconciler: the fire is already on record, which is the
+        // whole point — it is no longer indistinguishable from "never fired".
+        {
+            let conn = store.read().unwrap();
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM schedule_runs WHERE schedule_id='SCHED-9'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "the fire left no trace at all — this is the bug");
+        }
+
+        let fixed = store
+            .write_async(|conn| {
+                let n = fail_orphaned_cron_runs(conn)?;
+                Ok(WriteOutcome { applied: n > 0, events: vec![] })
+            })
+            .await
+            .unwrap();
+        assert!(fixed.applied, "the reconciler did not claim the orphaned cron row");
+
+        let conn = store.read().unwrap();
+        let (status, note, delivery): (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT status, note, delivery FROM schedule_runs WHERE schedule_id='SCHED-9'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "error", "an unrecorded fire must not read as delivered");
+        assert_ne!(status, "running", "it must not sit provisional forever");
+        assert!(note.contains("restarted"), "the row does not say what happened: {note}");
+        assert_eq!(delivery.as_deref(), Some("unknown"), "delivery must not read as achieved");
+    }
+
+    /// The two reconcilers must not claim each other's rows. A shell run is
+    /// stamped `delivery='shell'` at insert and a provisional cron row has NULL,
+    /// which is the only thing separating them; without that predicate the cron
+    /// reconciler would rewrite live shell runs on every startup.
+    #[tokio::test]
+    async fn the_cron_reconciler_leaves_running_shell_rows_alone() {
+        let (store, _dir) = store();
+        store
+            .write_async(|conn| {
+                let row = make_row("SCHED-5", "alpha", Some("every 10m"), "2020-01-01T00:00");
+                insert_schedule(conn, &row)?;
+                conn.execute(
+                    "INSERT INTO schedule_runs \
+                        (schedule_id, ran_at, status, note, source, delivery, submission) \
+                     VALUES ('SCHED-5', 1000, 'running', 'started on host', 'manual:x', \
+                             'shell', NULL)",
+                    [],
+                )?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+        let n = store
+            .write_async(|conn| {
+                let n = fail_orphaned_cron_runs(conn)?;
+                Ok(WriteOutcome { applied: n > 0, events: vec![] })
+            })
+            .await
+            .unwrap();
+        assert!(!n.applied, "the cron reconciler claimed a shell row");
+        let conn = store.read().unwrap();
+        let status: String = conn
+            .query_row("SELECT status FROM schedule_runs WHERE schedule_id='SCHED-5'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "running", "a live shell run was failed by the wrong reconciler");
     }
 
     #[tokio::test]
