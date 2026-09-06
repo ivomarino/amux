@@ -1941,6 +1941,63 @@ pub fn autofix_cards_are_dispatchable(open_unowned: i64, examples: &[String]) ->
     .evidence(json!({"open_unowned": open_unowned, "examples": examples}))]
 }
 
+/// Is the todo queue reachable by the thing that hands out todo cards? (AF-535)
+///
+/// AF-137 caught this for `session=NULL`. THIS IS THE SAME DEFECT ONE LEVEL UP,
+/// and the earlier check cannot see it: a card assigned to an ISOLATED lane has
+/// a perfectly good session, so it passes `COALESCE(session,'')=''` — and
+/// `board_drive`'s lane list is
+/// `all_lane_names().filter(|l| !session_is_isolated(l))`,
+/// so no tick will ever offer it to anybody. `todo` is the DISPATCH queue; the
+/// board's own WIP refusal calls a card there "a claim that it is next". A claim
+/// that it is next, addressed to a lane the dispatcher structurally skips, is
+/// ethos rule 3 arriving without anyone choosing it.
+///
+/// Measured 2026-09-06: 123 of the fleet's 209 live todo cards — 59% — sat on
+/// one isolated lane. Nothing anywhere reported it. The tell that finally
+/// surfaced it was a human writing "the board system still not working", which
+/// is the opposite of a check.
+///
+/// WHY THIS IS A CHECK AND NOT A SWEEP. Reassigning 123 of someone else's cards
+/// is ethos rule 8, and AF-137's own remedy says it in as many words: do NOT
+/// bulk-assign a backlog into one queue. The lanes are named so their owner can
+/// decide; the number is published so the decision is not made by nobody.
+///
+/// It derives "isolated" from `session_is_isolated`, the SAME predicate
+/// `board_drive` filters on, rather than restating a list — so a lane that
+/// becomes isolated cannot make this check quietly wrong.
+pub fn todo_is_reachable_by_dispatch(
+    stranded: &[(String, i64)],
+    total_live_todo: i64,
+) -> Vec<InvariantResult> {
+    const ID: &str = "board.todo_is_reachable_by_dispatch";
+    let n: i64 = stranded.iter().map(|(_, c)| *c).sum();
+    if n <= 0 {
+        return vec![InvariantResult::pass(ID).evidence(json!({
+            "stranded": 0,
+            "total_live_todo": total_live_todo,
+        }))];
+    }
+    let pct = if total_live_todo > 0 { n * 100 / total_live_todo } else { 0 };
+    let who: Vec<String> =
+        stranded.iter().map(|(lane, c)| format!("{lane} ({c})")).collect();
+    vec![InvariantResult::fail(
+        ID,
+        "every live todo card belongs to a lane board_drive will actually dispatch to"
+            .to_string(),
+        format!(
+            "{n} of {total_live_todo} live todo card(s) ({pct}%) belong to lane(s)              board_drive SKIPS, so no tick will ever offer them to anyone: {}.              `todo` is the dispatch queue — a card here claims to be next. Either              reassign them to a lane that is dispatched, or move them to `backlog`,              which is unbounded and makes no such claim. Do NOT bulk-assign them              into one queue (AF-137's remedy, same reason).",
+            who.join(", "),
+        ),
+    )
+    .evidence(json!({
+        "stranded": n,
+        "total_live_todo": total_live_todo,
+        "pct_of_live_todo": pct,
+        "by_lane": stranded.iter().map(|(l, c)| json!({"lane": l, "todo": c})).collect::<Vec<_>>(),
+    }))]
+}
+
 /// Every open card's type is IN THE VOCABULARY (AMUX-3552).
 ///
 /// An unknown type is not inert: `core_item_type` maps anything it does not
@@ -5918,5 +5975,51 @@ mod disposition_tests {
     fn empty_next_action_counts_as_missing() {
         let cards = vec![row("A-1", "doing", Some("  "))];
         assert_eq!(nonterminal_has_disposition(&cards)[0].status, Status::Fail);
+    }
+}
+
+#[cfg(test)]
+mod todo_reachable_tests {
+    use super::*;
+
+    /// AF-535. Both arms, because a check that only ever sees zero is not a
+    /// check: with nothing stranded it must PASS, and with a stranded lane it
+    /// must FAIL and NAME the lane, since the remedy is a human decision about
+    /// whose queue those cards belong in.
+    #[test]
+    fn a_lane_the_dispatcher_skips_is_named_not_just_counted() {
+        let clean = todo_is_reachable_by_dispatch(&[], 209);
+        assert_eq!(clean[0].status, Status::Pass);
+
+        let bad = todo_is_reachable_by_dispatch(&[("amux".to_string(), 123)], 209);
+        assert_eq!(bad[0].status, Status::Fail);
+        let d = format!("{:?}", bad[0]);
+        assert!(d.contains("amux (123)"), "must name the lane and its count: {d}");
+        assert!(d.contains("123 of 209"), "must give the denominator, not a bare count: {d}");
+        // 123*100/209 = 58.85, and integer division TRUNCATES to 58. Asserted on
+        // the truncated value deliberately: truncation understates the problem,
+        // which is the safe direction for a number that argues for attention.
+        assert!(d.contains("(58%)"), "a percentage is what makes the count legible: {d}");
+    }
+
+    /// The refusal must not push the reader toward the destructive remedy. This
+    /// is AF-137's lesson quoted forward: a bulk reassign is exactly the wrong
+    /// move and the message has to say so, because it is the obvious one.
+    #[test]
+    fn the_message_offers_backlog_and_refuses_a_bulk_assign() {
+        let bad = todo_is_reachable_by_dispatch(&[("amux".to_string(), 123)], 209);
+        let d = format!("{:?}", bad[0]);
+        assert!(d.contains("backlog"), "must offer the non-destructive exit: {d}");
+        assert!(d.contains("Do NOT bulk-assign"), "must refuse the destructive one: {d}");
+    }
+
+    /// A zero must be distinguishable from an unmeasured run: the PASS arm
+    /// carries the population it looked at, or "0 stranded" cannot be told
+    /// apart from "no cards examined" (ethos rule 4).
+    #[test]
+    fn a_clean_pass_still_publishes_what_it_counted() {
+        let clean = todo_is_reachable_by_dispatch(&[], 209);
+        let d = format!("{:?}", clean[0]);
+        assert!(d.contains("209"), "a pass must say how big the population was: {d}");
     }
 }

@@ -367,6 +367,7 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // reports invisible to auto-pickup's session-keyed predicate, both
     // halves reporting success for 11 days).
     out.extend(autofix_dispatchable_check(state));
+    out.extend(todo_reachable_check(state));
     out.extend(card_type_vocabulary_check(state));
     out.extend(board_list_read_check(state));
 
@@ -1723,6 +1724,113 @@ fn frustration_ledger_check(state: &AppState) -> Vec<InvariantResult> {
         if source == archive_source { source } else { "ledger and archive from different sources" },
     ));
     out
+}
+
+/// AF-535: the same defect AF-137 caught for session=NULL, one level up — a
+/// card on an ISOLATED lane has a session, so it passes that check, and
+/// board_drive still never offers it to anyone.
+///
+/// The isolation test is `session_is_isolated`, the SAME function board_drive
+/// filters its lane list with, so the check and the mechanism cannot drift.
+/// It is not expressible in SQL, hence the group-then-filter rather than one
+/// query.
+fn todo_reachable_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "board.todo_is_reachable_by_dispatch";
+    let Ok(conn) = state.store.read() else {
+        return vec![InvariantResult::unknown(ID, "store unreadable")];
+    };
+    let rows: Result<Vec<(String, i64)>, _> = conn
+        .prepare(
+            "SELECT COALESCE(session,''), COUNT(*) FROM issues \
+             WHERE deleted IS NULL AND COALESCE(archived,0)=0 AND status='todo' \
+             GROUP BY 1",
+        )
+        .and_then(|mut st| {
+            st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .map(|it| it.flatten().collect())
+        });
+    let Ok(per_lane) = rows else {
+        return vec![InvariantResult::unknown(ID, "query failed")];
+    };
+    let total: i64 = per_lane.iter().map(|(_, c)| *c).sum();
+    let stranded =
+        stranded_lanes(per_lane, &|l| crate::api::session_verbs::session_is_isolated(l));
+    checks::todo_is_reachable_by_dispatch(&stranded, total)
+}
+
+/// The SELECTION, with the isolation predicate injected.
+///
+/// Split out for the same reason AF-529 split the ambient-env lookup: the real
+/// `session_is_isolated` reads this machine's worker config, so a test written
+/// against it would pass or fail depending on which box ran it — which is the
+/// exact defect that produced this seam the first time. Injected, the rule is
+/// assertable anywhere.
+///
+/// An EMPTY session is AF-137's case and already has its own check with its own
+/// remedy; counting it here too would double-report one card under two different
+/// fixes, so it is excluded here on purpose.
+fn stranded_lanes(
+    per_lane: Vec<(String, i64)>,
+    is_isolated: &dyn Fn(&str) -> bool,
+) -> Vec<(String, i64)> {
+    let mut stranded: Vec<(String, i64)> = per_lane
+        .into_iter()
+        .filter(|(lane, _)| !lane.is_empty() && is_isolated(lane))
+        .collect();
+    stranded.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+    stranded
+}
+
+#[cfg(test)]
+mod stranded_lanes_tests {
+    use super::stranded_lanes;
+
+    fn lanes() -> Vec<(String, i64)> {
+        vec![
+            ("".to_string(), 3),          // AF-137's case, not this check's
+            ("amux".to_string(), 123),    // isolated -> stranded
+            ("mvs-infra".to_string(), 16),// dispatched -> fine
+            ("byo-ray".to_string(), 40),  // isolated -> stranded, and BIGGER than amux? no: sorts under
+        ]
+    }
+
+    /// The predicate must be ISOLATION, not lane name, not queue size. Mutate
+    /// the filter to `false` and this fails; mutate it to drop the emptiness
+    /// guard and the empty lane appears, which is AF-137's card double-counted.
+    #[test]
+    fn only_isolated_lanes_are_stranded_and_the_empty_session_is_left_to_af_137() {
+        // The fake says the EMPTY lane is isolated too. Deliberately: if it said
+        // otherwise, the empty-session assertion below would pass because of the
+        // fake rather than because of the `!lane.is_empty()` guard, and deleting
+        // that guard would leave the suite green. Measured — it did, until this
+        // line changed.
+        let out = stranded_lanes(lanes(), &|l| l.is_empty() || l == "amux" || l == "byo-ray");
+        assert_eq!(
+            out,
+            vec![("amux".to_string(), 123), ("byo-ray".to_string(), 40)],
+            "isolated lanes only, largest first"
+        );
+        assert!(
+            !out.iter().any(|(l, _)| l.is_empty()),
+            "an empty session belongs to board.autofix_cards_are_dispatchable, not here"
+        );
+    }
+
+    /// Nothing isolated is the healthy fleet, and it must come back empty
+    /// rather than defaulting to "everything" — the direction that would spam
+    /// every lane with a false stranding.
+    #[test]
+    fn a_fleet_with_no_isolated_lane_strands_nothing() {
+        assert!(stranded_lanes(lanes(), &|_| false).is_empty());
+        // ...and the empty session is still excluded even when EVERYTHING is
+        // isolated, which is the only condition under which the guard is load
+        // bearing.
+        let all = stranded_lanes(lanes(), &|_| true);
+        assert!(
+            !all.iter().any(|(l, _)| l.is_empty()),
+            "the empty session is AF-137's card and must never appear here: {all:?}"
+        );
+    }
 }
 
 fn autofix_dispatchable_check(state: &AppState) -> Vec<InvariantResult> {
