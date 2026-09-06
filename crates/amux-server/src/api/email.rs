@@ -60,6 +60,15 @@ pub fn routes_with(ctx: Arc<EmailCtx>) -> Router<AppState> {
         .route("/approve/{id}", post(approve))
         .route("/reject/{id}", post(reject))
         .route("/approvals", get(list_approvals))
+        // AF-540: the READ-ONLY half. `fate()` has always said the right thing —
+        // including "this approval EXPIRED unreleased (1h TTL)" — and was
+        // reachable ONLY as the error body of POST /approve/{id}, a mutation a
+        // worker is forbidden to make (creator-cannot-approve). So the one
+        // caller that needs the diagnosis could not ask for it without
+        // attempting something it is not allowed to do, and gtm/engine ended up
+        // reconstructing the answer from /approvals + /search?mailbox=sent
+        // (c06b5b8f91) — duplicating logic amux already had correct.
+        .route("/approval/{id}", get(approval_fate))
         // AMUX-3998: the ranked inbox + owner themes, nested here so they get the
         // same EmailCtx rather than opening a second client.
         .merge(super::email_intel::nested_routes())
@@ -1401,6 +1410,70 @@ pub async fn search(
     applescript_not_ported(&account)
 }
 
+/// GET /api/email/approval/{id} — what became of this approval (AF-540).
+///
+/// A pure read. It answers for a PENDING id, an approved one, a rejected one,
+/// an expired one, and an id nothing has ever heard of — because the caller
+/// asking is usually a scheduled one that woke up to find its draft gone, and
+/// "expired" and "never existed" are the two answers it most needs told apart.
+///
+/// `fate()` is the same function POST /approve/{id} answers a miss with, so the
+/// two cannot drift into telling different stories about one id.
+pub async fn approval_fate(
+    Extension(ctx): Extension<Arc<EmailCtx>>,
+    Path(id): Path<String>,
+) -> Response {
+    let home = ctx.client.home();
+    // A pending id has no terminal file yet, so `fate()` would give the
+    // non-committal answer for the one state the caller can still act on.
+    let pending = crate::api::email_approval::list_pending(home)
+        .into_iter()
+        // `create_approval` writes the id under "id"; `list_pending` passes the
+        // doc through untouched apart from age fields. Matching on the wrong key
+        // here made a PENDING approval read as "unknown", which is the exact blur
+        // this route exists to remove — caught by the pending arm of its own test.
+        .find(|a| a.get("id").and_then(Value::as_str) == Some(id.as_str()));
+    if let Some(p) = pending {
+        return Json(json!({
+            "ok": true,
+            "approval_id": id,
+            "state": "pending",
+            "fate": "this approval is PENDING and has not been released yet",
+            "age_s": p.get("age_s").cloned().unwrap_or(json!(null)),
+            "expires_in_s": p.get("expires_in_s").cloned().unwrap_or(json!(null)),
+            // Present on EVERY arm, or a caller reading `retry_is_safe` gets a
+            // silent None on the one state where re-asking would duplicate a
+            // live draft — the same absent-key defect AF-538 just fixed next
+            // door in this file.
+            "retry_is_safe": false,
+        }))
+        .into_response();
+    }
+    let fate = crate::api::email_approval::fate(home, &id);
+    // The state is DERIVED FROM THE SAME SENTENCE the human reads, so a reader
+    // matching on `state` and a reader quoting `fate` can never disagree.
+    let state = if fate.contains("EXPIRED") {
+        "expired"
+    } else if fate.contains("DISCARDED") {
+        "rejected"
+    } else if fate.contains("no approval with that id") {
+        "unknown"
+    } else {
+        "released"
+    };
+    Json(json!({
+        "ok": true,
+        "approval_id": id,
+        "state": state,
+        "fate": fate,
+        // The one an unattended caller needs, and the reason this route exists:
+        // expiring is not the same as never having been asked for.
+        "retry_is_safe": state == "expired" || state == "rejected",
+    }))
+    .into_response()
+}
+
+
 // ---- GET /api/email/log ---------------------------------------------------
 
 /// The send-audit ledger (AMUX-1897): one call answers "who sent X and
@@ -1620,6 +1693,72 @@ mod tests {
         });
         let router = Router::new().nest("/api/email", routes_with(ctx)).with_state(state);
         (router, dir, registry)
+    }
+
+    /// AF-540. gtm-engine measured every approval ever created: 60 total, and
+    /// ALL THREE real expirations are the unattended caller — one scheduled tick's
+    /// welcome email at 04:07 and 12:07 against a 1h TTL. That caller wakes to
+    /// find its draft gone and needs to tell "expired" from "never existed",
+    /// which are the two states a 404 used to blur.
+    ///
+    /// Every arm, because the point of the route is the DISTINCTION, and a route
+    /// tested on one state cannot make one.
+    #[tokio::test]
+    async fn the_fate_of_an_approval_is_readable_without_attempting_to_approve_it() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(crate::api::email_approval::approvals_dir(home.path())).unwrap();
+        let (app, _d, _r) = app_with(MockHttp::new(vec![]), home.path());
+
+        // 1. an id nothing has ever heard of
+        let (st, v) = send_req(&app, "GET", "/api/email/approval/apr_0000000000000000", None, &[]).await;
+        assert_eq!(st, StatusCode::OK, "a read must not 404: the answer IS the payload");
+        assert_eq!(v["state"], json!("unknown"));
+        assert_eq!(v["retry_is_safe"], json!(false), "we cannot say a retry is safe for an id we never saw");
+
+        // 2. pending — the one state the caller can still act on, and the one
+        //    fate() alone answers non-committally because no terminal file exists.
+        let id = crate::api::email_approval::create_approval(
+            home.path(), "gtm-ticker", "send",
+            json!({"to": "x@example.invalid"}), json!({"subject": "s"}),
+        ).unwrap();
+        let (_, v) = send_req(&app, "GET", &format!("/api/email/approval/{id}"), None, &[]).await;
+        assert_eq!(v["state"], json!("pending"), "{v}");
+        assert!(v["expires_in_s"].as_i64().unwrap() > 0, "a pending approval must say how long is left: {v}");
+        assert_eq!(v["retry_is_safe"], json!(false), "re-asking while one is still pending would duplicate it");
+
+        // 3. rejected
+        let rid = crate::api::email_approval::create_approval(
+            home.path(), "gtm-ticker", "send", json!({}), json!({}),
+        ).unwrap();
+        crate::api::email_approval::discard(home.path(), &rid, "dashboard");
+        let (_, v) = send_req(&app, "GET", &format!("/api/email/approval/{rid}"), None, &[]).await;
+        assert_eq!(v["state"], json!("rejected"), "{v}");
+        assert_eq!(v["retry_is_safe"], json!(true));
+
+        // 4. EXPIRED — the shape every real expiration in the store has, and the
+        //    reason this route exists. Aged past the TTL, then swept by the
+        //    lister exactly as it is in production.
+        let eid = crate::api::email_approval::create_approval(
+            home.path(), "gtm-ticker", "send", json!({}), json!({}),
+        ).unwrap();
+        let dir = crate::api::email_approval::approvals_dir(home.path());
+        let f = dir.join(format!("{eid}.json"));
+        let mut doc: Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        doc["created"] = json!(doc["created"].as_f64().unwrap()
+            - crate::api::email_approval::APPROVAL_TTL_S - 5.0);
+        std::fs::write(&f, doc.to_string()).unwrap();
+        let _ = crate::api::email_approval::list_pending(home.path()); // sweeps it to .expired.json
+        let (_, v) = send_req(&app, "GET", &format!("/api/email/approval/{eid}"), None, &[]).await;
+        assert_eq!(v["state"], json!("expired"), "{v}");
+        assert!(v["fate"].as_str().unwrap().contains("EXPIRED"), "{v}");
+        assert_eq!(v["retry_is_safe"], json!(true), "the whole point: the caller may ask again");
+
+        // 5. THE CONTROL. expired and unknown must not collapse into each other —
+        //    that blur is the defect, and a test that only checked `ok` would pass
+        //    with both answering the same string.
+        let (_, unk) = send_req(&app, "GET", "/api/email/approval/apr_1111111111111111", None, &[]).await;
+        assert_ne!(unk["state"], v["state"], "expired and never-existed must stay distinguishable");
+        assert_ne!(unk["fate"], v["fate"]);
     }
 
     async fn send_req(
