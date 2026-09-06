@@ -360,6 +360,12 @@ fn helper_cli_command(cli: &str, prompt: &str, model: &str) -> std::process::Com
     if cli == "claude" {
         cmd.arg("--strict-mcp-config").arg("--tools").arg("");
     }
+    // `Command::output()` used to add these pipes implicitly. The stdin-sized
+    // execution path now uses `spawn()` so it can stream the prompt; without
+    // explicit output pipes the helper writes into server-rs.log and the API
+    // sees two empty buffers, falsely reporting "exited without output".
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
     cmd.current_dir(std::env::temp_dir());
     cmd
 }
@@ -734,6 +740,18 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
         assert_eq!(custom_args, ["--print", "summarize", "--model", "fast"]);
+    }
+
+    #[tokio::test]
+    async fn spawned_helper_output_is_captured_instead_of_leaking_to_the_server_log() {
+        let cmd = helper_cli_command("echo", "helper-output-sentinel", "");
+        let mut cmd = tokio::process::Command::from(cmd);
+        let child = cmd.spawn().expect("echo helper starts");
+        let output = child.wait_with_output().await.expect("echo helper exits");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("helper-output-sentinel"),
+            "spawn-based execution must retain helper stdout for the API response"
+        );
     }
 
     #[test]
