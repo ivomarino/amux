@@ -101,18 +101,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
         row={"path":self.path,"authorization":self.headers.get("authorization"),
              "session":self.headers.get("x-amux-session"),"body":json.loads(raw)}
         open(capture,"w").write(json.dumps(row))
-        body=json.dumps({"text":"- Found it (sample.txt:2)","via":"api:haiku",
-                         "measured":True,"n_considered":1,"input_lines":2,
-                         "input_bytes":11,"elapsed_ms":17,
-                         "board_evidence":{"measured":True,"n_considered":1,
-                                           "verdict":"attached","card_id":"AMUX-T"}}).encode()
-        self.send_response(200); self.send_header("content-type","application/json")
+        if row["body"]["question"] == "force helper error":
+            response={"error":"helper provider is rate-limited","measured":True,
+                      "n_considered":1,"board_evidence":{"measured":True,
+                      "n_considered":1,"verdict":"attached","card_id":"AMUX-T"}}
+            status=429
+        else:
+            response={"text":"- Found it (sample.txt:2)","via":"api:haiku",
+                      "measured":True,"n_considered":1,"input_lines":2,
+                      "input_bytes":11,"elapsed_ms":17,
+                      "board_evidence":{"measured":True,"n_considered":1,
+                                        "verdict":"attached","card_id":"AMUX-T"}}
+            status=200
+        body=json.dumps(response).encode()
+        self.send_response(status); self.send_header("content-type","application/json")
         self.send_header("content-length",str(len(body))); self.end_headers(); self.wfile.write(body)
     def log_message(self,*args): pass
 class Server(socketserver.TCPServer): allow_reuse_address=True
 with Server(("127.0.0.1",0),Handler) as server:
     open(port_file,"w").write(str(server.server_address[1]))
-    server.handle_request()
+    server.handle_request(); server.handle_request()
 PY
 SERVER_PID=$!
 for _ in $(seq 1 100); do [[ -s "$PORT_FILE" ]] && break; sleep .02; done
@@ -137,8 +145,27 @@ assert row["body"]["question"]=="Where is beta?",row
 assert row["body"]["task"]=="AMUX-T",row
 assert row["body"]["files"]==[{"path":sys.argv[2],"content":"alpha\nbeta\n"}],row
 PY
+
+# JSON mode must preserve the measured failure receipt AND return nonzero. A
+# machine-readable error with exit 0 is still a false success to automation.
+set +e
+json_error="$(HOME="$TMP/home" AMUX_API="http://127.0.0.1:$(<"$PORT_FILE")" \
+  AMUX_SESSION=test-lane bash ./amux delegate read --json \
+  --question 'force helper error' --for AMUX-T -- "$TMP/sample.txt" 2>"$TMP/json.err")"
+json_rc=$?
+set -e
+[[ "$json_rc" -eq 1 ]]
+JSON_ERROR="$json_error" python3 - <<'PY'
+import json,os
+row=json.loads(os.environ["JSON_ERROR"])
+assert row["error"]=="helper provider is rate-limited",row
+assert row["board_evidence"]=={"measured":True,"n_considered":1,
+                              "verdict":"attached","card_id":"AMUX-T"},row
+PY
 wait "$SERVER_PID"
 SERVER_PID=""
 echo "ok   CLI sends caller-read bytes and prints the helper receipt"
 
-echo "test-large-read-delegation: PASS (8 outcome cells)"
+echo "ok   JSON errors keep their receipt and return nonzero"
+
+echo "test-large-read-delegation: PASS (9 outcome cells)"

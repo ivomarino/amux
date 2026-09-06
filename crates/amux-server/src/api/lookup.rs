@@ -475,17 +475,35 @@ pub(crate) async fn helper_answer(prompt: &str) -> Result<(String, String), (Sta
         }
         Ok(Ok(out)) => {
             // Non-empty stdout wins even on a non-zero exit (the CLI prints its
-            // answer then sometimes exits non-zero); only an EMPTY answer is a
-            // failure — the whole lookup incident was a zero-byte body.
+            // answer then sometimes exits non-zero), EXCEPT a provider limit
+            // banner. The live Claude CLI prints its weekly-limit sentence on
+            // stdout and exits 1; accepting that as an answer made the helper
+            // report `verdict=completed` with no work done. Reuse the provider
+            // adapter's existing vocabulary instead of maintaining a second
+            // set of quota strings here.
             let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let combined = if stderr.is_empty() {
+                stdout.clone()
+            } else {
+                format!("{stdout}\n{stderr}")
+            };
+            if !out.status.success() && helper_cli_rate_limited(&cli, &combined) {
+                let detail: String = combined.trim().chars().take(400).collect();
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!("helper provider is rate-limited: {detail}"),
+                ));
+            }
+            // Only an EMPTY answer is a failure — the whole original lookup
+            // incident was a zero-byte body.
             if stdout.is_empty() {
-                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    if err.is_empty() {
+                    if stderr.is_empty() {
                         format!("{cli} exited without output")
                     } else {
-                        err.chars().take(400).collect()
+                        stderr.chars().take(400).collect()
                     },
                 ));
             }
@@ -564,6 +582,18 @@ async fn record_bulk_read_activity(
 /// Keep an untrusted configured executable/model label on one board-log line.
 fn activity_label(raw: &str) -> String {
     raw.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(120).collect()
+}
+
+fn helper_cli_rate_limited(cli: &str, output: &str) -> bool {
+    if cli != "claude" {
+        return false;
+    }
+    crate::backend::adapter::TerminalAdapter::new(amux_core::provider::ProviderId::new(
+        "claude-code",
+    ))
+    .scan(output)
+    .iter()
+    .any(|event| matches!(event, amux_core::protocol::WorkerEvent::RateLimited(_)))
 }
 
 pub async fn bulk_read(
@@ -751,6 +781,20 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("helper-output-sentinel"),
             "spawn-based execution must retain helper stdout for the API response"
+        );
+    }
+
+    #[test]
+    fn a_claude_limit_banner_is_not_a_successful_helper_answer() {
+        let live = "You've hit your weekly limit · resets 10pm (America/New_York)";
+        assert!(
+            helper_cli_rate_limited("claude", live),
+            "the exact live stdout banner must reuse the provider adapter's limit verdict"
+        );
+        assert!(!helper_cli_rate_limited("claude", "A concise source summary."));
+        assert!(
+            !helper_cli_rate_limited("custom-helper", live),
+            "provider-specific prose must not classify an open custom helper"
         );
     }
 

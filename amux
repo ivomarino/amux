@@ -4177,11 +4177,7 @@ cmd_delegate() {
           "$AMUX_API/api/lookup/bulk" 2>/dev/null) || rc=$?
       [[ "$rc" -eq 0 ]] || die \
         "amux delegate read: request failed (exit $rc); no helper result was produced"
-      if [[ "$as_json" -eq 1 ]]; then
-        printf '%s\n' "$resp"
-        return 0
-      fi
-      RESP="$resp" python3 - <<'PY'
+      RESP="$resp" AS_JSON="$as_json" python3 - <<'PY'
 import json, os, sys
 raw = os.environ.get("RESP", "")
 try:
@@ -4189,6 +4185,9 @@ try:
 except Exception:
     sys.stderr.write("amux delegate read: server returned non-JSON or no body\n")
     raise SystemExit(1)
+if os.environ.get("AS_JSON") == "1":
+    print(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+    raise SystemExit(1 if data.get("error") else 0)
 if data.get("error"):
     sys.stderr.write(f"amux delegate read: {data['error']}\n")
     raise SystemExit(1)
