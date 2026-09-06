@@ -1056,6 +1056,33 @@ cmd_send() {
     [[ -n "$f" && -r "$f" ]] || die "usage: amux send <worker> --file <path>"
     local msg; msg=$(cat "$f")
     [[ -n "$msg" ]] || die "file is empty: $f"
+    # A RECEIPT, BECAUSE THIS PATH CANNOT TELL FRESH BYTES FROM STALE ONES.
+    #
+    # Reported by mixpeek-frustrations, 2026-09-06, reproduced on themselves: a
+    # heredoc write to a scratchpad path failed ("Permission denied" — a 0400
+    # file left on that exact name by a session two days earlier), and the send
+    # that followed read the STALE file and reported "sent". tubescience received
+    # a two-day-old commit message instead of the review finding meant for them.
+    #
+    # Two independent steps: the first fails loudly to stderr, the second
+    # succeeds on stale bytes and prints success in the same breath. Nothing in
+    # the send path can distinguish "what the caller just wrote" from "two days
+    # old", and the success line is what the eye lands on.
+    #
+    # Scratchpad filenames are predictable and reused across sessions
+    # (msg-ts.txt, msg-scan.txt), so the collision is structural rather than
+    # unlucky: a per-session scratchpad that is not per-session in practice.
+    #
+    # The receipt is the cheap half and it is unconditional — printing WHAT was
+    # read, before claiming it was sent, is what makes stale bytes visible with
+    # no extra call. Same reason graft-push prints its receipt before pushing.
+    # An mtime heuristic was the reporter's option 2 and is deliberately NOT
+    # here: a deliberate resend of an older draft is legitimate and would make it
+    # noise, and a warning people learn to ignore is worse than none.
+    local _bytes _first
+    _bytes=$(printf '%s' "$msg" | wc -c | tr -d ' ')
+    _first=$(printf '%s' "$msg" | head -1 | cut -c1-72)
+    echo "${DIM}read ${_bytes}B from ${f}: ${_first}${RESET}" >&2
     _send_via_api "$name" "$msg" "$_nb"; return $?
   fi
 
