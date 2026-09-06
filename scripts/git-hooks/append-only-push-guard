@@ -315,6 +315,35 @@ sys.stdout.write("\n".join(out))
     fi
     loss=1
     n=$(printf '%s\n' "$missing" | wc -l | tr -d ' ')
+    # AF-528: a FOURTH cause the refusal could not express. An entry REWRITTEN
+    # IN PLACE (STATUS: open -> fixed, a FIX paragraph replaced) loses its old
+    # lines while the entry itself survives under the same heading. Merging main
+    # FORWARD into a stale branch does exactly this, and the direction is the
+    # OPPOSITE of a stale republish — you are publishing NEWER text and the
+    # guard reads it as reverting. Neither the archive cross-check nor the
+    # substring rescue helps: the lines did not MOVE and they were not EXTENDED,
+    # they were replaced where they stood. A line-set difference cannot see an
+    # EDIT any more than it can see a MOVE.
+    #
+    # The discriminator is cheap and specific: does the missing line's enclosing
+    # entry heading still exist in the PUSHED copy? If it does, the entry was
+    # edited, not deleted. Only reported, never an automatic pass — it changes
+    # what the reader is told, not what the guard allows.
+    inplace=$(git cat-file blob "$base_blob" 2>/dev/null | python3 -c '
+import sys
+base = sys.stdin.read().split("\n")
+head = set(open(sys.argv[1], encoding="utf-8").read().split("\n"))
+missing = set(l for l in open(sys.argv[2], encoding="utf-8").read().split("\n") if l.strip())
+# Walk base, tracking the heading each line sits under. A heading is a line
+# starting "## " at column 0 — the shape both ledgers use for an entry.
+cur, survivors = None, []
+for l in base:
+    if l.startswith("## "):
+        cur = l
+    elif l in missing and cur is not None and cur in head and cur not in survivors:
+        survivors.append(cur)
+sys.stdout.write("\n".join(survivors))
+' /dev/fd/4 /dev/fd/5 4<<< "$(git cat-file blob "$head_blob" 2>/dev/null)" 5<<< "$missing") || inplace=""
     {
       echo ""
       echo "append-only guard: PUSH BLOCKED — $f as pushed is MISSING $n line(s) the"
@@ -326,7 +355,20 @@ sys.stdout.write("\n".join(out))
       printf '%s\n' "$missing" | head -"$MAX_SHOWN" | sed 's/^/    | /'
       [ "$n" -gt "$MAX_SHOWN" ] && echo "    ... and $((n - MAX_SHOWN)) more"
       echo ""
-      echo "FIRST, decide WHICH of the two causes this is. They need opposite actions and"
+      if [ -n "$inplace" ]; then
+        echo "LIKELIEST CAUSE HERE — AN IN-PLACE EDIT, and none of the remedies below apply."
+        echo "The entr(y/ies) those lines belong to STILL EXIST in what you are pushing,"
+        echo "under the same heading:"
+        printf '%s\n' "$inplace" | head -3 | cut -c1-92 | sed 's/^/    # /'
+        echo "So the text was REPLACED where it stood, not deleted and not moved. That is"
+        echo "what merging main FORWARD into a stale branch looks like: you are publishing"
+        echo "NEWER content and a line-set difference reports it as reverting. If that is"
+        echo "what you are doing, the scoped override is the honest answer and the checkout"
+        echo "below would REINSTATE the older text. Confirm with:"
+        echo "    git diff \$(git merge-base HEAD origin/main)..HEAD -- $f"
+        echo ""
+      fi
+      echo "FIRST, decide which of the causes below this is. They need opposite actions and"
       echo "the wrong one is destructive, so do not skip to the fix below (AMUX-3528,"
       echo "2026-08-23: this refusal's old text prescribed the checkout unconditionally and"
       echo "would have resurrected 11 deliberately-retired entries as live open ones — the"
