@@ -3306,3 +3306,30 @@ FIX: ecbf4daf derives the Settings rows from the full built-in provider registry
  quota APIs from unlimited local inference. 6bdf9999 also resolves Codex through the
  same login-shell path as a real worker, rather than launchd's stale-but-executable
  shim. `amux::usage_probe` logs whenever a probe succeeds or cannot report its quota.
+
+## append-only push guard offered two causes, and the real one was a third
+AREA: gates
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-06
+SESSION: amux-frustrations
+CARD: AF-528
+SYMPTOM: Pushing a maintainer conflict-resolution to a CONTRIBUTOR'S FORK branch (PR
+  #188), the pre-push guard refused: "frustrations.md as pushed is MISSING 4 line(s)
+  the remote's current copy has", then insisted I decide between RETIREMENT and STALE
+  REPUBLISH before acting, warning that the wrong choice is destructive. Neither was
+  true. main had UPDATED the ATE-17 entry IN PLACE (STATUS: open -> fixed, FIX
+  paragraph rewritten; origin/main:frustrations.md:2342-2365) and the fork branch
+  carried the older copy, so merging main FORWARD replaced their stale text with
+  main's newer text. The archive cross-check cannot help: the lines did not MOVE to
+  frustrations-archive.md, they were rewritten where they stood.
+COST: ~10 minutes ruling out both offered causes against a refusal that says picking
+  wrong is destructive. The direction was the OPPOSITE of the accusation -- I was
+  publishing NEWER content and it read as a revert.
+FIX: Two cheap discriminators the guard already has the inputs for. (1) If the missing
+  lines are ADJACENT to CHANGED lines in the same entry block, that is an in-place
+  rewrite, not a deletion -- name it as a third cause. (2) Report whether the push
+  target is `origin` or a fork branch: merging main forward into a fork can only ever
+  ADD to origin's history, so the stale-republish reading does not apply there at all.
+  A line-set difference cannot see an EDIT any more than it can see a MOVE, which is
+  the failure mode this file's own contract already names one layer up.
