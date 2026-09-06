@@ -1094,7 +1094,7 @@ async fn get_contract(
             "atomicity": "the root becomes an epic and all 2-50 children are created in one SQLite writer transaction; any invalid child creates zero",
             "required_per_child": ["unique title", "concrete description", "non-epic type", "p0-p3 priority", "earlier-task dependency indexes", "concrete next_action", "1-12 falsifiable acceptance_criteria"],
             "idempotency": "the normalized plan SHA-256 is durable on the root epic; an identical retry returns idempotent=true and a different retry returns 409 decomposition_plan_conflict",
-            "dependency_execution": "todo/backlog claims are refused while any dependency is open; board-drive promotes dependency-backed backlog only after every dependency is done or verified",
+            "dependency_execution": "todo/backlog claims are refused while any dependency is open; board-drive promotes dependency-backed backlog only after every dependency is done or verified, and a committed successor is not stranded by unrelated todo queue depth",
             "completion": "when every child is done, verified, discarded, or quarantined, board-drive closes the root epic and records the child-status summary as evidence",
         },
         // AMUX-2933 (ts-gke). The list filters WORK and were documented

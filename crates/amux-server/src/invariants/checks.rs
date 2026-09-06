@@ -2566,7 +2566,6 @@ pub struct DecompositionDetailRow {
     pub acceptance_criteria: Option<String>,
     pub tags: Vec<String>,
     pub evidence: Option<String>,
-    pub last_result: Option<String>,
     pub closed_at: Option<i64>,
 }
 
@@ -2654,13 +2653,6 @@ pub fn decomposed_tasks_have_comprehensive_details(
             if row.evidence.as_deref().is_none_or(|v| v.trim().is_empty()) {
                 gaps.push("terminal_evidence");
             }
-            if row
-                .last_result
-                .as_deref()
-                .is_none_or(|v| !concrete_sentence(v.trim()))
-            {
-                gaps.push("terminal_result");
-            }
             if row.closed_at.is_none() {
                 gaps.push("closed_at");
             }
@@ -2717,7 +2709,6 @@ mod decomposition_detail_tests {
             ),
             tags: vec!["p0".into()],
             evidence: Some("crates/amux-server/tests/board_api.rs".into()),
-            last_result: Some("The complete flow passed.".into()),
             closed_at: Some(1),
         }
     }
@@ -2733,7 +2724,7 @@ mod decomposition_detail_tests {
     #[test]
     fn every_required_detail_can_independently_make_the_invariant_fail() {
         type RemoveDetail = fn(&mut DecompositionDetailRow);
-        let cases: [(&str, RemoveDetail); 13] = [
+        let cases: [(&str, RemoveDetail); 12] = [
             ("title", |r| r.title.clear()),
             ("description", |r| r.desc = "thin".into()),
             ("session", |r| r.session = None),
@@ -2745,7 +2736,6 @@ mod decomposition_detail_tests {
             ("acceptance_criteria", |r| r.acceptance_criteria = Some("[]".into())),
             ("priority", |r| r.tags.clear()),
             ("terminal_evidence", |r| r.evidence = None),
-            ("terminal_result", |r| r.last_result = Some("done".into())),
             ("closed_at", |r| r.closed_at = None),
         ];
         for (expected, mutate) in cases {

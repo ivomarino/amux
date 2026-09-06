@@ -2320,6 +2320,11 @@ async fn promote_card(state: &AppState, card: &str, arm: PromoteArm) -> bool {
                 expected_from: Some("backlog".into()),
                 log_line: Some(arm.log_line().to_string()),
                 skip_continuation: true,
+                // A dependency successor is the next step of already-accepted
+                // work. The prior child just left WIP, so an unrelated deep
+                // todo queue must not strand this plan forever. Revisit-driven
+                // promotions remain ordinary queue additions and keep the cap.
+                skip_todo_wip: arm == PromoteArm::DepsCleared,
                 ..Default::default()
             };
             match crate::db::advance::advance(conn, &card_w, "todo", "board_drive", &opts)? {
@@ -2327,10 +2332,34 @@ async fn promote_card(state: &AppState, card: &str, arm: PromoteArm) -> bool {
                     applied: true,
                     events: outcome.events,
                 }),
-                Err(_) => Ok(crate::db::WriteOutcome { applied: false, events: vec![] }),
+                Err(refusal) => {
+                    tracing::warn!(
+                        target: "amux::board_drive",
+                        card = %card_w,
+                        ?arm,
+                        ?refusal,
+                        measured = true,
+                        n_considered = 1,
+                        verdict = "promotion_refused",
+                        "selected backlog promotion was refused by the transition engine"
+                    );
+                    Ok(crate::db::WriteOutcome { applied: false, events: vec![] })
+                }
             }
         })
         .await;
+    if let Err(error) = &reply {
+        tracing::warn!(
+            target: "amux::board_drive",
+            %card,
+            ?arm,
+            %error,
+            measured = false,
+            n_considered = 0,
+            verdict = "promotion_store_error",
+            "selected backlog promotion could not run its writer transaction"
+        );
+    }
     matches!(reply, Ok(r) if r.applied)
 }
 

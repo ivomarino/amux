@@ -3407,5 +3407,25 @@ SYMPTOM: Once an epic had children, every later decomposition request returned
 COST: The API acknowledged work it did not store and gave the caller no discriminator
  for recovering after a lost response or concurrent decomposition.
 FIX: Decomposition now persists a normalized plan SHA-256 on the root epic. Exact
- retries return measured idempotent success; divergent retries return a measured 409
- with both hashes and emit a greppable `plan_conflict` WARN verdict.
+retries return measured idempotent success; divergent retries return a measured 409
+with both hashes and emit a greppable `plan_conflict` WARN verdict.
+
+## The todo ceiling stranded a dependency successor after its predecessor closed
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-06
+SESSION: amux
+CARD: AMUX-4161
+SYMPTOM: Live dogfooding closed AMUX-4162, but AMUX-4163 remained in backlog across
+ multiple measured board-drive ticks even though its only dependency was done. The
+ selector found it correctly; the shared transition engine then refused backlog to
+ todo because this lane already had 122 unrelated todo cards against its 20-card
+ queue ceiling, and the refusal was discarded without a log line.
+COST: An accepted ordered plan could stop permanently between steps for a condition
+ unrelated to that plan, while `/api/debug/board-drive` reported `promoted: 0` with
+ no card or refusal reason to investigate.
+FIX: Dependency-cleared promotions now carry a narrow todo-ceiling exemption while
+ retaining transition, archive, and gate checks; revisit and ordinary queue additions
+ remain capped. Any selected promotion still refused by the transition engine now
+ emits a measured `promotion_refused` WARN naming the card and exact refusal.

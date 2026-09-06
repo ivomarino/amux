@@ -36,6 +36,12 @@ pub struct AdvanceOpts {
     pub log_line: Option<String>,
     /// Skip continuation check (for system transitions like promote).
     pub skip_continuation: bool,
+    /// Allow a dependency successor into `todo` even when the lane's ordinary
+    /// dispatch queue is full. This is narrower than `force`: every gate,
+    /// transition and archive check still applies. Board-drive uses it only
+    /// when a committed predecessor just completed, so the successor replaces
+    /// that plan step instead of adding unrelated queue inventory.
+    pub skip_todo_wip: bool,
     /// Acknowledge gate satisfaction (bypass gate without force, with
     /// attribution). The PATCH handler uses this for `gate_ack`.
     pub gate_ack: bool,
@@ -154,7 +160,7 @@ fn advance_typed(
     }
 
     // WIP limit check for todo.
-    if target == TaskStatus::Todo && !opts.force {
+    if target == TaskStatus::Todo && !opts.force && !opts.skip_todo_wip {
         let session = opts
             .assign_to
             .as_deref()
@@ -162,12 +168,7 @@ fn advance_typed(
             .unwrap_or(actor);
         let limit = bs::todo_wip_limit(Some(session));
         if limit > 0 {
-            let current: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM issues WHERE session = ?1 AND status = 'todo' \
-                 AND deleted IS NULL AND archived = 0",
-                rusqlite::params![session],
-                |r| r.get(0),
-            )?;
+            let current = bs::todo_wip_count(conn, session, &row.id);
             if current >= limit {
                 return Ok(Err(AdvanceRefusal::WipLimitReached { limit, current }));
             }
@@ -348,7 +349,7 @@ pub fn validate_transition(
             }
         }
         // WIP limit.
-        if target == TaskStatus::Todo && !opts.force {
+        if target == TaskStatus::Todo && !opts.force && !opts.skip_todo_wip {
             let session = opts
                 .assign_to
                 .as_deref()
@@ -356,12 +357,7 @@ pub fn validate_transition(
                 .unwrap_or(actor);
             let limit = bs::todo_wip_limit(Some(session));
             if limit > 0 {
-                let current: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM issues WHERE session = ?1 AND status = 'todo' \
-                     AND deleted IS NULL AND archived = 0",
-                    rusqlite::params![session],
-                    |r| r.get(0),
-                )?;
+                let current = bs::todo_wip_count(conn, session, &row.id);
                 if current >= limit {
                     return Ok(Err(AdvanceRefusal::WipLimitReached { limit, current }));
                 }
@@ -437,6 +433,7 @@ mod tests {
         assert!(opts.expected_from.is_none());
         assert!(opts.assign_to.is_none());
         assert!(!opts.skip_continuation);
+        assert!(!opts.skip_todo_wip);
         assert!(!opts.gate_ack);
     }
 }

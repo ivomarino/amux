@@ -19975,6 +19975,25 @@ mod tests {
 
         for (idx, id) in ids.iter().enumerate() {
             if idx > 0 {
+                if idx == 1 {
+                    // Chaos: this lane already has a full ordinary dispatch
+                    // queue. A dependency successor is committed work that
+                    // replaces the predecessor we just closed; it must not sit
+                    // in backlog until unrelated todos drain below the cap.
+                    st.store
+                        .write(move |conn| {
+                            for filler in 0..crate::db::board_store::TODO_WIP_LIMIT_DEFAULT {
+                                conn.execute(
+                                    "INSERT INTO issues \
+                                     (id,title,desc,status,session,creator,owner_type,type,created,updated) \
+                                     VALUES (?1,?1,'Independent queued work','todo',?2,?2,'agent','code',1,1)",
+                                    rusqlite::params![format!("QUEUE-{filler}"), lane],
+                                )?;
+                            }
+                            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                        })
+                        .unwrap();
+                }
                 let (promoted, held) = crate::runtime_jobs::board_drive::promote_ready_backlog(&st).await;
                 assert_eq!((promoted, held), (1, 0), "step {idx} did not become runnable");
             }

@@ -469,10 +469,12 @@ fn decomposition_detail_check(state: &AppState) -> Vec<InvariantResult> {
         return vec![InvariantResult::unknown(ID, "store unreadable")];
     };
     let mut stmt = match conn.prepare(
-        "SELECT id,title,desc,status,session,creator,COALESCE(type,'code'),epic, \
-                depends_on,next_action,acceptance_criteria,tags,evidence,last_result,closed_at \
-         FROM issues WHERE source='decomposition' AND deleted IS NULL \
-              AND COALESCE(archived,0)=0 ORDER BY created,id",
+        "SELECT i.id,i.title,i.desc,i.status,i.session,i.creator,COALESCE(i.type,'code'),i.epic, \
+                i.depends_on,i.next_action,i.acceptance_criteria, \
+                (SELECT GROUP_CONCAT(t.tag) FROM issue_tags t WHERE t.issue_id=i.id), \
+                i.evidence,i.closed_at \
+         FROM issues i WHERE i.source='decomposition' AND i.deleted IS NULL \
+              AND COALESCE(i.archived,0)=0 ORDER BY i.created,i.id",
     ) {
         Ok(stmt) => stmt,
         Err(e) => return vec![InvariantResult::unknown(ID, format!("query prepare failed: {e}"))],
@@ -493,12 +495,13 @@ fn decomposition_detail_check(state: &AppState) -> Vec<InvariantResult> {
                 next_action: r.get(9)?,
                 acceptance_criteria: r.get(10)?,
                 tags: tags_raw
-                    .as_deref()
-                    .and_then(|raw| serde_json::from_str(raw).ok())
-                    .unwrap_or_default(),
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter(|tag| !tag.is_empty())
+                    .map(str::to_string)
+                    .collect(),
                 evidence: r.get(12)?,
-                last_result: r.get(13)?,
-                closed_at: r.get(14)?,
+                closed_at: r.get(13)?,
             })
         })
         .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
@@ -2326,6 +2329,45 @@ mod tests {
             "a migrated, empty board is readable: {}",
             r.observed
         );
+    }
+
+    /// The decomposition check owns a query across `issues` and `issue_tags`.
+    /// Exercise that query, not only the pure row checker: tags are a relation,
+    /// and selecting an imaginary `issues.tags` column made the first live
+    /// probe return Unknown while every pure test stayed green.
+    #[test]
+    fn decomposition_detail_check_reads_the_real_tag_relation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(&dir.path().join("t.db")).unwrap();
+        store
+            .write(|conn| {
+                conn.execute(
+                    "INSERT INTO issues \
+                     (id,title,desc,status,session,creator,owner_type,type,epic,next_action, \
+                      acceptance_criteria,source,created,updated) \
+                     VALUES ('D-1','Execute the child','Execute this complete child.','todo', \
+                             'lane','lane','agent','code','E-1','Run the focused check', \
+                             '[\"The focused check passes\"]','decomposition',1,1)",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO issue_tags (issue_id,tag,added_at) VALUES ('D-1','p0',1)",
+                    [],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+        let state = AppState {
+            store: std::sync::Arc::new(store),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let rows = super::decomposition_detail_check(&state);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, crate::invariants::Status::Pass, "{rows:?}");
+        assert_eq!(rows[0].evidence["n_considered"], serde_json::json!(1));
     }
 
     use super::*;
