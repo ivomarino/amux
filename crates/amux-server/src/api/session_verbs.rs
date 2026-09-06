@@ -34,8 +34,8 @@
 //! - no boot board-digest briefing on start (standing instructions ARE re-sent)
 //! - no _install_amux_commit_hook / _auto_trust_dir / _ensure_memory side
 //!   effects (Python's loops still own those during coexistence)
-//! - commit-report attaches to the in-flight card but skips the cross-session
-//!   sweep notice (py:76008-76230)
+//! - commit-report records the exact task from its body/commit subject, but
+//!   skips the cross-session sweep notice (py:76008-76230)
 //! - env-explain / memory-explain answer 501 with a pointer (layered env
 //!   composition is not ported yet)
 //! - iTerm2-backed sessions (CC_ITERM2_SESSION_ID) answer 501 (0 in the fleet)
@@ -440,6 +440,28 @@ pub(crate) fn scoped_setting_in(home: &std::path::Path, lane: &str, key: &str) -
     EnvFile::load(&home.join("amux.env")).get(key).and_then(nonempty)
 }
 
+/// Resolve `CC_SEND_ALLOW` while preserving an explicit empty value.
+///
+/// The general scoped resolver deliberately treats empty as absent because
+/// most switches spell an override as `0`. Cross-worker reach predates that
+/// convention: its persisted opt-out is an empty allow-list. Once the product
+/// default became open, collapsing empty into absent made OFF reload as ON —
+/// exactly the resetting toggle the user observed. Same layer order as the
+/// launched shell and [`scoped_setting_in`], but presence and value stay two
+/// separate facts.
+pub(crate) fn cross_group_allow_setting_in(
+    home: &std::path::Path,
+    lane: &str,
+) -> Option<String> {
+    for path in scope_env_layers(home, lane).into_iter().rev() {
+        let cfg = EnvFile::load(&path);
+        if let Some(v) = cfg.get("CC_SEND_ALLOW") {
+            return Some(v.trim().trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
 fn provider_of(cfg: &EnvFile) -> String {
     let p = cfg.get_or("CC_PROVIDER", "claude").trim().to_lowercase();
     if SESSION_PROVIDERS.contains(&p.as_str()) && !p.is_empty() {
@@ -451,6 +473,10 @@ fn provider_of(cfg: &EnvFile) -> String {
 
 fn work_dir_of(cfg: &EnvFile) -> String {
     let wd = cfg.get_or("CC_DIR", "").trim();
+    normalize_work_dir(wd)
+}
+
+fn normalize_work_dir(wd: &str) -> String {
     if wd.is_empty() {
         return String::new();
     }
@@ -1401,7 +1427,21 @@ pub(crate) fn detect_claude_status(raw_output: &str) -> String {
         return String::new();
     }
     let n = lines.len();
+    // Codex keeps an apparently empty prompt shell on screen while a command
+    // continues in its background terminal. Its provider-owned active row is
+    // already parsed structurally by the adapter (including adjacency to the
+    // newest prompt); reuse it so quoted prose cannot become activity.
+    if crate::backend::adapter::codex_pane_generation_state(&clean) == Some(true) {
+        return "active".into();
+    }
     let reading_re = cached_re!(r"^Reading \d+ file");
+    // Claude Code yields the main composer while background agents continue,
+    // so every ordinary main-turn signal looks idle. This provider-owned row
+    // is the positive lifecycle statement; share its exact parser with the
+    // adapter rather than maintaining a second spelling here (ATE-45).
+    if crate::backend::adapter::claude_background_agents_working(&clean) {
+        return "active".into();
+    }
     // 0. Active spinner, wide window.
     for l in lines[n.saturating_sub(30)..].iter().rev() {
         let s = l.trim();
@@ -2376,10 +2416,13 @@ fn codex_rollout_files() -> Vec<(std::time::SystemTime, PathBuf)> {
     out
 }
 
-/// The `cwd` a rollout was recorded in, read from its first line
-/// (`session_meta`), so this stats one small read per candidate, not the whole
-/// file.
-fn rollout_cwd(path: &Path) -> Option<String> {
+/// Identity carried by a rollout's first `session_meta` row.
+///
+/// `cwd` alone is not an identity: several workers routinely share one
+/// checkout.  Keep the rollout's own start timestamp with it so the fallback
+/// resolver can associate it with the worker life that created it instead of
+/// assigning the newest sibling rollout to every worker in that directory.
+fn rollout_identity(path: &Path) -> Option<(String, f64)> {
     let Ok(f) = std::fs::File::open(path) else { return None };
     let mut reader = std::io::BufReader::new(f);
     let mut line = String::new();
@@ -2389,20 +2432,54 @@ fn rollout_cwd(path: &Path) -> Option<String> {
     if v.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
         return None;
     }
-    v.pointer("/payload/cwd")
-        .and_then(|c| c.as_str())
-        .map(str::to_string)
+    let cwd = normalize_work_dir(v.pointer("/payload/cwd").and_then(|c| c.as_str())?);
+    let started = v
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(parse_iso8601)?;
+    Some((cwd, started))
 }
 
-/// Map a codex/ollama worker to its live Codex rollout file. Mirrors
-/// `session_jsonl_path`'s resolution order: a recorded session-id claim first
-/// (deterministic: the id is the filename UUID), then the worker's `CC_DIR`
-/// cwd with newest mtime winning. `None` when nothing matches, which makes the
-/// caller fall back to the raw terminal (never a wrong transcript).
+const CODEX_ROLLOUT_START_WINDOW_S: f64 = 15.0 * 60.0;
+const CODEX_ROLLOUT_EARLY_GRACE_S: f64 = 30.0;
+
+/// Pick the rollout born nearest this worker life, never merely the newest
+/// rollout in the same checkout.  The bounded window accommodates startup
+/// pickers (the live ATE-42 specimen created its rollout six minutes after
+/// `last_started`) while refusing to borrow a later sibling's conversation.
+fn rollout_for_worker_start<'a>(
+    files: &'a [(std::time::SystemTime, PathBuf)],
+    cwd: &str,
+    started: f64,
+) -> Option<&'a PathBuf> {
+    if cwd.is_empty() || started <= 0.0 {
+        return None;
+    }
+    files
+        .iter()
+        .take(80)
+        .filter_map(|(_, path)| {
+            let (rollout_cwd, rollout_started) = rollout_identity(path)?;
+            let delta = rollout_started - started;
+            (rollout_cwd == cwd
+                && (-CODEX_ROLLOUT_EARLY_GRACE_S..=CODEX_ROLLOUT_START_WINDOW_S)
+                    .contains(&delta))
+                .then_some((delta.abs(), path))
+        })
+        .min_by(|(a, _), (b, _)| a.total_cmp(b))
+        .map(|(_, path)| path)
+}
+
+/// Map a codex/ollama worker to its live Codex rollout file: a recorded
+/// session-id claim first (deterministic: the id is the filename UUID), then a
+/// bounded `CC_DIR + worker start` association. `None` when nothing matches,
+/// which makes the caller fall back to the raw terminal (never a sibling's
+/// transcript).
 pub(crate) fn codex_rollout_path(name: &str) -> Option<PathBuf> {
     let cfg = parse_env(name);
-    let wd = cfg.get_or("CC_DIR", "").trim().to_string();
-    let sid = meta_str(&load_meta(name), "codex_session_id");
+    let wd = work_dir_of(&cfg);
+    let meta = load_meta(name);
+    let sid = meta_str(&meta, "codex_session_id");
     let files = codex_rollout_files();
     if files.is_empty() {
         return None;
@@ -2416,30 +2493,29 @@ pub(crate) fn codex_rollout_path(name: &str) -> Option<PathBuf> {
             return Some(p.clone());
         }
     }
-    // 2. cwd match, newest first. Bounded to the most recent candidates so a
-    //    years-deep history never turns one tab-open into thousands of reads.
-    if !wd.is_empty() {
-        for (_, p) in files.iter().take(80) {
-            if rollout_cwd(p).as_deref() == Some(wd.as_str()) {
-                return Some(p.clone());
-            }
-        }
-    }
-    None
+    // 2. Worker-life match. `cwd + newest` cross-linked every worker sharing
+    //    a checkout: an active sibling made an idle prompt read WORKING.  A
+    //    worker start is the second independent coordinate available before
+    //    Codex has given us a durable thread id, so use it and decline to guess
+    //    outside the bounded startup window.
+    let started = meta_i64(&meta, "last_started") as f64;
+    rollout_for_worker_start(&files, &wd, started).cloned()
 }
 
 /// The latest structured Codex turn boundary recorded in a rollout file.
 ///
 /// Codex does not expose Claude-style start/stop hooks, but its rollout is an
 /// append-only event stream with the same semantics: `task_started` opens a
-/// turn and `task_complete` closes it. This is stronger evidence than tmux's
-/// `window_activity`, which does not advance for Codex's alternate-screen TUI
-/// on some tmux builds (the live `amux-testing-e2e` specimen stayed `idle` for
-/// an entire multi-minute turn while the pane visibly said `Working`).
+/// turn, while `task_complete` and `turn_aborted` close it. This is stronger
+/// evidence than tmux's `window_activity`, which does not advance for Codex's
+/// alternate-screen TUI on some tmux builds (the live `amux-testing-e2e`
+/// specimen stayed `idle` for an entire multi-minute turn while the pane
+/// visibly said `Working`).
 #[derive(Clone, Debug)]
 pub(crate) struct CodexTurnSignal {
     pub state: String,
     pub ts: f64,
+    pub boundary: String,
 }
 
 fn codex_turn_signal_from_events(lines: &[Value]) -> Option<CodexTurnSignal> {
@@ -2447,16 +2523,24 @@ fn codex_turn_signal_from_events(lines: &[Value]) -> Option<CodexTurnSignal> {
     for event in lines {
         let top = event.get("type").and_then(Value::as_str).unwrap_or("");
         let nested = event.pointer("/payload/type").and_then(Value::as_str).unwrap_or("");
-        let state = match (top, nested) {
-            ("turn.started", _) | ("event_msg", "task_started") => "active",
-            ("turn.completed", _) | ("event_msg", "task_complete") => "idle",
+        let (state, boundary) = match (top, nested) {
+            ("turn.started", _) => ("active", "turn.started"),
+            ("event_msg", "task_started") => ("active", "task_started"),
+            ("turn.completed", _) => ("idle", "turn.completed"),
+            ("event_msg", "task_complete") => ("idle", "task_complete"),
+            ("turn.aborted", _) => ("idle", "turn.aborted"),
+            ("event_msg", "turn_aborted") => ("idle", "turn_aborted"),
             _ => continue,
         };
         let ts = event.get("timestamp")
             .and_then(Value::as_str)
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|t| t.timestamp_millis() as f64 / 1000.0)?;
-        latest = Some(CodexTurnSignal { state: state.into(), ts });
+        latest = Some(CodexTurnSignal {
+            state: state.into(),
+            ts,
+            boundary: boundary.into(),
+        });
     }
     latest
 }
@@ -2473,7 +2557,23 @@ pub(crate) fn codex_rollout_turn_signal(name: &str) -> Option<CodexTurnSignal> {
         return None;
     }
     let path = codex_rollout_path(name)?;
-    codex_turn_signal_from_events(&iter_jsonl_tail(&path, 32_000_000))
+    let signal = codex_turn_signal_from_events(&iter_jsonl_tail(&path, 32_000_000))?;
+    if matches!(signal.boundary.as_str(), "turn_aborted" | "turn.aborted") {
+        let now = chrono::Utc::now().timestamp() as f64;
+        let key = format!("codex-turn-aborted:{name}:{}", signal.ts);
+        if crate::log_dedupe::first_this_bucket(&key, crate::log_dedupe::hour_bucket(now)) {
+            tracing::warn!(
+                target: "status_truth",
+                session = name,
+                rollout = %path.display(),
+                boundary = %signal.boundary,
+                boundary_ts = signal.ts,
+                verdict = "interrupted_turn_is_terminal",
+                "Codex rollout interruption closed the active turn; prompt is safe to report idle"
+            );
+        }
+    }
+    Some(signal)
 }
 
 /// A codex/ollama worker's transcript as the uniform [`TranscriptEvent`] model
@@ -3746,8 +3846,12 @@ fn mint_capture_card(
             ask_type: None,
             ask_question: None,
             ask_unblocks: None,
+            ask_actor: None,
             // AF-367: an auto-captured human prompt — the population AF-367 is about.
             source: Some("capture".into()),
+            requested_by: None,
+            callback_session: None,
+            callback_prompt: None,
         },
         now_ms / 1000,
     )?;
@@ -3837,32 +3941,34 @@ pub(crate) async fn cmd_hist_record_full(
     // deliberate, and silently dropping one would turn a visible annoyance into
     // an invisible data-loss bug — strictly worse. It announces, and lets a
     // human or a sweep decide.
-    let dup_prior: Option<(i64, i64)> = match state.store.read() {
-        Ok(conn) => prior_delivered(&conn, &session, &text, now_ms - DUP_DELIVERY_WINDOW_MS),
-        Err(_) => None,
-    };
-    if let Some((prior_id, prior_ts)) = dup_prior {
-        let age_s = (now_ms - prior_ts) as f64 / 1000.0;
-        tracing::warn!(
-            session = %session, prior_id, age_s,
-            preview = %chars_truncate(&text, 80),
-            "duplicate delivery: identical text already recorded for this lane"
-        );
-        emit_event(
-            state,
-            &session,
-            "message.duplicate",
-            Some(json!({
-                "prior_id": prior_id, "age_s": age_s, "type": ctype,
-                "origin": origin.clone(),
-                "chars": text.chars().count(),
-                "preview": chars_truncate(&text, 120),
-            })),
-            None,
-            "cmd-history",
-        )
-        .await;
-    }
+    // THE LOOKUP RUNS INSIDE THE WRITE, and it did not (AF-483).
+    //
+    // It used to take a READ connection here, check, drop it, and let the
+    // INSERT happen later in its own `write_async`. Two sends whose reads both
+    // land before either write therefore each see no prior, and NEITHER
+    // announces — precisely the 0-1s pair a human does not produce, which is
+    // the case most worth announcing.
+    //
+    // Measured over all of cmd_history 2026-09-04: six exact-text duplicate
+    // pairs inside the window after the detector shipped, only two announced.
+    // The four misses had gaps of 2s, 1s, 7s and 31s. The first three are this
+    // race comfortably; 31s needs a stalled write queue as well, so this fix is
+    // claimed for the shape, not for all four rows.
+    //
+    // SQLite serialises writers, so performing the check in the same closure as
+    // the INSERT makes it a real check-then-act rather than a TOCTOU. The
+    // announcement stays OUT here: `emit_event` is async and the closure is not,
+    // and warning from inside a write would fire on a transaction that can still
+    // fail. The carrier is two atomics rather than a Mutex, matching msg_row_id
+    // directly below; 0 means no prior, and a real row id is never 0.
+    let dup_prior_id = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let dup_prior_ts = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let dup_prior_id_w = dup_prior_id.clone();
+    let dup_prior_ts_w = dup_prior_ts.clone();
+    // Copies for the announcement, which now runs AFTER the closure has taken
+    // ownership of the originals.
+    let cap_ctype = ctype.clone();
+    let cap_origin = origin.clone();
 
     let is_user = ctype == "user";
     // Carry the recorded row id out of the write so auto-capture can link the card.
@@ -3917,6 +4023,15 @@ pub(crate) async fn cmd_hist_record_full(
         .store
         .write_async(move |conn| {
             ensure_fleet_tables(conn)?;
+            // BEFORE the insert, on the writer's own connection: the prior must
+            // be one that already existed, and no concurrent record can slip its
+            // own insert between this read and ours (AF-483).
+            if let Some((pid, pts)) =
+                prior_delivered(conn, &session, &text, now_ms - DUP_DELIVERY_WINDOW_MS)
+            {
+                dup_prior_id_w.store(pid, std::sync::atomic::Ordering::SeqCst);
+                dup_prior_ts_w.store(pts, std::sync::atomic::Ordering::SeqCst);
+            }
             conn.execute(
                 "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at, submit_verdict) \
                  VALUES (?,?,?,?,?,?,?,?,?)",
@@ -3950,6 +4065,39 @@ pub(crate) async fn cmd_hist_record_full(
             })
         })
         .await;
+
+    // ANNOUNCE AFTER THE WRITE COMMITTED, never from inside it (AF-483). A warn
+    // emitted in the closure would fire on a transaction that can still fail,
+    // which is a duplicate report for a message that was never recorded.
+    //
+    // Still does NOT suppress the second delivery. Two identical sends can be
+    // deliberate, and silently dropping one turns a visible annoyance into an
+    // invisible data-loss bug, which is strictly worse. It announces and lets a
+    // human or a sweep decide.
+    let prior_id = dup_prior_id.load(std::sync::atomic::Ordering::SeqCst);
+    if prior_id > 0 {
+        let prior_ts = dup_prior_ts.load(std::sync::atomic::Ordering::SeqCst);
+        let age_s = (now_ms - prior_ts) as f64 / 1000.0;
+        tracing::warn!(
+            session = %cap_session, prior_id, age_s,
+            preview = %chars_truncate(&cap_text, 80),
+            "duplicate delivery: identical text already recorded for this lane"
+        );
+        emit_event(
+            state,
+            &cap_session,
+            "message.duplicate",
+            Some(json!({
+                "prior_id": prior_id, "age_s": age_s, "type": cap_ctype,
+                "origin": cap_origin,
+                "chars": cap_text.chars().count(),
+                "preview": chars_truncate(&cap_text, 120),
+            })),
+            None,
+            "cmd-history",
+        )
+        .await;
+    }
 
     // NO SILENT WORK (AMUX-3071): mint a ledger card for a HUMAN prompt and link
     // it to the message row. Separate write so a capture failure can never roll
@@ -4148,6 +4296,43 @@ pub(crate) async fn steer_enqueue_precond(
     sender: &str,
     precond: Option<(&str, i64)>,
 ) -> Result<String, &'static str> {
+    steer_enqueue_precond_with_id(store, name, text, guard, sender, precond, None).await
+}
+
+/// Board callbacks use a stable id so a crash between enqueue and marking the
+/// card cannot duplicate a callback. If the id is already queued its payload
+/// is refreshed in place; if it is in steering_history it is already delivered
+/// and is not queued again.
+#[must_use = "board callbacks must record whether their delivery was queued or refused"]
+pub(crate) async fn steer_enqueue_idempotent(
+    state: &AppState,
+    name: &str,
+    text: &str,
+    guard: &str,
+    sender: &str,
+    message_id: &str,
+) -> Result<String, &'static str> {
+    steer_enqueue_precond_with_id(
+        &state.store,
+        name,
+        text,
+        guard,
+        sender,
+        None,
+        Some(message_id),
+    )
+    .await
+}
+
+async fn steer_enqueue_precond_with_id(
+    store: &crate::db::SharedStore,
+    name: &str,
+    text: &str,
+    guard: &str,
+    sender: &str,
+    precond: Option<(&str, i64)>,
+    stable_id: Option<&str>,
+) -> Result<String, &'static str> {
     // ZERO AMUX HARNESS INTO AN ISOLATED LANE (Ethan, 2026-08-26: "isolated =
     // zero amux harness, just raw LLM pass through"), gated at the CHOKEPOINT
     // for the same reason AF-188 put the archived refusal here.
@@ -4220,7 +4405,9 @@ pub(crate) async fn steer_enqueue_precond(
         );
         return Err(reason);
     }
-    let msg_id = format!("steer-{}", (now_f64() * 1000.0) as i64);
+    let msg_id = stable_id
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("steer-{}", (now_f64() * 1000.0) as i64));
     let id = msg_id.clone();
     // The id we RETURN must be the row that actually exists. When a guarded
     // re-enqueue updates the prior row in place (AMUX-3557) the freshly minted
@@ -4234,9 +4421,46 @@ pub(crate) async fn steer_enqueue_precond(
     let guard_s = guard.to_string();
     let sender_s = sender.to_string();
     let precond_w = precond.map(|(c, r)| (c.to_string(), r));
-    let _ = store
+    let stable_w = stable_id.map(str::to_string);
+    let should_emit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let should_emit_w = should_emit.clone();
+    let persisted = store
         .write_async(move |conn| {
             ensure_fleet_tables(conn)?;
+            if let Some(ref fixed) = stable_w {
+                let delivered = conn
+                    .query_row(
+                        "SELECT 1 FROM steering_history WHERE id=?1 LIMIT 1",
+                        rusqlite::params![fixed],
+                        |_| Ok(true),
+                    )
+                    .unwrap_or(false);
+                if delivered {
+                    should_emit_w.store(false, std::sync::atomic::Ordering::SeqCst);
+                    if let Ok(mut g) = effective_id_w.lock() {
+                        *g = fixed.clone();
+                    }
+                    return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+                }
+                let queued = conn
+                    .query_row(
+                        "SELECT 1 FROM steering_queue WHERE id=?1 LIMIT 1",
+                        rusqlite::params![fixed],
+                        |_| Ok(true),
+                    )
+                    .unwrap_or(false);
+                if queued {
+                    conn.execute(
+                        "UPDATE steering_queue SET text=?1, session=?2, guard=?3, sender=?4 \
+                         WHERE id=?5",
+                        rusqlite::params![text_s, session, guard_s, sender_s, fixed],
+                    )?;
+                    if let Ok(mut g) = effective_id_w.lock() {
+                        *g = fixed.clone();
+                    }
+                    return Ok(crate::db::WriteOutcome { applied: true, events: vec![] });
+                }
+            }
             // A GUARDED RE-ENQUEUE UPDATES IN PLACE AND KEEPS `queued_at`
             // (AMUX-3557). This was DELETE-then-INSERT, which looks like the
             // same thing and is not: the new row got `now_f64()`, so a guarded
@@ -4298,15 +4522,20 @@ pub(crate) async fn steer_enqueue_precond(
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         })
         .await;
-    emit_event_store(
-        store,
-        name,
-        "message.queued",
-        Some(json!({"chars": text.chars().count(), "preview": chars_truncate(text, 120), "guard": if guard.is_empty() { Value::Null } else { json!(guard) }})),
-        Some(format!("q:{msg_id}")),
-        "steering",
-    )
-    .await;
+    if persisted.is_err() {
+        return Err("could not persist steering message");
+    }
+    if should_emit.load(std::sync::atomic::Ordering::SeqCst) {
+        emit_event_store(
+            store,
+            name,
+            "message.queued",
+            Some(json!({"chars": text.chars().count(), "preview": chars_truncate(text, 120), "guard": if guard.is_empty() { Value::Null } else { json!(guard) }})),
+            Some(format!("q:{msg_id}")),
+            "steering",
+        )
+        .await;
+    }
     // The row that exists, not the one we minted (AMUX-3557).
     Ok(effective_id.lock().map(|g| g.clone()).unwrap_or(msg_id))
 }
@@ -4719,6 +4948,35 @@ fn gemini_composer_state(raw_lines: &[&str], stripped: &[String]) -> Option<Comp
     Some(ComposerState::Typed(plain))
 }
 
+/// Codex's model/path line is footer chrome, not a continuation of the input.
+///
+/// The current TUI draws no box rule between its composer and this footer, so
+/// the generic continuation scan cannot stop on geometry as it does for Claude
+/// Code. Match the footer's STRUCTURE and styling instead of any model/version:
+/// Codex dims only the middle-dot separator and leaves the model, effort, and
+/// working directory normally coloured. Requiring that raw ANSI evidence is
+/// deliberate. If a future Codex release changes the chrome, this fails toward
+/// `Typed` (a visible, unconfirmed send) rather than hiding real user input and
+/// falsely claiming that it was submitted.
+fn codex_model_footer_chrome(raw: &str, stripped: &str) -> bool {
+    let text = stripped.trim();
+    let Some((identity, location)) = text.rsplit_once('\u{b7}') else {
+        return false;
+    };
+    let location = location.trim();
+    if identity.trim().is_empty()
+        || !(location == "~" || location.starts_with("~/") || location.starts_with('/'))
+    {
+        return false;
+    }
+
+    let (plain, dim) = dim_mask(raw);
+    let plain_squashed: String = plain.split_whitespace().collect();
+    let expected_plain: String = format!("{identity}{location}").split_whitespace().collect();
+    let dim_squashed: String = dim.split_whitespace().collect();
+    dim_squashed == "\u{b7}" && plain_squashed == expected_plain
+}
+
 pub(crate) fn composer_state(raw_frame: &str) -> ComposerState {
     let clean = strip_ansi(raw_frame);
     // The manager view owns the keyboard: its own status bar says so. Positive
@@ -4772,7 +5030,9 @@ pub(crate) fn composer_state(raw_frame: &str) -> ComposerState {
     let mut block: Vec<&str> = vec![raw_lines[idx]];
     for (i, s) in stripped.iter().enumerate().skip(idx + 1) {
         let t = s.trim();
-        if matches!(t.chars().next(), Some('\u{2500}') | Some('\u{23f5}')) {
+        if matches!(t.chars().next(), Some('\u{2500}') | Some('\u{23f5}'))
+            || codex_model_footer_chrome(raw_lines[i], s)
+        {
             break;
         }
         block.push(raw_lines[i]);
@@ -8714,9 +8974,10 @@ const FLEET_ROSTER_HEADER: &str = "\n## Fleet — who else is running (auto-gene
      Every live worker is listed, INCLUDING YOU — this file is shared by every lane in \
      this directory, so it cannot omit the reader. You are the one whose name matches \
      $AMUX_SESSION.\n\n\
-     Reach any of them with `amux send <name> --stdin` (origin-stamped). Peek before \
-     interrupting: `curl -sk $AMUX_URL/api/sessions/<name>/peek?lines=200`.\n\n\
-     | worker | groups | description |\n|---|---|---|\n";
+     Reach any of them with `amux send <name> --stdin` (origin-stamped), or make \
+     durable delegated work with `amux board request <name> <title>`. \
+     The latter keeps the request, gates, assets and terminal return on one card.\n\n\
+     | worker | groups | description | provider / model | workspace / branch |\n|---|---|---|---|---|\n";
 
 /// The fleet roster every worker gets, regenerated on each write.
 ///
@@ -8731,10 +8992,11 @@ const FLEET_ROSTER_HEADER: &str = "\n## Fleet — who else is running (auto-gene
 /// session env files that are already the source of truth for the worker list,
 /// so a roster cannot drift from the fleet the way a checked-in list would.
 ///
-/// Excludes archived lanes and the reader itself — "who else is out there" is
-/// the question, and 50 rows of which one is you is noise.
+/// Excludes archived/isolated lanes. It deliberately includes the reader: the
+/// roster is one shared generated file, so a per-reader omission would either
+/// require N copies or make the contents depend on whoever regenerated it.
 fn fleet_roster() -> String {
-    let mut rows: Vec<(String, String, String)> = Vec::new();
+    let mut rows: Vec<(String, String, String, String, String)> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(sessions_dir()) {
         let mut names: Vec<String> = rd
             .flatten()
@@ -8776,18 +9038,35 @@ fn fleet_roster() -> String {
                 })
                 .unwrap_or_default();
             let desc = env.get("CC_DESC").cloned().unwrap_or_default();
-            rows.push((other, groups, desc));
+            let provider = env.get("CC_PROVIDER").cloned().unwrap_or_else(|| "claude".into());
+            let model = env.get("CC_MODEL").cloned().unwrap_or_default();
+            let runtime = if model.is_empty() { provider } else { format!("{provider} / {model}") };
+            let dir = env.get("CC_DIR").cloned().unwrap_or_default();
+            let branch = env.get("CC_BRANCH").cloned().unwrap_or_default();
+            let workspace = if branch.is_empty() { dir } else { format!("{dir} @ {branch}") };
+            rows.push((other, groups, desc, runtime, workspace));
         }
     }
     if rows.is_empty() {
         return String::new();
     }
     let mut out = String::from(FLEET_ROSTER_HEADER);
-    for (n, g, d) in rows.iter().take(120) {
-        let d = d.replace('|', "\\|").chars().take(110).collect::<String>();
-        out.push_str(&format!("| `{n}` | {} | {} |\n", if g.is_empty() { "—" } else { g }, if d.is_empty() { "—" } else { &d }));
+    for (n, g, d, r, w) in rows.iter().take(120) {
+        let cell = |s: &str, max: usize| {
+            let escaped = s.replace('|', "\\|").replace('\n', " ");
+            let trimmed = escaped.chars().take(max).collect::<String>();
+            if trimmed.is_empty() { "—".to_string() } else { trimmed }
+        };
+        out.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} |\n",
+            cell(n, 64), cell(g, 80), cell(d, 110), cell(r, 80), cell(w, 140)
+        ));
     }
-    out.push_str(&format!("\n{} peer worker(s). Same-group peers share memory, env and gates.\n", rows.len()));
+    out.push_str(&format!(
+        "\n{} discoverable peer worker(s). Cross-group messaging is open by default; \
+         isolation is the explicit opt-out.\n",
+        rows.len()
+    ));
     out
 }
 
@@ -9209,6 +9488,24 @@ pub(crate) fn lane_block_reason_from(
     None
 }
 
+/// A time-window limit blocks only until its provider-reported reset. Limits
+/// with no clock (notably credit caps) remain parked until their banner clears.
+fn rate_limit_still_blocks(since: i64, reset_at: i64, now: i64) -> bool {
+    since > 0 && (reset_at <= 0 || now < reset_at)
+}
+
+/// Keep an arrived reset stable when Claude's old clock-only banner remains on
+/// screen. Re-parsing "4:10pm" at 4:11pm rolls it to tomorrow; that used to
+/// postpone every queued message by a full day. Before arrival, a refreshed
+/// provider clock wins, while a transient parse miss keeps the known clock.
+fn effective_rate_limit_reset(recorded: i64, parsed: i64, now: i64) -> i64 {
+    if recorded > 0 && (recorded <= now || parsed <= 0) {
+        recorded
+    } else {
+        parsed
+    }
+}
+
 /// [`lane_block_reason_from`] against the real filesystem and tmux.
 ///
 /// ONE predicate, shared by the drain loop, the point of send, the queue
@@ -9236,18 +9533,19 @@ pub(crate) async fn lane_block_reason(name: &str) -> Option<&'static str> {
     let archived = lane_is_archived(name);
     // Don't pay a tmux query for a lane already known unreachable.
     let running = env_exists && !archived && is_running(name).await;
-    // CONFIRMED RELEASE, NOT A CLOCK — which is what the card asks for and what
-    // makes this implementable at all.
-    //
-    // `rate_limited_since` is maintained by the rate-limit sweep and is
-    // PRESENCE-BASED in both directions: it is stamped when the limit menu or
-    // the credit banner is on screen, and CLEARED on the first tick where
-    // neither is. So a non-zero value means the lane is limited right now, and
-    // zero is a live observation that it is not. No reset timestamp is
-    // consulted, which is why this also covers credit caps — they have no reset
-    // clock at all, and the design was stuck on that until the sweep gained the
-    // presence-based clear.
-    let rate_limited = env_exists && !archived && meta_i64(&load_meta(name), "rate_limited_since") > 0;
+    let meta = load_meta(name);
+    let since = meta_i64(&meta, "rate_limited_since");
+    let reset_at = meta_i64(&meta, "rate_limited_until");
+    let kind = meta_str(&meta, "rate_limited_by");
+    // A known provider clock opens the queue gate exactly at reset; requiring
+    // the banner to disappear first stranded headless lanes whose first new
+    // prompt is what makes Claude move again. Credit caps still have no clock
+    // and remain presence-gated until payment/banner clear.
+    let rate_limited = env_exists && !archived && if kind == "credit-banner" {
+        since > 0
+    } else {
+        rate_limit_still_blocks(since, reset_at, now_i64())
+    };
     lane_block_reason_from(env_exists, archived, running, rate_limited)
 }
 
@@ -9255,10 +9553,8 @@ pub(crate) async fn lane_block_reason(name: &str) -> Option<&'static str> {
 ///
 /// The companion to [`lane_block_reason`]'s `rate-limited`, kept separate
 /// because that predicate returns a `&'static str` by design — one shared
-/// answer, no per-lane text. This is the WHEN, and it is deliberately NOT part
-/// of the block decision: the sweep's presence-based `rate_limited_since` is
-/// what says the lane is limited RIGHT NOW, and gating delivery on a clock
-/// instead would resurrect the bug the presence-based clear fixed.
+/// answer, no per-lane text. This is the WHEN used by the block decision for a
+/// time-window limit; a credit cap has no reset and stays presence-gated.
 ///
 /// 0 means "no reset time known", never "resets at the epoch". A credit cap has
 /// no clock at all, so a caller that reads 0 as a past time would treat every
@@ -9416,17 +9712,15 @@ pub(crate) fn block_reason_explain(reason: &str, name: &str) -> String {
              skips stopped lanes, so it waits for the lane to be STARTED, not for it to be free. \
              No deadline will force it through."
         ),
-        // AMUX-2238. Says WHEN it goes, not merely that it is stuck: the
-        // release is observed (the banner leaving the lane's screen), so a
-        // sender knows waiting is the correct action here, unlike the three
-        // above where waiting helps only after someone does something.
+        // AMUX-2238 + AMUX-4154. Says WHEN it goes, not merely that it is
+        // stuck: time windows release on the provider's own clock, while a
+        // clockless credit cap still waits for direct observation.
         "rate-limited" => format!(
             "HELD — '{name}' is rate-limited. The message is queued and will deliver once the limit \
-             is CONFIRMED released, which amux observes directly: the rate-limit sweep clears the \
-             lane the first tick its limit menu and credit banner are both off screen. No clock is \
-             consulted, so this also covers credit caps, which have no reset time. Nothing is \
-             required of you; the deadline that normally forces a message into a running turn does \
-             not apply, because a rate-limited lane cannot act on it."
+             reaches its provider-reported reset. If the provider reports no clock — such as credit \
+             caps — amux waits until the sweep confirms the banner is gone. Nothing is required of \
+             you; the deadline that normally forces a message into a running turn does not apply, \
+             because a rate-limited lane cannot act on it."
         ),
         other => format!("NOT DELIVERABLE — '{name}': {other}."),
     }
@@ -9538,6 +9832,25 @@ pub(crate) fn steer_decide(reported: Option<&str>, pane_idle: Option<bool>, age_
     SteerDelivery::Hold
 }
 
+/// A live background agent/terminal is not ordinary mid-turn work. The normal
+/// max-age escape deliberately hands an old message to the provider while a
+/// long foreground turn continues; doing that while the provider says a
+/// background child is live interrupted the parent conversation and killed the
+/// very work status was protecting. Only the terminal edge clears this hold.
+fn steer_decide_with_background(
+    reported: Option<&str>,
+    pane_idle: Option<bool>,
+    age_s: f64,
+    max_age_s: f64,
+    background_working: bool,
+) -> SteerDelivery {
+    if background_working {
+        SteerDelivery::Hold
+    } else {
+        steer_decide(reported, pane_idle, age_s, max_age_s)
+    }
+}
+
 /// One lane's stored self-report, with the SHARED trust verdict already applied.
 ///
 /// `None` means the lane has never reported — a hookless lane (gemini, codex),
@@ -9549,6 +9862,9 @@ pub(crate) struct LaneReport {
     /// badge uses. When false the report is evidence of nothing and the caller
     /// must fall through to the pane.
     pub applies: bool,
+    /// Identity-backed subagent count carried by the same report object. A
+    /// positive value is a hard mid-turn hold even when the main state is idle.
+    pub subagents_live: Option<i64>,
 }
 
 /// Read the report and judge it, in one place, for every mechanism that acts on
@@ -9580,7 +9896,69 @@ pub(crate) fn lane_report(state: &AppState, name: &str) -> Option<LaneReport> {
     if !applies {
         warn_stuck_report_once(name, &st, ts, now - ts);
     }
-    Some(LaneReport { state: st, age_s: (now - ts).max(0.0), applies })
+    let subagents_live = rep["subagents"]["count"].as_i64();
+    Some(LaneReport {
+        state: st,
+        age_s: (now - ts).max(0.0),
+        applies,
+        subagents_live,
+    })
+}
+
+/// Exact provider-owned evidence that work continues behind an idle-looking
+/// composer. This is intentionally narrower than generic pane activity: the
+/// Claude row is spinner-chrome anchored, and the Codex row is structurally
+/// adjacent to its newest prompt. A worker quoting either sentence in prose
+/// does not match.
+pub(crate) fn provider_background_working(raw: &str) -> bool {
+    if crate::backend::adapter::codex_pane_background_working(raw) {
+        return true;
+    }
+    let clean = crate::backend::adapter::strip_ansi(raw);
+    let working = crate::backend::adapter::claude_background_agents_working(&clean);
+    if !working && crate::backend::adapter::claude_background_wait_superseded(&clean) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static ANNOUNCED: AtomicBool = AtomicBool::new(false);
+        if !ANNOUNCED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                target: "status_truth",
+                provider_signal = "claude_background_agent",
+                verdict = "superseded_by_completed_turn",
+                "stale provider background row ignored: a newer completed-turn boundary owns the pane"
+            );
+        }
+    }
+    working
+}
+
+/// A trusted idle report describes the parent prompt, not background work.
+/// Kept pure because both board-drive and queued steering depend on this exact
+/// override; the live Codex interruption must be a regression cell, not an
+/// integration assumption.
+fn reported_idle_is_boundary(subagents_live: Option<i64>, raw: &str) -> bool {
+    !subagents_live.is_some_and(|count| count > 0) && !provider_background_working(raw)
+}
+
+fn warn_background_override_once(name: &str, raw: &str) {
+    use std::collections::BTreeSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    let kind = if crate::backend::adapter::codex_pane_background_working(raw) {
+        "codex_background_terminal"
+    } else {
+        "claude_background_agent"
+    };
+    let key = format!("{name}:{kind}");
+    let mut seen = SEEN.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
+    if !seen.insert(key) {
+        return;
+    }
+    tracing::warn!(
+        target: "status_truth",
+        session = name,
+        provider_signal = kind,
+        "provider_background_work_overrode_idle_report: board-drive and steering are held until the provider row clears"
+    );
 }
 
 /// WARN once per lane per stuck report, so a lane held out of the drive loop by
@@ -9666,7 +10044,18 @@ pub(crate) async fn steer_lane_at_boundary(state: &AppState, name: &str) -> bool
     //    but the status badge refuses is the AMUX-3756 deadlock.
     if let Some(r) = lane_report(state, name) {
         if r.applies {
-            return r.state == "idle";
+            if r.state != "idle" {
+                return false;
+            }
+            if r.subagents_live.is_some_and(|count| count > 0) {
+                return false;
+            }
+            let raw = tmux_capture(name, 12).await;
+            if !reported_idle_is_boundary(r.subagents_live, &raw) {
+                warn_background_override_once(name, &raw);
+                return false;
+            }
+            return true;
         }
     }
     // 2. Hookless lane, or a report that no longer applies: the pane. Empty
@@ -9693,6 +10082,9 @@ pub(crate) async fn steer_lane_at_boundary(state: &AppState, name: &str) -> bool
 /// because the gate never believed the lane was busy. A view that disagrees
 /// with the mechanism it describes is worse than no view (ethos rule 1).
 pub(crate) fn pane_is_at_boundary(raw: &str) -> bool {
+    if let Some(generating) = crate::backend::adapter::codex_pane_generation_state(raw) {
+        return !generating;
+    }
     !pane_bar_says_generating(raw) && detect_claude_status(raw) == "idle"
 }
 
@@ -9703,15 +10095,33 @@ pub(crate) async fn steer_delivery_for(state: &AppState, name: &str, age_s: f64)
     // to be a second, unjudged copy of the report read (AMUX-3756). A report
     // that no longer applies is dropped to `None`, which routes to the pane
     // exactly as a hookless lane does.
-    let reported: Option<String> =
-        lane_report(state, name).filter(|r| r.applies).map(|r| r.state);
+    let report = lane_report(state, name).filter(|r| r.applies);
+    let reported: Option<String> = report.as_ref().map(|r| r.state.clone());
+    // Capture even for a trusted active report: max-age delivery is allowed for
+    // ordinary foreground work, but must remain disabled for provider-owned
+    // background work until its terminal row appears.
+    let raw = tmux_capture(name, 12).await;
+    let provider_background = provider_background_working(&raw);
+    let background_working = report
+        .as_ref()
+        .and_then(|r| r.subagents_live)
+        .is_some_and(|count| count > 0)
+        || provider_background;
+    if provider_background {
+        warn_background_override_once(name, &raw);
+    }
     let pane_idle = if reported.is_some() {
         None
     } else {
-        let raw = tmux_capture(name, 12).await;
         if raw.trim().is_empty() { None } else { Some(pane_is_at_boundary(&raw)) }
     };
-    steer_decide(reported.as_deref(), pane_idle, age_s, steer_max_age_s())
+    steer_decide_with_background(
+        reported.as_deref(),
+        pane_idle,
+        age_s,
+        steer_max_age_s(),
+        background_working,
+    )
 }
 
 /// One pass: deliver queued steering to every lane that is at a turn boundary.
@@ -10579,8 +10989,8 @@ async fn warn_on_stalled_lanes(state: &AppState) {
                     queued = count,
                     oldest_min = (age / 60.0) as i64,
                     last_skip = %reason,
-                    "steering queue HELD — the lane is rate-limited; delivery resumes when the \
-                     sweep observes the limit released (AMUX-2238). This is the designed \
+                    "steering queue HELD — the lane is rate-limited; delivery resumes at its \
+                     provider-reported reset, or after a clockless cap clears (AMUX-4154). This is the designed \
                      behaviour, not a stall."
                 );
             } else {
@@ -11213,6 +11623,7 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
                         ("rate_limited_since", json!(0)),
                         ("rate_limited_until", json!(0)),
                         ("rate_limited_by", json!("")),
+                        ("rate_limit_resume_announced_for", json!(0)),
                     ],
                 );
             }
@@ -11225,7 +11636,14 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
         // be refreshed is worse than none once it goes stale. `None` stays 0 —
         // a credit cap has no reset clock, and callers must be able to tell
         // "no reset time" from "resets at the epoch".
-        let reset = parse_rate_limit_reset(&footer).unwrap_or(0);
+        let observed_now = now_i64();
+        let parsed_reset = parse_rate_limit_reset(&footer).unwrap_or(0);
+        let recorded_reset = meta_i64(&load_meta(name), "rate_limited_until");
+        let reset = if menu {
+            effective_rate_limit_reset(recorded_reset, parsed_reset, observed_now)
+        } else {
+            0
+        };
         if meta_i64(&load_meta(name), "rate_limited_until") != reset {
             update_meta(name, &[("rate_limited_until", json!(reset))]);
         }
@@ -11262,6 +11680,38 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
                 "session.rate_limited",
                 Some(json!({"detected_by": if menu { "menu" } else { "credit-banner" }})),
                 Some(format!("rl:{name}:{}", now_i64() / 3600)),
+                "rate-limit",
+            )
+            .await;
+        }
+        // The provider's reset re-opens the existing delivery primitive, so
+        // queued messages and durable tasks resume without a bespoke ninth
+        // queue. We deliberately do not type here: Claude's own banner says it
+        // continues automatically, and injecting Enter into a turn that
+        // restarted between capture and send corrupts the user's input. The
+        // normal delivery path does the boundary check.
+        if reset > 0
+            && reset <= observed_now
+            && meta_i64(&load_meta(name), "rate_limit_resume_announced_for") != reset
+        {
+            update_meta(name, &[("rate_limit_resume_announced_for", json!(reset))]);
+            tracing::info!(
+                target: "amux::usage_reset",
+                verdict = "delivery_gate_open",
+                session = %name,
+                reset_at = reset,
+                "Claude usage reset passed; queued messages and board work may continue"
+            );
+            emit_event(
+                state,
+                name,
+                "session.rate_limit_reset",
+                Some(json!({
+                    "reset_at": reset,
+                    "verdict": "delivery_gate_open",
+                    "detected_by": "sweep",
+                })),
+                Some(format!("rl-reset:{name}:{reset}")),
                 "rate-limit",
             )
             .await;
@@ -11676,15 +12126,45 @@ fn json_str_after(blob: &str, key: &str) -> Option<String> {
 }
 
 
-/// GET /api/debug/duplicate-deliveries?hours=24 — every lane that received the
-/// SAME text twice inside the detector's window, newest first.
+/// GET /api/debug/duplicate-deliveries?since_h=24 — every lane that received
+/// the SAME text twice inside the detector's window, newest first.
 ///
 /// Reads `session_events` rows the detector writes, so it reports what actually
 /// happened rather than re-deriving a heuristic. `window_ms` is echoed so a
 /// reader knows what "duplicate" meant without going to the source.
+///
+/// `since_h` IS THE FLEET CONVENTION AND THIS ENDPOINT DID NOT SPEAK IT
+/// (AF-482). Every other diagnostic takes `since_h` — /api/logs/analyze,
+/// /api/logs/stats, /api/logs/writers, /api/debug/sse, the git-guard and
+/// messages probes, and CLAUDE.md's observability table lists them that way.
+/// This one took `hours` alone, and an unrecognised parameter fell back to the
+/// 24h default silently.
+///
+/// Measured 2026-09-04, asking this endpoint for a month:
+///     since_h=24 -> total 7      since_h=168 -> total 7
+///     since_h=72 -> total 7      since_h=720 -> total 7
+/// while 26 duplicate events existed. The number never moved because the
+/// parameter was never read, and the payload said `measured: true` beside it.
+/// This is the one endpoint a frustration sweep is told to consult for "was
+/// that a double delivery", which is always a question about a SPECIFIC old
+/// message, so a silently-24h window is wrong exactly when it is used.
+///
+/// Both names are accepted, `since_h` wins, and the response says WHICH ONE
+/// answered. Echoing the resolved window is not enough on its own: `hours: 24`
+/// in a reply to `since_h=720` is a true field that reads as agreement.
 async fn debug_duplicate_deliveries(State(state): State<AppState>, RawQuery(q): RawQuery) -> Response {
     let params = parse_qs(q.as_deref().unwrap_or(""));
-    let hours: f64 = qs_get(&params, "hours").and_then(|v| v.parse().ok()).unwrap_or(24.0);
+    let (hours, window_param) = match (
+        qs_get(&params, "since_h").and_then(|v| v.parse::<f64>().ok()),
+        qs_get(&params, "hours").and_then(|v| v.parse::<f64>().ok()),
+    ) {
+        (Some(h), _) => (h, "since_h"),
+        (None, Some(h)) => (h, "hours"),
+        (None, None) => (24.0, "default"),
+    };
+    // Same bounds as `since_h_of` in request_log.rs, so the family agrees on
+    // what an out-of-range window does instead of each probe choosing.
+    let hours = hours.clamp(0.01, 24.0 * 365.0);
     let since = now_f64() - hours * 3600.0;
     let conn = match state.store.read() {
         Ok(c) => c,
@@ -11713,19 +12193,63 @@ async fn debug_duplicate_deliveries(State(state): State<AppState>, RawQuery(q): 
     for r in &rows {
         *by_session.entry(r["session"].as_str().unwrap_or("").to_string()).or_insert(0) += 1;
     }
+
+    // THE DENOMINATOR THIS PROBE NEVER HAD (AF-483).
+    //
+    // `total` counts what the detector ANNOUNCED. An unannounced duplicate is
+    // therefore invisible to the only endpoint a sweep is told to consult, and
+    // `total` is a lower bound with nothing beside it saying so. That is ethos
+    // rule 4 one layer up from the probe: the measurement can read low for two
+    // reasons and reports one number for both.
+    //
+    // The independent population is cmd_history itself: the same text to the
+    // same lane inside the same window is a duplicate whether or not anything
+    // noticed. Comparing the two is what turns "7 duplicates" into "7 announced
+    // of 11 that happened", and it is the query that would have surfaced the
+    // TOCTOU without a sweep — six pairs, two announced, measured by hand on
+    // 2026-09-04.
+    //
+    // ts is MILLISECONDS here and `since` is SECONDS, which is the same split
+    // the rest of this handler lives with; multiply rather than trusting the
+    // column names to agree.
+    let since_ms = (since * 1000.0) as i64;
+    let pairs_in_history: Option<i64> = conn
+        .query_row(
+            "SELECT COUNT(*) FROM cmd_history a JOIN cmd_history b \
+               ON b.session = a.session AND b.text = a.text AND b.id > a.id \
+              AND b.ts - a.ts BETWEEN 0 AND ?2 \
+             WHERE a.ts > ?1",
+            rusqlite::params![since_ms, DUP_DELIVERY_WINDOW_MS],
+            |r| r.get(0),
+        )
+        .ok();
+    let unannounced = pairs_in_history.map(|p| (p - rows.len() as i64).max(0));
     // AF-320. `total: 0` reads as "no duplicates" whether the query ran or
     // silently returned nothing; `unwrap_or_default()` above makes that a real
     // path rather than a hypothetical one.
     j200(crate::api::measured::measured(
         json!({
         "hours": hours,
+        // WHICH PARAMETER ANSWERED, because "hours: 24" alone cannot tell a
+        // caller who asked for 720 that their parameter was never read. A
+        // reader who typos `since_h` on any other probe would get 24h here and
+        // no way to see it (AF-482).
+        "window_param": window_param,
         "window_ms": DUP_DELIVERY_WINDOW_MS,
         "total": rows.len(),
+        // ANNOUNCED vs HAPPENED. `total` is the first; these two are the second
+        // and the difference. `null` when the comparison query itself failed,
+        // which is distinct from 0 and must not read as "none missed".
+        "pairs_in_history": pairs_in_history,
+        "unannounced": unannounced,
         "by_session": by_session,
         "events": rows,
         "note": "a duplicate is the SAME text recorded twice for one lane inside window_ms. \
                  Deliveries are never suppressed on this signal — two identical sends can be \
-                 deliberate, and dropping one would turn a visible annoyance into silent loss.",
+                 deliberate, and dropping one would turn a visible annoyance into silent loss. \
+                 `total` is what the detector ANNOUNCED; `pairs_in_history` is what cmd_history \
+                 shows happened, counted independently. A non-zero `unannounced` means the \
+                 detector missed some, so `total` alone is a lower bound (AF-483).",
         }),
         rows.len(),
     ))
@@ -13077,20 +13601,20 @@ fn dirs_home() -> Option<std::path::PathBuf> {
 
 /// Why a worker-to-worker send is allowed, or `Err(reason)` if it is not.
 ///
-/// Ethan's rule: "worker to worker communication should be limited to intra
-/// group unless explicitly stated." The escapes are CONFIG, never something the
-/// sending agent can assert about itself in a request body — a flag any caller
-/// could set would make the rule advisory.
+/// Worker-to-worker communication is open across the fleet by default. An
+/// explicit empty `CC_SEND_ALLOW` remains a configuration-level opt-out; it is
+/// never a request-body flag that a caller can forge or accidentally override.
 ///
 /// - same group (or a self-send)          -> allowed
-/// - sender's `CC_SEND_ALLOW`             -> groups it may reach, or `*`
+/// - absent sender `CC_SEND_ALLOW`         -> `*` (the product default)
+/// - sender's `CC_SEND_ALLOW`             -> explicit groups, `*`, or empty opt-out
 /// - receiver's `CC_RECEIVE_ANY=1`        -> a documented fleet-wide routing
 ///   target. `amux` is one by construction: the worker roster tells every lane
 ///   to route amux platform bugs here, which IS the explicit statement, and
 ///   683 of the 908 worker-to-worker sends in the 24h before this shipped were
 ///   cross-group — mostly bug reports inbound to this lane. Blocking those
 ///   would have severed the fleet's only bug channel to fix a broadcast problem.
-fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, String> {
+pub(crate) fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, String> {
     if origin.is_empty() || origin == target {
         return Ok("self-or-human");
     }
@@ -13115,7 +13639,7 @@ fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, Strin
     // (AMUX-4015). Both switches below are POLICY — a standing order about who
     // may talk to whom — and AMUX-2930 already established that policy read
     // through `parse_env` is the ethos-rule-1 shape: `/api/scope` advertises
-    // `env` at all three levels and the Scope tab writes all three, so a
+    // `env` at all three levels and the Configurations tab writes all three, so a
     // group-level or global `CC_SEND_ALLOW` saved cleanly and changed nothing,
     // because this gate only ever consulted `sessions/<worker>.env`.
     //
@@ -13144,9 +13668,16 @@ fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, Strin
     if recently_contacted_by(target, origin) {
         return Ok("reply-to-inbound");
     }
-    let allow: Vec<String> = scoped_setting_in(&home, origin, "CC_SEND_ALLOW")
-        .map(|v| v.split(',').map(|t| t.trim().trim_matches('"').to_lowercase()).filter(|t| !t.is_empty()).collect())
-        .unwrap_or_default();
+    // OPEN BY DEFAULT (Ethan, 2026-09-03). An absent setting means `*`; an
+    // explicit empty worker/group/global value remains the opt-out. Keeping
+    // the policy in this one resolver means direct sends, board requests and
+    // reviewer routing cannot acquire three different defaults.
+    let allow: Vec<String> = cross_group_allow_setting_in(&home, origin)
+        .unwrap_or_else(|| "*".into())
+        .split(',')
+        .map(|t| t.trim().trim_matches('"').to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
     if allow.iter().any(|a| a == "*") || allow.iter().any(|a| tg.contains(a)) {
         return Ok("sender-allowlist");
     }
@@ -13154,12 +13685,13 @@ fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, Strin
         if g.is_empty() { "(untagged)".to_string() } else { g.iter().cloned().collect::<Vec<_>>().join(",") }
     };
     Err(format!(
-        "cross-group send refused: {origin} [{}] -> {target} [{}]. Worker-to-worker \
-         messaging is intra-group unless explicitly configured. To allow it \
-         STANDING (no per-message approval): set CC_SEND_ALLOW on {origin} \
+        "cross-group send refused: {origin} [{}] -> {target} [{}]. This worker has \
+         an explicit cross-group opt-out. To allow it STANDING (no per-message \
+         approval): clear that override so it inherits the open fleet default, \
+         or set CC_SEND_ALLOW on {origin} \
          (comma-separated groups, or *), or CC_RECEIVE_ANY=1 on {target} if it is a \
          fleet-wide routing target. BOTH RESOLVE worker > group > global, so the \
-         Scope tab can set them for this one worker, for its whole group, or \
+         Configurations tab can set them for this one worker, for its whole group, or \
          fleet-wide, and a worker-level value overrides a group or global one \
          (AMUX-4015). For a ONE-OFF instead, this refusal mints a grant the owner \
          approves from the dashboard. A human send is never \
@@ -13187,7 +13719,9 @@ async fn get_cross_group_config() -> Response {
     let global = crate::config::parse_env_file(&home.join("amux.env"))
         .get("CC_SEND_ALLOW")
         .map(|v| v.trim().trim_matches('"').to_string())
-        .unwrap_or_default();
+        // Product default: a fresh install is an open peer fleet. Writing an
+        // explicit empty value through PUT is how an owner opts it back out.
+        .unwrap_or_else(|| "*".into());
     let enforcing = std::env::var("AMUX_GROUP_SEND_ENFORCE")
         .map(|v| !matches!(v.trim(), "0" | "false" | "no"))
         .unwrap_or(true);
@@ -13244,7 +13778,7 @@ async fn put_cross_group_config(headers: HeaderMap, body: Option<Json<Value>>) -
         // A worker-level value still overrides this, so the honest message says
         // "default" rather than implying it settles every lane.
         "message": if allow.is_empty() {
-            "cross-group sends are refused by default again; per-worker allowances still apply"
+            "cross-group sends are disabled by an explicit global opt-out; per-worker allowances still apply"
         } else if allow == "*" {
             "every worker may now send to any group by default, no approval needed"
         } else {
@@ -13379,6 +13913,35 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
         .unwrap_or(true)
     {
         if let Err(reason) = cross_group_send_ok(&send_origin, name) {
+            // Isolation is a permanent reachability boundary, not a permission
+            // prompt. The generic refusal path below used to mint a one-shot
+            // cross-group grant even though approving it could never make an
+            // isolated raw-agent lane a valid peer target. Worse, a previously
+            // approved allowance was consumed before the refusal and bypassed
+            // the isolation check entirely. Return the exact refusal without a
+            // grant: only the owner/dashboard path (empty origin) is allowed.
+            if session_is_isolated(name) {
+                tracing::warn!(origin = %send_origin, target = %name, "{reason}");
+                emit_event(
+                    state,
+                    name,
+                    "send.isolated_refused",
+                    Some(json!({"origin": send_origin, "target": name})),
+                    None,
+                    "isolation",
+                )
+                .await;
+                return jresp(
+                    StatusCode::FORBIDDEN,
+                    json!({
+                        "ok": false,
+                        "error": reason,
+                        "blocked": "isolated",
+                        "code": "isolated_target",
+                        "what_to_do": "An isolated worker is reachable only by its owner from the dashboard; no approval can authorize peer delivery.",
+                    }),
+                );
+            }
             // AN OWNER-APPROVED, SINGLE-USE ALLOWANCE RELEASES EXACTLY ONE SEND
             // (AMUX-3997). Checked before the refusal so an approval the owner
             // already gave is honoured on the worker's own retry.
@@ -13998,8 +14561,116 @@ pub(crate) fn env_explain_verb(name: &str, qs: &[(String, String)]) -> Response 
 
 /// `commit-report` as a callable verb, for the grouped
 /// `/api/workers/{id}/git/...` surface (AF-291).
+fn commit_task_refs(subject: &str) -> Vec<String> {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"\b[A-Z][A-Z0-9]+-\d+\b").expect("commit task ref regex")
+    });
+    let mut seen = std::collections::HashSet::new();
+    re.find_iter(subject)
+        .map(|m| m.as_str().to_string())
+        .filter(|id| seen.insert(id.clone()))
+        .collect()
+}
+
+#[derive(Debug, Default)]
+struct CommitArtifactScan {
+    full_sha: Option<String>,
+    subject: Option<String>,
+    files: Vec<String>,
+    measured: bool,
+    why_unmeasured: Option<&'static str>,
+}
+
+/// Read the identity and files from the commit itself. The hook's subject is
+/// truncated for a log line, so it cannot be the authoritative source of a
+/// task id near the end of a long subject. All git arguments are passed without
+/// a shell and `sha` is validated before reaching git.
+async fn read_commit_artifacts(dir: &str, sha: &str) -> CommitArtifactScan {
+    if dir.trim().is_empty() {
+        return CommitArtifactScan {
+            why_unmeasured: Some("no repo dir in the report"),
+            ..Default::default()
+        };
+    }
+    if !commit_shape::usable_sha(sha) {
+        return CommitArtifactScan {
+            why_unmeasured: Some("sha is not a plain hex object name"),
+            ..Default::default()
+        };
+    }
+    if !std::path::Path::new(dir).is_dir() {
+        return CommitArtifactScan {
+            why_unmeasured: Some("reported dir is not a directory here"),
+            ..Default::default()
+        };
+    }
+    let git = |args: Vec<String>| {
+        let dir = dir.to_string();
+        async move {
+            tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .await
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        }
+    };
+    let Some(full_sha) = git(vec![
+        "rev-parse".into(),
+        "--verify".into(),
+        format!("{sha}^{{commit}}"),
+    ])
+    .await
+    else {
+        return CommitArtifactScan {
+            why_unmeasured: Some("git could not resolve the commit"),
+            ..Default::default()
+        };
+    };
+    let subject = git(vec!["show".into(), "-s".into(), "--format=%s".into(), full_sha.clone()])
+        .await;
+    let files = git(vec![
+        "diff-tree".into(),
+        "--no-commit-id".into(),
+        "--name-only".into(),
+        "-r".into(),
+        "--root".into(),
+        "-m".into(),
+        full_sha.clone(),
+    ])
+    .await
+    .map(|out| {
+        let mut seen = std::collections::HashSet::new();
+        out.lines()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .filter(|p| seen.insert(p.clone()))
+            .collect::<Vec<_>>()
+    });
+    match (subject, files) {
+        (Some(subject), Some(files)) => CommitArtifactScan {
+            full_sha: Some(full_sha),
+            subject: Some(subject),
+            files,
+            measured: true,
+            why_unmeasured: None,
+        },
+        _ => CommitArtifactScan {
+            full_sha: Some(full_sha),
+            why_unmeasured: Some("git could not read commit subject or files"),
+            ..Default::default()
+        },
+    }
+}
+
 pub(crate) async fn commit_report_verb(state: &AppState, name: &str, body: &Value) -> Response {
-    // Attach the commit to the in-flight card (py:76233-76246). The
+    // Attach the commit to the exact task named by the report/subject. The
     // cross-session sweep notice (py:76008-76230) is a named gap.
     let sha: String = body_str(body, "sha").trim().chars().take(16).collect();
     let subj: String = body_str(body, "subject").trim().chars().take(140).collect();
@@ -14013,6 +14684,7 @@ pub(crate) async fn commit_report_verb(state: &AppState, name: &str, body: &Valu
     // the session goes to read what it shipped.
     let dir = body_str(body, "dir");
     let shape = read_commit_shape(&dir, &sha).await;
+    let scan = read_commit_artifacts(&dir, &sha).await;
     let empty = matches!(shape, commit_shape::Shape::Empty);
     // WHAT THE HOOK SAW, held by the staged-guard (AMUX-3837).
     // amux-frustrations demonstrated the mechanism: git writes the tree
@@ -14042,7 +14714,16 @@ pub(crate) async fn commit_report_verb(state: &AppState, name: &str, body: &Valu
         );
     }
     let session = name.to_string();
-    let sha2 = sha.clone();
+    let reported_task = body_str(body, "task_id").trim().to_string();
+    let authoritative_subject = scan.subject.clone().unwrap_or_else(|| subj.clone());
+    let subject_tasks = commit_task_refs(&authoritative_subject);
+    let full_sha = scan.full_sha.clone().unwrap_or_else(|| sha.clone());
+    let files = scan.files.clone();
+    let scan_measured = scan.measured;
+    let why_unmeasured = scan.why_unmeasured;
+    let authoritative_subject_w = authoritative_subject.clone();
+    let full_sha_w = full_sha.clone();
+    let files_w = files.clone();
     // Named so the log line can say WHY it is silent: absent because
     // the commit was fine, versus absent because nothing looked.
     let shape_note = match shape {
@@ -14050,68 +14731,210 @@ pub(crate) async fn commit_report_verb(state: &AppState, name: &str, body: &Valu
         commit_shape::Shape::Unchecked(why) => format!(" (not checked for content: {why})"),
         _ => String::new(),
     };
+    #[derive(Debug)]
+    enum CommitReportOutcome {
+        Unattached,
+        Refused(StatusCode, Value),
+        Attached {
+            task: String,
+            source: &'static str,
+            artifacts: Vec<crate::db::artifact_store::ArtifactRow>,
+        },
+    }
+    let outcome: Arc<std::sync::Mutex<Option<CommitReportOutcome>>> = Default::default();
+    let outcome_w = outcome.clone();
     let reply = state
         .store
         .write_async(move |conn| {
-            let row: Option<String> = conn
-                .query_row(
-                    "SELECT id FROM issues WHERE session=? AND deleted IS NULL \
-                     AND COALESCE(archived,0)=0 AND status IN ('doing','review') \
-                     AND owner_type='agent' ORDER BY updated DESC LIMIT 1",
-                    [&session],
-                    |r| r.get(0),
-                )
-                .ok();
-            let Some(issue_id) = row else {
+            let mut active = Vec::new();
+            let mut stmt = conn.prepare(
+                "SELECT id FROM issues WHERE session=?1 AND deleted IS NULL \
+                 AND COALESCE(archived,0)=0 AND status IN ('doing','review') \
+                 AND owner_type='agent' ORDER BY id",
+            )?;
+            active.extend(stmt.query_map([&session], |r| r.get::<_, String>(0))?.flatten());
+
+            let (issue_id, source) = if !reported_task.is_empty() {
+                if !subject_tasks.is_empty() && !subject_tasks.contains(&reported_task) {
+                    *outcome_w.lock().expect("commit-report outcome poisoned") = Some(
+                        CommitReportOutcome::Refused(
+                            StatusCode::CONFLICT,
+                            json!({
+                                "error": "commit report task_id disagrees with the commit subject",
+                                "code": "commit_task_mismatch",
+                                "task_id": reported_task,
+                                "subject_tasks": subject_tasks,
+                            }),
+                        ),
+                    );
+                    return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+                }
+                (reported_task.clone(), "body")
+            } else if subject_tasks.len() == 1 {
+                (subject_tasks[0].clone(), "subject")
+            } else if subject_tasks.len() > 1 {
+                *outcome_w.lock().expect("commit-report outcome poisoned") = Some(
+                    CommitReportOutcome::Refused(
+                        StatusCode::CONFLICT,
+                        json!({
+                            "error": "commit subject names more than one task; pass task_id explicitly",
+                            "code": "commit_task_ambiguous",
+                            "subject_tasks": subject_tasks,
+                            "active_tasks": active,
+                        }),
+                    ),
+                );
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            } else if active.len() == 1 {
+                (active[0].clone(), "unique-in-flight")
+            } else if active.is_empty() {
+                *outcome_w.lock().expect("commit-report outcome poisoned") =
+                    Some(CommitReportOutcome::Unattached);
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            } else {
+                *outcome_w.lock().expect("commit-report outcome poisoned") = Some(
+                    CommitReportOutcome::Refused(
+                        StatusCode::CONFLICT,
+                        json!({
+                            "error": "commit names no task and this worker has multiple in-flight tasks",
+                            "code": "commit_task_ambiguous",
+                            "subject_tasks": [],
+                            "active_tasks": active,
+                            "how_to_fix": "include one task id in the commit subject or send task_id",
+                        }),
+                    ),
+                );
                 return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
             };
-            let log: String = conn
-                .query_row("SELECT COALESCE(log,'') FROM issues WHERE id=?", [&issue_id], |r| r.get(0))
-                .unwrap_or_default();
+            let Some(task) = crate::db::board_store::get_issue(conn, &issue_id)? else {
+                *outcome_w.lock().expect("commit-report outcome poisoned") = Some(
+                    CommitReportOutcome::Refused(
+                        StatusCode::NOT_FOUND,
+                        json!({
+                            "error": "commit names a task that does not exist",
+                            "code": "commit_task_missing",
+                            "task_id": issue_id,
+                        }),
+                    ),
+                );
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            };
             let ts = chrono::Local::now().format("%H:%M");
-            let new_log = format!("{}\n`{ts}` commit {sha2} — {subj}{shape_note}", log.trim_end())
+            let capture_desc = format!(
+                "automatically captured by commit-report from {session}; task selected by {source}"
+            );
+            let refs = files_w
+                .iter()
+                .cloned()
+                .chain(std::iter::once(full_sha_w.clone()))
+                .collect::<Vec<_>>();
+            let artifacts = crate::db::artifact_store::insert_captured_refs(
+                conn,
+                &issue_id,
+                refs,
+                &capture_desc,
+                now_i64(),
+            )?;
+            let new_log = format!(
+                "{}\n`{ts}` commit {full_sha_w} — {authoritative_subject_w}{shape_note}",
+                task.log.as_deref().unwrap_or("").trim_end()
+            )
                 .trim()
                 .to_string();
             conn.execute(
                 "UPDATE issues SET log=?, rev=COALESCE(rev,0)+1, updated=? WHERE id=?",
-                rusqlite::params![new_log, now_i64(), issue_id],
+                rusqlite::params![new_log, now_i64(), &issue_id],
             )?;
+            let mut events = vec![crate::db::PendingEvent {
+                entity_type: amux_core::revision::EntityType::Other("issue".into()),
+                entity_id: issue_id.clone(),
+                mutation: amux_core::revision::MutationKind::Updated,
+                payload: None,
+            }];
+            events.extend(artifacts.iter().map(|artifact| crate::db::PendingEvent {
+                entity_type: amux_core::revision::EntityType::Other("artifact".into()),
+                entity_id: artifact.id.clone(),
+                mutation: amux_core::revision::MutationKind::Created,
+                payload: None,
+            }));
+            *outcome_w.lock().expect("commit-report outcome poisoned") = Some(
+                CommitReportOutcome::Attached {
+                    task: issue_id,
+                    source,
+                    artifacts,
+                },
+            );
             Ok(crate::db::WriteOutcome {
                 applied: true,
-                events: vec![crate::db::PendingEvent {
-                    entity_type: amux_core::revision::EntityType::Other("issue".into()),
-                    entity_id: issue_id,
-                    mutation: amux_core::revision::MutationKind::Updated,
-                    payload: None,
-                }],
+                events,
             })
         })
         .await;
-    match reply {
-        // The emptiness verdict rides BOTH arms. A session with no
-        // in-flight card is exactly the one whose commit lands with no
-        // trail, so it is the last place the warning may be dropped.
-        Ok(r) if !r.applied => {
-            j200(json!({"ok": true, "attached": Value::Null, "empty_commit": empty,
-                       "staged_at_hook": staged_at_hook}))
+    if let Err(e) = reply {
+        return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()}));
+    }
+    let result = outcome.lock().expect("commit-report outcome poisoned").take();
+    match result {
+        Some(CommitReportOutcome::Attached { task, source, artifacts }) => {
+            tracing::info!(
+                marker = "commit_report_task_exact",
+                session = %name,
+                task = %task,
+                task_source = source,
+                sha = %full_sha,
+                artifacts_captured = artifacts.len(),
+                scan_measured,
+                why_unmeasured = why_unmeasured.unwrap_or(""),
+                "commit-report attached commit and files to the exact board task"
+            );
+            j200(json!({
+                "ok": true,
+                "attached": task,
+                "task_source": source,
+                "sha": full_sha,
+                "artifacts_captured": artifacts.len(),
+                "artifact_refs": artifacts.iter().map(|a| a.ref_value.clone()).collect::<Vec<_>>(),
+                "artifact_scan": {
+                    "measured": scan_measured,
+                    "n_considered": files.len(),
+                    "why_unmeasured": why_unmeasured,
+                },
+                "empty_commit": empty,
+                "staged_at_hook": staged_at_hook,
+            }))
         }
-        Ok(_) => {
-            // Re-read the card id for the response (the write closure
-            // cannot return it through WriteReply).
-            let attached: Option<String> = state.store.read().ok().and_then(|conn| {
-                conn.query_row(
-                    "SELECT id FROM issues WHERE session=? AND deleted IS NULL \
-                     AND COALESCE(archived,0)=0 AND status IN ('doing','review') \
-                     AND owner_type='agent' ORDER BY updated DESC LIMIT 1",
-                    [name],
-                    |r| r.get(0),
-                )
-                .ok()
-            });
-            j200(json!({"ok": true, "attached": attached, "sha": sha, "empty_commit": empty,
-                        "staged_at_hook": staged_at_hook}))
+        Some(CommitReportOutcome::Refused(status, mut body)) => {
+            tracing::warn!(
+                marker = "commit_report_task_ambiguous",
+                session = %name,
+                sha = %full_sha,
+                subject = %authoritative_subject,
+                "commit-report refused to guess which board task produced the commit"
+            );
+            body["ok"] = json!(false);
+            body["sha"] = json!(full_sha);
+            jresp(status, body)
         }
-        Err(e) => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
+        Some(CommitReportOutcome::Unattached) | None => {
+            tracing::info!(
+                marker = "commit_report_unattached",
+                session = %name,
+                sha = %full_sha,
+                "commit-report found no explicit task and no unique in-flight card"
+            );
+            j200(json!({
+                "ok": true,
+                "attached": Value::Null,
+                "sha": full_sha,
+                "artifact_scan": {
+                    "measured": scan_measured,
+                    "n_considered": files.len(),
+                    "why_unmeasured": why_unmeasured,
+                },
+                "empty_commit": empty,
+                "staged_at_hook": staged_at_hook,
+            }))
+        }
     }
 }
 
@@ -14673,76 +15496,236 @@ pub(crate) fn context_pct_remaining(used: u64, window: u64) -> u8 {
 /// POST report (py:76238-76265) — the D1 report endpoint: harness-reported
 /// state into the SHARED prefs store Python reads at boot and
 /// sessions_legacy reads live.
-/// AMUX-3048: apply one subagent lifecycle event to the lane's live count.
+/// Maximum acknowledged lifecycle identities retained per lane. This is long
+/// enough to absorb response-loss retries and deliberately bounded so a
+/// long-lived worker cannot turn idempotency into an append-only log.
+const SUBAGENT_EVENT_HISTORY_LIMIT: usize = 128;
+
+#[derive(Clone, Debug)]
+struct SubagentApply {
+    next: Value,
+    verdict: &'static str,
+    count: i64,
+    live_ids: Vec<String>,
+    applied: bool,
+    status_changed: bool,
+}
+
+/// Apply one identity-bearing subagent lifecycle event to a stored report.
 ///
-/// Reuses the `session_reports` prefs store the main self-report already uses,
-/// under a `subagents` sub-key `{count, ts}` — no new table, and the consumer
-/// (`FleetSignals::subagents_working`) reads it straight from the `reports`
-/// Value it already loads at boot. `start` increments, `stop` decrements with a
-/// floor of 0 so a lost start cannot drive the count negative. The write touches
-/// ONLY the `subagents` sub-key, preserving state/model/tokens — a subagent
-/// starting or stopping says nothing about the main turn's state.
-async fn subagent_event_post(state: &AppState, name: &str, ev: &str) -> Response {
-    // `reset` is not a delta — it is the LEAK BOUND (AMUX-4024), and it is the
-    // "leak-safe reset" AMUX-3048's deferral said the count-authoritative "off"
-    // direction needed before it could ship.
-    //
-    // A lost SubagentStop (a lane killed mid-agent, a crashed subagent) pins the
-    // count positive, and since the count now outranks the mtime window that
-    // used to bound this at 240s, a leak would read WORKING forever — and
-    // survive a restart, because a state report carries the count forward.
-    //
-    // SESSION START is the one moment a zero is provably correct rather than a
-    // guess: a background agent belongs to the process that spawned it, so a
-    // NEW session has none by construction. That is exactly the property the
-    // deferral demanded — this cannot zero a live `run_in_background` agent,
-    // because a live one implies the session it belongs to is still the old one.
-    // The caller is responsible for not sending this on a compact, which does
-    // not restart the process (see `scripts/hooks/hook-report.sh`).
-    if ev == "reset" {
-        let name_s = name.to_string();
-        let reply = state
-            .store
-            .write_async(move |conn| {
-                ensure_fleet_tables(conn)?;
-                let mut reports: Value = conn
-                    .query_row("SELECT value FROM prefs WHERE key='session_reports'", [], |r| {
-                        r.get::<_, String>(0)
-                    })
-                    .ok()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_else(|| json!({}));
-                if !reports[&name_s].is_object() {
-                    reports[&name_s] = json!({});
-                }
-                reports[&name_s]["subagents"] = json!({"count": 0, "ts": now_f64()});
-                conn.execute(
-                    "INSERT INTO prefs(key, value) VALUES('session_reports', ?1) \
-                     ON CONFLICT(key) DO UPDATE SET value=?1",
-                    [reports.to_string()],
-                )?;
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
-            })
-            .await;
-        return match reply {
-            Ok(_) => j200(json!({"ok": true, "session": name, "subagent": "reset"})),
-            Err(e) => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
+/// `event_id` makes a retry after response loss a no-op. `agent_id` makes the
+/// live set itself idempotent even if a provider re-emits the same lifecycle
+/// edge with a new event id. The old anonymous counter remains readable during
+/// rollout, but every newly instrumented Claude agent is represented by its
+/// server-visible id instead of an untraceable delta.
+fn apply_subagent_event(
+    previous: &Value,
+    ev: &str,
+    agent_id: &str,
+    event_id: &str,
+    event_ts: f64,
+    lifecycle_session: &str,
+    now: f64,
+) -> SubagentApply {
+    let mut next = if previous.is_object() { previous.clone() } else { json!({}) };
+    let previous_count = next["count"].as_i64().unwrap_or(0).max(0);
+    let had_live_ids = next.get("live_ids").and_then(Value::as_array).is_some();
+    let mut live_ids: Vec<String> = next["live_ids"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+    live_ids.sort();
+    live_ids.dedup();
+    let mut anonymous = if had_live_ids {
+        next["anonymous"].as_i64().unwrap_or(0).max(0)
+    } else {
+        previous_count.saturating_sub(live_ids.len() as i64)
+    };
+    let mut seen: Vec<String> = next["seen_events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+    let mut agent_edges = next["agent_edges"].as_object().cloned().unwrap_or_default();
+    // Terminal tombstones are compacted after 128 distinct finished agents.
+    // The floor keeps their ordering fact after compaction: an event older
+    // than an evicted terminal edge still cannot resurrect that agent.
+    let mut terminal_floor_ts = next["terminal_floor_ts"].as_f64().unwrap_or(0.0);
+
+    if !event_id.is_empty() && seen.iter().any(|id| id == event_id) {
+        return SubagentApply {
+            next,
+            verdict: "duplicate_event",
+            count: previous_count,
+            live_ids,
+            applied: false,
+            status_changed: false,
         };
     }
-    let delta: i64 = match ev {
-        "start" => 1,
-        "stop" | "done" => -1,
-        other => {
-            return jresp(
-                StatusCode::BAD_REQUEST,
-                json!({"error": format!(
-                    "subagent must be 'start', 'stop' or 'reset' (got '{other}')"
-                )}),
-            );
+
+    let reset_ts = next["reset_ts"].as_f64().unwrap_or(0.0);
+    let stored_session = next["session_id"].as_str().unwrap_or("");
+    let stale_time = reset_ts > 0.0 && event_ts > 0.0 && event_ts < reset_ts;
+    let stale_session = ev != "reset"
+        && !stored_session.is_empty()
+        && !lifecycle_session.is_empty()
+        && stored_session != lifecycle_session;
+    let prior_agent = (!agent_id.is_empty())
+        .then(|| agent_edges.get(agent_id))
+        .flatten();
+    let prior_agent_ts = prior_agent.and_then(|edge| edge["ts"].as_f64()).unwrap_or(0.0);
+    let prior_agent_state = prior_agent.and_then(|edge| edge["state"].as_str()).unwrap_or("");
+    let stale_agent_order = ev != "reset"
+        && event_ts > 0.0
+        && prior_agent_ts > 0.0
+        && (event_ts < prior_agent_ts
+            || (event_ts == prior_agent_ts && ev == "start" && prior_agent_state == "terminal"));
+    let stale_terminal_floor = ev != "reset"
+        && !agent_id.is_empty()
+        && event_ts > 0.0
+        && terminal_floor_ts > 0.0
+        && event_ts <= terminal_floor_ts;
+    let mut verdict = "applied";
+
+    if stale_time || stale_session || stale_agent_order || stale_terminal_floor {
+        verdict = if stale_session {
+            "stale_session"
+        } else if stale_time {
+            "stale_event"
+        } else if stale_agent_order {
+            "stale_agent_event"
+        } else {
+            "stale_before_terminal_floor"
+        };
+    } else {
+        match ev {
+            "reset" => {
+                live_ids.clear();
+                anonymous = 0;
+                agent_edges.clear();
+                terminal_floor_ts = 0.0;
+                next["reset_ts"] = json!(if event_ts > 0.0 { event_ts } else { now });
+                if !lifecycle_session.is_empty() {
+                    next["session_id"] = json!(lifecycle_session);
+                }
+            }
+            "start" => {
+                if agent_id.is_empty() {
+                    anonymous += 1;
+                } else if !live_ids.iter().any(|id| id == agent_id) {
+                    live_ids.push(agent_id.to_string());
+                    live_ids.sort();
+                } else {
+                    verdict = "duplicate_agent_start";
+                }
+                if !agent_id.is_empty() {
+                    agent_edges.insert(
+                        agent_id.to_string(),
+                        json!({"state": "live", "ts": event_ts}),
+                    );
+                }
+                if stored_session.is_empty() && !lifecycle_session.is_empty() {
+                    next["session_id"] = json!(lifecycle_session);
+                }
+            }
+            "stop" | "done" => {
+                if agent_id.is_empty() {
+                    anonymous = anonymous.saturating_sub(1).max(0);
+                } else if let Some(pos) = live_ids.iter().position(|id| id == agent_id) {
+                    live_ids.remove(pos);
+                } else if anonymous > 0 {
+                    // Compatibility with a start recorded by the pre-identity
+                    // hook: the matching stop has an id, the carried count did not.
+                    anonymous -= 1;
+                } else {
+                    verdict = "orphan_stop";
+                }
+                if !agent_id.is_empty() {
+                    // Keep a terminal edge even for stop-before-start. When the
+                    // older start arrives later, ordering rejects it instead of
+                    // resurrecting work that has already completed.
+                    agent_edges.insert(
+                        agent_id.to_string(),
+                        json!({"state": "terminal", "ts": event_ts}),
+                    );
+                }
+            }
+            _ => unreachable!("validated by subagent_event_post"),
         }
-    };
+    }
+
+    if !event_id.is_empty() {
+        seen.push(event_id.to_string());
+        if seen.len() > SUBAGENT_EVENT_HISTORY_LIMIT {
+            seen.drain(..seen.len() - SUBAGENT_EVENT_HISTORY_LIMIT);
+        }
+    }
+    let mut terminal_edges: Vec<(String, f64)> = agent_edges
+        .iter()
+        .filter(|(_, edge)| edge["state"].as_str() == Some("terminal"))
+        .map(|(id, edge)| (id.clone(), edge["ts"].as_f64().unwrap_or(0.0)))
+        .collect();
+    if terminal_edges.len() > SUBAGENT_EVENT_HISTORY_LIMIT {
+        terminal_edges.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let remove_n = terminal_edges.len() - SUBAGENT_EVENT_HISTORY_LIMIT;
+        for (id, ts) in terminal_edges.into_iter().take(remove_n) {
+            agent_edges.remove(&id);
+            terminal_floor_ts = terminal_floor_ts.max(ts);
+        }
+    }
+    let count = anonymous + live_ids.len() as i64;
+    next["count"] = json!(count);
+    next["live_ids"] = json!(live_ids);
+    next["anonymous"] = json!(anonymous);
+    next["seen_events"] = json!(seen);
+    next["agent_edges"] = Value::Object(agent_edges);
+    next["terminal_floor_ts"] = json!(terminal_floor_ts);
+    next["ts"] = json!(now);
+    next["last_event"] = json!({
+        "event": ev,
+        "event_id": event_id,
+        "agent_id": agent_id,
+        "event_ts": event_ts,
+        "verdict": verdict,
+    });
+    let applied = &next != previous;
+    SubagentApply {
+        next,
+        verdict,
+        count,
+        live_ids,
+        applied,
+        status_changed: count != previous_count,
+    }
+}
+
+/// AMUX-3048/ATE-45: durably apply an ordered, idempotent lifecycle event.
+async fn subagent_event_post(state: &AppState, name: &str, ev: &str, body: &Value) -> Response {
+    if !matches!(ev, "start" | "stop" | "done" | "reset") {
+        return jresp(
+            StatusCode::BAD_REQUEST,
+            json!({"error": format!(
+                "subagent must be 'start', 'stop' or 'reset' (got '{ev}')"
+            )}),
+        );
+    }
     let name_s = name.to_string();
     let ev_s = ev.to_string();
+    let agent_id: String = body_str(body, "agent_id").trim().chars().take(128).collect();
+    let event_id: String = body_str(body, "event_id").trim().chars().take(200).collect();
+    let lifecycle_session: String = body_str(body, "session_id").trim().chars().take(128).collect();
+    let event_ts = body.get("event_ts").and_then(Value::as_f64).unwrap_or_else(now_f64);
+    let delivery_attempt = body.get("delivery_attempt").and_then(Value::as_u64).unwrap_or(1);
+    let result_slot = std::sync::Arc::new(std::sync::Mutex::new(None::<SubagentApply>));
+    let result_out = result_slot.clone();
+    let agent_id_write = agent_id.clone();
+    let event_id_write = event_id.clone();
+    let lifecycle_session_write = lifecycle_session.clone();
     let reply = state
         .store
         .write_async(move |conn| {
@@ -14754,41 +15737,102 @@ async fn subagent_event_post(state: &AppState, name: &str, ev: &str) -> Response
                 .ok()
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_else(|| json!({}));
-            let prev = reports[&name_s]["subagents"]["count"].as_i64().unwrap_or(0);
-            let next = (prev + delta).max(0);
-            if next == prev {
-                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
-            }
             if !reports[&name_s].is_object() {
                 reports[&name_s] = json!({});
             }
-            reports[&name_s]["subagents"] = json!({"count": next, "ts": now_f64()});
-            conn.execute(
-                "INSERT INTO prefs(key, value) VALUES('session_reports', ?1) \
-                 ON CONFLICT(key) DO UPDATE SET value=?1",
-                [reports.to_string()],
-            )?;
-            // Clear BEFORE returning the event: the store broadcasts only after
-            // this transaction commits, so the SSE-driven GET cannot race ahead
-            // of cache invalidation and render the old count for another 2s.
-            crate::api::sessions_legacy::invalidate_sessions_cache();
-            Ok(crate::db::WriteOutcome {
-                applied: true,
-                events: vec![crate::db::PendingEvent {
+            let applied = apply_subagent_event(
+                &reports[&name_s]["subagents"],
+                &ev_s,
+                &agent_id_write,
+                &event_id_write,
+                event_ts,
+                &lifecycle_session_write,
+                now_f64(),
+            );
+            if applied.applied {
+                reports[&name_s]["subagents"] = applied.next.clone();
+                conn.execute(
+                    "INSERT INTO prefs(key, value) VALUES('session_reports', ?1) \
+                     ON CONFLICT(key) DO UPDATE SET value=?1",
+                    [reports.to_string()],
+                )?;
+                crate::api::sessions_legacy::invalidate_sessions_cache();
+            }
+            let events = if applied.status_changed {
+                vec![crate::db::PendingEvent {
                     entity_type: amux_core::revision::EntityType::Session,
                     entity_id: name_s.clone(),
                     mutation: amux_core::revision::MutationKind::Updated,
                     payload: None,
-                }],
-            })
+                }]
+            } else {
+                vec![]
+            };
+            *result_out.lock().unwrap_or_else(|p| p.into_inner()) = Some(applied.clone());
+            Ok(crate::db::WriteOutcome { applied: applied.applied, events })
         })
         .await;
     match reply {
-        Ok(_) => j200(json!({"ok": true, "session": name, "subagent": ev_s})),
-        Err(e) => jresp(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({"error": e.to_string()}),
-        ),
+        Ok(_) => {
+            let applied = result_slot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+                .unwrap_or(SubagentApply {
+                    next: Value::Null,
+                    verdict: "unmeasured",
+                    count: 0,
+                    live_ids: vec![],
+                    applied: false,
+                    status_changed: false,
+                });
+            if delivery_attempt > 1 {
+                tracing::warn!(
+                    target: "subagent_lifecycle",
+                    session = name,
+                    event = ev,
+                    event_id,
+                    agent_id,
+                    delivery_attempt,
+                    verdict = applied.verdict,
+                    count = applied.count,
+                    "subagent lifecycle event replayed after an earlier delivery failure"
+                );
+            }
+            if matches!(
+                applied.verdict,
+                "stale_event"
+                    | "stale_session"
+                    | "stale_agent_event"
+                    | "stale_before_terminal_floor"
+                    | "orphan_stop"
+            ) {
+                tracing::warn!(
+                    target: "subagent_lifecycle",
+                    session = name,
+                    event = ev,
+                    event_id,
+                    agent_id,
+                    verdict = applied.verdict,
+                    count = applied.count,
+                    "subagent lifecycle event did not change the live set"
+                );
+            }
+            j200(json!({
+                "ok": true,
+                "session": name,
+                "subagent": ev,
+                "event_id": event_id,
+                "agent_id": agent_id,
+                "applied": applied.applied,
+                "verdict": applied.verdict,
+                "count": applied.count,
+                "live_ids": applied.live_ids,
+                "history_limit": SUBAGENT_EVENT_HISTORY_LIMIT,
+                "delivery_attempt": delivery_attempt,
+            }))
+        }
+        Err(e) => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
     }
 }
 
@@ -14885,7 +15929,7 @@ pub(crate) async fn report_post(state: &AppState, name: &str, headers: &HeaderMa
     // count is a self-report like any other.
     let sub_ev = body_str(body, "subagent").trim().to_lowercase();
     if !sub_ev.is_empty() {
-        return subagent_event_post(state, name, &sub_ev).await;
+        return subagent_event_post(state, name, &sub_ev, body).await;
     }
     let st_raw = body_str(body, "state").trim().to_lowercase();
     let st = match st_raw.as_str() {
@@ -16608,8 +17652,8 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
         // enforce rather than what was just typed — a group or global layer can
         // still grant this lane even when its own value is now empty, and
         // reporting "off" there would be a lie the next send disproves.
-        let effective = scoped_setting_in(&crate::config::amux_home(), name, "CC_SEND_ALLOW")
-            .unwrap_or_default();
+        let effective = cross_group_allow_setting_in(&crate::config::amux_home(), name)
+            .unwrap_or_else(|| "*".into());
         let effective = effective.trim().trim_matches('"').to_string();
         tracing::info!(
             session = %name, send_allow = %value, effective = %effective,
@@ -17261,15 +18305,13 @@ mod tests {
         assert_eq!(r(sha), sha, "git sha must survive: {}", r(sha));
     }
 
-    /// Ethan, 2026-08-11: worker-to-worker messaging is intra-group unless
-    /// explicitly configured. The escapes must be CONFIG — a body flag any
-    /// caller could set would make the rule advisory.
-    /// CONFIGURE A WORKER (OR A WHOLE GROUP) TO SPAN GROUPS, WITHOUT A
-    /// PER-MESSAGE APPROVAL (AMUX-4015).
+    /// Worker-to-worker messaging is open by default. Configuration may narrow
+    /// an individual worker or a whole group without putting policy in a body
+    /// flag that a caller could forge (AMUX-4015).
     ///
     /// `CC_SEND_ALLOW` and `CC_RECEIVE_ANY` were read through `parse_env`, which
     /// reads `sessions/<worker>.env` and nothing else. `/api/scope` has always
-    /// advertised `env` at global/group/worker and the Scope tab writes all
+    /// advertised `env` at global/group/worker and the Configurations tab writes all
     /// three, so setting either switch at the GROUP or GLOBAL layer saved a file
     /// this gate never opened: it appeared to work and changed nothing. That is
     /// AMUX-2930's shape, still live for these two keys.
@@ -17290,8 +18332,16 @@ mod tests {
 
         w("roamer", "CC_TAGS=\"customers\"\n");
         w("target", "CC_TAGS=\"gtm\"\n");
-        // Baseline: no configuration anywhere, so it is refused.
-        assert!(cross_group_send_ok("roamer", "target").is_err(), "premise: refused unconfigured");
+        // Product baseline: no configuration anywhere means open peer discovery
+        // and messaging.
+        assert_eq!(
+            cross_group_send_ok("roamer", "target").expect("fresh fleet must be open"),
+            "sender-allowlist"
+        );
+        // An explicit empty global value is the fleet opt-out. More-specific
+        // group/worker configuration may still open a deliberately selected lane.
+        std::fs::write(dir.path().join("amux.env"), "CC_SEND_ALLOW=\"\"\n").expect("write");
+        assert!(cross_group_send_ok("roamer", "target").is_err(), "explicit opt-out must close");
 
         // GROUP LAYER on the SENDER's group. This is the "configure it once for
         // the group" case, and before the fix it did nothing at all.
@@ -17305,7 +18355,7 @@ mod tests {
         // once rather than per worker.
         std::fs::remove_file(groups.join("customers.env")).expect("rm");
         assert!(cross_group_send_ok("roamer", "target").is_err(), "control: grant withdrawn");
-        std::fs::write(dir.path().join("amux.env"), "CC_RECEIVE_ANY=1\n").expect("write");
+        std::fs::write(dir.path().join("amux.env"), "CC_SEND_ALLOW=\"\"\nCC_RECEIVE_ANY=1\n").expect("write");
         assert_eq!(
             cross_group_send_ok("roamer", "target").expect("global layer must grant"),
             "receiver-open"
@@ -17341,7 +18391,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_group_sends_are_refused_unless_configured() {
+    fn cross_group_sends_are_open_by_default_and_explicitly_opt_out() {
         let dir = tempfile::tempdir().expect("tmp");
         let _g = crate::api::settings::test_env::set_home(dir.path());
         let sessions = dir.path().join("sessions");
@@ -17356,7 +18406,11 @@ mod tests {
         write("broadcaster", "CC_TAGS=\"customers\"\nCC_SEND_ALLOW=\"gtm\"\n");
         write("lonely", "\n"); // untagged
 
-        // THE REPORTED CASE: different groups, no config -> refused.
+        // Fresh fleets are open across groups.
+        assert_eq!(cross_group_send_ok("ts-gke", "gtm-engine").unwrap(), "sender-allowlist");
+        // An explicit global empty value closes the default. This is the only
+        // state in which the refusal/approval path should appear.
+        std::fs::write(dir.path().join("amux.env"), "CC_SEND_ALLOW=\"\"\n").expect("write");
         let err = cross_group_send_ok("ts-gke", "gtm-engine").expect_err("must refuse");
         assert!(err.contains("cross-group send refused"), "{err}");
         // The refusal must NAME both escapes, or it is a wall rather than a rule.
@@ -17422,6 +18476,26 @@ mod tests {
         // owner peek/send to an isolated worker still works.
         assert_eq!(cross_group_send_ok("", "secret").unwrap(), "self-or-human");
     }
+
+    #[tokio::test]
+    async fn an_isolated_peer_refusal_never_mints_an_approval_request() {
+        let (state, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("caller.env"), "CC_TAGS=alpha\n").unwrap();
+        std::fs::write(sessions.join("raw.env"), "CC_TAGS=beta\nCC_ISOLATED=1\n").unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-amux-session", "caller".parse().unwrap());
+        let response = send_post(&state, "raw", &headers, &json!({"text": "do work"})).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["blocked"], json!("isolated"));
+        assert_eq!(body["code"], json!("isolated_target"));
+        assert!(body.get("grant_id").is_none(), "an impossible send must not ask for approval: {body}");
+    }
+
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -18306,6 +19380,83 @@ mod tests {
         );
     }
 
+    /// THE DETECTOR MUST FIRE ON A CONCURRENT PAIR, NOT ONLY A SEQUENTIAL ONE
+    /// (AF-483).
+    ///
+    /// Measured over all of cmd_history on 2026-09-04: six exact-text duplicate
+    /// pairs to one lane inside the 120s window after the detector shipped, and
+    /// only two were announced. The four misses were 08-13 to 08-18 with gaps of
+    /// 2s, 31s, 1s and 7s, and deployment, retention, the `stuck` exclusion, the
+    /// client send-time stamp and row shape are all ruled out on AF-483.
+    ///
+    /// What is NOT ruled out is a TOCTOU in the detector itself. `dup_prior`
+    /// takes a READ connection, checks, drops it, and the INSERT happens later
+    /// in a separate `write_async`. Two sends whose reads both land before
+    /// either write therefore see no prior and neither announces, which is the
+    /// one case where the announcement matters most: a 0-1s gap is the shape a
+    /// human does not produce.
+    ///
+    /// The sequential case already works and this cell asserts it too, as the
+    /// control. Without it a "fix" that announced on every message would pass
+    /// the concurrent half and destroy the signal.
+    #[tokio::test]
+    async fn a_concurrent_duplicate_is_announced_like_a_sequential_one() {
+        // CONTROL FIRST: sequential. If this ever stops firing the concurrent
+        // assertion below is measuring a detector that is simply off.
+        let (st, _dir) = state();
+        cmd_hist_record_full(&st, "lane-seq", "same words", "user", "", true,
+                             DeliveryMeta::direct()).await;
+        cmd_hist_record_full(&st, "lane-seq", "same words", "user", "", true,
+                             DeliveryMeta::direct()).await;
+        assert_eq!(
+            duplicate_events(&st, "lane-seq"),
+            1,
+            "premise: a sequential duplicate pair must announce exactly once, or this \
+             cell cannot tell a broken detector from a race"
+        );
+
+        // THE CASE. Two records started together, so both reads can precede
+        // both writes.
+        let (st2, _dir2) = state();
+        let a = cmd_hist_record_full(&st2, "lane-race", "same words", "user", "", true,
+                                     DeliveryMeta::direct());
+        let b = cmd_hist_record_full(&st2, "lane-race", "same words", "user", "", true,
+                                     DeliveryMeta::direct());
+        tokio::join!(a, b);
+
+        let rows = lane_rows(&st2, "lane-race");
+        assert_eq!(rows, 2, "premise: both sends must have been recorded, got {rows}");
+        assert_eq!(
+            duplicate_events(&st2, "lane-race"),
+            1,
+            "two identical sends landed on one lane together and the detector said \
+             nothing. A 0-1s gap is the shape a human does not produce, so this is \
+             exactly the pair worth announcing (AF-483)."
+        );
+    }
+
+    /// How many `message.duplicate` events exist for a lane.
+    fn duplicate_events(st: &AppState, lane: &str) -> i64 {
+        st.store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM session_events \
+                 WHERE type='message.duplicate' AND session=?1",
+                [lane],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+    }
+
+    fn lane_rows(st: &AppState, lane: &str) -> i64 {
+        st.store
+            .read()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM cmd_history WHERE session=?1", [lane], |r| r.get(0))
+            .unwrap_or(0)
+    }
+
     /// A healthy SSE connection used to make Messages LESS live than the 5s
     /// polling fallback: cmd_history committed silently, so no client refetched
     /// until a reload or an unrelated board/session event. The ledger write is
@@ -18728,7 +19879,7 @@ mod tests {
         cmd_hist_record_full(
             &st,
             "lane-info",
-            "What is the difference between todo and backlog? Please answer only; do not change anything.",
+            "Acceptance check only: what provider and model are you currently running? Answer in one sentence. Do not create or modify any board task.",
             "user",
             "",
             false,
@@ -19326,6 +20477,47 @@ mod tests {
         assert_eq!(detect_claude_status(active), "active");
         let echoed = "\u{276f} [amux] VERIFY \u{2014} y\u{2026}\nmixpeek$ ";
         assert_ne!(detect_claude_status(echoed), "active");
+        // ATE-45: Claude yields its main composer while Explore agents run.
+        // The provider-owned waiting row is active for singular and plural;
+        // prose quoting the same words is not provider chrome.
+        for waiting in [
+            "\u{2736} Waiting for 1 background agent to finish\n\n\u{276f}\n\n\u{23f5}\u{23f5} bypass permissions on \u{b7} \u{2190} 2 agents",
+            "\u{273b} Waiting for 2 background agents to finish\n\n\u{276f}\n\n\u{23f5}\u{23f5} bypass permissions on",
+        ] {
+            assert_eq!(detect_claude_status(waiting), "active", "{waiting}");
+        }
+        let completed_after_wait = "\
+\u{2736} Waiting for 1 background agent to finish
+\u{23fa} Agent \"Post-fix status verification\" finished \u{b7} 16s
+\u{23fa} The background Explore agent finished and returned CLAUDE-POSTFIX-DONE.
+CLAUDE-POSTFIX-COMPLETE
+\u{273b} Churned for 23s \u{b7} done 3:40 PM
+\u{276f}\u{a0}
+\u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} \u{2190} 2 agents";
+        assert_eq!(
+            detect_claude_status(completed_after_wait),
+            "idle",
+            "a completed-turn/final-prompt boundary is newer than the stale wait row"
+        );
+        assert!(!provider_background_working(completed_after_wait));
+        let quoted_wait = "I am testing Waiting for 1 background agent to finish\n\n\u{276f}\n\n\u{23f5}\u{23f5} bypass permissions on";
+        assert_eq!(detect_claude_status(quoted_wait), "idle");
+        let prompt_quote = "\u{276f} Waiting for 1 background agent to finish\n\n\u{23f5}\u{23f5} bypass permissions on";
+        assert_eq!(
+            detect_claude_status(prompt_quote),
+            "idle",
+            "Claude's prompt glyph is not provider spinner chrome"
+        );
+        let pasted_row = "\u{276f} Here is the captured row:\n  \u{2736} Waiting for 1 background agent to finish\n\n\u{23f5}\u{23f5} bypass permissions on";
+        assert_eq!(
+            detect_claude_status(pasted_row),
+            "idle",
+            "an indented pasted provider row is still user text"
+        );
+        // Provider/model controls: the new Claude frame must not turn a Codex
+        // prompt or Gemini selector into active.
+        assert_eq!(detect_claude_status("\u{203a} Ask Codex to do anything"), "");
+        assert_eq!(detect_claude_status("\u{2502} \u{25cf} 1. Allow\n\u{2502}   2. Deny"), "waiting");
         // Resume picker needs the ⌕ search glyph.
         assert!(at_resume_picker("Resume Session \u{2315}\nEnter to select"));
         assert!(!at_resume_picker("Enter to select"));
@@ -19343,6 +20535,7 @@ mod tests {
         ];
         let active = codex_turn_signal_from_events(&events).unwrap();
         assert_eq!(active.state, "active");
+        assert_eq!(active.boundary, "task_started");
         assert!(active.ts > 1_700_000_000.0);
 
         let mut completed = events;
@@ -19351,13 +20544,86 @@ mod tests {
             "type": "event_msg",
             "payload": {"type": "task_complete"}
         }));
-        assert_eq!(codex_turn_signal_from_events(&completed).unwrap().state, "idle");
+        let completed = codex_turn_signal_from_events(&completed).unwrap();
+        assert_eq!(completed.state, "idle");
+        assert_eq!(completed.boundary, "task_complete");
 
         let exec_json = vec![json!({
             "timestamp": "2026-09-02T21:41:00Z",
             "type": "turn.started"
         })];
         assert_eq!(codex_turn_signal_from_events(&exec_json).unwrap().state, "active");
+
+        let interrupted = vec![
+            json!({
+                "timestamp": "2026-09-04T20:28:29.408Z",
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "01a06e1b"}
+            }),
+            json!({
+                "timestamp": "2026-09-04T20:28:54.769Z",
+                "type": "event_msg",
+                "payload": {"type": "turn_aborted", "turn_id": "01a06e1b"}
+            }),
+        ];
+        let interrupted = codex_turn_signal_from_events(&interrupted).unwrap();
+        assert_eq!(interrupted.state, "idle", "an interrupted turn is terminal, not active");
+        assert_eq!(interrupted.boundary, "turn_aborted");
+    }
+
+    /// ATE-42 live regression: `amux` and `amux-testing-e2e` shared one cwd.
+    /// The old newest-cwd resolver assigned e2e's active rollout to both, so
+    /// the idle `amux` prompt showed WORKING.  Each worker life must resolve
+    /// the rollout born near its own start, independent of file-list order.
+    #[test]
+    fn codex_rollout_fallback_is_worker_life_scoped_not_newest_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = normalize_work_dir(dir.path().to_str().unwrap());
+        let older = dir.path().join("rollout-amux.jsonl");
+        let newer = dir.path().join("rollout-e2e.jsonl");
+        std::fs::write(
+            &older,
+            format!(
+                "{{\"timestamp\":\"2026-09-03T21:44:35Z\",\"type\":\"session_meta\",\"payload\":{{\"cwd\":{}}}}}\n",
+                serde_json::to_string(&format!("{}/", dir.path().display())).unwrap()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &newer,
+            format!(
+                "{{\"timestamp\":\"2026-09-03T23:45:04Z\",\"type\":\"session_meta\",\"payload\":{{\"cwd\":{}}}}}\n",
+                serde_json::to_string(&cwd).unwrap()
+            ),
+        )
+        .unwrap();
+        let files = vec![
+            (std::time::SystemTime::now(), newer.clone()),
+            (std::time::SystemTime::UNIX_EPOCH, older.clone()),
+        ];
+
+        let amux_start = parse_iso8601("2026-09-03T21:44:10Z").unwrap();
+        let e2e_start = parse_iso8601("2026-09-03T23:39:24Z").unwrap();
+        assert_eq!(rollout_for_worker_start(&files, &cwd, amux_start), Some(&older));
+        assert_eq!(rollout_for_worker_start(&files, &cwd, e2e_start), Some(&newer));
+        assert_eq!(
+            rollout_for_worker_start(
+                &files,
+                &cwd,
+                parse_iso8601("2026-09-03T21:50:00Z").unwrap()
+            ),
+            None,
+            "a pre-restart rollout must not be adopted by the new worker life"
+        );
+        assert_eq!(
+            rollout_for_worker_start(
+                &files,
+                &cwd,
+                parse_iso8601("2026-09-04T12:00:00Z").unwrap()
+            ),
+            None,
+            "outside the bounded startup window the safe answer is unknown"
+        );
     }
 
     /// Codex's trust-directory picker, byte shape captured live 2026-08-11
@@ -20660,8 +21926,12 @@ mod steer_boundary_tests {
                         ask_type: None,
                         ask_question: None,
                         ask_unblocks: None,
+                        ask_actor: None,
                         // AF-367: an auto-captured human prompt — the population AF-367 is about.
                         source: Some("capture".into()),
+                        requested_by: None,
+                        callback_session: None,
+                        callback_prompt: None,
                     },
                     now_ms / 1000,
                 )?;
@@ -20787,11 +22057,17 @@ mod steer_boundary_tests {
             "a same-group reviewer must still be assignable"
         );
 
-        // THE NEW CELL: registered, real, and in another group. The old gate
-        // passed this — it is ECOLO-14 and AMUX-3761 exactly — and the owner
-        // then could not message the reviewer it was waiting on.
+        // EXPLICITLY CLOSED: registered, real, and in another group. Fresh
+        // fleets are intentionally open now; preserve this boundary regression
+        // by closing the owner's lane through the documented worker-level
+        // override before checking reviewer reachability.
+        std::fs::write(
+            sessions.join("owner.env"),
+            "CC_DIR=/tmp\nCC_TAGS=\"alpha\"\nCC_SEND_ALLOW=\"\"\n",
+        )
+        .unwrap();
         let why = reviewer_unreachable_reason("owner", "far")
-            .expect("a cross-group reviewer must refuse even though it IS registered");
+            .expect("an explicitly opted-out cross-group reviewer must refuse");
         assert!(
             !why.contains("not a registered worker"),
             "the refusal must name the REACH problem, not mislead about existence: {why}"
@@ -20917,7 +22193,7 @@ mod steer_boundary_tests {
                 .unwrap_or(Value::Null)
         };
 
-        subagent_event_post(&state, "probe", "start").await;
+        subagent_event_post(&state, "probe", "start", &json!({})).await;
         let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
             .await
             .expect("subagent start must push a real-time session event")
@@ -20925,7 +22201,7 @@ mod steer_boundary_tests {
         assert_eq!(event.entity_type, amux_core::revision::EntityType::Session);
         assert_eq!(event.entity_id, "probe");
         assert_eq!(event.mutation, amux_core::revision::MutationKind::Updated);
-        subagent_event_post(&state, "probe", "start").await;
+        subagent_event_post(&state, "probe", "start", &json!({})).await;
         let v = read(&state);
         assert_eq!(v["probe"]["subagents"]["count"].as_i64(), Some(2), "two starts -> 2");
         assert_eq!(
@@ -20950,13 +22226,13 @@ mod steer_boundary_tests {
             "main-turn reports must preserve the live subagent count"
         );
 
-        subagent_event_post(&state, "probe", "stop").await;
+        subagent_event_post(&state, "probe", "stop", &json!({})).await;
         assert_eq!(read(&state)["probe"]["subagents"]["count"].as_i64(), Some(1), "one stop -> 1");
 
         // FLOOR: more stops than starts (a lost start event) must never underflow
         // into a negative count that would misread once a real start arrives.
-        subagent_event_post(&state, "probe", "stop").await;
-        subagent_event_post(&state, "probe", "stop").await;
+        subagent_event_post(&state, "probe", "stop", &json!({})).await;
+        subagent_event_post(&state, "probe", "stop", &json!({})).await;
         assert_eq!(
             read(&state)["probe"]["subagents"]["count"].as_i64(),
             Some(0),
@@ -21032,6 +22308,267 @@ mod steer_boundary_tests {
         // reads a message that forbids the thing the hook is being asked to send.
         let bad = report_post(&state, "probe", &h, &json!({"subagent": "sideways"})).await;
         assert_eq!(bad.status(), StatusCode::BAD_REQUEST, "an unknown subagent event must 400");
+    }
+
+    /// ATE-45: response loss and server replacement may redeliver lifecycle
+    /// events. Identity, not delivery count, is the source of truth.
+    #[tokio::test]
+    async fn subagent_lifecycle_is_idempotent_ordered_and_restart_durable() {
+        async fn post(state: &AppState, ev: &str, body: Value) -> Value {
+            let response = subagent_event_post(state, "primis", ev, &body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+        fn read(state: &AppState) -> Value {
+            let raw: String = state
+                .store
+                .read()
+                .unwrap()
+                .query_row("SELECT value FROM prefs WHERE key='session_reports'", [], |r| r.get(0))
+                .unwrap();
+            serde_json::from_str(&raw).unwrap()
+        }
+        fn state_with(path: &Path) -> AppState {
+            AppState {
+                store: std::sync::Arc::new(crate::db::Store::open(path).unwrap()),
+                started: std::time::Instant::now(),
+                build_hash: "test".into(),
+                auth_token: None,
+                reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("restart.db");
+        let state = state_with(&db);
+        let sid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        post(
+            &state,
+            "reset",
+            json!({"session_id":sid,"event_id":"reset-1","event_ts":100.0}),
+        )
+        .await;
+        for (id, ts) in [("explore-1", 101.0), ("explore-2", 102.0)] {
+            post(
+                &state,
+                "start",
+                json!({"session_id":sid,"agent_id":id,"event_id":format!("{id}:start"),"event_ts":ts}),
+            )
+            .await;
+        }
+        let duplicate = post(
+            &state,
+            "start",
+            json!({"session_id":sid,"agent_id":"explore-1","event_id":"explore-1:start","event_ts":101.0}),
+        )
+        .await;
+        assert_eq!(duplicate["verdict"], json!("duplicate_event"));
+        assert_eq!(duplicate["count"], json!(2), "response loss retry must not increment");
+        assert_eq!(duplicate["live_ids"], json!(["explore-1", "explore-2"]));
+
+        // A real Store replacement reads the durable set from SQLite. This is
+        // the server-rebuild boundary from the live Primis incident, not an
+        // in-memory clone of the first AppState.
+        drop(state);
+        let restarted = state_with(&db);
+        assert_eq!(read(&restarted)["primis"]["subagents"]["count"], json!(2));
+
+        let stale = post(
+            &restarted,
+            "start",
+            json!({"session_id":sid,"agent_id":"old","event_id":"old:start","event_ts":99.0}),
+        )
+        .await;
+        assert_eq!(stale["verdict"], json!("stale_event"));
+        assert_eq!(stale["count"], json!(2));
+
+        let wrong_session = post(
+            &restarted,
+            "stop",
+            json!({
+                "session_id":"ffffffff-1111-4222-8333-444444444444",
+                "agent_id":"explore-1","event_id":"wrong:stop","event_ts":103.0
+            }),
+        )
+        .await;
+        assert_eq!(wrong_session["verdict"], json!("stale_session"));
+        assert_eq!(wrong_session["count"], json!(2));
+
+        for (id, ts) in [("explore-1", 104.0), ("explore-2", 105.0)] {
+            let stopped = post(
+                &restarted,
+                "stop",
+                json!({"session_id":sid,"agent_id":id,"event_id":format!("{id}:stop"),"event_ts":ts}),
+            )
+            .await;
+            assert_eq!(stopped["count"], json!(if id == "explore-1" { 1 } else { 0 }));
+        }
+        let duplicate_stop = post(
+            &restarted,
+            "stop",
+            json!({"session_id":sid,"agent_id":"explore-2","event_id":"explore-2:stop","event_ts":105.0}),
+        )
+        .await;
+        assert_eq!(duplicate_stop["verdict"], json!("duplicate_event"));
+        assert_eq!(duplicate_stop["count"], json!(0), "final stop returns the lane to idle");
+
+        let stored = read(&restarted);
+        assert_eq!(stored["primis"]["subagents"]["live_ids"], json!([]));
+        assert!(
+            stored["primis"]["subagents"]["seen_events"].as_array().unwrap().len()
+                <= SUBAGENT_EVENT_HISTORY_LIMIT,
+            "server-side delivery dedupe must remain bounded"
+        );
+    }
+
+    #[test]
+    fn subagent_event_dedupe_history_is_bounded() {
+        let mut current = Value::Null;
+        for i in 0..(SUBAGENT_EVENT_HISTORY_LIMIT + 12) {
+            current = apply_subagent_event(
+                &current,
+                "start",
+                "same-live-agent",
+                &format!("event-{i:03}"),
+                100.0 + i as f64,
+                "session-one",
+                200.0 + i as f64,
+            )
+            .next;
+        }
+        let seen = current["seen_events"].as_array().unwrap();
+        assert_eq!(seen.len(), SUBAGENT_EVENT_HISTORY_LIMIT);
+        assert_eq!(seen.first(), Some(&json!("event-012")));
+        assert_eq!(current["count"], json!(1), "new ids for one agent never inflate count");
+    }
+
+    #[test]
+    fn subagent_terminal_edges_reject_reordered_and_aged_starts() {
+        let sid = "session-one";
+        let mut current = apply_subagent_event(
+            &Value::Null,
+            "reset",
+            "",
+            "reset",
+            100.0,
+            sid,
+            100.0,
+        )
+        .next;
+
+        // A terminal edge arriving first is a tombstone, not a disposable
+        // orphan. The older start must not make the finished agent live again.
+        let stop_first = apply_subagent_event(
+            &current,
+            "stop",
+            "reordered-agent",
+            "stop-first",
+            120.0,
+            sid,
+            120.0,
+        );
+        assert_eq!(stop_first.verdict, "orphan_stop");
+        current = stop_first.next;
+        let late_start = apply_subagent_event(
+            &current,
+            "start",
+            "reordered-agent",
+            "late-start",
+            110.0,
+            sid,
+            121.0,
+        );
+        assert_eq!(late_start.verdict, "stale_agent_event");
+        assert_eq!(late_start.count, 0);
+
+        // A genuinely newer reuse remains possible and establishes a new
+        // terminal high-water edge when it completes.
+        current = apply_subagent_event(
+            &late_start.next,
+            "start",
+            "reordered-agent",
+            "new-start",
+            130.0,
+            sid,
+            130.0,
+        )
+        .next;
+        current = apply_subagent_event(
+            &current,
+            "stop",
+            "reordered-agent",
+            "new-stop",
+            140.0,
+            sid,
+            140.0,
+        )
+        .next;
+        assert_eq!(current["count"], json!(0));
+
+        // Age `new-start` out of the bounded event-id list. Its retry remains
+        // stale because ordering belongs to the agent edge, not dedupe history.
+        for i in 0..(SUBAGENT_EVENT_HISTORY_LIMIT + 4) {
+            current = apply_subagent_event(
+                &current,
+                "stop",
+                "reordered-agent",
+                &format!("later-stop-{i}"),
+                141.0 + i as f64,
+                sid,
+                141.0 + i as f64,
+            )
+            .next;
+        }
+        assert!(
+            !current["seen_events"].as_array().unwrap().contains(&json!("new-start")),
+            "the test must actually age the start identity out"
+        );
+        let aged_retry = apply_subagent_event(
+            &current,
+            "start",
+            "reordered-agent",
+            "new-start",
+            130.0,
+            sid,
+            999.0,
+        );
+        assert_eq!(aged_retry.verdict, "stale_agent_event");
+        assert_eq!(aged_retry.count, 0);
+    }
+
+    #[test]
+    fn subagent_compacted_terminal_tombstones_leave_a_replay_floor() {
+        let sid = "session-one";
+        let mut current = Value::Null;
+        for i in 0..(SUBAGENT_EVENT_HISTORY_LIMIT + 1) {
+            current = apply_subagent_event(
+                &current,
+                "stop",
+                &format!("finished-{i:03}"),
+                &format!("stop-{i:03}"),
+                100.0 + i as f64,
+                sid,
+                200.0 + i as f64,
+            )
+            .next;
+        }
+        assert_eq!(
+            current["agent_edges"].as_object().unwrap().len(),
+            SUBAGENT_EVENT_HISTORY_LIMIT
+        );
+        assert_eq!(current["terminal_floor_ts"], json!(100.0));
+        let replay = apply_subagent_event(
+            &current,
+            "start",
+            "finished-000",
+            "ancient-start",
+            99.0,
+            sid,
+            999.0,
+        );
+        assert_eq!(replay.verdict, "stale_before_terminal_floor");
+        assert_eq!(replay.count, 0);
     }
 
     /// Fail-closed is the whole safety property: an unknown lane must not be
@@ -21665,6 +23202,14 @@ mod send_retry_reporting_tests {
 mod composer_state_tests {
     use super::*;
 
+    /// `amux-testing-e2e`, captured live 2026-09-04 while the lane's native
+    /// stop hook and Codex rollout both said idle. The dashboard nevertheless
+    /// showed `UNSUBMITTED TEXT` with preview `gpt-5.6-solxhigh~/Dev/amux`:
+    /// `composer_state` correctly put the dim prompt hint in `Placeholder`,
+    /// then incorrectly folded Codex's normal-colour model/path footer into
+    /// the same composer block and promoted the whole thing to `Typed`.
+    const LIVE_CODEX_IDLE: &str = "\u{1b}[1m\u{203a}\u{1b}[0m \u{1b}[2mAsk Codex to do anything\u{1b}[0m\n\n  \u{1b}[38;2;246;226;183mgpt-5.6-sol xhigh\u{1b}[2m\u{1b}[39m \u{b7} \u{1b}[0m\u{1b}[38;2;171;223;167m~/Dev/amux\u{1b}[39m\n";
+
     /// `backend`, captured 2026-08-09 while it was being reported as "holding
     /// unsubmitted text for hours". The composer is EMPTY; `continue with the
     /// queue` is Claude Code's dim suggestion. Three people pressed Enter,
@@ -21836,6 +23381,28 @@ mod composer_state_tests {
     }
 
     #[test]
+    fn a_codex_model_footer_is_chrome_not_unsubmitted_text() {
+        assert_eq!(
+            composer_state(LIVE_CODEX_IDLE),
+            ComposerState::Placeholder("AskCodextodoanything".into())
+        );
+        assert_eq!(
+            composer_state(LIVE_CODEX_IDLE).typed(),
+            None,
+            "an idle Codex prompt must not inherit its model/path footer as typed input"
+        );
+
+        // CONTROL: only Codex's dim placeholder is replaced. Ordinary typed
+        // text in the same live frame must remain pending; otherwise a send
+        // could falsely claim success while the user's command is still there.
+        let typed = LIVE_CODEX_IDLE.replace(
+            "\u{1b}[2mAsk Codex to do anything\u{1b}[0m",
+            "ship the current task",
+        );
+        assert_eq!(composer_state(&typed).typed(), Some("shipthecurrenttask"));
+    }
+
+    #[test]
     fn real_typed_input_is_recognised_including_the_near_misses() {
         assert_eq!(
             composer_state(LIVE_TYPED).typed(),
@@ -21944,6 +23511,27 @@ mod steer_freeze_tests {
   \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} esc to interrupt \u{b7} \u{2190} 2 agents
 ";
 
+    const CODEX_BACKGROUND_TERMINAL: &str = "\
+• Working (0s • esc to interrupt) · 1 background terminal running · /ps to view · /stop to close
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol xhigh · ~/Dev/amux";
+
+    const CODEX_BACKGROUND_FINISHED: &str = "\
+• Worked for 42s
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol xhigh · ~/Dev/amux";
+
+    const CODEX_FOREGROUND_WORKING: &str = "\
+• Working (42s • esc to interrupt)
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol xhigh · ~/Dev/amux";
+
     #[test]
     fn prose_about_esc_to_interrupt_is_not_a_generating_lane() {
         assert!(
@@ -21993,6 +23581,65 @@ mod steer_freeze_tests {
             steer_decide(None, Some(pane_is_at_boundary(IDLE_WITH_AGENTS_PANE)), 601.0, 600.0),
             SteerDelivery::OverdueMidTurn
         );
+    }
+
+    /// ATE-45 live cross-model incident: board-drive trusted Codex's idle
+    /// self-report while this exact provider row said a background terminal
+    /// was still running. Delivery interrupted the conversation. The shared
+    /// steering predicate must hold until the row reaches its terminal form.
+    #[test]
+    fn board_drive_and_steering_hold_for_a_codex_background_terminal() {
+        assert_eq!(detect_claude_status(CODEX_BACKGROUND_TERMINAL), "active");
+        assert!(provider_background_working(CODEX_BACKGROUND_TERMINAL));
+        assert!(
+            !reported_idle_is_boundary(Some(0), CODEX_BACKGROUND_TERMINAL),
+            "an idle parent report cannot authorize board-drive over live provider chrome"
+        );
+        assert!(!pane_is_at_boundary(CODEX_BACKGROUND_TERMINAL));
+        assert_eq!(
+            steer_decide_with_background(Some("active"), None, 86_400.0, 600.0, true),
+            SteerDelivery::Hold,
+            "max age never authorizes interruption while background work is live"
+        );
+
+        assert!(!provider_background_working(CODEX_BACKGROUND_FINISHED));
+        assert!(reported_idle_is_boundary(Some(0), CODEX_BACKGROUND_FINISHED));
+        assert!(
+            pane_is_at_boundary(CODEX_BACKGROUND_FINISHED),
+            "after the background terminal finishes, the exact same prompt is deliverable"
+        );
+
+        let quoted = "\
+› Explain the phrase: • Working (0s • esc to interrupt) · 1 background terminal running
+
+  gpt-5.6-sol xhigh · ~/Dev/amux";
+        assert!(!provider_background_working(quoted), "quoted prose is not provider chrome");
+        assert!(reported_idle_is_boundary(Some(0), quoted));
+
+        assert!(
+            !provider_background_working(CODEX_FOREGROUND_WORKING),
+            "ordinary Codex foreground work is not relabelled as a background terminal"
+        );
+        assert_eq!(
+            steer_decide_with_background(Some("active"), None, 601.0, 600.0, false),
+            SteerDelivery::OverdueMidTurn,
+            "the pre-existing max-age policy remains available for ordinary foreground work"
+        );
+
+        let pasted_frame = "\
+\u{276f} Compare this pasted Codex frame:
+  • Working (0s • esc to interrupt) · 1 background terminal running
+  › Ask Codex to do anything
+  gpt-5.6-sol xhigh · ~/Dev/amux
+\u{2500}\u{2500}\u{2500} claude \u{2500}\u{2500}\u{2500}
+\u{276f}\u{a0}
+\u{23f5}\u{23f5} bypass permissions on";
+        assert_eq!(
+            crate::backend::adapter::codex_pane_generation_state(pasted_frame),
+            None,
+            "a Codex-looking transcript inside Claude is not Codex provider state"
+        );
+        assert!(!provider_background_working(pasted_frame));
     }
 
     #[test]
@@ -22354,6 +24001,44 @@ mod steer_max_age_tests {
         assert_eq!(parse_rate_limit_reset_at("resets soon", noon), None, "no digits");
     }
 
+    #[test]
+    fn every_claude_lane_releases_at_its_known_usage_reset() {
+        let now = 1_788_639_000i64;
+        let reset = now;
+        let lanes = [
+            ("backend", now - 600),
+            ("mixpeek-cicd", now - 300),
+            ("tubescience", now - 1),
+            ("mvs-infra", now),
+        ];
+        assert!(
+            lanes.iter().all(|(_, since)| !rate_limit_still_blocks(*since, reset, now)),
+            "every stamped lane at the shared provider reset must resume"
+        );
+        assert!(rate_limit_still_blocks(now - 1, now + 1, now));
+        assert!(rate_limit_still_blocks(now - 1, 0, now));
+        assert!(!rate_limit_still_blocks(0, now + 1, now));
+    }
+
+    #[test]
+    fn an_arrived_reset_is_not_rolled_to_tomorrow_by_a_stale_banner() {
+        let now = 1_788_639_060i64;
+        let recorded_today = now - 60;
+        let stale_reparse_tomorrow = recorded_today + 86_400;
+        assert_eq!(
+            effective_rate_limit_reset(recorded_today, stale_reparse_tomorrow, now),
+            recorded_today,
+            "the recorded reset disambiguates the stale clock-only terminal frame"
+        );
+        assert_eq!(effective_rate_limit_reset(now + 60, now + 120, now), now + 120);
+        assert_eq!(
+            effective_rate_limit_reset(now + 60, 0, now),
+            now + 60,
+            "a transient parse miss must not erase a known future reset"
+        );
+        assert_eq!(effective_rate_limit_reset(0, now + 120, now), now + 120);
+    }
+
 
     /// The policy is the human's, set once (D2). Default is `wait` — press 1 —
     /// because a human pressing 1 on sixty lanes is not a workflow and the
@@ -22480,9 +24165,9 @@ mod steer_max_age_tests {
 
     /// AMUX-2238: a send to a rate-limited lane HOLDS, and is never dropped.
     ///
-    /// Ethan, 2026-08-03: "commands sent to a rate-limited session must queue
-    /// and deliver only after the limit is confirmed released — keyed on the
-    /// limit passing + a live confirmation, not just the clock."
+    /// Ethan, 2026-08-03: commands sent to a rate-limited session must queue;
+    /// AMUX-4154 adds that every Claude lane continues at the provider's known
+    /// reset rather than waiting for an unrelated screen change.
     ///
     /// THE ORDER IS THE CLAIM, and it is the trap I flagged when triaging this.
     /// A lane that is not running is `not-running` whether or not it is also
@@ -22490,13 +24175,8 @@ mod steer_max_age_tests {
     /// never reach a lane before the lane is up. The two cells below pin that
     /// precedence, so a later reorder cannot quietly invert it.
     ///
-    /// The delivery-order half of the design question resolves BY CONSTRUCTION
-    /// rather than by ordering logic, which is why there is no queue-position
-    /// code here to test: the resume that clears a limit is a direct tmux key
-    /// (`send_keys_op(name, "Enter")` in the sweep), not a steering row. So the
-    /// resume cannot be queued behind a held send, and the queue does not drain
-    /// until the sweep observes the banner gone — which is downstream of the
-    /// lane actually working again.
+    /// Delivery order resolves by construction: the provider reset opens the
+    /// existing queue gate and the normal turn-boundary sender drains it.
     #[test]
     fn a_rate_limited_lane_holds_its_queue_and_never_dead_letters() {
         assert_eq!(
@@ -22543,8 +24223,8 @@ mod steer_max_age_tests {
         let msg = block_reason_explain("rate-limited", "busy-lane");
         assert!(msg.contains("busy-lane"), "{msg}");
         assert!(
-            msg.contains("CONFIRMED released"),
-            "the card's own words: confirmed, not a clock: {msg}"
+            msg.contains("provider-reported reset"),
+            "a known provider clock is the automatic release boundary: {msg}"
         );
         assert!(
             msg.contains("credit caps"),

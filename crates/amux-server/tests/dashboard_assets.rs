@@ -83,6 +83,53 @@ fn the_app_bundle_still_contains_an_app() {
 /// CLAUDE.md: "Client JS changes need APP_VER and the CACHE version bumped
 /// together, or a browser holding the cached script never receives the fix."
 /// Enforced here rather than remembered.
+/// A WORKER BRANCH IS ISOLATION, NOT DELIVERY (AF-495).
+///
+/// From the 2026-09-04 Doron session. His worker was off main with nothing
+/// pushed, and Ethan read both facts off the screen while Doron could not:
+///
+///   Ethan: "First off, your amux worker is in a different branch."
+///   Doron: "No, I don't know. I don't know why that is."
+///   Ethan (later): "It says it's in a different branch. It says nothing is
+///                   pushed yet."
+///   Doron: "Still. No, I think I'm on main again."   (he was not)
+///
+/// The branch popover's verdict for that exact state was a GREEN TICK reading
+/// "Isolated on worker branch". True, and it is a reassuring signal over the
+/// question that mattered: whether anything on the branch had ever left. The
+/// popover has no push data and should not pretend to, so the fix is to stop the
+/// green line from reading as "all good" and say what isolation does NOT cover.
+///
+/// Pinned here because it is a CLAIM the UI makes, and this file already holds
+/// the auto-compact copy to the threshold the server really uses. Prose in a
+/// template is exactly what rots silently.
+#[test]
+fn the_branch_popover_does_not_read_isolation_as_delivery() {
+    let js = asset("app.js");
+    assert!(
+        js.contains("Isolation is not delivery."),
+        "the branch popover must say what being on a worker branch does NOT mean; \
+         a bare green tick over an unmeasured condition is the defect (AF-495)"
+    );
+    assert!(
+        js.contains("nothing here reaches anyone until it is merged or pushed"),
+        "and name the consequence in the reader's terms, not as jargon"
+    );
+    // NEGATIVE: the old copy asserted a state it had not measured. If it comes
+    // back, so does the false verdict.
+    assert!(
+        !js.contains("Isolated on worker branch"),
+        "the old verdict is back: it reads as 'all good' for a branch nothing has \
+         ever left"
+    );
+    // CONTROL: the conflict warning is a DIFFERENT and genuinely measured signal
+    // (another worker shares the branch) and must survive untouched.
+    assert!(
+        js.contains("Another worker shares this branch"),
+        "the conflict warning is measured and must not be lost to this change"
+    );
+}
+
 #[test]
 fn app_ver_and_the_sw_cache_version_agree() {
     let app_ver = const_str(&asset("app.js"), "APP_VER")
@@ -95,6 +142,75 @@ fn app_ver_and_the_sw_cache_version_agree() {
         cache, expected,
         "APP_VER ({app_ver}) and the sw.js CACHE ({cache}) disagree. Bump BOTH: a client \
          holding the cached script never receives a fix shipped under a stale cache key."
+    );
+}
+
+#[test]
+fn idle_ready_work_names_the_queue_and_keeps_real_stalls_distinct() {
+    let app = asset("app.js");
+    let start = app.find("function _stalledChip(s)").expect("frontier chip renderer must exist");
+    let tail = &app[start..];
+    let end = tail.find("function updatePeekStatus()").expect("frontier chip must precede peek status");
+    let chip = &tail[..end];
+
+    for required in ["readyCards: d.ready || []", "queued behind", "_openIssue("] {
+        assert!(app.contains(required), "queued-WIP rendering lost `{required}`");
+    }
+    assert!(chip.contains("work-queued-chip"), "the holding card must be a semantic control");
+    assert!(chip.contains("queued-behind-wip"), "healthy WIP waits need a logged verdict");
+    assert!(chip.contains("'stalled'"), "the no-holding control must preserve real stalled detection");
+    assert!(chip.contains("no current work explains the block"), "stalled must say why it is alarming");
+}
+
+#[test]
+fn worker_card_and_peek_share_actions_and_the_canonical_file_entry() {
+    let app = asset("app.js");
+    let html = asset("index.html");
+    let css = asset("app.css");
+
+    for required in [
+        "function _workerActionDefinitions(s)",
+        "function _renderWorkerActionMenu(s, surface)",
+        "_renderWorkerActionMenu(s, 'card')",
+        "_renderWorkerActionMenu(s, 'peek')",
+        "data-worker-action",
+        "data-peek-action=\"file-browser\"",
+        "id=\"peek-focus-btn\"",
+        "worker-action-menu-parity",
+        "worker-file-entry",
+    ] {
+        assert!(app.contains(required), "shared worker-action contract lost `{required}`");
+    }
+    let inventory_start = app.find("function _workerActionDefinitions(s)")
+        .expect("shared worker-action inventory must exist");
+    let inventory_tail = &app[inventory_start..];
+    let inventory_end = inventory_tail.find("function _renderWorkerActionMenu")
+        .expect("the shared renderer must follow its inventory");
+    let inventory = &inventory_tail[..inventory_end];
+    assert_eq!(
+        inventory.matches("{ key: '").count(),
+        25,
+        "the full running Claude worker fixture has 25 shared worker actions"
+    );
+
+    let browse_start = app.find("function _browseWorkerFiles(name, source)")
+        .expect("canonical worker file entry must exist");
+    let browse_tail = &app[browse_start..];
+    let browse_end = browse_tail.find("function _reportWorkerActionParity")
+        .expect("file entry must precede the parity diagnostic");
+    let browse = &browse_tail[..browse_end];
+    assert!(browse.contains("openExplore(root, name)"), "worker file entry must use full Files route");
+    assert!(!browse.contains("togglePeekSplit"), "worker file entry must not retain the split-pane fork");
+    assert!(
+        html.contains("_browseWorkerFiles(peekSession,'peek-directory')"),
+        "the displayed directory must use the canonical worker file entry"
+    );
+    assert_eq!(html.matches("id=\"peek-worker-menu-btn\"").count(), 1, "peek header action id must be unique");
+    assert_eq!(html.matches("id=\"peek-composer-more-btn\"").count(), 1, "peek composer action id must be unique");
+    assert_eq!(html.matches("id=\"peek-more-btn\"").count(), 0, "ambiguous duplicate peek-more-btn returned");
+    assert!(
+        css.contains(".peek-more-dropdown") && css.contains("overflow-y:auto") && css.contains("max-height:min(500px"),
+        "the complete peek menu must remain scrollable on desktop and mobile"
     );
 }
 
@@ -148,6 +264,44 @@ fn messages_link_schedule_ids_to_the_scheduler() {
     assert!(
         app.contains("_linkifyScheduleIds(origin.replace"),
         "scheduled-message origin is where the canonical SCHED-N token lives"
+    );
+}
+
+#[test]
+fn message_card_links_survive_the_capped_board_working_set() {
+    let app = asset("app.js");
+    let start = app
+        .find("function _msgCardChip(cardId, message)")
+        .expect("message card chip must accept authoritative card metadata");
+    let tail = &app[start..];
+    let end = tail
+        .find("function _msgCtxPeek")
+        .expect("message card chip must precede the shared message renderer");
+    let body = &tail[..end];
+    for needle in [
+        "message.card_title",
+        "message.card_status",
+        "message.card_archived",
+        "message.card_deleted",
+        "const c = live ||",
+    ] {
+        assert!(
+            body.contains(needle),
+            "message card chip lost authoritative history metadata `{needle}`"
+        );
+    }
+    assert!(
+        app.contains("_msgCardChip(typeof e === 'string' ? '' : (e.card_id || ''), e)"),
+        "the shared history row must pass its authoritative card metadata to the chip"
+    );
+    assert!(
+        app.contains("card_title: x.card_title, card_status: x.card_status"),
+        "normalizing history rows must preserve card metadata"
+    );
+    assert!(
+        app.contains("async function openBoardDetail(id)")
+            && app.contains("await apiCall(API + '/api/board/' + encodeURIComponent(id))"),
+        "clicking a message's older/terminal task must hydrate it even when the capped board list omitted it"
     );
 }
 
@@ -241,8 +395,9 @@ fn sse_message_invalidation_refreshes_each_visible_message_surface() {
 }
 
 #[test]
-fn live_doing_card_stays_visible_and_clickable_during_sessions_poll_lag() {
+fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state() {
     let app = asset("app.js");
+    let index = asset("index.html");
     let helper_start = app
         .find("function _cardDoingItem(name)")
         .expect("dashboard must derive the live doing card from SSE-synced board data");
@@ -252,10 +407,11 @@ fn live_doing_card_stays_visible_and_clickable_during_sessions_poll_lag() {
         .expect("live-card helper must precede board-change invalidation");
     let helper = &helper_tail[..helper_end];
     for needle in [
-        "c.session !== name",
-        "c.status !== 'doing'",
-        "c.deleted || c.archived",
-        "c.updated || c.created",
+        "session.task_board_id",
+        "c.id === claimed",
+        "c.session === name",
+        "c.status === 'doing'",
+        "!c.deleted && !c.archived",
     ] {
         assert!(helper.contains(needle), "live-card selection lost `{needle}`");
     }
@@ -275,6 +431,45 @@ fn live_doing_card_stays_visible_and_clickable_during_sessions_poll_lag() {
     assert!(
         app.contains("board-card-live-label\"><span class=\"board-live-dot\"></span>Working now"),
         "a live board card needs an explicit visible label, not only a border or tooltip"
+    );
+    assert!(
+        app.contains("const _liveNow = !!(_liveCard && _liveCard.id === item.id)"),
+        "only the explicitly claimed card may say Working now"
+    );
+    for rejected in ["no board task claimed", "board-unclaimed-mount", "_activeWithoutClaim"] {
+        assert!(!app.contains(rejected), "runtime activity must not manufacture the board pseudo-state `{rejected}`");
+        assert!(!index.contains(rejected), "the removed pseudo-state must not retain a dead mount `{rejected}`");
+    }
+}
+
+#[test]
+fn idle_workers_explain_blocked_and_parked_board_work() {
+    let app = asset("app.js");
+    let start = app
+        .find("function _boardDriveCardReason(drive)")
+        .expect("worker cards need a board-drive explanation helper");
+    let helper = &app[start..start + 2200.min(app.len() - start)];
+    for needle in [
+        "all-candidates-refused",
+        "(dependency root)",
+        "backlog auto-drain off",
+        "backlog parked on human/trigger",
+        "missing next action",
+    ] {
+        assert!(helper.contains(needle), "board-drive explanation lost `{needle}`");
+    }
+
+    let render_start = app
+        .find("function _renderSessionCard(s)")
+        .expect("session-card renderer must exist");
+    let render = &app[render_start..render_start + 16_000.min(app.len() - render_start)];
+    assert!(
+        render.contains("(todo || backlog || d || review) && driveFresh"),
+        "the explanation must cover every non-terminal work column, including backlog-only lanes"
+    );
+    assert!(
+        render.contains("_boardDriveCardReason(drive)"),
+        "the card must render the mechanism's explanation"
     );
 }
 
@@ -427,10 +622,24 @@ fn board_detail_hydration_refreshes_authoritative_state_and_relations() {
         .find("async function _bdHydrate(")
         .expect("_bdHydrate exists");
     let tail = &app[start..];
-    let end = tail
-        .find("\n}\n\nfunction openBoardDetail")
-        .expect("_bdHydrate closes");
+    // END AT THIS FUNCTION'S OWN TOP-LEVEL CLOSE, not at the next function's
+    // declaration. This used to look for "\n}\n\nfunction openBoardDetail", so it
+    // pinned _bdHydrate's extent to the literal TEXT of an unrelated neighbour.
+    // c6fd9832 ("fix(ui): open terminal tasks from message history") made
+    // openBoardDetail `async`, and main went red with "_bdHydrate closes" — a
+    // correct production change failing a test about a function it did not touch.
+    // Nothing in _bdHydrate had changed, and the assertions below all still held.
+    //
+    // A check pinned to the wrong layer is exactly as green as one pinned to the
+    // right layer, until it is not (ethos rule 7). "\n}\n" is the function's own
+    // terminator: inner braces are indented, so a `}` at column 0 ends it whatever
+    // follows.
+    let end = tail.find("\n}\n").expect("_bdHydrate closes");
     let body = &tail[..end];
+    assert!(
+        !body.contains("function openBoardDetail"),
+        "the extent ran past _bdHydrate into its neighbour — the anchor is wrong again"
+    );
     for needle in [
         "boardDetailStatus = full.status",
         "_populateSessionSelect('bd-session', full.session",
@@ -481,9 +690,13 @@ fn board_detail_leads_with_actionable_task_context() {
         "a.resolved_ref",
         "const explicitPath =",
         "const serverResolvedPath =",
+        "<button type=\"button\" class=\"file-link board-artifact-file\"",
         "targetPath = target.replace(/#.*$/",
         "Produced assets (",
         "Source message",
+        "Worker request",
+        "Terminal callback",
+        "item.requested_by",
         "_bdOpenMessage(",
         "_bdWorkerActivity(",
         "Worker actions",

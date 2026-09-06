@@ -118,6 +118,16 @@ jobs:
             echo "::error::amux-server.py is back in the repo — the python server was deleted in 792ce1f"
             fail=1
           fi
+          # AMUX-2779: the check above only sees the REPO ROOT. A python server
+          # committed into a subdir (e.g. cloud/docker/amux-server.py, which
+          # .gitignore hides from `git status`) would slip past it — a force-add is
+          # the only way it gets tracked. Fail on a tracked amux-server.py at ANY
+          # path. (A Dockerfile/compose COPY or mount of it is caught below.)
+          tracked=$(git ls-files '*amux-server.py')
+          if [ -n "$tracked" ]; then
+            echo "::error::a tracked amux-server.py exists — the python server must not be committed anywhere (AMUX-2779): $tracked"
+            fail=1
+          fi
           if ! grep -qE '^FROM rust:' cloud/docker/Dockerfile; then
             echo "::error::cloud/docker/Dockerfile does not start from a rust image"
             fail=1

@@ -2,7 +2,7 @@
 """Idempotently wire amux's canonical Claude lifecycle reporter.
 
 Unrelated settings and hooks are preserved. Older amux report commands are
-removed before the canonical five-event set is added, so re-running install
+removed before the canonical six-event set is added, so re-running install
 cannot multiply reports or leave an inline fork active beside the real hook.
 """
 
@@ -41,6 +41,10 @@ def canonical(hook_path: str) -> dict[str, dict[str, Any]]:
     quoted = '"' + hook_path.replace('"', '\\"') + '"'
     base = f"bash {quoted}"
     return {
+        # SessionStart is the leak bound for a process that died before its
+        # final SubagentStop. hook-report skips source=compact because compact
+        # preserves the process and its live background agents.
+        "SessionStart": group(f"{base} subagent-reset session-start-hook"),
         "UserPromptSubmit": group(f"{base} active prompt-hook"),
         "PostToolUse": group(f"{base} active tool-hook", ".*"),
         "Stop": group(f"{base} idle stop-hook"),

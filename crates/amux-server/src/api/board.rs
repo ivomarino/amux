@@ -206,7 +206,15 @@ async fn needsyou_queue(
                 // predates AF-318 is NULL here, which is a different thing from
                 // a card that answered the gate — and the owner triaging this
                 // list is exactly who needs to tell them apart.
-                o.insert("has_typed_ask".into(), json!(r.ask_type.is_some()));
+                o.insert(
+                    "has_typed_ask".into(),
+                    json!(bs::ask_verdict(
+                        r.ask_actor.as_deref().unwrap_or(""),
+                        r.ask_type.as_deref().unwrap_or(""),
+                        r.ask_question.as_deref().unwrap_or(""),
+                        r.ask_unblocks.as_deref().unwrap_or(""),
+                    ) == bs::AskVerdict::Ok),
+                );
             }
             if let Some(o) = v.as_object_mut() {
                 // Say it in the payload, so a reader can see WHY a card is where
@@ -246,7 +254,17 @@ async fn needsyou_queue(
         scored.into_iter().take(cap).map(|(_, _, v)| v).collect()
     };
     let hidden = total.saturating_sub(shown.len());
-    let untyped = rows.iter().filter(|r| r.ask_type.is_none()).count();
+    let untyped = rows
+        .iter()
+        .filter(|r| {
+            bs::ask_verdict(
+                r.ask_actor.as_deref().unwrap_or(""),
+                r.ask_type.as_deref().unwrap_or(""),
+                r.ask_question.as_deref().unwrap_or(""),
+                r.ask_unblocks.as_deref().unwrap_or(""),
+            ) != bs::AskVerdict::Ok
+        })
+        .count();
     // Counted from the store rather than from `rows`, which by construction
     // holds only the active ones — a count derived from the filtered set could
     // never be anything but zero, which is the check-that-cannot-fail shape.
@@ -286,8 +304,9 @@ async fn needsyou_queue(
                      list can be finished. `hidden` is the remainder, reachable with ?all=1 \
                      — the cap is a default, not a hiding place. `untyped_legacy` counts \
                      cards that predate the typed-ask gate (AF-318); they were never \
-                     required to name a human act, so a NULL ask_type there means \
-                     unrecorded, not junk.",
+                     required to name a routable actor, direct question, human act, \
+                     and exit condition, so an invalid/partial ask there means \
+                     unrecorded legacy state, not junk.",
         }),
         total,
     ))
@@ -372,8 +391,12 @@ mod frontier_exclusion_tests {
             ask_type: None,
             ask_question: None,
             ask_unblocks: None,
+            ask_actor: None,
             // AF-367: the HTTP create path: a real POST /api/board from a lane or a human.
             source: Some("agent".into()),
+            requested_by: None,
+            callback_session: None,
+            callback_prompt: None,
         };
         bs::create_issue(&conn, &new, 1000).expect("create")
     }
@@ -384,6 +407,38 @@ mod frontier_exclusion_tests {
     /// entirely left every other cell green: the logic was inline in a handler
     /// that needs AppState, so nothing could reach it. A predicate the tests
     /// cannot call is a predicate nothing pins.
+    /// A LOGGED SENTINEL MUST BE PRINTABLE (AF-481).
+    ///
+    /// `NEW_CARD_SELF_ID` is passed to `depends_on_cycle`, which logs it as
+    /// `self_id` when it finds a pre-existing cycle elsewhere on the board. It
+    /// used to be "\u{0}new-card". Nineteen of those bytes in a 67 MB
+    /// server-rs.log made grep call the whole file binary, and `grep -o` then
+    /// returned 8 matches where `grep -c` counted 17 lines, silently, into a
+    /// pipe. The repo's own log-sweep doc prescribes greps over that file.
+    ///
+    /// The cell asserts the property rather than the string, so any future
+    /// sentinel is covered: no control characters, and still impossible as a
+    /// real card id (ids are `[A-Z]+-<digits>`).
+    #[test]
+    fn the_new_card_sentinel_cannot_poison_a_log_or_collide_with_an_id() {
+        assert!(
+            !NEW_CARD_SELF_ID.chars().any(|c| c.is_control()),
+            "a sentinel that reaches a log line must be printable: {NEW_CARD_SELF_ID:?}"
+        );
+        // NON-COLLISION, the property the NUL was chosen for and which must
+        // survive the fix. A real id is uppercase letters, a hyphen and digits;
+        // anything outside that alphabet is as impossible as a NUL was.
+        assert!(
+            NEW_CARD_SELF_ID
+                .chars()
+                .any(|c| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-')),
+            "the sentinel must contain a character no card id can: {NEW_CARD_SELF_ID:?}"
+        );
+        // AND IT MUST NOT BE EMPTY, which would satisfy both assertions above
+        // vacuously and match every id as a substring.
+        assert!(!NEW_CARD_SELF_ID.is_empty(), "an empty sentinel is not a sentinel");
+    }
+
     #[test]
     fn the_frontier_excludes_both_spellings_of_blocked() {
         // Ready: a plain todo with a continuation, gate on.
@@ -603,7 +658,20 @@ async fn bulk_migrate(
     let result = state
         .store
         .write_async(move |conn| {
-            let ids: Vec<String> = {
+            // AN EXPLICIT SELECTION WINS (AMUX-4058). The UI sends the ids it
+            // actually rendered, so a filtered column migrates what the human
+            // saw. Without this the server took a whole column and a filtered
+            // view would have moved ~500 cards while showing twelve.
+            //
+            // Still re-checked against status and lane below by `advance`'s
+            // `expected_from`, so a stale id from a view rendered minutes ago
+            // refuses rather than moving a card that has since left the column.
+            let explicit: Vec<String> = body
+                .get("ids")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            let ids: Vec<String> = if !explicit.is_empty() { explicit } else {
                 let (sql, params): (String, Vec<String>) = match &lane3 {
                     Some(l) => (
                         "SELECT id FROM issues WHERE status=?1 AND session=?2 \
@@ -960,7 +1028,7 @@ async fn get_contract(
             "rule": bs::ASSET_LINK_CRITERION,
             "accepts": "a URL, a repo file path (a/b.ext), a commit sha, or a #PR/issue reference, in the card's desc or history",
             "enforced": "server-validated on any transition to done; force bypasses it (logged); gate_ack cannot",
-            "override": "set AMUX_DONE_LINK_REQUIRED=0 in a worker's / group's / global scope env (Scope tab) to opt that scope out",
+            "override": "set AMUX_DONE_LINK_REQUIRED=0 in a worker's / group's / global configuration to opt that level out",
         },
         // Global done constraint (AF-321). Sits IN FRONT of the asset-link rule
         // above, which it does not replace: that one is a shape check over the
@@ -973,18 +1041,18 @@ async fn get_contract(
             "accepts": "a command (backticked, or on a `$ ` line), a repo file path, a URL, a commit sha, a #PR — or `none: <reason>` (3+ words) when the card genuinely produced no artifact",
             "field": "`evidence`, writable on its own so it can be recorded BEFORE the transition that needs it",
             "enforced": "server-validated on any transition to done; force bypasses it (logged); gate_ack cannot",
-            "override": "set AMUX_DONE_EVIDENCE_REQUIRED=0 in a worker's / group's / global scope env (Scope tab) to opt that scope out",
+            "override": "set AMUX_DONE_EVIDENCE_REQUIRED=0 in a worker's / group's / global configuration to opt that level out",
             "what_to_run": "the repo's VERIFY.md names the proof for each surface",
         },
         // Global `needsyou` constraint (AF-318). Published for the AF-112
         // reason: a gate you can only learn by tripping it teaches nobody.
         "needsyou_requires_typed_ask": {
-            "rule": "a card entering needsyou must carry `ask_type`, `ask_question` and `ask_unblocks`",
+            "rule": "a card entering needsyou must name a specific `ask_actor`, a valid `ask_type`, a direct `ask_question` containing ?, and an observable `ask_unblocks` exit",
             "why": "389 live cards were parked here at a median age of 15 days and 51% of them were not blocked on a human at all — `needsyou` was the only status that cost a worker nothing and stopped the nudge, so the ~20 real asks became unfindable",
             "ask_types": bs::ASK_TYPE_HELP.iter().map(|(k, v)| json!({"type": k, "means": v})).collect::<Vec<_>>(),
-            "fields": "`ask_question` is what you are asking, `ask_unblocks` is what ends the block — both a sentence (3+ words). All three writable on their own, so a refused transition cannot discard them",
+            "fields": "`ask_actor` is the specific person or external actor, `ask_question` is the direct question, and `ask_unblocks` is what ends the block — the latter two are sentences (3+ words). All four are writable on their own, so a refused transition cannot discard them",
             "enforced": "server-validated on any transition to needsyou; force bypasses it (logged); gate_ack cannot",
-            "override": "set AMUX_NEEDSYOU_ASK_REQUIRED=0 in a worker's / group's / global scope env (Scope tab) to opt that scope out",
+            "override": "set AMUX_NEEDSYOU_ASK_REQUIRED=0 in a worker's / group's / global configuration to opt that level out",
             "not_retroactive": "the 445 existing cards are untouched — the gate is on the transition. They drain by being re-asked, not by a sweep guessing on their behalf",
             "owner_view": "GET /api/board/needsyou — ranked by age x blast radius, capped at 10, ?all=1 for the remainder",
         },
@@ -1010,6 +1078,16 @@ async fn get_contract(
             // filed mistyped in one night by guessing the field name at CREATE,
             // where no refusal exists to correct you.
             "wrong_type": "If the item has no code, set its type first — the gate is DERIVED                            from the type. CLI: `amux board type <id> <type>`. API: PATCH                            /api/board/<id> with {\"type\": \"investigation\"} — the field is                            `type`, NOT `item_type` (that one is ignored and reported in                            `ignored_fields`). Settable at creation too: POST /api/board with                            {\"title\": ..., \"type\": ...}.",
+        },
+        "worker_requests": {
+            "cli": "amux board request <worker> <title> [--for <PARENT-TASK>] [--desc ...] [--callback-prompt ...] [--no-callback]",
+            "api": "POST /api/board with a different session plus optional request_parent and callback:true, a prompt string, or {prompt}; X-Amux-Worker is the verified requester",
+            "lifecycle": "the delegated child is created in backlog and added to the requester task's depends_on; the parent moves doing -> todo so it releases WIP, stays dependency-blocked while the child is open, and becomes ready automatically when the child closes",
+            "parent_resolution": "request_parent/--for is authoritative. Otherwise the latest durable message->task link identifies the current task, with a unique doing task as fallback. No active task creates an intentional standalone request; multiple doing tasks are refused rather than linked incorrectly",
+            "callback": "optional; request CLI arms it by default. It fires exactly when the card first enters done, verified, or discarded and queues a durable message to the verified requester",
+            "durability": "requested_by, callback target/prompt/state/message id/fired time/error live on the task. A stable steering id makes restart recovery idempotent; model/provider context is not involved",
+            "visibility": "the initial request and terminal callback are Messages rows linked to the same task id; the card carries requester, callback state, action log and produced assets",
+            "security": "a callback can return only to the server-verified requester; isolated raw workers remain outside harness delivery",
         },
         // AMUX-2933 (ts-gke). The list filters WORK and were documented
         // NOWHERE — "discoverable only by guessing", and the cap was worse than
@@ -1852,6 +1930,357 @@ fn detail_body(row: &IssueRow) -> Value {
     v
 }
 
+/// Result of one durable callback outbox pass.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct CallbackDispatch {
+    pub attempted: usize,
+    pub queued: usize,
+    pub refused: usize,
+}
+
+/// Drain terminal task callbacks through the same durable steering path as all
+/// other harness messages. `only` is used by the interactive PATCH path for an
+/// immediate response; the board-drive tick passes None and recovers any item
+/// left pending by a crash or by a non-HTTP transition producer.
+pub(crate) async fn dispatch_pending_callbacks(
+    state: &AppState,
+    only: Option<&str>,
+) -> CallbackDispatch {
+    let ids: Vec<String> = match state.store.read() {
+        Ok(conn) => {
+            if let Some(id) = only {
+                conn.query_row(
+                    "SELECT id FROM issues WHERE id=?1 AND deleted IS NULL \
+                     AND callback_state IN ('pending','dispatching')",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .map(|id| vec![id])
+                .unwrap_or_default()
+            } else {
+                conn.prepare(
+                    "SELECT id FROM issues WHERE deleted IS NULL \
+                     AND callback_state IN ('pending','dispatching') ORDER BY updated LIMIT 100",
+                )
+                .and_then(|mut st| {
+                    st.query_map([], |r| r.get::<_, String>(0))
+                        .map(|rows| rows.flatten().collect())
+                })
+                .unwrap_or_default()
+            }
+        }
+        Err(_) => Vec::new(),
+    };
+    let mut report = CallbackDispatch::default();
+    for id in ids {
+        report.attempted += 1;
+        let stable_id = format!("task-callback-{id}");
+        let staged: Arc<Mutex<Option<IssueRow>>> = Arc::new(Mutex::new(None));
+        let staged_w = staged.clone();
+        let id_w = id.clone();
+        let stable_w = stable_id.clone();
+        let _ = state
+            .store
+            .write_async(move |conn| {
+                let Some(mut row) = bs::get_issue(conn, &id_w)? else {
+                    return Ok(no_write());
+                };
+                if !matches!(row.callback_state.as_deref(), Some("pending" | "dispatching")) {
+                    return Ok(no_write());
+                }
+                row.callback_state = Some("dispatching".into());
+                row.callback_message_id = Some(stable_w);
+                row.callback_error = None;
+                row.updated = now_secs();
+                row.rev += 1;
+                row.version += 1;
+                bs::save_patched(conn, &mut row)?;
+                *staged_w.lock().unwrap() = Some(row.clone());
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![ev_snap(&row, MutationKind::Updated)],
+                })
+            })
+            .await;
+        let Some(row) = staged.lock().ok().and_then(|mut g| g.take()) else {
+            continue;
+        };
+        let Some(target) = row.callback_session.clone() else {
+            continue;
+        };
+        let sender = row.session.clone().unwrap_or_else(|| "board".into());
+        let outcome = row
+            .last_result
+            .as_deref()
+            .or(row.evidence.as_deref())
+            .unwrap_or("The complete action log and produced assets are on the task card.");
+        let mut prompt = format!(
+            "[task callback {}: {}] {} finished the task you requested. \
+             Terminal state: {}.\nOutcome: {}\nOpen board card {} for gates, action history, \
+             source message, epic, and produced assets.",
+            row.id, row.title, sender, row.status, outcome, row.id
+        );
+        if let Some(instruction) = row.callback_prompt.as_deref().filter(|s| !s.trim().is_empty()) {
+            prompt.push_str("\nCallback instruction: ");
+            prompt.push_str(instruction.trim());
+        }
+        let guard = format!("task-callback:{}", row.id);
+        // Re-resolve policy at delivery time. The request was authorized when
+        // it was created, but a later explicit opt-out must not be bypassed by
+        // a callback that happens to have been armed earlier. A refusal remains
+        // visible on the card and can be retried only by an explicit re-arm.
+        let delivered: Result<String, String> =
+            match crate::api::session_verbs::cross_group_send_ok(&sender, &target) {
+                Err(reason) => Err(reason),
+                Ok(_) => crate::api::session_verbs::steer_enqueue_idempotent(
+                    state,
+                    &target,
+                    &prompt,
+                    &guard,
+                    &sender,
+                    &stable_id,
+                )
+                .await
+                .map_err(str::to_string),
+            };
+        let id_w = row.id.clone();
+        let target_w = target.clone();
+        let sender_w = sender.clone();
+        let prompt_w = prompt.clone();
+        let stable_w = stable_id.clone();
+        match delivered {
+            Ok(_) => {
+                report.queued += 1;
+                let _ = state.store.write_async(move |conn| {
+                    let Some(mut latest) = bs::get_issue(conn, &id_w)? else {
+                        return Ok(no_write());
+                    };
+                    if latest.callback_message_id.as_deref() != Some(stable_w.as_str()) {
+                        return Ok(no_write());
+                    }
+                    let now = now_secs();
+                    latest.callback_state = Some("queued".into());
+                    latest.callback_fired_at = Some(now);
+                    latest.callback_error = None;
+                    latest.updated = now;
+                    latest.rev += 1;
+                    latest.version += 1;
+                    latest.log = Some(bs::append_log(
+                        latest.log.as_deref(),
+                        &chrono::Local::now().format("%H:%M").to_string(),
+                        &format!("terminal callback queued to {target_w} as {stable_w}"),
+                    ));
+                    bs::save_patched(conn, &mut latest)?;
+                    let exists = conn.query_row(
+                        "SELECT 1 FROM cmd_history WHERE card_id=?1 AND type='task-callback' LIMIT 1",
+                        rusqlite::params![id_w], |_| Ok(true),
+                    ).unwrap_or(false);
+                    let mut events = vec![ev_snap(&latest, MutationKind::Updated)];
+                    if !exists {
+                        conn.execute(
+                            "INSERT INTO cmd_history \
+                             (text,type,session,ts,origin,card_id,delivery,queued_at) \
+                             VALUES (?1,'task-callback',?2,?3,?4,?5,'queued',?3)",
+                            rusqlite::params![prompt_w, target_w, now * 1000, sender_w, id_w],
+                        )?;
+                        let message_id = conn.last_insert_rowid();
+                        events.push(crate::db::PendingEvent {
+                            entity_type: amux_core::revision::EntityType::Message,
+                            entity_id: format!("MSG-{message_id}"),
+                            mutation: MutationKind::Created,
+                            payload: None,
+                        });
+                    }
+                    Ok(WriteOutcome { applied: true, events })
+                }).await;
+            }
+            Err(reason) => {
+                report.refused += 1;
+                let reason = reason.to_string();
+                let _ = state.store.write_async(move |conn| {
+                    let Some(mut latest) = bs::get_issue(conn, &id_w)? else {
+                        return Ok(no_write());
+                    };
+                    latest.callback_state = Some("refused".into());
+                    latest.callback_error = Some(reason.clone());
+                    latest.updated = now_secs();
+                    latest.rev += 1;
+                    latest.version += 1;
+                    latest.log = Some(bs::append_log(
+                        latest.log.as_deref(),
+                        &chrono::Local::now().format("%H:%M").to_string(),
+                        &format!("terminal callback to {target_w} refused: {reason}"),
+                    ));
+                    bs::save_patched(conn, &mut latest)?;
+                    Ok(WriteOutcome {
+                        applied: true,
+                        events: vec![ev_snap(&latest, MutationKind::Updated)],
+                    })
+                }).await;
+            }
+        }
+    }
+    report
+}
+
+#[cfg(test)]
+mod callback_dispatch_tests {
+    use super::*;
+
+    fn state(home: &std::path::Path) -> AppState {
+        let store = std::sync::Arc::new(
+            crate::db::Store::open(&home.join("callback-test.db")).expect("open store"),
+        );
+        AppState {
+            store,
+            started: std::time::Instant::now(),
+            build_hash: "callback-test".into(),
+            auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+
+    fn pending_request(state: &AppState) -> String {
+        let new = bs::NewIssue {
+            title: "Produce the launch report".into(),
+            desc: "Requested by another worker.".into(),
+            status: "todo".into(),
+            session: Some("worker-b".into()),
+            item_type: "code".into(),
+            creator: "worker-a".into(),
+            owner_type: "agent".into(),
+            due: None,
+            due_time: None,
+            reviewer: None,
+            shepherd: None,
+            gate: vec![],
+            depends_on: vec![],
+            tags: vec![],
+            ask_type: None,
+            ask_question: None,
+            ask_unblocks: None,
+            ask_actor: None,
+            source: Some("agent".into()),
+            requested_by: Some("worker-a".into()),
+            callback_session: Some("worker-a".into()),
+            callback_prompt: Some("Start the dependent launch step.".into()),
+        };
+        let id = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let id_w = id.clone();
+        state.store.write(move |conn| {
+            let mut row = bs::create_issue(conn, &new, 1000)?;
+            row.status = "done".into();
+            row.last_result = Some("Report written to /tmp/launch-report.md".into());
+            row.updated = 2000;
+            row.rev += 1;
+            row.version += 1;
+            bs::save_patched(conn, &mut row)?;
+            *id_w.lock().unwrap() = row.id;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).expect("create and complete request");
+        let created_id = id.lock().unwrap().clone();
+        created_id
+    }
+
+    /// Happy path plus the crash window: enqueue succeeds, but the process dies
+    /// before the card is marked queued. Retrying the `dispatching` row must
+    /// reuse the stable queue id and the one linked Messages record.
+    #[tokio::test(flavor = "current_thread")]
+    async fn callback_delivery_is_board_linked_and_crash_idempotent() {
+        let home = tempfile::tempdir().expect("home");
+        let _home_guard = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(home.path().join("sessions/worker-a.env"), "CC_TAGS=\"a\"\n").unwrap();
+        std::fs::write(home.path().join("sessions/worker-b.env"), "CC_TAGS=\"b\"\n").unwrap();
+        let state = state(home.path());
+        let id = pending_request(&state);
+
+        let first = dispatch_pending_callbacks(&state, Some(&id)).await;
+        assert_eq!((first.attempted, first.queued, first.refused), (1, 1, 0));
+        {
+            let conn = state.store.read().unwrap();
+            let row = bs::get_issue(&conn, &id).unwrap().unwrap();
+            assert_eq!(row.callback_state.as_deref(), Some("queued"));
+            assert_eq!(row.callback_message_id.as_deref(), Some(format!("task-callback-{id}").as_str()));
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM steering_queue WHERE id=?1",
+                    rusqlite::params![format!("task-callback-{id}")],
+                    |r| r.get::<_, i64>(0),
+                ).unwrap(),
+                1
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM cmd_history WHERE card_id=?1 AND type='task-callback'",
+                    rusqlite::params![id],
+                    |r| r.get::<_, i64>(0),
+                ).unwrap(),
+                1
+            );
+        }
+
+        // Simulate a crash after enqueue but before finalization. Mutations go
+        // through the one writer, just like production.
+        let id_w = id.clone();
+        state.store.write(move |conn| {
+            conn.execute(
+                "UPDATE issues SET callback_state='dispatching' WHERE id=?1",
+                rusqlite::params![id_w],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+
+        let recovered = dispatch_pending_callbacks(&state, Some(&id)).await;
+        assert_eq!((recovered.attempted, recovered.queued, recovered.refused), (1, 1, 0));
+        let conn = state.store.read().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM steering_queue WHERE id=?1",
+                rusqlite::params![format!("task-callback-{id}")],
+                |r| r.get::<_, i64>(0),
+            ).unwrap(),
+            1,
+            "recovery must refresh the stable row, never duplicate it"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM cmd_history WHERE card_id=?1 AND type='task-callback'",
+                rusqlite::params![id],
+                |r| r.get::<_, i64>(0),
+            ).unwrap(),
+            1,
+            "the Messages link is one callback, not one per retry"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn callback_to_an_isolated_worker_is_visibly_refused() {
+        let home = tempfile::tempdir().expect("home");
+        let _home_guard = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(
+            home.path().join("sessions/worker-a.env"),
+            "CC_TAGS=\"a\"\nCC_ISOLATED=1\n",
+        ).unwrap();
+        std::fs::write(home.path().join("sessions/worker-b.env"), "CC_TAGS=\"b\"\n").unwrap();
+        let state = state(home.path());
+        let id = pending_request(&state);
+
+        let report = dispatch_pending_callbacks(&state, Some(&id)).await;
+        assert_eq!((report.attempted, report.queued, report.refused), (1, 0, 1));
+        let conn = state.store.read().unwrap();
+        let row = bs::get_issue(&conn, &id).unwrap().unwrap();
+        assert_eq!(row.callback_state.as_deref(), Some("refused"));
+        assert!(row.callback_error.as_deref().unwrap_or("").contains("isolated"));
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM steering_queue", [], |r| r.get::<_, i64>(0)).unwrap(),
+            0,
+            "a refusal must not leave an immortal queued callback"
+        );
+    }
+}
+
 /// List body, Python-parity (AMUX-2586 fix #4). The plain list serves the
 /// FULL `desc` and FULL `log` exactly as Python's `_load_board` does — the
 /// SPA renders `item.desc` and reads `item.log` (the folded badge) straight
@@ -1875,7 +2304,17 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
     }
     // (see designate_owner_reach for why this exists)
     if slim {
-        obj.insert("desc_len".into(), json!(row.desc.chars().count()));
+        // AF-346: `desc` may be a bounded PREFIX here. The two derivations
+        // that cannot be recomputed from one arrive beside it, from SQL; the
+        // `None` arm is what every non-prefixed row and every hand-built test
+        // row takes, unchanged. Deliberately NOT `unwrap_or_else(compute from
+        // the prefix)` — that fallback would return a smaller number that looks
+        // exactly like a real one, which is the failure a99955f7 shipped.
+        let desc_len = match &row.desc_prefixed {
+            Some(p) => p.desc_len,
+            None => row.desc.chars().count(),
+        };
+        obj.insert("desc_len".into(), json!(desc_len));
         let log_n = row
             .log
             .as_deref()
@@ -1909,8 +2348,13 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
             .take(120)
             .collect();
         obj.insert("desc_head".into(), json!(head));
-        let folded_n = row.desc.matches("New task:").count()
-            + row.log.as_deref().map(|l| l.matches("New task:").count()).unwrap_or(0);
+        let folded_n = match &row.desc_prefixed {
+            Some(p) => p.folded_n,
+            None => {
+                row.desc.matches("New task:").count()
+                    + row.log.as_deref().map(|l| l.matches("New task:").count()).unwrap_or(0)
+            }
+        };
         obj.insert("folded_n".into(), json!(folded_n));
 
         // The third derivation the list makes over desc+log (app.js:19231): the
@@ -2571,6 +3015,11 @@ pub async fn list_board(
         }
     };
 
+    // AF-346: a slim response ships DERIVATIONS of desc, never desc, so it does
+    // not need the whole string. `Full` is not a fallback here, it is the shape
+    // `?full=1` / `?slim=0` asked for, and it is what every other caller of
+    // these two functions still gets.
+    let prose = if slim { bs::Prose::SlimDerivations } else { bs::Prose::Full };
     let quota = qp_truthy(p.quota.as_deref());
     let store = state.store.clone();
     let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -2591,12 +3040,13 @@ pub async fn list_board(
                     &session_f,
                     archived,
                     done_limit.max(0) as usize,
+                    prose,
                 )?,
                 0,
                 0,
             )
         } else {
-            bs::list_issues_capped(&conn, &status_f, &session_f, archived, done_limit)?
+            bs::list_issues_capped(&conn, &status_f, &session_f, archived, done_limit, prose)?
         };
         // The `stale` flag needs the active-session set only when an
         // in-progress card is present (Python computes it in `_load_board`).
@@ -2852,9 +3302,17 @@ fn needsyou_ask_refusal(verdict: bs::AskVerdict, id: &str, session: Option<&str>
             "That is not one of the five kinds of human act. The vocabulary is closed on purpose: a block that fits none of them is not a block on a person.",
             "needsyou_ask_type_unknown",
         ),
+        bs::AskVerdict::NoActor => (
+            "`ask_actor` must name the specific person or external actor who can answer. Generic values such as human, user, owner, someone, or you are not a routing address.",
+            "needsyou_requires_specific_actor",
+        ),
         bs::AskVerdict::NoQuestion => (
             "`ask_question` has to be an actual question, in a sentence. \"Blocked on Ethan\" with no question is not an ask — that phrasing is most of what is sitting in this queue today.",
             "needsyou_ask_has_no_question",
+        ),
+        bs::AskVerdict::NotAQuestion => (
+            "`ask_question` must be an actual direct question ending in `?`, not a status note or an instruction the worker could keep doing itself.",
+            "needsyou_ask_is_not_a_question",
         ),
         bs::AskVerdict::NoUnblocks => (
             "`ask_unblocks` has to say what ENDS the block, in a sentence. Without it nobody but you can tell whether an answer has landed, so the card cannot leave this queue except by you noticing.",
@@ -2879,12 +3337,139 @@ fn needsyou_ask_refusal(verdict: bs::AskVerdict, id: &str, session: Option<&str>
             "why": why,
             "ask_types": bs::ASK_TYPES,
             "how_to_fix": {
-                "fields": "ask_type (one of the five), ask_question (the question, in a sentence), ask_unblocks (what ends the block).",
-                "cli": "amux board needsyou <ID> --ask-type <type> --ask-question \"...\" --ask-unblocks \"...\"",
+                "fields": "ask_actor (a named person/external actor), ask_type, ask_question (a direct question containing ?), and ask_unblocks (the observable exit).",
+                "cli": "amux board needsyou <ID> --actor <name> --ask <type> --question \"...?\" --unblocks \"...\"",
                 "not_an_ask": "If nobody is actually waiting on a person, this is not a needsyou card — put it back in todo/backlog, or discard it.",
             },
         }),
     )
+}
+
+#[derive(Debug)]
+struct RequestParentRefusal {
+    code: &'static str,
+    why: String,
+    candidates: Vec<String>,
+}
+
+#[derive(Debug)]
+enum RequestParentResolution {
+    /// A peer request may intentionally be standalone. Preserve that existing
+    /// use when the requester has no active task rather than inventing a
+    /// parent from an unrelated todo.
+    Standalone,
+    Linked(Box<IssueRow>),
+    Refused(RequestParentRefusal),
+}
+
+fn request_parent_is_owned(row: &IssueRow, requester: &str) -> bool {
+    row.session.as_deref() == Some(requester)
+        && row.owner_type == "agent"
+        && row.archived == 0
+}
+
+/// A todo parent is considered current only when this requester already
+/// delegated one of its open dependencies. That is the multiple-fanout case:
+/// the first request requeues the parent, then subsequent requests in the same
+/// turn must append to that same task instead of becoming standalone siblings.
+fn is_open_delegation_parent(conn: &rusqlite::Connection, row: &IssueRow, requester: &str) -> bool {
+    row.status == "todo"
+        && row.depends_on.iter().any(|id| {
+            conn.query_row(
+                "SELECT requested_by, status FROM issues \
+                 WHERE id=?1 AND deleted IS NULL AND COALESCE(archived,0)=0",
+                rusqlite::params![id],
+                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)),
+            )
+            .ok()
+            .is_some_and(|(requested_by, status)| {
+                requested_by.as_deref() == Some(requester) && !bs::is_terminal_status(&status)
+            })
+        })
+}
+
+/// Resolve which requester task a peer request belongs to.
+///
+/// Explicit `request_parent` is authoritative. Without it, the latest durable
+/// message->task link is the current-task signal; only when that is absent do
+/// we accept a unique `doing` card. Multiple doing cards are refused because
+/// silently selecting the wrong task would corrupt the dependency graph.
+fn resolve_request_parent(
+    conn: &rusqlite::Connection,
+    requester: &str,
+    explicit: Option<&str>,
+) -> rusqlite::Result<RequestParentResolution> {
+    if let Some(id) = explicit {
+        let Some(row) = bs::get_issue(conn, id)? else {
+            return Ok(RequestParentResolution::Refused(RequestParentRefusal {
+                code: "task_request_parent_not_found",
+                why: format!("request_parent {id} does not name a live task"),
+                candidates: Vec::new(),
+            }));
+        };
+        if !request_parent_is_owned(&row, requester) {
+            return Ok(RequestParentResolution::Refused(RequestParentRefusal {
+                code: "task_request_parent_not_owned",
+                why: format!(
+                    "request_parent {id} is not a live agent task owned by requester {requester}"
+                ),
+                candidates: Vec::new(),
+            }));
+        }
+        if !matches!(row.status.as_str(), "doing" | "todo") {
+            return Ok(RequestParentResolution::Refused(RequestParentRefusal {
+                code: "task_request_parent_not_active",
+                why: format!(
+                    "request_parent {id} is {}, but delegation can attach only to doing or todo work",
+                    row.status
+                ),
+                candidates: Vec::new(),
+            }));
+        }
+        return Ok(RequestParentResolution::Linked(Box::new(row)));
+    }
+
+    let linked_ids: Vec<String> = conn
+        .prepare(
+            "SELECT i.id FROM cmd_history h JOIN issues i ON i.id=h.card_id \
+             WHERE h.session=?1 AND i.session=?1 AND i.owner_type='agent' \
+               AND i.deleted IS NULL AND COALESCE(i.archived,0)=0 \
+               AND i.status IN ('doing','todo') \
+             ORDER BY h.id DESC LIMIT 32",
+        )?
+        .query_map(rusqlite::params![requester], |r| r.get::<_, String>(0))?
+        .filter_map(Result::ok)
+        .collect();
+    for id in linked_ids {
+        if let Some(row) = bs::get_issue(conn, &id)? {
+            if row.status == "doing" || is_open_delegation_parent(conn, &row, requester) {
+                return Ok(RequestParentResolution::Linked(Box::new(row)));
+            }
+        }
+    }
+
+    let doing: Vec<String> = conn
+        .prepare(
+            "SELECT id FROM issues WHERE session=?1 AND status='doing' \
+             AND owner_type='agent' AND deleted IS NULL AND COALESCE(archived,0)=0 \
+             ORDER BY updated DESC,id",
+        )?
+        .query_map(rusqlite::params![requester], |r| r.get::<_, String>(0))?
+        .filter_map(Result::ok)
+        .collect();
+    match doing.as_slice() {
+        [] => Ok(RequestParentResolution::Standalone),
+        [id] => Ok(RequestParentResolution::Linked(Box::new(
+            bs::get_issue(conn, id)?.expect("selected live parent disappeared inside one write"),
+        ))),
+        _ => Ok(RequestParentResolution::Refused(RequestParentRefusal {
+            code: "task_request_parent_ambiguous",
+            why: format!(
+                "requester {requester} has multiple doing tasks; refusing to attach the delegated work to the wrong one"
+            ),
+            candidates: doing,
+        })),
+    }
 }
 
 pub async fn create_item(
@@ -2934,6 +3519,7 @@ pub async fn create_item(
             .filter(|s| !s.trim().is_empty());
         if bs::needsyou_ask_required(session_for_gate.as_deref()) {
             let verdict = bs::ask_verdict(
+                body_str(&map, "ask_actor").unwrap_or_default().as_str(),
                 body_str(&map, "ask_type").unwrap_or_default().as_str(),
                 body_str(&map, "ask_question").unwrap_or_default().as_str(),
                 body_str(&map, "ask_unblocks").unwrap_or_default().as_str(),
@@ -3043,9 +3629,109 @@ pub async fn create_item(
         None => if session.is_empty() { "human" } else { "agent" }.to_string(),
     };
 
+    // A peer request is a BOARD CONTRACT, not an ordinary pane message. The
+    // requester comes only from the verified worker header; accepting a body
+    // field here would let a worker manufacture somebody else's return path.
+    let is_peer_request = !hdr_session.is_empty() && !session.is_empty() && hdr_session != session;
+    if is_peer_request {
+        if let Err(reason) =
+            crate::api::session_verbs::cross_group_send_ok(&hdr_session, &session)
+        {
+            return err(
+                StatusCode::FORBIDDEN,
+                json!({
+                    "error": reason,
+                    "code": "task_request_not_authorized",
+                    "requester": hdr_session,
+                    "target": session,
+                    "how_to_fix": "put both workers in a group, or enable the existing cross-group worker configuration; the board request and direct-send paths use the same policy",
+                }),
+            );
+        }
+    }
+    let request_parent = match map.get("request_parent") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) if !id.trim().is_empty() => Some(id.trim().to_string()),
+        Some(Value::String(_)) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "request_parent must be a non-empty task id"}),
+            )
+        }
+        Some(_) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "request_parent must be a task id string"}),
+            )
+        }
+    };
+    if request_parent.is_some() && !is_peer_request {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": "request_parent is valid only for a worker-to-worker task request",
+                "code": "task_request_parent_without_peer_request",
+            }),
+        );
+    }
+    let requested_by = is_peer_request.then(|| hdr_session.clone());
+    let callback_specified = map.contains_key("callback");
+    let (callback_session, callback_prompt) = match map.get("callback") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => (None, None),
+        Some(Value::Bool(true)) => (Some(hdr_session.clone()), None),
+        Some(Value::String(prompt)) => (Some(hdr_session.clone()), Some(prompt.trim().to_string())),
+        Some(Value::Object(cb)) => {
+            let target = cb
+                .get("session")
+                .and_then(Value::as_str)
+                .unwrap_or(&hdr_session)
+                .trim()
+                .to_string();
+            let prompt = cb
+                .get("prompt")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            (Some(target), prompt)
+        }
+        Some(_) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "callback must be true, false, a prompt string, or {session?, prompt?}"}),
+            )
+        }
+    };
+    if callback_specified && hdr_session.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "a callback requires a verified X-Amux-Worker requester"}),
+        );
+    }
+    if callback_session.as_deref().is_some_and(|s| s.is_empty()) {
+        return err(StatusCode::BAD_REQUEST, json!({"error": "callback session is empty"}));
+    }
+    if callback_session.as_deref().is_some_and(|s| s != hdr_session) {
+        return err(
+            StatusCode::FORBIDDEN,
+            json!({
+                "error": "a task callback may return only to the verified requester",
+                "requester": hdr_session,
+                "callback_session": callback_session,
+            }),
+        );
+    }
+    if callback_session.is_some() && bs::is_terminal_status(&status_raw) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "cannot arm a completion callback on a task created terminal"}),
+        );
+    }
+
     let known_keys = [
         "title", "desc", "status", "session", "type", "depends_on", "tags", "creator",
-        "reviewer", "shepherd", "gate", "owner_type", "due", "due_time",
+        "reviewer", "shepherd", "gate", "owner_type", "due", "due_time", "callback",
+        "ask_actor", "ask_type", "ask_question", "ask_unblocks", "request_parent",
     ];
     let ignored: Vec<String> = map
         .keys()
@@ -3099,7 +3785,7 @@ pub async fn create_item(
                             })).collect::<Vec<_>>(),
                             "how_to_fix": {
                                 "file_it_anyway_but_not_as_next": "POST with {\"status\":\"backlog\"} — unbounded on purpose, and where a real card that is not NEXT belongs",
-                                "raise_it": "set AMUX_TODO_WIP_LIMIT=<n> in this worker's / group's / global scope env (Scope tab); 0 disables it"
+                                "raise_it": "set AMUX_TODO_WIP_LIMIT=<n> in this worker's / group's / global configuration; 0 disables it"
                             }
                         })),
                     )
@@ -3113,7 +3799,7 @@ pub async fn create_item(
         title,
         desc: body_str(&map, "desc").unwrap_or_default(),
         status: status_raw,
-        session: Some(session).filter(|s| !s.is_empty()),
+        session: Some(session.clone()).filter(|s| !s.is_empty()),
         item_type,
         creator,
         owner_type,
@@ -3127,14 +3813,23 @@ pub async fn create_item(
         ask_type: body_str(&map, "ask_type"),
         ask_question: body_str(&map, "ask_question"),
         ask_unblocks: body_str(&map, "ask_unblocks"),
+        ask_actor: body_str(&map, "ask_actor"),
         // AF-367: the HTTP create path — a real POST /api/board from a lane or
         // a human, as opposed to a card a daemon filed.
         source: Some("agent".into()),
+        requested_by,
+        callback_session,
+        callback_prompt,
     };
 
+    enum DependencyLink {
+        Standalone,
+        ParentRequeued { parent: String, prior_status: String },
+    }
     enum Out {
         Cycle(Vec<String>),
-        Created(Box<IssueRow>),
+        ParentRefused(RequestParentRefusal),
+        Created(Box<IssueRow>, DependencyLink),
     }
     let slot: Arc<Mutex<Option<Out>>> = Arc::new(Mutex::new(None));
     let slot_w = slot.clone();
@@ -3142,20 +3837,139 @@ pub async fn create_item(
     // response can name it and it can be reported without re-querying.
     let folded: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let folded_w = folded.clone();
+    let requester_for_parent = hdr_session.clone();
     let write = state
         .store
         .write_async(move |conn| {
+            let mut parent = if new.requested_by.is_some() {
+                match resolve_request_parent(
+                    conn,
+                    &requester_for_parent,
+                    request_parent.as_deref(),
+                )? {
+                    RequestParentResolution::Standalone => None,
+                    RequestParentResolution::Linked(row) => Some(row),
+                    RequestParentResolution::Refused(refusal) => {
+                        return finish(&slot_w, Out::ParentRefused(refusal), no_write())
+                    }
+                }
+            } else {
+                None
+            };
             // Acyclicity is validated INSIDE the write so no interleaved
             // create can slip a cycle between check and insert. The new id
             // does not exist yet, so a placeholder self id is fine — only
             // edges out of it are being added.
+            //
+            // THE PLACEHOLDER IS PRINTABLE, and it was not (AF-481). It used to
+            // be "\u{0}new-card": a leading NUL, chosen because no real card id
+            // can contain one, which is correct and is also true of a space. The
+            // sentinel reaches a LOG LINE verbatim, `depends_on_cycle` warns with
+            // `self_id = %self_id` on a pre-existing cycle elsewhere on the board,
+            // and a single NUL byte makes grep declare the WHOLE FILE binary.
+            //
+            // Measured 2026-09-04: 19 NUL bytes in a 67 MB server-rs.log, all 19
+            // from this one warn, all from the same stuck cycle
+            // (GE-473 -> MHC-256) retried across three days. `grep -c` still
+            // counted 17 matching lines while `grep -o` returned 8, because grep
+            // suppresses match OUTPUT for binary input and says nothing when the
+            // output goes to a pipe. Every `grep -o` sweep over that file
+            // undercounted by 53% and looked fine, and this repo's own log-sweep
+            // doc prescribes greps.
+            //
+            // Non-collision is unchanged: card ids are `[A-Z]+-<digits>`, so the
+            // space and the parentheses are as impossible as the NUL was.
             if !new.depends_on.is_empty() {
-                if let Some(cycle) = bs::depends_on_cycle(conn, "\u{0}new-card", &new.depends_on)? {
+                if let Some(cycle) = bs::depends_on_cycle(conn, NEW_CARD_SELF_ID, &new.depends_on)? {
                     return finish(&slot_w, Out::Cycle(cycle), no_write());
                 }
+                // Adding parent -> new-child at the same time would close a
+                // cycle when any child dependency already reaches the parent.
+                // Validate that hypothetical edge before minting either side
+                // of the relationship; no partial child may survive refusal.
+                if let Some(parent) = parent.as_deref() {
+                    if let Some(path) =
+                        bs::dependency_path(conn, &new.depends_on, &parent.id)?
+                    {
+                        let mut cycle = vec![parent.id.clone(), NEW_CARD_SELF_ID.to_string()];
+                        cycle.extend(path);
+                        return finish(&slot_w, Out::Cycle(cycle), no_write());
+                    }
+                }
             }
-            let row = bs::create_issue(conn, &new, now_secs())?;
+            let now = now_secs();
+            let row = bs::create_issue(conn, &new, now)?;
             let mut events = vec![ev_snap(&row, MutationKind::Created)];
+            let dependency_link = if let Some(mut parent) = parent.take() {
+                let prior_status = parent.status.clone();
+                if !parent.depends_on.iter().any(|id| id == &row.id) {
+                    parent.depends_on.push(row.id.clone());
+                }
+                // The delegated child is work the parent must wait for. Put
+                // the parent back on the ready queue, where depends_on keeps it
+                // blocked until the child closes, instead of letting `doing`
+                // consume the requester's sole WIP slot while it cannot move.
+                parent.status = "todo".into();
+                parent.updated = now;
+                parent.rev += 1;
+                parent.version += 1;
+                // A trigger got this task into doing; delegation means that
+                // trigger has been consumed. Leaving it fresh would keep the
+                // now-todo parent undispatchable even after its child closes.
+                parent.source_ref = None;
+                parent.last_verified_at = None;
+                parent.log = Some(bs::append_log(
+                    parent.log.as_deref(),
+                    &hhmm(),
+                    &format!(
+                        "{requester_for_parent} delegated dependency {} to {}; parent requeued until it completes",
+                        row.id,
+                        row.session.as_deref().unwrap_or("(unassigned)")
+                    ),
+                ));
+                if bs::save_patched(conn, &mut parent)? != 1 {
+                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                }
+                let mutation = if prior_status == parent.status {
+                    MutationKind::Updated
+                } else {
+                    MutationKind::StatusChanged {
+                        from: prior_status.clone(),
+                        to: parent.status.clone(),
+                    }
+                };
+                events.push(ev_snap(&parent, mutation));
+                DependencyLink::ParentRequeued {
+                    parent: parent.id.clone(),
+                    prior_status,
+                }
+            } else {
+                DependencyLink::Standalone
+            };
+            // The Messages ledger carries the SAME task id. Delivery is
+            // `board`, not `direct` or `queued`: the recipient consumes this
+            // request through board-drive and the card is the source of truth.
+            if let (Some(requester), Some(target)) =
+                (row.requested_by.as_deref(), row.session.as_deref())
+            {
+                let text = format!(
+                    "[board request {}] {} requested work from {}: {}",
+                    row.id, requester, target, row.title
+                );
+                conn.execute(
+                    "INSERT INTO cmd_history \
+                     (text,type,session,ts,origin,card_id,delivery,delivered_at,submit_verdict) \
+                     VALUES (?1,'session',?2,?3,?4,?5,'board',?3,'accepted')",
+                    rusqlite::params![text, target, now_secs() * 1000, requester, row.id],
+                )?;
+                let message_id = conn.last_insert_rowid();
+                events.push(crate::db::PendingEvent {
+                    entity_type: amux_core::revision::EntityType::Message,
+                    entity_id: format!("MSG-{message_id}"),
+                    mutation: MutationKind::Created,
+                    payload: None,
+                });
+            }
             // AMUX-3391: fold the silent auto-capture card into this worker card
             // (see fold_capture_for_worker_card). The window is env-tunable.
             let fold_window: i64 = std::env::var("AMUX_CAPTURE_FOLD_WINDOW_S")
@@ -3170,7 +3984,7 @@ pub async fn create_item(
             }
             finish(
                 &slot_w,
-                Out::Created(Box::new(row)),
+                Out::Created(Box::new(row), dependency_link),
                 WriteOutcome {
                     applied: true,
                     events,
@@ -3185,8 +3999,44 @@ pub async fn create_item(
     let outcome = slot.lock().expect("outcome slot poisoned").take();
     match outcome {
         None => internal("create produced no outcome"),
-        Some(Out::Cycle(cycle)) => cycle_response(&cycle),
-        Some(Out::Created(row)) => {
+        Some(Out::Cycle(cycle)) => {
+            if is_peer_request {
+                tracing::warn!(
+                    target: "amux::task_dependency",
+                    verdict = "dependency_cycle",
+                    requester = %hdr_session,
+                    target = %session,
+                    cycle = %cycle.join(" -> "),
+                    "peer task dependency refused: cycle"
+                );
+            }
+            cycle_response(&cycle)
+        }
+        Some(Out::ParentRefused(refusal)) => {
+            tracing::warn!(
+                target: "amux::task_dependency",
+                verdict = refusal.code,
+                requester = %hdr_session,
+                target = %session,
+                candidates = %refusal.candidates.join(","),
+                "peer task dependency refused: {}",
+                refusal.why
+            );
+            err(
+                StatusCode::CONFLICT,
+                json!({
+                    "error": refusal.why,
+                    "code": refusal.code,
+                    "ok": false,
+                    "blocked": true,
+                    "requester": hdr_session,
+                    "target": session,
+                    "candidates": refusal.candidates,
+                    "how_to_fix": "pass the intended active requester task with `amux board request <worker> --for <TASK-ID> ...` or request_parent in the API body",
+                }),
+            )
+        }
+        Some(Out::Created(row, dependency_link)) => {
             let mut v = detail_body(&row);
             v["rev"] = json!(row.rev);
             v["global_rev"] = json!(reply.rev.0);
@@ -3197,6 +4047,44 @@ pub async fn create_item(
             // so a worker sees the reconcile happened and never hand-discards it.
             if let Some(cap_id) = folded.lock().expect("folded slot poisoned").take() {
                 v["folded_capture"] = json!(cap_id);
+            }
+            match dependency_link {
+                DependencyLink::ParentRequeued { parent, prior_status } => {
+                    v["request_dependency"] = json!({
+                        "verdict": "parent_requeued",
+                        "linked": true,
+                        "parent": parent.clone(),
+                        "child": row.id,
+                        "parent_status": "todo",
+                        "prior_parent_status": prior_status,
+                    });
+                    tracing::info!(
+                        target: "amux::task_dependency",
+                        verdict = "parent_requeued",
+                        parent = %parent,
+                        child = %row.id,
+                        requester = %row.requested_by.as_deref().unwrap_or("(none)"),
+                        delegate = %row.session.as_deref().unwrap_or("(none)"),
+                        "peer task dependency linked; requester WIP released"
+                    );
+                }
+                DependencyLink::Standalone => {
+                    if row.requested_by.is_some() {
+                        v["request_dependency"] = json!({
+                            "verdict": "standalone_no_active_parent",
+                            "linked": false,
+                            "child": row.id,
+                        });
+                        tracing::info!(
+                            target: "amux::task_dependency",
+                            verdict = "standalone_no_active_parent",
+                            child = %row.id,
+                            requester = %row.requested_by.as_deref().unwrap_or("(none)"),
+                            delegate = %row.session.as_deref().unwrap_or("(none)"),
+                            "peer task request created without an active requester task"
+                        );
+                    }
+                }
             }
             // AF-366: RECORD WHO CALLED, not only what the row now says.
             //
@@ -3232,6 +4120,18 @@ pub async fn create_item(
                 owner_session = %row.session.as_deref().unwrap_or("(none)"),
                 "board card created"
             );
+            // A peer request should enter the same durable board-drive path
+            // immediately; waiting for the periodic sweep makes a successful
+            // request look lost for up to a minute.
+            if row.requested_by.is_some() {
+                if let Some(target) = row.session.clone() {
+                    let st = state.clone();
+                    tokio::spawn(async move {
+                        let _ = crate::runtime_jobs::board_drive::drive_session(&st, &target).await;
+                        crate::api::session_verbs::steer_deliver_for_session(&st, &target).await;
+                    });
+                }
+            }
             (StatusCode::CREATED, Json(v)).into_response()
         }
     }
@@ -3241,6 +4141,14 @@ pub async fn create_item(
 
 fn resolve_task_asset(reference: &str, work_dir: &str) -> String {
     let reference = reference.trim();
+    if let Some(rest) = reference.strip_prefix("~/") {
+        return std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join(rest)
+            .to_string_lossy()
+            .into_owned();
+    }
     let is_external = reference.starts_with("http://")
         || reference.starts_with("https://")
         || reference.starts_with('#')
@@ -3267,6 +4175,10 @@ fn resolve_task_asset(reference: &str, work_dir: &str) -> String {
     let path_shaped = path_ref.starts_with("./")
         || path_ref.starts_with("../")
         || path_ref.contains('/')
+        || path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with('.') && name.len() > 1)
         || path.extension().is_some();
     if !path_shaped {
         return reference.to_string();
@@ -3302,6 +4214,37 @@ fn resolve_task_asset(reference: &str, work_dir: &str) -> String {
     }
 }
 
+/// Availability is measured only where doing so is local and side-effect free.
+/// Fetching an arbitrary artifact URL from this endpoint would turn a board
+/// render into an SSRF primitive; an external link therefore says explicitly
+/// that reachability was not measured instead of pretending it passed.
+fn task_asset_availability(reference: &str, resolved: &str) -> Value {
+    let external = reference.starts_with("http://") || reference.starts_with("https://");
+    let symbolic = reference.starts_with('#')
+        || ((7..=40).contains(&reference.len())
+            && reference.bytes().all(|c| c.is_ascii_hexdigit()));
+    if external {
+        json!({
+            "state": "external",
+            "measured": false,
+            "why_unmeasured": "external URLs are not fetched by the server (avoids SSRF and side effects)",
+        })
+    } else if symbolic {
+        json!({
+            "state": "symbolic",
+            "measured": false,
+            "why_unmeasured": "commit and PR references are resolved by their repository surface",
+        })
+    } else {
+        let exists = std::path::Path::new(resolved.split('#').next().unwrap_or(resolved)).exists();
+        json!({
+            "state": if exists { "available" } else { "missing" },
+            "measured": true,
+            "exists": exists,
+        })
+    }
+}
+
 #[cfg(test)]
 mod task_asset_resolution_tests {
     use super::resolve_task_asset;
@@ -3324,8 +4267,10 @@ mod task_asset_resolution_tests {
         let repo = root.path().join("mixpeek");
         let cwd = repo.join("customers/tubescience");
         let file = cwd.join("migration/mxp.py");
+        let dotenv = cwd.join(".env");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, "# asset").unwrap();
+        std::fs::write(&dotenv, "TOKEN=hidden-asset").unwrap();
 
         assert_eq!(
             resolve_task_asset("migration/mxp.py", cwd.to_str().unwrap()),
@@ -3337,6 +4282,16 @@ mod task_asset_resolution_tests {
                 cwd.to_str().unwrap()
             ),
             format!("{}#contract", file.to_string_lossy())
+        );
+        assert_eq!(
+            resolve_task_asset("customers/tubescience/.env", cwd.to_str().unwrap()),
+            dotenv.to_string_lossy(),
+            "repo-relative dotfiles resolve from the producing worker's directory"
+        );
+        assert_eq!(
+            resolve_task_asset(".env", cwd.to_str().unwrap()),
+            dotenv.to_string_lossy(),
+            "a bare dotfile resolves from the producing worker's directory"
         );
     }
 }
@@ -3419,7 +4374,9 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
             .unwrap_or_default();
         for artifact in &mut artifacts {
             if let Some(reference) = artifact.get("ref").and_then(Value::as_str) {
-                artifact["resolved_ref"] = json!(resolve_task_asset(reference, &work_dir));
+                let resolved = resolve_task_asset(reference, &work_dir);
+                artifact["availability"] = task_asset_availability(reference, &resolved);
+                artifact["resolved_ref"] = json!(resolved);
             }
         }
         let mut add_asset = |reference: String, source: &str| {
@@ -3427,6 +4384,7 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
             let resolved_ref = resolve_task_asset(&reference, &work_dir);
             asset_links.push(json!({
                 "ref": reference,
+                "availability": task_asset_availability(&reference, &resolved_ref),
                 "resolved_ref": resolved_ref,
                 "source": source,
             }));
@@ -3434,9 +4392,14 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
         for (source, text) in [
             ("evidence", row.evidence.as_deref().unwrap_or("")),
             ("last result", row.last_result.as_deref().unwrap_or("")),
-            ("activity", row.log.as_deref().unwrap_or("")),
         ] {
             for reference in bs::asset_refs(text) { add_asset(reference, source); }
+        }
+        // Activity is broad: it names inputs, peer-owned dirty files, and
+        // commits belonging to other cards. Only explicit output language may
+        // synthesize a link; commit-report registers its exact outputs below.
+        for reference in bs::output_asset_refs(row.log.as_deref().unwrap_or("")) {
+            add_asset(reference, "worker output");
         }
         let mut file_stmt = conn.prepare(
             "SELECT path FROM issue_files WHERE issue_id=?1 ORDER BY added_at, path",
@@ -3672,7 +4635,11 @@ async fn decompose_item(
                     ask_type: None,
                     ask_question: None,
                     ask_unblocks: None,
+                    ask_actor: None,
                     source: Some("decomposition".into()),
+                    requested_by: None,
+                    callback_session: None,
+                    callback_prompt: None,
                 };
                 let mut child = bs::create_issue(conn, &new, now)?;
                 child.epic = Some(parent.id.clone());
@@ -3879,12 +4846,54 @@ pub async fn claim_item(
 /// Truncate for a HISTORY LINE, on chars not bytes (a multi-byte title must not
 /// panic the writer) and with an ellipsis so a truncated value never reads as
 /// the whole value.
+/// Stand-in self id for a card that does not exist yet, used only by the
+/// create-path acyclicity check (AF-481).
+///
+/// Printable, because it is logged. See the call site for the 19 NUL bytes that
+/// turned a 67 MB log binary and cost every `grep -o` sweep over it 53% of its
+/// matches, silently.
+const NEW_CARD_SELF_ID: &str = "(new card)";
+
 fn chars_truncate_log(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         return s.to_string();
     }
     format!("{}…", s.chars().take(n).collect::<String>())
 }
+
+/// Head+tail with the dropped count NAMED, for a value the log is the only copy
+/// of (AF-459, reopened by gtm-engine 2026-09-04 after refusing to validate it).
+///
+/// `chars_truncate_log` keeps a PREFIX, and a prefix of a destroyed value
+/// reproduces the exact failure this log line exists to prevent: gtm-engine lost
+/// a 366-character five-item inventory, recovered four items from a prefix, and
+/// the fifth was gone. The first fix raised the cap from 60 to 200 and their
+/// case still lands past it, so partial recovery from a prefix survived the fix
+/// that was written for it. Any FIXED prefix cap has that property for some
+/// value; the question is only whose.
+///
+/// Two changes, and the second is the one that matters. The bound is generous
+/// enough that a real trigger is kept WHOLE, and past it the middle goes rather
+/// than the tail, with `[N chars elided]` in the gap. A reader then knows they
+/// are holding an incomplete value instead of believing a prefix is all there
+/// was, which is the difference between a recoverable loss and a silent one.
+fn chars_elide_middle(s: &str, head: usize, tail: usize) -> String {
+    let n = s.chars().count();
+    if n <= head + tail {
+        return s.to_string();
+    }
+    let h: String = s.chars().take(head).collect();
+    let t: String = s.chars().skip(n - tail).collect();
+    format!("{h}…[{} chars elided]…{t}", n - head - tail)
+}
+
+/// The destroyed `source_ref` is kept whole up to head+tail characters.
+///
+/// 1800 rather than 200: gtm-engine's real loss was 366 and the previous bound
+/// was chosen without one. A bound wants a measurement behind it, and the only
+/// measurement available is the largest value anyone has actually lost.
+const SOURCE_REF_LOG_HEAD: usize = 900;
+const SOURCE_REF_LOG_TAIL: usize = 900;
 
 /// AF-413: which fields did a REFUSAL throw away?
 ///
@@ -3920,14 +4929,17 @@ fn discarded_by_refusal(map: &serde_json::Map<String, Value>) -> Vec<String> {
     let mut out: Vec<String> = map
         .keys()
         .filter(|k| k.as_str() != "status")
-        .filter(|k| PATCH_WRITABLE.contains(&k.as_str()) || k.as_str() == "desc_append")
+        .filter(|k| {
+            PATCH_WRITABLE.contains(&k.as_str())
+                || matches!(k.as_str(), "desc_append" | "callback")
+        })
         .cloned()
         .collect();
     out.sort();
     out
 }
 
-const PATCH_WRITABLE: [&str; 32] = [
+const PATCH_WRITABLE: [&str; 33] = [
     "title", "desc", "status", "session", "type", "depends_on", "tags", "reviewer", "shepherd",
     "epic", // AMUX-2992: assign/clear the epic a card rolls up under
     "due", "due_time", "owner_type", "pinned", "pos", "gate", "source_ref", "archived",
@@ -3951,6 +4963,7 @@ const PATCH_WRITABLE: [&str; 32] = [
     "ask_type",
     "ask_question",
     "ask_unblocks",
+    "ask_actor",
     // The continuation contract (AMUX-3946). Writable on their own for the same
     // reason the ask fields are: a lane can write the continuation first and
     // then move the card in a second call that cannot fail on content, so a
@@ -4042,7 +5055,7 @@ mod af413_discarded_tests {
     }
 }
 
-const PATCH_CONTROL: [&str; 9] = [
+const PATCH_CONTROL: [&str; 10] = [
     "expect_rev",
     "gate_ack",
     "gate_checked",
@@ -4055,6 +5068,9 @@ const PATCH_CONTROL: [&str; 9] = [
     // nothing — the caller then retries forever against a refusal it believes
     // it answered (the AC-323 shape this array's comment already records).
     "desc_shrink_ack",
+    // Structured write spanning the callback_* columns. Kept as one public
+    // contract so callers cannot manufacture half-armed callbacks.
+    "callback",
 ];
 
 /// One owner-notice per (owner, card, author, NOTE TEXT) per 10 minutes: a burst
@@ -4150,6 +5166,12 @@ enum PatchOut {
         /// dropped goes and sets it again, or files a bug against working
         /// code, which is exactly what this card was.
         diverted: Vec<Value>,
+        /// Advisories are NOT diversions (AF-469 regression, 2026-09-04). A
+        /// diversion says "the key you named is not the key that changed"; an
+        /// advisory says "the write landed, and here is a companion field you
+        /// did not send". Merging them tripped a control written to stop an
+        /// advisory firing on every source_ref write.
+        advisories: Vec<Value>,
         /// (session, from_status, to_status) when a status change happened,
         /// for reactive pickup: if the transition freed the lane (done/verified/
         /// discarded), fire an immediate pickup instead of waiting 60s.
@@ -4285,12 +5307,138 @@ fn criterion_wants_a_name(c: &str) -> bool {
     c.to_lowercase().contains("name them")
 }
 
+/// The exit for a card whose WORK belongs to another lane (AF-506).
+///
+/// Reported by `backend`, hit live on MI-4155 during autonomous backlog triage.
+/// A lane holding a card that is not its work has no honest state to move it to:
+/// `backlog` re-feeds that same lane's auto-pickup, `todo` re-queues after a
+/// cooldown, `needsyou` reads as blocked on Ethan rather than on a peer, and
+/// `review` — which the DISPATCHER's own card text recommends — gates on acking
+/// "Implemented and self-tested" / "Diff / PR is up", which a card you are
+/// ROUTING AWAY cannot truthfully claim. Every move is a lie or a loop, which is
+/// ethos rule 3: a legitimate state with no truthful path forward.
+///
+/// The gate is RIGHT to refuse; what was missing is that the refusal knew only
+/// one way out. Reassignment is not a bypass and is deliberately kept out of the
+/// `or_force` family: it does not skip the gate, it moves the card to whoever
+/// the gate is asking about, and that lane satisfies it honestly.
+///
+/// Two wordings because two different things are true. When the caller is not
+/// the owner, the owner can be NAMED. When the caller IS the owner — backend's
+/// case, since the pickup had already assigned it to them — nothing here can
+/// tell whether the work belongs elsewhere, so it is stated as a conditional
+/// and the loop is spelled out. Neither wording asserts the card is misassigned
+/// (AF-169: a hint that cannot apply must not print as though it does).
+fn reassign_exit(card: &str, owner: Option<&str>, caller: &str) -> Value {
+    let owner = owner.map(str::trim).filter(|o| !o.is_empty());
+    let mine = owner.is_none_or(|o| o == caller);
+    if let (false, Some(o)) = (mine, owner) {
+        return json!({
+            "when": format!(
+                "This card is owned by {o:?}, not by you. If the work is theirs, you do not need to satisfy this gate at all — hand it back."
+            ),
+            "how": format!("amux board assign {card} {o} && amux board todo {card}"),
+            "effect": format!("dispatches to {o}, not to you"),
+            "not_a_bypass": "this does not skip the gate; it moves the card to the lane the gate is asking about, and they satisfy it honestly",
+        });
+    }
+    json!({
+        "when": "If this card's WORK belongs to another lane, hand it over instead of acking a criterion you cannot truthfully claim. You own it right now, so nothing here can tell whether that is the case — only you can.",
+        "how": format!("amux board assign {card} <owning-lane> && amux board todo {card}"),
+        "effect": "dispatches to THEM, not back to you. Moving it to `backlog` or `todo` while you still own it re-feeds your own auto-pickup and it returns.",
+        "not_a_bypass": "this does not skip the gate; it moves the card to the lane the gate is asking about, and they satisfy it honestly",
+    })
+}
+
+#[cfg(test)]
+mod reassign_exit_tests {
+    use super::*;
+
+    /// A card owned by someone else NAMES them, so the reader can evaluate the
+    /// advice without another call. This is the case the caller can act on
+    /// immediately.
+    #[test]
+    fn a_card_owned_by_a_peer_names_that_peer_in_the_command() {
+        let v = reassign_exit("MI-4155", Some("mvs-infra"), "backend");
+        assert!(v["when"].as_str().unwrap().contains("\"mvs-infra\""), "{v:#}");
+        assert!(
+            v["how"].as_str().unwrap() == "amux board assign MI-4155 mvs-infra && amux board todo MI-4155",
+            "{v:#}"
+        );
+        assert!(v["effect"].as_str().unwrap().contains("dispatches to mvs-infra"), "{v:#}");
+    }
+
+    /// THE REPORTED CASE. The pickup had already assigned MI-4155 to backend, so
+    /// they OWNED the card they needed to hand away. Nothing here can tell
+    /// whether the work belongs elsewhere, so it must be a conditional the
+    /// reader resolves — and it must name the loop, which is the part that cost
+    /// them two round trips.
+    #[test]
+    fn a_card_you_already_own_states_the_condition_and_names_the_loop() {
+        let v = reassign_exit("MI-4155", Some("backend"), "backend");
+        assert!(v["when"].as_str().unwrap().starts_with("If this card's WORK belongs"), "{v:#}");
+        assert!(v["when"].as_str().unwrap().contains("only you can"), "{v:#}");
+        assert!(
+            v["effect"].as_str().unwrap().contains("re-feeds your own auto-pickup"),
+            "the loop that sent the card back twice is not named: {v:#}"
+        );
+        assert!(v["how"].as_str().unwrap().contains("<owning-lane>"), "{v:#}");
+    }
+
+    /// An unowned card behaves like one you own: amux cannot name a peer, so it
+    /// must not pretend to. An empty or whitespace owner is the same state as
+    /// none, not a lane called "".
+    #[test]
+    fn an_unowned_card_never_invents_an_owner() {
+        for owner in [None, Some(""), Some("   ")] {
+            let v = reassign_exit("AF-1", owner, "amux-frustrations");
+            assert!(
+                v["how"].as_str().unwrap().contains("<owning-lane>"),
+                "owner {owner:?} produced a named command: {v:#}"
+            );
+        }
+    }
+
+    /// No run of spaces reaches the reader. Every string here is a Rust literal
+    /// spanning several source lines, and the difference between a continuation
+    /// that joins them and one that does not is invisible in the source and
+    /// obvious in the output — this shipped once, and it was a live probe that
+    /// showed "the                              gate is asking about".
+    #[test]
+    fn no_arm_leaks_source_indentation_into_the_text() {
+        for (owner, caller) in [(Some("peer"), "me"), (Some("me"), "me"), (None, "me")] {
+            let v = reassign_exit("AF-1", owner, caller);
+            for key in ["when", "how", "effect", "not_a_bypass"] {
+                let s = v[key].as_str().unwrap_or_default();
+                assert!(
+                    !s.contains("  "),
+                    "{owner:?}/{key} carries source indentation into the reader's text: {s:?}"
+                );
+            }
+        }
+    }
+
+    /// It is NOT a bypass, and every arm says so. The `force` family skips the
+    /// gate; this moves the card to the lane the gate is asking about, and that
+    /// distinction is the whole reason this can be offered beside a refusal
+    /// without weakening it.
+    #[test]
+    fn every_arm_says_it_is_not_a_bypass() {
+        for (owner, caller) in [(Some("peer"), "me"), (Some("me"), "me"), (None, "me")] {
+            let v = reassign_exit("AF-1", owner, caller);
+            let s = v["not_a_bypass"].as_str().unwrap_or("");
+            assert!(s.contains("does not skip the gate"), "{owner:?}: {v:#}");
+        }
+    }
+}
+
 fn gate_409(
     row: &IssueRow,
     eff_gate: &[String],
     target_raw: &str,
     wb: &[amux_core::board::WhyBlocked],
     gate_source: Option<&bs::GateSource>,
+    caller_lane: &str,
 ) -> Value {
     let checked_args = eff_gate
         .iter()
@@ -4348,6 +5496,11 @@ fn gate_409(
         "item": row.id,
         "item_type": row.item_type,
         "how_to_ack": how_to_ack,
+        // AF-506. The refusal used to teach exactly one exit — satisfy the gate —
+        // so a lane holding someone else's card had to rediscover reassignment or
+        // pick a dead end. Same mechanism as `how_to_ack`: the response already
+        // knows how to teach a CLI invocation.
+        "or_reassign": reassign_exit(&row.id, row.session.as_deref(), caller_lane),
         "cli": format!("amux board {target_raw} {} --checked {checked_args}", row.id),
         "valid_types": bs::KNOWN_TYPES,
         "kind": "gate_blocked",
@@ -4623,6 +5776,8 @@ pub async fn patch_item(
             // Filled by the source_ref arm below when a trigger is rerouted to
             // the card body. Empty on every other write.
             let mut diverted: Vec<Value> = Vec::new();
+            // Separate from `diverted` on purpose — see the advisory push below.
+            let mut advisories: Vec<Value> = Vec::new();
             // EVERY key unwritable = the request was unusable (AEAB/#134 review,
             // reported by tsukimiya). Narrow on purpose: a MIXED body such as
             // {"status":"done","item_type":"code"} where the card is already
@@ -4891,6 +6046,7 @@ pub async fn patch_item(
             set_opt("ask_type", &mut next.ask_type, &mut changed);
             set_opt("ask_question", &mut next.ask_question, &mut changed);
             set_opt("ask_unblocks", &mut next.ask_unblocks, &mut changed);
+            set_opt("ask_actor", &mut next.ask_actor, &mut changed);
             set_opt("next_action", &mut next.next_action, &mut changed);
             set_opt("last_result", &mut next.last_result, &mut changed);
             set_opt("unresolved", &mut next.unresolved, &mut changed);
@@ -4900,6 +6056,126 @@ pub async fn patch_item(
             set_opt("decision_rationale", &mut next.decision_rationale, &mut changed);
             set_opt("decision_supersedes", &mut next.decision_supersedes, &mut changed);
             set_opt("waiting_on", &mut next.waiting_on, &mut changed);
+            if let Some(spec) = map.get("callback") {
+                if caller_lane.is_empty() {
+                    return finish(
+                        &slot_w,
+                        PatchOut::Refused(
+                            StatusCode::BAD_REQUEST,
+                            json!({"error": "a callback requires a verified X-Amux-Worker requester"}),
+                        ),
+                        no_write(),
+                    );
+                }
+                // A delegated card's return contract belongs to its verified
+                // requester. The recipient may finish the work, but cannot
+                // silently disable the callback or redirect it to itself/a
+                // third worker. Standalone cards have no requester and may be
+                // armed by the verified worker editing them.
+                if let Some(requester) = next.requested_by.as_deref() {
+                    if requester != caller_lane {
+                        return finish(
+                            &slot_w,
+                            PatchOut::Refused(
+                                StatusCode::FORBIDDEN,
+                                json!({
+                                    "error": "only the verified requester may change this task callback",
+                                    "requester": requester,
+                                    "caller": caller_lane,
+                                }),
+                            ),
+                            no_write(),
+                        );
+                    }
+                }
+                if matches!(next.callback_state.as_deref(), Some("pending" | "dispatching" | "queued")) {
+                    return finish(
+                        &slot_w,
+                        PatchOut::Refused(
+                            StatusCode::CONFLICT,
+                            json!({
+                                "error": "this task callback has already fired or is being dispatched",
+                                "callback": next.snapshot()["callback"].clone(),
+                            }),
+                        ),
+                        no_write(),
+                    );
+                }
+                let disabling = matches!(spec, Value::Null | Value::Bool(false));
+                if !disabling && bs::is_terminal_status(&next.status) {
+                    return finish(
+                        &slot_w,
+                        PatchOut::Refused(
+                            StatusCode::CONFLICT,
+                            json!({"error": "cannot arm a completion callback after a task is already terminal"}),
+                        ),
+                        no_write(),
+                    );
+                }
+                let callback_owner = next
+                    .requested_by
+                    .clone()
+                    .unwrap_or_else(|| caller_lane.clone());
+                let (target, prompt) = match spec {
+                    Value::Null | Value::Bool(false) => (None, None),
+                    Value::Bool(true) => (Some(callback_owner.clone()), None),
+                    Value::String(s) => (
+                        Some(callback_owner.clone()),
+                        Some(s.trim().to_string()).filter(|s| !s.is_empty()),
+                    ),
+                    Value::Object(cb) => {
+                        let target = cb
+                            .get("session")
+                            .and_then(Value::as_str)
+                            .unwrap_or(&callback_owner)
+                            .trim()
+                            .to_string();
+                        let prompt = cb
+                            .get("prompt")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                        (Some(target), prompt)
+                    }
+                    _ => {
+                        return finish(
+                            &slot_w,
+                            PatchOut::Refused(
+                                StatusCode::BAD_REQUEST,
+                                json!({"error": "callback must be true, false, a prompt string, or {session?, prompt?}"}),
+                            ),
+                            no_write(),
+                        )
+                    }
+                };
+                if target.as_deref().is_some_and(|t| t != callback_owner) {
+                    return finish(
+                        &slot_w,
+                        PatchOut::Refused(
+                            StatusCode::FORBIDDEN,
+                            json!({
+                                "error": "a task callback may return only to the verified requester",
+                                "requester": callback_owner,
+                                "callback_session": target,
+                            }),
+                        ),
+                        no_write(),
+                    );
+                }
+                if next.callback_session != target || next.callback_prompt != prompt {
+                    next.callback_session = target;
+                    next.callback_prompt = prompt;
+                    next.callback_state = next.callback_session.as_ref().map(|_| "armed".into());
+                    next.callback_message_id = None;
+                    next.callback_fired_at = None;
+                    next.callback_error = None;
+                    if next.callback_session.is_some() && next.requested_by.is_none() {
+                        next.requested_by = Some(caller_lane.clone());
+                    }
+                    changed.push("callback".into());
+                }
+            }
             // A TRIGGER MUST NOT EAT AN AUTOFIX SIGNATURE (AMUX-3686).
             //
             // `source_ref` has two owners. autofix stores its fault signature
@@ -4971,6 +6247,56 @@ pub async fn patch_item(
                         }));
                     }
                     _ => set_opt("source_ref", &mut next.source_ref, &mut changed),
+                }
+                // A TRIGGER WITH NO VERIFICATION TIME RE-DRAINS FOREVER, SILENTLY.
+                //
+                // board_drive's idle-drain gate is
+                //   COALESCE(source_ref,'')='' OR COALESCE(last_verified_at,0) < now-24h
+                // so a card parked with a source_ref and NO last_verified_at reads as
+                // "trigger nobody has re-checked" on every tick and is offered again,
+                // forever. `amux board <status> --trigger` stamps both. A raw PATCH —
+                // which is the shape ~/.claude/CLAUDE.md's board recipes teach — sets
+                // only the one field, and nothing said so.
+                //
+                // Measured 2026-09-04 by ts-gke, on themselves. They parked TG-3239 by
+                // raw PATCH and eleven other cards with the CLI. The drain served
+                // TG-3239 four times in one session while the eleven stayed quiet, and
+                // they filed a dispatch-ORDERING report against amux on the strength of
+                // it: wrong population, wrong conclusion, wrong recommendation, sent to
+                // a peer. The two calls do the same visible thing and only one stamps.
+                //
+                // TELL THE CALLER, not just the card (AMUX-3791, same reasoning as the
+                // autofix diversion above): the operator saw a 200 and a card that
+                // looked parked. This is the only signal that reaches the person who
+                // can fix it, at the moment they can.
+                if changed.iter().any(|c| c == "source_ref")
+                    && next.source_ref.as_deref().is_some_and(|v| !v.trim().is_empty())
+                    && !map.contains_key("last_verified_at")
+                {
+                    // ITS OWN FIELD, NOT `diverted`. A diversion means "the key
+                    // you named is deliberately not the key that changed"
+                    // (AMUX-3791). Nothing was diverted here: source_ref landed
+                    // exactly where the caller asked. This is an ADVISORY about a
+                    // companion field they did not send.
+                    //
+                    // Overloading `diverted` cost a real regression the same day:
+                    // a_trigger_cannot_overwrite_an_autofix_signature_but_can_
+                    // replace_a_trigger carries a CONTROL asserting an ordinary
+                    // trigger write reports NO diversion, written precisely so
+                    // "a version that emitted the advisory on every source_ref
+                    // write would pass every cell above and train readers to
+                    // ignore a line that cries wolf". It caught this, correctly,
+                    // and the control was right.
+                    advisories.push(json!({
+                        "field": "last_verified_at",
+                        "not_set": true,
+                        "why": "source_ref was set without last_verified_at, so board-drive \
+                                reads this card as a trigger nobody has re-checked and will \
+                                re-offer it on every idle tick. `amux board <status> <id> \
+                                --trigger \"...\"` stamps both; a raw PATCH sets only \
+                                source_ref. Send last_verified_at (unix seconds) alongside \
+                                it, or park with the CLI.",
+                    }));
                 }
             }
             if let Some(ot) = body_str(&map, "owner_type") {
@@ -5348,7 +6674,7 @@ pub async fn patch_item(
                                 &slot_w,
                                 PatchOut::Refused(
                                     StatusCode::CONFLICT,
-                                    gate_409(&next, &eff_gate, &target_raw, &[], None),
+                                    gate_409(&next, &eff_gate, &target_raw, &[], None, &caller_lane),
                                 ),
                                 no_write(),
                             );
@@ -5509,6 +6835,9 @@ pub async fn patch_item(
                                             "blocked": true,
                                             "item": next.id,
                                             "detail": msg,
+                                            "or_reassign": reassign_exit(
+                                                &next.id, next.session.as_deref(), &caller_lane,
+                                            ),
                                         }),
                                     ),
                                     no_write(),
@@ -5611,6 +6940,9 @@ pub async fn patch_item(
                                         "blocked": true,
                                         "item": next.id,
                                         "attempted_status": target_raw,
+                                        "or_reassign": reassign_exit(
+                                            &next.id, next.session.as_deref(), &caller_lane,
+                                        ),
                                         "why": "A card cannot be marked done without pointing at the artifact it produced: a URL, a repo file path, a commit sha, or a #PR/issue. This is a global constraint and gate_ack cannot satisfy it.",
                                         "how_to_fix": {
                                             "add_link": "PATCH /api/board/<id> with a desc containing the URL / file path / commit / #PR, then retry done.",
@@ -5630,7 +6962,7 @@ pub async fn patch_item(
                                             // this only stops the message promising it.
                                             "or_evidence": "--evidence naming the artifact satisfies this gate too (a repo path, URL, sha or #PR). A bare command does NOT: it says how to reproduce the finding, not what the work created. This card's evidence is empty or has nothing checkable in it.",
                                             "no_artifact": "If the work genuinely produced none, say so: evidence starting `none: <reason>` (three words or more) is accepted and counted, not a bypass.",
-                                            "override_for_this_worker": "set AMUX_DONE_LINK_REQUIRED=0 in this worker's (or its group's, or the global) scope env — Scope tab.",
+                                            "override_for_this_worker": "set AMUX_DONE_LINK_REQUIRED=0 in this worker's (or its group's, or the global) configuration.",
                                             "force": "true (explicit bypass; logged)"
                                         }
                                     }),
@@ -5698,6 +7030,18 @@ pub async fn patch_item(
                                         "attempted_status": target_raw,
                                         "why": why,
                                         "recorded_evidence": next.evidence,
+                                        // AF-506, second pass. This refusal fires
+                                        // BEFORE the gate-ack one, so a lane routing
+                                        // a card away hits it FIRST and never sees the
+                                        // exit added to gate_409 — measured against the
+                                        // live server on the very commit that added it.
+                                        // Same friction (a refusal that teaches one way
+                                        // out), same remedy: if the work is another
+                                        // lane's, you should not be closing this card at
+                                        // all.
+                                        "or_reassign": reassign_exit(
+                                            &next.id, next.session.as_deref(), &caller_lane,
+                                        ),
                                         "how_to_fix": {
                                             "cli": format!("amux board done {} --evidence-stdin  (heredoc; inline text is evaluated by YOUR shell)", next.id),
                                             "api": "PATCH /api/board/<id> with {\"evidence\": \"...\"} — writable on its own, so record it first and the transition cannot discard it",
@@ -5707,7 +7051,7 @@ pub async fn patch_item(
                                                 "`none: <reason>` when the card genuinely produced no artifact (stored and counted, not a bypass)"
                                             ],
                                             "what_to_run": "the repo's VERIFY.md names the proof for each surface",
-                                            "override_for_this_worker": "set AMUX_DONE_EVIDENCE_REQUIRED=0 in this worker's (or its group's, or the global) scope env — Scope tab.",
+                                            "override_for_this_worker": "set AMUX_DONE_EVIDENCE_REQUIRED=0 in this worker's (or its group's, or the global) configuration.",
                                             "force": "true (explicit bypass; logged)"
                                         }
                                     }),
@@ -5788,7 +7132,7 @@ pub async fn patch_item(
                                             "not_next": format!("amux board backlog <ID> --trigger \"<what re-arms it>\" — `backlog` is unbounded on purpose and is where a real card that is not NEXT belongs"),
                                             "not_a_unit_of_work": "amux board discard <ID>",
                                             "finish_one": "amux board done <ID> --evidence-stdin",
-                                            "raise_it": "set AMUX_TODO_WIP_LIMIT=<n> in this worker's / group's / global scope env (Scope tab); 0 disables it",
+                                            "raise_it": "set AMUX_TODO_WIP_LIMIT=<n> in this worker's / group's / global configuration; 0 disables it",
                                             "force": "true (explicit bypass; logged)"
                                         }
                                     }),
@@ -5838,7 +7182,7 @@ pub async fn patch_item(
                                             "on_another_card": "PATCH {\"depends_on\": [\"<ID>\"]} — the card that has to land first",
                                             "on_a_condition": "amux board backlog <ID> --trigger \"<the condition that re-arms it>\" — re-checked, so the card comes back on its own",
                                             "on_a_person": "amux board needsyou <ID> --ask <type> --question \"...\" --unblocks \"...\" (AF-318)",
-                                            "override_for_this_worker": "set AMUX_BLOCKED_NEEDS_WATCH=0 in this worker's / group's / global scope env (Scope tab).",
+                                            "override_for_this_worker": "set AMUX_BLOCKED_NEEDS_WATCH=0 in this worker's / group's / global configuration.",
                                             "force": "true (explicit bypass; logged)"
                                         }
                                     }),
@@ -5922,7 +7266,7 @@ pub async fn patch_item(
                                         "fields": "next_action is what to do next; last_result is what the previous attempt produced; unresolved is what is still open. Only next_action is gated — a card should not have to invent an open question to be claimable.",
                                         "escape": "amux board doing <ID> --force  (audited, and it is the honest move when the next action genuinely is not knowable yet)",
                                         "scope": "This gate is on `doing` only, and only for lanes that have opted in.",
-                                        "override_for_this_worker": "set AMUX_CONTINUATION_REQUIRED=0 in this worker's (or its group's, or the global) scope env — Scope tab.",
+                                        "override_for_this_worker": "set AMUX_CONTINUATION_REQUIRED=0 in this worker's (or its group's, or the global) configuration.",
                                     }),
                                 ),
                                 no_write(),
@@ -5934,6 +7278,7 @@ pub async fn patch_item(
                         && bs::needsyou_ask_required(next.session.as_deref());
                     if ask_required {
                         let verdict = bs::ask_verdict(
+                            next.ask_actor.as_deref().unwrap_or(""),
                             next.ask_type.as_deref().unwrap_or(""),
                             next.ask_question.as_deref().unwrap_or(""),
                             next.ask_unblocks.as_deref().unwrap_or(""),
@@ -5948,9 +7293,17 @@ pub async fn patch_item(
                                     "That is not one of the five kinds of human act. The vocabulary is closed on purpose: a block that fits none of them is not a block on a person.",
                                     "needsyou_ask_type_unknown",
                                 ),
+                                bs::AskVerdict::NoActor => (
+                                    "`ask_actor` must name the specific person or external actor who can answer. Generic placeholders are not routable and are how cards disappear into a human-shaped queue.",
+                                    "needsyou_requires_specific_actor",
+                                ),
                                 bs::AskVerdict::NoQuestion => (
                                     "`ask_question` has to be an actual question, in a sentence. \"Blocked on Ethan\" with no question is not an ask — that phrasing is most of what is sitting in this queue today.",
                                     "needsyou_ask_has_no_question",
+                                ),
+                                bs::AskVerdict::NotAQuestion => (
+                                    "`ask_question` must be an actual direct question containing `?`, not a status note or an instruction the worker could continue itself.",
+                                    "needsyou_ask_is_not_a_question",
                                 ),
                                 bs::AskVerdict::NoUnblocks => (
                                     "`ask_unblocks` has to say what ENDS the block, in a sentence. Without it nobody but you can tell whether an answer has landed, so the card cannot leave this queue except by you noticing.",
@@ -5981,6 +7334,7 @@ pub async fn patch_item(
                                         "why": why,
                                         "recorded_ask": {
                                             "ask_type": next.ask_type,
+                                            "ask_actor": next.ask_actor,
                                             "ask_question": next.ask_question,
                                             "ask_unblocks": next.ask_unblocks,
                                         },
@@ -5988,10 +7342,10 @@ pub async fn patch_item(
                                             .map(|(k, v)| json!({"type": k, "means": v}))
                                             .collect::<Vec<_>>(),
                                         "how_to_fix": {
-                                            "cli": format!("amux board needsyou {} --ask <type> --question-stdin --unblocks \"...\"", next.id),
-                                            "api": "PATCH /api/board/<id> with {\"ask_type\":\"...\",\"ask_question\":\"...\",\"ask_unblocks\":\"...\"} — all three writable on their own, so record them first and the transition cannot discard them",
+                                            "cli": format!("amux board needsyou {} --actor <name> --ask <type> --question \"...?\" --unblocks \"...\"", next.id),
+                                            "api": "PATCH /api/board/<id> with {\"ask_actor\":\"named person\",\"ask_type\":\"...\",\"ask_question\":\"...?\",\"ask_unblocks\":\"...\"} — record them before the transition",
                                             "if_it_is_not_human_blocked": "then it is not `needsyou`. Use `backlog --trigger \"<condition>\"` for an external wait that re-arms itself, or leave it in `doing` and work the blocker.",
-                                            "override_for_this_worker": "set AMUX_NEEDSYOU_ASK_REQUIRED=0 in this worker's (or its group's, or the global) scope env — Scope tab.",
+                                            "override_for_this_worker": "set AMUX_NEEDSYOU_ASK_REQUIRED=0 in this worker's (or its group's, or the global) configuration.",
                                             "force": "true (explicit bypass; logged)"
                                         }
                                     }),
@@ -6202,7 +7556,7 @@ pub async fn patch_item(
                                     &slot_w,
                                     PatchOut::Refused(
                                         StatusCode::CONFLICT,
-                                        gate_409(&next, &eff_gate, &target_raw, &wb, gate_src.as_ref()),
+                                        gate_409(&next, &eff_gate, &target_raw, &wb, gate_src.as_ref(), &caller_lane),
                                     ),
                                     no_write(),
                                 );
@@ -6314,7 +7668,7 @@ pub async fn patch_item(
                                 &slot_w,
                                 PatchOut::Refused(
                                     StatusCode::CONFLICT,
-                                    gate_409(&next, &eff_gate, &target_raw, &wb, gate_src.as_ref()),
+                                    gate_409(&next, &eff_gate, &target_raw, &wb, gate_src.as_ref(), &caller_lane),
                                 ),
                                 no_write(),
                             );
@@ -6424,7 +7778,7 @@ pub async fn patch_item(
                                 &slot_w,
                                 PatchOut::Refused(
                                     StatusCode::CONFLICT,
-                                    gate_409(&next, &eff_gate, &target_raw, &blocked, gate_src.as_ref()),
+                                    gate_409(&next, &eff_gate, &target_raw, &blocked, gate_src.as_ref(), &caller_lane),
                                 ),
                                 no_write(),
                             );
@@ -6521,6 +7875,57 @@ pub async fn patch_item(
                             next.reviewer.as_deref().unwrap_or("(none)")
                         ),
                         "owner_type" => format!("owner_type -> {}", next.owner_type),
+                        // THE ONE FIELD WHERE THE LOG NAMES WHAT WAS DESTROYED
+                        // RATHER THAN WHAT ARRIVED (AF-459).
+                        //
+                        // The rule three comments up — "VALUES ARE SUMMARISED,
+                        // NOT COPIED ... the new value is already on the card" —
+                        // is right for every other field and inverts for this
+                        // one. `--trigger` is a plain overwrite; only an
+                        // `autofix:` prefix is protected (AMUX-3686 above), and
+                        // that narrowness is deliberate. So when a trigger
+                        // replaces a trigger, the OLD value exists nowhere: not
+                        // on the card, not in /api/history, not in this log,
+                        // which recorded the bare word "source_ref". There is no
+                        // redundancy to trade against readability here, because
+                        // the column that just got written WAS the only copy.
+                        //
+                        // gtm-engine lost a five-item inventory from 2026-08-09
+                        // this way, probing whether --trigger works on an
+                        // archived card (it does). They recovered four items
+                        // from a prefix they had happened to print earlier in
+                        // their own transcript. The fifth is gone. Second known
+                        // clobber of this field on that board.
+                        //
+                        // The old value is kept WHOLE where the arriving one is
+                        // truncated at 60, and the asymmetry is the point: the
+                        // arriving value is ON THE CARD, and this line is the
+                        // only copy of the one being destroyed.
+                        //
+                        // It said "kept LONG (200)" and named the hazard it was
+                        // still committing (AF-459). gtm-engine refused to
+                        // validate it and measured the boundary: 88 and 158
+                        // chars survive, 208 and beyond are head-truncated to
+                        // 201, and their real loss was 366. A prefix cap fails
+                        // for some value whatever the number; see
+                        // chars_elide_middle for why the middle goes instead.
+                        "source_ref" => {
+                            let before = row.source_ref.as_deref().unwrap_or("");
+                            let after = next.source_ref.as_deref().unwrap_or("(cleared)");
+                            if before.is_empty() {
+                                format!("source_ref -> {}", chars_truncate_log(after, 60))
+                            } else {
+                                format!(
+                                    "source_ref: WAS {} -> {}",
+                                    chars_elide_middle(
+                                        before,
+                                        SOURCE_REF_LOG_HEAD,
+                                        SOURCE_REF_LOG_TAIL
+                                    ),
+                                    chars_truncate_log(after, 60)
+                                )
+                            }
+                        }
                         "archived" => {
                             // ARCHIVING A TRIGGER-BEARING CARD DE-ARMS IT, SILENTLY
                             // (AMUX-3715, reported by tubescience). `archived`
@@ -6784,6 +8189,7 @@ pub async fn patch_item(
                     body,
                     ignored,
                     diverted,
+                    advisories,
                     status_transition: st,
                     progress_notify,
                     // FIRE ON THE TRANSITION INTO REVIEW, not only on a note
@@ -6861,6 +8267,39 @@ pub async fn patch_item(
                     "these keys are not writable via PATCH and were NOT applied; \
                      the rest of this response reflects the card as stored"
                 );
+                // NAME THE FIELD THEY MEANT (AF-476). Telling a caller a key is
+                // unwritable answers "why did nothing happen" and leaves "what
+                // should I have sent" to guesswork. For keys that are CLI FLAG
+                // names rather than column names, the answer is exact and cheap.
+                //
+                // `trigger` is the whole reason this exists. It is the flag
+                // `amux board <status> <id> --trigger "..."`, which writes
+                // source_ref AND stamps last_verified_at — so a raw PATCH of
+                // {"trigger": ...} writes nothing at all. Measured by the
+                // 2026-09-04 log sweep: 226 such PATCHes from `backend` in 80
+                // seconds across ~220 distinct cards, every one a 422 that could
+                // not have done anything. I had made the identical mistake myself
+                // earlier the same day, which is what made it recognisable.
+                //
+                // Related to AF-469 but not the same: there the caller sent the
+                // right column and missed its companion, so the write LANDED and
+                // the card re-drained forever. Here the write is a complete
+                // no-op. Same root — the CLI flag and the API field have
+                // different names, and only one path stamps both.
+                let hints: Vec<Value> = ignored
+                    .iter()
+                    .filter_map(|k| match k.as_str() {
+                        "trigger" => Some(json!({
+                            "sent": "trigger",
+                            "meant": ["source_ref", "last_verified_at"],
+                            "how": "`amux board <status> <id> --trigger \"...\"` writes both. A raw PATCH must send source_ref AND last_verified_at (unix seconds) itself, or the card re-drains forever (AF-469).",
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                if !hints.is_empty() {
+                    body["ignored_hints"] = json!(hints);
+                }
             }
             // 422 WHEN NOTHING YOU SENT WAS WRITABLE.
             //
@@ -6886,11 +8325,15 @@ pub async fn patch_item(
             mut body,
             ignored,
             diverted,
+            advisories,
             status_transition,
             progress_notify,
             reviewer_notify,
         }) => {
             body["applied"] = json!(true);
+            if !advisories.is_empty() {
+                body["advisories"] = json!(advisories);
+            }
             body["global_rev"] = json!(reply.rev.0);
             // SEPARATE KEY FROM `ignored_fields`, because they are opposite
             // facts and a caller acts differently on each: ignored means set it
@@ -7108,6 +8551,29 @@ pub async fn patch_item(
                                 );
                             }
                         }
+                    }
+                }
+            }
+            // Immediate path for an interactive terminal transition. The
+            // periodic board-drive pass is the crash/non-HTTP recovery path;
+            // doing both gives the caller real-time callback status without
+            // sacrificing durability.
+            let callback_pending = body
+                .pointer("/callback/state")
+                .and_then(Value::as_str)
+                .is_some_and(|s| matches!(s, "pending" | "dispatching"));
+            if callback_pending {
+                let dispatch = dispatch_pending_callbacks(&state, Some(&id)).await;
+                body["callback_dispatch"] = json!({
+                    "attempted": dispatch.attempted,
+                    "queued": dispatch.queued,
+                    "refused": dispatch.refused,
+                });
+                if let Ok(conn) = state.store.read() {
+                    if let Ok(Some(latest)) = bs::get_issue(&conn, &id) {
+                        body["callback"] = latest.snapshot()["callback"].clone();
+                        body["log"] = latest.snapshot()["log"].clone();
+                        body["rev"] = latest.snapshot()["rev"].clone();
                     }
                 }
             }
@@ -7459,7 +8925,7 @@ async fn status_request(
              cannot receive, so nobody was asked"
         ),
     };
-    if let Err(e) = append_card_log(&state, &id, &line).await {
+    if let Err(e) = append_card_log(&state, &id, &line, None).await {
         return internal(e);
     }
     match queued {
@@ -7532,14 +8998,59 @@ async fn status_update(
             Err(e) => return internal(e),
         }
     }
-    if let Err(e) = append_card_log(&state, &id, &format!("STATUS ({actor}): {text}")).await {
-        return internal(e);
+    let update = match apply_status_update(
+        &state,
+        &id,
+        &format!("STATUS ({actor}): {text}"),
+        bs::output_asset_refs(&text),
+        &actor,
+        &text,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return internal(e),
+    };
+    if update.claimed {
+        tracing::info!(
+            target: "amux::board", marker = "status_update_claimed_exact",
+            task = %id, worker = %actor, from = %update.prior_status,
+            "worker status update atomically claimed its exact actionable card"
+        );
+        crate::api::session_verbs::emit_event(
+            &state, &actor, "task.claimed",
+            Some(json!({"issue": id, "status": "doing"})), None,
+            "board-status-update",
+        ).await;
+    } else if matches!(update.prior_status.as_str(), "todo" | "backlog") {
+        tracing::warn!(
+            target: "amux::board", marker = "status_update_claim_refused",
+            task = %id, worker = %actor, owner = %update.owner,
+            status = %update.prior_status, verdict = %update.claim_verdict,
+            "worker status update was stored but did not claim the actionable card"
+        );
+    }
+    let captured = &update.captured;
+    if !captured.is_empty() {
+        tracing::info!(
+            target: "amux::board",
+            task = %id,
+            worker = %actor,
+            captured = captured.len(),
+            refs = ?captured.iter().map(|a| a.ref_value.as_str()).collect::<Vec<_>>(),
+            "board task artifacts auto-captured from worker output"
+        );
     }
     let mut resp = Json(json!({
         "ok": true, "id": id, "actor": actor,
         "chars": text.chars().count(),
         "original_chars": original_chars,
         "truncated": truncated,
+        "claimed": update.claimed,
+        "status": update.status,
+        "claim_verdict": update.claim_verdict,
+        "artifacts_captured": captured.len(),
+        "artifact_refs": captured.iter().map(|a| a.ref_value.clone()).collect::<Vec<_>>(),
     }))
     .into_response();
     if truncated {
@@ -7707,6 +9218,21 @@ async fn list_artifacts(State(state): State<AppState>, Path(id): Path<String>) -
     (StatusCode::OK, Json(json!(items))).into_response()
 }
 
+/// Does this write error mean "the card does not exist" (AF-477)?
+///
+/// EXTRACTED so the NARROWNESS is testable. The guard lives inline in a match
+/// arm otherwise, and the only mutation reachable there touches the Err side —
+/// so widening it to catch EVERY error would send a genuine storage fault to
+/// 404 and no test would notice. That gap was recorded on AF-477 as unproven
+/// rather than implied away; this is what closes it.
+///
+/// The closure returns `anyhow::Error`, so the rusqlite variant has to be
+/// downcast rather than matched (E0308 if you try, caught at compile).
+fn is_missing_task(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<rusqlite::Error>()
+        .is_some_and(|r| matches!(r, rusqlite::Error::QueryReturnedNoRows))
+}
+
 /// POST /api/board/{id}/artifacts
 async fn create_artifact(
     State(state): State<AppState>,
@@ -7715,18 +9241,42 @@ async fn create_artifact(
     Json(body): Json<Value>,
 ) -> Response {
     let kind = match body.get("kind").and_then(|v| v.as_str()) {
-        Some(k) => k.to_string(),
+        Some(k) if !k.trim().is_empty() => k.trim().to_string(),
         None => {
             return (StatusCode::BAD_REQUEST, Json(json!({"error": "kind required"}))).into_response()
         }
+        Some(_) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": "kind cannot be blank"}))).into_response()
+        }
     };
     let ref_value = match body.get("ref").and_then(|v| v.as_str()) {
-        Some(r) => r.to_string(),
+        Some(r) if !r.trim().is_empty() => r.trim().to_string(),
         None => {
             return (StatusCode::BAD_REQUEST, Json(json!({"error": "ref required"}))).into_response()
         }
+        Some(_) => {
+            tracing::warn!(
+                marker = "artifact_blank_ref",
+                task = %id,
+                "board artifact registration refused: a blank reference cannot be opened"
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "artifact ref cannot be blank",
+                    "code": "artifact_ref_blank",
+                    "task_id": id,
+                })),
+            )
+                .into_response();
+        }
     };
-    let state_val = body.get("state").and_then(|v| v.as_str()).unwrap_or("created").to_string();
+    let state_val = body
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("created")
+        .trim()
+        .to_string();
     let desc = body.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
     if !crate::db::artifact_store::KNOWN_KINDS.contains(&kind.as_str()) {
         return (StatusCode::BAD_REQUEST, Json(json!({
@@ -7810,6 +9360,22 @@ async fn create_artifact(
                 "actor": actor,
             }))).into_response()
         }
+        // A MISSING CARD IS A 404, NOT A 500 (AF-475). The closure signals
+        // "no such task" with rusqlite::Error::QueryReturnedNoRows, which fell
+        // into the arm below and answered `500 Query returned no rows` — a raw
+        // storage error as the entire body, on a request whose only fault was
+        // naming a card that does not exist. Found by the 2026-09-04 log sweep:
+        // one row, mixpeek-cicd, 0.25ms, and in the analyze output it is
+        // indistinguishable from a genuine server fault.
+        //
+        // That indistinguishability is the cost: the sweep's contract says a
+        // 500 is ALWAYS a finding, so a client error wearing a 500 buys a real
+        // investigation every time it appears.
+        Err(e) if is_missing_task(&e) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no such task", "task_id": id})),
+        )
+            .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -7825,19 +9391,32 @@ async fn patch_artifact(
     if new_state.is_none() && new_desc.is_none() {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "nothing to update"}))).into_response();
     }
+    if let Some(ref new_state) = new_state {
+        if !crate::db::artifact_store::ARTIFACT_STATES.contains(&new_state.as_str()) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "unknown artifact state",
+                    "state": new_state,
+                    "valid_states": crate::db::artifact_store::ARTIFACT_STATES,
+                })),
+            )
+                .into_response();
+        }
+    }
     let now = chrono::Utc::now().timestamp();
+    let task_for_log = id.clone();
+    let aid_for_log = aid.clone();
     let write = state.store.write_async(move |conn| {
+        if bs::get_issue(conn, &id)?.is_none() {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
         let existing = crate::db::artifact_store::get(conn, &aid)?
             .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
         if existing.task_id != id {
             return Err(rusqlite::Error::QueryReturnedNoRows);
         }
         if let Some(ref s) = new_state {
-            if !crate::db::artifact_store::ARTIFACT_STATES.contains(&s.as_str()) {
-                return Err(rusqlite::Error::InvalidParameterName(
-                    format!("invalid state: {s}"),
-                ));
-            }
             crate::db::artifact_store::update_state(conn, &aid, s, now)?;
         }
         if let Some(ref d) = new_desc {
@@ -7858,6 +9437,25 @@ async fn patch_artifact(
     }).await;
     match write {
         Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
+        Err(e) if is_missing_task(&e) => {
+            tracing::warn!(
+                marker = "artifact_target_missing",
+                task = %task_for_log,
+                artifact = %aid_for_log,
+                operation = "patch",
+                "board artifact mutation refused: artifact is absent or belongs to another task"
+            );
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": "artifact not found on this task",
+                    "code": "artifact_target_missing",
+                    "task_id": task_for_log,
+                    "artifact_id": aid_for_log,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -7865,26 +9463,49 @@ async fn patch_artifact(
 /// DELETE /api/board/{id}/artifacts/{aid}
 async fn delete_artifact(
     State(state): State<AppState>,
-    Path((_id, aid)): Path<(String, String)>,
+    Path((id, aid)): Path<(String, String)>,
 ) -> Response {
+    let task_for_log = id.clone();
+    let aid_for_log = aid.clone();
     let write = state.store.write_async(move |conn| {
-        let n = crate::db::artifact_store::delete(conn, &aid)?;
+        if bs::get_issue(conn, &id)?.is_none() {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        let n = crate::db::artifact_store::delete_for_task(conn, &id, &aid)?;
+        if n == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
         Ok(crate::db::WriteOutcome {
-            applied: n > 0,
-            events: if n > 0 {
-                vec![crate::db::PendingEvent {
-                    entity_type: amux_core::revision::EntityType::Other("artifact".into()),
-                    entity_id: aid.clone(),
-                    mutation: amux_core::revision::MutationKind::Deleted,
-                    payload: None,
-                }]
-            } else {
-                vec![]
-            },
+            applied: true,
+            events: vec![crate::db::PendingEvent {
+                entity_type: amux_core::revision::EntityType::Other("artifact".into()),
+                entity_id: aid.clone(),
+                mutation: amux_core::revision::MutationKind::Deleted,
+                payload: None,
+            }],
         })
     }).await;
     match write {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) if is_missing_task(&e) => {
+            tracing::warn!(
+                marker = "artifact_target_missing",
+                task = %task_for_log,
+                artifact = %aid_for_log,
+                operation = "delete",
+                "board artifact deletion refused: artifact is absent or belongs to another task"
+            );
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": "artifact not found on this task",
+                    "code": "artifact_target_missing",
+                    "task_id": task_for_log,
+                    "artifact_id": aid_for_log,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -7912,15 +9533,143 @@ mod discard_orphan_tests {
     }
 }
 
-/// Append one stamped line to a card's log. Both handlers above write only
-/// here — a status update must never move the card, and reusing the PATCH path
-/// would put a status report one typo away from a status TRANSITION.
+#[derive(Debug, Clone)]
+struct StatusUpdateResult {
+    captured: Vec<crate::db::artifact_store::ArtifactRow>,
+    claimed: bool,
+    prior_status: String,
+    status: String,
+    owner: String,
+    claim_verdict: String,
+}
+
+/// Store a worker's progress and, when eligible, claim that worker's exact
+/// card in the same serialized transaction (GCA-153 / ATE-41).
+async fn apply_status_update(
+    state: &AppState,
+    id: &str,
+    line: &str,
+    refs: Vec<String>,
+    actor: &str,
+    progress: &str,
+) -> Result<StatusUpdateResult, rusqlite::Error> {
+    let (id, line, actor, progress, stamp) = (
+        id.to_string(), line.to_string(), actor.to_string(),
+        progress.to_string(), hhmm(),
+    );
+    let result = Arc::new(Mutex::new(None));
+    let result_w = result.clone();
+    state.store.write_async(move |conn| {
+        let row = bs::get_issue(conn, &id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        let prior_status = row.status.clone();
+        let owner = row.session.as_deref().unwrap_or("").trim().to_string();
+        let mut claimed = false;
+        let mut status = prior_status.clone();
+        let mut events = Vec::new();
+
+        let claim_verdict = if !matches!(prior_status.as_str(), "todo" | "backlog") {
+            "status_not_actionable".to_string()
+        } else if actor == "session" {
+            "actor_unattributed".to_string()
+        } else if row.owner_type != "agent" {
+            "owner_not_agent".to_string()
+        } else if owner != actor {
+            "owner_mismatch".to_string()
+        } else if row.archived != 0 {
+            "archived".to_string()
+        } else if row.tags.iter().any(|tag| tag.to_ascii_lowercase().starts_with("needs:you")) {
+            "needs_you".to_string()
+        } else if row.waiting_on.as_deref().is_some_and(|v| !v.trim().is_empty()) {
+            "waiting".to_string()
+        } else if crate::runtime_jobs::board_drive::fresh_source_ref_trigger(&row, now_secs()) {
+            "external_trigger".to_string()
+        } else if !crate::runtime_jobs::board_drive::deps_blocking(conn, &row).is_empty() {
+            "dependency_blocked".to_string()
+        } else if let Some(exclusion) = frontier_exclusion(&row, false) {
+            match exclusion {
+                FrontierExclusion::Blocked => "blocked".to_string(),
+                FrontierExclusion::NoContinuation => unreachable!("continuation gate is off"),
+            }
+        } else if bs::continuation_required(Some(&actor))
+            && bs::continuation_verdict(&progress) != bs::ContinuationVerdict::Ok
+        {
+            "continuation_missing".to_string()
+        } else {
+            let holding: Vec<String> = conn.prepare(
+                "SELECT id FROM issues WHERE session=?1 AND status='doing' AND id!=?2 \
+                 AND deleted IS NULL AND COALESCE(archived,0)=0 \
+                 AND COALESCE(type,'') NOT IN ('tripwire','watch','epic') \
+                 AND NOT (creator='amux' AND substr(COALESCE(\"desc\",''),1,11)='**Prompt:**') \
+                 AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=issues.id \
+                                 AND lower(t.tag) LIKE 'needs:you%') ORDER BY id"
+            )?.query_map(rusqlite::params![&actor, &id], |r| r.get::<_, String>(0))?
+                .filter_map(Result::ok).collect();
+            if !holding.is_empty() {
+                "wip_conflict".to_string()
+            } else {
+                if bs::continuation_required(Some(&actor)) {
+                    conn.execute(
+                        "UPDATE issues SET next_action=?1 WHERE id=?2",
+                        rusqlite::params![&progress, &id],
+                    )?;
+                }
+                let opts = crate::db::advance::AdvanceOpts {
+                    expected_from: Some(prior_status.clone()),
+                    assign_to: Some(actor.clone()),
+                    log_line: Some(format!("Claimed by status update from {actor}")),
+                    force: false,
+                    skip_continuation: false,
+                    gate_ack: true,
+                    ..Default::default()
+                };
+                match crate::db::advance::advance(conn, &id, "doing", &actor, &opts)? {
+                    Ok(outcome) => {
+                        claimed = true;
+                        status = "doing".to_string();
+                        events.extend(outcome.events);
+                        "claimed".to_string()
+                    }
+                    Err(_) => "transition_refused".to_string(),
+                }
+            }
+        };
+
+        // `advance` appended the claim audit line, so read that before adding progress.
+        let current_log = if claimed { bs::get_issue(conn, &id)?.and_then(|r| r.log) } else { row.log };
+        let next = bs::append_log(current_log.as_deref(), &stamp, &line);
+        conn.execute("UPDATE issues SET log=?1 WHERE id=?2", rusqlite::params![next, &id])?;
+        let inserted = crate::db::artifact_store::insert_captured_refs(
+            conn, &id, refs,
+            &format!("automatically captured from status update by {actor}"), now_secs(),
+        )?;
+        events.extend(inserted.iter().map(|artifact| crate::db::PendingEvent {
+            entity_type: amux_core::revision::EntityType::Other("artifact".into()),
+            entity_id: artifact.id.clone(),
+            mutation: amux_core::revision::MutationKind::Created,
+            payload: None,
+        }));
+        *result_w.lock().expect("status update result slot poisoned") = Some(StatusUpdateResult {
+            captured: inserted, claimed, prior_status, status, owner, claim_verdict,
+        });
+        Ok(WriteOutcome { applied: true, events })
+    }).await.map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(
+        std::io::Error::other(e.to_string()),
+    )))?;
+    let outcome = result.lock().expect("status update result slot poisoned")
+        .clone().ok_or(rusqlite::Error::QueryReturnedNoRows);
+    outcome
+}
+
+/// Append one stamped line for requests that carry no worker progress claim.
 async fn append_card_log(
     state: &AppState,
     id: &str,
     line: &str,
-) -> Result<(), rusqlite::Error> {
+    capture: Option<(Vec<String>, String)>,
+) -> Result<Vec<crate::db::artifact_store::ArtifactRow>, rusqlite::Error> {
     let (id, line, stamp) = (id.to_string(), line.to_string(), hhmm());
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let captured_w = captured.clone();
     state
         .store
         .write_async(move |conn| {
@@ -7930,13 +9679,37 @@ async fn append_card_log(
             let next = bs::append_log(existing.as_deref(), &stamp, &line);
             conn.execute(
                 "UPDATE issues SET log=?1 WHERE id=?2",
-                rusqlite::params![next, id],
+                rusqlite::params![next, &id],
             )?;
-            Ok(WriteOutcome { applied: true, events: vec![] })
+            let inserted = match capture {
+                Some((refs, description)) => crate::db::artifact_store::insert_captured_refs(
+                    conn,
+                    &id,
+                    refs,
+                    &description,
+                    now_secs(),
+                )?,
+                None => Vec::new(),
+            };
+            let events = inserted
+                .iter()
+                .map(|artifact| crate::db::PendingEvent {
+                    entity_type: amux_core::revision::EntityType::Other("artifact".into()),
+                    entity_id: artifact.id.clone(),
+                    mutation: amux_core::revision::MutationKind::Created,
+                    payload: None,
+                })
+                .collect();
+            *captured_w.lock().expect("artifact capture slot poisoned") = inserted;
+            Ok(WriteOutcome { applied: true, events })
         })
         .await
-        .map(|_| ())
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e.to_string()))))
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e.to_string()))))?;
+    let inserted = captured
+        .lock()
+        .expect("artifact capture slot poisoned")
+        .clone();
+    Ok(inserted)
 }
 
 #[cfg(test)]
@@ -8510,8 +10283,12 @@ mod slim_tests {
             ask_type: None,
             ask_question: None,
             ask_unblocks: None,
+            ask_actor: None,
             // AF-367: the HTTP create path: a real POST /api/board from a lane or a human.
             source: Some("agent".into()),
+            requested_by: None,
+            callback_session: None,
+            callback_prompt: None,
         }
     }
 
@@ -8615,6 +10392,36 @@ mod slim_tests {
 
 #[cfg(test)]
 mod bulk_migrate_tests {
+
+    /// AF-477. The 404 guard must be NARROW: only "the card does not exist"
+    /// becomes a 404, and every other storage fault stays a 500.
+    ///
+    /// This exists because the integration test could not prove it. That test
+    /// drives the real handler, so the only mutation it can reach touches the
+    /// Err arm — widening the guard to catch EVERY error would send a genuine DB
+    /// fault to 404 and the integration test would still pass, because its
+    /// success case is an Ok. The gap was recorded on the card as unproven; this
+    /// closes it by testing the classification directly.
+    #[test]
+    fn only_a_missing_row_is_a_missing_task() {
+        // The one that IS a missing card.
+        assert!(
+            super::is_missing_task(&anyhow::Error::new(rusqlite::Error::QueryReturnedNoRows)),
+            "QueryReturnedNoRows is how the closure signals 'no such task'"
+        );
+        // A DIFFERENT rusqlite error is a real fault and must stay a 500.
+        assert!(
+            !super::is_missing_task(&anyhow::Error::new(
+                rusqlite::Error::ExecuteReturnedResults
+            )),
+            "a genuine storage fault must NOT be reported to the caller as 404"
+        );
+        // And a non-rusqlite error must not be swallowed either.
+        assert!(
+            !super::is_missing_task(&anyhow::anyhow!("pool exhausted")),
+            "an error that is not a rusqlite error at all must stay a 500"
+        );
+    }
     use super::*;
 
     /// AMUX-4044. The safety property of bulk migrate is that a GATED column

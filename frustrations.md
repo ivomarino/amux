@@ -44,59 +44,6 @@ needs rebuilding. No single entry makes that argument, and free-form prose canno
 counted.
 
 ---
-## The staged-guard was silent on the commit that swept a peer's work, and warned on the clean one
-AREA: attribution
-SEVERITY: blocks
-STATUS: open
-DATE: 2026-08-08
-SESSION: amux-cloud
-CARD: AC-297
-FIX-NOTE: b7dba01 PARTIAL — _staged_guard_check() now checks for unstaged changes, which
-  helps when peer work is left unstaged. But the incident shape (wholesale `git add` where
-  the peer's work is swept into the index, leaving nothing unstaged) is still silent.
-  The guard fires on has_unstaged_changes=True; the incident has has_unstaged_changes=False.
-  Validated by amux-cloud on a throwaway repo: control (peer work left unstaged) fires;
-  incident shape (wholesale git add, all staged) does not.
-SYMPTOM: Two commits, 20 minutes apart, both `git add amux-server.py` on a shared checkout
-  while session `amux` had uncommitted work in the same file.
-    fc72811 — guard WARNED ("also edited by session 'amux' 30m ago... stages 55 insertions /
-              2 deletions"). I checked line by line. It was genuinely clean, all mine.
-    8adf348 — guard SILENT. It swept ~85 insertions of amux's session-report/heartbeat work
-              (_ACTIVE_HEARTBEAT_S, _persist_session_reports(force=...), the PostToolUse
-              "tool-hook" entry, _scrape_vs_report "active-stale") into my AC-293 fix.
-  So the one time it mattered it said nothing, and the one time it spoke the commit was fine.
-COST: A peer's uncommitted work is now inside my commit and cannot be separated without a
-  history rewrite on a shared checkout — the operation CLAUDE.md records as having destroyed a
-  session's unpushed work. Second occurrence for me; the first was b1c3e93 (~93 lines).
-  Disclosed both times, and both times the fix was the peer's call rather than mine to make.
-FIX: The correlation is the dangerous part, not the miss. I checked BECAUSE it warned and did
-  not check when it did not — so the guard actively trained the behaviour it exists to prevent.
-  A guard that is silent on the true positive is worse than no guard. Find why it fired at 30m
-  and not at ~20m (mtime window? cooldown? a debounce that suppresses a second warning in the
-  same session?) and make it fire on the FACT — peer has uncommitted hunks in a file I am
-  staging whole — not on a time heuristic.
-  Until then the instrument that actually worked was arithmetic: reconcile the numstat against
-  what you believe you wrote, every commit, guard or no guard. 146/14 against a ~60-line change
-  is what caught this. That check needs no guard and cannot go silent.
-
-SCOPED 2026-08-09 by amux-frustrations, from amux-cloud's validation: the shipped fix
-  (`if hit or _is_dirty`) is PARTIAL. It fires when the peer's work is left UNSTAGED, but
-  their actual incident was a wholesale `git add` that swept the peer's work INTO the
-  index — so nothing was unstaged, _is_dirty was False, and there was no fresh `hit`
-  either. Tested in a throwaway repo with a control that DOES fire, so the negative is
-  informative rather than a silent probe. Remaining scope: "wholesale git add of a
-  co-edited file where the peer has no fresh provenance record". Nobody has started it.
-  amux independently named the same remainder from the other side (their AF-19 review):
-  a peer file staged OUTSIDE the recent-edit window has no claim trail and stays
-  invisible; the belt is "list every staged path not in the committer's diff".
-
-  CONTESTED 2026-08-21 by the author (amux-cloud). The 08-15 guard overhaul
-  (d5c575e / b9dbf70 / 26adbc6) may well cover the incident shape (wholesale git add,
-  has_unstaged_changes=False), but nobody has re-run the throwaway-repo specimen against
-  it, and the entry's own FIX-NOTE records that shape as validated STILL SILENT. Held open
-  on the honest basis that a plausible fix is not an exercised one. amux-cloud volunteered
-  to re-run the specimen; the entry goes when that runs, not before.
-
 ## Dashboard's usage-limit discriminator says 'worker'; the live endpoint says 'session'
 AREA: instruments
 SEVERITY: annoys
@@ -759,19 +706,6 @@ FIX: The generalisable half is the CORROBORATION, not the bad grep. I confirmed 
   the mechanism could fire — for hooks specifically, resolve core.hooksPath first,
   because the file at the obvious path may not be the one that runs.
 
-## Cloud silently froze behind a red main CI — "skipped" reads as "up to date," not "frozen"
-AREA: cloud
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-13
-SESSION: amux-cloud
-CARD: AC-344
-SYMPTOM: Ethan reported "cloud is still behind in versions." A fresh cloud org still booted build 0f2f6e48 (pre-env_config: GET /api/env/schema -> 404, /api/env/apply absent from 213 routes), so the converged seed.py --via-apply 405'd against cloud. Root cause was three layers down: deploy-cloud.yml auto-deploy is gated on GREEN rust.yml (workflow_run), and main CI had been RED for hours on ONE clippy lint (unnecessary_sort_by, messages.rs:585). Every deploy-cloud run showed "skipped" — indistinguishable from "nothing to deploy." Nothing anywhere said "the cloud image is frozen and falling behind main because CI is red."
-COST: Ethan had to notice the version lag by hand. Diagnosing it took several manual steps (fresh provision -> /health build hash -> /api/debug/routes -> gh run list conclusion -> git log timing) to join signals that no single instrument joins. And it is fleet-recurring: ANY lane's red-main break freezes the entire cloud deploy for every customer, invisibly, until a human notices — the busier the fleet, the more often it happens. PREDICTION PROVEN 2026-08-14 (author-verified during a frustrations validation): the "until a human notices" line came true VERBATIM, three times in ONE session, all AFTER this entry was written — 67b44f7 (clippy unnecessary_sort_by), 64fd450 (steering restart_persistence test), 9442f77 (opencode ETXTBSY flake + /api/tts unclaimed in the boundary registry). Each red-mained main, each made deploy-cloud SKIP silently, each froze :latest, and each was caught BY HAND via the freshness tick — never by any instrument. A prediction that recurred 3x on the record is the strongest possible argument for finally building the signal.
-FIX: AC-344 — a signal that joins live-cloud-build-hash vs latest-green-main and fires when they diverge (commits or hours), OR make deploy-cloud's skip loud (record "skipped because CI red since <sha>/<time>"). Interim: clippy blocker fixed (67b44f7); steering-test blocker handed to amux; cloud auto-catches-up once CI green. Related: AMUX-3013 (pinned toolchain so local clippy == CI clippy — why the red wasn't caught pre-push).
-
----
-
 ## Verified gate rejects a cross-group reporter's verification, so the strongest evidence cannot close the card
 AREA: gates
 SEVERITY: slows
@@ -788,35 +722,6 @@ COST: Two genuinely-verified cards cannot reach `verified`; the strongest verifi
   available (the affected user, who also reported the bug) does not count toward the gate.
 FIX: The verified gate should accept verification by the originating reporter, or by any
   worker when the card records who plus their evidence (AMUX-3119).
-
-## amux send to a bare REPL worker: origin header is submitted as its own message, prompt body is not
-AREA: notices
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-15
-SESSION: amux-cloud
-CARD: AC-354
-SYMPTOM: Driving a qwen3.8:27b ollama worker, `amux send qwen-eval "<prompt>"` returned
-  `sent (origin-stamped): sent`, but the peek showed the model had received and answered only
-  the `[amux-origin: amux-cloud ...]` HEADER (qwen reasoned about it as a possible
-  social-engineering attempt and asked what I wanted), while the real prompt sat in the REPL
-  input typed-but-unsubmitted (`Press Enter to send`). I had to `tmux send-keys Enter` by hand
-  to get an answer. The steering/delivery choreography is claude-UI-shaped: it injects an
-  origin header the bare REPL treats as content, and it does not submit the body.
-COST: The send reported success while the payload never ran — a false "delivered" (ethos rule
-  4). Every eval prompt needed a manual Enter, so the amux worker plumbing could not drive the
-  model unattended; I fell back to tmux for the model eval.
-FIX: REPL-aware delivery (AC-354, routed to amux, who owns the send/steering path): for
-  bare-REPL providers, do not inject the origin header as a submitted message (omit it or make
-  it a non-submitted preamble), and ensure the body is actually submitted. Verify by peeking
-  that the model answered, not by trusting `sent`. Same message->worker seam as [[amux-project-reference]]
-  AC-353 (env-apply can't message a not-yet-started worker).
-
-  CONTESTED 2026-08-21 by the author (amux-cloud). No commit in history references AC-354
-  except the docs commit a21ad4d, so the card closing is not evidence of a fix — this is
-  the "card closed on a different thing" shape the validation pass was watching for. A
-  bare REPL worker is not cheap to exercise, so the entry stays until someone names the
-  fix sha.
 
 ## staged-guard can't see a subagent's own edits, so it blocks the subagent's real work as "foreign"
 AREA: attribution
@@ -2291,39 +2196,6 @@ FIX: Amux does not infer lifecycle from Claude's notification text. The status f
   content as display-only evidence. The provider-side duplicate/early notification
   remains outside this repository.
 
-## A main lane with no $AMUX_SESSION in its env is invisible to the staged-guard's edit records
-AREA: attribution
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-24
-SESSION: mixpeek-research
-CARD: MR-43
-SYMPTOM: This lane runs in tmux session `amux-mixpeek-research` (amux-launched), yet
-  $AMUX_SESSION is empty in its shell. In one task that meant: `amux board add` would have
-  created an unattributed card, the prepare-commit-msg trailer would have been empty, and the
-  staged-guard's cross-session check said "you have no edit record on this path in the last
-  360m" for a file this lane had edited three times in the previous ten minutes, because the
-  PostToolUse edit-record hook reports under the same empty variable. Its verdict then named
-  the peer as the sole editor and blocked the commit. The three subagent entries earlier in this
-  file (SESSION: "... no $AMUX_SESSION in env") are the same shape one level down.
-COST: two refused commits and about 5 minutes, plus a guard verdict that was wrong about who
-  edited the file; every CLI call needed AMUX_SESSION exported by hand from the tmux name.
-FIX: derive the session from the tmux session name (`tmux display-message -p '#S'`, strip the
-  `amux-` prefix) in the edit-record hook and the CLI when the variable is empty, and say in
-  the guard verdict when that fallback was used. Plus a WARN in the lane-launch path when a lane
-  starts without the variable, so /api/logs/analyze can count these instead of a human noticing.
-RESTORED 2026-09-02 by amux-frustrations, not by its author, and the way it was lost is worth
-  one sentence because no set-difference could have found it. 7dbab8f6's whole-file overwrite
-  left this entry's HEADING sitting on top of a DIFFERENT entry's body: AF-195's, which had
-  already been validated and archived. So the ledger carried a chimera that read as a live
-  MR-43 to anyone scanning headings and as a live AF-195 to anyone reading bodies, and it
-  survived AF-430's title-based dedup because its heading was not in the archive. Recovered
-  verbatim from 8fdc4bdf; every line above this note is mixpeek-research's. STATUS stays
-  `open` because only they can change it. See AF-434.
-
-
----
-
 ## A correct answer makes a wrong reason feel checked, and the reason is what gets generalised into a rule
 AREA: instruments
 SEVERITY: slows
@@ -2467,7 +2339,7 @@ NOTE: distinct from AF-435 (checks that ran, passed and could not have failed). 
 ## An answer-only prompt still cards when its no-op tail isn't one of ten hardcoded literal strings
 AREA: harness
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-09-03
 SESSION: amux-testing-e2e
 CARD: ATE-17
@@ -2483,7 +2355,954 @@ SYMPTOM: Yesterday's fix (53b3e952, archived from frustrations.md 2026-09-02, va
 COST: The exact friction the archived entry described recurred one day later under a
   paraphrase, consuming two board ids and two WIP-adjacent doing slots for pure Q&A that
   was already answered inline both times.
-FIX: Replace literal ANSWER_ONLY_TAILS matching with a structural check — e.g. the tail
-  contains no CAPTURE_TASK_VERBS and no additional imperative clause, mirroring what
-  capture_has_task_followup already does for the pre-question clause — instead of an
-  enumerable list of exact phrasings. Not done here; filed as ATE-17.
+FIX: f999caff replaces the literal ANSWER_ONLY_TAILS list with `tail_is_answer_only()`,
+  which splits the tail on the same connectors `capture_has_task_followup` already uses
+  for the pre-question clause and requires no resulting clause starts a task per the
+  existing `capture_clause_starts_task` verb check — reusing the mechanism already
+  trusted for the rest of the function instead of an enumerable list. Pinned the ATE-17
+  specimen plus a negative control (a real task stacked after an answer-only opener must
+  still card); `scripts/mutate.sh` confirms the negative control can actually fail.
+  NOT YET independently re-validated against the running server build — see AF-433's
+  discipline for what that validation should check before this entry is archived.
+
+## staged-guard blocks on an edit-ownership record that a plain `git diff` is enough to create
+AREA: attribution
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-03
+SESSION: amux
+CARD: AMUX-4083
+SYMPTOM: Two independent blocks in one hour, both false, both naming a session
+  that had only READ the file.
+  (1) mixpeek-oss went to commit two browser.rs paths and staged-guard refused,
+  reporting that session `amux` had an edit record on both files 3 minutes
+  prior. What `amux` had actually done in that window was `git diff` and
+  `grep` on those paths, to describe them accurately in a message ASKING
+  mixpeek-oss to commit them. No write. They cleared it with
+  AMUX_VERIFIED_SOLO=1 after checking the diff content and line counts were
+  identical before and after.
+  (2) Fifteen minutes later the guard blocked `amux` from running
+  `git checkout --theirs` on app.css and sw.js to resolve a MERGE CONFLICT,
+  naming amux-homepage: "discarding a file ANOTHER SESSION HAS ALSO EDITED ...
+  UNRECOVERABLE". Reconstructing the ours-side of the conflict and diffing it
+  against HEAD gave 0 differing lines for sw.js, and every app.css difference
+  traced to #184's own auto-merged hunks. No peer content existed in either file.
+COST: About 25 minutes across two sessions, and a cross-session round trip that
+  existed only to clear the first block. The second one is worse than the time:
+  the refusal text says UNRECOVERABLE and instructs you to stash or ask the named
+  peer, so the honest response to a false positive is to stop and ask a session
+  that has nothing to do with the file. It also teaches the wrong lesson, since
+  the way past it is an override flag, and a guard whose normal resolution is its
+  own bypass stops being read.
+FIX: Do not derive edit ownership from mtime alone. CLAUDE.md already states the
+  rule the guard violates: "An owner derived from mtime is not evidence ...
+  reports whoever was ACTIVE, not whoever WROTE, because every lane shares the
+  cwd." Record ownership from an actual WRITE — the PostToolUse hook already sees
+  Edit/Write tool calls and could stamp content identity (a hash of the file
+  before and after) instead of a timestamp. AMUX-3954 is the same defect stated
+  as "an observed co-edit record carries no content identity, so it names a
+  session for a write it did not make"; this entry is two measured specimens of
+  it, one of which blocked a peer rather than the recorder. Second, a file in
+  CONFLICTED state is a distinct case the guard does not model: its content is
+  git-generated, so "another session also edited it" cannot be inferred from the
+  working copy at all.
+CO-SIGNED: mixpeek-oss, who hit specimen (1) from the blocked side and
+  independently verified it the same way ("read-only git diff/grep during
+  message composition, flagged as an edit ... a signal with no way to
+  distinguish read from write").
+
+## A process killed before it can log leaves the fleet no diagnostic surface for the failure that removes the diagnostic surface
+
+AREA: instruments
+SEVERITY: wrong-conclusion
+STATUS: open
+DATE: 2026-09-03
+SESSION: amux-frustrations
+CARD: AF-458
+SYMPTOM: the server is in a launchd crash loop and NOTHING in its own logs says so.
+ macOS SIGKILLs it at exec for `Code Signature Invalid` / `Launch Constraint
+ Violation`, so it dies before any of our code can write a shutdown line. Both
+ StandardOutPath and StandardErrorPath point at ~/.amux/logs/server-rs.log, and the
+ last line before each death is an ordinary WARN. The only honest record is
+ ~/Library/Logs/DiagnosticReports/*.ips plus `launchctl print`, where `runs` went
+ 10 -> 18 -> 23 in about two minutes and `properties` reads "needs LWCR update".
+COST: this is the flap the whole fleet is hitting, and it presents as five unrelated
+ problems. It forced gtm-engine's send onto the unstamped fallback (see the two
+ entries above), made `amux board retitle` exit 7 with no message, broke a `git
+ commit` with "unable to write new_index file", and made two /api/board reads
+ return empty. Each looks like its own bug. Worse, the log carries an ERROR-level
+ line 24 seconds before a death — "migration VERSION COLLISION at 35" — which is
+ loud, adjacent, and irrelevant: migrate.rs:636 documents it as deliberately
+ non-fatal ("this reports rather than refuses ... a gate with no truthful path,
+ ethos rule 3") and it appears identically on runs that stayed healthy. A wrong
+ cause was one step away and I nearly filed it. Fifth AF-445-shaped near-miss in
+ this session.
+FIX: not actioned — the remedy touches a launchd agent and ~/Dev/CLAUDE.md requires
+ explicit owner approval ("This machine runs 24/7. Do NOT restart launchd agents").
+ One-shot is `launchctl bootout gui/501/com.amux.server-rs` then `bootstrap`, since
+ the binary itself verifies clean on disk and it is launchd's cached Lightweight
+ Code Requirement that is stale. The durable fix is the builder re-bootstrapping the
+ agent after it swaps the binary; until then every deploy on this box reopens the
+ window. The INSTRUMENT half is the part that belongs here: a process killed before
+ it can log needs its death reported somewhere a lane already looks. /health going
+ unreachable and `/api/debug/*` being unreachable at the same moment means the fleet
+ has no diagnostic surface for exactly the failure that removes the diagnostic
+ surface.
+NOTE: gtm-engine independently confirmed this from the other end and bounded it
+ (origin-stamped, 2026-09-03). They closed five cards inside a flap window trusting
+ a "-> done" line, re-read all five at the FIELD, and found two gaps that were their
+ own omissions rather than the crash loop. Their conclusion: "on this lane the flap
+ degraded loudly every time and silently never." Every symptom seen so far is
+ fail-loud (curl rc 7, empty body, refused index write, a verb exiting non-zero with
+ no message); nothing yet shows a write that REPORTED success and did not land. So
+ the failure mode is availability, not silent corruption, which is the difference
+ between a degraded fleet and one whose records are suspect. Not a reason to leave
+ it running; it is a reason not to re-verify every board write made today.
+NOTE: CAUSE CORRECTED, 2026-09-03, same session. The codesign SIGKILL is real
+ (crash report 160828.ips) but it is NOT what drives the climbing run counter, and
+ I recommended a fix that would not have worked. Three facts I should have checked
+ before recommending anything: only ONE crash report all day against 76 runs (a
+ codesign kill writes one per death), the binary unchanged since 16:10 so there is
+ no swap-kill-swap cycle, and `codesign --verify` clean right now. What is actually
+ happening is a port race: an agent session started `AMUX_RS_PORT=8824
+ amux-server-rs` by hand in a gemini-shell background job (pid 20191, parent a
+ /bin/bash -c with `trap 'jobs -p > "$_bgpids_file"' EXIT`), it holds 8824, and
+ launchd's managed copy cannot bind, exits cleanly with 78, and KeepAlive respawns
+ it forever. Clean exit, hence no .ips. So `bootout`/`bootstrap` would have resumed
+ losing the same race. The entry's INSTRUMENT argument survives intact and is if
+ anything stronger: a process that exits before binding logs nothing either, both
+ halves of `runs`-climbing-with-a-silent-log look identical, and I distinguished
+ them only by counting crash reports, which is not a thing any lane would think to
+ do. The deeper problem this exposed: the fleet's live server is an UNSUPERVISED
+ background job that dies with its parent shell, while the supervisor that should
+ own it is locked out of the port.
+
+## An archived card is listed as actionable and refuses every closing action
+
+AREA: board
+SEVERITY: wrong-conclusion
+STATUS: open
+DATE: 2026-09-03
+SESSION: gtm-engine
+CARD: AF-460
+SYMPTOM: a card can hold `archived: 1`, `status: backlog` and `closed_at: None` at
+ once. It appears in the DEFAULT `/api/board` list, which is what the idle nudge
+ reads, so it is offered as a drainable backlog card with "you have to pull from
+ it". Every closing verb then refuses with `archived_task_immutable` / "task is
+ archived; restore it first". The nudge says drain it; the board says you cannot.
+ The asymmetry is what makes it permanent: `--trigger` DOES work on an archived
+ card, so such a card is silenceable forever and closeable never.
+COST: 26 days on GE-564, whose trigger sat 617h stale while it re-listed. A triage
+ on 2026-08-20 chose ARCHIVE, the archive neither closed nor hid it, and nobody
+ could close it afterwards. SECOND INSTANCE, and mine is the worse one: I hit the
+ identical refusal on AF-224 the same day and read it as "already archived, no
+ action needed" rather than as a defect. A lane that shrugs at the refusal never
+ reports it, which is why one card absorbed 26 days before anyone said so.
+FIX: not chosen — three candidates land in different places and it is a data-model
+ call: (1) archiving sets a terminal status, (2) the default list excludes
+ archived, (3) the nudge filters them. Recommending (1), because (2) and (3) leave
+ a card that is simultaneously backlog and archived and merely stop showing it to
+ one reader. Workaround that works today and is documented nowhere: PATCH
+ archived:0, then done. Companion entry: the refusal message is correct and only
+ reaches you when you ACT, never where the card is listed (AF-461).
+
+## 19 NUL bytes made grep call a 67 MB log binary, and every `grep -o` sweep silently lost half its matches
+AREA: instruments
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-frustrations
+CARD: AF-481
+SYMPTOM: same file, same pattern, three answers. `grep -c 'verdict=READ'` -> 17
+ lines. `grep -o 'verdict=READ' | wc -l` -> 8. `grep -ao ...` -> 17. grep declares a
+ file binary if it contains a single NUL byte and then SUPPRESSES match output while
+ `-c` keeps counting lines, and it says nothing at all when its output goes to a
+ pipe. The source was one warn: the create-path acyclicity check passes a placeholder
+ self id of `"\u{0}new-card"`, chosen because no real card id can contain a NUL,
+ which is correct and also true of a space. `depends_on_cycle` logs it as
+ `self_id = %self_id`, so 19 NULs landed in server-rs.log from one stuck cycle
+ (GE-473 -> MHC-256) retried across three days.
+COST: 53% of the matches, in the reassuring direction, on the instrument this repo's
+ own log-sweep doc prescribes. I nearly filed AMUX-2841's specimen count as 8 when it
+ is 17, which would have understated a watch's evidence by half. Nineteen bytes in 67
+ MB is enough, so no amount of the file being "mostly text" protects you. The wider
+ shape is that a probe can be correct, run cleanly, exit 0 and answer about a
+ different population than the one you asked about, with nothing beside the number
+ saying so.
+FIX: db3ff38a and accbba96. The sentinel is now `"(new card)"`; non-collision is
+ unchanged, since card ids are `[A-Z]+-<digits>` and a space and parentheses are as
+ impossible as a NUL was, and it survives a log. The guard asserts the PROPERTY, not
+ the string: no control characters, at least one character no card id can contain,
+ and non-empty so neither can pass vacuously. Two mutations fire (back to the NUL
+ sentinel; a valid-id-shaped "NEW-0"). The repo CLAUDE.md now tells lanes to grep
+ that file with `-a`, because AF-481 removed this source and any logged payload can
+ reintroduce one.
+ SELF-CORRECTION, recorded because it is the same class: I first reported 216,873
+ NULs from `grep -c $'\0'`. bash cannot put a NUL in a string, so `$'\0'` is the
+ EMPTY string and that command is `grep -c ''`, a line count wearing a NUL count's
+ label. The real figure is 19, read from the bytes in python. Both halves of this
+ entry are a probe whose argument silently became something else.
+
+## `GET /api/board` returns a WORKING SET, and the cap is disclosed only in headers the prescribed recipe cannot see
+AREA: instruments
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-frustrations
+CARD: AF-480
+SYMPTOM: `GET /api/board` returns 2,053 rows; `GET /api/board?all=1` returns 12,745.
+ The default caps terminal rows (done/verified/discarded) to the most recently
+ updated FLEET-WIDE, which across ~50 lanes can be none of yours. The cap is right
+ and the server is honest about it, in RESPONSE HEADERS: `x-amux-truncated: 1`,
+ `x-amux-total: 2052`, `x-amux-terminal-total: 10793`. The body is a bare JSON array
+ with no envelope, and the recipe in ~/.claude/CLAUDE.md is
+ `curl -sk $AMUX_URL/api/board | python3 -c "..."`, which cannot see a header.
+COST: reconciling all 84 frustrations.md entries against the default listing reported
+ 63 cards as MISSING FROM THE BOARD. All 63 existed. That is a whole reconciliation
+ pass, and the report it produced was wrong in the direction that invents work: it
+ would have had me file 63 duplicate cards for entries that already had one. The
+ `amux` CLI ALREADY reads those headers and prints the cap, and its own comment says
+ why ("nobody reads response headers from a pipe, which is ethos rule 4's second
+ layer: a tag in a store the reader never opens") — so the capability existed, was
+ correct, and did not reach the path CLAUDE.md tells every lane to run. Ethos rule 1:
+ a feature nobody can name is a feature nobody has.
+FIX: ~/.claude/CLAUDE.md now shows both forms with their row counts, says the cap is
+ header-only and that a raw curl cannot see it, and points at `amux board ls` which
+ can. The "read the whole board" recipe in the task-ledger section takes `?all=1`,
+ since that one is asked to be exhaustive by its own sentence. Not fixed and
+ deliberately not attempted: putting the disclosure in the BODY would need an
+ envelope, and every consumer of that endpoint parses a bare array.
+
+## "commit by pathspec" protects other files, and does nothing for a file you BOTH edited
+AREA: attribution
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-frustrations
+CARD: AF-485
+SYMPTOM: ~/.claude/CLAUDE.md prescribes, for a shared checkout, "commit by pathspec.
+ `git commit <your paths>` ignores the index for everything it does not name and
+ leaves their staged entries untouched." Every clause is true and the paragraph reads
+ as a general guarantee against sweeping a peer. It is not one. `git commit <path>`
+ takes the WORKING TREE state of that path, all of it, not your hunks — so a peer's
+ UNSTAGED edits to a file you name land in your commit, under your message and your
+ Amux-Session trailer, while the pathspec does exactly what it promises. The same
+ paragraph pre-emptively dismisses `git add -p` ("theirs are already staged"), which
+ is correct for the state it describes and wrong for this one, so the reader is
+ steered away from the one tool that would have helped.
+COST: self-traced, 2026-09-04. I committed 66818693 by pathspec on
+ crates/amux-server/src/api/session_verbs.rs and swept amux-testing-e2e's
+ uncommitted Codex composer-footer fix, its LIVE_CODEX_IDLE fixture and its
+ regression test: four of six hunks, 59 of 171 added lines. I pushed it before they
+ could tell me, so the remedy CLAUDE.md prescribes for an absorbed change (do not
+ rewrite shared history; record the reasoning in a follow-up) is now the only one
+ available. The code survived correct and tested; the REASONING did not, because my
+ commit message is entirely about a diagnostic window parameter and says nothing
+ about Codex footer chrome. They found it, not me, and they asked whether they could
+ push a commit that was already on origin.
+ The guard was honest and I misread it: the commit printed "no transcript for RUNNING
+ cotenant(s) amux-codex — their edits are INVISIBLE to this verdict". It never named
+ amux-testing-e2e. A guard saying it cannot see is telling you to look.
+ Filed the same day I measured that 21 of 75 live entries in this file are the one
+ shared-index class (AF-336). This is the twenty-second, produced by following the
+ guidance written to prevent it.
+FIX: the pathspec paragraph in ~/.claude/CLAUDE.md now states what pathspec does NOT
+ cover, carries the measurement above, and gives the three commands to run before a
+ pathspec commit on a co-edited file: `git diff -- <path>`, `git diff --cached --
+ <path>`, and `git add -p -- <path>` followed by a commit with no pathspec. It also
+ says why `add -p` is right here despite the dismissal three lines above it: that
+ dismissal is about a peer's already-STAGED work, a different state.
+ NOT FIXED and deliberately not attempted: making the staged-guard see a cotenant it
+ has no transcript for. It already reports that blind spot by name, which is the
+ honest behaviour; the defect was in the guidance, not the guard.
+
+## An idle Codex prompt was labelled `UNSUBMITTED TEXT` using its model/path footer as the draft
+AREA: instruments
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-36
+SYMPTOM: the worker's stop hook said idle, Codex's structured rollout said idle,
+ zero subagents were live, and the pane visibly ended at the dim `Ask Codex to do
+ anything` placeholder. `/api/sessions/amux-testing-e2e` nevertheless returned
+ `status: waiting`, `composer_stuck_since > 0`, and
+ `composer_preview: gpt-5.6-solxhigh~/Dev/amux`; the dashboard rendered that
+ override as `UNSUBMITTED TEXT`. The composer reader stopped on Claude's border
+ and status-bar glyphs but Codex puts its model/effort/path footer directly below
+ the prompt with no border, so the footer was concatenated into the input.
+COST: the worker presented a false human-action state for roughly three hours and
+ contradicted both of its structured state sources. A human could have pressed
+ Enter to submit what the UI claimed was pending, although there was no command
+ in the composer.
+FIX: 66818693. `composer_state` now treats Codex's ANSI-styled middle-dot
+ model/path footer as a structural boundary without naming any model or version.
+ It deliberately requires the raw styling and therefore fails toward visible
+ `Typed` if Codex changes its chrome, never toward a false successful send. The
+ live-frame regression first reproduced `Typed("gpt-5.6-solxhigh~/Dev/amux")`,
+ then passed as `Placeholder`; its control keeps real typed text pending. Live
+ build `668186939734` cleared `composer_stuck_since` and `composer_preview`, and
+ the browser changed from the false badge to the worker's actual idle/working
+ state in real time.
+
+## One blocked To Do hid an independent backlog from automatic draining
+AREA: coordination
+SEVERITY: stuck
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-37
+SYMPTOM: `mvs-research` could finish its active card and then remain idle with
+ MR-14 in To Do and 18 cards in backlog. MR-14 depends on MR-27, which the lane
+ cannot complete, while MR-150 and other backlog work have no dependency. The
+ pickup selector only tried backlog when its To Do SQL query returned zero rows;
+ one blocked row therefore hid every independent backlog card even though this
+ worker had the default auto-drain configuration enabled.
+COST: the board advertised queued work and the worker advertised idle, but the
+ driver repeatedly returned `all-candidates-refused`. Progress then depended on
+ a person noticing the mismatch and moving a backlog card by hand. A tempting
+ workaround would be to ignore dependencies or claim backlog directly, both of
+ which would weaken the board's gates.
+FIX: ATE-37 makes automatic draining a fallback after every To Do candidate has
+ been evaluated and honestly refused. It still gives runnable To Do priority and
+ still promotes exactly one backlog card through backlog -> todo -> doing. The
+ drainable backlog query now excludes cards with open dependencies, so it cannot
+ merely move the same blockage sideways. The regression reproduces an older
+ blocked backlog card, a blocked To Do, and a newer runnable backlog card and
+ requires the runnable card alone to be selected. All 106 board-driver tests
+ pass, including WIP, needs:you, freshness, capture-shell, irreversible-action,
+ dependency-promotion, and explicit auto-drain opt-out controls.
+
+## Codex kept a live turn above its prompt shell and the dashboard called it idle
+AREA: instruments
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-38
+SYMPTOM: while `amux-testing-e2e` visibly showed `Waiting for background
+ terminal (... esc to interrupt)` directly above `Ask Codex to do anything`,
+ `/api/status-explain` set `pane.says_working=false` and the Workers UI labelled
+ the session idle. The status parser treated the persistent Codex prompt/model
+ shell as a newer idle boundary even though Codex paints that shell throughout
+ an active turn.
+COST: the worker's current board card lost its working highlight during a real
+ generation. That makes the board contradict the terminal and can also let the
+ driver reason from a false idle state.
+FIX: ATE-38 recognizes the exact adjacent live shapes on both supported Codex
+ layouts: older builds paint `Working` after the submitted prompt, while current
+ builds paint `Working`, `Running`, or `Waiting for background terminal/command`
+ immediately before the disabled prompt shell. A separated historical row still
+ cannot override the newest prompt, and a completed `Worked for` row is an idle
+ control. Adapter and end-to-end status-truth tests cover active, completed,
+ stale-row, queued-message, and prompt-churn cases without matching arbitrary
+ transcript prose.
+
+## A commit naming ATE-38 attached its outputs to the newer ATE-39 card
+AREA: attribution
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-39
+SYMPTOM: commit `be87f031` named `(ATE-38)` in its subject, but the post-commit
+ `commit-report` appended the commit activity and derived links for
+ `sessions_legacy.rs` and `be87f031` to the currently-Doing ATE-39. ATE-38 had
+ no durable artifact rows when the report landed. The endpoint ignored the
+ explicit task id and selected the worker's most recently updated in-flight card.
+COST: the board put another task's source and commit on this card and left the
+ producing task without its outputs. The user had to inspect both cards, identify
+ the wrong newest-card guess, and provide a corrective live specimen before the
+ task record could be trusted.
+FIX: ATE-39 (this commit). `commit-report` reads the full subject and changed-file
+ list from the git object, attaches by an explicit body/subject task id, and
+ refuses ambiguity instead of guessing newest. It stores the full SHA and every
+ changed file as durable rows on that exact task and emits
+ `commit_report_task_exact` / `commit_report_task_ambiguous` log markers.
+
+## Evidence hid a real .env file and rendered the 1.93M row count as a file
+AREA: board
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-39
+SYMPTOM: TUBES-2426 evidence named `customers/tubescience/.env` but Board details
+ returned no asset link. TUBES-2428 named the same file yet returned only `1.93M`,
+ a decimal measurement, as a clickable missing-file asset. The parser required a
+ non-empty stem before the final dot and accepted alphabetic measurement suffixes.
+COST: the actual customer configuration artifact disappeared from two task records,
+ while one record sent a reviewer toward a manufactured file. The user had to
+ compare the two live payloads to show that the positive and negative parser arms
+ were both backwards.
+FIX: ATE-39 (this commit). Hidden leaf files and hidden path components are
+ accepted, decimal measurement tokens are rejected, and bare/relative dotfiles
+ resolve against the producing worker directory. File rows now render as semantic
+ buttons; local availability and external reachability-not-measured verdicts make
+ missing and unreachable assets explicit.
+
+## Worker progress was recorded while its exact Board card stayed unclaimed
+AREA: board
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-41
+SYMPTOM: general-canvas-apps posted four status updates describing active work on
+ GCA-153, but the card remained in To Do and `task_board_id` stayed empty. The
+ status-update endpoint appended the text and artifacts without participating in
+ the Board claim transition.
+COST: the Board showed an actively executing worker without its current card and
+ left the same card eligible for another pickup. The user had to correlate the
+ worker transcript, card log, and session payload to identify the disagreement.
+FIX: ATE-41 (this commit). An owned, actionable To Do/backlog card is now claimed
+ in the same serialized transaction that appends the progress line and artifacts.
+ Cross-worker, blocked, dependency-held, fresh-trigger, WIP-conflicting, waiting,
+ and later-state updates remain informational and return a named refusal verdict;
+ claimed and refused paths emit distinct sweep-visible log markers.
+
+## An idle Codex worker borrowed a sibling's active rollout and showed WORKING
+AREA: status
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-42
+SYMPTOM: `amux` sat at the empty `Ask Codex to do anything` prompt and its own
+ stop hook reported idle, but the dashboard showed WORKING on stale AMUX-4079.
+ `status-explain` named `codex_rollout`; the chosen rollout actually belonged to
+ active sibling `amux-testing-e2e`, which shares `/Users/ethan/Dev/amux`.
+COST: the worker header and Board highlight asserted current execution where
+ none existed, while two workers' transcripts and lifecycle signals were
+ cross-linked solely because they used the same checkout.
+FIX: ATE-42. An explicit Codex session id still wins. Before one exists, rollout
+ fallback now canonicalizes the cwd and selects only the rollout born within a
+ bounded window around that worker's own `last_started`; outside that window it
+ refuses to guess and lets the exact terminal/provider signals decide.
+
+## WIP-capped ready work was labelled STALLED while its holding task progressed
+AREA: dashboard
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-43
+SYMPTOM: TubeScience was idle at its main prompt while detached work continued
+ on TUBES-2418 and TUBES-2419 correctly waited behind WIP-1. The worker header
+ rendered the red `STALLED · 1 READY` chip even though `/api/board/ready` named
+ TUBES-2418 as the current WIP holder.
+COST: a healthy, intentionally serialized queue looked like a broken autonomy
+ loop. The label hid both card identities, so the user could neither see what
+ was waiting nor open the task that explained the wait.
+FIX: ATE-43 (this commit). The ready frontier retains card identities and renders
+ TUBES-2419 as queued behind a clickable TUBES-2418 control. Only ready work with
+ zero claimable cards and no holding work keeps the stalled verdict. A one-shot
+ `idle-ready-work` client beacon records which classification rendered.
+
+## Peek and worker-card action menus drifted into different products
+AREA: dashboard
+SEVERITY: wrong-action
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-44
+SYMPTOM: the worker card exposed 25 worker actions and configurations, while the
+ peek overflow exposed only File browser and Focus mode. Worse, the peek File
+ browser opened a desktop-only split pane while clicking the displayed directory
+ entered the canonical full Files route for the same worker and path.
+COST: the place where the user was already operating a worker hid almost every
+ control, and two labels for the same file-browsing intent produced different
+ session, navigation, and visible-state outcomes. A duplicated `peek-more-btn`
+ id also made automation and DOM lookup choose whichever button came first.
+FIX: ATE-44 (this commit). Both surfaces render one shared worker-action
+ inventory; peek retains its two additional controls. All three peek file entry
+ controls call one canonical full-route helper, the two overflow buttons have
+ unique semantic IDs, and mismatch/file-entry verdicts reach client-debug logs.
+
+## Claude's background-agent wait row had two conflicting status parsers
+AREA: status
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: Primis visibly showed the provider-owned `Waiting for 1 background
+ agent to finish` row and an active Explore agent, while the dashboard header
+ said IDLE. `backend/adapter.rs` classified the row active, but the legacy
+ session projection called a second parser that omitted it.
+COST: the user had to reconcile the terminal, agent panel, session payload and
+ status-explain output to establish that real work was still running.
+FIX: ATE-45 shares one chrome-anchored singular/plural predicate between the
+ adapter and session status path. The exact provider row overrides an idle
+ parent-prompt report; quoted prose remains a negative control.
+
+## Subagent lifecycle truth disappeared whenever the server rebuilt
+AREA: hooks
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: Primis SubagentStart and SubagentStop hooks both recorded `http=000`
+ during a server rebuild. The callbacks were one-shot, so the server retained
+ neither the active agent identity nor its final stop after coming back.
+COST: the authoritative live-agent count read zero during real work and could
+ also remain positive after a lost stop; recovery depended on a later process
+ reset rather than replaying the facts that had already happened.
+FIX: ATE-45 gives each lifecycle edge a session/agent/event identity, persists
+ it in a bounded fsynced FIFO, replays oldest-first across outages and response
+ loss, and deduplicates durably in the server. Permanent 4xx poison events
+ dead-letter with full identity; 000/5xx retry; any later hook wakes the queue.
+
+## Board-drive interrupted Codex while its background terminal was running
+AREA: board
+SEVERITY: wrong-action
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: this ATE-45 turn visibly showed Codex's `1 background terminal
+ running` provider row, but board-drive sent an Idle nudge and Codex reported
+ `Conversation interrupted`. The status adapter already understood the row;
+ the steering boundary trusted a fresh idle parent report without reading it.
+COST: the harness interrupted its own green test run, forced the model to
+ reconstruct its place, and demonstrated that dashboard truth and delivery
+ safety still disagreed on the same frame.
+FIX: ATE-45 makes the shared structured Codex pane state override an idle
+ parent report for status, board-drive and steering. The hold clears on the
+ completed `Worked for` frame, and quoted copies of the text do not match.
+
+## Durable lifecycle replay posted valid events to the server root
+AREA: hooks
+SEVERITY: wrong-action
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: commit 483ff0aa queued the base `AMUX_URL`, so its drain POSTed every
+ SubagentStart/Stop to `/` instead of `/api/sessions/<worker>/report`. The live
+ server returned 405 and the new permanent-4xx rule immediately dead-lettered
+ the valid lifecycle facts.
+COST: ATE-45 was committed, deployed and moved to review with a green chaos
+ suite while its central production path delivered zero lifecycle events. A
+ second read-only review and live failure-log inspection were needed to catch it.
+FIX: ATE-45 now constructs one canonical per-session report URL used by queued
+ and immediate delivery. The fake server returns 405 for every other path, every
+ captured request asserts its exact worker route, and the failure log retains
+ URL, HTTP verdict and event identity.
+
+## Submitted and pasted provider frames impersonated live background work
+AREA: status
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: Claude's broad dingbat range included its own `❯` input glyph, so a
+ prompt containing the exact waiting sentence read active. The provider-agnostic
+ Codex fallback likewise accepted a pasted Codex frame inside Claude output.
+COST: user-authored text could pin a truly idle worker WORKING and suppress its
+ ready queue indefinitely; the original negative tests covered only unprefixed
+ prose and same-line Codex quotation.
+FIX: ATE-45 accepts only measured Claude spinner glyphs at column zero, excluding
+ the prompt and indented pasted rows. Provider-known Codex scans keep partial-
+ frame support, while provider-agnostic status requires the current exact Codex
+ prompt/model-footer structure. Prompt, indented and cross-provider pastes are
+ explicit negative controls and unknown variants remain sweep-visible.
+
+## An older start could resurrect an agent whose stop arrived first
+AREA: status
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: server lifecycle state remembered only live IDs plus 128 recent event
+ IDs. A stop delivered before its older start was discarded as an orphan; once
+ a start ID aged out, replaying it after the final stop made the agent live again.
+COST: response reordering or a sufficiently delayed retry could leave a worker
+ permanently WORKING after every child had completed, defeating both accurate
+ status and automatic Board pickup.
+FIX: ATE-45 stores monotonic per-agent live/terminal edges. Stop-before-start is
+ a durable tombstone; older/equal resurrecting starts are rejected with named
+ verdicts. Terminal entries compact to a bounded set plus a timestamp floor, so
+ evicted tombstones still reject ancient replay and resets preserve generations.
+
+## Steering's deadline overrode its live-background safety hold
+AREA: messages
+SEVERITY: wrong-action
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: ATE-45 mapped exact provider/background evidence to `active`, then fed
+ it to the ordinary max-age rule, which deliberately turns old active messages
+ into mid-turn delivery. A long agent or background terminal was still
+ interruptible after `AMUX_STEER_MAX_AGE_S`.
+COST: the safety fix postponed the same conversation interruption instead of
+ preventing it, contradicting its own regression name and acceptance contract.
+FIX: ATE-45 carries background work as a separate hard-hold fact into the
+ delivery decision. No message age can bypass it; only the reported final stop
+ or provider terminal frame clears the hold, while ordinary foreground turns
+ retain the existing starvation deadline.
+
+## The lifecycle drain could strand its bounded tail or lose the final wakeup
+AREA: hooks
+SEVERITY: stuck
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: one drain performed only 90 total loop iterations although the queue
+ admitted 128 rows. At the empty boundary, a producer could enqueue and launch
+ a replacement before the old drain released its nonblocking lock, so both
+ exited with the final row still queued.
+COST: up to 38 healthy events could remain behind an entirely healthy server,
+ and the last SubagentStop could sleep until an unrelated future hook happened.
+FIX: ATE-45 spends the 90-attempt budget only on retryable failures, so successes
+ drain the complete bounded FIFO. The empty read releases drain ownership while
+ holding the queue lock, replacements wait through the bounded handoff, and
+ tests prove one process drains 128 rows plus the lock-race specimen.
+
+## A corrupt lifecycle queue was silently replaced with an empty one
+AREA: hooks
+SEVERITY: data-loss
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: JSON read errors and wrong-schema JSON both became `rows=[]`; the next
+ enqueue atomically overwrote the only bytes that could explain which lifecycle
+ facts were lost. Malformed provider payloads also shared an empty dedupe key.
+COST: a damaged queue erased its own evidence and multiple malformed but real
+ callbacks collapsed into one, making the status error impossible to reconstruct.
+FIX: ATE-45 atomically preserves corrupt bytes/schemas under a timestamped path
+ and logs the queue, preserved path, error and verdict before recovery. Every
+ malformed invocation gets a unique persisted identity; tests cover both corrupt
+ forms and duplicate malformed callbacks.
+
+## A green shared-target build embedded another worktree's dashboard
+AREA: build
+SEVERITY: wrong-conclusion
+STATUS: open
+DATE: 2026-09-04
+SESSION: amux
+CARD: AMUX-4142
+SYMPTOM: A post-commit `scripts/safe-cargo.sh build -p amux-server` in the
+ Basecoat integration worktree exited 0 and `/health` reported that worktree's
+ `11c1b789` commit, but the same process served `APP_VER=0.9.804` and no
+ `ui-system.js` from another worktree instead of its own `0.9.807` Basecoat
+ assets. Both worktrees use the required shared `CARGO_TARGET_DIR`; Cargo
+ treated the other checkout's `amux-dashboard` RustEmbed artifact as current.
+COST: Seven minutes, an extra 2m32s server build, and a browser run that would
+ have falsely certified the old UI if it had checked appearance without joining
+ `/health.commit` to the actually served asset version.
+FIX: Open as AMUX-4142. Make embedded-asset provenance part of the build
+ fingerprint or have the build/deploy gate compare served APP_VER/CACHE with
+ the source tree and emit a sweep-visible mismatch verdict.
+
+## A lost Stop report left a finished Primis turn WORKING for 139 seconds
+AREA: hooks
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: Root's live browser saw both Primis subagents finish and Claude return
+ to its prompt at 15:22, but the worker card and input still said WORKING. The
+ status explanation chose a fresh `prompt-hook` active report with zero live
+ subagents; the hook log showed the missing edge exactly: `15:22:22 primis
+ source=stop-hook http=000` during a server rebuild.
+COST: the production UI contradicted the provider for 139 seconds and Board
+ pickup remained suppressed after all work was terminal. It self-cleared only
+ when the active-report trust window expired, not because the final fact landed.
+FIX: ATE-45 makes main-turn state a durable singleton latest-wins queue using
+ the same bounded detached drain as lifecycle events. A newer report atomically
+ replaces an older pending state, so recovery cannot replay idle over a later
+ active turn; successful recovery logs the state, identity, attempt and
+ `replayed_state` verdict. The exact lost-Stop outage replays idle without any
+ later hook and is a shipped regression cell.
+
+## Claude's stale background-wait scrollback overruled a later completed turn
+AREA: status
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: Primis visibly returned to its final prompt after
+ `CLAUDE-POSTFIX-COMPLETE`, with zero live subagents and an idle stop report,
+ but status-explain still set `provider_background_working=true` because an
+ older provider-owned "Waiting for 1 background agent to finish" row remained
+ in tmux scrollback.
+COST: Workers stayed WORKING and turn-boundary-safe Board drive remained
+ suppressed for minutes after the real work finished.
+FIX: ATE-45 reads Claude's provider rows as ordered lifecycle edges: a newer
+ completed-turn marker terminates every older wait, while a newer wait still
+ wins. The status path logs `superseded_by_completed_turn`, and exact-frame
+ adapter, detector and status-explain regressions cover the live Primis pane.
+
+## One capture shell's cooldown hid the next non-work shell forever
+AREA: board
+SEVERITY: stuck
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: PRIMI-204 was explicitly classified by its prompt as "do not create or
+ retain a board task", but a recent nudge for PRIMI-203 activated the lane-wide
+ advance cooldown before PRIMI-204 received its own cleanup prompt. It remained
+ in `doing` after the turn ended with no `decompose:PRIMI-204` event.
+COST: a non-task occupied the Board indefinitely while the drive report called
+ the lane healthy and no model was asked to make the keep/discard decision.
+FIX: ATE-45 lets a newly captured shell rejected by the shared pickup classifier
+ bypass an unrelated lane cooldown exactly once, prioritizes that exact card,
+ and relies on the durable per-card `decompose:<id>` idem to close the exception.
+ The bypass emits `capture_cleanup_bypassed_lane_cooldown`; a focused regression
+ proves both the first nudge and duplicate suppression.
+
+## Codex `turn_aborted` left an interrupted turn structurally active
+AREA: status
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: After Codex displayed `Conversation interrupted` and returned to its
+ empty prompt, both Workers surfaces stayed WORKING. Status-explain chose a
+ fresh `codex_rollout` active vote even though the stop report was idle,
+ `subagents_live=0`, and `provider_background_working=false`. The rollout held
+ the exact missing edge: an `event_msg` whose payload type was `turn_aborted`.
+COST: An already terminal turn suppressed safe Board drive and contradicted the
+ provider UI until a later recognized lifecycle event replaced the stale vote.
+FIX: ATE-45 treats both top-level and nested Codex abort events as durable idle
+ boundaries, surfaces the chosen boundary in status-explain, and emits the
+ `interrupted_turn_is_terminal` status-truth verdict. Exact rollout and pane
+ regressions pin the interrupted-turn prompt frame for Codex and Ollama.
+
+## No board state means "blocked on ANOTHER LANE's decision"
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-04
+SESSION: backend
+CARD: AF-506
+SYMPTOM: Autonomous backlog triage picked up MI-4155, a card owned by a different
+ lane. Every state is a lie or a loop: `backlog` re-feeds the same lane's
+ auto-pickup (it came back twice), `todo` re-queues after cooldown, `needsyou`
+ reads as blocked on Ethan rather than on a peer, and `review` — which the
+ DISPATCHER's own card text recommends ("if blocked on an owner decision, move to
+ review") — gates on acking "Implemented and self-tested" / "Diff / PR is up",
+ which a card you are ROUTING AWAY cannot truthfully claim.
+COST: A lane cycled a card through two dead ends before finding that PATCHing the
+ card's `session` to the owning lane is the answer. Nothing in the blocked
+ response's how_to_ack hints at it, so every lane running backlog triage
+ rediscovers it or picks a dead end. Ethos rule 3: no truthful path for a
+ legitimate state.
+FIX: AF-506. (b) first — surface "reassign session to the owning lane" in the
+ blocked response, the same way it already surfaces the gate-ack CLI. (a) a real
+ blocked-on-peer state that does not re-dispatch and is not gated on a
+ self-implementation attestation; that is a board-state change and is Ethan's to
+ approve. Also fix the dispatcher's "move to review" line, which routes people
+ into the refusal.
+
+## Shared-checkout guard blocks `git reset` but not the bare `git commit`
+AREA: gates
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-04
+SESSION: backend
+CARD: AF-507
+SYMPTOM: `git add <file>` hit a peer's index.lock and failed, so the file was
+ never staged. The follow-up bare `git commit -m` then committed the whole
+ index-vs-frozen-HEAD drift — 1120 files, +67067/-6296 — under their message, not
+ containing their change. `git reset --soft HEAD~1` to undo it was then BLOCKED by
+ git-shared-guard.py, correctly. The guard blocks the FIX and not the CAUSE.
+COST: A near-miss, contained only because the mega-commit was local-only and
+ diverged non-ff from origin; the real change landed via the zero-write graft
+ recipe instead. `git reset` is guarded because it moves HEAD, while a bare `git
+ commit` on this checkout is both more common and less recoverable, and is
+ unguarded.
+FIX: AF-507. Refuse a no-pathspec `git commit` whose staged set exceeds a
+ file-count threshold against ORIGIN/MAIN (not HEAD — graft-push freezes HEAD
+ ~1846 behind, which is what makes the drift large), with a named audited env
+ escape. backend confirms both primitives already exist in that guard: the
+ origin/main-diff is in the co-edit leg and the escape shape is the --allow-*/env
+ pins. Related: AF-503 (the index.lock contention that started the sequence).
+
+## An unsigned fake browser PID shut down every Linux CI runner process
+AREA: tests
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-44
+SYMPTOM: Ten consecutive Rust check jobs ended around seven minutes with "runner
+ received a shutdown signal" after commit 92044fc8 added a browser-reaper test
+ seeded with PID 4294967295. The test called the real browser stop path, which
+ passed that decimal string to Linux procps `kill -TERM`; procps returned success
+ and treated the unsigned value as the signed process-group sentinel -1.
+COST: Every descendant main run lost the workspace-test process and GitHub runner,
+ blocking ATE-44 and ATE-45 verification while the 25-minute workflow timeout and
+ passing test output falsely suggested external cancellation.
+FIX: ATE-44 validates every browser PID at the signed OS boundary, refuses
+ reserved/group values before constructing arguments or launching external
+ `kill`, and emits `invalid_process_id_refused`. The original
+ 4294967295 fixture remains as an end-to-end regression, with boundary controls
+ for PID 0, PID 1, ordinary positive PIDs, and the signed maximum.
+
+## Multiplayer workspace switching was replayed later as offline work
+AREA: cloud
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-codex
+CARD: AC-416
+SYMPTOM: In three simultaneous saved browser profiles, switching workspaces
+ returned synthetic HTTP 202 `queued/offline`, reloaded as though it succeeded,
+ and either stayed in the old workspace or changed context later when the
+ outbox replayed. The god-mode account's switcher also rendered all 62 inherited
+ workspaces as a giant green invitation banner, and chrome-cdp's shared
+ `pages.json` made listing profile C erase the target lookup for profiles A/B.
+COST: Ethan, god mode, and the Gmail participant could not be kept in one
+ workspace long enough to prove cross-user board/log visibility; retries
+ created delayed context switches, and the operator-facing page exposed the
+ whole customer directory above the actual dashboard.
+FIX: Workspace switching is now explicitly non-replayable, requires a real
+ JSON acknowledgement, and reports `workspace_switch_failed` instead of
+ reloading on failure. The gateway acknowledges JSON clients before entering a
+ tenant container and logs `[org-switch] ... verdict=switched`. Org rows say
+ `via_god_mode`, so inherited access remains in Settings without becoming an
+ invite banner. chrome-cdp now scopes targets/sockets by profile or port and
+ selects the requested profile from the multi-browser status array.
+
+## Three-user cloud test saturated on minute-long workspace requests
+AREA: cloud
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-04
+SESSION: amux-codex
+CARD: AC-416
+SYMPTOM: The Gmail workspace stayed on "Starting your workspace" for several
+ minutes while board/session reads in the other two profiles took 50-135s.
+ The local 8824 control plane simultaneously repeated its known failure mode:
+ TCP accepted, but TLS `/health` handshakes timed out until the watchdog or a
+ manual launchd restart replaced the process.
+COST: A browser-created Backlog canary existed only in Ethan's optimistic page
+ state; after more than a minute the owner profile still had an empty board, so
+ real cross-user observation and actor attribution could not be certified.
+FIX: AC-416. The saved profiles and exact three-identity browser path now
+ reproduce it without credentials, and the watchdog/server log records the TLS
+ hang. Diagnose tenant wake latency and the local request-path stalls before
+ claiming realtime multiplayer from a cached shell.
+
+## A CLI negative control assumed its specimen was globally unique
+AREA: tests
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-44
+SYMPTOM: Fresh descendant CI completed the full Rust workspace suite after the
+ PID-safety fix, then `scripts/test-cli-launch-unbound.sh` refused to build its
+ broken fixture because a second command legitimately gained the same local
+ AMUX_API declaration used by cmd_start.
+COST: The otherwise-valid ATE-44 descendant run stayed red after all 1,947
+ amux-server library tests and every integration binary passed; the failure was
+ attributed from the job log only after the old runner-shutdown defect cleared.
+FIX: The negative control now counts and removes the declaration only within
+ cmd_start, preserving the independent declaration in cmd_open_browser while
+ still proving the broken fixture fails with an unbound variable. Its failure
+ output names the scoped occurrence count.
+
+## An async menu-reachability assertion raced the app's normal rerender
+AREA: tests
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-44
+SYMPTOM: The full Playwright run passed 300 scenarios, then the ATE-44 iOS
+ Safari parity case failed because `scrollIntoViewIfNeeded` acquired the Focus
+ action before a session poll rerendered the peek menu and detached that node.
+COST: The six-case focused matrix had passed, but the first full descendant CI
+ run stayed red after 16.7 minutes and could not satisfy ATE-44's final gate.
+FIX: The parity test now scrolls and measures the final Focus action inside the
+ same synchronous render snapshot. It still proves overflow, scrollability and
+ viewport reachability while eliminating the cross-rerender locator lifetime.
+
+## Staged-guard attributed this Codex task's files to two peer lanes and blocked its commit
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-05
+SESSION: amux (Codex agent; no $AMUX_SESSION in env)
+CARD: AMUX-3249
+SYMPTOM: After implementing and browser-testing local multiplayer invites, the commit
+  guard attributed the staged files to `amux-cloud` and `amux-frustrations` and refused
+  the commit even though every staged hunk was produced by this task. The shell had an
+  empty $AMUX_SESSION, but its tmux name resolved to `amux-amux` and the installed
+  MR-43 prepare-commit hook already contained that fallback, so the commit stamp and
+  the edit-record ownership used by the guard still disagreed.
+COST: One refused commit and about 5 minutes re-reading all nine staged files by hand
+  before the documented AMUX_VERIFIED_SOLO override could be used honestly.
+FIX: AMUX-3249. Attribute Codex tool writes to the active agent/session, or make the
+  guard distinguish absent agent edit records from affirmative peer ownership so a
+  missing producer cannot be rendered as evidence that a peer authored the diff.
+
+## Delegated worker requests held the requester's WIP instead of becoming task dependencies
+AREA: scheduler
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-05
+SESSION: amux
+CARD: AMUX-4153
+SYMPTOM: `amux board request` created a durable child task and terminal callback,
+ but left the requester's active parent in `doing` with no `depends_on` edge. The
+ requester therefore occupied its WIP slot and appeared idle until the peer finished.
+COST: Delegation serialized work that should have run concurrently, hid independent
+ ready work from the requester, and left the board without a durable record of why
+ the requester was waiting.
+FIX: ccb37879 atomically adds the delegated child to the parent task's dependencies,
+ requeues the parent to `todo` to release WIP, and lets the existing ready frontier
+ wake it when the child closes. `amux::task_dependency` now logs a verdict for every
+ linked, standalone, ambiguous, invalid-parent, or cycle-refused peer request.
+
+## Usage resets opened the clock gate after delivery had already been skipped
+AREA: scheduler
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-05
+SESSION: amux
+CARD: AMUX-4154
+SYMPTOM: A Claude worker with a known, elapsed reset remained protocol-level
+ `RateLimited` until its first subsequent prompt, while the legacy lane sweep could
+ roll a stale clock banner forward to the next day. The scheduler also recovered
+ rate-limited workers after command delivery and planning had already consumed a
+ stale snapshot, leaving the worker idle for another tick.
+COST: Workers could remain visibly idle after their provider said usage was
+ available, and queued work needed a manual interaction or an extra scheduler cycle
+ before it continued.
+FIX: dd57e1d5 makes an elapsed reported reset immediately deliverable, recovers
+ protocol workers before pumping and planning, and preserves the original reset
+ through stale terminal banners. `amux::usage_reset` emits `worker_recovered`,
+ `delivery_released`, and `delivery_gate_open` verdicts at each release boundary.
+
+## Settings collapsed a multi-provider fleet into one Claude quota bar
+AREA: observability
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-05
+SESSION: amux
+CARD: AMUX-4154
+SYMPTOM: The Settings usage panel exposed only Claude's two coarse percentages even
+ though the built-in registry also supports Codex, Gemini, and Ollama. Codex's API
+ supplies named buckets, exact reset times, durations, credits, and plan metadata,
+ but none of those facts reached the operator.
+COST: Operators could not tell which provider constrained a mixed fleet, how long a
+ limit would last, or whether another provider was unmetered or simply unmeasured.
+FIX: ecbf4daf derives the Settings rows from the full built-in provider registry,
+ retains every provider-reported window and exact reset, and distinguishes unavailable
+ quota APIs from unlimited local inference. 6bdf9999 also resolves Codex through the
+ same login-shell path as a real worker, rather than launchd's stale-but-executable
+ shim. `amux::usage_probe` logs whenever a probe succeeds or cannot report its quota.

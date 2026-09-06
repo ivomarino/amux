@@ -653,8 +653,12 @@ async fn apply(
                         ask_type: None,
                         ask_question: None,
                         ask_unblocks: None,
+                        ask_actor: None,
                         // AF-367: seeded by a fleet-config apply, not authored by anyone.
                         source: Some("config".into()),
+                        requested_by: None,
+                        callback_session: None,
+                        callback_prompt: None,
                     };
                     let row = crate::db::board_store::create_issue(conn, &new, now)?;
                     if !epic.is_empty() {

@@ -59,6 +59,20 @@ whole-file write and on this shared checkout has reverted a peer's in-flight
 work twice (AMUX-3670, AF-284). Naming it here because it existed for four days
 and reached neither of the two lanes that mutate most, which is rule 1 applied
 to a rule.
+**A GREEN MUTATION CAN MEAN REDUNDANCY RATHER THAN COVERAGE.** Mutate ONE rule at
+a time and require the suite to NAME that rule. If reverting rule A leaves you
+green because rule B covers it, you have not tested A, you have tested A-or-B
+(mixpeek-frustrations, 2026-09-04). That is fine as a safety property and it is
+not coverage, and the difference only shows up on the day somebody deletes B.
+The trap is that the suite reports STRONGEST exactly where the rules are most
+redundant, which is where somebody is most likely to simplify one away as a
+duplicate. Three instances in one day: two overlapping regexes in the shared
+git-guard where reverting either alone stayed green and only reverting both
+reddened three cells; a test grepping the CONDITION `$CANARY_CODE = 1` rather
+than the OUTCOME, where the condition also guards a second block and survived a
+mutation that collapsed the thing it selects; and a test matching its own label
+inside a comment written in the same sitting. Count the OUTCOMES (distinct
+labels, distinct titles), not the guard.
 
 **8. Are you deciding something that is the human's to decide?**
 Whose data is this? Would they recognise the change as theirs? Report and

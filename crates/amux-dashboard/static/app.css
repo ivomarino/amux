@@ -180,10 +180,19 @@
   .card-menu {
     display: none; position: fixed;
     background: var(--card); border: 1px solid var(--border);
-    /* Menus can open upward into the global approval strip. Keep them above
-       that in-flow strip (90), but below full-screen overlays (100+), so a
-       pending permission request never makes worker actions unclickable. */
-    border-radius: 10px; min-width: 200px; z-index: 95;
+    /* TWO constraints, and only a value above BOTH satisfies them.
+       1. Menus can open upward into the global approval strip (90), so a
+          pending permission request must not make worker actions unclickable.
+       2. The column ellipsis menu also opens INSIDE #peek-overlay, which is
+          `.overlay { z-index: 100 }` a few hundred lines up. At 95 it paints
+          underneath: the menu is built, populated and positioned correctly and
+          the click does nothing. Measured with elementFromPoint at the menu's
+          own corner, which returned the tab bar. It works on the global board,
+          which is not inside an overlay, which is why 95 looks sufficient.
+       310 clears the strip (90) and the overlay (100) and the modal backdrop
+       (300), and stays under the toast/picker layers (2000+) that must cover
+       it. 95 clears only the first. */
+    border-radius: 10px; min-width: 200px; z-index: 310;
     box-shadow: 0 8px 24px rgba(0,0,0,0.4);
     overflow-x: hidden; overflow-y: auto; max-height: 500px;
   }
@@ -878,6 +887,7 @@
   .overlay-body a:active { color: #79c0ff; }
   .overlay-body .file-link { color: var(--cyan); text-decoration: none; border-bottom: 1px dashed var(--cyan); cursor: pointer; }
   .overlay-body .file-link:active { color: #79ead3; }
+  .overlay-body button.file-link { appearance: none; -webkit-appearance: none; background: none; border-top: 0; border-right: 0; border-left: 0; padding: 0; font: inherit; }
   .overlay-body .md-link { color: var(--yellow); text-decoration: none; border-bottom: 1px dashed var(--yellow); cursor: pointer; }
   .overlay-body .md-link:active { color: #e8c547; }
   /* A markdown link to ANOTHER file — opens IN the viewer (renderMarkdown +
@@ -1821,6 +1831,54 @@
   .settings-tab-panel.active { display: block; }
   .settings-section { padding: 6px 14px; }
   .settings-section-label { font-size: 0.68rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px; font-weight: 600; }
+  /* Four providers fit as four one-line summaries; only the tightest quota is
+     expanded on open. Details retain every provider window and exact reset
+     without turning the 260px Settings menu into a quota dashboard. */
+  #settings-usage-body { display: grid; gap: 4px; }
+  .usage-provider {
+    border: 1px solid var(--border); border-radius: 7px; background: var(--bg);
+    overflow: hidden;
+  }
+  .usage-provider summary {
+    display: flex; align-items: center; gap: 5px; min-height: 30px;
+    padding: 3px 7px; cursor: pointer; list-style: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .usage-provider summary::-webkit-details-marker { display: none; }
+  .usage-provider summary::before {
+    content: '›'; color: var(--dim); font-size: 0.9rem; line-height: 1;
+    transform: rotate(0); transition: transform 0.12s ease;
+  }
+  .usage-provider[open] summary::before { transform: rotate(90deg); }
+  .usage-provider-name {
+    color: var(--fg); font-size: 0.78rem; font-weight: 600;
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .usage-provider-plan {
+    color: var(--dim); background: var(--card); border: 1px solid var(--border);
+    border-radius: 999px; padding: 1px 5px; font-size: 0.61rem;
+    text-transform: capitalize; white-space: nowrap;
+  }
+  .usage-provider-status {
+    margin-left: auto; color: var(--dim); font-size: 0.69rem; white-space: nowrap;
+  }
+  .usage-provider-detail { padding: 1px 7px 7px 22px; }
+  .usage-window { margin-top: 6px; }
+  .usage-window-line { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; }
+  .usage-window-label {
+    color: var(--fg); font-size: 0.72rem; min-width: 0; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+  }
+  .usage-window-value { color: var(--dim); font-size: 0.67rem; flex-shrink: 0; white-space: nowrap; }
+  .usage-bar { height: 4px; margin-top: 3px; border-radius: 3px; background: var(--border); overflow: hidden; }
+  .usage-bar > span { display: block; height: 100%; border-radius: inherit; }
+  .usage-reset { color: var(--dim); font-size: 0.62rem; margin-top: 2px; white-space: normal; }
+  .usage-unavailable { color: var(--dim); font-size: 0.68rem; line-height: 1.35; padding-top: 4px; }
+  .usage-provider-meta { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+  .usage-provider-meta > span {
+    color: var(--dim); background: var(--card); border: 1px solid var(--border);
+    border-radius: 999px; padding: 1px 5px; font-size: 0.61rem;
+  }
   .settings-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
   .settings-row input {
     flex: 1; font-size: 0.78rem; padding: 6px 8px; border-radius: 6px;
@@ -1892,12 +1950,14 @@
   .peek-msg-count { font-size: 0.62rem; color: var(--dim); white-space: nowrap; line-height: 1; padding: 1px 0; min-width: 16px; text-align: center; user-select: none; }
   .peek-prompt.peek-msg-current { outline: 2px solid var(--accent); outline-offset: 1px; border-radius: 3px; }
   .peek-more-wrap { position: relative; }
-  .peek-more-dropdown { display: none; position: absolute; top: calc(100% + 4px); right: 0; background: var(--card); border: 1px solid var(--border); border-radius: 8px; min-width: 160px; z-index: 60; box-shadow: 0 6px 20px rgba(0,0,0,0.3); }
+  .peek-more-dropdown { display: none; position: absolute; top: calc(100% + 4px); right: 0; background: var(--card); border: 1px solid var(--border); border-radius: 8px; min-width: 260px; max-width:min(340px,calc(100vw - 16px)); max-height:min(500px,calc(100dvh - 120px)); overflow-x:hidden; overflow-y:auto; z-index: 60; box-shadow: 0 6px 20px rgba(0,0,0,0.3); }
   .peek-more-dropdown.open { display: block; }
   .peek-more-item { display: flex; align-items: center; gap: 8px; padding: 10px 14px; cursor: pointer; font-size: 0.85rem; color: var(--text); border-bottom: 1px solid var(--border); -webkit-tap-highlight-color: transparent; }
   .peek-more-item:last-child { border-bottom: none; }
   .peek-more-item:active { background: var(--border); }
   .peek-more-item .mi { width: 18px; text-align: center; flex-shrink: 0; }
+  .peek-more-item.danger { color: var(--red); }
+  .peek-more-sep { height:1px; background:var(--border); }
   /* Peek search highlight */
   .peek-highlight { background: rgba(210,153,34,0.35); color: #fff; border-radius: 2px; }
   .peek-highlight.current { background: rgba(210,153,34,0.85); color: #000; }
@@ -1934,7 +1994,7 @@
   /* Peek compact mode — when visual viewport is constrained (pinch zoom / keyboard) */
   .overlay.vv-compact .peek-cmd-row .chips { display: none !important; }
   .overlay.vv-compact .peek-dir-bar { display: none; }
-  .overlay.vv-compact .peek-tabs { padding: 0 8px; }
+  .overlay.vv-compact .peek-tabs { padding: 0 0 0 8px; }   /* right stays 0, see .peek-tabs */
   .overlay.vv-compact .peek-tab { padding: 4px 10px; font-size: 0.75rem; }
   .overlay.vv-compact .overlay-header { padding-bottom: 4px !important; gap: 2px !important; }
   .overlay.vv-compact .peek-cmd-toggle { padding: 3px; }
@@ -2076,7 +2136,11 @@
     border-radius: 12px; font-weight: 600; letter-spacing: 0.02em;
   }
   /* Peek tabs & memory panel */
-  .peek-tabs { display: flex; border-bottom: 1px solid var(--border); flex-shrink: 0; padding: 0 12px;
+  /* padding-RIGHT is 0 deliberately (AF-45): #peek-tab-customize below is
+     position:sticky at right:0 of this scrollport, and a right padding is inside
+     the scrollable area, so tabs render in that gap and bleed past the pinned
+     button. The button carries its own padding, so nothing is lost. */
+  .peek-tabs { display: flex; border-bottom: 1px solid var(--border); flex-shrink: 0; padding: 0 0 0 12px;
     overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; scrollbar-width: none; -ms-overflow-style: none;
     overscroll-behavior-x: contain; touch-action: pan-x; }
   .peek-tabs::-webkit-scrollbar { display: none; }
@@ -2252,7 +2316,7 @@
     #peek-overlay .overlay-header { padding-bottom: 0 !important; gap: 2px !important; margin-bottom: 2px; }
     #peek-overlay #peek-task-row { display: none !important; }
     #peek-overlay .peek-dir-bar { padding: 1px 6px; font-size: 0.68rem; }
-    #peek-overlay .peek-tabs { padding: 0 4px; }
+    #peek-overlay .peek-tabs { padding: 0 0 0 4px; }   /* right stays 0, see .peek-tabs */
     #peek-overlay .peek-tab { padding: 3px 8px; min-height: 36px; font-size: 0.75rem; }
     #peek-overlay .overlay-body { padding: 6px; }
     /* Reclaim the "Updated … · vX" status line on mobile — its ~20px is
@@ -2435,6 +2499,17 @@
   .status-badge.idle { background: rgba(139,148,158,0.15); color: var(--dim); }
   .status-badge.steering { background: rgba(137,87,229,0.2); color: var(--purple,#8957e5); }
   .status-badge.rate-limited { background: rgba(248,81,73,0.18); color: #f85149; }
+  .status-badge.work-queued-chip {
+    border: 0; margin-left: 6px; cursor: pointer; font-family: inherit;
+    white-space: nowrap; max-width: min(260px, 42vw); overflow: hidden;
+    text-overflow: ellipsis; -webkit-tap-highlight-color: transparent;
+  }
+  .work-queued-short { display: none; }
+  @media (max-width: 600px) {
+    .work-queued-wide { display: none; }
+    .work-queued-short { display: inline; }
+    .status-badge.work-queued-chip { max-width: 170px; }
+  }
   .last-active { font-size: 0.7rem; color: var(--dim); flex-shrink: 0; }
   .token-count { font-size: 0.65rem; color: var(--dim); flex-shrink: 0; font-family: "SF Mono","Fira Code",monospace; opacity: 0.7; }
 
@@ -2952,6 +3027,33 @@
     color: var(--dim); padding: 4px 2px; transition: color 0.15s;
   }
   .tab-customize-btn:hover { color: var(--fg); }
+  /* AF-45, the part three passes at this card kept missing: on a phone the peek's
+     ⊞ is not merely SMALL, it is OFF-SCREEN. Measured 2026-09-04 on the shipped
+     build, both mobile targets, peek open with the default tab set:
+       iPhone 15 / WebKit  viewport 393  strip scrollWidth 1025  ⊞ at left=983
+       Chromium 375        viewport 375  strip scrollWidth  985  ⊞ at left=943
+     Nine of sixteen tabs and the ⊞ itself sit past the right edge. Reaching the
+     customizer requires discovering that a strip with no scrollbar
+     (`::-webkit-scrollbar{display:none}`) scrolls horizontally, and panning it
+     ~590px. That is consistent with every report on this card and with either
+     reading of "the box", so it needed no branch decision to fix.
+     WHY THE E2E WENT GREEN THROUGH ALL OF IT, and this is the same shape as the
+     44px comment above: Playwright scrolls an element into view before clicking
+     it. `btn.click()` therefore tests a path the user cannot take. The check that
+     discriminates is the button's rect against the viewport with NO scrolling,
+     which is what tab-customizer.spec.ts now asserts.
+     The main dashboard never had this bug because `.tab-bar-outer` keeps its
+     `.tab-customize-wrap` OUTSIDE the scroller as a sibling. The peek's button is
+     the last child INSIDE `.peek-tabs`. Sticky reproduces that pinning without
+     restructuring a strip whose focus/compact/mobile rules select `.peek-tabs`
+     by name in five places — a wrapper would have had to be added to each, and
+     missing one hides the border or leaves a stray button in focus mode. */
+  #peek-tab-customize {
+    position: sticky; right: 0; z-index: 2;
+    background: var(--bg);
+    border-left: 1px solid var(--border);
+    box-shadow: -10px 0 10px -8px rgba(0, 0, 0, 0.45);
+  }
   /* AF-45. Ethan, three reports: "I click it and nothing happens. It doesn't show."
      Measured on his viewport (screenshot 1125x2436 @3x = 375x812) under WebKit: the
      button's box is 16.5 x 35. The MENU was never the bug — it opens correctly,

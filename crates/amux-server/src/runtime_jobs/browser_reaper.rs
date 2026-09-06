@@ -281,7 +281,113 @@ pub async fn reap_stale_profiles(home: &std::path::Path) -> Vec<String> {
     removed
 }
 
-async fn tick(home: &std::path::Path) -> Vec<String> {
+
+/// Why a browser was released. One variant per arm of `tick`, so the notice
+/// cannot drift from the reason the log line gives.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ReapReason {
+    /// No driver verb for the whole activity window — nobody was driving it.
+    NoActivity { since_verb_s: i64, window_s: u64 },
+    /// Hard age ceiling, regardless of what was open.
+    Ttl { age_s: i64, ttl_s: u64 },
+    /// No real page open for the whole idle window.
+    Idle { idle_s: i64, window_s: u64 },
+}
+
+impl ReapReason {
+    fn sentence(&self) -> String {
+        match *self {
+            ReapReason::NoActivity { since_verb_s, window_s } => format!(
+                "nothing had driven it for {}min (the activity window is {}min)",
+                since_verb_s / 60,
+                window_s / 60
+            ),
+            ReapReason::Ttl { age_s, ttl_s } => format!(
+                "it hit the hard age ceiling — open {}min, limit {}min",
+                age_s / 60,
+                ttl_s / 60
+            ),
+            ReapReason::Idle { idle_s, window_s } => format!(
+                "it had no page open for {}min (the idle window is {}min)",
+                idle_s / 60,
+                window_s / 60
+            ),
+        }
+    }
+}
+
+/// What the owning lane is told when amux closes its browser (AF-497).
+///
+/// The reaper already knows the profile, the owner and the reason, and writes
+/// all three to the log and to LAST_EXIT. It told the one party who needed it
+/// nothing. Measured in a live onboarding session (2026-09-04): a Chrome window
+/// disappeared mid-task and the exchange was "where'd the browser go?" / "did it
+/// close?" / "it did, but I didn't close it" — a human watching a window vanish,
+/// guessing, and landing on "it has, like, a zombie thing".
+///
+/// Addressed to the LANE and explicitly asks it to tell the person, because the
+/// person is the one who saw it happen and amux has no channel to them.
+///
+/// Pure, so what it says is testable without a Chrome or a reaper tick.
+pub fn reap_notice(profile: &str, reason: ReapReason) -> String {
+    format!(
+        "[amux] I closed your browser on profile {profile:?}: {}.\n\n\
+         NOTHING WAS LOST that was saved: the profile's logins, cookies and \
+         sessions are on disk and survive. What is gone is the running window and \
+         whatever was only in it — an unsubmitted form, an unsaved page.\n\n\
+         IF A PERSON WAS USING THAT WINDOW, TELL THEM. They watched it disappear \
+         and amux has no way to reach them; from where they sit a window vanished \
+         for no reason. Say that amux closed it, say why, and say their logins \
+         survived.\n\n\
+         Reopen it whenever you need it:\n\
+         POST /api/browser/start {{\"profile\":\"{profile}\"}}\n\n\
+         To stop this happening mid-task, widen or disable the window: \
+         AMUX_BROWSER_ACTIVITY_REAP_S, AMUX_BROWSER_TTL_S, AMUX_BROWSER_REAP_AFTER_S \
+         (0 disables an arm) in ~/.amux/server.env.",
+        reason.sentence()
+    )
+}
+
+/// Deliver the reap notice to the lane that started the browser.
+///
+/// Best-effort and never fatal: a reap that succeeded must not be reported as a
+/// failure because a notice could not be delivered. An owner amux cannot name is
+/// the one case with nothing to send to, and it is LOGGED rather than dropped —
+/// a browser reaped with nobody told is exactly the silence this exists to end.
+async fn notify_owner_of_reap(
+    store: &crate::db::SharedStore,
+    owner: &str,
+    profile: &str,
+    reason: ReapReason,
+) {
+    let owner = owner.trim();
+    if owner.is_empty() {
+        tracing::warn!(
+            profile = %profile,
+            "browser: reaped a profile with no recorded owner — nobody could be told (AF-497)"
+        );
+        return;
+    }
+    let text = reap_notice(profile, reason);
+    match crate::api::session_verbs::steer_enqueue_store(
+        store, owner, &text, "browser-reaper", "browser-reaper",
+    )
+    .await
+    {
+        Ok(_) => tracing::info!(
+            profile = %profile, owner = %owner, reason = ?reason,
+            "browser: told the owning lane its browser was released (AF-497)"
+        ),
+        // An isolated lane refuses harness sends by design, and that refusal is
+        // correct rather than a fault — say which it was.
+        Err(e) => tracing::warn!(
+            profile = %profile, owner = %owner, reason = ?reason, error = %e,
+            "browser: could not tell the owning lane its browser was released (AF-497)"
+        ),
+    }
+}
+
+async fn tick(home: &std::path::Path, store: Option<&crate::db::SharedStore>) -> Vec<String> {
     // Runs BEFORE the early return below: the profile TTL is about disk that
     // nobody is using, and the idle arm is about a running browser with no
     // pages. Disabling one must not silently disable the other — they were
@@ -315,6 +421,13 @@ async fn tick(home: &std::path::Path) -> Vec<String> {
                      (AMUX_BROWSER_ACTIVITY_REAP_S). Logins survive on disk."
                 );
                 crate::integrations::browser::stop_profile_as(home, &profile, "activity-reaper").await;
+                if let Some(st) = store {
+                    notify_owner_of_reap(st, &owner, &profile, ReapReason::NoActivity {
+                        since_verb_s: since_verb as i64,
+                        window_s: activity_ttl,
+                    })
+                    .await;
+                }
                 next.remove(&profile);
                 reaped.push(profile);
                 continue;
@@ -332,6 +445,13 @@ async fn tick(home: &std::path::Path) -> Vec<String> {
                  Any open page is lost; saved login is on disk and survives."
             );
             crate::integrations::browser::stop_profile_as(home, &profile, "ttl-reaper").await;
+            if let Some(st) = store {
+                notify_owner_of_reap(st, &owner, &profile, ReapReason::Ttl {
+                    age_s: age_s as i64,
+                    ttl_s: ttl,
+                })
+                .await;
+            }
             next.remove(&profile);
             reaped.push(profile);
             continue;
@@ -369,6 +489,13 @@ async fn tick(home: &std::path::Path) -> Vec<String> {
         // what happened rather than leaving the AMUX-3414 silence — a browser
         // that vanished with nothing on record cost two sessions a morning.
         crate::integrations::browser::stop_profile_as(home, &profile, "idle-reaper").await;
+        if let Some(st) = store {
+            notify_owner_of_reap(st, &owner, &profile, ReapReason::Idle {
+                idle_s: idle_s as i64,
+                window_s: after_s,
+            })
+            .await;
+        }
         next.remove(&profile);
         reaped.push(profile);
     }
@@ -391,7 +518,7 @@ pub fn idle_ages(home: &std::path::Path, now: f64) -> HashMap<String, f64> {
 
 /// Spawn the loop, registered so a dead reaper is visible on
 /// `/api/system-jobs` rather than silently absent.
-pub fn spawn() {
+pub fn spawn(store: crate::db::SharedStore) {
     let interval = Duration::from_secs(tick_secs());
     let h = tokio::spawn(async move {
         let mut t = tokio::time::interval(interval);
@@ -399,7 +526,7 @@ pub fn spawn() {
             t.tick().await;
             crate::runtime_jobs::registry::tick(crate::runtime_jobs::registry::ids::BROWSER_REAPER);
             let home = crate::integrations::browser::amux_home();
-            let _ = tick(&home).await;
+            let _ = tick(&home, Some(&store)).await;
         }
     });
     crate::runtime_jobs::registry::adopt(
@@ -415,6 +542,172 @@ mod tests {
     use serde_json::json;
 
     /// What counts as a real page, and what Chrome spawns on its own.
+    /// THE WIRING, not the wording.
+    ///
+    /// Every other cell here reads `reap_notice`'s TEXT, and all of them stay
+    /// green if `tick` never calls it — measured: disabling the call site left
+    /// 11/11 passing, which is the feature silently deleted and the suite
+    /// reporting success. This one drives the real `tick` and reads the queue.
+    ///
+    /// The activity arm is the one exercised because it fires before any CDP
+    /// call, so the reap happens without a Chrome. `u32::MAX` is intentionally
+    /// retained as the regression sentinel: Linux procps interpreted that
+    /// unsigned value as the process-group pid -1 and terminated the CI runner
+    /// until the browser signal boundary began rejecting it (ATE-44).
+    #[tokio::test]
+    async fn a_reap_actually_enqueues_the_notice_for_the_owning_lane() {
+        let home = tempfile::tempdir().unwrap();
+        let db = tempfile::tempdir().unwrap();
+        let store: crate::db::SharedStore =
+            std::sync::Arc::new(crate::db::Store::open(&db.path().join("t.db")).unwrap());
+
+        // Prove the target exists through the durable worker row that the
+        // enqueue chokepoint already understands. Do not take HomeGuard here:
+        // this test also exercises the process-global browser registry, and a
+        // parallel browser test can take those two locks in the opposite order.
+        // The first guarded draft wedged 14 unrelated tests in the full suite.
+        store
+            .write_async(|conn| {
+                conn.execute(
+                    "INSERT INTO _amux_workers \
+                     (id, display_name, name_aliases, cwd, provider, model, state, created_at, updated_at) \
+                     VALUES ('wrk_reaper_notice', 'gtm-engine', '[]', '/tmp', 'claude', \
+                             'test', '{\"state\":\"stopped\"}', \
+                             '2026-09-04T00:00:00Z', '2026-09-04T00:00:00Z')",
+                    [],
+                )?;
+                Ok(crate::db::WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
+            })
+            .await
+            .unwrap();
+
+        // SAFETY: this is the only test that mutates these two variables, and
+        // both are restored below before the test returns.
+        let prior_after = std::env::var("AMUX_BROWSER_REAP_AFTER_S").ok();
+        let prior_act = std::env::var("AMUX_BROWSER_ACTIVITY_REAP_S").ok();
+        unsafe { std::env::set_var("AMUX_BROWSER_REAP_AFTER_S", "60") };
+        unsafe { std::env::set_var("AMUX_BROWSER_ACTIVITY_REAP_S", "1") };
+
+        crate::integrations::browser::test_clear_running();
+        crate::integrations::browser::test_seed_running_port("hubspot", "gtm-engine", u32::MAX, 1);
+
+        let reaped = crate::integrations::browser::test_with_kill_capture(async {
+            let reaped = tick(home.path(), Some(&store)).await;
+            assert!(
+                crate::integrations::browser::test_kill_commands().is_empty(),
+                "u32::MAX reached /bin/kill through the real reaper stop path"
+            );
+            assert!(
+                crate::integrations::browser::test_normal_pid_reaches_kill(std::process::id())
+                    .await,
+                "the normal positive-pid control did not invoke a successful kill -0"
+            );
+            assert_eq!(
+                crate::integrations::browser::test_kill_commands(),
+                vec![["-0".to_string(), std::process::id().to_string()]],
+                "only the normal control may reach /bin/kill"
+            );
+            reaped
+        })
+        .await;
+        assert_eq!(reaped, vec!["hubspot".to_string()], "the activity arm did not fire");
+
+        let rows: Vec<(String, String)> = {
+            let conn = store.read().unwrap();
+            let mut st = conn.prepare("SELECT session, text FROM steering_queue").unwrap();
+            let out = st
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect();
+            out
+        };
+        crate::integrations::browser::test_clear_running();
+        match prior_after {
+            Some(v) => unsafe { std::env::set_var("AMUX_BROWSER_REAP_AFTER_S", v) },
+            None => unsafe { std::env::remove_var("AMUX_BROWSER_REAP_AFTER_S") },
+        }
+        match prior_act {
+            Some(v) => unsafe { std::env::set_var("AMUX_BROWSER_ACTIVITY_REAP_S", v) },
+            None => unsafe { std::env::remove_var("AMUX_BROWSER_ACTIVITY_REAP_S") },
+        }
+
+        let mine: Vec<&(String, String)> =
+            rows.iter().filter(|(s, _)| s == "gtm-engine").collect();
+        assert_eq!(
+            mine.len(),
+            1,
+            "the reap did not enqueue exactly one notice for the owning lane: {rows:?}"
+        );
+        assert!(
+            mine[0].1.contains("hubspot") && mine[0].1.contains("TELL THEM"),
+            "the queued text is not the reap notice: {}",
+            mine[0].1
+        );
+    }
+
+    /// THE CELL THIS EXISTS FOR. The reaper already knew the profile, the owner
+    /// and the reason and wrote all three to the log; the one party who needed
+    /// them got nothing. The notice has to carry each, and it has to tell the
+    /// lane to pass it on — the PERSON is the one who watched the window vanish
+    /// and amux has no channel to them.
+    #[test]
+    fn the_notice_names_the_profile_the_reason_and_asks_the_lane_to_tell_the_person() {
+        let n = reap_notice("hubspot", ReapReason::Idle { idle_s: 1800, window_s: 900 });
+        assert!(n.contains("hubspot"), "the profile is not named: {n}");
+        assert!(n.contains("no page open for 30min"), "the reason is not stated: {n}");
+        assert!(
+            n.contains("IF A PERSON WAS USING THAT WINDOW, TELL THEM"),
+            "the notice never asks the lane to pass it on, which is the whole gap: {n}"
+        );
+    }
+
+    /// The sentence that stops a panic. A vanished browser reads as lost logins,
+    /// and the specimen's user had just spent minutes recovering a password.
+    #[test]
+    fn the_notice_says_the_logins_survived() {
+        for r in [
+            ReapReason::Idle { idle_s: 900, window_s: 900 },
+            ReapReason::Ttl { age_s: 7200, ttl_s: 3600 },
+            ReapReason::NoActivity { since_verb_s: 600, window_s: 600 },
+        ] {
+            let n = reap_notice("default", r);
+            assert!(n.contains("survive"), "no reassurance about saved state in {r:?}: {n}");
+            assert!(n.contains("/api/browser/start"), "no way back in {r:?}: {n}");
+        }
+    }
+
+    /// Each arm says something DIFFERENT. Three reaper arms fire for three
+    /// different reasons and need three different responses from the reader —
+    /// "nobody was driving it" and "it hit a hard ceiling" are not the same
+    /// news, and a shared sentence would make them read as one.
+    #[test]
+    fn every_reap_reason_produces_its_own_sentence() {
+        let a = reap_notice("p", ReapReason::NoActivity { since_verb_s: 600, window_s: 600 });
+        let b = reap_notice("p", ReapReason::Ttl { age_s: 7200, ttl_s: 3600 });
+        let c = reap_notice("p", ReapReason::Idle { idle_s: 900, window_s: 900 });
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
+        assert!(a.contains("nothing had driven it"), "{a}");
+        assert!(b.contains("hard age ceiling"), "{b}");
+        assert!(c.contains("no page open"), "{c}");
+    }
+
+    /// The knobs are named. Without them the only response to "amux closed my
+    /// browser mid-task" is to hit start again and wait for it to happen twice
+    /// more.
+    #[test]
+    fn the_notice_names_the_knobs_that_prevent_a_recurrence() {
+        let n = reap_notice("default", ReapReason::Ttl { age_s: 7200, ttl_s: 3600 });
+        for knob in ["AMUX_BROWSER_ACTIVITY_REAP_S", "AMUX_BROWSER_TTL_S", "AMUX_BROWSER_REAP_AFTER_S"] {
+            assert!(n.contains(knob), "{knob} is not offered: {n}");
+        }
+    }
+
     #[test]
     fn only_a_real_page_keeps_a_browser_alive() {
         let page = |u: &str| json!({"type": "page", "url": u});

@@ -35,10 +35,21 @@ PASS=0; FAIL=0
 ok()  { echo "  ok   $1"; PASS=$((PASS+1)); }
 bad() { echo "  FAIL $1"; [ -n "${2:-}" ] && echo "       $2"; FAIL=$((FAIL+1)); }
 
-# The one line whose removal reproduces AMUX-3145. Unique in the file: it is the only
-# AMUX_API declaration resolved via $(cmd_url) (the others use a literal default), so
-# deleting it leaves the use at amux:650 out of scope without touching any other path.
+# The one line whose removal reproduces AMUX-3145. Scope the mutation to cmd_start:
+# other commands legitimately resolve AMUX_API through cmd_url too, and adding one of
+# those must not make this negative control impossible to construct. Deleting the
+# declaration only inside cmd_start leaves the use at amux:650 out of scope without
+# touching another function's independent declaration.
 SPECIMEN='local AMUX_API="${AMUX_API:-$(cmd_url)}"'
+
+count_cmd_start_specimen() {
+  awk -v needle="$SPECIMEN" '
+    /^cmd_start\(\)[[:space:]]*\{/ { in_cmd_start=1 }
+    in_cmd_start && index($0, needle) { count++ }
+    in_cmd_start && /^}/ { in_cmd_start=0 }
+    END { print count + 0 }
+  ' "$1"
+}
 
 # ── Isolated fleet ───────────────────────────────────────────────────────────
 # CC_HOME is overridable (amux:35), so the worker roster is a throwaway dir. A stub
@@ -90,19 +101,25 @@ else
 fi
 
 # ── 2. self-check / negative control: the AMUX-3145 specimen must be caught ────
-# Build the broken copy by deleting cmd_start's AMUX_API declaration.
+# Build the broken copy by deleting cmd_start's AMUX_API declaration. Do not use a
+# file-wide grep deletion: cmd_open_browser now carries the same legitimate spelling.
 BROKEN="$WORK/amux-broken"
-grep -Fv "$SPECIMEN" "$AMUX_BIN" > "$BROKEN"
+awk -v needle="$SPECIMEN" '
+  /^cmd_start\(\)[[:space:]]*\{/ { in_cmd_start=1 }
+  in_cmd_start && index($0, needle) { next }
+  { print }
+  in_cmd_start && /^}/ { in_cmd_start=0 }
+' "$AMUX_BIN" > "$BROKEN"
 # Prove the fixture is ACTUALLY broken before trusting its failure. A self-check that
 # silently no-ops (the specimen line drifted, so nothing was deleted) is the exact
 # theatre rule 7 warns about: build a broken fixture, verify it is broken.
-n_orig=$(grep -Fc "$SPECIMEN" "$AMUX_BIN")
-n_brk=$(grep -Fc "$SPECIMEN" "$BROKEN" || true)
+n_orig=$(count_cmd_start_specimen "$AMUX_BIN")
+n_brk=$(count_cmd_start_specimen "$BROKEN")
 if [ "$n_orig" -eq 1 ] && [ "$n_brk" -eq 0 ]; then
   ok "broken fixture built: cmd_start AMUX_API declaration removed (was $n_orig, now $n_brk)"
 else
   bad "could not build the broken fixture; has the specimen line drifted?" \
-      "expected exactly 1 occurrence in $AMUX_BIN and 0 in the copy; got $n_orig and $n_brk"
+      "expected exactly 1 cmd_start occurrence in $AMUX_BIN and 0 in the copy; got $n_orig and $n_brk"
 fi
 run_launch "$BROKEN"; RC=$?; OUT=$(cat "$WORK/out")
 if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q "unbound variable"; then

@@ -458,6 +458,51 @@ pub(crate) enum PathFate {
 /// Pure, because the wording is the product here and the branch it sits in is a
 /// 60-line async block nothing could reach — the same reason `victim_path_line`
 /// below was pulled out.
+/// The notice BODY, which must not prescribe a check the verdict then retracts
+/// (AF-505).
+///
+/// The body was unconditional: "If those are edits you had staged or in flight…",
+/// then "Check with: git log -2 --stat -- <path>", then "If your work was
+/// absorbed, do not rewrite shared history…", and only THEN the verdict, which
+/// for a settled set says "Nothing here needs reconciling."
+///
+/// Measured across both server logs: 154 victim notices sent, 69 of them (45%)
+/// carrying `all paths settled/absorbed/landed`. Every one of those 69 told its
+/// reader to run a check and what to do if their work was absorbed, before
+/// telling them nothing was at risk. Two lanes paid that check repeatedly in one
+/// day — mixpeek-frustrations twice on one file, this lane five times — and every
+/// instance came back "nothing to reconcile".
+///
+/// Same shape as the DIVERGED nudge's generated-file carve-out (AF-428): a caveat
+/// placed UNDER a command is read after the command. The fix there was to stop
+/// handing the recipe to the class it is wrong for, and it is the fix here.
+///
+/// The unsettled arm is unchanged. That is the direction that must never get
+/// quieter.
+pub(crate) fn victim_body(all_settled: bool) -> &'static str {
+    if all_settled {
+        "This fires on EDIT RECORDS, and an edit record is not authorship on a shared \
+         checkout. Nothing below needs action from you; the per-path lines say why."
+    } else {
+        "This is the mirror of the warning they got. If those are edits you had \
+         staged or in flight, they may land under THEIR commit message — the code \
+         usually survives, the reasoning does not."
+    }
+}
+
+/// The remedy block, which only a set with something at risk should receive.
+pub(crate) fn victim_remedy(all_settled: bool, first_path: &str) -> String {
+    if all_settled {
+        String::new()
+    } else {
+        format!(
+            "\n\nCheck with:  git log -2 --stat -- {first_path}\n\
+             If your work was absorbed, do not rewrite shared history — record the \
+             reasoning where it belongs (a follow-up commit, or the card) and say so."
+        )
+    }
+}
+
 pub(crate) fn victim_verdict(all_settled: bool, all_mine: bool) -> &'static str {
     if all_settled && all_mine {
         "\n\nEVERY path above is already committed by you, so this is almost certainly \
@@ -994,6 +1039,10 @@ const READ_ONLY_VERBS: &[&str] = &[
     "cut", "column", "od", "xxd", "hexdump", "tree", "du", "basename",
     "dirname", "realpath", "readlink", "sha256sum", "md5sum", "nl", "tac",
     "pwd", "echo", "printf",
+    // `read` consumes stdin into a shell variable and cannot touch a file.
+    // Reached via `while read -r l; do ...; done`, where stripping `while` leaves
+    // it as the segment's verb (AMUX-2841 fix, 2026-09-04).
+    "read",
     // `cd` cannot modify anything, and its ABSENCE silently undid the
     // git-read exemption directly below: `git show f` was correctly a read,
     // while `cd /repo && git show f` was not, because the FIRST segment's
@@ -1079,12 +1128,107 @@ fn is_pure_read_command(cmd: &str) -> bool {
             }
             return false;
         }
+        // SHELL STRUCTURE IS NOT A COMMAND (AMUX-2841's first observed specimen,
+        // 2026-09-04). `for c in A B; do git show HEAD:f | grep -c x; done` splits
+        // into verbs [for, do, git, grep, done], and `for`/`do`/`done` are not read
+        // verbs, so a loop wrapping nothing but reads was classified as a potential
+        // write. Its paths then went to the mtime gate, and while a PEER was
+        // committing frustrations.md the gate minted a self-claim on a file this
+        // lane had only read. That is the exact trigger AMUX-2841 was filed on and
+        // waited for a specimen since 2026-08-11; it produced two in one session.
+        //
+        // IDENTICAL TO THE `cd` CASE directly above, which cost 117 of 191
+        // inferred-edit records in 24h (AEAB-24): one non-command token at the
+        // front of a segment decided the whole command.
+        //
+        // SAFE FOR THE SAME REASON. The check is conjunctive: EVERY segment must
+        // read, so `for f in *; do rm $f; done` still fails on the `rm` segment.
+        // Adding structure words cannot make a mutation look like a read; it only
+        // stops structure from making a read look like a mutation.
+        // STRIP leading structure and check what FOLLOWS it. Skipping the whole
+        // segment was the first version of this fix and the negative cell caught
+        // it in one run: `for f in *.rs; do rm $f; done` splits to
+        // ["for f in *.rs", "do rm $f", "done"], and skipping on `do` never
+        // examined the `rm`. Structure must not be able to hide a command behind
+        // it, which is the entire safety property here.
+        let mut toks = seg.split_whitespace().skip_while(|t| {
+            let v = Path::new(t).file_name().and_then(|x| x.to_str()).unwrap_or(t);
+            SHELL_STRUCTURE.contains(&v)
+        });
+        let verb = match toks.next() {
+            // Nothing but structure (`done`, `fi`, `esac`). Reads nothing, writes
+            // nothing, decides nothing.
+            None => continue,
+            Some(t) => Path::new(t).file_name().and_then(|x| x.to_str()).unwrap_or(t),
+        };
+        // Inside a test expression. `if [ -f a.md ]; then cat a.md; fi` leaves
+        // `-f a.md ]` once `if` and `[` are stripped, and a command never begins
+        // with a dash. `[ ... ]` evaluates a condition and runs nothing.
+        if verb.starts_with('-') || verb == "]" || verb == "]]" {
+            continue;
+        }
+        // `for c in AF-1 AF-2` leaves `c in AF-1 AF-2` once `for` is stripped, and
+        // the loop VARIABLE is not a command. A segment whose head is a bare word
+        // followed by the `in` keyword is a for/case header and runs nothing.
+        if seg.split_whitespace().any(|t| t == "in")
+            && SHELL_STRUCTURE.contains(
+                &Path::new(seg.split_whitespace().next().unwrap_or(""))
+                    .file_name()
+                    .and_then(|x| x.to_str())
+                    .unwrap_or(""),
+            )
+        {
+            continue;
+        }
+        // Re-run the git and sed arms against the STRIPPED verb, so `do git show f`
+        // gets the same treatment as `git show f`.
+        if verb == "git" {
+            let after: Vec<&str> = seg
+                .split_whitespace()
+                .skip_while(|t| SHELL_STRUCTURE.contains(t))
+                .collect();
+            let mut rest = after.into_iter().skip(1);
+            let mut sub = None;
+            while let Some(t) = rest.next() {
+                if t == "-C" || t == "-c" {
+                    rest.next();
+                    continue;
+                }
+                if t.starts_with('-') {
+                    continue;
+                }
+                sub = Some(t);
+                break;
+            }
+            match sub {
+                Some(x) if GIT_READ_SUBCMDS.contains(&x) => continue,
+                _ => return false,
+            }
+        }
+        // A stray delimiter left by splitting on `(` and `)`. `echo "x $(git show
+        // f | grep y)"` yields a final segment of `"`, whose "verb" is `"` — not a
+        // read verb, so the same false claim followed. A token with no alphanumeric
+        // character is punctuation the split produced, never a command.
+        if !verb.chars().any(|c| c.is_alphanumeric()) {
+            continue;
+        }
         if !READ_ONLY_VERBS.contains(&verb) {
             return false;
         }
     }
     saw
 }
+
+/// Shell keywords and builtins that STRUCTURE a command without running one.
+///
+/// Deliberately not merged into `READ_ONLY_VERBS`: that list means "a command
+/// that reads", and `done` reads nothing. Keeping them apart is what makes the
+/// safety argument legible — structure is skipped, commands are checked.
+const SHELL_STRUCTURE: &[&str] = &[
+    "for", "do", "done", "while", "until", "if", "then", "elif", "else", "fi",
+    "case", "esac", "in", "select", "function", "time", "!", ":", "true",
+    "[", "[[", "]]", "test",
+];
 
 /// `sed -n '1,50p' <file>` is a READ, and it is the read this fleet is TOLD to
 /// use: bypass-permissions sessions are instructed to "read files with cat,
@@ -1100,8 +1244,90 @@ fn is_pure_read_command(cmd: &str) -> bool {
 /// conservative treatment; anything unrecognized still falls through to
 /// authored, so no real write loses its attribution — the direction this must
 /// never get wrong.
+/// Split on whitespace, but treat a quoted span as one token.
+///
+/// Only good enough for counting operands: it does not resolve escapes or nested
+/// quoting, and it does not need to. Anything it gets wrong lands on "there is an
+/// operand", which is the conservative side.
+fn quote_aware_tokens(seg: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    for c in seg.chars() {
+        match quote {
+            Some(q) => {
+                cur.push(c);
+                if c == q {
+                    quote = None;
+                }
+            }
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                cur.push(c);
+            }
+            None if c.is_whitespace() => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            None => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 fn sed_is_pure_read(seg: &str) -> bool {
     let mut saw_n = false;
+    // A SED WITH NO FILE OPERAND CANNOT REACH A FILE (AMUX-2841's third specimen,
+    // 2026-09-04). `... | sed 's/^/x/'` reads stdin and writes stdout. The `-n`
+    // requirement below is right for `sed 's/a/b/' notes.md`, which NAMES a file,
+    // and wrong for a stream filter, which names none — and the wrong half claimed
+    // board_drive.rs off a peer's concurrent commit, through the pipeline
+    // `git show HEAD:...board_drive.rs | grep -c ... | sed 's/^/  n: /'`, where the
+    // first two segments classify as reads and the third decided the command.
+    //
+    // Operand counting, not flag counting: `-e` and `-f` CONSUME the next token
+    // (the script, and a script FILE), so a bare token after them is an operand
+    // rather than the script. With neither, the first bare token IS the script.
+    // `-i` still refuses regardless, and `-i` cannot occur without an operand
+    // anyway; `/w` still refuses, since it writes with no shell redirection.
+    // QUOTE-AWARE TOKENS. `split_whitespace` tears `'s/^/  n: /'` into three
+    // tokens and the last two counted as file operands, which put the specimen
+    // back where it started. A quoted span is ONE token: keeping it whole also
+    // keeps a quoted FILENAME (`sed -n 'p' 'my file.txt'`) countable as the
+    // operand it is, which dropping quoted spans entirely would have lost — the
+    // unsafe direction.
+    let toks = quote_aware_tokens(seg);
+    let mut operands = 0usize;
+    let mut script_taken = false;
+    let mut expect_arg = false;
+    for tok in toks.iter().skip(1).map(String::as_str) {
+        if expect_arg {
+            expect_arg = false;
+            script_taken = true;
+            continue;
+        }
+        if tok == "-e" || tok == "-f" || tok == "--expression" || tok == "--file" {
+            expect_arg = true;
+            continue;
+        }
+        if tok.starts_with("-e") || tok.starts_with("-f") {
+            script_taken = true; // attached form, e.g. -e's/a/b/'
+            continue;
+        }
+        if tok.starts_with('-') {
+            continue;
+        }
+        if script_taken {
+            operands += 1;
+        } else {
+            script_taken = true;
+        }
+    }
+    let stream_only = operands == 0;
     for tok in seg.split_whitespace().skip(1) {
         if tok == "--in-place" || tok.starts_with("--in-place=") {
             return false;
@@ -1129,7 +1355,9 @@ fn sed_is_pure_read(seg: &str) -> bool {
     if seg.contains("/w") || seg.contains("/W") {
         return false;
     }
-    saw_n
+    // Every write route is ruled out above. With no file operand there is nothing
+    // left for sed to write to, so `-n` is not required to call it a read.
+    stream_only || saw_n
 }
 
 /// MG-1484: is this command a RESTORE and nothing else? True when every
@@ -1757,6 +1985,39 @@ pub(crate) fn inferred_warn_fields(
     (r(base), r(verb), r(blocked_by))
 }
 
+/// The verdict the WARN can actually support for a `blocked_by` token (AF-452).
+///
+/// Extracted from the log site so the arms can be tested. They could not be
+/// before, and the first one was wrong for its whole life.
+///
+/// THE ORDER IS LOAD-BEARING. `first_blocking_verb` `continue`s on a real git
+/// read subcommand, so a genuine `git status` can NEVER reach this field. A
+/// BARE `status`/`show`/`log`/`blame` token therefore proves the OPPOSITE of
+/// what it looks like: it came from quoted DATA tokenised as shell, not from a
+/// git invocation. `is_known_read_verb` consults GIT_READ_SUBCMDS and so reads
+/// it as a genuine read, which is the upgrade that manufactured the lie.
+///
+/// Measured 2026-09-03 over 75,758 firings: all 17 `verdict=READ verb` rows
+/// ever emitted were this artifact (`blocked_by=status`, on two mixpeek lanes),
+/// and each told its reader it was the specimen AMUX-2841 had been parked on
+/// since 2026-08-11. Zero real specimens. Same class as AMUX-3822 — quoted data
+/// read as shell — arriving through a quoted string instead of a heredoc.
+fn inferred_edit_verdict(blocked_by: &str) -> &'static str {
+    if GIT_READ_SUBCMDS.contains(&blocked_by) {
+        "a BARE git read subcommand — impossible from a real git invocation, which \
+         first_blocking_verb skips, so this token came from QUOTED DATA tokenised as \
+         shell. NOT a specimen; it is AMUX-3822's defect through a quoted string (AF-452)"
+    } else if is_known_read_verb(blocked_by) {
+        "READ verb — is_pure_read_command missed a reader, so this record may be minting \
+         FALSE co-authorship. This is the specimen AMUX-2841 wants"
+    } else if blocked_by == "redirect" {
+        "output redirection — a write, the record working as designed"
+    } else {
+        "NOT a known read verb, and not classifiable from this token alone — treat as \
+         unmeasured rather than as a write (AMUX-3822)"
+    }
+}
+
 fn warn_inferred_edit(session: &str, abs_path: &str, cmd: &str) {
     // Same stripper as `first_blocking_verb` (AMUX-3822): this extractor had
     // the identical defect and produced `verb=persona_tick.json`, a filename.
@@ -1795,15 +2056,7 @@ fn warn_inferred_edit(session: &str, abs_path: &str, cmd: &str) {
     // third answer and must stay distinguishable from both others: it means the
     // token is in neither vocabulary, so this row cannot be classified and is
     // not evidence either way.
-    let verdict = if is_known_read_verb(&blocked_by) {
-        "READ verb — is_pure_read_command missed a reader, so this record may be minting \
-         FALSE co-authorship. This is the specimen AMUX-2841 wants"
-    } else if blocked_by == "redirect" {
-        "output redirection — a write, the record working as designed"
-    } else {
-        "NOT a known read verb, and not classifiable from this token alone — treat as \
-         unmeasured rather than as a write (AMUX-3822)"
-    };
+    let verdict = inferred_edit_verdict(&blocked_by);
     // AF-343: `verb`, `blocked_by` and `base` are TOKENS LIFTED OUT OF A BASH
     // COMMAND, so anything a lane typed can reach this line, and this line goes
     // to a file. Measured before the fix: 192 live-looking `mxp_sk_` secrets in
@@ -3332,18 +3585,17 @@ pub async fn staged_guard_inner(
                 let text = format!(
                     "[amux staged-guard] Session `{}` is committing in {} and the staged set \
                      includes {} file(s) whose edit records are YOURS:\n{}{}\n\n\
-                     This is the mirror of the warning they got. If those are edits you had \
-                     staged or in flight, they may land under THEIR commit message — the code \
-                     usually survives, the reasoning does not.\n\n\
-                     Check with:  git log -2 --stat -- {}\n\
-                     If your work was absorbed, do not rewrite shared history — record the \
-                     reasoning where it belongs (a follow-up commit, or the card) and say so.{}",
+                     {}{}{}",
                     session,
                     wd_root,
                     paths.len(),
                     list,
                     if more > 0 { format!("\n  … and {more} more") } else { String::new() },
-                    path_names.first().cloned().unwrap_or_default(),
+                    victim_body(all_settled),
+                    victim_remedy(
+                        all_settled,
+                        &path_names.first().cloned().unwrap_or_default()
+                    ),
                     verdict,
                 );
                 let _ = crate::api::session_verbs::steer_enqueue(st, &owner, &text, "staged-guard", "")
@@ -4003,6 +4255,68 @@ mod tests {
             PathFate::SettledByOwner("def5678".into()),
         ];
         assert!(victim_flags(&mine, &[false, false]).1, "all-SettledByOwner is the reader's own");
+    }
+
+    /// A SETTLED NOTICE MUST NOT PRESCRIBE A CHECK ITS OWN VERDICT RETRACTS
+    /// (AF-505).
+    ///
+    /// The body was unconditional: "If those are edits you had staged or in
+    /// flight…", then "Check with: git log -2 --stat", then "If your work was
+    /// absorbed, do not rewrite shared history…", and only THEN the verdict,
+    /// which for a settled set reads "Nothing here needs reconciling."
+    ///
+    /// Measured across both server logs: 154 notices, 69 of them (45%) carrying
+    /// `all paths settled/absorbed/landed`. Every one told its reader to run a
+    /// check before telling them nothing was at risk. Two lanes paid it
+    /// repeatedly in one day and every instance came back "nothing to reconcile".
+    ///
+    /// Same shape as AF-428's generated-file carve-out: a caveat placed UNDER a
+    /// command is read after the command.
+    #[test]
+    fn a_settled_victim_notice_asks_for_no_check() {
+        let body = victim_body(true);
+        let remedy = victim_remedy(true, "src/x.rs");
+        assert!(
+            remedy.is_empty(),
+            "a settled set must get no remedy block; it was told to run git log and \
+             then told nothing was at risk: {remedy:?}"
+        );
+        assert!(
+            !body.contains("may land under THEIR commit message"),
+            "the settled body must not open with the at-risk framing: {body:?}"
+        );
+        assert!(
+            body.contains("edit record is not authorship"),
+            "it must still say WHY it fired, or it is a notice with no content: {body:?}"
+        );
+    }
+
+    /// THE DIRECTION THAT MUST NEVER GET QUIETER. Everything above is a
+    /// suppression, so the unsettled arm needs its own cell: a set with real
+    /// risk keeps the framing, the command, and the do-not-rewrite instruction.
+    #[test]
+    fn an_at_risk_victim_notice_keeps_its_remedy() {
+        let body = victim_body(false);
+        let remedy = victim_remedy(false, "src/x.rs");
+        assert!(
+            body.contains("may land under THEIR commit message"),
+            "the at-risk framing is the point of the notice: {body:?}"
+        );
+        assert!(
+            remedy.contains("git log -2 --stat -- src/x.rs"),
+            "the check must name the actual path, not a placeholder: {remedy:?}"
+        );
+        assert!(
+            remedy.contains("do not rewrite shared history"),
+            "the remedy must keep the instruction that stops the worse repair: {remedy:?}"
+        );
+    }
+
+    /// The two arms must not be the same string, or the split is decorative.
+    #[test]
+    fn the_two_victim_bodies_actually_differ() {
+        assert_ne!(victim_body(true), victim_body(false));
+        assert_ne!(victim_remedy(true, "a"), victim_remedy(false, "a"));
     }
 
     /// An EMPTY fate list must not read as "everything above is yours". `all()`
@@ -4822,8 +5136,62 @@ mod tests {
             "find . -name x.rs",
             "head foo.md | grep x",
             "cat a.md | head -5 | wc -l",
+            // AMUX-2841's first observed specimens, both from one session on
+            // 2026-09-04, both verbatim. A loop and a command substitution over
+            // nothing but reads; before this they classified as potential writes
+            // and minted a self-claim on frustrations.md while a PEER was
+            // committing it.
+            "for c in AF-485 AF-481; do printf '  %s: ' $c; \
+             git show HEAD:frustrations.md | grep -c \"CARD: $c\"; done",
+            "echo \"count: $(git show HEAD:frustrations.md | grep -c '^## ')\"",
+            "if [ -f a.md ]; then cat a.md; fi",
+            "while read -r l; do echo \"$l\"; done",
+            // AMUX-2841's THIRD specimen, 2026-09-04, verbatim. A stream sed has
+            // no file operand: it reads stdin and writes stdout and cannot touch
+            // a file. Requiring `-n` here claimed board_drive.rs off a peer's
+            // concurrent commit.
+            "git show HEAD:crates/x.rs | grep -c 'oldest-first' | sed 's/^/  n: /'",
+            "cat a.md | sed 's/foo/bar/'",
+            "grep x a.md | sed -e 's/a/b/' -e 's/c/d/'",
         ] {
             assert!(is_pure_read_command(cmd), "should be pure read: {cmd}");
+        }
+    }
+
+    /// A STREAM SED IS A READ; A SED WITH A FILE OPERAND KEEPS ITS CAUTION.
+    /// The `-n` requirement is correct when sed NAMES a file and wrong when it
+    /// filters a pipe. These are the writes that must stay authored.
+    #[test]
+    fn a_sed_that_can_reach_a_file_is_still_not_a_read() {
+        for cmd in [
+            "sed -i s/a/b/ notes.md",
+            "sed -i.bak s/a/b/ notes.md",
+            "cat a | sed -ni s/a/b/ notes.md",
+            "cat a | sed 's/x/y/w out.txt'",
+            "sed 's/a/b/' notes.md",
+            "cat a | sed --in-place s/a/b/ notes.md",
+        ] {
+            assert!(!is_pure_read_command(cmd), "a file-reaching sed read as pure: {cmd}");
+        }
+    }
+
+    /// STRUCTURE MUST NOT LAUNDER A WRITE (AMUX-2841 fix, 2026-09-04).
+    ///
+    /// The fix skips shell keywords and punctuation so a loop over reads is a
+    /// read. The direction that must never break is the other one: a mutation
+    /// inside the same structure still has to be authored, or the guard stops
+    /// protecting anything. The check is conjunctive per segment, and this is
+    /// what asserts that it stayed that way.
+    #[test]
+    fn shell_structure_does_not_launder_a_write() {
+        for cmd in [
+            "for f in *.rs; do rm $f; done",
+            "if [ -f a.md ]; then sed -i s/a/b/ a.md; fi",
+            "while read -r l; do echo $l > out.txt; done",
+            "for c in 1 2; do git add frustrations.md; done",
+            "echo \"$(git commit -am wip)\"",
+        ] {
+            assert!(!is_pure_read_command(cmd), "structure laundered a write: {cmd}");
         }
     }
 
@@ -5584,6 +5952,51 @@ mod tests {
         //    silently rewriting every command it sees.
         let plain = "cd /repo && python3 -c 'open(\"x\",\"w\")'";
         assert_eq!(strip_heredoc_bodies(plain), plain);
+    }
+
+    /// AF-452: `verdict=READ verb` was reachable ONLY as an artifact.
+    ///
+    /// All 17 rows it ever produced were `blocked_by=status` from quoted prose,
+    /// each announcing itself as the specimen AMUX-2841 was parked on. Both
+    /// arms below, because the fix must not become a deletion: arm 1 kills the
+    /// false positive, arm 2 fails if the read arm was removed rather than
+    /// reordered.
+    #[test]
+    fn a_bare_git_read_token_is_an_artifact_and_says_so() {
+        // ARM 1 — the artifact. A REAL git read never reaches the field.
+        assert_eq!(
+            first_blocking_verb("cd /repo && git status"),
+            None,
+            "a real `git status` is a pure read and names no blocking verb, so a \
+             `status` in blocked_by cannot have come from one",
+        );
+        // ...but quoted DATA is tokenised as shell, so a bare one does reach it.
+        assert_eq!(
+            first_blocking_verb("echo \"checking\nstatus of the run\"").as_deref(),
+            Some("status"),
+            "the newline inside the quoted string splits it into a segment whose \
+             first token is a bare `status` — this is the live defect",
+        );
+        let v = inferred_edit_verdict("status");
+        assert!(
+            v.contains("BARE git read subcommand") && v.contains("NOT a specimen"),
+            "a bare git-read token must be reported as an artifact, got: {v}",
+        );
+        assert!(
+            !v.contains("specimen AMUX-2841 wants"),
+            "the artifact must not claim to be AMUX-2841's specimen",
+        );
+
+        // ARM 2 — the read arm still exists. Reordering must not delete it.
+        // (`cat` cannot reach blocked_by today either, which is AF-452's larger
+        // finding; the arm is kept so a future tokeniser fix has it to reach.)
+        assert!(
+            inferred_edit_verdict("cat").contains("specimen AMUX-2841 wants"),
+            "a genuine read verb must still classify as the specimen case",
+        );
+        // And the other two arms are untouched.
+        assert!(inferred_edit_verdict("redirect").contains("output redirection"));
+        assert!(inferred_edit_verdict("kubectl").contains("not classifiable"));
     }
 
     /// The WARN must state the verdict it can support, not hand the reader a

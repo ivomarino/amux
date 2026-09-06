@@ -622,6 +622,91 @@ fn google_union_scopes(requesting: &Provider) -> String {
     set.into_iter().collect::<Vec<_>>().join(" ")
 }
 
+/// Plain-words capability for one OAuth scope, and whether it is DESTRUCTIVE.
+///
+/// AF-500. A user watched a worker delete a shared Google Sheet and asked two
+/// questions the product could not answer: "do I want to give it so much
+/// permission?" and "why did it delete the sheet?" Their worry was correct and
+/// understated: `google_union_scopes` unions every Google provider's scopes, so
+/// authorizing ANY Google connector — connecting Gmail for email, say — also
+/// requests `auth/drive`, which is full Drive including permanent deletion, and
+/// hands it to every worker. The auth response said "One approval per account"
+/// and listed nothing.
+///
+/// Returning `None` for an unmapped scope would let a new scope be added and
+/// silently vanish from the disclosure, which understates a grant in exactly the
+/// direction that matters. Unknown scopes are listed verbatim instead.
+fn scope_capability(scope: &str) -> (String, bool) {
+    match scope {
+        "https://www.googleapis.com/auth/drive" => (
+            "Google Drive — read, edit, CREATE AND PERMANENTLY DELETE any file in this \
+             account's Drive, including files other people shared with it"
+                .into(),
+            true,
+        ),
+        "https://www.googleapis.com/auth/drive.file" => (
+            "Google Drive — only files this app created or the account explicitly opened \
+             with it; it cannot see or delete anything else"
+                .into(),
+            false,
+        ),
+        "https://www.googleapis.com/auth/documents" => {
+            ("Google Docs — read and edit document content".into(), false)
+        }
+        "https://www.googleapis.com/auth/gmail.modify" => (
+            "Gmail — read, write, and DELETE mail and drafts in this mailbox".into(),
+            true,
+        ),
+        "https://www.googleapis.com/auth/gmail.send" => {
+            ("Gmail — send mail AS this account".into(), true)
+        }
+        "https://www.googleapis.com/auth/gmail.settings.basic" => {
+            ("Gmail — change settings such as filters, forwarding and signatures".into(), true)
+        }
+        "https://www.googleapis.com/auth/calendar" => (
+            "Google Calendar — read, create, edit and DELETE events".into(),
+            true,
+        ),
+        "https://www.googleapis.com/auth/userinfo.email" => {
+            ("Read this account's email address".into(), false)
+        }
+        s if s.ends_with(".readonly") => (format!("Read-only: {s}"), false),
+        s => (format!("{s} (amux has no plain-words description for this scope yet)"), false),
+    }
+}
+
+/// The whole grant, in the order a human should read it: what it permits, and
+/// which of those are destructive.
+///
+/// Every scope appears exactly once in `permits`, so the count is a real
+/// denominator rather than a list that quietly drops what it does not recognise.
+fn describe_grant(scope: &str) -> Value {
+    let mut permits = Vec::new();
+    let mut destructive = Vec::new();
+    for s in scope.split_whitespace() {
+        let (text, danger) = scope_capability(s);
+        if danger {
+            destructive.push(text.clone());
+        }
+        permits.push(text);
+    }
+    json!({
+        "scope_count": scope.split_whitespace().count(),
+        "permits": permits,
+        "destructive": destructive,
+        "summary": if destructive.is_empty() {
+            "This grant permits no destructive action.".to_string()
+        } else {
+            format!(
+                "THIS ONE APPROVAL GIVES EVERY WORKER {} DESTRUCTIVE CAPABILITIES on this \
+                 account, listed under `destructive`. A worker can act on them without asking \
+                 again. Approve only if that is what you want.",
+                destructive.len()
+            )
+        },
+    })
+}
+
 fn pending_path(home: &std::path::Path) -> PathBuf {
     home.join("connectors").join("pending.json")
 }
@@ -1352,10 +1437,13 @@ async fn begin_auth(
                 format!("{}{}", origin(), callback_path)
             };
             let state = token_urlsafe(24);
+            // AF-500: kept so the response can say what the human is approving.
+            let mut granted_scope = scopes.to_string();
             let (url, verifier) = if p.category == "Google" {
                 // One grant covers the whole Google family: union scopes, so
                 // Ethan approves ONCE per account (see the broker doc above).
                 let scope = google_union_scopes(p);
+                granted_scope = scope.clone();
                 let verifier = token_urlsafe(64);
                 let challenge = base64url_nopad(&Sha256::digest(verifier.as_bytes()));
                 (
@@ -1423,8 +1511,11 @@ async fn begin_auth(
                 )
                     .into_response();
             }
+            let described = describe_grant(&granted_scope);
             tracing::info!(
-                "connector_auth: {} grant started for account={} family={} redirect_uri={}",
+                scopes = %granted_scope,
+                destructive = described["destructive"].as_array().map(Vec::len).unwrap_or(0),
+                "connector_auth: {} grant started for account={} family={} redirect_uri={} (AF-500)",
                 p.id,
                 account,
                 family,
@@ -1458,7 +1549,17 @@ async fn begin_auth(
                         "add_redirect_uri": redirect_uri,
                     })
                 },
-                "note": "open authorize_url in a browser and approve — the callback completes the exchange and stores the grant for every worker. One approval per account.",
+                // WHAT THE APPROVAL ACTUALLY PERMITS (AF-500). The note below has
+                // always said "One approval per account" and never what that one
+                // approval covers. For Google it is the UNION of every Google
+                // provider's scopes, so connecting Gmail for email also grants full
+                // Drive — read, edit and permanent DELETE — to every worker.
+                // A user watched that capability delete a shared Sheet and asked
+                // "do I want to give it so much permission?"; nothing here could
+                // have answered them.
+                "grant": described,
+                "scopes": granted_scope,
+                "note": "open authorize_url in a browser and approve — the callback completes the exchange and stores the grant for every worker. One approval per account. READ `grant` FIRST: it says what that approval permits.",
             }))
             .into_response()
         }
@@ -3714,5 +3815,73 @@ mod tests {
             !store_path(home.path(), "mattermost", "alice").exists(),
             "a failed login must not leave a store file behind"
         );
+    }
+
+    /// THE CELL THIS EXISTS FOR (AF-500). Connecting GMAIL, for email, also
+    /// requests full Drive — the union grant — and the disclosure has to say so
+    /// in the same breath, because that is the capability that deleted a user's
+    /// shared Sheet while they watched.
+    #[test]
+    fn a_gmail_grant_discloses_that_it_also_hands_over_full_drive() {
+        let gmail = REGISTRY.iter().find(|p| p.id == "google-gmail").expect("google-gmail provider");
+        let scope = google_union_scopes(gmail);
+        assert!(
+            scope.contains("https://www.googleapis.com/auth/drive"),
+            "the union no longer carries full Drive; this cell's premise moved: {scope}"
+        );
+        let d = describe_grant(&scope);
+        let destructive = d["destructive"].as_array().expect("destructive list");
+        assert!(
+            destructive.iter().any(|x| x.as_str().unwrap_or("").contains("PERMANENTLY DELETE")),
+            "a grant carrying full Drive does not disclose deletion: {d:#}"
+        );
+        assert!(
+            d["summary"].as_str().unwrap_or("").contains("DESTRUCTIVE"),
+            "the summary does not warn at all: {d:#}"
+        );
+    }
+
+    /// The narrower scope reads DIFFERENTLY. Without this the disclosure could
+    /// be a constant that warns whatever it is handed, which would be exactly as
+    /// green over a grant that is genuinely safe — and it is the check that
+    /// would notice if `drive` were ever narrowed to `drive.file`.
+    #[test]
+    fn the_narrow_drive_scope_is_not_reported_as_destructive() {
+        let d = describe_grant("https://www.googleapis.com/auth/drive.file");
+        assert_eq!(d["destructive"].as_array().map(Vec::len), Some(0), "{d:#}");
+        assert!(
+            d["summary"].as_str().unwrap_or("").contains("no destructive action"),
+            "{d:#}"
+        );
+        assert!(
+            d["permits"][0].as_str().unwrap_or("").contains("cannot see or delete anything else"),
+            "{d:#}"
+        );
+    }
+
+    /// A scope amux has no words for must still be LISTED. Dropping it would
+    /// understate the grant in the one direction that matters, and would happen
+    /// silently the next time a provider gains a scope (ethos rule 4).
+    #[test]
+    fn a_scope_with_no_description_is_still_disclosed() {
+        let d = describe_grant("https://example.com/auth/something-new");
+        assert_eq!(d["scope_count"], 1);
+        assert_eq!(d["permits"].as_array().map(Vec::len), Some(1), "{d:#}");
+        assert!(
+            d["permits"][0].as_str().unwrap_or("").contains("something-new"),
+            "the unknown scope vanished from the disclosure: {d:#}"
+        );
+    }
+
+    /// `permits` is complete: one line per scope, so its length is a real
+    /// denominator rather than a filtered list.
+    #[test]
+    fn every_scope_produces_exactly_one_line() {
+        let gmail = REGISTRY.iter().find(|p| p.id == "google-gmail").expect("google-gmail provider");
+        let scope = google_union_scopes(gmail);
+        let n = scope.split_whitespace().count();
+        let d = describe_grant(&scope);
+        assert_eq!(d["scope_count"], n);
+        assert_eq!(d["permits"].as_array().map(Vec::len), Some(n), "{d:#}");
     }
 }

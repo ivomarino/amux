@@ -1195,10 +1195,41 @@ impl FleetSignals {
             .and_then(serde_json::Value::as_i64)
     }
 
+    /// Provider agent identities behind `subagents_live`. Empty is distinct
+    /// from unavailable through the sibling count: count=null means this lane
+    /// has no lifecycle producer; count=0 plus [] means it reported a final
+    /// stop. Keeping the ids in status-explain makes duplicate/missing-agent
+    /// failures visible without reconstructing hook delivery from text logs.
+    fn reported_subagent_ids(&self, name: &str) -> Option<Vec<String>> {
+        self.reports
+            .get(name)
+            .and_then(|r| r.get("subagents"))
+            .and_then(|s| s.get("live_ids"))
+            .and_then(serde_json::Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+    }
+
     fn pane_says_working(&self, name: &str) -> bool {
         let Some(raw) = self.pane_of(name) else {
             return false;
         };
+        // Codex/ollama have an explicit, ordered terminal boundary. If the
+        // newest frame paints a fresh prompt/model bar, that current-state
+        // evidence outranks stale "Working" rows, queued-message prose, and
+        // the model-agnostic churn history below. Active Codex frames still
+        // return true when their newest boundary is the working row. `None`
+        // means this is not structurally a Codex-family pane, so Claude/Gemini
+        // retain the existing hooks + bar + churn logic unchanged.
+        if let Some(generating) =
+            crate::backend::adapter::codex_pane_generation_state(raw)
+        {
+            return generating;
+        }
         // THE BAR PHRASE ALONE NO LONGER PROVES A GENERATING MAIN TURN
         // (AMUX-2959, Ethan at 1am: "this worker says working" over an idle
         // prompt). Claude Code now shows "esc to interrupt" in the status bar
@@ -1443,6 +1474,12 @@ impl FleetSignals {
             "subagents_live".into(),
             self.reported_subagent_count(name).map(|c| json!(c)).unwrap_or(serde_json::Value::Null),
         );
+        ex.insert(
+            "subagent_live_ids".into(),
+            self.reported_subagent_ids(name)
+                .map(|ids| json!(ids))
+                .unwrap_or(serde_json::Value::Null),
+        );
         ex.insert("subagents_working".into(), json!(self.subagents_working(name)));
         // No transition: prefer the PANE over the activity timestamp when the
         // pane is admissible. A timestamp says something painted; the pane
@@ -1571,6 +1608,22 @@ impl FleetSignals {
         ex.insert("churn_since_claim".into(), json!(churn_since_claim));
         ex.insert("churn_since_claim_threshold".into(), json!(CHURN_MIN_SINCE_CLAIM));
         ex.insert("fresh_idle_contradicted".into(), json!(fresh_idle_contradicted));
+        // Provider-owned background work is not the repaint-race evidence the
+        // fresh-idle gate protects against. Claude explicitly says it is
+        // waiting for live agents; Codex explicitly says its background
+        // terminal is running. Both describe the lane AFTER the parent prompt
+        // became idle, so a fresh parent report cannot contradict them.
+        let provider_background_working = self
+            .pane_of(name)
+            .is_some_and(crate::api::session_verbs::provider_background_working);
+        ex.insert(
+            "provider_background_working".into(),
+            json!(provider_background_working),
+        );
+        if status == "idle" && provider_background_working {
+            status = "active".into();
+            decided = "contradiction_provider_background_working";
+        }
         if status == "idle" && (idle_gate_open || fresh_idle_contradicted) && self.pane_says_working(name)
         {
             status = "active".into();
@@ -1682,6 +1735,7 @@ impl FleetSignals {
                 .as_deref() == Some("waiting");
             ex.insert("codex_rollout".into(), json!({
                 "state": signal.state,
+                "boundary": signal.boundary,
                 "age_s": (self.now - signal.ts).max(0.0),
                 "from_this_life": from_this_life,
                 "applied": from_this_life,
@@ -2707,6 +2761,7 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             // LEAKED count (a lost SubagentStop pinning a lane "working") is
             // diagnosable rather than hidden — null on a hookless/mtime-only lane.
             "subagents_live": signals.reported_subagent_count(&name),
+            "subagent_live_ids": signals.reported_subagent_ids(&name),
             // The lightning button's state derives from THIS field in the
             // SPA (isYolo checks flags for the provider's skip-permissions
             // flag) — a card without flags renders the wrong YOLO badge
@@ -2847,14 +2902,13 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             // `_own` says whether the WORKER's own file sets it, so the UI can
             // tell "this worker" from "inherited" and can refuse to offer a
             // local switch-off for something it did not set locally.
-            "spans_groups": crate::api::session_verbs::scoped_setting_in(
-                &crate::config::amux_home(), &name, "CC_SEND_ALLOW",
-            ).map(|v| !v.trim().trim_matches('"').is_empty()).unwrap_or(false),
-            "spans_groups_value": crate::api::session_verbs::scoped_setting_in(
-                &crate::config::amux_home(), &name, "CC_SEND_ALLOW",
-            ).map(|v| v.trim().trim_matches('"').to_string()).unwrap_or_default(),
-            "spans_groups_own": env.get("CC_SEND_ALLOW")
-                .map(|v| !v.trim().trim_matches('"').is_empty()).unwrap_or(false),
+            "spans_groups": crate::api::session_verbs::cross_group_allow_setting_in(
+                &crate::config::amux_home(), &name,
+            ).map(|v| !v.trim().trim_matches('"').is_empty()).unwrap_or(true),
+            "spans_groups_value": crate::api::session_verbs::cross_group_allow_setting_in(
+                &crate::config::amux_home(), &name,
+            ).map(|v| v.trim().trim_matches('"').to_string()).unwrap_or_else(|| "*".into()),
+            "spans_groups_own": env.contains_key("CC_SEND_ALLOW"),
             "steering_queue": [],
             "managed_by": "python",
         }));
@@ -3735,11 +3789,18 @@ mod tests {
         // A live count with NO transcript activity at all still reads working —
         // exactly what the mtime window missed.
         sig.reports = serde_json::json!({
-            "primis": {"state": "idle", "subagents": {"count": 2, "ts": sig.now - 5.0}}
+            "primis": {"state": "idle", "subagents": {
+                "count": 2, "live_ids": ["explore-1", "explore-2"], "ts": sig.now - 5.0
+            }}
         });
         assert!(
             sig.subagents_working("primis"),
             "a reported live count must contradict idle even with a silent transcript"
+        );
+        assert_eq!(
+            sig.reported_subagent_ids("primis"),
+            Some(vec!["explore-1".into(), "explore-2".into()]),
+            "the identities behind the count must survive into status diagnostics"
         );
 
         // Count back to 0 with no mtime -> not working (the count invents nothing).
@@ -4330,6 +4391,7 @@ Claude usage limit reached. Your limit will reset at 3pm.
             crate::api::session_verbs::CodexTurnSignal {
                 state: "active".into(),
                 ts: s.now - 120.0,
+                boundary: "task_started".into(),
             },
         );
         let (status, ex) = s.derive_status_explain("codex-lane", true);
@@ -4340,7 +4402,9 @@ Claude usage limit reached. Your limit will reset at 3pm.
         assert_eq!(ex["decided_by"], json!("codex_rollout"));
         assert_eq!(ex["codex_rollout"]["applied"], json!(true));
 
-        s.codex_turns.get_mut("codex-lane").unwrap().state = "idle".into();
+        let signal = s.codex_turns.get_mut("codex-lane").unwrap();
+        signal.state = "idle".into();
+        signal.boundary = "task_complete".into();
         let (status, ex) = s.derive_status_explain("codex-lane", true);
         assert_eq!(status, "idle", "task-complete is the provider's terminal truth: {ex}");
         assert_eq!(ex["decided_by"], json!("codex_rollout"));
@@ -4350,6 +4414,52 @@ Claude usage limit reached. Your limit will reset at 3pm.
         assert_eq!(status, "idle", "pre-restart rollout evidence must be ignored: {ex}");
         assert_eq!(ex["codex_rollout"]["applied"], json!(false));
         assert_ne!(ex["decided_by"], json!("codex_rollout"));
+    }
+
+    #[test]
+    fn a_codex_interrupted_turn_is_a_durable_terminal_edge_at_the_prompt() {
+        // ATE-45 live frame, 2026-09-04 16:28. The pane had returned to the
+        // provider's empty prompt, but the rollout's latest recognized event
+        // was still task_started because the real `turn_aborted` edge was
+        // ignored. That pinned both Workers surfaces WORKING until another turn
+        // eventually completed. The rollout boundary, not an mtime grace, owns
+        // this answer.
+        let lane = "ate45-codex-interrupted";
+        let frame = "\
+• Confirmed: b228d3dc is on origin/main, and live /health reports descendant commit b228d3dc1f03173fbccd07d7a36e0fbcdf10c5ef (build 73beeb35e4a579e2). Awaiting your browser reruns.
+
+• Ran amux board discard ATE-52 --outcome-stdin
+  └ ATE-52 → discarded
+
+■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol xhigh · ~/Dev/amux · Main [default]";
+        let mut s = signals();
+        s.activity.insert(format!("amux-{lane}"), (s.now - 1.0) as i64);
+        s.running.insert(format!("amux-{lane}"));
+        s.started.insert(lane.into(), s.now - 300.0);
+        s.reports = json!({lane: {
+            "state": "idle", "ts": s.now - 1607.0, "source": "stop-hook"
+        }});
+        s.panes.insert(lane.into(), frame.into());
+        s.codex_turns.insert(
+            lane.into(),
+            crate::api::session_verbs::CodexTurnSignal {
+                state: "idle".into(),
+                ts: s.now - 1.0,
+                boundary: "turn_aborted".into(),
+            },
+        );
+
+        let (status, ex) = s.derive_status_explain(lane, true);
+        assert_eq!(status, "idle", "turn_aborted must close the live rollout: {ex}");
+        assert_eq!(ex["decided_by"], json!("codex_rollout"), "{ex}");
+        assert_eq!(ex["codex_rollout"]["boundary"], json!("turn_aborted"), "{ex}");
+        assert_eq!(ex["subagents_live"], serde_json::Value::Null, "{ex}");
+        assert_eq!(ex["provider_background_working"], json!(false), "{ex}");
+        assert_eq!(ex["subagents_working"], json!(false), "{ex}");
     }
 
     // ── AMUX-3896: a FRESH idle claim is falsifiable too ────────────────────
@@ -4384,7 +4494,8 @@ Claude usage limit reached. Your limit will reset at 3pm.
 
     fn fresh_idle_lane(lane: &str, claim_age_s: f64) -> FleetSignals {
         let mut s = signals();
-        s.activity.insert(format!("amux-{lane}"), (s.now - 1.0) as i64);
+        s.activity
+            .insert(format!("amux-{lane}"), (s.now - 1.0) as i64);
         s.running.insert(format!("amux-{lane}"));
         s.reports = json!({lane: {"state": "idle", "ts": s.now - claim_age_s, "source": "stop-hook"}});
         s.panes.insert(lane.into(), WORKING_BAR.into());
@@ -4423,12 +4534,14 @@ Claude usage limit reached. Your limit will reset at 3pm.
         let lane = "t4024-bg";
         let mut s = fresh_idle_lane(lane, 9.0);
         s.panes.insert(lane.into(), IDLE_WITH_AGENTS.into());
-        s.reports[lane]["subagents"] = json!({"count": 1, "ts": s.now - 3.0});
+        s.reports[lane]["subagents"] =
+            json!({"count": 1, "live_ids": ["explore-live"], "ts": s.now - 3.0});
         let (status, ex) = s.derive_status_explain(lane, true);
         assert_eq!(status, "active", "a lane waiting on a background agent is not idle: {ex}");
         assert_eq!(ex["decided_by"], json!("contradiction_subagents_reported_live"), "{ex}");
         assert_eq!(ex["idle_contradiction_gate_open"], json!(false), "the 60s gate is still shut: {ex}");
         assert_eq!(ex["subagents_live"], json!(1), "the count is the evidence: {ex}");
+        assert_eq!(ex["subagent_live_ids"], json!(["explore-live"]), "{ex}");
     }
 
     /// AMUX-4024, THE FALSE WORKING — the same card's other direction, and the
@@ -4457,6 +4570,34 @@ Claude usage limit reached. Your limit will reset at 3pm.
         let (status, ex) = s.derive_status_explain(lane, true);
         assert_eq!(status, "idle", "finished agents must not pin a lane WORKING: {ex}");
         assert_eq!(ex["subagents_live"], json!(0), "{ex}");
+    }
+
+    #[test]
+    fn a_final_prompt_after_background_wait_does_not_override_idle() {
+        // ATE-45 live Primis acceptance, including the provider's retained
+        // agent-count footer. The capture-shell card is attached later in
+        // build_array and never participates in this derivation; its presence
+        // cannot turn a terminal pane back into runtime work.
+        let lane = "ate45-primis-complete";
+        let mut s = fresh_idle_lane(lane, 4.0);
+        s.reports[lane]["subagents"] = json!({"count": 0, "live_ids": []});
+        s.panes.insert(
+            lane.into(),
+            "\
+\u{2736} Waiting for 1 background agent to finish
+\u{23fa} Agent \"Post-fix status verification\" finished \u{b7} 16s
+\u{23fa} The background Explore agent finished and returned CLAUDE-POSTFIX-DONE.
+CLAUDE-POSTFIX-COMPLETE
+\u{273b} Churned for 23s \u{b7} done 3:40 PM
+\u{276f}\u{a0}
+\u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} \u{2190} 2 agents"
+                .into(),
+        );
+        let (status, ex) = s.derive_status_explain(lane, true);
+        assert_eq!(status, "idle", "the later terminal boundary must keep the lane idle: {ex}");
+        assert_eq!(ex["provider_background_working"], json!(false), "{ex}");
+        assert_eq!(ex["subagents_live"], json!(0), "{ex}");
+        assert_eq!(ex["decided_by"], json!("report"), "{ex}");
     }
 
     /// The blast radius of making the count authoritative, stated as a test: a
@@ -4641,6 +4782,90 @@ Claude usage limit reached. Your limit will reset at 3pm.
         assert_eq!(status, "active", "{ex}");
         assert_eq!(ex["decided_by"], json!("contradiction_pane_generating"), "{ex}");
         assert!(ex["pane"]["churn_distinct_frames"].as_u64().unwrap() >= 3, "{ex}");
+    }
+
+    /// ATE-36, the second live false-WORKING shape. Codex had finished and
+    /// painted its empty prompt/model bar below a queued-message notice, but
+    /// the dashboard projection OR'd recent pane churn back into "working".
+    /// A provider-specific terminal boundary is stronger evidence than the
+    /// model-agnostic churn fallback: the latter describes recent history,
+    /// while the former says what the newest frame is doing now.
+    #[test]
+    fn a_newer_codex_prompt_beats_queued_message_prose_and_recent_churn() {
+        let lane = "ate36-codex-complete";
+        let completed = "\
+• Messages to be submitted after next tool call (press esc to interrupt and send immediately)
+↳ [amux-origin: amux-frustrations]
+Checked, nothing of mine was at risk, no action needed from you.
+› Ask Codex to do anything
+  gpt-5.6-sol xhigh · ~/Dev/amux";
+        let mut s = signals();
+        s.activity.insert(format!("amux-{lane}"), (s.now - 1.0) as i64);
+        s.running.insert(format!("amux-{lane}"));
+        s.reports = json!({lane: {
+            "state": "idle", "ts": s.now - 1076.0, "source": "stop-hook-test"
+        }});
+
+        // The preceding turn painted multiple distinct bodies. This is the
+        // exact stale history that the live status-explain exposed as
+        // churn_distinct_frames=9 after the prompt was already idle.
+        for (i, body) in ["working one", "working two", "working three"].iter().enumerate() {
+            let frame = format!("{body}\n{completed}");
+            note_pane_frame(lane, &frame, s.now - 4.0 + i as f64, s.contradiction_window());
+        }
+        s.panes.insert(lane.into(), completed.into());
+
+        let (status, ex) = s.derive_status_explain(lane, true);
+        assert_eq!(
+            status, "idle",
+            "the newest Codex prompt is authoritative over queued-message prose and stale churn: {ex}"
+        );
+        assert_eq!(ex["pane"]["says_working"], json!(false), "{ex}");
+        assert!(ex["pane"]["churn_distinct_frames"].as_u64().unwrap() >= 3, "{ex}");
+    }
+
+    /// ATE-38, the opposite live edge of ATE-36. Codex leaves the prompt shell
+    /// visible while generating; an exact active status row immediately above
+    /// it means the prompt is disabled, not that the worker is idle.
+    #[test]
+    fn a_codex_working_row_above_its_prompt_shell_is_active() {
+        let lane = "ate38-codex-active";
+        let active = "\
+• Waiting for background terminal (16m 29s • esc to interrupt)
+› Ask Codex to do anything
+  gpt-5.6-sol xhigh · ~/Dev/amux";
+        let mut s = signals();
+        s.activity.insert(format!("amux-{lane}"), (s.now - 1.0) as i64);
+        s.running.insert(format!("amux-{lane}"));
+        s.reports = json!({lane: {
+            "state": "idle", "ts": s.now - 1076.0, "source": "stop-hook-test"
+        }});
+        s.panes.insert(lane.into(), active.into());
+
+        let (status, ex) = s.derive_status_explain(lane, true);
+        assert_eq!(
+            status, "active",
+            "the adjacent live status row must win: {ex}"
+        );
+        assert_eq!(ex["pane"]["says_working"], json!(true), "{ex}");
+        assert_eq!(
+            ex["decided_by"],
+            json!("contradiction_provider_background_working"),
+            "{ex}"
+        );
+
+        // ATE-45 live variant: an in-flight command moves to Codex's
+        // background terminal, but the parent conversation is still active
+        // and must not accept board-drive input.
+        let background_terminal = "\
+• Working (0s • esc to interrupt) · 1 background terminal running · /ps to view · /stop to close
+› Ask Codex to do anything
+  gpt-5.6-sol xhigh · ~/Dev/amux";
+        s.panes.insert(lane.into(), background_terminal.into());
+        let (status, ex) = s.derive_status_explain(lane, true);
+        assert_eq!(status, "active", "a live Codex background terminal is lane work: {ex}");
+        assert_eq!(ex["pane"]["says_working"], json!(true), "{ex}");
+        assert_eq!(ex["decided_by"], json!("contradiction_provider_background_working"), "{ex}");
     }
 
     /// The two controls that keep churn honest: the SAME frame re-captured is

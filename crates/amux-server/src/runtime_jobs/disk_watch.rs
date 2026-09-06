@@ -599,8 +599,12 @@ async fn tick(state: AppState) {
                 ask_type: None,
                 ask_question: None,
                 ask_unblocks: None,
+                ask_actor: None,
                 // AF-367: filed by the disk watcher.
                 source: Some("disk_watch".into()),
+                requested_by: None,
+                callback_session: None,
+                callback_prompt: None,
             };
             let row = bs::create_issue(conn, &new, crate::api::reclaim::now_secs())?;
             conn.execute(

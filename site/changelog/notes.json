@@ -1,5 +1,41 @@
 [
   {
+    "hash": "83e180ef0b8ecedd1591fa9471a5ab6904261d39",
+    "short": "83e180ef",
+    "title": "Tab customizer button now works on phones",
+    "date": "2026-09-04",
+    "type": "fix",
+    "tags": ["mobile", "dashboard", "ui", "peek"],
+    "description": "The tab customizer button was clipped off-screen on every phone, making it impossible to rearrange or hide tabs from a mobile device. The button is now fully visible and tappable on all phone sizes. Manage your dashboard view from your phone just as you would from a desktop."
+  },
+  {
+    "hash": "62218f49bccf36f44b24bc4df8bf88cea4ca817b",
+    "short": "62218f4",
+    "title": "Board drain trigger no longer loops forever when verification time is missing",
+    "date": "2026-09-04",
+    "type": "fix",
+    "tags": ["board", "automation", "drain", "reliability"],
+    "description": "A board trigger with no verification time set would re-drain the same card in a silent loop, sending duplicate task prompts to sessions. The drain now correctly waits for a verification window before re-triggering. This affected any auto-drain setup where the trigger condition was satisfied but verification hadn't been configured."
+  },
+  {
+    "hash": "cc9909687f95914bb709d4eac710f7bdd10f5abf",
+    "short": "cc99096",
+    "title": "Board API now tells you exactly which fields an unrecognized trigger key expected",
+    "date": "2026-09-04",
+    "type": "feat",
+    "tags": ["board", "api", "dx", "trigger"],
+    "description": "When you POST a board trigger with an unrecognized key, the API now names the correct field names you should have used, instead of silently ignoring the key. This makes it faster to debug automation scripts and integrations that send slightly wrong field names."
+  },
+  {
+    "hash": "e78081710356a25c5e360f87101cab2190ed5350",
+    "short": "e780817",
+    "title": "Board list loads descriptions faster — 512-char prefix hydrated immediately",
+    "date": "2026-09-04",
+    "type": "feat",
+    "tags": ["board", "performance", "ui"],
+    "description": "The board list now hydrates the first 512 characters of each card description on initial load, so you can read card context without opening individual cards. Previously the list returned only titles and metadata. The change is backwards-compatible and requires no client-side update."
+  },
+  {
     "hash": "67e199eb7a147017a407b4b7a29ec5f0ab76ef1f",
     "short": "67e199e",
     "title": "Board auto-drain: idle workers now automatically claim the next backlog task",

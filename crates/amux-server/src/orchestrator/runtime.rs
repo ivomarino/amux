@@ -109,6 +109,26 @@ fn amux_server_parse_status_is_unmodelled(raw: &str) -> bool {
     crate::db::board_store::parse_status(raw).is_none()
 }
 
+/// Protocol readiness for a queued command at a turn boundary.
+///
+/// A provider reset is itself a boundary: the durable row is recovered first,
+/// then the next prompt is what moves a headless protocol from its cached
+/// RateLimited state back to Working. Requiring the protocol to spontaneously
+/// emit Idle made automatic recovery impossible for protocols that correctly
+/// stay parked until they receive that first post-reset prompt.
+fn agent_accepts_boundary_delivery(
+    state: &crate::opencode::AgentState,
+    now: DateTime<Utc>,
+) -> bool {
+    match state {
+        crate::opencode::AgentState::Idle | crate::opencode::AgentState::WaitingForInput => true,
+        crate::opencode::AgentState::RateLimited(limit) => {
+            limit.reset_at.is_some_and(|reset_at| reset_at <= now)
+        }
+        _ => false,
+    }
+}
+
 
 impl Runtime {
     /// Startup reconciliation (Invariant 9): the DB's picture of live
@@ -224,10 +244,110 @@ impl Runtime {
         }
     }
 
+    /// Move every clock-eligible rate-limited worker back to the dispatch
+    /// boundary. The reset comes from the provider; unknown resets remain
+    /// parked rather than getting a guessed retry (Invariant 20).
+    async fn recover_rate_limited_workers(
+        &self,
+        workers: &[Worker],
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<usize> {
+        let stagger =
+            chrono::Duration::seconds(self.resume_stagger_secs.min(i64::MAX as u64) as i64);
+        let mut parked_by_provider: BTreeMap<
+            amux_core::provider::ProviderId,
+            Vec<(&Worker, DateTime<Utc>)>,
+        > = BTreeMap::new();
+        for worker in workers {
+            if let amux_core::worker::WorkerState::RateLimited { reset_at: Some(reset) } =
+                &worker.state
+            {
+                parked_by_provider
+                    .entry(worker.config.provider.clone())
+                    .or_default()
+                    .push((worker, *reset));
+            }
+        }
+
+        let mut recovered = 0usize;
+        for (provider, parked) in parked_by_provider {
+            let order: Vec<amux_core::ids::WorkerId> =
+                parked.iter().map(|(worker, _)| worker.id().clone()).collect();
+            for (worker, reset_at) in parked {
+                let eligible_at =
+                    amux_core::provider_fleet::resume_schedule(&order, reset_at, stagger)
+                        .into_iter()
+                        .find(|slot| &slot.worker == worker.id())
+                        .map(|slot| slot.resume_at)
+                        .unwrap_or(reset_at);
+                if now < eligible_at {
+                    continue;
+                }
+
+                let worker_id = worker.id().to_string();
+                let state_at = now;
+                let updated_at = now.to_rfc3339();
+                let reply = self.store.write_async(move |conn| {
+                    let n = crate::db::queries::update_worker_state(
+                        conn,
+                        &worker_id,
+                        &amux_core::worker::WorkerState::Idle { since: state_at },
+                        &updated_at,
+                    )?;
+                    let payload = if n > 0 {
+                        crate::db::queries::get_worker(conn, &worker_id)?.map(|row| row.snapshot())
+                    } else {
+                        None
+                    };
+                    Ok(WriteOutcome {
+                        applied: n > 0,
+                        events: if n > 0 {
+                            vec![PendingEvent {
+                                entity_type: EntityType::Worker,
+                                entity_id: worker_id.clone(),
+                                mutation: MutationKind::StatusChanged {
+                                    from: "rate_limited".into(),
+                                    to: "idle".into(),
+                                },
+                                payload,
+                            }]
+                        } else {
+                            vec![]
+                        },
+                    })
+                }).await?;
+                if reply.applied {
+                    recovered += 1;
+                    tracing::info!(
+                        target: "amux::usage_reset",
+                        verdict = "worker_recovered",
+                        worker = %worker.id(),
+                        provider = %provider,
+                        reset_at = %reset_at,
+                        eligible_at = %eligible_at,
+                        "usage reset passed; worker returned to the delivery boundary"
+                    );
+                }
+            }
+        }
+        Ok(recovered)
+    }
+
     /// One tick: load state, evaluate the circuit breaker, plan, execute.
     pub async fn tick_once(&self, heartbeat: bool) -> anyhow::Result<()> {
         let now = Utc::now();
-        let (workers, leases, quarantined_total) = self.load_state()?;
+        let (mut workers, leases, quarantined_total) = self.load_state()?;
+
+        // Recover BEFORE deriving provider state, pumping commands, or
+        // planning. The old order wrote Idle to SQLite only after the pump had
+        // inspected the protocol's still-RateLimited state, then planned from
+        // the stale pre-recovery snapshot. A reset therefore changed the row
+        // without continuing any work — every worker needed an unrelated
+        // later tick plus an external protocol-state change to move again.
+        if self.recover_rate_limited_workers(&workers, now).await? > 0 {
+            let conn = self.store.read()?;
+            workers = hydrate_workers(&conn)?;
+        }
 
         // Circuit breaker (RR-0048b): evaluate the rolling window BEFORE
         // planning. While open, reconciliation looks for runnable work and
@@ -278,84 +398,6 @@ impl Runtime {
         // head through the agent protocol, honoring DeliveryTiming.
         if let Err(e) = self.pump_commands(now, &provider_states).await {
             tracing::warn!(error = %e, "command pump failed this tick");
-        }
-
-        // RR-0072 + RR-0044b: STAGGERED rate-limit recovery. A worker whose
-        // reset instant has passed returns to Idle automatically — but not
-        // all at once: parked worker i (sorted-id order per provider)
-        // becomes eligible at reset_at + i*stagger, so a 20-worker fleet
-        // does not fire 20 simultaneous first requests at the provider that
-        // just un-throttled it (thundering herd). Workers rate-limited with
-        // NO reset time stay parked until an event or a human moves them:
-        // inventing a retry time for an unknown window would be guessing
-        // (Invariant 20), and a Credit cap clears on payment, not a clock.
-        let stagger = chrono::Duration::seconds(self.resume_stagger_secs.min(i64::MAX as u64) as i64);
-        let mut parked_by_provider: BTreeMap<
-            amux_core::provider::ProviderId,
-            Vec<(&Worker, DateTime<Utc>)>,
-        > = BTreeMap::new();
-        for w in &workers {
-            if let amux_core::worker::WorkerState::RateLimited { reset_at: Some(reset) } = &w.state {
-                parked_by_provider
-                    .entry(w.config.provider.clone())
-                    .or_default()
-                    .push((w, *reset));
-            }
-        }
-        for (_, parked) in parked_by_provider {
-            let order: Vec<amux_core::ids::WorkerId> =
-                parked.iter().map(|(w, _)| w.id().clone()).collect();
-            for (w, reset) in parked {
-                // Slot arithmetic through the ONE implementation (core's
-                // resume_schedule, anchored at this worker's own reset so a
-                // solo limit recovers exactly at its reset, index 0).
-                let eligible_at = amux_core::provider_fleet::resume_schedule(&order, reset, stagger)
-                    .into_iter()
-                    .find(|s| &s.worker == w.id())
-                    .map(|s| s.resume_at)
-                    .unwrap_or(reset);
-                if now < eligible_at {
-                    continue;
-                }
-                let wid = w.id().to_string();
-                self.store
-                    .write_async(move |conn| {
-                        let n = crate::db::queries::update_worker_state(
-                            conn,
-                            &wid,
-                            &amux_core::worker::WorkerState::Idle { since: Utc::now() },
-                            &Utc::now().to_rfc3339(),
-                        )?;
-                        // Post-mutation snapshot for the journal (RR-0111a):
-                        // one indexed read inside the same transaction. A
-                        // payload-less Worker event would push the replay
-                        // horizon forward, leaving this worker's replayed
-                        // state permanently unknown.
-                        let payload = if n > 0 {
-                            crate::db::queries::get_worker(conn, &wid)?.map(|r| r.snapshot())
-                        } else {
-                            None
-                        };
-                        Ok(WriteOutcome {
-                            applied: n > 0,
-                            events: if n > 0 {
-                                vec![PendingEvent {
-                                    entity_type: EntityType::Worker,
-                                    entity_id: wid.clone(),
-                                    mutation: MutationKind::StatusChanged {
-                                        from: "rate_limited".into(),
-                                        to: "idle".into(),
-                                    },
-                                    payload,
-                                }]
-                            } else {
-                                vec![]
-                            },
-                        })
-                    })
-                    .await?;
-                tracing::info!(worker = %w.id(), "rate limit reset passed — worker recovered (staggered)");
-            }
         }
 
         let tasks = self.load_board_tasks(&workers)?;
@@ -1008,17 +1050,33 @@ impl Runtime {
             let Some(cmd) = head else { continue };
 
             // Timing gate.
+            let mut released_after_reset = false;
             let due = match cmd.timing {
                 amux_core::protocol::DeliveryTiming::Immediate => true,
                 amux_core::protocol::DeliveryTiming::AtTurnBoundary
-                | amux_core::protocol::DeliveryTiming::WhenIdle => matches!(
-                    protocol.state(&worker).await,
-                    Ok(crate::opencode::AgentState::Idle)
-                        | Ok(crate::opencode::AgentState::WaitingForInput)
-                ),
+                | amux_core::protocol::DeliveryTiming::WhenIdle => {
+                    match protocol.state(&worker).await {
+                        Ok(state) => {
+                            let accepts = agent_accepts_boundary_delivery(&state, now);
+                            released_after_reset = accepts
+                                && matches!(state, crate::opencode::AgentState::RateLimited(_));
+                            accepts
+                        }
+                        Err(_) => false,
+                    }
+                }
             };
             if !due {
                 continue;
+            }
+            if released_after_reset {
+                tracing::info!(
+                    target: "amux::usage_reset",
+                    verdict = "delivery_released",
+                    worker = %worker,
+                    command = %cmd.id,
+                    "first queued command released after the provider reset"
+                );
             }
 
             // Precondition gate (freshness at delivery, Invariant 38): a
@@ -1386,8 +1444,12 @@ impl Runtime {
                         ask_type: None,
                         ask_question: None,
                         ask_unblocks: None,
+                        ask_actor: None,
                         // AF-367: minted by the orchestrator runtime.
                         source: Some("orchestrator".into()),
+                        requested_by: None,
+                        callback_session: None,
+                        callback_prompt: None,
                     },
                     now.timestamp(),
                 )?;
@@ -1934,8 +1996,12 @@ mod adherence_tests {
                         ask_type: None,
                         ask_question: None,
                         ask_unblocks: None,
+                        ask_actor: None,
                         // AF-367: minted by the orchestrator runtime.
                         source: Some("orchestrator".into()),
+                        requested_by: None,
+                        callback_session: None,
+                        callback_prompt: None,
                     },
                     1_700_000_000,
                 )?;
@@ -2435,7 +2501,39 @@ mod adherence_tests {
 #[cfg(test)]
 mod rate_limit_recovery_tests {
     use super::*;
+    use amux_core::protocol::{RateLimit, RateLimitKind};
     use amux_core::worker::{WorkerConfig, WorkerState};
+    use crate::opencode::AgentState;
+
+    #[test]
+    fn every_protocol_worker_becomes_deliverable_at_its_reported_reset() {
+        let now = Utc::now();
+        let limited = |reset_at| AgentState::RateLimited(RateLimit {
+            kind: RateLimitKind::Weekly,
+            reset_at,
+            provider: amux_core::provider::ProviderId::new("claude-code"),
+            raw: None,
+        });
+
+        // "All" is the vector, not one convenient worker: every expired
+        // Claude protocol state releases, while future and unknown clocks
+        // retain the exact safety gate.
+        let expired_workers = [
+            limited(Some(now - chrono::Duration::seconds(30))),
+            limited(Some(now)),
+            limited(Some(now - chrono::Duration::hours(5))),
+        ];
+        assert!(
+            expired_workers.iter().all(|state| agent_accepts_boundary_delivery(state, now)),
+            "every worker at/past its provider reset must accept queued work"
+        );
+        assert!(!agent_accepts_boundary_delivery(
+            &limited(Some(now + chrono::Duration::seconds(1))), now
+        ));
+        assert!(!agent_accepts_boundary_delivery(&limited(None), now));
+        assert!(agent_accepts_boundary_delivery(&AgentState::Idle, now));
+        assert!(agent_accepts_boundary_delivery(&AgentState::WaitingForInput, now));
+    }
 
     #[tokio::test]
     async fn expired_rate_limit_recovers_to_idle_and_unexpired_stays() {

@@ -177,6 +177,14 @@ const BACKLOG_STALE_AGE_S: i64 = 14 * 86400;
 /// answer by either re-confirming the trigger (bumps `last_verified_at`) or
 /// finally acting on the card — never by an automated status change.
 const SOURCE_REF_STALE_S: i64 = 24 * 3600;
+
+/// A source ref is an external-trigger block only while the owner has recently
+/// verified it. Older refs still preserve message/provenance links but do not
+/// make an otherwise actionable card undispatchable.
+pub(crate) fn fresh_source_ref_trigger(row: &bs::IssueRow, now: i64) -> bool {
+    row.source_ref.as_deref().is_some_and(|v| !v.trim().is_empty())
+        && row.last_verified_at.is_some_and(|at| at > now - SOURCE_REF_STALE_S)
+}
 /// Idle-backlog DRAIN nudge cooldown, SCALED TO THE BACKLOG SIZE. Distinct from
 /// the 72h stale-triage above — this fires when a lane is idle (no doing) with an
 /// empty todo and a non-empty backlog OF ANY AGE, the "board doesn't drive to
@@ -420,8 +428,12 @@ async fn file_nudge_escalation(state: &AppState, lane: &str, backlog: i64, unhee
         ask_type: None,
         ask_question: None,
         ask_unblocks: None,
+        ask_actor: None,
         // AF-367: filed by the board drive loop.
         source: Some("board_drive".into()),
+        requested_by: None,
+        callback_session: None,
+        callback_prompt: None,
     };
     let l = lane.to_string();
     let _ = state
@@ -1586,26 +1598,46 @@ fn backlog_by_type_count(conn: &Connection, session: &str) -> usize {
 
 /// How many drainable backlog cards remain. Reported beside the promotion so
 /// the trace answers "is this lane about to run dry" without a second query.
-fn drainable_backlog_count(conn: &Connection, session: &str, now: f64) -> usize {
+fn drainable_backlog_ids(conn: &Connection, session: &str, now: f64) -> Vec<String> {
     let reclaim_cut = now - reclaim_cooldown_s();
     let verified_cut = (now as i64) - SOURCE_REF_STALE_S;
-    conn.query_row(
-        "SELECT COUNT(*) FROM issues i WHERE i.session=?1 AND i.status='backlog' \
+    let candidates = conn
+        .prepare(
+            "SELECT i.id FROM issues i WHERE i.session=?1 AND i.status='backlog' \
            AND i.owner_type='agent' AND i.deleted IS NULL AND COALESCE(i.archived,0)=0 \
            AND COALESCE(i.type,'') NOT IN ('tripwire','watch','epic') \
            AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id \
                            AND lower(t.tag) LIKE 'needs:you%') \
            AND NOT EXISTS (SELECT 1 FROM session_events e WHERE e.type='task.claimed' \
                            AND e.ts > ?2 AND e.data LIKE '%\"' || i.id || '\"%') \
-           AND NOT (COALESCE(i.source_ref,'') <> '' AND COALESCE(i.last_verified_at,0) > ?3)",
-        rusqlite::params![session, reclaim_cut, verified_cut],
-        |r| r.get::<_, i64>(0),
-    )
-    .optional()
-    .ok()
-    .flatten()
-    .unwrap_or(0)
-    .max(0) as usize
+           AND NOT (COALESCE(i.source_ref,'') <> '' AND COALESCE(i.last_verified_at,0) > ?3) \
+         ORDER BY COALESCE(i.created,0) ASC, i.id ASC",
+        )
+        .and_then(|mut st| {
+            st.query_map(rusqlite::params![session, reclaim_cut, verified_cut], |r| {
+                r.get::<_, String>(0)
+            })
+            .map(|rows| rows.flatten().collect::<Vec<_>>())
+        })
+        .unwrap_or_default();
+
+    // A dependency-blocked backlog card is parked just as surely as a fresh
+    // external trigger. Counting or promoting it as drainable only moves the
+    // blockage sideways into To Do, where it can prevent independent backlog
+    // work from ever being considered (the live MR-14/MR-27 topology).
+    candidates
+        .into_iter()
+        .filter(|id| {
+            bs::get_issue(conn, id)
+                .ok()
+                .flatten()
+                .is_some_and(|row| deps_blocking(conn, &row).is_empty())
+        })
+        .collect()
+}
+
+fn drainable_backlog_count(conn: &Connection, session: &str, now: f64) -> usize {
+    drainable_backlog_ids(conn, session, now).len()
 }
 
 /// The oldest backlog card this lane could actually work, or `None`.
@@ -1621,24 +1653,28 @@ fn drainable_backlog_count(conn: &Connection, session: &str, now: f64) -> usize 
 /// condition"; draining it would override that, which is the MG-1388 mistake
 /// this module already carries a scar from.
 fn oldest_drainable_backlog(conn: &Connection, session: &str, now: f64) -> Option<String> {
-    let reclaim_cut = now - reclaim_cooldown_s();
-    let verified_cut = (now as i64) - SOURCE_REF_STALE_S;
-    conn.query_row(
-        "SELECT i.id FROM issues i WHERE i.session=?1 AND i.status='backlog' \
-           AND i.owner_type='agent' AND i.deleted IS NULL AND COALESCE(i.archived,0)=0 \
-           AND COALESCE(i.type,'') NOT IN ('tripwire','watch','epic') \
-           AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id \
-                           AND lower(t.tag) LIKE 'needs:you%') \
-           AND NOT EXISTS (SELECT 1 FROM session_events e WHERE e.type='task.claimed' \
-                           AND e.ts > ?2 AND e.data LIKE '%\"' || i.id || '\"%') \
-           AND NOT (COALESCE(i.source_ref,'') <> '' AND COALESCE(i.last_verified_at,0) > ?3) \
-         ORDER BY COALESCE(i.created,0) ASC LIMIT 1",
-        rusqlite::params![session, reclaim_cut, verified_cut],
-        |r| r.get::<_, String>(0),
-    )
-    .optional()
-    .ok()
-    .flatten()
+    drainable_backlog_ids(conn, session, now).into_iter().next()
+}
+
+/// Promote the next genuinely runnable backlog card when this lane opted into
+/// automatic draining. This is deliberately reusable after todo candidates
+/// have been inspected: the mere presence of a blocked todo must not hide
+/// independent work waiting in backlog.
+fn backlog_drain_pickup(
+    conn: &Connection,
+    session: &str,
+    now: f64,
+    todo_refusals: usize,
+) -> Option<Pickup> {
+    if !dispatch_backlog_when_idle(session) {
+        return None;
+    }
+    let card = oldest_drainable_backlog(conn, session, now)?;
+    Some(Pickup::DrainBacklog {
+        card,
+        backlog_left: drainable_backlog_count(conn, session, now),
+        todo_refusals,
+    })
 }
 
 /// The dependency promotion that must NOT wait for a free WIP slot (AMUX-4040).
@@ -2437,9 +2473,10 @@ pub enum Pickup {
     /// `blocked_card` is the todo that was waiting; `promoted` are the backlog
     /// ids that were promoted. The lane receives no nudge — it just gets work.
     PromoteDeps { blocked_card: String, promoted: Vec<String> },
-    /// A `backlog` card promoted to `todo` because the lane ran out of todo
-    /// and opted in to draining its own backlog (AMUX-4055).
-    DrainBacklog { card: String, backlog_left: usize },
+    /// A `backlog` card promoted to `todo` because the lane has no claimable
+    /// todo and opted in to draining its own backlog (AMUX-4055). A non-zero
+    /// `todo_refusals` makes the ATE-37 fallback visible in traces and logs.
+    DrainBacklog { card: String, backlog_left: usize, todo_refusals: usize },
     /// An ABANDONED `doing` card, returned to `todo` so it stops holding the
     /// lane's WIP slot (AMUX-4042). `held_h` is how long it went untouched.
     ReclaimStale { card: String, held_h: f64, blocking: usize },
@@ -2749,10 +2786,10 @@ pub fn select_pickup_with(
         } else {
             format!("{:.0}m", cooldown_s / 60.0)
         };
-        // OPT-IN BACKLOG DRAIN (AMUX-4055). The todo queue is empty, which is the
-        // only moment this may fire: a lane with todo work must work THAT, and
-        // reaching into backlog while todo has cards would reorder the owner's
-        // queue behind their back.
+        // OPT-IN BACKLOG DRAIN (AMUX-4055). The todo query is empty, so no card
+        // is even eligible for the refusal guards below. If candidates exist,
+        // we inspect them first and use this same drain arm only after every
+        // one proves unclaimable; runnable todo always keeps priority.
         //
         // Promotes ONE card to `todo` rather than claiming it into `doing`
         // directly, so the card takes the ordinary path and the board still
@@ -2764,11 +2801,8 @@ pub fn select_pickup_with(
         // acting on it. The nudge is advisory by design; this is the arm for an
         // owner who would rather it just happen.
         let drain_on = dispatch_backlog_when_idle(session);
-        if drain_on {
-            if let Some(card) = oldest_drainable_backlog(conn, session, now) {
-                let left = drainable_backlog_count(conn, session, now);
-                return Pickup::DrainBacklog { card, backlog_left: left };
-            }
+        if let Some(pickup) = backlog_drain_pickup(conn, session, now, 0) {
+            return pickup;
         }
         // SAY WHY THE DRAIN DID NOT FIRE, in the line someone already reads.
         //
@@ -2929,6 +2963,13 @@ pub fn select_pickup_with(
             text,
         };
     }
+    // A todo row can exist yet be unclaimable (for example, waiting on a
+    // human-owned dependency). Once every todo candidate has been honestly
+    // refused, continue the opted-in lane with independent backlog rather than
+    // letting the blocked row shadow that work forever.
+    if let Some(pickup) = backlog_drain_pickup(conn, session, now, skipped.len()) {
+        return pickup;
+    }
     Pickup::None {
         reason: "all-candidates-refused",
         detail: skipped.join("; "),
@@ -3055,8 +3096,12 @@ fn verify_nudge_text(cards: &[(String, String, String)], total: i64) -> String {
          (GET /api/board/<id>) or with the scoped query above, not the capped default \
          (this is the exact trap that read as 'these cards do not exist', 2026-08-13).\n\n\
          Cards that genuinely cannot be verified by you (e.g., they require a human \
-         decision or access you lack) should be tagged `needs:you` so they surface \
-         in the owner digest rather than sitting here indefinitely."
+         decision or access you lack) should be tagged `needs:you` — with the ask and \
+         what unblocks it — to mark them human-blocked. Be honest about what that does \
+         today: it moves the card into the dashboard needs:you view, and NOTHING pushes \
+         it to the owner (there is no digest/alert/email path for needs:you as of \
+         2026-09-03, AC-413). So tag it only when a human genuinely owes the next step; \
+         it is not an escape hatch that makes the card someone else's problem."
     )
 }
 
@@ -3085,10 +3130,16 @@ fn stale_backlog_candidates(
     .unwrap_or_default()
 }
 
-/// Backlog cards of ANY age, newest first — the candidates for the idle-drain
-/// nudge (a lane sitting on a fresh backlog with nothing in todo). Newest first
-/// because a just-arrived batch is the likeliest thing the worker meant to act
-/// on; the worker's own model picks which to promote.
+/// Backlog cards of ANY age, OLDEST FIRST — the candidates for the idle-drain
+/// nudge (a lane sitting on a fresh backlog with nothing in todo).
+///
+/// This comment said "newest first" three times, and gave the reason (a
+/// just-arrived batch is the likeliest thing the worker meant to act on), for as
+/// long as AMUX-3779 has been shipped — which reversed the order to `created ASC`
+/// so the drain reads the same way as the todo scorer. The query below is the
+/// truth; the prose was describing the code it replaced. Found 2026-09-04 while
+/// checking a dispatch-ordering report from ts-gke, where the stale comment was
+/// the first thing that made the behaviour look wrong.
 fn backlog_candidates(conn: &Connection, session: &str, now: i64) -> Vec<(String, String, i64)> {
     // DRAINABLE only — mirror the exclusions in the idle_drain gate so the cards
     // the nudge lists are exactly the ones it claims are un-worked: no dormant
@@ -3690,9 +3741,22 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
     // a stale pickup (AMUX-3052). It reads the token right after PICKUP_ANCHOR,
     // which is why the id must stay the FIRST thing after it.
     let mut prompt = format!(
+        // AF-506: this line used to say "if blocked on an owner decision, move to
+        // review". The REVIEW GATE then refuses that card, because it asks you to
+        // ack "Implemented and self-tested" / "Diff / PR is up", which a card you
+        // are parking or routing away cannot truthfully claim. So the dispatcher
+        // sent people somewhere its own gate would turn them back from: two
+        // components disagreeing about the same fact, with neither individually
+        // wrong. Reported by `backend`, hit live on MI-4155.
+        //
+        // Both real cases are named instead, because they have different exits
+        // and conflating them is what produced the loop.
         "{PICKUP_ANCHOR}{} — work it now. Card text below is historical, \
-         not a live message. If blocked on an owner decision, move to review (not todo, \
-         which re-queues after a brief cooldown):\n{}{}",
+         not a live message. If this card's WORK belongs to another lane, hand it over: \
+         `amux board assign <ID> <lane> && amux board todo <ID>` — it dispatches to THEM, \
+         not back to you. If it needs a decision only Ethan can make, `amux board needsyou \
+         <ID>` with the question. Do NOT move it to review to park it: the review gate asks \
+         you to attest work you have not done, and will refuse.\n{}{}",
         row.id,
         quoted_card_text(&row.title, &row.id),
         qnote
@@ -3791,6 +3855,50 @@ pub fn select_advance(
     })
 }
 
+/// A newly captured prompt shell that still needs the owning model's explicit
+/// keep/split/discard judgment.
+///
+/// Capture cleanup is keyed per card (`decompose:<id>`), while the ordinary
+/// advance cooldown is keyed per lane. Letting an older real card's cooldown
+/// hide a brand-new shell leaves the shell in `doing` even after the turn has
+/// ended. Find only shells the shared pickup classifier rejects and which
+/// have never received their durable cleanup prompt; ordinary work is never
+/// promoted by this exception.
+fn unnudged_capture_cleanup(conn: &Connection, session: &str) -> Option<String> {
+    let candidates: Vec<(String, String, String, String)> = conn
+        .prepare(
+            "SELECT id,title,COALESCE(desc,''),COALESCE(log,'') FROM issues \
+             WHERE session=?1 AND status='doing' AND source='capture' \
+             AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent' \
+             ORDER BY updated DESC LIMIT 40",
+        )
+        .and_then(|mut st| {
+            st.query_map(rusqlite::params![session], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default();
+
+    candidates.into_iter().find_map(|(id, title, desc, log)| {
+        if pickup_junk_reason(&title, &desc, &log).is_empty() {
+            return None;
+        }
+        let idem = format!("decompose:{id}");
+        let already = conn
+            .query_row(
+                "SELECT 1 FROM session_events WHERE idem=?1 LIMIT 1",
+                rusqlite::params![idem],
+                |_| Ok(()),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .is_some();
+        (!already).then_some(id)
+    })
+}
+
 /// [`select_advance`] over an INJECTED "is this name a registered worker"
 /// lookup.
 ///
@@ -3811,6 +3919,7 @@ pub fn select_advance_with(
     reviewer_unreachable: &dyn Fn(&str, &str) -> Option<String>,
 ) -> Advance {
     let budget = advance_card_budget();
+    let capture_cleanup = unnudged_capture_cleanup(conn, session);
 
     // PER-SESSION COOLDOWN, with PROGRESS YIELDING IT (py:13346, AMUX-2500).
     // Ethan: "all issues should always continue driving; a worker should NOT go
@@ -3836,7 +3945,7 @@ pub fn select_advance_with(
                     .unwrap_or(false),
                 _ => false,
             };
-            if !moved {
+            if !moved && capture_cleanup.is_none() {
                 return Advance::None {
                     reason: "cooldown",
                     detail: format!(
@@ -3845,6 +3954,16 @@ pub fn select_advance_with(
                         now - last_ts
                     ),
                 };
+            }
+            if !moved {
+                tracing::warn!(
+                    target: "amux::board_drive",
+                    session,
+                    card = capture_cleanup.as_deref().unwrap_or(""),
+                    previous_card = last_card.as_deref().unwrap_or(""),
+                    verdict = "capture_cleanup_bypassed_lane_cooldown",
+                    "new per-card capture cleanup is not suppressed by an unrelated lane cooldown"
+                );
             }
         }
     }
@@ -3945,7 +4064,7 @@ pub fn select_advance_with(
     // OTHER card the lane held — and because the ordering puts `doing` first, a
     // lane that peer-reviews continuously always has a populated review tier, so
     // the lanes using reviewers most were starved hardest.
-    let cands: Vec<(String, String)> = conn
+    let mut cands: Vec<(String, String)> = conn
         .prepare(
             "SELECT id, status FROM issues WHERE session=?1 AND deleted IS NULL \
              AND COALESCE(archived,0)=0 AND status IN ('doing','review') AND owner_type='agent' \
@@ -3956,6 +4075,9 @@ pub fn select_advance_with(
                 .map(|rows| rows.flatten().collect())
         })
         .unwrap_or_default();
+    if let Some(capture_id) = capture_cleanup.as_deref() {
+        cands.sort_by_key(|(id, _)| if id == capture_id { 0 } else { 1 });
+    }
     if cands.is_empty() {
         return Advance::None {
             reason: "no-open-card",
@@ -4315,7 +4437,7 @@ pub fn select_advance_with(
         // This gate used to ask only "is `rev` a registered worker", which is
         // one predicate short. A registered CROSS-GROUP reviewer passed it, got
         // nudged, and the owner then could not talk to them: worker-to-worker
-        // messaging is intra-group unless configured, and `cross_group_send_ok`
+        // messaging is open across groups unless explicitly opted out, and `cross_group_send_ok`
         // is enforced in exactly ONE place — the send API. The review nudge goes
         // through `steer_enqueue` and never touches it.
         //
@@ -4606,23 +4728,21 @@ fn needsyou_renag_text(
             |r| r.get(0),
         )
         .unwrap_or(0.0);
+    // Cooldown only: once re-nagged, stay quiet for one window. `last_ts=0` (never
+    // re-nagged) falls through and fires — the first reminder should.
     if last_ts > 0.0 && (now - last_ts) < win {
         return None;
     }
-    if last_ts > 0.0 {
-        let updated: f64 = conn
-            .query_row(
-                "SELECT COALESCE(updated,0) FROM issues WHERE id=?1",
-                rusqlite::params![card],
-                |r| r.get::<_, f64>(0),
-            )
-            .unwrap_or(0.0);
-        if updated > last_ts {
-            // Re-stated since we last asked: that IS the remedy the message
-            // prescribes. Say nothing this round.
-            return None;
-        }
-    }
+    // REMOVED (AF-465): the `updated > last_ts` "re-stated since we last asked, say
+    // nothing" check. It made re-statement a silence lever, which is the abuse
+    // vector the decision closed — a lane could keep a human's ask quiet forever by
+    // touching the card every window, and the `updated` bump fired on ANY desc
+    // write, not a deliberate re-statement. It also silenced only AFTER the first
+    // re-nag (last_ts>0), so the escape the old text advertised did not work the
+    // one time a lane tried it (AF-111). Keep MIN(added_at) as the monotonic ask
+    // clock and the cooldown above; re-statement no longer silences. The nudge now
+    // fires once per window until the HUMAN answers or the ask is cleared as
+    // overtaken — loud nagging over quiet suppression, per the decision.
     let days = (asked_age / 86400.0) as i64;
     let arch = if archived != 0 {
         "This card is ARCHIVED, which does NOT clear the ask — needs:you stays visible to the \
@@ -4630,12 +4750,26 @@ fn needsyou_renag_text(
     } else {
         ""
     };
+    // The old text promised "Re-state it on the card (silences this for Nd)".
+    // That was false, measured on AF-111 (AF-465): re-statement is meant to
+    // silence via the `updated > last_ts` check above, but that check is gated on
+    // `last_ts > 0`, so the FIRST re-nag skips it and fires regardless — which is
+    // exactly when a lane tries the escape. It is also unreliable after, since any
+    // desc write bumps `updated`. So we no longer tell the lane an action it
+    // cannot rely on. A needs:you card is waiting on the HUMAN (the age-gate above
+    // says as much: "the human owes the answer, not the lane"), and the ONE thing
+    // the lane can actually do is clear an OVERTAKEN ask — which is the drain that
+    // keeps needs:you from accreting. We do NOT claim the owner is reminded
+    // elsewhere: whether the owner digest carries needs:you cards is unverified in
+    // this file, so promising it here would be the same assert-without-reading the
+    // old line was. AF-465's full split (route the reminder to the owner digest,
+    // drop the lane nudge entirely) waits on confirming that producer.
     Some(format!(
-        "[amux] {card} needs:you for {days}d: {}\n\n\
-         {arch}Still the right question? Re-state it on the card (silences this for {}d). \
-         Overtaken? Clear needs:you and move the card.",
+        "[amux] {card} needs:you for {days}d — waiting on the HUMAN, not the lane: {}\n\n\
+         {arch}The only lane action here is if the ask is OVERTAKEN: clear needs:you and \
+         move the card. Re-stating does NOT silence this (it never reliably did — the first \
+         re-nag ignores it; AF-465).",
         quoted_card_text(&title.chars().take(90).collect::<String>(), card),
-        needsyou_renag_days() as i64
     ))
 }
 
@@ -4979,14 +5113,14 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 .with_counts(eligible, open),
             }
         }
-        Pickup::DrainBacklog { card, backlog_left } => {
+        Pickup::DrainBacklog { card, backlog_left, todo_refusals } => {
             // AMUX-4055. CAS on `expected_from: backlog`, so if the owner moved
             // the card between select and write we lose the race and say so
             // rather than promoting something they just re-parked.
             let card_c = card.clone();
             let line = format!(
-                "auto-drained: lane had no todo left and opted in to backlog dispatch \
-                 ({backlog_left} drainable card(s) remain)"
+                "auto-drained: lane had no claimable todo and opted in to backlog dispatch \
+                 ({backlog_left} drainable card(s) remain; {todo_refusals} todo refusal(s))"
             );
             let result = state
                 .store
@@ -5007,11 +5141,26 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 .await;
             match result {
                 Ok(o) if o.applied => {
+                    if todo_refusals > 0 {
+                        // Two-fix signal: the recovered topology is searchable
+                        // without reconstructing the board at that instant.
+                        tracing::info!(
+                            session = lane,
+                            card,
+                            todo_refusals,
+                            backlog_left,
+                            "board_drive: auto-drain bypassed unclaimable todo"
+                        );
+                    }
                     crate::api::session_verbs::emit_event(
                         state,
                         lane,
                         "backlog.drained",
-                        Some(json!({"issue": card, "backlog_left": backlog_left})),
+                        Some(json!({
+                            "issue": card,
+                            "backlog_left": backlog_left,
+                            "todo_refusals": todo_refusals,
+                        })),
                         None,
                         "board-drive",
                     )
@@ -5020,7 +5169,10 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                         lane,
                         "drain-backlog",
                         &card,
-                        format!("{card} backlog -> todo; {backlog_left} drainable left"),
+                        format!(
+                            "{card} backlog -> todo; {backlog_left} drainable left; \
+                             bypassed {todo_refusals} unclaimable todo(s)"
+                        ),
                     )
                     .with_counts(eligible, open)
                 }
@@ -5755,6 +5907,18 @@ pub fn spawn(state: AppState) -> super::PeriodicTask {
     super::spawn_periodic(JOB, secs, move || {
         let state = state.clone();
         async move {
+            // Terminal callbacks are a durable board outbox. Drain it on every
+            // board tick so a restart or a transition produced outside the
+            // HTTP PATCH handler cannot strand a completed peer request.
+            let callbacks = crate::api::board::dispatch_pending_callbacks(&state, None).await;
+            if callbacks.attempted > 0 {
+                tracing::info!(
+                    attempted = callbacks.attempted,
+                    queued = callbacks.queued,
+                    refused = callbacks.refused,
+                    "[board-drive] terminal task callbacks"
+                );
+            }
             let fleet = LiveFleet { state: state.clone() };
             let r = drive_tick(&state, &fleet).await;
             if r.assigned > 0 || r.nudged > 0 || r.promoted > 0 || r.promoted_due > 0 {
@@ -7922,11 +8086,31 @@ mod tests {
     /// that keeps this a repair rather than a hole: with nothing promotable, a
     /// capped lane must still be told `wip-cap` and handed no work.
     /// AMUX-4055. An empty To Do column with actionable backlog is work the
+    /// Serialises the three tests that mutate `AMUX_DISPATCH_BACKLOG_WHEN_IDLE`.
+    ///
+    /// The variable is PROCESS-GLOBAL and cargo runs tests as threads in ONE
+    /// process, so `remove_var` in the default-on test and `set_var(.., "0")`
+    /// in the other two are the same memory. Interleave them and the default-on
+    /// test reads "0" between its own remove_var and its assertion, then fails
+    /// with "default-on backlog dispatch did not run" — a red that points at
+    /// the dispatcher and is really this.
+    ///
+    /// MEASURED, not theorised: 1 failure in 12 consecutive runs of this module
+    /// with the auto-builder idle and the worktree clean, so build contention
+    /// (AMUX-3853) was ruled out first. It also survived a full-suite run once
+    /// and failed the next, which is what makes it expensive — it reads as a
+    /// regression in whatever landed that day.
+    ///
+    /// Poisoning is recovered rather than propagated: one panicking test must
+    /// not convert the other two into failures that hide their own result.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// worker is expected to keep driving. Default-on is safe because the drain
     /// query excludes every parked/human/trigger shape; an explicit 0 remains
     /// the worker/group/global opt-out.
     #[test]
     fn backlog_dispatch_is_on_by_default_and_supports_an_explicit_opt_out() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The default must be tested against an actually empty scope chain,
         // not the developer machine's ~/.amux global configuration.
         let home = tempfile::tempdir().expect("temp home");
@@ -7945,9 +8129,10 @@ mod tests {
         // needing a redundant opt-in key.
         std::env::remove_var(DISPATCH_BACKLOG_KEY);
         match select_pickup_with(&build(), "lane", now_f64(), false) {
-            Pickup::DrainBacklog { card, backlog_left } => {
+            Pickup::DrainBacklog { card, backlog_left, todo_refusals } => {
                 assert_eq!(card, "B-1", "oldest first, so a starved card is not starved further");
                 assert_eq!(backlog_left, 2, "the count reports what is drainable, before the move");
+                assert_eq!(todo_refusals, 0, "an empty todo queue has no refusals");
             }
             other => panic!("default-on backlog dispatch did not run: {other:?}"),
         }
@@ -7970,6 +8155,7 @@ mod tests {
     /// mentioned that a drain had been considered and declined.
     #[test]
     fn the_trace_says_why_a_drain_declined() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let conn = board_db();
         add_card(&conn, "P-1", "lane", "backlog", "parked on a trigger", "SCOPE: x");
         conn.execute(
@@ -8006,6 +8192,7 @@ mod tests {
     /// The two cards this must never touch, even when opted in.
     #[test]
     fn a_drain_skips_a_human_parked_card_and_a_live_trigger() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(DISPATCH_BACKLOG_KEY, "1");
         let conn = board_db();
         // Parked ON A HUMAN.
@@ -8479,7 +8666,10 @@ mod tests {
         add_card(&conn2, "D-2", "lane", "doing", "waiting on a decision", "SCOPE: x");
         tag(&conn2, "D-2", "needs:you:decision", now);
         add_card(&conn2, "T-2", "lane", "todo", "next", "SCOPE: x\n- [ ] y");
-        assert_eq!(claimed(&select_pickup(&conn2, "lane", now)), Some("T-2"));
+        assert_eq!(
+            claimed(&select_pickup_with(&conn2, "lane", now, false)),
+            Some("T-2")
+        );
     }
 
     /// An armed tripwire "costs nothing until it fires" and can never be
@@ -8632,6 +8822,39 @@ mod tests {
         }
     }
 
+    /// ATE-37 / live mvs-research acceptance case. A todo that exists but
+    /// cannot run is not queued work; it must not prevent an opted-in lane from
+    /// advancing independent backlog work. MR-14 was blocked on human-owned
+    /// MR-27 while MR-150 and other backlog work were independent, and the lane would
+    /// otherwise stop forever after its current card completed.
+    #[test]
+    fn a_blocked_todo_does_not_hide_actionable_backlog_from_auto_drain() {
+        let conn = board_db();
+        let now = now_f64();
+        add_card(&conn, "H-1", "human", "todo", "external prerequisite", "SCOPE: x");
+        add_card(&conn, "T-1", "lane", "todo", "blocked todo", "SCOPE: x\n- [ ] y");
+        conn.execute("UPDATE issues SET depends_on='[\"H-1\"]' WHERE id='T-1'", [])
+            .expect("dep");
+        add_card(&conn, "B-0", "lane", "backlog", "older blocked backlog", "SCOPE: x\n- [ ] y");
+        conn.execute(
+            "UPDATE issues SET depends_on='[\"H-1\"]', created=1 WHERE id='B-0'",
+            [],
+        )
+        .expect("blocked backlog dep");
+        add_card(&conn, "B-1", "lane", "backlog", "independent backlog", "SCOPE: x\n- [ ] y");
+        conn.execute("UPDATE issues SET created=2 WHERE id='B-1'", [])
+            .expect("backlog order");
+
+        match select_pickup_with(&conn, "lane", now, false) {
+            Pickup::DrainBacklog { card, backlog_left, todo_refusals } => {
+                assert_eq!(card, "B-1");
+                assert_eq!(backlog_left, 1);
+                assert_eq!(todo_refusals, 1, "the trace must expose the blocked todo bypass");
+            }
+            other => panic!("blocked todo must not strand independent backlog: {other:?}"),
+        }
+    }
+
     /// Invariant 20: silence is the correct output for an empty board, and the
     /// trace must SAY so rather than being absent.
     #[test]
@@ -8746,15 +8969,21 @@ mod tests {
         }
     }
 
-    /// py:12979: the message asks the lane to "re-state it on the card so it
-    /// resurfaces fresh". A card edited SINCE the last re-nag counts as
-    /// re-confirmed — a guard whose prescribed remedy cannot clear it teaches
-    /// sessions to ignore it.
+    /// AF-465 REVERSED the old py:12979 behaviour: re-stating a needs:you card no
+    /// longer silences the re-nag. Re-statement as a silence lever was an abuse
+    /// vector (a lane could keep a human's ask quiet forever by touching the card
+    /// each window, and any desc write tripped it), and it silenced only after the
+    /// first re-nag — so the escape the old text advertised did not work the one
+    /// time a lane tried it (AF-111). Now: MIN(added_at) is the monotonic ask
+    /// clock, the cooldown is the only silence, and a re-stated but still-open ask
+    /// past the window IS re-nagged.
     #[test]
-    fn re_stating_a_needs_you_card_resets_the_window() {
+    fn re_stating_a_needs_you_card_no_longer_silences_the_renag() {
         let conn = board_db();
         add_card(&conn, "D-1", "lane", "doing", "asked Ethan", "SCOPE: x");
         tag(&conn, "D-1", "needs:you", now_f64() - 10.0 * 86400.0);
+        // Last re-nag was a full window+ ago (cooldown expired), then the card was
+        // re-stated one minute after that fire.
         let renagged_at = now_f64() - 10.0 * 86400.0 + 1.0;
         conn.execute(
             "INSERT INTO session_events (ts,session,type,data,source) \
@@ -8767,9 +8996,21 @@ mod tests {
             rusqlite::params![(renagged_at + 60.0) as i64],
         )
         .expect("restate");
+        let text = needsyou_renag_text(&conn, "lane", "D-1", "t", 10.0 * 86400.0, 0, now_f64());
         assert!(
-            needsyou_renag_text(&conn, "lane", "D-1", "t", 10.0 * 86400.0, 0, now_f64()).is_none(),
-            "a re-stated ask must not be re-nagged"
+            text.is_some(),
+            "a re-stated ask past the cooldown MUST still be re-nagged (AF-465): re-statement is not a silence lever"
+        );
+        let text = text.unwrap();
+        // And the message must not promise the removed escape, nor claim an
+        // unverified owner-digest reminder.
+        assert!(
+            !text.contains("silences this"),
+            "the re-nag must not promise re-statement silences it: {text}"
+        );
+        assert!(
+            text.contains("OVERTAKEN"),
+            "the re-nag must keep the one real lane action — clear an overtaken ask: {text}"
         );
     }
 
@@ -9010,6 +9251,60 @@ mod tests {
         }
     }
 
+    /// ATE-45, live PRIMI-204. The preceding capture shell had just been
+    /// nudged, so its unchanged status put the whole Primis lane on cooldown.
+    /// A new prompt explicitly saying "do not create or retain a board task"
+    /// was then captured as a second `doing` card and never received the one
+    /// model-judgment prompt that could discard it. The exception is narrow:
+    /// it is per-card, only for the shared junk classifier, and the durable
+    /// idem closes it immediately after the first delivery.
+    #[test]
+    fn a_new_capture_cleanup_bypasses_an_unrelated_lane_cooldown_once() {
+        let conn = board_db();
+        let now = now_f64();
+        add_card(&conn, "PRIMI-203", "primis", "doing", "prior work", "SCOPE: real work");
+        conn.execute(
+            "INSERT INTO session_events (ts,session,type,data,source) VALUES \
+             (?1,'primis','advance.nudged',\
+              '{\"issue\":\"PRIMI-203\",\"status\":\"doing\"}','board-drive')",
+            rusqlite::params![now - 60.0],
+        )
+        .expect("prior lane nudge");
+        add_card(
+            &conn,
+            "PRIMI-204",
+            "primis",
+            "doing",
+            "Post-fix status verification only",
+            "**Prompt:** Post-fix status verification only; do not create or retain a board task.",
+        );
+        conn.execute("UPDATE issues SET source='capture' WHERE id='PRIMI-204'", [])
+            .expect("capture source");
+
+        match select_advance(&conn, "primis", &[], now) {
+            Advance::Nudge { card, kind, .. } => {
+                assert_eq!(card, "PRIMI-204", "the new shell, not the cooldown holder");
+                assert_eq!(kind, "decompose-asked");
+            }
+            Advance::None { reason, detail } => {
+                panic!("new capture cleanup must bypass unrelated cooldown: {reason}: {detail}")
+            }
+        }
+
+        conn.execute(
+            "INSERT INTO session_events (ts,session,type,data,source,idem) VALUES \
+             (?1,'primis','advance.nudged',\
+              '{\"issue\":\"PRIMI-204\",\"status\":\"doing\"}',\
+              'board-drive','decompose:PRIMI-204')",
+            rusqlite::params![now],
+        )
+        .expect("durable per-card cleanup event");
+        match select_advance(&conn, "primis", &[], now + 1.0) {
+            Advance::None { reason, .. } => assert_eq!(reason, "cooldown"),
+            Advance::Nudge { text, .. } => panic!("the same shell must not be prompted twice: {text}"),
+        }
+    }
+
     /// REBUILT FROM THE LIVE SPECIMEN, not a convenient fixture: amux-agent was
     /// routed AC-233 at 22:07:14, 22:08:14 and 22:09:14 — one per tick, stopping
     /// only when the per-CARD budget hit 3. The per-LANE cooldown never applied
@@ -9078,7 +9373,9 @@ mod tests {
         // this test is measuring the filter and not a prompt that never quotes.
         let conn2 = board_db();
         add_card(&conn2, "T-2", "lane", "todo", "Fix the logo", "SCOPE: real work\n- [ ] do it");
-        let Pickup::Claim { prompt: p2, .. } = select_pickup(&conn2, "lane", now_f64()) else {
+        let Pickup::Claim { prompt: p2, .. } =
+            select_pickup_with(&conn2, "lane", now_f64(), false)
+        else {
             panic!("expected a claim");
         };
         assert!(p2.contains("- [ ] do it"), "ordinary card text must be quoted: {p2}");
@@ -9609,6 +9906,61 @@ mod tests {
     }
 
     /// And the real verbs must pass, so the check is not simply always-panicking.
+    /// THE PROSE THAT DOCUMENTS THIS FLAG MUST NAME THE REAL KEY (AF-449).
+    ///
+    /// AMUX-4055 shipped this switch on 2026-09-02 at 22:00, default off, named
+    /// in no prompt, no doc and no nudge text. Within eleven hours Ethan asked
+    /// for it 23 times across BOTH repos — "there should be an environment
+    /// variable in the scope" — for a switch that already existed. The friction
+    /// sweep measured that at n=23 against a 0.54/day baseline with
+    /// `prose_exists: false`.
+    ///
+    /// The fix was a paragraph in ~/.claude/CLAUDE.md, and a paragraph naming a
+    /// constant is exactly the unenforceable prose the friction-themes contract
+    /// warns about: rename the key and the documentation silently becomes a lie
+    /// pointing at a variable nothing reads. So the doc is checked against the
+    /// CONSTANT rather than against a copy of its text.
+    ///
+    /// ABSENT IS REPORTED, NOT PASSED. The global prompt is per-machine and is
+    /// legitimately missing on a cloud image, so this cannot fail there — but a
+    /// silent skip is how a check stops covering anything without saying so, and
+    /// this file's own signal is that unnamed capabilities reach nobody. It
+    /// prints why it could not measure.
+    #[test]
+    fn the_global_prompt_names_the_real_backlog_dispatch_key() {
+        let Some(home) = std::env::var_os("HOME") else {
+            println!("UNMEASURED: no HOME, cannot locate the global prompt");
+            return;
+        };
+        let p = std::path::Path::new(&home).join(".claude/CLAUDE.md");
+        let Ok(txt) = std::fs::read_to_string(&p) else {
+            println!("UNMEASURED: {} is absent (expected on a cloud image); \
+                      the key/doc agreement is UNCHECKED on this box, not confirmed",
+                     p.display());
+            return;
+        };
+        assert!(
+            txt.contains(DISPATCH_BACKLOG_KEY),
+            "~/.claude/CLAUDE.md documents backlog dispatch but does not name {DISPATCH_BACKLOG_KEY}. \
+             Either the key was renamed and the prose now points at a variable nothing reads, or the \
+             paragraph was dropped — both leave the capability unnameable, which is the state \
+             AMUX-4055 was in for eleven hours while Ethan asked for it 23 times."
+        );
+        // The CONTROL. Asserting only "the key appears" would pass on a file
+        // that mentions it in passing, so require the sentence that makes it
+        // actionable: that `backlog` is not dispatched by default.
+        // Case-INSENSITIVE: the property is that the behaviour is stated, not
+        // that it is stated in lower case. Pinning the exact casing is the
+        // hand-typed-fixture trap one level down — the first version of this
+        // cell failed on "NOT dispatched by default", which says the same thing.
+        let lower = txt.to_lowercase();
+        assert!(
+            lower.contains("backlog") && lower.contains("not dispatched by default"),
+            "the key is named but the behaviour it changes is not stated; a reader learns the \
+             variable exists and not what it is for"
+        );
+    }
+
     #[test]
     fn the_real_board_verbs_are_accepted() {
         assert_cli_verbs_exist("amux board show X, amux board done X, amux board reviewer X y");

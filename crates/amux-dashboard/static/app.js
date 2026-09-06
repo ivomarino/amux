@@ -1003,6 +1003,7 @@ function showConnHistory() {
 
 // ═══════ DEVICE NAME / CLOUD IDENTITY ═══════
 let _cloudEmail = '';
+let _localMemberEmail = '';
 let _gatewayOrgs = [];
 
 async function _initIdentity() {
@@ -1019,7 +1020,8 @@ async function _initIdentity() {
     }
     if (!r.ok) return;
     const d = await r.json();
-    _cloudEmail = d.email || '';
+    _cloudEmail = d.is_cloud ? (d.email || '') : '';
+    _localMemberEmail = d.is_local_member ? (d.email || '') : '';
     if (!d.has_api_key) {
       if (d.is_cloud) {
         // Blocking modal for cloud users — must set key before using the app
@@ -1204,7 +1206,13 @@ function _renderOrgSwitcher() {
 
   // Banner: you have access to other workspaces (but aren't in one yet)
   const dismissed = JSON.parse(localStorage.getItem('amux_dismissed_org_banners') || '[]');
-  const undismissedOrgs = otherOrgs.filter(o => !dismissed.includes(o.id));
+  // God-mode visibility is not an invitation. Admins may inspect every
+  // workspace, but rendering all of those inherited rows as a giant green
+  // "You have access to" banner exposed the whole customer directory and
+  // pushed the actual dashboard below the fold. Explicit memberships retain
+  // the banner; inherited god-mode rows remain available in the settings
+  // switcher where the operator deliberately looks for them.
+  const undismissedOrgs = otherOrgs.filter(o => !o.via_god_mode && !dismissed.includes(o.id));
   if (inviteBanner && inviteBannerText && !inOtherOrg && undismissedOrgs.length > 0) {
     const names = undismissedOrgs.map(o => o.name || o.id).join(', ');
     inviteBannerText.innerHTML = `You have access to: <strong>${esc(names)}</strong> &nbsp;`;
@@ -1222,12 +1230,36 @@ function _renderOrgSwitcher() {
 }
 
 async function _switchOrg(orgId) {
-  await fetch('/api/gateway/switch-org', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({org_id: orgId || ''})
-  }).catch(() => {});
-  location.reload();
+  const ctl = new AbortController();
+  const timeout = setTimeout(() => ctl.abort(), 20000);
+  try {
+    const r = await fetch('/api/gateway/switch-org', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json', 'Accept':'application/json'},
+      body: JSON.stringify({org_id: orgId || ''}),
+      // A workspace switch changes where every subsequent API call goes and
+      // needs its response now. Replaying it minutes later from the offline
+      // outbox silently moves a person while they are doing other work.
+      _skipOutbox: true,
+      signal: ctl.signal,
+    });
+    if (_isLocallyQueued(r)) throw new Error('workspace switch was queued locally');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const ack = await r.json();
+    if (ack?.ok !== true) throw new Error('gateway did not acknowledge workspace switch');
+    location.reload();
+  } catch (e) {
+    console.warn('workspace switch failed; staying in the current workspace', e);
+    try {
+      amuxTrack('workspace_switch_failed', {
+        target: orgId ? 'other' : 'personal',
+        err: String(e).slice(0, 200),
+      });
+    } catch (_) {}
+    showToast('Workspace switch failed — still viewing the current workspace');
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 // ── Org invite banner dismiss ──────────────────────────────────────────────
@@ -1350,10 +1382,10 @@ function _applyIdentityToSettings() {
   const label = document.getElementById('settings-device-label');
   const row = document.getElementById('settings-device-row');
   const cur = document.getElementById('settings-device-current');
-  if (_cloudEmail) {
-    if (label) label.textContent = 'Account';
+  if (_cloudEmail || _localMemberEmail) {
+    if (label) label.textContent = _cloudEmail ? 'Account' : 'Member';
     if (row) row.style.display = 'none';
-    if (cur) cur.textContent = _cloudEmail;
+    if (cur) cur.textContent = _cloudEmail || _localMemberEmail;
   } else {
     if (label) label.textContent = 'Device';
     if (row) row.style.display = '';
@@ -1364,7 +1396,7 @@ _initIdentity();
 _renderInstanceSwitcher();
 
 function _getDeviceName() {
-  if (_cloudEmail) return _cloudEmail;
+  if (_cloudEmail || _localMemberEmail) return _cloudEmail || _localMemberEmail;
   const custom = localStorage.getItem('amux_device_name');
   if (custom) return custom;
   const ua = navigator.userAgent;
@@ -2307,7 +2339,7 @@ const _origFetch = window.fetch.bind(window);
 // deploy has its fetch fail, get queued, and report success. Ethan saw the two
 // halves separately — "mdai files are stuck at running", and a banner reading
 // `Syncing 0/1 · POST /api/files/mdai/run` that never cleared.
-const _OUTBOX_SKIP = /\/api\/(client-debug|speedtest|tts|lookup|sql|suggest-branch|terminal\/|upload|fs\/upload|sessions\/login\/|tunnel\/|push\/test|browser|files\/mdai\/run|config\/cross-group)/;
+const _OUTBOX_SKIP = /\/api\/(client-debug|speedtest|tts|lookup|sql|suggest-branch|terminal\/|upload|fs\/upload|sessions\/login\/|tunnel\/|push\/test|browser|files\/mdai\/run|config\/cross-group|gateway\/switch-org)/;
 const _OUTBOX_METHODS = { POST: 1, PATCH: 1, PUT: 1, DELETE: 1 };
 function _outboxQueueable(url, init) {
   if (!url || typeof url !== 'string') return false;
@@ -2877,6 +2909,7 @@ function _agentsChip(s) {
 // would cost 127 lanes' queries to answer a question about one.
 let _workFrontier = {};
 let _workFrontierBusy = {};
+let _workFrontierReported = {};
 function _workFrontierFor(name) {
   const c = _workFrontier[name];
   if (c && Date.now() - c.ts < 20000) return c;
@@ -2887,6 +2920,7 @@ function _workFrontierFor(name) {
       .then(d => {
         _workFrontier[name] = {
           ready: (d.ready || []).length,
+          readyCards: d.ready || [],
           claimable: d.claimable_now,
           holding: (d.wip || {}).holding || [],
           // `measured` decides whether this may render at all: an unmeasured
@@ -2901,18 +2935,52 @@ function _workFrontierFor(name) {
   }
   return c || null;
 }
-// The badge, or '' when the lane is not stalled. Same conjunction as the
-// server-side invariant `board.lane_idle_with_ready_work`: idle AND ready AND
-// nothing claimable. A busy lane holding its one card is working correctly and
-// must not be labelled.
+// One diagnostic per distinct frontier shape. Both verdicts are useful in a
+// sweep: `queued-behind-wip` explains a healthy wait; `stalled` says there is
+// ready work but no current work explaining why it cannot be claimed.
+function _reportWorkFrontier(s, w, verdict) {
+  const readyIds = (w.readyCards || []).map(c => c.id).filter(Boolean);
+  const key = [s.name, verdict, readyIds.join(','), w.claimable, w.holding.join(',')].join('|');
+  if (_workFrontierReported[key]) return;
+  _workFrontierReported[key] = true;
+  try {
+    fetch(API + '/api/client-debug', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
+      body: JSON.stringify({ kind: 'idle-ready-work', verdict, session: s.name,
+        ready: w.ready, ready_cards: readyIds, claimable: w.claimable,
+        holding: w.holding, ver: APP_VER }),
+    }).catch(() => {});
+  } catch (e) {}
+}
+
+// The badge, or '' when this lane is not idle with ready-but-unclaimable work.
+// Holding work is a queue explanation, not a stall: TubeScience's detached
+// import legitimately held TUBES-2418 while TUBES-2419 waited behind WIP-1.
+// With no holding work, preserve the alarming verdict because nothing in the
+// board explains why an idle lane cannot claim its ready card.
 function _stalledChip(s) {
   if (!s.running || s.status !== 'idle') return '';
   const w = _workFrontierFor(s.name);
   if (!w || !w.measured || !(w.ready > 0) || w.claimable !== 0) return '';
-  const held = w.holding.length ? w.holding.join(', ') : 'nothing';
+  if (w.holding.length) {
+    const first = w.holding[0];
+    const readyCard = ((w.readyCards || [])[0] || {}).id || (w.ready + ' ready');
+    const readyMore = w.ready > 1 ? ' +' + (w.ready - 1) : '';
+    const more = w.holding.length > 1 ? ' +' + (w.holding.length - 1) : '';
+    _reportWorkFrontier(s, w, 'queued-behind-wip');
+    return '<button type="button" class="status-badge waiting work-queued-chip" '
+      + 'onclick="event.stopPropagation();_openIssue(\'' + escJs(first) + '\')" '
+      + 'title="' + esc(readyCard) + readyMore + ' queued behind current work: '
+      + esc(w.holding.join(', ')) + '. Open ' + esc(first) + '." '
+      + 'aria-label="' + esc(readyCard) + readyMore + ' queued behind current work ' + esc(first) + '">'
+      + '<span class="work-queued-wide">' + esc(readyCard) + readyMore + ' queued behind ' + esc(first) + more + '</span>'
+      + '<span class="work-queued-short">' + esc(readyCard) + readyMore + ' behind ' + esc(first) + more + '</span>'
+      + '</button>';
+  }
+  _reportWorkFrontier(s, w, 'stalled');
   return '<span class="status-badge rate-limited" style="margin-left:6px;" title="'
-    + w.ready + ' card(s) ready, 0 claimable. The WIP cap is held by ' + esc(held)
-    + '. This lane is not out of work, it cannot claim the work it has.">stalled &middot; '
+    + w.ready + ' card(s) ready, 0 claimable, and no current work explains the block.'
+    + '">stalled &middot; '
     + w.ready + ' ready</span>';
 }
 
@@ -2921,6 +2989,7 @@ function updatePeekStatus() {
   if (!el || !peekSession) { if (el) el.innerHTML = ''; return; }
   const s = sessions.find(s => s.name === peekSession);
   if (!s) { el.innerHTML = ''; return; }
+  _renderPeekWorkerActions(s);
   let badge = '';
   // NAME · STATUS · MODEL, and nothing else (Ethan, 2026-08-11: "top we only
   // need the task name, status and model"). `_liveWorkLine` used to append the
@@ -3083,22 +3152,51 @@ function _cardBoardStatusCounts(name) {
   });
   return counts;
 }
-// The sessions payload and board SSE arrive independently. During auto-pickup,
-// the board can already have the new doing card while /api/sessions still
-// carries the worker's description fallback. Prefer the newest live board
-// fact in that window so a working worker never says "no active card" and the
-// task remains clickable. The server-provided task remains the fallback while
-// boardItems is loading.
+// The ONE board card a worker explicitly claims through `task_board_id`.
+//
+// Do not derive this from "worker active + card doing". A worker may have more
+// than one historical/captured card in doing (TubeScience had four), while one
+// terminal turn can execute only one parent task. The old newest-doing fallback
+// made all four cards say "Working now" and could also replace the task named by
+// the status hook with whichever card happened to be touched last. An active
+// worker can also be answering an informational message that correctly produced
+// no card. Runtime activity is not a board error state; guessing a task is wrong.
 function _cardDoingItem(name) {
-  let newest = null;
-  let newestAt = -1;
-  (boardItems || []).forEach(c => {
-    if (c.deleted || c.archived || c.session !== name || c.status !== 'doing') return;
-    const raw = c.updated || c.created || 0;
-    const at = typeof raw === 'number' ? raw : (Date.parse(raw) || 0);
-    if (!newest || at >= newestAt) { newest = c; newestAt = at; }
-  });
-  return newest;
+  const session = (sessions || []).find(s => s.name === name);
+  const claimed = String(session && session.task_board_id || '').trim();
+  if (!claimed) return null;
+  return (boardItems || []).find(c =>
+    !c.deleted && !c.archived && c.session === name && c.status === 'doing' && c.id === claimed
+  ) || null;
+}
+
+// Turn the board-drive trace into the smallest useful operator explanation.
+// The trace keeps the complete detail for diagnostics; worker cards need the
+// actionable reason. In particular, "all-candidates-refused" hid a dependency
+// chain behind a generic label. Resolve the root blocker from the structured
+// prose the mechanism itself emitted instead of inventing a second readiness
+// predicate in the UI.
+function _boardDriveCardReason(drive) {
+  if (!drive) return '';
+  const detail = String(drive.detail || '');
+  if (drive.reason === 'all-candidates-refused') {
+    const edges = [...detail.matchAll(/(?:^|;\s*)([^;\s]+) blocked by ([^;,\s]+)/g)];
+    if (edges.length) {
+      const cards = new Set(edges.map(m => m[1]));
+      const roots = [...new Set(edges.map(m => m[2]).filter(id => !cards.has(id)))];
+      if (roots.length) return 'blocked by ' + roots.join(', ') + ' (dependency root)';
+      return 'dependency blocked';
+    }
+    if (detail.includes('continuation gate')) return 'missing next action';
+    return 'no dispatchable task';
+  }
+  if (drive.reason === 'no-eligible-card') {
+    if (/drain:\s*OFF/i.test(detail)) return 'backlog auto-drain off';
+    if (/parked on a human or a live trigger/i.test(detail)) return 'backlog parked on human/trigger';
+    return 'no dispatchable task';
+  }
+  if (drive.reason === 'mid-turn') return 'working now';
+  return String(drive.reason || drive.outcome || 'checked').replaceAll('-', ' ');
 }
 // Worker cards embed board-derived figures (the helpers above), so ANY
 // boardItems ingest must repaint the workers view when those inputs move —
@@ -3162,6 +3260,147 @@ async function _grpSchedFetch(g) {
     if (!prev || prev.n !== n) {
       render();
     }
+  } catch (e) {}
+}
+
+// One inventory for every worker-level action/configuration entry point. The
+// card and peek used to carry independent menus: 25 actions on the card, two in
+// peek, including two different meanings of "File browser". Keep dynamic
+// labels and provider/running predicates here so adding or removing an action
+// changes both surfaces in the same edit.
+function _workerActionDefinitions(s) {
+  const name = escJs(s.name);
+  const provider = sessionProvider(s);
+  const model = sessionConfiguredModel(s);
+  const effort = provider === 'claude' ? flagValue(s.flags || '', '--effort') : '';
+  return [
+    { key: 'task-label', icon: '&#x270F;', label: 'Task label' + (s.task_override ? '' : ' (none)'),
+      run: "editField('" + name + "','task','" + escJs(s.task_override || '') + "')" },
+    { separator: true },
+    { key: 'peek-terminal', icon: '&#x1F4BB;', label: 'Peek terminal',
+      run: "closeAllMenus();openPeek('" + name + "')" },
+    { key: 'read-latest', icon: '&#x1F50A;', label: 'Read latest message',
+      run: "closeAllMenus();_readLatestMessage('" + name + "')" },
+    s.dir ? { key: 'browse-files', icon: '&#x1F4C1;', label: 'Browse files',
+      run: "_browseWorkerFiles('" + name + "','worker-menu')" } : null,
+    { key: 'info', icon: '&#x2139;', label: 'Info',
+      run: "closeAllMenus();showSessionInfo('" + name + "')" },
+    { key: 'pin', icon: '&#x1F4CC;', label: s.pinned ? 'Unpin' : 'Pin to top',
+      run: "togglePin('" + name + "')" },
+    { key: 'rename', icon: '&#x270E;', label: 'Rename',
+      run: "editField('" + name + "','name','" + name + "')" },
+    { key: 'provider', icon: '&#x21C4;', label: 'Provider: ' + providerLabel(provider),
+      run: "editField('" + name + "','provider','" + escJs(provider) + "')" },
+    { key: 'model', icon: '&#x2699;', label: 'Model' + (model ? ': ' + model : ''),
+      run: "editField('" + name + "','model','" + escJs(model || '') + "','" + escJs(provider) + "')" },
+    provider === 'claude' ? { key: 'effort', icon: '&#x1F9E0;',
+      label: 'Effort' + (effort ? ': ' + effort : ' (default)'),
+      run: "editField('" + name + "','effort','" + escJs(effort || '') + "','" + escJs(provider) + "')" } : null,
+    { key: 'yolo', icon: s.yolo ? '&#x2611;' : '&#x2610;', label: 'YOLO mode',
+      run: "toggleYolo('" + name + "')" },
+    { key: 'isolated', icon: s.isolated ? '&#x2611;' : '&#x2610;',
+      label: 'Isolated (raw agent, no amux harness)',
+      title: 'Run as a raw agent: just tmux plus the CLI, no amux harness, hidden from peers. The owner can still peek and send.',
+      run: "toggleIsolated('" + name + "')" },
+    { key: 'description', icon: '&#x1F4DD;', label: 'Description',
+      run: "editField('" + name + "','desc','" + escJs(s.desc || '') + "')" },
+    // `tags` is the API field. "Groups" is only the display vocabulary; using
+    // the label as the field name once made Save silently do nothing.
+    { key: 'groups', icon: '&#x1F3F7;', label: 'Groups',
+      run: "editField('" + name + "','tags','" + escJs((s.tags || []).join(', ')) + "')" },
+    { key: 'auto-drain', icon: s.auto_drain_backlog ? '&#x2611;' : '&#x2610;', label: 'Auto-drain backlog',
+      title: 'When this worker runs out of todo cards, pull its oldest eligible backlog card into todo automatically. Human, trigger, and dependency blocks stay parked.',
+      run: "toggleAutoDrain('" + name + "')" },
+    { key: 'spans-groups', icon: s.spans_groups ? '&#x2611;' : '&#x2610;',
+      labelHtml: 'Spans groups' + _spansLabel(s),
+      title: 'Let this worker message workers in other groups according to its resolved cross-group configuration.',
+      run: "toggleSpansGroups('" + name + "')" },
+    { key: 'directory', icon: '&#x1F4C1;', label: 'Directory',
+      run: "editField('" + name + "','dir','" + escJs(s.dir || '') + "')" },
+    s.running ? { key: 'restart', icon: '&#x21BB;', label: 'Restart',
+      run: "closeAllMenus();doRestart('" + name + "')" } : null,
+    s.running ? { key: 'stop', icon: '&#x23F9;', label: 'Stop',
+      run: "closeAllMenus();doStop('" + name + "')" } : null,
+    s.running ? { key: 'clear-scrollback', icon: '&#x239A;', label: 'Clear scrollback',
+      run: "clearScrollback('" + name + "')" } : null,
+    { key: 'duplicate', icon: '&#x2398;', label: 'Duplicate',
+      run: "duplicateSession('" + name + "')" },
+    { key: 'new-conversation', icon: '&#x1F195;', label: 'New conversation',
+      run: "newConversation('" + name + "'," + (s.running ? 'true' : 'false') + ")" },
+    { key: 'share', icon: '&#x1F517;', label: 'Share link',
+      run: "closeAllMenus();shareSession('" + name + "')" },
+    { key: 'archive', icon: '&#x1F4E6;', label: 'Archive',
+      run: "archiveSession('" + name + "')" },
+    { separator: true },
+    { key: 'delete', icon: '&#x2716;', label: 'Delete', danger: true,
+      run: "deleteSession('" + name + "')" },
+  ].filter(Boolean);
+}
+
+function _renderWorkerActionMenu(s, surface) {
+  const peek = surface === 'peek';
+  const itemClass = peek ? 'peek-more-item' : 'card-menu-item';
+  return _workerActionDefinitions(s).map(action => {
+    if (action.separator) return '<div class="' + (peek ? 'peek-more-sep' : 'card-menu-sep') + '"></div>';
+    const classes = itemClass + (action.danger ? ' danger' : '');
+    const close = peek ? '_closePeekMore();' : '';
+    const title = action.title ? ' title="' + esc(action.title) + '"' : '';
+    return '<div class="' + classes + '" role="menuitem" data-worker-action="' + action.key
+      + '" onclick="event.stopPropagation();' + close + action.run + '"' + title + '>'
+      + '<span class="mi">' + action.icon + '</span>'
+      + (action.labelHtml || esc(action.label)) + '</div>';
+  }).join('');
+}
+
+function _renderPeekWorkerActions(s) {
+  const menu = document.getElementById('peek-more-dropdown');
+  if (!menu) return;
+  const html = _renderWorkerActionMenu(s, 'peek')
+    + '<div class="peek-more-sep"></div>'
+    + '<div class="peek-more-item" id="peek-file-browser-btn" data-peek-action="file-browser" role="menuitem" '
+    + 'onclick="event.stopPropagation();_closePeekMore();_browseWorkerFiles(peekSession,\'peek-file-browser\')">'
+    + '<span class="mi">&#x1F4C2;</span>File browser</div>'
+    + '<div class="peek-more-item" id="peek-focus-btn" role="menuitem" '
+    + 'onclick="event.stopPropagation();_closePeekMore();togglePeekFocus()">'
+    + '<span class="mi">&#x25B4;</span>Focus mode</div>';
+  if (menu.innerHTML !== html) menu.innerHTML = html;
+}
+
+// Both menu Browse actions and the displayed directory path land here. One
+// function owns the session/root selection and always enters the full Files
+// route; the old peek-only branch toggled an unrelated split pane on desktop.
+function _browseWorkerFiles(name, source) {
+  const s = (sessions || []).find(row => row.name === name);
+  const root = (peekSession === name && peekSessionDir) || (s && s.dir) || '';
+  if (!root) { showToast('This worker has no directory to browse'); return; }
+  closeAllMenus();
+  _closePeekMore();
+  try {
+    fetch(API + '/api/client-debug', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
+      body: JSON.stringify({ kind: 'worker-file-entry', verdict: 'canonical-files-route',
+        source: source || 'unknown', session: name, root, measured: true,
+        n_considered: 1, ver: APP_VER }),
+    }).catch(() => {});
+  } catch (e) {}
+  openExplore(root, name);
+}
+
+function _reportWorkerActionParity(s) {
+  const menu = document.getElementById('peek-more-dropdown');
+  if (!menu) return;
+  const expected = _workerActionDefinitions(s).filter(a => !a.separator).map(a => a.key);
+  const actual = Array.from(menu.querySelectorAll('[data-worker-action]')).map(el => el.dataset.workerAction);
+  const duplicateIds = document.querySelectorAll('#peek-worker-menu-btn').length !== 1
+    || document.querySelectorAll('#peek-composer-more-btn').length !== 1;
+  if (expected.join('|') === actual.join('|') && !duplicateIds) return;
+  try {
+    fetch(API + '/api/client-debug', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
+      body: JSON.stringify({ kind: 'worker-action-menu-parity', verdict: 'mismatch',
+        session: s.name, expected, actual, duplicate_ids: duplicateIds,
+        measured: true, n_considered: expected.length, ver: APP_VER }),
+    }).catch(() => {});
   } catch (e) {}
 }
 
@@ -3348,39 +3587,7 @@ function render() {
           <div class="card-name">${s.pinned ? '<span class="pin-icon">&#x1F4CC;</span> ' : ''}${s.isolated ? '<span class="card-isolated" title="ISOLATED (raw agent): tmux plus the CLI, no amux harness — no AMUX_SESSION/AMUX_URL, no MCP config, no self-report hooks. Undiscoverable to peers: hidden from their fleet list and roster, and peer sends are refused. You can still peek and send from here. Applies at the next spawn.">ISOLATED</span> ' : ''}${esc(s.name)}${offCached ? ' <span class="card-offline-dot" title="Scrollback saved on this device — readable offline">&#x2B07;</span>' : ''}</div>
           <button class="card-menu-btn" onclick="event.stopPropagation();toggleMenu('${s.name}')" title="Options">&#x22EF;</button>
           <div class="card-menu" id="menu-${s.name}">
-          <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','task','${escJs(s.task_override||"")}')"><span class="mi">&#x270F;</span> Task label${s.task_override ? '' : ' (none)'}</div>
-          <div class="card-menu-sep"></div>
-          <div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();openPeek('${s.name}')"><span class="mi">&#x1F4BB;</span> Peek terminal</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();_readLatestMessage('${s.name}')"><span class="mi">&#x1F50A;</span> Read latest message</div>
-          ${s.dir ? `<div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();openExplore('${s.dir.replace(/'/g,"\\'")}','${s.name.replace(/'/g,"\\'")}')"><span class="mi">&#x1F4C1;</span> Browse files</div>` : ''}
-          <div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();showSessionInfo('${s.name}')"><span class="mi">&#x2139;</span> Info</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();togglePin('${s.name}')"><span class="mi">${s.pinned?'&#x1F4CC;':'&#x1F4CC;'}</span> ${s.pinned ? 'Unpin' : 'Pin to top'}</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','name','${escJs(s.name)}')"><span class="mi">&#x270E;</span> Rename</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','provider','${escJs(provider)}')"><span class="mi">&#x21C4;</span> Provider: ${pLabel}</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','model','${escJs(model||"")}','${escJs(provider)}')"><span class="mi">&#x2699;</span> Model${model ? ': '+esc(model) : ''}</div>
-          ${provider === 'claude' ? `<div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','effort','${escJs(effort||"")}','${escJs(provider)}')"><span class="mi">&#x1F9E0;</span> Effort${effort ? ': '+esc(effort) : ' (default)'}</div>` : ''}
-          <div class="card-menu-item" onclick="event.stopPropagation();toggleYolo('${s.name}')"><span class="mi">${isYolo?'&#x2611;':'&#x2610;'}</span> YOLO mode</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();toggleIsolated('${s.name}')" title="Run as a raw agent: just tmux plus the CLI, no amux harness, hidden from peers. The owner can still peek and send."><span class="mi">${s.isolated?'&#x2611;':'&#x2610;'}</span> Isolated (raw agent, no amux harness)</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','desc','${escJs(s.desc||"")}')"><span class="mi">&#x1F4DD;</span> Description</div>
-          ${/* field is 'tags', the INTERNAL name — b009f6e's vocab pass renamed
-               this argument to 'groups' as if it were a display string, and
-               every branch in editField/submitEdit tests 'tags', so the Groups
-               editor opened as a bare text box and Save silently did nothing
-               (AMUX-2559, "I cant add a worker to a group"). The label is the
-               vocab; the field is the contract. */ ''}
-          <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','tags','${escJs(s.tags.join(", "))}')"><span class="mi">&#x1F3F7;</span> Groups</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();toggleAutoDrain('${s.name}')" title="When this worker runs out of todo cards, pull its oldest eligible backlog card into todo automatically. On by default for every worker. Cards parked on a human (needs:you) or on a live trigger are always skipped; a worker, group, or global configuration can opt out."><span class="mi">${s.auto_drain_backlog?'&#x2611;':'&#x2610;'}</span> Auto-drain backlog</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();toggleSpansGroups('${s.name}')" title="Let this worker message workers in OTHER groups with no per-message approval. Writes CC_SEND_ALLOW on this worker; a group or global layer can also grant it from Configurations."><span class="mi">${s.spans_groups?'&#x2611;':'&#x2610;'}</span> Spans groups${_spansLabel(s)}</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','dir','${esc(s.dir)}')"><span class="mi">&#x1F4C1;</span> Directory</div>
-          ${s.running ? `<div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();doRestart('${s.name}')"><span class="mi">&#x21BB;</span> Restart</div>` : ''}
-          ${s.running ? `<div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();doStop('${s.name}')"><span class="mi">&#x23F9;</span> Stop</div>` : ''}
-          ${s.running ? `<div class="card-menu-item" onclick="event.stopPropagation();clearScrollback('${s.name}')"><span class="mi">&#x239A;</span> Clear scrollback</div>` : ''}
-          <div class="card-menu-item" onclick="event.stopPropagation();duplicateSession('${s.name}')"><span class="mi">&#x2398;</span> Duplicate</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();newConversation('${s.name}', ${s.running ? 'true' : 'false'})"><span class="mi">&#x1F195;</span> New conversation</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();shareSession('${s.name}')"><span class="mi">&#x1F517;</span> Share link</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();archiveSession('${s.name}')"><span class="mi">&#x1F4E6;</span> Archive</div>
-          <div class="card-menu-sep"></div>
-          <div class="card-menu-item danger" onclick="event.stopPropagation();deleteSession('${s.name}')"><span class="mi">&#x2716;</span> Delete</div>
+          ${_renderWorkerActionMenu(s, 'card')}
         </div>
         </div>
         ${(s.status || s.tokens || s.last_activity || s.rate_limited_until || s.credit_limited || s.sched_on || s.sched_off || !online) ? `<div class="card-header-meta">
@@ -3420,9 +3627,13 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
             if (todo) parts.push(`<span class="mc-active mc-todo">${todo}</span> todo`);
             const drive = s.board_drive || null;
             const driveFresh = drive && drive.checked_at && (Date.now()/1000 - drive.checked_at) < 180;
-            if (s.status === 'idle' && todo && driveFresh) {
+            // A non-empty queue plus an idle badge is never left unexplained.
+            // This applies to backlog-only and doing/review lanes too, not only
+            // todo: Primis was parked on a live trigger and looked abandoned;
+            // rtsp-connection had a dependency chain and looked identical.
+            if (s.status === 'idle' && (todo || backlog || d || review) && driveFresh) {
               const ready = Number(drive.eligible_todos || 0);
-              const why = drive.reason || drive.outcome || 'checked';
+              const why = _boardDriveCardReason(drive);
               parts.push(`<span class="mc-total" title="${esc(drive.detail || 'Latest board-drive decision')}">${ready} ready · ${esc(why)}</span>`);
             }
             if (backlog) parts.push(`<span class="mc-total mc-backlog">${backlog}</span> backlog`);
@@ -3877,7 +4088,7 @@ function showBranchPopover(name, e) {
   if (hasBranch) {
     pop.innerHTML = `
       <div style="font-size:0.75rem;color:var(--dim);margin-bottom:6px;font-weight:600;">⎇ ${esc(displayBranch)}</div>
-      ${gi._conflict ? '<div style="font-size:0.78rem;color:var(--red);margin-bottom:6px;">⚠ Another worker shares this branch — conflicts possible</div>' : '<div style="font-size:0.78rem;color:var(--green);margin-bottom:6px;">✓ Isolated on worker branch</div>'}
+      ${gi._conflict ? '<div style="font-size:0.78rem;color:var(--red);margin-bottom:6px;">⚠ Another worker shares this branch — conflicts possible</div>' : '<div style="font-size:0.78rem;color:var(--green);margin-bottom:6px;">✓ Isolated from other workers</div><div style="font-size:0.75rem;color:var(--dim);margin-bottom:6px;">Not on main, so nothing here reaches anyone until it is merged or pushed. Isolation is not delivery.</div>'}
       <button class="btn" style="width:100%;" onclick="document.querySelectorAll('.branch-popover').forEach(p=>p.remove())">Close</button>`;
   } else {
     const suggested = 'session/' + name;
@@ -5980,7 +6191,7 @@ async function doSend(name, text) {
   // Slash commands (e.g. /clear, /compact) must be sent verbatim — no timestamp prefix
   const isSlashCmd = /^\/[a-z]/.test(text.trim());
   amuxTrack('message_sent', { session: name, is_slash: isSlashCmd, cmd: isSlashCmd ? text.trim().split(/\s+/)[0] : null, length: text.length });
-  const payload = isSlashCmd ? text : _stampSendTime(text, new Date(), _cloudEmail);
+  const payload = isSlashCmd ? text : _stampSendTime(text, new Date(), _cloudEmail || _localMemberEmail);
   // One msg_id per logical send, reused verbatim by the offline-queue replay:
   // the server dedups on it, so a retry after a lost response (e.g. the
   // server restarted mid-request AFTER the keys landed) can't deliver twice.
@@ -6454,6 +6665,18 @@ function _grpOpenBoard(g) {
 
 let _scopeRowOpen = {};   // capability rows are CONTRACTED by default
 
+/// Where a scope panel re-renders after a write. Mirrors `_scopeRowToggle`,
+/// which is the only place that got it right.
+///
+/// The save paths computed this as `name ? 'grp-scope-body-'+name : undefined`,
+/// which for a WORKER names the GROUP panel's element id. That element does not
+/// exist in the peek, `_scopeLoad` returns early on a missing target, and the
+/// tile keeps showing its pre-save value underneath a green "Saved". The write
+/// landed; only the panel disagreed, which gets reported as "it doesn't save".
+function _scopeTargetId(lvl, name) {
+  return (lvl === 'group') ? ('grp-scope-body-' + name) : 'peek-scope-body';
+}
+
 function _scopeRowToggle(key) {
   _scopeRowOpen[key] = !_scopeRowOpen[key];
   const parts = key.split(':');
@@ -6654,7 +6877,7 @@ async function _scopeEditSave() {
     msg.textContent = 'Saved'; msg.style.color = 'var(--green)';
     showToast(key + ' saved at ' + (lvl === 'global' ? 'global' : lvl + ' ' + name));
     _scopeLoad(lvl === 'global' ? { level: 'global' } : { level: lvl, name: name },
-               name ? 'grp-scope-body-' + name : undefined);
+               _scopeTargetId(lvl, name));
   } catch (e) {
     msg.textContent = 'Save failed: ' + e.message; msg.style.color = '#f85149';
   }
@@ -6845,8 +7068,20 @@ async function _scopeLoad(scope, targetId) {
     const G = byKey(gl), Gr = grp.map(byKey);
     const esc = t => String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     const sum = (c) => {
-      const v = c && c.value;
+      let v = c && c.value;
       if (!v) return '\u2014';
+      // UNWRAP THE ENVELOPE FIRST. `skin` and `connectors` come back as
+      // {"skin": {...}} / {"connectors": {...}}, so every branch below sees a
+      // one-key object and summarises it as the literal word "connectors"
+      // rather than what is configured. Measured: the tile read "global ·
+      // connectors" while the global layer had granola enabled. (An earlier
+      // form of the predicate below returned an em-dash for the same input,
+      // which is the same defect one stage worse.)
+      if (typeof v === 'object' && !Array.isArray(v)) {
+        const ks = Object.keys(v);
+        if (ks.length === 1 && (ks[0] === 'skin' || ks[0] === 'connectors')) v = v[ks[0]];
+        if (!v) return '\u2014';
+      }
       // Array check FIRST: an empty list is [] and `v.keys` on it is undefined,
       // but the object branch below rendered it as "0 keys" — a keyed summary
       // for something that has no keys, which reads as a real but empty setting
@@ -8695,7 +8930,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.793';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.815';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -10530,9 +10765,14 @@ function peekSearchPrev() {
 function togglePeekMoreMenu() {
   const dd = document.getElementById('peek-more-dropdown');
   if (!dd) return;
+  const s = (sessions || []).find(row => row.name === peekSession);
+  if (s) _renderPeekWorkerActions(s);
   const opening = !dd.classList.contains('open');
   dd.classList.toggle('open');
-  if (opening) setTimeout(() => document.addEventListener('click', _closePeekMore, {once: true}), 0);
+  if (opening) {
+    if (s) requestAnimationFrame(() => _reportWorkerActionParity(s));
+    setTimeout(() => document.addEventListener('click', _closePeekMore, {once: true}), 0);
+  }
 }
 function _closePeekMore() {
   const dd = document.getElementById('peek-more-dropdown');
@@ -13910,21 +14150,38 @@ function _linkifyUrls(safeHtml) {
     });
   } catch (e) { return safeHtml; }
 }
-function _msgCardChip(cardId) {
+function _msgCardChip(cardId, message) {
   if (!cardId) return '';
-  const c = (typeof boardItems !== 'undefined' && Array.isArray(boardItems))
+  const live = (typeof boardItems !== 'undefined' && Array.isArray(boardItems))
     ? boardItems.find(i => i.id === cardId) : null;
+  // Message history can outlive the board's deliberately capped working set.
+  // Treat the history API's authoritative issues-table metadata as a real card,
+  // rather than claiming an archived/older card is "gone" merely because this
+  // browser has not loaded it into `boardItems` (MSG-38618 / TUBES-2372).
+  const recorded = message && typeof message === 'object'
+    && (message.card_title != null || message.card_status != null);
+  const c = live || (recorded ? {
+    id: cardId,
+    title: message.card_title || '',
+    status: message.card_status || 'todo',
+    archived: !!message.card_archived,
+    deleted: message.card_deleted != null,
+    log: ''
+  } : null);
   const stC = st => st === 'verified' ? 'var(--green)' : st === 'done' ? '#3fb950'
     : st === 'doing' ? '#d29922' : st === 'review' ? '#bc8cff'
     : st === 'discarded' ? 'var(--dim)' : 'var(--accent)';
   const st = c ? (c.status || 'todo') : '';
+  const displaySt = c && c.deleted ? 'deleted'
+    : c && c.archived ? 'archived'
+    : st;
   const undec = c && ((c.log || '').indexOf('capture: worker prompt') !== -1) && st === 'todo';
   const lastCommit = c ? (((c.log || '').match(/commit ([0-9a-f]{7,12}) \u2014 [^\n]*/g) || []).pop() || '') : '';
   return '<span class="msg-card-chip" onclick="event.stopPropagation();switchView(\'board\');setTimeout(() => openBoardDetail(\'' + escJs(cardId) + '\'), 250);" '
     + 'title="' + esc(c ? (c.title || '') : 'card no longer on the board') + (lastCommit ? '\n' + esc(lastCommit) : '') + '" '
     + 'style="cursor:pointer;font-size:0.68rem;border:1px solid ' + (c ? stC(st) : 'var(--border)') + ';border-radius:6px;padding:1px 7px;white-space:nowrap;'
     + 'color:' + (c ? stC(st) : 'var(--dim)') + ';">\u2192 ' + esc(cardId)
-    + (c ? ' \u00B7 ' + esc(undec ? 'captured, not yet decomposed' : st) : ' \u00B7 gone')
+    + (c ? ' \u00B7 ' + esc(undec ? 'captured, not yet decomposed' : displaySt) : ' \u00B7 gone')
     + (lastCommit ? ' \u00B7 \u2318' : '') + '</span>';
 }
 
@@ -13955,7 +14212,9 @@ function _msgNorm(x) {
   const t = (x.time !== undefined && x.time !== null) ? x.time : x.ts;
   return { id: x.id, text: x.text, type: x.type, session: x.session,
            time: t, ts: t, origin: x.origin || '', kind: x.kind,
-           queued: x.queued, card_id: x.card_id || '' };
+           queued: x.queued, card_id: x.card_id || '',
+           card_title: x.card_title, card_status: x.card_status,
+           card_archived: x.card_archived, card_deleted: x.card_deleted };
 }
 // ONE row renderer for all three message surfaces. `ctx` carries only what
 // genuinely differs — which selection set the checkbox belongs to, which resend
@@ -14023,7 +14282,8 @@ function _cmdHistItemHTML(e, ctx) {
   const idTag = _mid
     ? `<code class="msg-id-badge" title="Message id — click to copy" onclick="event.stopPropagation();_copyMsgId('${esc(_mid)}')">MSG-${esc(_mid)}</code>`
     : '';
-  const meta = tag + _msgDeliveryChip(e) + _msgSubmitChip(e) + sessTag + tsTag + idTag + _msgCardChip(typeof e === 'string' ? '' : (e.card_id || ''));
+  const meta = tag + _msgDeliveryChip(e) + _msgSubmitChip(e) + sessTag + tsTag + idTag
+    + _msgCardChip(typeof e === 'string' ? '' : (e.card_id || ''), e);
   const locSess = (session || (typeof peekSession !== 'undefined' ? peekSession : '') || '').replace(/'/g,'');
   const _target = ctx.target(e) || locSess;
   // A MATCHING message is force-expanded while a search is active, even if the
@@ -14252,7 +14512,7 @@ function _mergeUnechoed(serverRows, session) {
 // still passes a worker, so the change is provably behaviour-preserving before a
 // group or global caller exists — the sequencing amux-cloud called the most
 // valuable paragraph on the original card, and the same order that made the
-// Scope tab's second caller a one-liner instead of a second renderer.
+// Configurations tab's second caller a one-liner instead of a second renderer.
 async function _peekMsgFetch(scope, offset) {
   const sc = (typeof scope === 'string') ? { level: 'worker', name: scope } : (scope || {});
   const q = sc.level === 'group'  ? '&group=' + encodeURIComponent(sc.name)
@@ -19752,6 +20012,26 @@ function _acShowSuggested() {
   el.classList.add('open');
 }
 
+// Render a set of labelled sections into the dropdown, keeping `acItems` index-
+// aligned with what is on screen so arrow keys, Tab and acPick keep working.
+function _acRenderSections(sections) {
+  const el = document.getElementById('ac-list');
+  acItems = [];
+  acSelected = -1;
+  let html = '';
+  for (const [label, items] of sections) {
+    if (!items.length) continue;
+    if (label) html += `<div class="ac-section">${esc(label)}</div>`;
+    for (const item of items) {
+      html += `<div class="ac-item" onmousedown="acPick(${acItems.length})">${esc(item)}</div>`;
+      acItems.push(item);
+    }
+  }
+  if (!acItems.length) { el.classList.remove('open'); return; }
+  el.innerHTML = html;
+  el.classList.add('open');
+}
+
 function acFetch(query) {
   clearTimeout(acTimer);
   const el = document.getElementById('ac-list');
@@ -19765,17 +20045,35 @@ function acFetch(query) {
     _acShowSuggested();
     return;
   }
-  el.classList.remove('open');
+  // A BARE NAME IS A SEARCH, NOT A PATH (AF-501). Typing used to DROP the
+  // suggested list — the one holding every directory amux already knows about —
+  // and replace it with a path completion that only answers if you already knew
+  // the path. Measured in a live onboarding session (2026-09-04): the user knew
+  // the repo's name, not its location, typed the name, got nothing, could not
+  // find it in Finder either, and spent three minutes of a one-hour call on it.
+  //
+  // Known dirs are matched HERE rather than server-side because the client
+  // already holds them: the answer is on screen before the request goes out,
+  // and the disk search fills in underneath it.
+  const bareName = query.indexOf('/') === -1 && query[0] !== '~';
+  let known = [];
+  if (bareName) {
+    const q = query.toLowerCase();
+    known = _buildSuggestedDirs().filter(d => d.toLowerCase().includes(q));
+    if (known.length) _acRenderSections([['Your directories', known]]);
+    else el.classList.remove('open');
+  } else {
+    el.classList.remove('open');
+  }
   acTimer = setTimeout(async () => {
     try {
       const r = await fetch(API + '/api/autocomplete/dir?q=' + encodeURIComponent(query));
-      acItems = await r.json();
-      acSelected = -1;
-      if (!acItems.length) { el.classList.remove('open'); return; }
-      el.innerHTML = acItems.map((item, i) =>
-        `<div class="ac-item" onmousedown="acPick(${i})">${esc(item)}</div>`
-      ).join('');
-      el.classList.add('open');
+      const found = await r.json();
+      // Deduped against what is already shown, so a directory that is both a
+      // worker's and on disk does not appear twice under two headings.
+      const fresh = found.filter(d => !known.includes(d) && !known.includes(d.replace(/\/$/, '')));
+      if (bareName) _acRenderSections([['Your directories', known], ['Found on disk', fresh]]);
+      else _acRenderSections([[null, found]]);
     } catch(e) {}
   }, 150);
 }
@@ -25346,13 +25644,17 @@ function _renderBoardCard(item) {
   const firstLine = (item.desc !== undefined ? item.desc : (item.desc_head || ''))
                       .split('\n')[0].slice(0, 80);
   const pinned = item.pinned ? 1 : 0;
-  // LIVE emphasis: this card is what its owning session is working on right now
-  // (item in doing + that session's terminal is actively generating).
+  // LIVE emphasis: this card is what its owning session explicitly claims it is
+  // working on right now. `active + doing` is not enough: a lane can contain
+  // several doing cards, but only one is the current parent task.
   // `sessions`, not the pre-rename `workers` (b009f6e's FOURTH casualty —
   // the typeof guard made the dead global read as false instead of throwing,
   // so the LIVE emphasis just silently never lit).
-  const _liveNow = item.status === 'doing' && item.session &&
-    (typeof sessions !== 'undefined') && (sessions || []).some(s => s.name === item.session && s.status === 'active');
+  const _liveSession = item.session && (typeof sessions !== 'undefined')
+    ? (sessions || []).find(s => s.name === item.session && s.status === 'active')
+    : null;
+  const _liveCard = _liveSession ? _cardDoingItem(item.session) : null;
+  const _liveNow = !!(_liveCard && _liveCard.id === item.id);
   // item.session, not the pre-rename item.worker — the dead field rendered
   // 'undefined is working on this right now' in the LIVE tooltip.
   let h = '<div class="board-card' + (pinned ? ' board-card-pinned' : '') + (_liveNow ? ' board-card-live' : '') + '" data-id="' + item.id + '"' + (_liveNow ? ' title="' + esc(item.session) + ' is working on this right now"' : '') + ' onclick="openBoardDetail(\'' + item.id + '\')" oncontextmenu="return _boardCtxMenu(event,\'' + escJs(item.id) + '\')">';
@@ -25923,7 +26225,6 @@ function renderBoard() {
   if (document.body.classList.contains('board-dragging')) { _boardRenderPending = true; return; }
   renderBoardFilters();
   const container = document.getElementById('board-columns');
-
   // Update view toggle buttons
   var bvS = document.getElementById('bv-session');
   var bvC = document.getElementById('bv-status');
@@ -26492,8 +26793,8 @@ function _bdArtifactRef(a) {
     || (!/\s/.test(refPath) && (refPath.includes('/') || /\.[a-z0-9]{1,12}$/i.test(refPath)));
   const serverResolvedPath = target !== ref && /^(?:\/|\.\.?\/)/.test(targetPath);
   if (explicitPath || serverResolvedPath) {
-    return '<span class="file-link" onclick="event.stopPropagation();openFilePreview(\''
-      + escJs(targetPath) + '\')" title="Open ' + esc(targetPath) + '">' + esc(ref) + '</span>';
+    return '<button type="button" class="file-link board-artifact-file" onclick="event.stopPropagation();openFilePreview(\''
+      + escJs(targetPath) + '\')" title="Open ' + esc(targetPath) + '">' + esc(ref) + '</button>';
   }
   return '<code>' + esc(ref) + '</code>';
 }
@@ -26546,6 +26847,41 @@ function _bdRenderMeta(item) {
           + '<span>' + (m.session ? esc(m.session) + ' · ' : '') + (sec ? timeAgo(sec) + ' · ' : '')
           + esc(String(m.text || '').slice(0,220)) + '</span></div>';
       }).join('') + '</section>';
+  }
+
+  if (item.requested_by || item.callback) {
+    let requestHtml = '';
+    if (item.requested_by) {
+      requestHtml += '<div class="board-detail-meta-row"><b>Requested by</b> '
+        + '<button class="task-id-chip bd-link-chip" onclick="event.stopPropagation();openPeek(\''
+        + escJs(item.requested_by) + '\')" title="Open requester">' + esc(item.requested_by) + '</button></div>';
+    }
+    if (item.callback) {
+      const cb = item.callback || {};
+      const state = String(cb.state || 'armed');
+      const stateColor = state === 'queued' ? 'var(--green)' : (state === 'refused' ? 'var(--red)' : 'var(--accent)');
+      requestHtml += '<div class="board-detail-meta-row"><b>Terminal callback</b> '
+        + '<button class="task-id-chip bd-link-chip" onclick="event.stopPropagation();openPeek(\''
+        + escJs(cb.session || '') + '\')">' + esc(cb.session || '') + '</button> '
+        + '<span style="color:' + stateColor + '">' + esc(state) + '</span>'
+        + (cb.fired_at ? ' · ' + timeAgo(Number(cb.fired_at)) : '') + '</div>';
+      if (cb.prompt) requestHtml += '<div class="board-detail-meta-row"><span style="color:var(--dim)">Then:</span> '
+        + _linkifyUrls(_linkifyCardIds(esc(String(cb.prompt)))) + '</div>';
+      if (cb.message_id) requestHtml += '<div class="board-detail-meta-row"><span style="color:var(--dim)">Delivery:</span> <code>'
+        + esc(String(cb.message_id)) + '</code></div>';
+      if (cb.error) requestHtml += '<div class="board-detail-meta-row" style="color:var(--red)">Callback not delivered: '
+        + esc(String(cb.error)) + '</div>';
+    }
+    html += '<section class="bd-card-section"><h4>Worker request</h4>' + requestHtml + '</section>';
+  }
+  if (item.ask_actor || item.ask_question || item.ask_unblocks) {
+    html += '<section class="bd-card-section"><h4>Human request</h4>'
+      + '<div class="board-detail-meta-row"><b>Waiting on</b> ' + esc(item.ask_actor || 'unspecified')
+      + (item.ask_type ? ' · ' + esc(item.ask_type) : '') + '</div>'
+      + (item.ask_question ? '<div class="board-detail-meta-row"><span style="color:var(--dim)">Question:</span> '
+          + _linkifyUrls(esc(String(item.ask_question))) + '</div>' : '')
+      + (item.ask_unblocks ? '<div class="board-detail-meta-row"><span style="color:var(--dim)">Unblocks when:</span> '
+          + esc(String(item.ask_unblocks)) + '</div>' : '') + '</section>';
   }
 
   let relationHtml = '';
@@ -26605,10 +26941,17 @@ function _bdRenderMeta(item) {
     });
   if (artifacts.length) {
     html += '<section class="bd-card-section"><h4>Produced assets (' + artifacts.length + ')</h4>'
-      + artifacts.map(a => '<div class="board-detail-meta-row">' + _bdArtifactRef(a)
+      + artifacts.map(a => {
+        const availability = a && a.availability || {};
+        const availabilityText = availability.state === 'missing' ? ' · missing'
+          : availability.state === 'available' ? ' · available'
+          : availability.state === 'external' && availability.measured === false ? ' · reachability not checked'
+          : '';
+        return '<div class="board-detail-meta-row">' + _bdArtifactRef(a)
         + ' <span style="color:var(--dim)">· ' + esc(a.kind || a.source || 'artifact')
-        + (a.state ? ' · ' + esc(a.state) : '') + '</span>'
-        + (a.description ? '<div style="color:var(--dim)">' + esc(a.description) + '</div>' : '') + '</div>').join('');
+        + (a.state ? ' · ' + esc(a.state) : '') + esc(availabilityText) + '</span>'
+        + (a.description ? '<div style="color:var(--dim)">' + esc(a.description) + '</div>' : '') + '</div>';
+      }).join('');
     html += '</section>';
   }
 
@@ -26687,9 +27030,23 @@ async function _bdHydrate(id) {
   } catch (e) { /* leave unhydrated; the save guard covers it */ }
 }
 
-function openBoardDetail(id) {
-  const item = boardItems.find(i => i.id === id);
-  if (!item) return;
+async function openBoardDetail(id) {
+  let item = boardItems.find(i => i.id === id);
+  if (!item) {
+    // Message history, lineage, and deep links can point at an older terminal
+    // card that is intentionally absent from the board's capped working set.
+    // Resolve that ID authoritatively instead of turning a valid clickable
+    // link into a silent navigation to an unrelated board overview.
+    try {
+      const fetched = await apiCall(API + '/api/board/' + encodeURIComponent(id));
+      if (!fetched || !fetched.id) throw new Error('Task not found');
+      item = fetched;
+      boardItems.push(fetched);
+    } catch (e) {
+      showToast('Could not open ' + id + ': ' + (e.message || e), true);
+      return;
+    }
+  }
   boardDetailId = id;
   // Render instantly from cache, then correct it from the server. Blocking the
   // modal on a fetch would make every card open feel slow for a field most
@@ -30397,7 +30754,7 @@ function toggleSettings() {
     if (zd) zd.textContent = _zoomLevel + '%';
     // Apply cloud identity (email) or device name
     _applyIdentityToSettings();
-    if (!_cloudEmail) {
+    if (!_cloudEmail && !_localMemberEmail) {
       // Show effective device name and populate override input
       const effective = _getDeviceName();
       const custom = localStorage.getItem('amux_device_name') || '';
@@ -30424,10 +30781,103 @@ function toggleSettings() {
     loadUsage();
   }
 }
-// Subscription usage — model-agnostic. The server proxies Claude's OAuth usage
-// endpoint and returns limits[]: session (5h), weekly_all, and per-model
-// weekly_scoped entries (scope.model.display_name). We render remaining =
-// 100 − percent for each, colouring by how close to the cap it is.
+// Subscription usage across every provider amux ships. Keep the four provider
+// summaries visible, then put the provider API's detailed windows one tap
+// away. That makes "what can still run?" scannable in the tiny Settings menu
+// without hiding model-specific limits, exact reset clocks, credits, or auth
+// states when somebody needs the full answer (AMUX-4154).
+function usageResetText(raw) {
+  if (raw === null || raw === undefined || raw === '') return '';
+  const dt = new Date(typeof raw === 'number' && raw < 1e12 ? raw * 1000 : raw);
+  if (isNaN(dt.getTime())) return '';
+  const diff = dt.getTime() - Date.now();
+  const exact = dt.toLocaleString([], {
+    weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+  });
+  if (diff <= 0) return 'due now · ' + exact;
+  let seconds = Math.ceil(diff / 1000);
+  const days = Math.floor(seconds / 86400); seconds -= days * 86400;
+  const hours = Math.floor(seconds / 3600); seconds -= hours * 3600;
+  const minutes = Math.floor(seconds / 60); seconds -= minutes * 60;
+  const parts = [];
+  if (days) parts.push(days + 'd');
+  if (hours) parts.push(hours + 'h');
+  if (minutes) parts.push(minutes + 'm');
+  if (!parts.length) parts.push(Math.max(1, seconds) + 's');
+  return 'in ' + parts.slice(0, 2).join(' ') + ' · ' + exact;
+}
+function usagePercent(n) {
+  const value = Math.max(0, Math.min(100, Number(n) || 0));
+  return (Math.round(value * 10) / 10).toLocaleString([], { maximumFractionDigits: 1 });
+}
+function usageProviderMeta(provider) {
+  const bits = [];
+  const resetCredits = provider.reset_credits;
+  if (resetCredits && typeof resetCredits.availableCount === 'number') {
+    bits.push(resetCredits.availableCount + ' reset credit' + (resetCredits.availableCount === 1 ? '' : 's'));
+    const first = Array.isArray(resetCredits.credits) ? resetCredits.credits[0] : null;
+    const expiry = first && usageResetText(first.expiresAt || first.expires_at);
+    if (expiry) bits.push('next reset credit expires ' + expiry);
+  }
+  const buckets = Array.isArray(provider.buckets) ? provider.buckets : [];
+  buckets.forEach(bucket => {
+    const credits = bucket && bucket.credits;
+    if (!credits) return;
+    const name = bucket.name && bucket.name !== 'codex' ? bucket.name + ': ' : '';
+    if (credits.unlimited) bits.push(name + 'unlimited credits');
+    else if (credits.balance !== null && credits.balance !== undefined) bits.push(name + credits.balance + ' credits');
+    if (bucket.individual_limit) bits.push(name + 'individual limit');
+    if (bucket.spend_control_reached) bits.push(name + 'spend control reached');
+    if (bucket.rate_limit_reached_type) bits.push(name + String(bucket.rate_limit_reached_type).replace(/_/g, ' '));
+  });
+  if (provider.extra_usage) {
+    const extra = provider.extra_usage;
+    if (extra.is_enabled) {
+      let label = 'extra usage on';
+      if (extra.used_credits !== null && extra.used_credits !== undefined) label += ' · ' + extra.used_credits + ' used';
+      if (extra.monthly_limit !== null && extra.monthly_limit !== undefined) label += ' / ' + extra.monthly_limit;
+      bits.push(label);
+    } else {
+      bits.push('extra usage off');
+    }
+  }
+  if (provider.spend && provider.spend.enabled) {
+    const spend = provider.spend;
+    const used = spend.used && spend.used.amount_minor;
+    const exponent = spend.used && spend.used.exponent;
+    const currency = spend.used && spend.used.currency;
+    if (typeof used === 'number' && typeof exponent === 'number') {
+      bits.push((currency || '') + ' ' + (used / Math.pow(10, exponent)).toFixed(exponent));
+    }
+    if (spend.cap !== null && spend.cap !== undefined) bits.push('spend cap ' + spend.cap);
+  }
+  if (provider.credits !== null && provider.credits !== undefined) {
+    if (typeof provider.credits === 'number' || typeof provider.credits === 'string') {
+      bits.push(provider.credits + ' credits');
+    } else if (provider.credits.availableCredits !== undefined) {
+      bits.push(provider.credits.availableCredits + ' credits');
+    }
+  }
+  if (provider.auth_type) bits.push(String(provider.auth_type).replace(/-/g, ' '));
+  return [...new Set(bits)];
+}
+function usageWindowRow(window) {
+  const used = Math.max(0, Math.min(100, Number(window.used_percent) || 0));
+  const remaining = window.remaining_percent === null || window.remaining_percent === undefined
+    ? 100 - used : Number(window.remaining_percent);
+  const colour = used >= 90 ? 'var(--red)' : (used >= 70 ? '#f0a020' : 'var(--green)');
+  let amount = usagePercent(remaining) + '% left';
+  if (window.remaining_amount !== null && window.remaining_amount !== undefined) {
+    amount += ' · ' + window.remaining_amount + ' requests';
+  }
+  const reset = usageResetText(window.resets_at);
+  return '<div class="usage-window" data-usage-window>'
+    + '<div class="usage-window-line"><span class="usage-window-label" title="' + esc(window.label || 'Limit') + '">' + esc(window.label || 'Limit') + '</span>'
+    + '<span class="usage-window-value">' + esc(amount) + '</span></div>'
+    + '<div class="usage-bar" aria-label="' + esc(amount) + '"><span style="width:' + used + '%;background:' + colour + '"></span></div>'
+    + (reset ? '<div class="usage-reset">Resets ' + esc(reset) + '</div>' : '')
+    + '</div>';
+}
 async function loadUsage() {
   const el = document.getElementById('settings-usage-body');
   if (!el) return;
@@ -30435,56 +30885,40 @@ async function loadUsage() {
   try {
     const r = await fetch(API + '/api/usage');
     const d = await r.json();
-    if (!d.available) { el.innerHTML = '<span style="color:var(--dim);">' + esc(d.reason || 'Usage unavailable') + '</span>'; return; }
-    const limits = (d.limits || []).filter(l => typeof l.percent === 'number');
-    if (!limits.length) { el.innerHTML = '<span style="color:var(--dim);">No usage limits reported</span>'; return; }
-    // Anthropic renamed this limit's kind from 'worker' to 'session'. Accept
-    // BOTH: a client that hard-codes today's spelling breaks on the next
-    // rename, and an older server still sends the old one. Two call sites key
-    // on this — the label AND the sort order below, whose comment already said
-    // "session first" while its predicate had stopped matching, so the 5-hour
-    // row silently lost its place as well as its name.
-    const isSession = l => l.kind === 'session' || l.kind === 'worker';
-    const label = l => {
-      // "session", not "worker": in amux a worker is a lane, and this limit is
-      // the account's 5-hour window, not any one lane's.
-      if (isSession(l)) return '5-hour session';
-      const m = l.scope && l.scope.model && l.scope.model.display_name;
-      if (m) return m + ' · weekly';
-      if (l.group === 'weekly' || l.kind.indexOf('weekly') === 0) return 'Weekly (all models)';
-      return l.kind;
-    };
-    const resetTxt = iso => {
-      if (!iso) return '';
-      const dt = new Date(iso); if (isNaN(dt)) return '';
-      const now = Date.now(), diff = dt - now;
-      if (diff <= 0) return 'resets soon';
-      const h = Math.floor(diff / 3600000), dys = Math.floor(h / 24);
-      return 'resets ' + (dys >= 1 ? 'in ' + dys + 'd' : (h >= 1 ? 'in ' + h + 'h' : 'in <1h'));
-    };
-    // session first, then weekly-all, then per-model scoped
-    const order = l => isSession(l) ? 0 : (l.scope && l.scope.model ? 2 : 1);
-    limits.sort((a, b) => order(a) - order(b));
-    el.innerHTML = limits.map(l => {
-      const used = Math.max(0, Math.min(100, Math.round(l.percent)));
-      const rem = 100 - used;
-      const col = used >= 90 ? 'var(--red)' : (used >= 70 ? '#f0a020' : 'var(--green)');
-      return '<div style="margin-bottom:9px;">'
-        + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:3px;">'
-        // THE LABEL SHRINKS, THE NUMBER DOES NOT. Capping the menu width alone
-        // would clip these rows one layer in: both spans were nowrap by default
-        // in a space-between flex, so the row's intrinsic width was 445px on a
-        // 375px screen and something had to be cut. The reading order decides
-        // WHICH: "78% left · resets in <1h" is the answer, "5-hour session" is
-        // the question and is recoverable from position. So the label gets
-        // min-width:0 + ellipsis (a flex item will not shrink below its content
-        // without min-width:0) and the value gets flex-shrink:0.
-        +   '<span style="font-size:0.8rem;color:var(--fg);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(label(l)) + '</span>'
-        +   '<span style="font-size:0.74rem;color:var(--dim);flex-shrink:0;white-space:nowrap;">' + rem + '% left · ' + esc(resetTxt(l.resets_at)) + '</span>'
-        + '</div>'
-        + '<div style="height:6px;border-radius:4px;background:var(--border);overflow:hidden;">'
-        +   '<div style="height:100%;width:' + used + '%;background:' + col + ';"></div>'
-        + '</div></div>';
+    // Old servers remain usable during a rolling deploy: synthesize their
+    // Claude-only body into the provider collection the new renderer expects.
+    let providers = Array.isArray(d.providers) ? d.providers : [{
+      id: 'claude', label: 'Claude', available: !!d.available,
+      reason: d.reason, metered: true,
+      windows: (d.limits || []).filter(l => typeof l.percent === 'number').map(l => ({
+        label: (l.kind === 'session' || l.kind === 'worker') ? '5-hour session'
+          : (l.scope && l.scope.model ? l.scope.model.display_name + ' · weekly' : 'Weekly · all models'),
+        used_percent: l.percent, remaining_percent: 100 - l.percent, resets_at: l.resets_at,
+      })),
+    }];
+    const constrained = providers
+      .filter(p => p.available && Array.isArray(p.windows) && p.windows.length)
+      .sort((a, b) => Math.min(...a.windows.map(w => Number(w.remaining_percent) || 0))
+        - Math.min(...b.windows.map(w => Number(w.remaining_percent) || 0)))[0];
+    el.innerHTML = providers.map(provider => {
+      const windows = Array.isArray(provider.windows) ? provider.windows : [];
+      const minimum = windows.length ? Math.min(...windows.map(w => Number(w.remaining_percent) || 0)) : null;
+      const status = !provider.available ? 'Unavailable'
+        : provider.metered === false ? 'Unlimited'
+        : minimum === null ? 'No active limits' : usagePercent(minimum) + '% left';
+      const meta = usageProviderMeta(provider);
+      const detail = !provider.available
+        ? '<div class="usage-unavailable">' + esc(provider.reason || 'Usage unavailable') + '</div>'
+        : windows.length ? windows.map(usageWindowRow).join('')
+        : '<div class="usage-unavailable">' + esc(provider.summary || 'No active limits reported') + '</div>';
+      return '<details class="usage-provider" data-provider="' + esc(provider.id || '') + '"'
+        + (constrained && constrained.id === provider.id ? ' open' : '') + '>'
+        + '<summary><span class="usage-provider-name">' + esc(provider.label || provider.id || 'Provider') + '</span>'
+        + (provider.plan ? '<span class="usage-provider-plan">' + esc(String(provider.plan).replace(/_/g, ' ')) + '</span>' : '')
+        + '<span class="usage-provider-status">' + esc(status) + '</span></summary>'
+        + '<div class="usage-provider-detail">' + detail
+        + (meta.length ? '<div class="usage-provider-meta">' + meta.map(bit => '<span>' + esc(bit) + '</span>').join('') + '</div>' : '')
+        + '</div></details>';
     }).join('');
   } catch (e) {
     el.innerHTML = '<span style="color:var(--dim);">Could not load usage</span>';
@@ -30961,22 +31395,31 @@ async function loadTeamSection() {
       list.innerHTML = html || '<span style="color:var(--dim);font-size:0.75rem;">No members yet — invite someone!</span>';
     } else {
       // Local mode: use container-level org
-      const [orgRes, membersRes] = await Promise.all([
-        fetch('/api/org'), fetch('/api/org/members')
+      const [orgRes, membersRes, invitesRes] = await Promise.all([
+        fetch('/api/org'), fetch('/api/org/members'), fetch('/api/org/invites')
       ]);
       const org = await orgRes.json();
       const members = await membersRes.json();
+      const invites = invitesRes.ok ? await invitesRes.json() : [];
       const nameEl = document.getElementById('settings-org-name');
       if (nameEl && nameEl !== document.activeElement) nameEl.value = org.name || '';
-      if (!members.length) {
-        list.innerHTML = '<span style="color:var(--dim);font-size:0.75rem;">No members yet — invite someone!</span>';
-      } else {
-        list.innerHTML = members.map(m => `
+      let html = '';
+      if (members.length) {
+        html += members.map(m => `
           <div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;border-bottom:1px solid var(--border);">
             <span>${esc(m.name || m.email)}</span>
             <span style="color:var(--dim);font-size:0.7rem;">${m.role}</span>
           </div>`).join('');
       }
+      if (invites.length) {
+        html += '<div style="margin-top:4px;font-size:0.68rem;color:var(--dim);">Pending invites:</div>';
+        html += invites.map(inv => `
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:2px 0;">
+            <span style="font-size:0.72rem;color:var(--dim);">${esc(inv.email || 'Anyone with link')} · expires ${new Date(inv.expires_at*1000).toLocaleDateString()}</span>
+            <button onclick="deleteInvite('${esc(inv.token)}')" style="background:none;border:none;color:var(--dim);cursor:pointer;font-size:0.65rem;">revoke</button>
+          </div>`).join('');
+      }
+      list.innerHTML = html || '<span style="color:var(--dim);font-size:0.75rem;">No members yet — invite someone!</span>';
     }
   } catch(e) {}
 }
@@ -30998,8 +31441,17 @@ async function saveOrgName(val) {
 
 async function openTeamInvite() {
   closeSettings();
-  const res = await fetch('/api/org/invites', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({})});
-  const data = await res.json();
+  const email = await showPrompt('Invite by email (optional)', 'person@example.com');
+  if (email === null) return;
+  let res;
+  try {
+    res = await fetch('/api/org/invites', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email})});
+  } catch (e) {
+    showAlert('Failed to create invite: network error');
+    return;
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) { showAlert('Failed to create invite: ' + (data.error || 'HTTP ' + res.status)); return; }
   if (!data.url) { showAlert('Failed to create invite: ' + (data.error || 'unknown error')); return; }
   // Show modal with copyable link
   const modal = document.createElement('div');
@@ -31008,7 +31460,7 @@ async function openTeamInvite() {
     <h3 style="margin:0 0 8px;font-size:1rem;">Invite to workspace</h3>
     <p style="color:var(--dim);font-size:0.82rem;margin:0 0 14px;">Share this link. It expires in 7 days.</p>
     <div style="display:flex;gap:8px;">
-      <input id="invite-link-input" type="text" value="${data.url}" readonly
+      <input id="invite-link-input" type="text" value="${esc(data.url)}" readonly
         style="flex:1;padding:8px 10px;border-radius:6px;border:1px solid var(--border,#333);background:var(--bg,#111);color:inherit;font-size:0.8rem;min-width:0;">
       <button onclick="(function(){var el=document.getElementById('invite-link-input');el.select();navigator.clipboard.writeText(el.value).then(()=>{this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500)})}).call(this)"
         style="padding:8px 14px;border-radius:6px;background:var(--accent,#a78bfa);color:#000;border:none;cursor:pointer;font-weight:600;white-space:nowrap;">Copy</button>
@@ -32057,7 +32509,7 @@ function _costBars(rows, labelKey, opts) {
 function _costRender(d, opts) {
   opts = opts || {};
   const cards = `<div class="cost-cards">
-    <div class="cost-card"><div class="cost-card-v">${_fmtUsd(d.total_cost)}</div><div class="cost-card-l">est. cost${opts.perSession?'':' \u00B7 on Max'}</div></div>
+    <div class="cost-card" title="What these tokens would cost at LIST PRICE with no plan. On a Claude plan this is not money you spend, it is the value of the usage. Doron read &quot;est. cost&quot; as a bill and changed what plan he was going to buy on the strength of it (AF-494)."><div class="cost-card-v">${_fmtUsd(d.total_cost)}</div><div class="cost-card-l">est. list price${opts.perSession?'':' \u00B7 on Max'}</div></div>
     <div class="cost-card"><div class="cost-card-v">${_fmtTok(d.total_tokens)}</div><div class="cost-card-l">tokens</div></div>
     <div class="cost-card"><div class="cost-card-v">${(d.total_turns||0).toLocaleString()}</div><div class="cost-card-l">turns</div></div>
     <div class="cost-card"><div class="cost-card-v">${d.cache_hit_pct||0}%</div><div class="cost-card-l">cache hit</div></div>
@@ -36114,6 +36566,30 @@ async function _bwClearInspect() {
 // reCAPTCHA — many sites do. A human completing the challenge once in a real
 // window is the only thing that works, and closing the window is what flushes
 // the session to the profile for the API to reuse.
+// AF-496. amux launches Chrome into its own --user-data-dir, so the window it
+// opens sits beside the human's own Chrome and looks identical: same icon, same
+// frame, no badge. Measured in a live onboarding session (2026-09-04) — the user
+// signed into the wrong window and was corrected three times, and asked "should
+// I trust it, it does look like two different browsers?".
+//
+// amux held the answer the whole time (pid, port, profile, starting lane) and
+// had no way to SHOW it. This button puts it where the person is looking: it
+// raises the amux window and draws a bar across it. A Chrome window WITHOUT a
+// bar is their own, which is what makes the multi-window case answerable.
+async function _bwIdentify() {
+  _bwStatus('identifying the amux window\u2026');
+  try {
+    const r = await fetch('/api/browser/identify', { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' });
+    const d = await r.json();
+    if (d.error) { _bwStatus(d.error + (d.running_profiles ? ' (running: ' + d.running_profiles.join(', ') + ')' : '')); return; }
+    // Report the OUTCOME, not the request. `labeled/pages` is the pair that
+    // says whether a 0 means "no tabs" or "every tab refused" (ethos rule 4).
+    const names = (d.identified || []).map(b => b.profile).join(', ');
+    if (!d.identified || !d.identified.length) { _bwStatus(d.verdict || 'no amux browser is running'); return; }
+    _bwStatus(d.verdict + ' \u2014 ' + names + ' (' + d.labeled + '/' + d.pages + ' tab(s) labelled)');
+  } catch (e) { _bwStatus('identify failed: ' + e); }
+}
+
 async function _bwNewProfile() {
   const url = (document.getElementById('bw-url').value || '').trim();
   const suggested = (() => {

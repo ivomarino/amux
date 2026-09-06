@@ -185,19 +185,66 @@ fallback when a finding needs row-level inspection.
    Read `error_body` before counting a 403 as an auth failure — the spike shape
    (one IP, many, fast) is the signal, not the status on its own.
 
-5. **Worker traffic with no board trace.** Collect distinct `worker` values from
-   `GET /api/logs?since=$SINCE&limit=2000`, keeping only rows whose `method` is
-   POST/PATCH/PUT/DELETE; cross-check
-   `GET /api/board?done_limit=100000` for cards with that session
-   updated in the window. Finding = a worker doing MUTATING work whose board
-   shows nothing in `doing`/updated — silent work (task-ledger rule violation),
+5. **Sessions writing with no board trace.** One deterministic call:
+
+   ```
+   GET /api/logs/writers?since_h=24
+   ```
+
+   It returns every `amux_session` that made a mutating request in the window,
+   with per-method counts, `first_ts`/`last_ts`, and a `distinct_writers` total.
+   Cross-check `GET /api/board?done_limit=100000` for cards with that session
+   updated in the window. Finding = a session doing MUTATING work whose board
+   shows nothing in `doing`/updated: silent work (task-ledger rule violation),
    or a runaway loop hammering the API.
+
+   **Three fields decide whether you may draw a conclusion at all.** Read them
+   before the list, not after:
+
+   - `actual_window_h` is the window the rows ACTUALLY cover. `24` asked for and
+     `6.2` covered is a complete answer to a smaller question, and only this
+     field says so.
+   - `unattributed_mutations` is writes that named no caller. They belong to
+     nobody, and the count is published unowned for exactly that reason. At
+     ~7,708 unattributed reports a day (AF-67) a large number here is normal and
+     is NOT evidence about any lane.
+   - `scan_truncated` is true only if more than 500 distinct sessions wrote, in
+     which case `writers` is a slice while `distinct_writers` stays the full
+     count.
+
+   **This step used to page and could not cover its window (AF-475).** It said
+   "collect distinct `worker` values from `GET /api/logs?since=$SINCE&limit=2000`",
+   which is 2,000 of 417,852 rows: measured 2026-09-04, that page spanned **0.85
+   hours of the 24** it was characterising. The sessions it yielded were the ones
+   that happened to be writing in the last fifty minutes, and this step's output
+   is an accusation the qualifications below call "the expensive kind".
+
+   Adding a `method=` filter to the page was the obvious cheaper fix and does not
+   work. Measured from the aggregate over a full 24h window: 34,145 mutating rows
+   out of 416,340. A 2,000-row page of mutating-only rows is 5.9% of the day's
+   writes, roughly 1.4 hours of 24. Better than the 0.48% an unfiltered page
+   reaches, and still not a window.
+
+   The decisive number is the answer itself, not the ratio. On the same window
+   the prescribed page yielded **12 sessions**; a hand-rolled 14-page walk yielded
+   37; the aggregate yields **53**. A filter that closes as fixed while still
+   naming a third of the writers is the worse outcome, because the next sweep
+   inherits a closed card telling it not to re-check.
+
+   Do not extrapolate coverage from one page's `page_span_h`. Traffic here is
+   bursty enough that the newest page ran at ~2,400 rows/h against a 24h mean of
+   ~17,300, so a span read off the newest page overstates coverage by 7x. Both
+   this card's original estimate and its first correction were computed that way
+   and both were wrong. `mutating_rows` and `n_considered` on this endpoint are
+   whole-window counts and are the numbers to reason from.
 
    Three qualifications, each from a false positive this rule produced on
    2026-08-09 (AF-34). It accused a peer, and the accusation is the expensive
    kind — you cannot un-say "you are working off-ledger":
 
-   - **Mutating methods only.** `amux-homepage` was flagged on 105 requests with
+   - **Mutating methods only.** NOW ENFORCED BY THE ENDPOINT (`MUTATING_METHODS`),
+     kept because it says why and because a server-side rule can still regress.
+     `amux-homepage` was flagged on 105 requests with
      0 cards. All 105 were `GET/POST /api/sessions` — 103 GETs, every one a 200:
      polling and messaging, not work. Reading the board and peeking at lanes is
      not silent work, and under the old wording every idle observer looked guilty.
@@ -227,7 +274,11 @@ fallback when a finding needs row-level inspection.
    caught only by re-querying the store.** Neither is hypothetical; the first is
    this file's own rule, violated by someone who had just read it.
 
-   - **Attribute on `amux_session` ONLY. Never fall back to `worker`.** `worker`
+   - **Attribute on `amux_session` ONLY. Never fall back to `worker`.** NOW
+     ENFORCED BY THE ENDPOINT: its query does not select `worker` at all, so the
+     mistake is not available. Note that the old headline for this step said
+     "collect distinct `worker` values" while this bullet forbade it, so a reader
+     who followed the bold line did the forbidden thing. `worker`
      is PATH-derived (`/api/sessions/{name}/*`), so an UNATTRIBUTED report *about*
      lane X is tagged `worker=X` and reads as a mutation *by* X. That is what the
      header of this file means by "worker logs are a filter, never a second log".

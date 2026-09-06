@@ -154,25 +154,45 @@ print("restored %%d keys" %% len(merged))
     return ok
 
 
-def fix_logs():
+def fix_logs(emergency=False):
     # `truncate -s 0`, NOT open(f,"w").close(). Replacing the file contents out
     # from under the docker daemon WEDGES `docker logs` for that container until
     # it is restarted — measured 2026-08-27: an open()-truncate of 7 live json
     # logs left all 7 `docker logs` hanging, which crashed the backup-freshness
     # sweep. `truncate` keeps the same inode/offset the daemon is tracking, so the
     # log reader stays healthy. journald vacuum is unaffected.
-    out = ssh(r'''
+    # Also truncate /var/log/*.log — the biggest single reclaimable log on this
+    # host is /var/log/amux-gateway.log (~52MB), which the container-json glob
+    # missed, so the automatic path freed less than a hand-truncation did and the
+    # disk kept climbing (AC-414). truncate -s 0 is inode-safe here too: a process
+    # holding the fd open for append keeps writing at its old offset (sparse
+    # regrow), and df is relieved immediately.
+    #
+    # EMERGENCY (AC-414, 2026-09-05): at the 0-bytes-free cliff the >20MB floor
+    # reclaims NOTHING — there are no large logs left, so the automatic guard was
+    # useless exactly when it mattered and the disk truncated gateway.env. In
+    # emergency mode drop the size floor (truncate EVERY log), vacuum the journal
+    # hard, and clear the apt cache. All non-customer-data and regenerable; this
+    # is the hand reclaim that pulled the host back from 0KB, now automatic.
+    min_size = "0" if emergency else str(20 * 1024 * 1024)
+    journal_keep = "30M" if emergency else "100M"
+    apt_line = ("subprocess.run(['apt-get','clean'],capture_output=True,timeout=30)"
+                if emergency else "pass")
+    script = r'''
 import subprocess, glob, os
 n = 0
-for f in glob.glob("/var/lib/docker/containers/*/*-json.log"):
+MIN = __MIN__
+for f in glob.glob("/var/lib/docker/containers/*/*-json.log") + glob.glob("/var/log/*.log"):
     try:
-        if os.path.getsize(f) > 20*1024*1024:
+        if os.path.getsize(f) > MIN:
             subprocess.run(["truncate", "-s", "0", f], timeout=10); n += 1
     except Exception: pass
-subprocess.run(["journalctl", "--vacuum-size=100M"], capture_output=True)
+subprocess.run(["journalctl", "--vacuum-size=__JOURNAL__"], capture_output=True)
+__APT__
 print("truncated %d logs" % n)
-''')
-    trace("truncate_logs", out[:60], "truncated" in out)
+'''.replace("__MIN__", min_size).replace("__JOURNAL__", journal_keep).replace("__APT__", apt_line)
+    out = ssh(script)
+    trace("truncate_logs" + ("(emergency)" if emergency else ""), out[:60], "truncated" in out)
     return "truncated" in out
 
 
@@ -506,7 +526,43 @@ except Exception as e:
 def main():
     no_fix = "--no-fix" in sys.argv
     as_json = "--json" in sys.argv
+    disk_only = "--disk-only" in sys.argv
     result = {"trace": TRACE, "healthy": False}
+
+    # --disk-only: a LIGHTWEIGHT stopgap (AC-414). The full sweep runs once a day
+    # (SCHED-356), but a net-negative disk gains ~100MB/h and would hit 100%
+    # between daily runs — so this fast path (check_disk + preventive fix_logs,
+    # skipping the slow persona/deploy/orphan checks) is scheduled every 2h to
+    # hold the disk below 100% until the host disk is resized. It is deliberately
+    # SILENT on the board: AC-414 already carries the escalation, so this must not
+    # file a card every 2h. Retire the schedule when AC-414 is resolved.
+    if disk_only:
+        _disk = check_disk()
+        result["disk"] = _disk
+        if _disk.get("error"):
+            trace("disk", "ERROR: %s" % _disk["error"], False)
+            result["healthy"] = False
+        else:
+            trace("disk", "root %.1f%% used, %.1fGB free" % (_disk.get("pct", 0), _disk.get("free_gb", 0)),
+                  _disk.get("pct", 0) < 90)
+            if _disk.get("pct", 0) >= 95 and not no_fix:
+                _fb = _disk.get("free_gb", 0)
+                # At the cliff (<~300MB free) drop the 20MB log floor and clear the
+                # journal + apt cache too, or the guard reclaims 0 (AC-414 2026-09-05).
+                fix_logs(emergency=_fb < 0.3)
+                _disk = check_disk(); result["disk"] = _disk
+                trace("disk_preventive", "after truncate: %.1f%% used, %.1fGB free (was %.1fGB)"
+                      % (_disk.get("pct", 0), _disk.get("free_gb", 0), _fb), _disk.get("pct", 100) < 95)
+            result["healthy"] = _disk.get("pct", 100) < 98
+        ssh("import json; open('/var/log/cloud-autofix.jsonl','a').write(%r+chr(10))"
+            % json.dumps({"ts": int(time.time()), "disk_only": True, "trace": TRACE}), timeout=20)
+        if as_json:
+            print(json.dumps(result, indent=2))
+        else:
+            print("cloud-autofix --disk-only: disk %.1f%% used (%.1fGB free) -> %s"
+                  % (result["disk"].get("pct", 0), result["disk"].get("free_gb", 0),
+                     "ok" if result["healthy"] else "CRITICAL"))
+        sys.exit(0 if result["healthy"] else 1)
 
     status = probe_cloud()
     result["cloud_status"] = status
@@ -590,13 +646,33 @@ def main():
         if _disk.get("error"):
             trace("disk", "ERROR: %s" % _disk["error"], False)
         else:
-            hi = _disk.get("pct", 0) >= 90
             extra = ""
             if _disk.get("docker_reclaimable"):
                 extra = " | docker=%s backups=%s" % (_disk.get("docker_reclaimable"), _disk.get("backups_dir"))
-            trace("disk", "root %.1f%% used, %.1fGB free%s" % (_disk.get("pct", 0), _disk.get("free_gb", 0), extra), not hi)
+            trace("disk", "root %.1f%% used, %.1fGB free%s" % (_disk.get("pct", 0), _disk.get("free_gb", 0), extra),
+                  _disk.get("pct", 0) < 90)
+            # PREVENTIVE self-heal (AC-414): fix_logs previously ran ONLY on the
+            # DOWN path, so on the healthy path the disk was allowed to climb to
+            # 100% and truncate gateway.env before a single log was freed — a
+            # preventable outage. Truncate oversized logs here, while cloud is
+            # still UP, whenever the disk is critically full, then re-measure so
+            # the escalation below carries the POST-truncation number (naming that
+            # self-help was tried, and whether it was enough).
+            _truncated_this_tick = False
+            if _disk.get("pct", 0) >= 95 and not no_fix:
+                _free_before = _disk.get("free_gb", 0)
+                # At the cliff (<~300MB free), emergency mode: all logs + journal + apt.
+                _truncated_this_tick = fix_logs(emergency=_free_before < 0.3)
+                _disk = check_disk()
+                result["disk"] = _disk
+                trace("disk_preventive", "after truncate: %.1f%% used, %.1fGB free (was %.1fGB)"
+                      % (_disk.get("pct", 0), _disk.get("free_gb", 0), _free_before),
+                      _disk.get("pct", 100) < 95)
+            hi = _disk.get("pct", 0) >= 90
             if hi and not env_problem:
-                env_problem = ("root disk at %.1f%% (%.1fGB free)" % (_disk.get("pct"), _disk.get("free_gb")),
+                _tried = " (logs already truncated this tick — this is the net-negative disk, only a resize or deprovision fixes it)" \
+                    if _truncated_this_tick else ""
+                env_problem = ("root disk at %.1f%% (%.1fGB free)%s" % (_disk.get("pct"), _disk.get("free_gb"), _tried),
                                "Top consumers — docker reclaimable: %s; same-host backups: %s; oversized logs: %s. "
                                "NOTE: 'reclaimable' images may be pinned to running containers (freed only by a "
                                "recreate), and unused VOLUMES may be customer data — never auto-prune volumes (ethos 8)."
@@ -635,12 +711,19 @@ def main():
             trace("no_fix", "dry run — skipping repairs", None)
         else:
             fixed_something = False
-            # Repair 1: truncated gateway.env (the incident's real blocker).
-            if d.get("env_missing") and d.get("env_backup"):
-                fixed_something |= fix_gateway_env(d["env_backup"])
-            # Repair 2: disk full of reclaimable LOGS.
+            # Repair 1: FREE DISK FIRST. fix_gateway_env writes a tempfile under
+            # /etc/amux, which FAILS on a 100%-full disk — so restoring before
+            # freeing space silently no-ops and leaves prod down. That is exactly
+            # what happened 2026-09-03 (AC-414): disk 100% -> gateway.env truncated
+            # -> restore ran first, could not write, failed -> 502 stood until a
+            # human restored by hand. Truncate logs BEFORE the env restore so the
+            # restore has room, and the whole outage self-heals in one pass.
             if (d.get("disk_pct", 0) >= 95) and d.get("reclaimable_log_mb", 0) >= 300:
                 fixed_something |= fix_logs()
+            # Repair 2: truncated gateway.env (the incident's real blocker) — now
+            # with space to write its atomic tempfile.
+            if d.get("env_missing") and d.get("env_backup"):
+                fixed_something |= fix_gateway_env(d["env_backup"])
             # Repair 3: bring the gateway up (covers crash-loop + post-repair).
             restart_gateway()
             # Re-probe.

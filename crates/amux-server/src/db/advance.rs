@@ -189,7 +189,7 @@ fn advance_typed(
     // Gap 4: populate waiting_on when entering NeedsYou.
     if target == TaskStatus::NeedsYou && row.waiting_on.is_none() {
         let waiting = serde_json::json!({
-            "actor": "human",
+            "actor": row.ask_actor.as_deref().unwrap_or("human"),
             "type": row.ask_type.as_deref().unwrap_or("judgment"),
             "question": row.ask_question.as_deref().unwrap_or(""),
             "unblocks": row.ask_unblocks.as_deref().unwrap_or(""),
@@ -411,7 +411,7 @@ pub fn apply_status_side_effects(row: &mut IssueRow, destination: &str) {
     // Gap 4: populate waiting_on when entering NeedsYou.
     if target_typed == Some(TaskStatus::NeedsYou) && row.waiting_on.is_none() {
         let waiting = serde_json::json!({
-            "actor": "human",
+            "actor": row.ask_actor.as_deref().unwrap_or("human"),
             "type": row.ask_type.as_deref().unwrap_or("judgment"),
             "question": row.ask_question.as_deref().unwrap_or(""),
             "unblocks": row.ask_unblocks.as_deref().unwrap_or(""),

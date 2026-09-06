@@ -80,7 +80,11 @@ async fn get_history_item(
     let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Value>> {
         let conn = store.read()?;
         let sql = "SELECT id, text, type, session, ts, origin, card_id, \
-                   delivery, queued_at, delivered_at, submit_verdict \
+                   delivery, queued_at, delivered_at, submit_verdict, \
+                   (SELECT title FROM issues WHERE issues.id=cmd_history.card_id) AS card_title, \
+                   (SELECT status FROM issues WHERE issues.id=cmd_history.card_id) AS card_status, \
+                   (SELECT archived FROM issues WHERE issues.id=cmd_history.card_id) AS card_archived, \
+                   (SELECT deleted FROM issues WHERE issues.id=cmd_history.card_id) AS card_deleted \
                    FROM cmd_history WHERE id=?1";
         let refs: Vec<&dyn rusqlite::types::ToSql> = vec![&nid];
         let mut rows = super::calendar::query_rows_json(&conn, sql, &refs)?;
@@ -567,7 +571,12 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
             // NULL — the UI distinguishes "not recorded" from "direct", and
             // coalescing here would assert a delivery path nobody observed.
             "SELECT id, text, type, session, ts, origin, card_id, \
-             delivery, queued_at, delivered_at, submit_verdict FROM cmd_history",
+             delivery, queued_at, delivered_at, submit_verdict, \
+             (SELECT title FROM issues WHERE issues.id=cmd_history.card_id) AS card_title, \
+             (SELECT status FROM issues WHERE issues.id=cmd_history.card_id) AS card_status, \
+             (SELECT archived FROM issues WHERE issues.id=cmd_history.card_id) AS card_archived, \
+             (SELECT deleted FROM issues WHERE issues.id=cmd_history.card_id) AS card_deleted \
+             FROM cmd_history",
         );
         if !where_cl.is_empty() {
             sql.push_str(" WHERE ");
@@ -1028,6 +1037,12 @@ mod tests {
                 [],
             )
             .unwrap();
+            conn.execute(
+                "INSERT INTO issues (id, title, desc, status, created, updated, archived) \
+                 VALUES ('AMUX-9', 'Fix parser', '', 'done', 1, 1, 1)",
+                [],
+            )
+            .unwrap();
         }
         let (st, list) = send(&app, "GET", "/api/history", None).await;
         assert_eq!(st, StatusCode::OK, "{list}");
@@ -1039,8 +1054,18 @@ mod tests {
         assert_eq!(row["ts"], json!(1753000000123i64));
         assert_eq!(row["origin"], json!("orch"));
         assert_eq!(row["card_id"], json!("AMUX-9"));
+        assert_eq!(row["card_title"], json!("Fix parser"));
+        assert_eq!(row["card_status"], json!("done"));
+        assert_eq!(row["card_archived"], json!(1));
+        assert!(row["card_deleted"].is_null());
         assert_eq!(row["kind"], json!("human"), "steering displays as human");
         assert_eq!(row["queued"], json!(true), "steering is the queued delivery detail");
+
+        let (st, one) = send(&app, "GET", "/api/history/MSG-1", None).await;
+        assert_eq!(st, StatusCode::OK, "{one}");
+        assert_eq!(one["card_title"], json!("Fix parser"));
+        assert_eq!(one["card_status"], json!("done"));
+        assert_eq!(one["card_archived"], json!(1));
     }
 
     #[tokio::test]

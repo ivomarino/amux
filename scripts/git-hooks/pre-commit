@@ -633,6 +633,15 @@ if [ -n "$STAGED" ] && echo "$STAGED" | grep -q '^crates/'; then
     echo "test receipt: none for session '${AMUX_SESSION:-unknown}' — $_n_staged staged crate"
     echo "test receipt: file(s) carry no claim that any run compiled these bytes. Not a"
     echo "test receipt: problem; said out loud so silence is not read as coverage."
+    # NAME THE COMMANDS THAT WRITE ONE (AF-478). This branch used to report the
+    # absence and stop, which is honest and unactionable: a reader who HAD run
+    # tests could not tell "you did not test" from "the command you used does
+    # not record it". That was a live conflict for a day — `safe-cargo.sh`
+    # wrote nothing, so following CLAUDE.md's isolation instruction produced
+    # this message after three green runs.
+    echo "test receipt: written by \`scripts/test-contended.sh <cargo test args>\` or"
+    echo "test receipt: \`scripts/safe-cargo.sh test <args>\`. A run through anything"
+    echo "test receipt: else (bare cargo, a remote build) leaves no receipt to read."
   elif [ "$(grep -m1 '^# repo	' "$_rcpt" | cut -f2)" != "$ROOT" ]; then
     echo "test receipt: the receipt on file is from a DIFFERENT checkout"
     echo "test receipt: ($(grep -m1 '^# repo	' "$_rcpt" | cut -f2)) — it says nothing about this one."

@@ -117,7 +117,25 @@ def lane_repo(session: str) -> str:
 # is computed and not guessed.
 # ---------------------------------------------------------------------------
 RULE_CLASSES = [
-    ("verification", r"\bverif(?:y|ied|ication)\b|\bactually (?:works|live|shipped)\b|\bprove it\b|\bin prod\b|\be2e\b",
+    # `e2e` MUST BE ADJACENT TO A VERB, never bare (AF-450).
+    #
+    # The bare `\be2e\b` arm counted Ethan's own harness prompt NAMES as
+    # restatements of the verification rule: "ISOLATED-E2E-20260903",
+    # "September 3 Gemini E2E workflow", "E2E-Q-20260903-CLAUDE". Measured
+    # 2026-09-03 — 9 of the signal's 18 window hits fired on that arm ALONE, and
+    # every one of the nine was a task label rather than a demand. It reported
+    # 4.2x against baseline where the honest figure is 2.8x.
+    #
+    # The theme this feeds ("Verification is something Ethan has to demand,
+    # every single time") is one of the highest-value entries in the ledger, so
+    # the noise landed on the signal least able to absorb it.
+    #
+    # NOT dropped, because "did you run e2e?" is a real restatement that no
+    # other arm catches and `testing`'s pattern needs the word "tests" after it.
+    # Requiring a verb within 24 non-sentence characters keeps all five demand
+    # forms and drops all four labels.
+    ("verification", r"\bverif(?:y|ied|ication)\b|\bactually (?:works|live|shipped)\b|\bprove it\b|\bin prod\b|"
+                     r"\b(?:run|ran|rerun|re-run|do|did|does|pass(?:ed|es)?|no|any)\b[^.\n]{0,24}\be2e\b",
      r"verified|VERIFY\.md|verification"),
     ("evidence", r"\bevidence\b|\bshow me the\b|\bproof\b|\bpaste the\b|\bwhat did you run\b",
      r"evidence|--evidence"),
@@ -228,8 +246,29 @@ def is_bare_drive(text: str) -> bool:
 LONG_MSG_CHARS = int(os.environ.get("FRICTION_LONG_MSG_CHARS", "1200"))
 
 
+# Text AMUX APPENDS to a human's message. Must be removed before any phrase
+# comparison, or the harness's own words count as the human repeating himself.
+#
+# Measured 2026-09-04: `cross-lane-repeat` read n=14, and 4 of the 14 were this
+# footer. Two of them, MSG-40511 and MSG-42067, share 194 identical characters
+# and NOTHING ELSE: one asks to add public datasets to a table, the other asks
+# for MVS throughput metrics. The signal reported them as the same instruction
+# sent to two lanes.
+#
+# It matters more than 29% suggests, because `cross-lane-repeat` is the only
+# evidence under the theme "Ethan is the fleet's status poller", whose entire
+# claim is that he has to repeat himself. An instrument that counts amux's own
+# text as his repetition is arguing the theme from the harness's voice.
+AMUX_APPENDED = re.compile(r"\n*\[amux: ", re.I)
+
+
+def strip_amux_appended(text: str) -> str:
+    """The human's own words, with anything amux added removed."""
+    return AMUX_APPENDED.split(text or "", 1)[0]
+
+
 def instruction_of(text: str) -> str:
-    t = text or ""
+    t = strip_amux_appended(text)
     if len(t) <= LONG_MSG_CHARS:
         return t
     return t.split("\n\n", 1)[0][:LONG_MSG_CHARS]
@@ -269,6 +308,25 @@ def canon_area(text: str) -> str:
 # entry that says "documents" (8 -> 156) and `index|cluster|pipeline` inflating
 # engine 134 -> 472. So this adds ONE precise membership and takes nothing away:
 # instruments 103 -> 116, every other cluster unchanged.
+# WIDENED 2026-09-04, and the widening is the sweep's own finding. The arms above
+# were written from three specimens that all said "reports COMPLETED", so the
+# membership matched the WORDING of those three rather than the class. Measured
+# over the same 1206 open entries: the shipped arms caught 32, and 63 more open
+# entries describe the identical shape in different words. Sampled at 4 per arm,
+# every one is the class: "documents/list through the SHARED host returns a silent
+# 200-empty", "`objects/batch` silently drops any blob whose URL its fetcher cannot
+# reach", "setting an App `is_active: false` does NOT take it offline",
+# "`post_filters` is typed, documented, autocompleted, and never applied".
+#
+# THE BASELINE MOVES AND THE NEXT RUN MUST NOT READ IT AS A SURGE. instruments
+# goes 32 -> 95 memberships on the same corpus, with no entry leaving its
+# subsystem cluster. That is an instrument change, not new friction, and it is
+# recorded in docs/friction-themes.md against the theme it feeds.
+#
+# EACH ARM IS ITS OWN PHRASE, not a general "success" pattern. A bare \bok\b or
+# \bgreen\b was measured and rejected: they match ordinary prose and would let
+# this membership absorb the ledger, which is the failure the negative cells in
+# scripts/test-friction-themes.sh exist to catch.
 GREEN_BUT_EMPTY = re.compile(
     r"reports? (?:completed|success|green|ok)\b"
     r"|completes? green|complet\w* green"
@@ -276,7 +334,26 @@ GREEN_BUT_EMPTY = re.compile(
     r"|zero (?:bytes|documents|rows|results|files|objects)"
     r"|(?:reported|reports|says) (?:it )?(?:worked|succeeded|done)\b"
     r"|silent (?:write )?loss"
-    r"|nothing (?:says so|can search)",
+    r"|nothing (?:says so|can search)"
+    # a 2xx carrying nothing, said the several ways this fleet says it
+    r"|silent(?:ly)? (?:200|202)|(?:200|202)[- ]empty"
+    r"|HTTP 200 (?:with|and) (?:zero|no|an empty)"
+    # a success status contradicted in the same sentence, EITHER SIDE of it. The
+    # first version only looked forward and missed "is cancelled, and reports
+    # HTTP 200 / status: completed", where the contradiction is stated first;
+    # the test cell caught that on its own specimen.
+    r"|status:\s*(?:completed|success|ok)\b[^.\n]{0,80}"
+    r"(?:cancel|fail|never|still running|zero|empty)"
+    r"|(?:cancel\w*|fail\w*|times? out|timed out|never \w+)[^.\n]{0,80}"
+    r"(?:reports?|returns?)[^.\n]{0,30}(?:200|202|status:\s*(?:completed|success|ok))"
+    # the operation discarding work while answering normally
+    r"|silently (?:drops?|discards?|ignores?|skips?|reversible|overwrit\w+|swallow\w*)"
+    # a control that answers and does not act
+    r"|does NOT (?:take|apply|remove|delete|disable|stop)\b"
+    r"|plumbed[^.\n]{0,60}(?:no[- ]op|inert|nothing|never)"
+    r"|documented[^.\n]{0,40}and (?:inert|ignored|never)"
+    # the defining clause of the class, stated directly
+    r"|and (?:nothing|no one|nobody) (?:anywhere )?(?:says|warns|reports|notices)",
     re.I,
 )
 
@@ -317,6 +394,8 @@ class Signal:
         self.active = False
         self.evidence = []
         self.detail = {}
+        # AF-511: computed over the FULL matching set, not `evidence`.
+        self.concentration = None
 
     def to_dict(self):
         return {
@@ -330,9 +409,57 @@ class Signal:
             "baseline": self.baseline,
             "baseline_means": self.baseline_label,
             "active": self.active,
+            "concentration": self.concentration,
             "evidence": self.evidence[:MAX_PER_SIGNAL],
             "detail": self.detail,
         }
+
+
+def concentration(pairs):
+    """How CONCENTRATED a signal's evidence is, over the FULL set (AF-511).
+
+    `n` alone cannot separate a recurring class from one long incident: n=11
+    spread over eleven lane-days and n=11 from one lane in one hour print
+    identically, and only the first is a theme. Measured 2026-09-05, the three
+    loudest signals of the day — idle-stall (7.5x baseline), deploy-live (13x)
+    and verification — were ALL amux-testing-e2e on 2026-09-04, one
+    ATE-44/ATE-45 incident. Ranked by n they were the day's top themes.
+
+    That matters more here than in an ordinary dashboard because
+    docs/friction-themes.md increments OCCURRENCES from these signals, and its
+    own header calls an inflated OCCURRENCES the one way the file can corrupt
+    itself. The LAST_SEEN guard does not catch this, because a run that sees one
+    incident is legitimately a new run.
+
+    No threshold and no judgement call: this prints the three numbers and lets
+    the reading session discriminate. A verdict computed here would be a second
+    opinion the reader cannot audit, and `incident_shaped` below is deliberately
+    a DESCRIPTION of the numbers rather than a filter that hides anything.
+
+    `pairs` is [(session, ts_ms)] over EVERY matching row, never the displayed
+    sample — the evidence list truncates at MAX_PER_SIGNAL, so computing this
+    from it would measure the truncation.
+    """
+    pairs = [(sess or "?", ts) for sess, ts in pairs if ts is not None]
+    if not pairs:
+        return None
+    lanes = Counter(sess for sess, _ in pairs)
+    lane_days = {(sess, time.strftime("%Y-%m-%d", time.localtime(ts / 1000)))
+                 for sess, ts in pairs}
+    days = {d for _, d in lane_days}
+    top_lane, top_n = lanes.most_common(1)[0]
+    share = top_n / len(pairs)
+    return {
+        "sampled_over": len(pairs),
+        "distinct_lanes": len(lanes),
+        "distinct_lane_days": len(lane_days),
+        "distinct_days": len(days),
+        "top_lane": top_lane,
+        "top_lane_share": round(share, 2),
+        # One lane, one day, and more than a couple of messages. Stated as what
+        # the numbers ARE, so a reader who disagrees can see why.
+        "incident_shaped": bool(len(lanes) == 1 and len(days) == 1 and len(pairs) >= 3),
+    }
 
 
 def db_connect():
@@ -438,6 +565,10 @@ def signal_rule_restatement(con, now_ms, prompts_doc):
         # ordinary conversation, and at n>=1 every class fired every day.
         s.active = (s.value > max(2.0, baseline_rate * 1.5)) or (
             already_written and s.value >= 2)
+        # OVER `in_win`, THE FULL SET — `evidence` below truncates at
+        # MAX_PER_SIGNAL, and computing concentration from it would measure the
+        # truncation rather than the signal (AF-511).
+        s.concentration = concentration([(r["session"], r["ts"]) for r in in_win])
         s.evidence = [
             {"msg": f"MSG-{r['id']}", "session": r["session"],
              "ts": time.strftime("%Y-%m-%d %H:%M", time.localtime(r["ts"] / 1000)),
@@ -882,6 +1013,13 @@ def main():
                  if s.baseline is not None else "")
               + f", considered {s.n_considered})")
         print(f"  {s.headline}")
+        c = s.concentration
+        if c:
+            flag = "  <-- INCIDENT-SHAPED: one lane, one day" if c["incident_shaped"] else ""
+            print(f"  concentration: {c['distinct_lanes']} lane(s), "
+                  f"{c['distinct_lane_days']} lane-day(s), "
+                  f"top lane {c['top_lane']} {int(c['top_lane_share']*100)}% "
+                  f"(over all {c['sampled_over']}){flag}")
         if s.detail:
             print(f"  detail: {json.dumps(s.detail)}")
         for e in s.evidence[:MAX_PER_SIGNAL]:

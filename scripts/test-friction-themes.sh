@@ -309,12 +309,44 @@ for t in green:
 assert m.canon_area(green[0]) == "engine", m.canon_area(green[0])
 assert m.canon_area(green[1]) == "api-contract", m.canon_area(green[1])
 
+# THE 2026-09-04 WIDENING, one specimen per new arm, in the fleet's real wording.
+# The three originals above all say "reports COMPLETED", so they pin the WORDING
+# of three specimens rather than the class; measured that day, 63 further open
+# entries were the same shape in different words and the membership missed every
+# one. Without these cells the new arms can be deleted and everything stays green.
+for t in [
+    # a 2xx carrying nothing
+    "API/routing (documents/list through the SHARED host returns a silent 200-empty for a dedicated-tenant namespace)",
+    "API/retrievers (three filter-operator spellings, one 400s, one works, and one returns HTTP 200 with zero rows)",
+    # a success status contradicted in the same breath
+    "API/retrievers (`query_expand` exceeds a 6000ms hard ceiling, is cancelled, and reports HTTP 200 / status: completed)",
+    # work discarded while the call answers normally
+    "API/Ingestion — `objects/batch` silently drops any blob whose URL its server-side fetcher cannot reach",
+    "MVS (the vector store's `count()` SILENTLY IGNORES its `filters` argument and returns the NAMESPACE total)",
+    # a control that answers and does not act
+    "API/apps — setting an App `is_active: false` does NOT take it offline; the public URL keeps serving",
+    "API/Retrievers — `post_filters` is typed, documented, autocompleted, and never applied by any stage",
+    # the class stated outright
+    "API/collections (a document can be listed and still be unsearchable, and nothing says which)",
+]:
+    assert "instruments" in m.extra_areas(t), "widened arm missed its own specimen: " + t
+    assert m.canon_area(t) != "unclassified", "subsystem label lost by the widening: " + t
+
 # NEGATIVE: an ordinary defect must not acquire the label, or instruments
 # absorbs the whole ledger and the theme stops discriminating.
+#
+# The last four are the ones the WIDENING could plausibly over-match: a bare
+# success word, a bare "green", a plain 200, and an ordinary "does not" that is
+# not a control failing to act. All four were measured against the shipped
+# pattern before it was widened and must stay out.
 for t in [
     "Studio/retrievers (the input-type picker offered a type the API rejects at create time)",
     "API/manifest (POST /v1/manifest/diff ignores X-Namespace-Id and runs org-wide)",
     "CI/Security (the weekly full-tree secret scan shares a cancel-in-progress group)",
+    "CI (the suite is green on main and the nightly deep run is red, and nobody owns the difference)",
+    "API/auth (a valid key returns 200 and the docs example returns 401, so the example is wrong)",
+    "Studio/pricing (the estimate does not match the invoice by a few cents on annual plans)",
+    "Docs/api-reference (the endpoint is documented and the SDK method name does not match it)",
 ]:
     assert m.extra_areas(t) == [], "ordinary defect wrongly labelled instruments: " + t
 CANONPY
@@ -322,6 +354,53 @@ then
   ok "I: green-but-empty reaches instruments, keeps its subsystem, and ordinary defects do not"
 else
   bad "I: the cross-cutting label either missed its class, moved an entry, or over-matched"
+fi
+
+# ---------------------------------------------------------------------------
+# Cell J: amux's own appended text is not the human repeating himself.
+#
+# `cross-lane-repeat` read n=14 on 2026-09-04 and 4 of the 14 were the @-mention
+# footer amux appends. MSG-40511 and MSG-42067 share 194 identical characters and
+# nothing else: one asks to add public datasets to a table, the other asks for MVS
+# throughput metrics. The signal called them the same instruction to two lanes.
+#
+# The cell asserts the two directions that matter: the footer is removed, and the
+# human's own words in front of it survive intact. Stripping the whole message
+# would pass a naive "footer is gone" check and delete the signal.
+# ---------------------------------------------------------------------------
+if python3 - "$(pwd)/scripts/friction_themes.py" <<'FOOTERPY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("ft", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+
+FOOT = ('\n\n[amux: @-mentions above are amux workers, NOT files. Reach them via HTTP '
+        'API, never tmux directly]\n  @mvs-research \u2192 POST $AMUX_URL/api/sessions/'
+        'mvs-research/send  {"text":"<msg>"}')
+a = "[02:39 PM] add the public datasets that `@mvs-research` is working on to the table md" + FOOT
+b = "[10:11 AM] I want MVS to have system level logging/metrics for write/import throughput" + FOOT
+
+ia, ib = m.instruction_of(a), m.instruction_of(b)
+assert "[amux:" not in ia and "[amux:" not in ib, "the appended footer survived the strip"
+assert "public datasets" in ia, "the human's own words were stripped too: " + repr(ia)
+assert "system level logging" in ib, "the human's own words were stripped too: " + repr(ib)
+
+# THE PROPERTY. Two unrelated instructions must share no shingle once the footer
+# is gone. Before the strip they shared the footer's phrases and scored as a
+# cross-lane repeat.
+assert not (set(m.shingle(ia)) & set(m.shingle(ib))), \
+    "two unrelated instructions still share a phrase: " + repr(set(m.shingle(ia)) & set(m.shingle(ib)))
+
+# NEGATIVE CONTROL: a message with no footer is untouched, and two genuinely
+# identical instructions must STILL match, or the strip has deleted the signal.
+plain = "review your backlog and todo see whats still relevant, discard what is not"
+assert m.instruction_of(plain) == plain, "a footerless message was altered"
+assert set(m.shingle(m.instruction_of(plain))) & set(m.shingle(m.instruction_of(plain + FOOT))), \
+    "the same instruction with and without a footer must still match"
+FOOTERPY
+then
+  ok "J: amux's appended footer is stripped, the human's words survive, real repeats still match"
+else
+  bad "J: the footer strip either left amux's text in, ate the human's, or killed the signal"
 fi
 
 # ---------------------------------------------------------------------------
@@ -397,6 +476,177 @@ assert w and 'issues.created' in w, f'unit flip not announced: {w!r}'
   ok "G: a timestamp unit flip surfaces as a warning"
 else
   bad "G: a timestamp unit flip is absorbed silently"
+fi
+
+# H. AF-450: `e2e` as a task LABEL is not a restatement of the verification rule.
+#
+# The bare \be2e\b arm counted Ethan's own harness prompt names — measured
+# 2026-09-03, 9 of the signal's 18 window hits fired on that arm alone and every
+# one was a label. THE CONTROL IS THE SECOND HALF: a real demand mentioning e2e
+# must still match, or the fix has deleted the signal rather than sharpened it.
+if python3 - <<'PY'
+import re, sys
+sys.path.insert(0, "scripts")
+import importlib.util
+spec = importlib.util.spec_from_file_location("ft", "scripts/friction_themes.py")
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+pat = dict((k, p) for k, p, _ in m.RULE_CLASSES)["verification"]
+rx = re.compile(pat, re.I)
+LABELS = [
+    "ISOLATED-E2E-20260903: Reply only with isolated-ok.",
+    "September 3 Gemini E2E workflow. Work only in /tmp/amux-reverify-20260903/gemini",
+    "E2E-Q-20260903-CLAUDE: What is the difference between todo and backlog?",
+    "September 3 Claude E2E workflow. Work only in /tmp/amux-reverify-20260903/claude",
+]
+DEMANDS = [
+    "did you run e2e?", "no e2e tests?", "run the e2e suite before you call it done",
+    "did the e2e pass", "rerun e2e",
+]
+bad = [s for s in LABELS if rx.search(s)]
+assert not bad, f"harness prompt NAMES still count as restatements: {bad}"
+missed = [s for s in DEMANDS if not rx.search(s)]
+assert not missed, f"real e2e demands no longer match — the arm was deleted, not fixed: {missed}"
+# And the arms that never had this problem must be untouched.
+assert rx.search("did you verify it in prod?"), "the verify/in-prod arms regressed"
+PY
+then
+  ok "H: e2e as a label is not a restatement, and a real e2e demand still is"
+else
+  bad "H: the e2e arm counts task labels, or the fix deleted real demands"
+fi
+
+# ---------------------------------------------------------------------------
+# I: concentration — one incident must not read as a recurring class (AF-511)
+#
+# `n` alone cannot separate a class from one long incident. Measured 2026-09-05:
+# idle-stall (7.5x baseline), deploy-live (13x) and verification were the day's
+# three loudest signals and all three were ~90% one lane over two lane-days —
+# one ATE-44 incident. docs/friction-themes.md increments OCCURRENCES from these,
+# and its own header calls an inflated OCCURRENCES the one way it can corrupt
+# itself.
+# ---------------------------------------------------------------------------
+if python3 - <<'PY'
+import importlib.util, time
+spec = importlib.util.spec_from_file_location("ft", "scripts/friction_themes.py")
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+DAY = 86400_000
+now = int(time.time() * 1000)
+
+inc = m.concentration([("amux-testing-e2e", now - i * 60_000) for i in range(5)])
+assert inc["distinct_lanes"] == 1, inc
+assert inc["distinct_lane_days"] == 1, inc
+assert inc["top_lane_share"] == 1.0, inc
+assert inc["incident_shaped"] is True, inc
+
+# THE CONTROL. Same n=5, five lanes, five days: a real class. Without this a
+# helper returning incident_shaped=True unconditionally passes the block above.
+cls = m.concentration([("lane-%d" % i, now - i * DAY) for i in range(5)])
+assert cls["distinct_lanes"] == 5, cls
+assert cls["distinct_lane_days"] == 5, cls
+assert cls["top_lane_share"] == 0.2, cls
+assert cls["incident_shaped"] is False, cls
+
+# n is identical and the verdicts are opposite, which is the whole point.
+assert inc["sampled_over"] == cls["sampled_over"] == 5
+
+# n=2 from one lane on one day is NOT an incident: nothing distinguishes it from
+# ordinary conversation, and calling it one would suppress small real signals.
+assert m.concentration([("a", now), ("a", now - 60_000)])["incident_shaped"] is False
+
+# An empty set says NOTHING rather than a clean zero (ethos rule 4).
+assert m.concentration([]) is None
+assert m.concentration([("a", None)]) is None
+PY
+then
+  ok "I: one lane on one day is incident-shaped; the same n over five lanes is not"
+else
+  bad "I: concentration cannot separate an incident from a class"
+fi
+
+# ---------------------------------------------------------------------------
+# J: concentration is computed over the FULL set, never the displayed sample
+#
+# The cell that caught a real error. The 2026-09-05 sweep reported "6/6 shown:
+# amux-testing-e2e" and concluded one lane; over the full 11 rows it is 2 lanes
+# at 91%. The sample was truncated at MAX_PER_SIGNAL=6 and the conclusion was
+# drawn from the truncation.
+# ---------------------------------------------------------------------------
+if FRICTION_MAX_EVIDENCE=2 python3 - <<'PY'
+import importlib.util, time
+spec = importlib.util.spec_from_file_location("ft", "scripts/friction_themes.py")
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+assert m.MAX_PER_SIGNAL == 2, "the cap under test did not take effect"
+now = int(time.time() * 1000)
+pairs = [("lane-a", now), ("lane-a", now - 1000)] + [("lane-b", now - i) for i in range(2, 8)]
+c = m.concentration(pairs)
+assert c["sampled_over"] == 8, "computed over the sample, not the population: %s" % (c,)
+assert c["top_lane"] == "lane-b", c
+assert c["distinct_lanes"] == 2, c
+PY
+then
+  ok "J: concentration counts every row, not the MAX_PER_SIGNAL sample"
+else
+  bad "J: concentration is measuring the truncation instead of the signal"
+fi
+
+# ---------------------------------------------------------------------------
+# K: the SHIPPED script hands concentration every row, not the evidence sample
+#
+# Cell J proves the helper counts what it is given. It does NOT prove the CALL
+# SITE gives it everything, and that is a different rule: a mutation changing
+# `in_win` to `in_win[:MAX_PER_SIGNAL]` at the call site left J green. Measured
+# while writing this file, which is the same wiring-vs-wording gap that let three
+# other suites pass over deleted call sites today.
+#
+# So this drives the shipped scanner, per this file's own opening rule.
+# ---------------------------------------------------------------------------
+KDB="$TMP/conc.db"
+python3 - "$KDB" "$NOW_MS" <<'PY'
+import sqlite3, sys
+db, now = sys.argv[1], int(sys.argv[2])
+con = sqlite3.connect(db)
+con.execute("""CREATE TABLE cmd_history (id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'direct',
+    session TEXT NOT NULL DEFAULT '', ts INTEGER NOT NULL,
+    origin TEXT NOT NULL DEFAULT '', card_id TEXT, delivery TEXT,
+    queued_at INTEGER, delivered_at INTEGER, submit_verdict TEXT)""")
+con.execute("""CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL,
+    "desc" TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'todo',
+    session TEXT, creator TEXT NOT NULL DEFAULT '', due TEXT,
+    created INTEGER NOT NULL, updated INTEGER NOT NULL, deleted INTEGER,
+    archived INTEGER NOT NULL DEFAULT 0, closed_at INTEGER)""")
+M = 60_000
+# 8 restatements of one rule, 6 from one lane and 2 from another, all inside the
+# window. With the evidence cap at 2 below, a call site that passed the sample
+# would see 2 rows and one lane.
+for i in range(6):
+    con.execute("INSERT INTO cmd_history (text,type,session,ts,origin) VALUES (?,?,?,?,?)",
+                ("did you verify it in prod?", "user", "lane-loud", now - (i + 1) * M, ""))
+for i in range(2):
+    con.execute("INSERT INTO cmd_history (text,type,session,ts,origin) VALUES (?,?,?,?,?)",
+                ("did you verify it in prod?", "user", "lane-quiet", now - (i + 20) * M, ""))
+con.commit()
+PY
+if AMUX_DB="$KDB" AMUX_REPO="$TMP/amux" MIXPEEK_REPO="$TMP/mixpeek" \
+   FRICTION_DAYS=1 FRICTION_MAX_EVIDENCE=2 python3 "$SCAN" --json 2>/dev/null \
+ | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+sig = [s for s in d["active"] if s["key"] == "rule-restatement:verification"]
+assert sig, "the seeded rule class did not fire: %s" % [s["key"] for s in d["active"]]
+s = sig[0]
+c = s["concentration"]
+assert c, "the shipped script emitted no concentration at all"
+assert len(s["evidence"]) == 2, "the evidence cap did not apply: %d" % len(s["evidence"])
+assert c["sampled_over"] == 8, \
+    "call site passed the SAMPLE, not the population: sampled_over=%s" % c["sampled_over"]
+assert c["distinct_lanes"] == 2, c
+assert c["top_lane"] == "lane-loud" and c["top_lane_share"] == 0.75, c
+'
+then
+  ok "K: the shipped scanner computes concentration over all 8 rows while showing 2"
+else
+  bad "K: the call site is passing the truncated evidence sample"
 fi
 
 echo
