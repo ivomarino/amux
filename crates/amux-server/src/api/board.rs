@@ -2580,7 +2580,7 @@ const RECOGNISED_BOARD_PARAMS: &[&str] = &[
 ];
 /// Cache-buster keys clients legitimately append; never a filter typo, so they
 /// are not surfaced as "ignored" (that would be pure noise on every polled tab).
-const BENIGN_QUERY_KEYS: &[&str] =
+pub(crate) const BENIGN_QUERY_KEYS: &[&str] =
     &["_", "t", "v", "ts", "cb", "_t", "cache", "cachebust", "nocache"];
 
 /// Query keys GET /api/board neither consumes nor treats as a benign

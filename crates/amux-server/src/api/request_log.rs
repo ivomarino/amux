@@ -683,10 +683,13 @@ pub fn routes() -> Router<AppState> {
 ///
 /// Additive params (not sent by the SPA today, needed by the daily sweep —
 /// docs/rust-migration/log-sweep.md): `worker` (the per-worker subset),
+/// `amux_session` (the CALLER, exactly — see AF-521 at its clause below; this is
+/// the attribution step 5 mandates and `session=` deliberately does not give),
 /// `since` + `until` (unix ts, a HALF-OPEN window `since < ts <= until`),
-/// `family`, `min_status`, `max_status`, `answered_by`. Additive response field:
+/// `family`, `min_status`, `max_status`, `answered_by`. Additive response fields:
 /// `total_matched` — the pre-LIMIT count, so volume questions are
-/// answerable without paging (the page-vs-corpus trap).
+/// answerable without paging (the page-vs-corpus trap) — and `ignored_params`,
+/// the keys the caller sent that this endpoint did not consume.
 ///
 /// `until` exists because this list used to stop at `since` (AF-230), and a
 /// lower bound alone is not a window: with `ORDER BY ts DESC LIMIT <=2000`
@@ -695,6 +698,50 @@ pub fn routes() -> Router<AppState> {
 /// `total_matched` is the pre-LIMIT count and stays the right answer for
 /// "how many" — `until` is for when you need the ROWS across a window
 /// wider than 2000 of them.
+/// Query keys `GET /api/logs` actually consumes. Anything else is DROPPED by
+/// design — AF-402 settled that ("the fix is to make the param real rather than
+/// to start rejecting unknown ones"), and a blanket 400 is unsafe here because
+/// any client may append a cache-buster. The decision this list serves is the
+/// other one: a drop that nobody can SEE is what makes the class recur.
+///
+/// Four endpoints have now shipped the same defect and been fixed one at a time
+/// — AF-402 (`max_status`, this endpoint), BACKE-3228 (/api/board), MF-822
+/// (/api/health), AF-518 (/api/scope). Every instance has the same shape: an
+/// ignored filter returns a SUPERSET that looks exactly like an answer, so the
+/// caller reads a confident wrong result rather than an error.
+const RECOGNISED_LOG_PARAMS: &[&str] = &[
+    "limit",
+    "category",
+    "session",
+    "worker",
+    "amux_session",
+    "family",
+    "since",
+    "until",
+    "min_status",
+    "max_status",
+    "answered_by",
+];
+
+/// Keys the caller sent that `GET /api/logs` neither consumed nor treats as a
+/// benign cache-buster: the ones they think are filtering and that did nothing.
+///
+/// Pure over the key set so it is tested without an HTTP round-trip, and sorted
+/// so the assertion does not depend on HashMap order.
+fn ignored_log_params<'a>(keys: impl Iterator<Item = &'a String>) -> Vec<String> {
+    let mut out: Vec<String> = keys
+        .filter(|k| {
+            let lk = k.to_ascii_lowercase();
+            !RECOGNISED_LOG_PARAMS.contains(&lk.as_str())
+                && !crate::api::board::BENIGN_QUERY_KEYS.contains(&lk.as_str())
+        })
+        .cloned()
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {
     let limit: i64 = q
         .get("limit")
@@ -741,6 +788,24 @@ async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String,
     if let Some(w) = q.get("worker").filter(|s| !s.is_empty()) {
         clauses.push("worker = ?".into());
         params.push(w.clone().into());
+    }
+    // `amux_session` — the CALLER, exactly, with no worker fallback (AF-521).
+    //
+    // The sweep contract's step 5 mandates this attribution in bold ("Attribute
+    // on `amux_session` ONLY. Never fall back to `worker`") and says the endpoint
+    // enforces it. That is true of `/api/logs/writers`, the AGGREGATE. On THIS
+    // endpoint — the deep dive the same step routes you to when you need the
+    // rows — the rule had no query at all: `session=` is deliberately the OR
+    // above, `worker=` is the forbidden half on its own, and `amux_session=`
+    // was not a param, so it was dropped and the answer was the whole log.
+    //
+    // Measured 2026-09-06: `session=nissan` returned 146 rows of which 137 have
+    // an EMPTY amux_session; nissan made 9. `amux_session=nissan` returned
+    // 46,729 — every row in the window. The drop fails toward the accusation,
+    // which is the one direction this step must never fail in.
+    if let Some(a) = q.get("amux_session").filter(|s| !s.is_empty()) {
+        clauses.push("amux_session = ?".into());
+        params.push(a.clone().into());
     }
     if let Some(f) = q.get("family").filter(|s| !s.is_empty()) {
         clauses.push("family = ?".into());
@@ -847,11 +912,31 @@ async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String,
     // AF-320: `count: 0` is ambiguous on its own — no matching events, or a
     // window nobody read. n_considered is the matched population, which is the
     // number that disambiguates it.
+    // WHAT YOU SENT THAT DID NOTHING (AF-521). Always present, empty when the
+    // query was fully consumed, so it answers "did my filter run" in the same
+    // payload as the rows — ethos rule 4's "a count beside a zero", applied to a
+    // filter instead of a measurement.
+    //
+    // In the BODY, not a response header. /api/board's fix for the same class
+    // put its disclosure in a header, and ~/.claude/CLAUDE.md already records
+    // what that costs: the reader pipes curl into python and never sees one.
+    let ignored_params = ignored_log_params(q.keys());
+    if !ignored_params.is_empty() {
+        tracing::warn!(
+            ignored = ?ignored_params,
+            recognised = ?RECOGNISED_LOG_PARAMS,
+            total_matched = total,
+            "[/api/logs AF-521] query param(s) DROPPED — the rows returned are a \
+             SUPERSET of what was asked for, not an answer to it. Filter on a \
+             recognised key, or read `ignored_params` in the body."
+        );
+    }
     Json(crate::api::measured::measured(
         json!({
         "events": events,
         "count": events.len(),
         "total_matched": total,
+        "ignored_params": ignored_params,
         // True = you are holding the newest `limit` rows, NOT the window you
         // asked for. Page backward with `until=<oldest ts you got>`.
         "truncated": truncated,
@@ -4638,6 +4723,182 @@ mod tests {
         );
         assert_eq!(v["mutating_rows"], n as u64, "every write is still counted: {v}");
     }
+
+    /// Seed a row where the CALLER and the path-derived worker DISAGREE — the
+    /// only shape that can tell the three attribution filters apart. `seed`
+    /// writes `worker` as NULL, so it cannot express this case at all.
+    async fn seed_attributed(
+        store: &crate::db::Store,
+        ts: f64,
+        path: &str,
+        amux_session: &str,
+        worker: Option<&str>,
+    ) {
+        let (path, amux_session, worker) =
+            (path.to_string(), amux_session.to_string(), worker.map(str::to_string));
+        store
+            .write_async(move |conn| {
+                conn.execute(
+                    "INSERT INTO _amux_request_log \
+                     (ts, method, path, family, status, latency_ms, client_ip, \
+                      amux_session, worker, answered_by, error_body) \
+                     VALUES (?1,'POST',?2,?3,200,1.0,'127.0.0.1',?4,?5,'native',NULL)",
+                    rusqlite::params![ts, path, family_of(&path), amux_session, worker],
+                )?;
+                Ok(WriteOutcome { applied: false, events: vec![] })
+            })
+            .await
+            .unwrap();
+    }
+
+    /// AF-521 — `amux_session=` must select the CALLER, with no worker fallback.
+    ///
+    /// The sweep contract's step 5 mandates this attribution in bold and states
+    /// the endpoint enforces it. `/api/logs/writers` does. THIS endpoint — the
+    /// deep dive the same step routes you to for the rows — did not have the
+    /// param at all, so it was dropped and the answer was the entire log.
+    ///
+    /// THE FIXTURE IS THE TEST. Two rows about lane `nissan` that `nissan` did
+    /// not make (an unattributed report ABOUT it, tagged worker=nissan by the
+    /// path) and one row it did. That is the live shape measured 2026-09-06:
+    /// `session=nissan` returned 146 rows of which 137 had an empty
+    /// `amux_session`. A fixture where caller and worker agree passes against
+    /// every one of the three filters, including the broken one.
+    #[tokio::test]
+    async fn amux_session_selects_the_caller_and_never_falls_back_to_worker() {
+        let (store, _dir) = store();
+        let now = unix_now();
+        // Two reports ABOUT nissan, made by nobody (the 7,708/day unattributed class).
+        seed_attributed(&store, now - 30.0, "/api/sessions/nissan/report", "", Some("nissan")).await;
+        seed_attributed(&store, now - 29.0, "/api/sessions/nissan/report", "", Some("nissan")).await;
+        // One write BY nissan, against a path that names nobody.
+        seed_attributed(&store, now - 28.0, "/api/board", "nissan", None).await;
+        // One write by someone else entirely, so "everything" is distinguishable
+        // from "the whole log happens to be nissan's".
+        seed_attributed(&store, now - 27.0, "/api/board", "backend", None).await;
+
+        let api = logs_api(store.clone());
+        let get = |uri: String| {
+            let api = api.clone();
+            async move {
+                let (st, body) =
+                    hit(&api, HttpRequest::builder().uri(uri).body(Body::empty()).unwrap()).await;
+                assert_eq!(st, StatusCode::OK);
+                serde_json::from_slice::<Value>(&body).unwrap()
+            }
+        };
+        let since = now - 3600.0;
+
+        // Control: the fixture is real and all four rows are in the window.
+        // Without this a seeding failure makes every assertion below pass by
+        // returning nothing (ethos rule 7).
+        let all = get(format!("/api/logs?since={since}&limit=100")).await;
+        assert_eq!(all["total_matched"], 4, "control: four seeded rows: {all}");
+
+        // THE ASSERTION THAT FAILS PRE-FIX. Without the clause the param is
+        // dropped and this is 4 — every row in the log, read as nissan's writes.
+        let mine = get(format!("/api/logs?since={since}&amux_session=nissan&limit=100")).await;
+        assert_eq!(mine["total_matched"], 1, "amux_session must select the CALLER only: {mine}");
+        for e in mine["events"].as_array().unwrap() {
+            assert_eq!(e["amux_session"], "nissan", "a row nissan did not make leaked through: {e}");
+        }
+
+        // The other two filters are unchanged, and the numbers differ from each
+        // other — which is what proves `amux_session` is a third predicate and
+        // not an alias that happens to agree on this fixture.
+        let by_worker = get(format!("/api/logs?since={since}&worker=nissan&limit=100")).await;
+        assert_eq!(by_worker["total_matched"], 2, "worker= stays path-derived: {by_worker}");
+        let by_session = get(format!("/api/logs?since={since}&session=nissan&limit=100")).await;
+        assert_eq!(by_session["total_matched"], 3, "session= stays the documented OR: {by_session}");
+
+        // A caller that does not exist must match NOTHING, not everything. This
+        // is the direction step 5 must never fail in: a dropped filter hands
+        // back the whole log under the name of a lane, and the output of that
+        // step is the accusation the contract calls "the expensive kind".
+        let ghost =
+            get(format!("/api/logs?since={since}&amux_session=NO_SUCH_LANE&limit=100")).await;
+        assert_eq!(ghost["total_matched"], 0, "an unknown caller owns no rows: {ghost}");
+    }
+
+    /// AF-521 — a query key this endpoint does not consume must SAY so.
+    ///
+    /// AF-402 settled that unknown params stay dropped rather than rejected
+    /// (a blanket 400 breaks cache-busters), and this does not reopen that. It
+    /// closes the other half: the drop was invisible, which is why the class has
+    /// now shipped four times — AF-402 here, BACKE-3228, MF-822, AF-518. An
+    /// ignored filter returns a SUPERSET that reads exactly like an answer.
+    #[tokio::test]
+    async fn a_dropped_query_param_is_named_in_the_body_beside_the_rows_it_did_not_filter() {
+        let (store, _dir) = store();
+        let now = unix_now();
+        seed_attributed(&store, now - 30.0, "/api/board", "backend", None).await;
+        seed_attributed(&store, now - 29.0, "/api/board", "nissan", None).await;
+        let api = logs_api(store.clone());
+        let get = |uri: String| {
+            let api = api.clone();
+            async move {
+                let (st, body) =
+                    hit(&api, HttpRequest::builder().uri(uri).body(Body::empty()).unwrap()).await;
+                assert_eq!(st, StatusCode::OK);
+                serde_json::from_slice::<Value>(&body).unwrap()
+            }
+        };
+        let since = now - 3600.0;
+
+        // A typo that reads like a filter. It still returns both rows — that is
+        // the AF-402 decision standing — but the body now says which key did
+        // nothing, in the same payload as the rows.
+        let typo = get(format!("/api/logs?since={since}&sesion=nissan&limit=100")).await;
+        assert_eq!(typo["total_matched"], 2, "the drop still happens (AF-402 stands): {typo}");
+        assert_eq!(typo["ignored_params"], json!(["sesion"]), "the drop must be NAMED: {typo}");
+
+        // PRESENT AND EMPTY on a clean query, never absent. An absent key reads
+        // as None to `.get()` and as "nothing was dropped" to a human, and those
+        // are the same three characters as the honest answer (ethos rule 4).
+        let clean = get(format!("/api/logs?since={since}&amux_session=nissan&limit=100")).await;
+        assert_eq!(clean["ignored_params"], json!([]), "a consumed query drops nothing: {clean}");
+        assert_eq!(clean["total_matched"], 1, "and the recognised filter really ran: {clean}");
+
+        // Cache-busters are not typos. Surfacing `_=<ts>` would put noise in
+        // every polled response and train the reader to ignore the field.
+        let busted = get(format!("/api/logs?since={since}&_=12345&cb=x&limit=100")).await;
+        assert_eq!(busted["ignored_params"], json!([]), "cache-busters are benign: {busted}");
+    }
+
+    /// AF-521 — every key the handler reads must be in `RECOGNISED_LOG_PARAMS`.
+    ///
+    /// Without this the disclosure rots in the direction that lies: add a real
+    /// filter, forget the list, and the endpoint reports its own working param
+    /// as ignored. The check is over the SHIPPED source of `get_logs`, so it
+    /// fails on the next `q.get("...")` that is not declared.
+    #[test]
+    fn every_param_the_handler_consumes_is_declared_as_recognised() {
+        let src = include_str!("request_log.rs");
+        let body = src
+            .split("async fn get_logs(")
+            .nth(1)
+            .expect("get_logs is in this file")
+            .split("\n/// One DB row")
+            .next()
+            .expect("get_logs ends before row_to_event");
+        let mut consumed: Vec<&str> = Vec::new();
+        for part in body.split("q.get(\"").skip(1) {
+            consumed.push(part.split('"').next().unwrap());
+        }
+        assert!(
+            consumed.len() >= 10,
+            "the scrape found only {} keys — get_logs was reshaped and this check is \
+             pinning nothing: {consumed:?}",
+            consumed.len()
+        );
+        for k in &consumed {
+            assert!(
+                RECOGNISED_LOG_PARAMS.contains(k),
+                "get_logs reads `{k}` but it is not in RECOGNISED_LOG_PARAMS, so a caller \
+                 using the working filter is told it was ignored"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4737,6 +4998,7 @@ mod caller_attribution_tests {
 
     /// CONTROL: no headers at all is still anonymous. A resolver that invented a
     /// caller would be worse than the bug.
+
     #[test]
     fn no_identity_headers_stays_anonymous() {
         assert_eq!(caller_from_headers(&HeaderMap::new()), "");
