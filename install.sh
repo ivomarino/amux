@@ -379,6 +379,38 @@ if [[ "$OS" == "Linux" ]] && command -v systemctl &>/dev/null; then
   # Reload systemd to recognize the new units.
   systemctl --user daemon-reload || die "systemctl daemon-reload failed"
 
+  # A systemd USER unit does not start at boot, and stops at logout, unless
+  # lingering is enabled for the user. Every unit this installer just wrote is
+  # a user unit with WantedBy=default.target, so on a headless box the whole
+  # set is silently inert until somebody logs in (AF-527).
+  #
+  # This is issue #92's report, reproduced from the other side: the reporter ran
+  # a headless Arch box, found nothing came up, and hand-wrote a SYSTEM unit at
+  # /etc/systemd/system/amux.service — which is the exact remedy
+  # docs/systemd-setup.md then calls "not recommended". They derived the heavy
+  # workaround because the one-command one was written down nowhere in this
+  # repo: `loginctl enable-linger` appeared in no script, no doc and no template.
+  # Ethos rule 1 — the capability existed in systemd and reached no installer.
+  #
+  # It WARNS rather than enabling it. Lingering changes state for the user
+  # account beyond this repo, and an installer that silently does that is the
+  # kind of thing you discover later; naming it costs one line and leaves the
+  # decision where it belongs.
+  linger_advice() {
+    command -v loginctl >/dev/null 2>&1 || return 0
+    local state
+    state="$(loginctl show-user "$(id -un)" --property=Linger --value 2>/dev/null)" || return 0
+    [ "$state" = "yes" ] && return 0
+    printf '%s\n' "LINGER IS OFF for $(id -un). The units just written are USER units, so"
+    printf '%s\n' "they will NOT start at boot and will stop when you log out. On a headless"
+    printf '%s\n' "box that means nothing above comes back after a reboot. Enable it with:"
+    printf '%s\n' "    sudo loginctl enable-linger $(id -un)"
+    printf '%s\n' "Without this, the usual next step is hand-writing a /etc/systemd/system unit,"
+    printf '%s\n' "which needs root and is not what these templates are for (issue #92)."
+    return 1
+  }
+  if ! linger_advice; then LINGER_OFF=1; else LINGER_OFF=0; fi
+
   say "systemd user services created:"
   say "  $SYSTEMD_DIR/amux-server.service"
   say "  $SYSTEMD_DIR/amux-builder.service"
@@ -403,6 +435,9 @@ if [[ "$OS" == "Linux" ]] && command -v systemctl &>/dev/null; then
   echo ""
   echo "Then: dashboard at ${BOLD}https://localhost:$PORT${RESET} · token in $AMUX_HOME/auth_token"
   echo ""
+  if [ "${LINGER_OFF:-0}" = "1" ]; then
+    warn "lingering is OFF — re-read the LINGER note above before rebooting"
+  fi
   say "See docs/systemd-setup.md for full documentation"
   echo ""
   # Deliberate, not incidental (review @esteininger, PR #166): this path

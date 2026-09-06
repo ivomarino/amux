@@ -230,18 +230,36 @@ systemctl --user daemon-reload
 systemctl --user restart amux-server
 ```
 
-### Service doesn't survive logout
+### Service doesn't survive logout, or doesn't come back after a reboot
 
-**This is expected behavior for user-level services.** By design:
-- Service runs while user is logged in
-- Service stops when user logs out (no lingering processes)
-- Service auto-restarts on next login
+Both symptoms are the same cause, and it has a one-command fix:
 
-**To run server while logged out:**
-- Use a system-level service (requires sudo, not recommended)
-- Use screen/tmux in a persistent session
-- Use a Docker container
-- Use a dedicated amux deployment machine (VPS, physical server)
+```bash
+sudo loginctl enable-linger $(id -un)
+```
+
+A systemd **user** unit runs inside a session. Without lingering, systemd starts
+your user manager at login and tears it down at logout, so every unit this
+installer writes — all of them `WantedBy=default.target` — stops with it and does
+not come back at boot. On a headless box that means nothing starts until someone
+logs in, which reads as "amux does not work".
+
+`install.sh` now checks this and says so when lingering is off (AF-527). Verify:
+
+```bash
+loginctl show-user "$(id -un)" --property=Linger   # want: Linger=yes
+```
+
+**Do not reach for a system-level unit for this.** `/etc/systemd/system/amux.service`
+needs root, runs as root unless you add `User=`, and puts `~` at `/root` — which
+silently breaks every `$HOME`-relative path in these templates. Issue #92's
+reporter hand-wrote exactly that unit after a headless install came up dead, and
+they only did it because `enable-linger` was documented nowhere in this repo.
+
+The other options below are real but heavier, and none of them is needed just to
+survive a logout:
+- A Docker container, if you want the whole box's amux isolated
+- A dedicated deployment machine (VPS, physical server)
 
 ### Multiple Users
 
