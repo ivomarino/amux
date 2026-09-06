@@ -4105,19 +4105,23 @@ pub(crate) async fn cmd_hist_record_full(
     // consequence (CLAUDE.md: hang the consequence off the write that happened).
     // Gated on ctype=="user": inter-session ("session") and scheduler ("schedule")
     // messages are not the recipient's task and must not spam the board.
-    // ISOLATED (AMUX-3232): a raw agent leaves no board trace; its prompts are
-    // not auto-captured as ledger cards. It has no session/URL to run `amux
-    // board`, so a card minted here would name work nobody can drive, and the
-    // accountability sweep is likewise told to skip it.
+    // ISOLATED DOES NOT MEAN INVISIBLE WORK (AMUX-4159). Isolation controls
+    // what amux injects into a worker and whether peers/automation can reach it;
+    // it does not change the fact that an owner's delivered prompt is work in
+    // the shared ledger. The `amux` lane itself supplied the specimen: its
+    // CC_ISOLATED=1 prompt was delivered and recorded as confirmed while
+    // card_id stayed NULL. The board already renders isolated owners explicitly,
+    // so keep the card visible and let that label describe its reachability.
     // AND NOT FOR A PROMPT THE LANE NEVER RECEIVED (AMUX-3903). A ledger card
     // asserts "this lane was given this task", and a stuck send means it was
     // not: the text is sitting in the composer. Minting one would hand the
     // accountability sweep a lane to chase over work nobody delivered. The
     // message ROW still goes in, because the delivery attempt is the fact worth
     // keeping; the card is a consequence that did not happen.
-    if is_user && landed && !skip_board && !session_is_isolated(&cap_session) {
+    if is_user && landed && !skip_board {
         let row_id = msg_row_id.load(std::sync::atomic::Ordering::SeqCst);
         if row_id > 0 {
+            let cap_isolated = session_is_isolated(&cap_session);
             let minted: std::sync::Arc<std::sync::Mutex<Option<String>>> =
                 std::sync::Arc::new(std::sync::Mutex::new(None));
             let minted_w = minted.clone();
@@ -4150,10 +4154,12 @@ pub(crate) async fn cmd_hist_record_full(
                 Ok(_) => {
                     if let Some(cid) = minted.lock().unwrap().take() {
                         tracing::info!(session = %sess_log, card_id = %cid,
+                            owner_isolated = cap_isolated,
                             "ledger: auto-captured board card from delivered prompt");
                     }
                 }
                 Err(e) => tracing::warn!(session = %sess_log, error = %e,
+                    owner_isolated = cap_isolated,
                     "ledger auto-capture FAILED; prompt recorded without a board card"),
             }
         }
@@ -13521,8 +13527,10 @@ pub(crate) fn env_flag_on(v: Option<&str>) -> bool {
 /// persists across reload and applies at the next spawn with no new store to
 /// keep in step (deliberately not a second spelling in a SQLite column). This
 /// function is the single source of truth every isolation decision consults:
-/// spawn-env suppression, `--mcp-config`, board auto-capture, the peer fleet
-/// list, the fleet roster, the peer-send guard, and the status/rate-limit sweep.
+/// spawn-env suppression, `--mcp-config`, the peer fleet list, the fleet roster,
+/// the peer-send guard, and the status/rate-limit sweep. Owner prompt capture is
+/// deliberately not an isolation decision: the shared board records human work
+/// even when the worker receiving it has no injected harness (AMUX-4159).
 ///
 /// AND WHAT GETS TYPED INTO ITS PANE, which that list did not cover for two
 /// months (Ethan, 2026-08-26: "we have an isolated worker but it still has amux
@@ -19830,6 +19838,48 @@ mod tests {
                 .is_none(),
             "inter-session messages must not spam the board"
         );
+    }
+
+    /// AMUX-4159: `CC_ISOLATED` strips the agent-side harness; it must not strip
+    /// the owner's work from the shared ledger. This is the exact prompt shape
+    /// that was delivered to the live isolated `amux` lane with
+    /// submit_verdict=confirmed while card_id remained NULL.
+    #[tokio::test]
+    async fn an_isolated_workers_owner_prompt_still_reaches_the_board() {
+        let (st, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("raw.env"), "CC_ISOLATED=1\n").unwrap();
+        assert!(session_is_isolated("raw"), "fixture must exercise the isolated path");
+
+        cmd_hist_record_full(
+            &st,
+            "raw",
+            "[09:23 AM] implement something like this\n\nhttps://x.com/undefinedki/status/2095942506433089832?s=46",
+            "user",
+            "",
+            false,
+            DeliveryMeta {
+                delivery: Some(Delivery::Direct),
+                queued_at_ms: None,
+                submit_verdict: Some("confirmed"),
+            },
+        )
+        .await;
+
+        let (card_id, verdict): (Option<String>, Option<String>) = st
+            .store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT card_id, submit_verdict FROM cmd_history WHERE session='raw' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(card_id.is_some(), "an isolated owner must still see delivered work on the board");
+        assert_eq!(verdict.as_deref(), Some("confirmed"));
     }
 
     // AMUX-3330: a pure status query is answered inline and produces no

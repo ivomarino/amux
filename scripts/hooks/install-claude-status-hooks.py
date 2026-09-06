@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Idempotently wire amux's canonical Claude lifecycle reporter.
+"""Idempotently wire amux's canonical Claude lifecycle and read-routing hooks.
 
 Unrelated settings and hooks are preserved. Older amux report commands are
-removed before the canonical six-event set is added, so re-running install
-cannot multiply reports or leave an inline fork active beside the real hook.
+removed before the canonical six-event set is added, and the large-read router
+is installed once for both Read and Bash. Re-running install cannot multiply
+hooks or leave an inline fork active beside the real scripts.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from typing import Any
 
 
 REPORT_MARKERS = ("hook-report.sh", "amux-report.sh")
+READ_GUARD_MARKERS = ("large-read-guard.py",)
 
 
 def is_amux_report(command: Any) -> bool:
@@ -26,6 +28,10 @@ def is_amux_report(command: Any) -> bool:
     return any(marker in command for marker in REPORT_MARKERS) or (
         "/api/sessions/" in command and "/report" in command
     )
+
+
+def is_amux_read_guard(command: Any) -> bool:
+    return isinstance(command, str) and any(marker in command for marker in READ_GUARD_MARKERS)
 
 
 def group(command: str, matcher: str | None = None) -> dict[str, Any]:
@@ -53,13 +59,23 @@ def canonical(hook_path: str) -> dict[str, dict[str, Any]]:
     }
 
 
-def merge(data: dict[str, Any], hook_path: str) -> dict[str, Any]:
+def canonical_read_guard(hook_path: str) -> list[dict[str, Any]]:
+    quoted = '"' + hook_path.replace('"', '\\"') + '"'
+    command = f"python3 {quoted}"
+    return [group(command, "Read"), group(command, "Bash")]
+
+
+def merge(
+    data: dict[str, Any],
+    hook_path: str,
+    read_guard_path: str = "$HOME/.amux/hooks/large-read-guard.py",
+) -> dict[str, Any]:
     raw_hooks = data.setdefault("hooks", {})
     if not isinstance(raw_hooks, dict):
         raise ValueError("settings 'hooks' must be an object")
 
-    # Remove only amux report commands. A group can contain unrelated commands
-    # beside one old reporter; keep the group and every unrelated hook intact.
+    # Remove only managed amux commands. A group can contain unrelated commands
+    # beside one old hook; keep the group and every unrelated hook intact.
     for event, groups in list(raw_hooks.items()):
         if not isinstance(groups, list):
             raise ValueError(f"settings hooks.{event} must be an array")
@@ -75,7 +91,13 @@ def merge(data: dict[str, Any], hook_path: str) -> dict[str, Any]:
             kept_commands = [
                 item
                 for item in commands
-                if not (isinstance(item, dict) and is_amux_report(item.get("command")))
+                if not (
+                    isinstance(item, dict)
+                    and (
+                        is_amux_report(item.get("command"))
+                        or is_amux_read_guard(item.get("command"))
+                    )
+                )
             ]
             if kept_commands:
                 next_group = dict(raw_group)
@@ -88,6 +110,7 @@ def merge(data: dict[str, Any], hook_path: str) -> dict[str, Any]:
 
     for event, report_group in canonical(hook_path).items():
         raw_hooks.setdefault(event, []).append(report_group)
+    raw_hooks.setdefault("PreToolUse", []).extend(canonical_read_guard(read_guard_path))
     return data
 
 
@@ -119,6 +142,10 @@ def main() -> int:
         default=Path.home() / ".claude" / "settings.json",
     )
     parser.add_argument("--hook-path", default="$HOME/.amux/hook-report.sh")
+    parser.add_argument(
+        "--read-guard-path",
+        default="$HOME/.amux/hooks/large-read-guard.py",
+    )
     args = parser.parse_args()
 
     if args.settings.exists():
@@ -131,11 +158,11 @@ def main() -> int:
     else:
         data = {}
     try:
-        merged = merge(data, args.hook_path)
+        merged = merge(data, args.hook_path, args.read_guard_path)
     except ValueError as exc:
         raise SystemExit(f"refusing to rewrite {args.settings}: {exc}")
     write_atomic(args.settings, merged)
-    print(f"wired amux status hooks in {args.settings}")
+    print(f"wired amux status and read-routing hooks in {args.settings}")
     return 0
 
 

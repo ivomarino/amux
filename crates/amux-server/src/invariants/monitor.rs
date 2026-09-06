@@ -326,6 +326,25 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
             wt.as_deref(),
             runtime,
         ));
+
+        // The helper-model read router is the third consumer of the same
+        // installed-script rule. Keeping it here means an uncommitted runtime
+        // edit cannot silently change fleet-wide context routing.
+        const BAKED_LARGE_READ_GUARD: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/hooks/large-read-guard.py"
+        ));
+        let runtime = std::fs::read_to_string(amux_home.join("hooks/large-read-guard.py"))
+            .map_err(|e| e.to_string());
+        let head = read_head(checks::LARGE_READ_GUARD.committed_path);
+        let wt = read_worktree(checks::LARGE_READ_GUARD.committed_path);
+        out.extend(checks::installed_script_matches_committed(
+            &checks::LARGE_READ_GUARD,
+            BAKED_LARGE_READ_GUARD,
+            head.as_deref(),
+            wt.as_deref(),
+            runtime,
+        ));
     }
 
     tm.mark(&out, "6. shared-checkout git guard");
@@ -334,6 +353,7 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // file it compares was correct the whole time and settings.json simply
     // pointed elsewhere. This is the leg that fails on the actual incident.
     out.extend(report_hooks_check());
+    out.extend(large_read_hooks_check());
 
     tm.mark(&out, "6b. and is anything WIRED to that script? The sha ch");
     // -- 6c. are session reports ATTRIBUTED? (AF-67). The largest signal in the
@@ -659,13 +679,6 @@ fn capture_pipeline_check(state: &AppState) -> Vec<InvariantResult> {
         max_ts: i64,
     }
     let mut map: std::collections::HashMap<String, Acc> = std::collections::HashMap::new();
-    // ISOLATED LANES MUST STILL REPORT (AMUX-3824, second pass). Skipping them
-    // outright was my first fix and it was wrong in the way this file keeps
-    // teaching: a skipped entity emits NO result, so `latest_per_invariant`
-    // holds its last one forever — `self` stayed RED after the fix deployed,
-    // because the check simply stopped speaking about it. Absence is not health
-    // (ethos rule 4). An isolated lane is a PASS with a reason, not a silence.
-    let mut isolated_seen: std::collections::BTreeSet<String> = Default::default();
     for (session, text, carded, ts) in rows {
         if session.is_empty()
             || amux_core::board::title_from_prompt(&text).is_none()
@@ -673,25 +686,10 @@ fn capture_pipeline_check(state: &AppState) -> Vec<InvariantResult> {
         {
             continue;
         }
-        // AN ISOLATED LANE IS NOT CARDED BY DESIGN (AMUX-3232, AMUX-3824).
-        //
-        // The mint's gate is `is_user && !skip_board && !session_is_isolated(..)`,
-        // and this loop replicated only the first. So a raw agent — which has no
-        // session or URL to run `amux board`, and whose prompts are deliberately
-        // left off the board because a card there would name work nobody can
-        // drive — read as a lane whose board leg had been "silently dropped".
-        //
-        // Measured: `self` (CC_ISOLATED=1, Ethan's personal notes lane) failed
-        // this check 67 times from 2026-08-15 to 2026-08-28 while behaving
-        // exactly as specified. A permanently-red check on deliberate behaviour
-        // is the AF-132 shape, and it trains people to skim the invariants page.
-        //
-        // Calls the MINT'S OWN predicate rather than re-reading CC_ISOLATED here,
-        // so the exclusion cannot drift from the rule it mirrors (ethos rule 1).
-        if crate::api::session_verbs::session_is_isolated(&session) {
-            isolated_seen.insert(session);
-            continue;
-        }
+        // AMUX-4159: isolated means no injected harness/peer automation, not
+        // invisible human work. These rows now follow the same invariant as
+        // every other owner-delivered task so another capture regression is a
+        // failing `/api/health/invariants` result instead of a policy-shaped gap.
         let e = map.entry(session).or_insert(Acc {
             cardable: 0,
             carded: 0,
@@ -717,15 +715,7 @@ fn capture_pipeline_check(state: &AppState) -> Vec<InvariantResult> {
             span_s: (a.max_ts - a.min_ts) / 1000,
         })
         .collect();
-    let mut out = checks::user_prompts_produce_cards(&stats, min_cardable);
-    // An isolated lane PASSES, explicitly and by name, so its entity keeps
-    // reporting. Appended rather than folded into `stats` because it is a
-    // different claim: not "this lane carded its prompts" but "this lane is not
-    // supposed to card them" (AMUX-3232), and the two should not be one row.
-    for session in isolated_seen {
-        out.push(InvariantResult::pass(ID).entity(&session));
-    }
-    out
+    checks::user_prompts_produce_cards(&stats, min_cardable)
 }
 
 /// The derived card status against the physical pane, per lane (AMUX-2646).
@@ -1200,6 +1190,43 @@ fn report_hooks_check() -> Vec<InvariantResult> {
         tracing::debug!(target: "invariants", "{ID}: {why}");
     }
     checks::report_hooks_wired(parsed)
+}
+
+fn large_read_hooks_check() -> Vec<InvariantResult> {
+    const ID: &str = "hooks.large_read_guard_wired";
+    let path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".claude/settings.json");
+    let parsed = std::fs::read_to_string(&path)
+        .map_err(|e| format!("{} unreadable: {e}", path.display()))
+        .and_then(|text| {
+            serde_json::from_str::<serde_json::Value>(&text)
+                .map_err(|e| format!("{} is not valid JSON: {e}", path.display()))
+        })
+        .map(|value| extract_large_read_hooks(&value));
+    if let Err(ref why) = parsed {
+        tracing::debug!(target: "invariants", "{ID}: {why}");
+    }
+    checks::large_read_hooks_wired(parsed)
+}
+
+fn extract_large_read_hooks(v: &serde_json::Value) -> Vec<checks::ReportHookEntry> {
+    let mut entries = Vec::new();
+    for (event, groups) in v["hooks"].as_object().into_iter().flatten() {
+        for group in groups.as_array().into_iter().flatten() {
+            for hook in group["hooks"].as_array().into_iter().flatten() {
+                let command = hook["command"].as_str().unwrap_or_default().to_string();
+                if !command.contains("large-read-guard.py") {
+                    continue;
+                }
+                entries.push(checks::ReportHookEntry {
+                    event: event.clone(),
+                    command,
+                    matcher: group["matcher"].as_str().map(String::from),
+                });
+            }
+        }
+    }
+    entries
 }
 
 /// PURE so it can be driven by the incident's own settings.json shape.

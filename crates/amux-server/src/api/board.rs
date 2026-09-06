@@ -30,7 +30,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rusqlite::OptionalExtension;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::sync::{Arc, Mutex};
 
@@ -3362,6 +3362,22 @@ enum RequestParentResolution {
     Refused(RequestParentRefusal),
 }
 
+/// What happened when a worker-side helper tried to leave evidence on the task
+/// that caused it. This is deliberately a receipt, not another board card:
+/// high-frequency helper calls are activity INSIDE work, and minting one task
+/// per read would turn observability into the board accumulation it is meant to
+/// explain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TaskActivityReceipt {
+    pub measured: bool,
+    pub n_considered: usize,
+    pub verdict: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub card_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+}
+
 fn request_parent_is_owned(row: &IssueRow, requester: &str) -> bool {
     row.session.as_deref() == Some(requester)
         && row.owner_type == "agent"
@@ -3470,6 +3486,118 @@ fn resolve_request_parent(
             candidates: doing,
         })),
     }
+}
+
+/// Append compact worker activity to the SAME current-task predicate used by
+/// peer delegation. That shared resolver matters: a bulk read and a farmed-out
+/// dependency must not disagree about which parent the worker is advancing.
+///
+/// The payload is caller-supplied summary metadata only (counts/model/verdict),
+/// never helper output or source contents. The task mutation carries a normal
+/// StateEvent, so other dashboard clients see it through the existing board
+/// realtime path rather than a private side channel.
+fn record_session_task_activity(
+    conn: &rusqlite::Connection,
+    session: &str,
+    explicit: Option<&str>,
+    line: &str,
+    now: i64,
+) -> rusqlite::Result<(TaskActivityReceipt, Option<PendingEvent>)> {
+    match resolve_request_parent(conn, session, explicit)? {
+        RequestParentResolution::Standalone => Ok((
+            TaskActivityReceipt {
+                measured: true,
+                n_considered: 0,
+                verdict: "no_active_task".into(),
+                card_id: None,
+                why: Some(format!(
+                    "worker {session} has no active task; the helper receipt remains in amux logs"
+                )),
+            },
+            None,
+        )),
+        RequestParentResolution::Refused(refusal) => {
+            let n_considered = refusal.candidates.len();
+            Ok((
+                TaskActivityReceipt {
+                    measured: true,
+                    n_considered,
+                    verdict: refusal.code.into(),
+                    card_id: None,
+                    why: Some(refusal.why),
+                },
+                None,
+            ))
+        }
+        RequestParentResolution::Linked(mut row) => {
+            row.log = Some(bs::append_log(row.log.as_deref(), &hhmm(), line));
+            row.updated = now;
+            bs::save_patched(conn, &mut row)?;
+            let event = ev_snap(&row, MutationKind::Updated);
+            Ok((
+                TaskActivityReceipt {
+                    measured: true,
+                    n_considered: 1,
+                    verdict: "attached".into(),
+                    card_id: Some(row.id),
+                    why: None,
+                },
+                Some(event),
+            ))
+        }
+    }
+}
+
+pub(crate) async fn append_session_task_activity(
+    state: &AppState,
+    session: &str,
+    explicit: Option<&str>,
+    line: &str,
+) -> Result<TaskActivityReceipt, anyhow::Error> {
+    let session = session.trim();
+    if session.is_empty() {
+        return Ok(TaskActivityReceipt {
+            measured: false,
+            n_considered: 0,
+            verdict: "unattributed".into(),
+            card_id: None,
+            why: Some(
+                "no X-Amux-Worker or X-Amux-Session header; no task owner could be resolved"
+                    .into(),
+            ),
+        });
+    }
+    let (session, explicit, line) = (
+        session.to_string(),
+        explicit.map(str::to_string),
+        line.to_string(),
+    );
+    let slot = Arc::new(Mutex::new(None));
+    let slot_w = slot.clone();
+    state
+        .store
+        .write_async(move |conn| {
+            let (receipt, event) = record_session_task_activity(
+                conn,
+                &session,
+                explicit.as_deref(),
+                &line,
+                now_secs(),
+            )?;
+            let applied = event.is_some();
+            *slot_w.lock().expect("task activity receipt slot poisoned") = Some(receipt);
+            Ok(WriteOutcome {
+                applied,
+                events: event.into_iter().collect(),
+            })
+        })
+        .await?;
+    let receipt = slot
+        .lock()
+        .expect("task activity receipt slot poisoned")
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("task activity receipt was not produced"));
+    receipt
 }
 
 pub async fn create_item(
@@ -10444,6 +10572,62 @@ mod slim_tests {
             "a capture a prior worker card already owns must not be re-folded"
         );
         assert_eq!(bs::get_issue(&conn, &cap.id).unwrap().unwrap().status, "doing");
+    }
+
+    /// Bulk helpers are work inside a task, not new tasks. The receipt must
+    /// land on the uniquely active card and emit the same task-update event a
+    /// dashboard already knows how to consume.
+    #[test]
+    fn helper_activity_attaches_to_the_active_task_and_emits_its_snapshot() {
+        let conn = fold_db();
+        let card =
+            bs::create_issue(&conn, &fold_card("amux", "doing", "Current task", "lane"), 1000)
+                .unwrap();
+        let (receipt, event) = record_session_task_activity(
+            &conn,
+            "lane",
+            None,
+            "delegated bulk read completed: 2 file(s), 900 line(s), via haiku, 12ms",
+            2000,
+        )
+        .unwrap();
+
+        assert_eq!(receipt.verdict, "attached");
+        assert_eq!(receipt.card_id.as_deref(), Some(card.id.as_str()));
+        assert_eq!(receipt.n_considered, 1);
+        let updated = bs::get_issue(&conn, &card.id).unwrap().unwrap();
+        assert!(updated.log.unwrap().contains("delegated bulk read completed"));
+        assert_eq!(updated.updated, 2000, "the activity must move board recency");
+        let event = event.expect("a visible task mutation needs a realtime event");
+        assert_eq!(event.entity_type, EntityType::Task);
+        assert_eq!(event.entity_id, card.id);
+        assert!(event.payload.is_some(), "replay needs the post-write task snapshot");
+    }
+
+    /// Negative controls: no parent means an honest no-op; several candidates
+    /// are refused rather than writing evidence onto whichever row sorted first.
+    #[test]
+    fn helper_activity_never_invents_or_guesses_a_parent_task() {
+        let conn = fold_db();
+        let (none, event) =
+            record_session_task_activity(&conn, "lane", None, "helper ran", 2000).unwrap();
+        assert_eq!(none.verdict, "no_active_task");
+        assert_eq!(none.n_considered, 0);
+        assert!(event.is_none());
+
+        let a = bs::create_issue(&conn, &fold_card("lane", "doing", "A", "lane"), 1000)
+            .unwrap();
+        let b = bs::create_issue(&conn, &fold_card("lane", "doing", "B", "lane"), 1001)
+            .unwrap();
+        let (ambiguous, event) =
+            record_session_task_activity(&conn, "lane", None, "wrong card", 2000).unwrap();
+        assert_eq!(ambiguous.verdict, "task_request_parent_ambiguous");
+        assert_eq!(ambiguous.n_considered, 2);
+        assert!(event.is_none());
+        for id in [a.id, b.id] {
+            let row = bs::get_issue(&conn, &id).unwrap().unwrap();
+            assert!(!row.log.unwrap_or_default().contains("wrong card"));
+        }
     }
 }
 

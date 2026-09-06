@@ -4094,6 +4094,137 @@ EOF
   esac
 }
 
+# ── delegated bulk reads ────────────────────────────────────────────────────
+# Large, untargeted file reads are navigation/compression work. The primary
+# worker keeps the question and judgment; this client sends caller-read bytes
+# to the server's existing configurable helper-model seam. The server never
+# receives a filesystem path it can open, which matters for remote/Tailscale
+# callers: a label cannot become a read primitive on the host.
+_delegate_read_body() {
+  QUESTION="${QUESTION:-}" python3 - "$@" <<'PY'
+import json, os, pathlib, sys
+
+paths = sys.argv[1:]
+if not paths:
+    sys.stderr.write("amux delegate read: at least one file is required\n")
+    raise SystemExit(2)
+if len(paths) > 16:
+    sys.stderr.write("amux delegate read: at most 16 files may be delegated at once\n")
+    raise SystemExit(2)
+
+files = []
+total = 0
+for raw in paths:
+    path = pathlib.Path(raw)
+    if not path.is_file():
+        sys.stderr.write(f"amux delegate read: not a readable file: {raw}\n")
+        raise SystemExit(2)
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        sys.stderr.write(f"amux delegate read: cannot read {raw}: {exc}\n")
+        raise SystemExit(2)
+    total += len(content.encode("utf-8"))
+    if total > 512 * 1024:
+        sys.stderr.write("amux delegate read: file content exceeds the 512 KiB request limit\n")
+        raise SystemExit(2)
+    files.append({"path": raw, "content": content})
+
+body = {"question": os.environ.get("QUESTION", ""), "files": files}
+task = os.environ.get("TASK", "").strip()
+if task:
+    body["task"] = task
+print(json.dumps(body, ensure_ascii=False, separators=(",", ":")))
+PY
+}
+
+cmd_delegate() {
+  local AMUX_API="${AMUX_API:-$(cmd_url)}"
+  local sub="${1:-}"; [[ $# -gt 0 ]] && shift
+  case "$sub" in
+    read)
+      local question="" task="" as_json=0 arg rc=0 resp token=""
+      local -a files=() auth=()
+      while [[ $# -gt 0 ]]; do
+        arg="$1"; shift
+        case "$arg" in
+          --question)
+            [[ $# -gt 0 ]] || die "amux delegate read: --question needs text"
+            question="$1"; shift ;;
+          --question-stdin) question="$(cat)" ;;
+          --for)
+            [[ $# -gt 0 ]] || die "amux delegate read: --for needs a task id"
+            task="$1"; shift ;;
+          --json) as_json=1 ;;
+          --) files+=("$@"); break ;;
+          -*) die "amux delegate read: unknown option '$arg'" ;;
+          *) files+=("$arg") ;;
+        esac
+      done
+      [[ -n "${question//[[:space:]]/}" ]] || die \
+        "amux delegate read: provide --question <text> or --question-stdin"
+      [[ ${#files[@]} -gt 0 ]] || die "amux delegate read: at least one file is required"
+
+      # Remote clients need the same bearer as amux-rs; localhost bypasses it.
+      # Never put the token in the payload or in a diagnostic breadcrumb.
+      if [[ -s "$CC_HOME/auth_token" ]]; then
+        token="$(tr -d '\r\n' < "$CC_HOME/auth_token")"
+        [[ -n "$token" ]] && auth=(-H "Authorization: Bearer $token")
+      fi
+      resp=$(QUESTION="$question" TASK="$task" _delegate_read_body "${files[@]}" | \
+        _curl -sk --max-time 100 -X POST -H 'Content-Type: application/json' \
+          -H "X-Amux-Session: ${AMUX_SESSION:-}" "${auth[@]}" --data-binary @- \
+          "$AMUX_API/api/lookup/bulk" 2>/dev/null) || rc=$?
+      [[ "$rc" -eq 0 ]] || die \
+        "amux delegate read: request failed (exit $rc); no helper result was produced"
+      if [[ "$as_json" -eq 1 ]]; then
+        printf '%s\n' "$resp"
+        return 0
+      fi
+      RESP="$resp" python3 - <<'PY'
+import json, os, sys
+raw = os.environ.get("RESP", "")
+try:
+    data = json.loads(raw)
+except Exception:
+    sys.stderr.write("amux delegate read: server returned non-JSON or no body\n")
+    raise SystemExit(1)
+if data.get("error"):
+    sys.stderr.write(f"amux delegate read: {data['error']}\n")
+    raise SystemExit(1)
+text = str(data.get("text") or "").strip()
+if not text:
+    sys.stderr.write("amux delegate read: helper returned an empty answer\n")
+    raise SystemExit(1)
+print(text)
+sys.stderr.write(
+    "amux delegate: verdict=completed "
+    f"via={data.get('via', '?')} files={data.get('n_considered', '?')} "
+    f"lines={data.get('input_lines', '?')} bytes={data.get('input_bytes', '?')} "
+    f"elapsed_ms={data.get('elapsed_ms', '?')} "
+    f"board={data.get('board_evidence', {}).get('verdict', '?')}:"
+    f"{data.get('board_evidence', {}).get('card_id', '-')}\n"
+)
+PY
+      ;;
+    ""|help|-h|--help)
+      cat <<'EOF'
+Usage: amux delegate read --question <text> -- <file> [file ...]
+       amux delegate read --question-stdin [--for <TASK-ID>] -- <file> [file ...]
+
+Compress up to 16 files (512 KiB total) with the configured fast helper model.
+The helper returns path:line evidence but cannot edit, use tools, debug, or make
+architecture/product/security decisions; those stay with the primary worker.
+The measured receipt is attached to the current board task. Use --for when a
+worker has several active tasks and the intended parent would be ambiguous.
+
+Use --json to retain all receipt fields, including the board evidence verdict.
+EOF
+      ;;
+    *) die "amux delegate: unknown subcommand '$sub' (try: read)" ;;
+  esac
+}
+
 cmd_help() {
   cat <<EOF
 ${BOLD}amux${RESET} — phone-friendly Claude Code worker manager ${DIM}v${CC_VERSION}${RESET}
@@ -4134,6 +4265,11 @@ ${BOLD}Info:${RESET}
   amux whoami                    Live worker identity vs inherited env (mismatch warns)
   amux url [--verify]            Print the canonical API base (use \$(amux url), not
                                  \$AMUX_URL — self-heals a stale port; --verify probes)
+
+${BOLD}Delegation:${RESET}
+  amux delegate read --question <text> -- <files...>
+                                 Compress large reads with the configured fast helper;
+                                 returns path:line evidence and a measured receipt
 
 ${BOLD}Dashboard:${RESET}
   amux                           Interactive dashboard (optimized for phone)
@@ -4639,6 +4775,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     serve|web)        shift; cmd_serve "$@" ;;
     board|b)          shift; cmd_board "$@" ;;
     browser|br)      shift; cmd_browser "$@" ;;
+    delegate)        shift; cmd_delegate "$@" ;;
     crm)              shift; cmd_crm "$@" ;;
     tunnel|t)         shift; cmd_tunnel "$@" ;;
     alert)            shift; cmd_alert "$@" ;;

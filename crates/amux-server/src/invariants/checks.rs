@@ -1788,6 +1788,16 @@ pub const REPORT_HOOK: InstalledScript = InstalledScript {
     noun: "report hook",
 };
 
+/// Large untargeted Read/Bash calls are routed to the configured helper model.
+/// This is fleet-wide context/cost policy, so the script running outside the
+/// checkout must remain byte-identical to the reviewable committed source.
+pub const LARGE_READ_GUARD: InstalledScript = InstalledScript {
+    id: "hooks.large_read_guard_matches_committed",
+    runtime_path: "~/.amux/hooks/large-read-guard.py",
+    committed_path: "scripts/hooks/large-read-guard.py",
+    noun: "large-read router",
+};
+
 /// AF-132: the committed side must be read at CHECK time, not baked at build
 /// time. These scripts are not compiled into the binary's deploy unit — the
 /// builder rebuilds only on crates//Cargo.* commits — so a script-only commit
@@ -2323,6 +2333,102 @@ pub fn report_hooks_wired(entries: Result<Vec<ReportHookEntry>, String>) -> Vec<
     }
 }
 
+/// The large-read router is useful only when Claude actually invokes it before
+/// both relevant tools. This is separate from the byte-identity invariant: the
+/// report-hook incident proved that a perfect installed script can stay dark
+/// for months when settings point somewhere else.
+pub fn large_read_hooks_wired(
+    entries: Result<Vec<ReportHookEntry>, String>,
+) -> Vec<InvariantResult> {
+    const ID: &str = "hooks.large_read_guard_wired";
+    let entries = match entries {
+        Err(e) => return vec![InvariantResult::unknown(ID, e)],
+        Ok(v) if v.is_empty() => {
+            return vec![InvariantResult::unknown(
+                ID,
+                "no large-read router configured in ~/.claude/settings.json",
+            )]
+        }
+        Ok(v) => v,
+    };
+
+    let mut broken = Vec::new();
+    let mut read_matches = 0usize;
+    let mut bash_matches = 0usize;
+    let mut rows = Vec::new();
+    for entry in &entries {
+        let regex = entry.matcher.as_deref().and_then(|raw| regex::Regex::new(raw).ok());
+        let matches_read = regex.as_ref().is_some_and(|re| re.is_match("Read"));
+        let matches_bash = regex.as_ref().is_some_and(|re| re.is_match("Bash"));
+        let overbroad = regex.as_ref().is_some_and(|re| {
+            ["Write", "Edit", "Glob", "Grep", "WebFetch"]
+                .iter()
+                .any(|tool| re.is_match(tool))
+        });
+        let event_ok = entry.event == "PreToolUse";
+        let command_ok = entry.command.contains("large-read-guard.py");
+        if event_ok && command_ok && !overbroad {
+            read_matches += usize::from(matches_read);
+            bash_matches += usize::from(matches_bash);
+        }
+        if !event_ok {
+            broken.push(format!("{}: router must run at PreToolUse", entry.event));
+        }
+        if regex.is_none() {
+            broken.push(format!(
+                "{}: missing or invalid regex matcher — the entry is inert",
+                entry.event
+            ));
+        } else if overbroad {
+            broken.push(format!(
+                "{}: matcher {:?} runs the filesystem probe for unrelated tools",
+                entry.event, entry.matcher
+            ));
+        } else if !matches_read && !matches_bash {
+            broken.push(format!(
+                "{}: matcher {:?} reaches neither Read nor Bash",
+                entry.event, entry.matcher
+            ));
+        }
+        if !command_ok {
+            broken.push(format!(
+                "{}: does not invoke large-read-guard.py",
+                entry.event
+            ));
+        }
+        rows.push(json!({
+            "event": entry.event,
+            "matcher": entry.matcher,
+            "matches_read": matches_read,
+            "matches_bash": matches_bash,
+            "overbroad": overbroad,
+            "command_ok": command_ok,
+        }));
+    }
+    if read_matches != 1 {
+        broken.push(format!("Read must invoke the router exactly once (found {read_matches})"));
+    }
+    if bash_matches != 1 {
+        broken.push(format!("Bash must invoke the router exactly once (found {bash_matches})"));
+    }
+
+    let evidence = json!({
+        "entries": rows,
+        "read_matches": read_matches,
+        "bash_matches": bash_matches,
+    });
+    if broken.is_empty() {
+        vec![InvariantResult::pass(ID).evidence(evidence)]
+    } else {
+        vec![InvariantResult::fail(
+            ID,
+            "PreToolUse routes Read and Bash exactly once through large-read-guard.py",
+            broken.join("; "),
+        )
+        .evidence(evidence)]
+    }
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -2378,25 +2484,14 @@ pub struct SessionPromptStats {
 /// - `carded == 0`: one card proves the pipeline works for this lane; a low
 ///   ratio is a separate, quieter concern, not this outage.
 #[cfg(test)]
-mod capture_isolation_tests {
+mod capture_pipeline_tests {
     use super::*;
 
-    /// AMUX-3824: the check must not fire on a lane the mint deliberately skips.
-    ///
-    /// The mint's gate is `is_user && !skip_board && !session_is_isolated(..)`.
-    /// The monitor's loop replicated only the first, so an ISOLATED lane — a raw
-    /// agent with no session or URL to run `amux board`, whose prompts are left
-    /// off the board on purpose because a card there would name work nobody can
-    /// drive — read as a lane whose board leg had been silently dropped. `self`
-    /// failed it 67 times over 13 days while behaving exactly as specified.
-    ///
-    /// The exclusion itself lives in the monitor (it needs the session env that
-    /// this pure function deliberately does not read). What is pinned HERE is
-    /// the shape the monitor must feed it: an isolated lane must not reach this
-    /// function at all, and a NON-isolated lane with the same numbers must still
-    /// fail — otherwise the fix is a blanket mute rather than an exclusion.
+    /// AMUX-4159: isolation is no longer an exemption from the work ledger.
+    /// This pure check does not need worker configuration; receiving cardable
+    /// owner prompts with no cards is a failure for every worker kind.
     #[test]
-    fn a_lane_with_uncarded_prompts_still_fails_when_it_is_not_isolated() {
+    fn uncarded_prompts_fail_for_every_worker_kind() {
         let s = |session: &str| SessionPromptStats {
             session: session.to_string(),
             cardable: 3,
@@ -2404,16 +2499,12 @@ mod capture_isolation_tests {
             distinct_cardable: 3,
             span_s: 933,
         };
-        // The specimen's exact numbers, for a lane the monitor DID pass through.
-        let rs = user_prompts_produce_cards(&[s("a-real-lane")], 3);
-        assert_eq!(rs[0].status, Status::Fail, "a genuine dropped board leg must still fire");
-        assert!(rs[0].observed.contains("0 carded"), "{}", rs[0].observed);
-
-        // CONTROL: an isolated lane is filtered UPSTREAM, so this function never
-        // sees it. Passing an empty slice is what that looks like here, and it
-        // must PASS rather than produce a spurious entity-less failure.
-        let rs = user_prompts_produce_cards(&[], 3);
-        assert!(rs.iter().all(|r| r.status == Status::Pass), "no stats is not a failure: {rs:?}");
+        for lane in ["ordinary", "isolated-raw"] {
+            let rs = user_prompts_produce_cards(&[s(lane)], 3);
+            assert_eq!(rs[0].status, Status::Fail, "{lane} must announce a dropped board leg");
+            assert_eq!(rs[0].entity_key, lane);
+            assert!(rs[0].observed.contains("0 carded"), "{}", rs[0].observed);
+        }
     }
 }
 
@@ -2442,8 +2533,8 @@ pub fn user_prompts_produce_cards(
                     "carded": s.carded,
                     "span_s": s.span_s,
                     "class": "capture-pipeline-dropped",
-                    "incident": "steering-queue deliverer never minted; direct path did (AMUX-3148)",
-                    "fix": "mint on the queued-delivery path for guard=='' && sender=='' prompts",
+                    "incident": "delivered owner prompt has no linked board card",
+                    "fix": "inspect ledger capture verdicts for this session and the direct/queued delivery path",
                 })),
             );
         } else {
@@ -4799,6 +4890,17 @@ mod negative_controls {
             Ok(committed.into()),
         );
         assert_eq!(rep[0].invariant_id, "hooks.report_hook_matches_committed");
+        let read_guard = installed_script_matches_committed(
+            &LARGE_READ_GUARD,
+            committed,
+            Some(committed),
+            Some(committed),
+            Ok(committed.into()),
+        );
+        assert_eq!(
+            read_guard[0].invariant_id,
+            "hooks.large_read_guard_matches_committed"
+        );
         // ...and the prose must follow the spec, not stay hardcoded to the guard.
         let rep_drift = installed_script_matches_committed(
             &REPORT_HOOK,
@@ -4932,6 +5034,41 @@ mod negative_controls {
         // settings file into an API response.
         assert!(the_incident[0].evidence["entries"][0]["command_head"].is_string());
         assert!(healthy[0].evidence["entries"][0]["command_head"].is_null());
+    }
+
+    #[test]
+    fn large_read_hook_wiring_catches_dark_duplicate_and_overbroad_routes() {
+        let healthy = large_read_hooks_wired(Ok(vec![
+            ent("PreToolUse", r#"python3 "$HOME/.amux/hooks/large-read-guard.py""#, Some("Read")),
+            ent("PreToolUse", r#"python3 "$HOME/.amux/hooks/large-read-guard.py""#, Some("Bash")),
+        ]));
+        assert_eq!(healthy[0].status, Status::Pass, "canonical wiring must pass: {healthy:?}");
+
+        let dark = large_read_hooks_wired(Ok(vec![ent(
+            "PreToolUse",
+            r#"python3 "$HOME/.amux/hooks/large-read-guard.py""#,
+            Some("Read"),
+        )]));
+        assert_eq!(dark[0].status, Status::Fail, "missing Bash bypass coverage must fail");
+        assert!(dark[0].observed.contains("Bash must invoke"));
+
+        let duplicate = large_read_hooks_wired(Ok(vec![
+            ent("PreToolUse", "python3 large-read-guard.py", Some("Read|Bash")),
+            ent("PreToolUse", "python3 large-read-guard.py", Some("Bash")),
+        ]));
+        assert_eq!(duplicate[0].status, Status::Fail, "double execution must fail");
+        assert!(duplicate[0].observed.contains("Bash must invoke the router exactly once"));
+
+        let overbroad = large_read_hooks_wired(Ok(vec![ent(
+            "PreToolUse",
+            "python3 large-read-guard.py",
+            Some(".*"),
+        )]));
+        assert_eq!(overbroad[0].status, Status::Fail, "an all-tools filesystem probe is noise");
+        assert!(overbroad[0].observed.contains("unrelated tools"));
+
+        assert_eq!(large_read_hooks_wired(Ok(vec![]))[0].status, Status::Unknown);
+        assert_eq!(large_read_hooks_wired(Err("missing settings".into()))[0].status, Status::Unknown);
     }
 
     /// AMUX-3397 cells, built from the real incident artifact. The specimen

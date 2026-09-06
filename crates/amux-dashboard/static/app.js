@@ -8930,7 +8930,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.816';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.817';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -21427,6 +21427,7 @@ let boardViewMode = localStorage.getItem('amux_board_view') || 'status';
 if (boardViewMode === 'session') boardViewMode = 'worker';
 let boardOwnerFilter = localStorage.getItem('amux_board_owner') || 'human';
 let _sessionGroupCollapsed = JSON.parse(localStorage.getItem('amux_board_collapsed') || '{}');
+let _boardWorkerDensityBeaconSent = false;
 let _tagGroupCollapsed = JSON.parse(localStorage.getItem('amux_status_collapsed') || '{}');
 // First visit collapses the archive columns. backlog + todo are 1082 of 1553
 // items — they are the reason the ~64 in-flight cards are invisible. Collapsed
@@ -25601,10 +25602,26 @@ function setBoardOwner(type) {
   renderBoard();
 }
 
-function toggleSessionGroup(name) {
-  _sessionGroupCollapsed[name] = !_sessionGroupCollapsed[name];
+function toggleSessionGroup(name, currentlyCollapsed) {
+  // `undefined` no longer means open for every historical worker: idle groups
+  // default closed below. Toggle the state the user ACTUALLY saw, or the first
+  // click on a default-closed group writes `true` and appears to do nothing.
+  _sessionGroupCollapsed[name] = !currentlyCollapsed;
   localStorage.setItem('amux_board_collapsed', JSON.stringify(_sessionGroupCollapsed));
   renderBoard();
+}
+
+function _boardWorkerGroupCollapsed(name, items) {
+  // A saved human choice always wins. For a worker never seen on this device,
+  // open only real in-flight work; the 1,595-card live board otherwise expands
+  // every historical lane and turns the Workers view into hundreds of cards.
+  if (Object.prototype.hasOwnProperty.call(_sessionGroupCollapsed, name)) {
+    return !!_sessionGroupCollapsed[name];
+  }
+  return !items.some(function(item) {
+    const status = _statusCanon(item.status || 'todo');
+    return status === 'doing' || status === 'review';
+  });
 }
 
 // Shared Linear-dense issue row (AMUX-2152): status dot · id · one-line
@@ -26005,12 +26022,14 @@ function _renderBoardBySession(visible, container) {
   }
 
   let html = '';
+  let defaultCollapsedGroups = 0;
+  let defaultOpenGroups = 0;
 
   // ── Yours (human tasks) at the top ──
   if (humanItems.length) {
     const collapsed = _sessionGroupCollapsed['__human__'];
     html += '<div class="board-session-group board-human-group">';
-    html += '<div class="board-session-header" onclick="toggleSessionGroup(\'__human__\')">';
+    html += '<div class="board-session-header" onclick="toggleSessionGroup(\'__human__\',' + (!!collapsed) + ')">';
     html += '<span class="board-session-chevron' + (collapsed ? '' : ' open') + '">\u25B6</span>';
     html += '<span class="board-session-name">&#x1F464; Yours</span>';
     html += '<div class="board-session-counts">' + _sessionCountsHtml(humanItems) + '</div></div>';
@@ -26029,10 +26048,15 @@ function _renderBoardBySession(visible, container) {
   // ── Agent tasks grouped by session ──
   sessionNames.forEach(function(name) {
     const items = name ? groups[name] : noSession;
-    const collapsed = _sessionGroupCollapsed[name || '__none__'];
     const groupKey = name || '__none__';
+    const saved = Object.prototype.hasOwnProperty.call(_sessionGroupCollapsed, groupKey);
+    const collapsed = _boardWorkerGroupCollapsed(groupKey, items);
+    if (!saved) {
+      if (collapsed) defaultCollapsedGroups++;
+      else defaultOpenGroups++;
+    }
     html += '<div class="board-session-group">';
-    html += '<div class="board-session-header" onclick="toggleSessionGroup(\'' + esc(groupKey) + '\')">';
+    html += '<div class="board-session-header" onclick="toggleSessionGroup(\'' + esc(groupKey) + '\',' + collapsed + ')">';
     html += '<span class="board-session-chevron' + (collapsed ? '' : ' open') + '">\u25B6</span>';
     html += '<span class="board-session-name">' + (name ? esc(name) : '<span style="color:var(--dim)">Unassigned</span>') + '</span>';
     html += '<div class="board-session-counts">' + _sessionCountsHtml(items) + '</div></div>';
@@ -26047,6 +26071,26 @@ function _renderBoardBySession(visible, container) {
     }
     html += '</div>';
   });
+
+  if (defaultCollapsedGroups > 0) {
+    html = '<div class="board-session-summary">In-progress work is open · '
+      + defaultCollapsedGroups + ' idle worker group' + (defaultCollapsedGroups === 1 ? '' : 's')
+      + ' collapsed</div>' + html;
+  }
+  // Two-fix signal: a sweep can now see the population that made this surface
+  // unusable, and how much the default collapse removed, without screen video.
+  if (!_boardWorkerDensityBeaconSent && sessionNames.length) {
+    _boardWorkerDensityBeaconSent = true;
+    try {
+      fetch(API + '/api/client-debug', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
+        body: JSON.stringify({ kind: 'board-worker-density', verdict: 'idle-history-collapsed',
+          measured: true, n_considered: sessionNames.length, cards: agentVisible.length,
+          default_collapsed: defaultCollapsedGroups, default_open: defaultOpenGroups,
+          ver: APP_VER })
+      }).catch(() => {});
+    } catch (e) {}
+  }
 
   if (!visible.length) {
     html = '<div class="board-session-empty">No board items yet</div>';

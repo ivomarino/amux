@@ -271,6 +271,19 @@ if [[ -f "$SCRIPT_DIR/scripts/git-hooks/git-shared-guard.py" ]]; then
   say "git guard: $AMUX_HOME/hooks/git-shared-guard.py (sha ${_guard_sha:0:12})"
 fi
 
+# Cheap-model read router. Full Read/cat/less/more calls over the configurable
+# line threshold are sent to `amux delegate read`; bounded reads stay with the
+# primary model for editing and debugging. Like the git guard, the bytes that
+# run are installed from HEAD and checked by a health invariant.
+if [[ -f "$SCRIPT_DIR/scripts/hooks/large-read-guard.py" ]]; then
+  mkdir -p "$AMUX_HOME/hooks"
+  install_hook_from_head scripts/hooks/large-read-guard.py "$AMUX_HOME/hooks/large-read-guard.py"
+  chmod +x "$AMUX_HOME/hooks/large-read-guard.py"
+  _read_guard_sha="$(shasum -a 256 "$AMUX_HOME/hooks/large-read-guard.py" | cut -d' ' -f1)"
+  printf '%s  large-read-guard.py\n' "$_read_guard_sha" > "$AMUX_HOME/hooks/large-read-guard.py.sha256"
+  say "read router: $AMUX_HOME/hooks/large-read-guard.py (sha ${_read_guard_sha:0:12})"
+fi
+
 # State-report hook (AMUX-2936), installed from the repo for the same reason as
 # the guard above: it was an unversioned runtime file, and unversioned runtime
 # files fork. There were already THREE spellings of "report state to amux" on
@@ -300,8 +313,9 @@ if [[ -f "$SCRIPT_DIR/scripts/hooks/hook-report.sh" ]]; then
   if [[ "$AMUX_HOME" == "$HOME/.amux" || -n "${AMUX_CLAUDE_SETTINGS:-}" ]]; then
     _claude_settings="${AMUX_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
     if /usr/bin/python3 "$SCRIPT_DIR/scripts/hooks/install-claude-status-hooks.py" \
-      --settings "$_claude_settings" --hook-path '$HOME/.amux/hook-report.sh'; then
-      say "Claude status hooks: $_claude_settings"
+      --settings "$_claude_settings" --hook-path '$HOME/.amux/hook-report.sh' \
+      --read-guard-path '$HOME/.amux/hooks/large-read-guard.py'; then
+      say "Claude status + read-routing hooks: $_claude_settings"
     else
       warn "could not wire Claude status hooks; the report-hook invariant will remain unhealthy"
     fi
