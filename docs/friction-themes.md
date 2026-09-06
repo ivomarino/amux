@@ -96,8 +96,8 @@ scope was assessed on amux evidence and is re-measured across both repos daily.
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-09-04
-OCCURRENCES: 3
+LAST_SEEN: 2026-09-06
+OCCURRENCES: 4
 SIGNALS: board-resting:*, rule-restatement:backlog-growth
 FIX_SITE: crates/amux-server/src/api/board*, plus a runtime job
 CARDS: AF-317
@@ -110,12 +110,21 @@ Re-measured 2026-09-04: `board-resting:mixpeek:blocked` is 39 cards, median age
 32.8 days, 85% over a week, +6 against 33 seven days ago. Still growing, and the
 median age is now the highest of any resting queue in this file.
 
+Re-measured 2026-09-06: `ledger-cluster:board-gates` n=3 new and spanning both
+repos (1 amux / 2 mixpeek), 96 open in total. The sharpest new specimen is
+structural rather than volumetric: the `todo` WIP limit is 20, and one lane holds
+123 — the limit is enforced against NEW entrants and was never applied to the
+standing population, so it blocks legitimate routing while doing nothing about
+the backlog it exists to prevent. Hit live this pass: routing AF-111 to its owner
+was refused with `todo_wip_limit_reached ... amux already holds 121 todo card(s)`,
+and the honest move was `backlog` with a trigger.
+
 ## `needsyou` is the cheap escape hatch, so the real asks are buried
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-09-05
-OCCURRENCES: 5
+LAST_SEEN: 2026-09-06
+OCCURRENCES: 6
 LAST_SEEN_NOTE: re-measured 2026-09-05 in BOTH repos for the first time; still GROWING
 SIGNALS: board-resting:*:needsyou, cross-lane-repeat
 FIX_SITE: board status gate (`needsyou` requires a typed `--ask`) AND an owner-side
@@ -175,12 +184,23 @@ primis and tubescience. primis had 8 of 9 non-terminal cards in `needsyou` aged
 answer to his question was "it is waiting on you", and asking a lane was the only
 way to find that out.
 
+Re-measured 2026-09-06: mixpeek `needsyou` is 349 cards, median age 16.2d, 72%
+older than 7 days, oldest 66.6d — and **+98 against the 251 open 7 days ago**, so
+it is growing by ~14 cards a day. `blocked` moved the same direction: 43 cards,
+median 34.9d, +7. Both signals carry `growing: true`.
+
+On the amux side the same shape is visible from inside: 36 of this lane's 42
+non-terminal cards are `needsyou`, and one of them (AF-510) is literally "506
+needs:you cards name Ethan as the blocker and nothing tells him". A queue whose
+own backlog contains the card describing the queue is the accumulation this theme
+names.
+
 ## Nudging is the dominant channel and the loop has no negative feedback
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-09-04
-OCCURRENCES: 2
+LAST_SEEN: 2026-09-06
+OCCURRENCES: 3
 SIGNALS: nudge-no-movement, rule-restatement:idle-stall
 FIX_SITE: `idle_backlog_drain_cooldown_s()` and the board_drive job
 CARDS: AF-319
@@ -201,6 +221,25 @@ baseline, 3.3x, down from 8x on 2026-08-31. `nudge-no-movement` fired at n=1 and
 its single lane is `ledger-selftest-target`, a test fixture with 14 machine
 messages and 0 human ones, so that signal contributed no real specimen this pass
 and is reported rather than counted.
+
+Re-measured 2026-09-06: `nudge-no-movement` n=3, and this time the specimens are
+REAL lanes, not the test fixture that made 09-04 uncountable — mvs-research (23
+machine messages, 0 human, 0 cards closed), mixpeek-studio (20/0/0),
+general-canvas-apps (14/0/0). Fleet totals for the day: 1,274 machine messages
+against 15 human ones, a ratio of 85:1.
+
+This pass found the mechanism underneath rather than restating the prose, and it
+is worse than "the cadence is too high": 123 of the fleet's 209 LIVE todo cards
+(58%) belong to `amux`, which is an isolated lane, and `board_drive` builds its
+lane list as `all_lane_names().filter(|l| !session_is_isolated(l))`. So the
+largest queue in the fleet is addressed to a lane the dispatcher structurally
+skips — the nudge loop cannot move it no matter how often it fires, and nothing
+anywhere said so. The existing check could not see it either: its predicate is
+`COALESCE(session,'')=''` and an isolated lane HAS a session (ethos rule 1, a
+view must share the predicate of the mechanism it describes). Shipped as a
+MECHANISM, not a sentence: `board.todo_is_reachable_by_dispatch`, 7d409d0a,
+AF-535. What surfaced it was a human typing "this workers board is evident if
+the board system still not working".
 
 ## Verification is something Ethan has to demand, every single time
 SCOPE: both
@@ -322,8 +361,8 @@ message seven hours before the complaint.
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-09-04
-OCCURRENCES: 4
+LAST_SEEN: 2026-09-06
+OCCURRENCES: 5
 SIGNALS: ledger-cluster:instruments, rule-restatement:instrument-lies
 FIX_SITE: the `measured`/`n_considered` contract + `tests/diagnostic_contract.rs`
 CARDS: AF-320, AF-394
@@ -374,6 +413,21 @@ THE FIX SITE MOVES WITH IT. This theme's FIX_SITE is the amux `measured` /
 a response contract on the PRODUCT API, which is subsystem work owned by those
 lanes and not this sweep's to write. Carded and routed rather than written as
 prose here.
+
+Re-measured 2026-09-06: `ledger-cluster:instruments` n=2 new, 166 open in total
+(25 amux / 141 mixpeek). Three fresh specimens from this lane alone in one
+session, all the same shape — an output that reads as a clean result when the
+measurement did not run:
+- `scripts/mutate.sh` reported `command exited 0` for a mutation whose build never
+  completed, because a pipeline's status is its last element's and the documented
+  usage pipes cargo through grep. After a mutation, "exited 0" reads as THE CHECK
+  CANNOT FAIL. Fixed 5285562c (AF-532); the headline symptom is still open.
+- `google_sa::sa_config()` read the real `~/.amux` rather than the home it was
+  handed, so one test was green in CI and red on every developer box, and neither
+  result said which environment it had measured. Fixed 5ce96bee (AF-529).
+- `GET /api/board?all=1` includes ARCHIVED rows, so a count over it reported 183
+  stranded cards where 3 were live. Caught before filing, only because a second
+  measurement disagreed. Same family as AF-460.
 
 ## A fix ships, its tests pass, and it does nothing in production
 SCOPE: amux
