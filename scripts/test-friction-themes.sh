@@ -515,6 +515,140 @@ else
   bad "H: the e2e arm counts task labels, or the fix deleted real demands"
 fi
 
+# ---------------------------------------------------------------------------
+# I: concentration — one incident must not read as a recurring class (AF-511)
+#
+# `n` alone cannot separate a class from one long incident. Measured 2026-09-05:
+# idle-stall (7.5x baseline), deploy-live (13x) and verification were the day's
+# three loudest signals and all three were ~90% one lane over two lane-days —
+# one ATE-44 incident. docs/friction-themes.md increments OCCURRENCES from these,
+# and its own header calls an inflated OCCURRENCES the one way it can corrupt
+# itself.
+# ---------------------------------------------------------------------------
+if python3 - <<'PY'
+import importlib.util, time
+spec = importlib.util.spec_from_file_location("ft", "scripts/friction_themes.py")
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+DAY = 86400_000
+now = int(time.time() * 1000)
+
+inc = m.concentration([("amux-testing-e2e", now - i * 60_000) for i in range(5)])
+assert inc["distinct_lanes"] == 1, inc
+assert inc["distinct_lane_days"] == 1, inc
+assert inc["top_lane_share"] == 1.0, inc
+assert inc["incident_shaped"] is True, inc
+
+# THE CONTROL. Same n=5, five lanes, five days: a real class. Without this a
+# helper returning incident_shaped=True unconditionally passes the block above.
+cls = m.concentration([("lane-%d" % i, now - i * DAY) for i in range(5)])
+assert cls["distinct_lanes"] == 5, cls
+assert cls["distinct_lane_days"] == 5, cls
+assert cls["top_lane_share"] == 0.2, cls
+assert cls["incident_shaped"] is False, cls
+
+# n is identical and the verdicts are opposite, which is the whole point.
+assert inc["sampled_over"] == cls["sampled_over"] == 5
+
+# n=2 from one lane on one day is NOT an incident: nothing distinguishes it from
+# ordinary conversation, and calling it one would suppress small real signals.
+assert m.concentration([("a", now), ("a", now - 60_000)])["incident_shaped"] is False
+
+# An empty set says NOTHING rather than a clean zero (ethos rule 4).
+assert m.concentration([]) is None
+assert m.concentration([("a", None)]) is None
+PY
+then
+  ok "I: one lane on one day is incident-shaped; the same n over five lanes is not"
+else
+  bad "I: concentration cannot separate an incident from a class"
+fi
+
+# ---------------------------------------------------------------------------
+# J: concentration is computed over the FULL set, never the displayed sample
+#
+# The cell that caught a real error. The 2026-09-05 sweep reported "6/6 shown:
+# amux-testing-e2e" and concluded one lane; over the full 11 rows it is 2 lanes
+# at 91%. The sample was truncated at MAX_PER_SIGNAL=6 and the conclusion was
+# drawn from the truncation.
+# ---------------------------------------------------------------------------
+if FRICTION_MAX_EVIDENCE=2 python3 - <<'PY'
+import importlib.util, time
+spec = importlib.util.spec_from_file_location("ft", "scripts/friction_themes.py")
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+assert m.MAX_PER_SIGNAL == 2, "the cap under test did not take effect"
+now = int(time.time() * 1000)
+pairs = [("lane-a", now), ("lane-a", now - 1000)] + [("lane-b", now - i) for i in range(2, 8)]
+c = m.concentration(pairs)
+assert c["sampled_over"] == 8, "computed over the sample, not the population: %s" % (c,)
+assert c["top_lane"] == "lane-b", c
+assert c["distinct_lanes"] == 2, c
+PY
+then
+  ok "J: concentration counts every row, not the MAX_PER_SIGNAL sample"
+else
+  bad "J: concentration is measuring the truncation instead of the signal"
+fi
+
+# ---------------------------------------------------------------------------
+# K: the SHIPPED script hands concentration every row, not the evidence sample
+#
+# Cell J proves the helper counts what it is given. It does NOT prove the CALL
+# SITE gives it everything, and that is a different rule: a mutation changing
+# `in_win` to `in_win[:MAX_PER_SIGNAL]` at the call site left J green. Measured
+# while writing this file, which is the same wiring-vs-wording gap that let three
+# other suites pass over deleted call sites today.
+#
+# So this drives the shipped scanner, per this file's own opening rule.
+# ---------------------------------------------------------------------------
+KDB="$TMP/conc.db"
+python3 - "$KDB" "$NOW_MS" <<'PY'
+import sqlite3, sys
+db, now = sys.argv[1], int(sys.argv[2])
+con = sqlite3.connect(db)
+con.execute("""CREATE TABLE cmd_history (id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'direct',
+    session TEXT NOT NULL DEFAULT '', ts INTEGER NOT NULL,
+    origin TEXT NOT NULL DEFAULT '', card_id TEXT, delivery TEXT,
+    queued_at INTEGER, delivered_at INTEGER, submit_verdict TEXT)""")
+con.execute("""CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL,
+    "desc" TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'todo',
+    session TEXT, creator TEXT NOT NULL DEFAULT '', due TEXT,
+    created INTEGER NOT NULL, updated INTEGER NOT NULL, deleted INTEGER,
+    archived INTEGER NOT NULL DEFAULT 0, closed_at INTEGER)""")
+M = 60_000
+# 8 restatements of one rule, 6 from one lane and 2 from another, all inside the
+# window. With the evidence cap at 2 below, a call site that passed the sample
+# would see 2 rows and one lane.
+for i in range(6):
+    con.execute("INSERT INTO cmd_history (text,type,session,ts,origin) VALUES (?,?,?,?,?)",
+                ("did you verify it in prod?", "user", "lane-loud", now - (i + 1) * M, ""))
+for i in range(2):
+    con.execute("INSERT INTO cmd_history (text,type,session,ts,origin) VALUES (?,?,?,?,?)",
+                ("did you verify it in prod?", "user", "lane-quiet", now - (i + 20) * M, ""))
+con.commit()
+PY
+if AMUX_DB="$KDB" AMUX_REPO="$TMP/amux" MIXPEEK_REPO="$TMP/mixpeek" \
+   FRICTION_DAYS=1 FRICTION_MAX_EVIDENCE=2 python3 "$SCAN" --json 2>/dev/null \
+ | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+sig = [s for s in d["active"] if s["key"] == "rule-restatement:verification"]
+assert sig, "the seeded rule class did not fire: %s" % [s["key"] for s in d["active"]]
+s = sig[0]
+c = s["concentration"]
+assert c, "the shipped script emitted no concentration at all"
+assert len(s["evidence"]) == 2, "the evidence cap did not apply: %d" % len(s["evidence"])
+assert c["sampled_over"] == 8, \
+    "call site passed the SAMPLE, not the population: sampled_over=%s" % c["sampled_over"]
+assert c["distinct_lanes"] == 2, c
+assert c["top_lane"] == "lane-loud" and c["top_lane_share"] == 0.75, c
+'
+then
+  ok "K: the shipped scanner computes concentration over all 8 rows while showing 2"
+else
+  bad "K: the call site is passing the truncated evidence sample"
+fi
+
 echo
 echo "  $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

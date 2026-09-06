@@ -31,7 +31,7 @@ use amux_core::verification::VerifierKind;
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use rusqlite::{params, Connection, OptionalExtension, Row};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
@@ -3066,6 +3066,60 @@ pub fn depends_on_cycle(
             None
         }
     }))
+}
+
+/// Find an existing dependency path from any of `starts` to `target`.
+///
+/// This is the hypothetical-edge companion to [`depends_on_cycle`]. A peer
+/// request creates a new child and, in the same transaction, adds
+/// `parent -> child`. The child id does not exist until it is minted, so the
+/// ordinary replacement check cannot see both new edge sets at once. A cycle
+/// can only be introduced when one of the child's declared dependencies
+/// already reaches the parent; walking from those starts proves or disproves
+/// exactly that condition before either row is written.
+///
+/// The returned path includes both its starting dependency and `target`.
+/// Missing/deleted ids are leaves, matching the board's runtime dependency
+/// semantics: a dependency that resolves to no live task cannot block work.
+pub fn dependency_path(
+    conn: &Connection,
+    starts: &[String],
+    target: &str,
+) -> rusqlite::Result<Option<Vec<String>>> {
+    let mut queue: VecDeque<Vec<String>> = starts
+        .iter()
+        .map(|start| vec![start.clone()])
+        .collect();
+    let mut seen = HashSet::new();
+
+    while let Some(path) = queue.pop_front() {
+        let Some(node) = path.last() else { continue };
+        if node == target {
+            return Ok(Some(path));
+        }
+        if !seen.insert(node.clone()) {
+            continue;
+        }
+        let dep_json: Option<String> = conn
+            .query_row(
+                "SELECT depends_on FROM issues WHERE id=?1 AND deleted IS NULL",
+                params![node],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let deps = dep_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+            .unwrap_or_default();
+        for dep in deps {
+            if !seen.contains(&dep) {
+                let mut next = path.clone();
+                next.push(dep);
+                queue.push_back(next);
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]

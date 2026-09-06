@@ -174,18 +174,22 @@ async function main() {
 
     // ── Test 6: Switch to new organization ──
     await test('Switch to new organization', async () => {
-      // switch-org does a redirect, so we navigate via page
+      // JSON clients get an immediate control-plane acknowledgement. Following
+      // a redirect into a cold tenant made the switch itself hang and enter the
+      // dashboard's offline outbox even though the cookie was already set.
       const resp = await page.evaluate(async (orgId) => {
         const r = await fetch('/api/gateway/switch-org', {
           method: 'POST',
           credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
           body: JSON.stringify({ org_id: orgId }),
-          redirect: 'follow',
         });
-        return { status: r.status, url: r.url, redirected: r.redirected };
+        return { status: r.status, json: await r.json(), redirected: r.redirected };
       }, createdOrgId);
       log(`Switch response: status=${resp.status}, redirected=${resp.redirected}`);
+      assert(resp.status === 200, `Expected JSON acknowledgement, got ${resp.status}`);
+      assert(resp.json?.ok === true, `Switch was not acknowledged: ${JSON.stringify(resp.json)}`);
+      assert(resp.redirected === false, 'JSON workspace switch must not enter the tenant container');
       // Reload to pick up new org context
       await page.goto(CLOUD_URL, { waitUntil: 'networkidle', timeout: 30000 });
       // Verify active org changed
@@ -246,13 +250,13 @@ async function main() {
     // ── Test 11: Switch back to personal workspace ──
     await test('Switch back to personal workspace', async () => {
       await page.evaluate(async () => {
-        await fetch('/api/gateway/switch-org', {
+        const r = await fetch('/api/gateway/switch-org', {
           method: 'POST',
           credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
           body: JSON.stringify({ org_id: '' }),
-          redirect: 'follow',
         });
+        if (!r.ok || !(await r.json()).ok) throw new Error('personal workspace switch was not acknowledged');
       });
       await page.goto(CLOUD_URL, { waitUntil: 'networkidle', timeout: 30000 });
       const orgs = await apiCall('GET', '/api/gateway/orgs');
@@ -300,11 +304,12 @@ async function main() {
       console.log(`\nCleaning up: deleting org ${createdOrgId}`);
       // Switch back to personal first
       await page.evaluate(async () => {
-        await fetch('/api/gateway/switch-org', {
+        const r = await fetch('/api/gateway/switch-org', {
           method: 'POST', credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ org_id: '' }), redirect: 'follow',
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+          body: JSON.stringify({ org_id: '' }),
         });
+        if (!r.ok || !(await r.json()).ok) throw new Error('cleanup workspace switch was not acknowledged');
       });
       const del = await apiCall('DELETE', `/api/gateway/orgs/${createdOrgId}`);
       log(`Delete org: ${del.status} ${JSON.stringify(del.json)}`);

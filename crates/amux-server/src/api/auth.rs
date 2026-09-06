@@ -64,6 +64,12 @@ pub async fn require_bearer(
     let Some(expected) = &state.auth_token else {
         return next.run(req).await;
     };
+    // Local invitees authenticate through the revocable member cookie. Only
+    // org::local_member_identity can insert this marker: it strips any inbound
+    // copy before validating the cookie against org_invites -> org_members.
+    if super::org::is_verified_local_member(req.headers()) {
+        return next.run(req).await;
+    }
     // Localhost always bypasses auth (Python parity: local sessions, CLI
     // tools). ConnectInfo is only present when the server was started with
     // into_make_service_with_connect_info (lib.rs does); absence — e.g. in

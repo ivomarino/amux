@@ -980,6 +980,13 @@ pub fn insert_audit(
     source: &str,
     by_who: &str,
 ) -> rusqlite::Result<()> {
+    // SEC-104: a schedule command that inlined a secret (e.g. CLERK_SECRET_KEY=sk_live_…)
+    // left the raw key in old_value/new_value here. cmd_history is redacted at ingestion
+    // but this audit table was NOT, so the value persisted in cleartext in a
+    // fleet-readable, B2-backed store. Run the same redaction over both values, at the
+    // one choke point every schedule_audit write passes through.
+    let (old_r, _) = crate::api::history::redact_secrets(old);
+    let (new_r, _) = crate::api::history::redact_secrets(new);
     conn.execute(
         "INSERT INTO schedule_audit (schedule_id, ts, field, old_value, new_value, source, by_who)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -987,8 +994,8 @@ pub fn insert_audit(
             schedule_id,
             chrono::Utc::now().timestamp(),
             field,
-            old,
-            new,
+            old_r,
+            new_r,
             source,
             by_who
         ],

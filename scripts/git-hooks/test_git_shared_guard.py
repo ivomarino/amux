@@ -676,6 +676,58 @@ def main():
         failures.append("lock-note: an absent lsof reported the lock UNHELD: %r" % _err[:220])
     os.unlink(_lock)
 
+    # ---- MC-1624: the amend LOCK REFUSAL, which shipped with no test ----------
+    # The pin is checked at ADMISSION. mvs-research pinned correctly, their
+    # command then waited 30 iterations on .git/index.lock held by another lane's
+    # commit, and by the time the amend ran HEAD was that lane's commit, which it
+    # rewrote. The guard now refuses while a FRESH lock is held.
+    #
+    # Four states, and the last two are the ones that matter. A refusal keyed on
+    # "lock exists" with no aging blocks every lane forever behind a lock from a
+    # crashed git; a refusal that fires on non-amend commands blocks ordinary
+    # work. Either failure is worse than the race being closed, and neither is
+    # visible from a test that only checks the refusal fires.
+    _amendlock = 0
+    _al_lock = os.path.join(work, ".git", "index.lock")
+    _al_head = subprocess.run(("git", "-C", work, "rev-parse", "HEAD"),
+                              capture_output=True, text=True).stdout.strip()
+    _al_pinned = "AMUX_AMEND_EXPECT=%s git commit --amend --no-edit" % _al_head
+
+    for _n, _setup, _cmd, _want_block in (
+        # 1. NO LOCK, correct pin -> ALLOW. The control that says this whole
+        #    block did not just break the documented amend procedure.
+        ("no lock, pinned", None, _al_pinned, False),
+        # 2. FRESH LOCK, correct pin -> BLOCK. The case that fired.
+        ("fresh lock, pinned", "fresh", _al_pinned, True),
+        # 3. STALE LOCK, correct pin -> ALLOW. Aging works. Without this a lock
+        #    from a crashed git refuses every lane's amend indefinitely while
+        #    blaming a peer who is not there.
+        ("stale lock, pinned", "stale", _al_pinned, False),
+        # 4. FRESH LOCK, NOT an amend -> ALLOW. The refusal must not widen into
+        #    ordinary commands just because a peer is mid-commit.
+        ("fresh lock, plain commit", "fresh", "git commit -m x", False),
+    ):
+        if _setup == "fresh":
+            open(_al_lock, "w").close()
+            os.utime(_al_lock, None)
+        elif _setup == "stale":
+            open(_al_lock, "w").close()
+            _st = time.time() - 1200          # past the 900s freshness cutoff
+            os.utime(_al_lock, (_st, _st))
+        _amendlock += 1
+        _rc, _err = run_hook(_cmd, work, tmp)
+        _blocked = _rc != 0
+        if _blocked != _want_block:
+            failures.append(
+                "MC-1624/%s: expected %s, got %s for %r"
+                % (_n, "BLOCK" if _want_block else "ALLOW",
+                   "BLOCK" if _blocked else "ALLOW", _cmd))
+        # The refusal has to name WHY, or the caller retries into the same wall.
+        if _want_block and "index.lock" not in _err:
+            failures.append("MC-1624/%s: refusal does not name the lock: %r" % (_n, _err[:200]))
+        if os.path.exists(_al_lock):
+            os.unlink(_al_lock)
+
     # ------------------------------------------------------------------
     # AF-507 — a bare `git commit` that would sweep index-vs-frozen-HEAD drift
     #
@@ -783,7 +835,7 @@ def main():
             "The signal is drift, not size. stderr: %r" % (_rc, _err[:300]))
 
     total = (len(cases) + len(trio) + len(quad) + len(matrix) + _bodies + 1
-             + len(redir_cases) + _mr101 + _subst + _lockcases + _sweep)
+             + len(redir_cases) + _mr101 + _subst + _lockcases + _amendlock + _sweep)
     if failures:
         print(f"FAIL {len(failures)}/{total}:")
         for f in failures:

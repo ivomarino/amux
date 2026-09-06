@@ -1850,6 +1850,54 @@
   .settings-tab-panel.active { display: block; }
   .settings-section { padding: 6px 14px; }
   .settings-section-label { font-size: 0.68rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px; font-weight: 600; }
+  /* Four providers fit as four one-line summaries; only the tightest quota is
+     expanded on open. Details retain every provider window and exact reset
+     without turning the 260px Settings menu into a quota dashboard. */
+  #settings-usage-body { display: grid; gap: 4px; }
+  .usage-provider {
+    border: 1px solid var(--border); border-radius: 7px; background: var(--bg);
+    overflow: hidden;
+  }
+  .usage-provider summary {
+    display: flex; align-items: center; gap: 5px; min-height: 30px;
+    padding: 3px 7px; cursor: pointer; list-style: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .usage-provider summary::-webkit-details-marker { display: none; }
+  .usage-provider summary::before {
+    content: '›'; color: var(--dim); font-size: 0.9rem; line-height: 1;
+    transform: rotate(0); transition: transform 0.12s ease;
+  }
+  .usage-provider[open] summary::before { transform: rotate(90deg); }
+  .usage-provider-name {
+    color: var(--fg); font-size: 0.78rem; font-weight: 600;
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .usage-provider-plan {
+    color: var(--dim); background: var(--card); border: 1px solid var(--border);
+    border-radius: 999px; padding: 1px 5px; font-size: 0.61rem;
+    text-transform: capitalize; white-space: nowrap;
+  }
+  .usage-provider-status {
+    margin-left: auto; color: var(--dim); font-size: 0.69rem; white-space: nowrap;
+  }
+  .usage-provider-detail { padding: 1px 7px 7px 22px; }
+  .usage-window { margin-top: 6px; }
+  .usage-window-line { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; }
+  .usage-window-label {
+    color: var(--fg); font-size: 0.72rem; min-width: 0; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+  }
+  .usage-window-value { color: var(--dim); font-size: 0.67rem; flex-shrink: 0; white-space: nowrap; }
+  .usage-bar { height: 4px; margin-top: 3px; border-radius: 3px; background: var(--border); overflow: hidden; }
+  .usage-bar > span { display: block; height: 100%; border-radius: inherit; }
+  .usage-reset { color: var(--dim); font-size: 0.62rem; margin-top: 2px; white-space: normal; }
+  .usage-unavailable { color: var(--dim); font-size: 0.68rem; line-height: 1.35; padding-top: 4px; }
+  .usage-provider-meta { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+  .usage-provider-meta > span {
+    color: var(--dim); background: var(--card); border: 1px solid var(--border);
+    border-radius: 999px; padding: 1px 5px; font-size: 0.61rem;
+  }
   .settings-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
   .settings-row input {
     flex: 1; font-size: 0.78rem; padding: 6px 8px; border-radius: 6px;
