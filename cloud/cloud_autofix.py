@@ -176,7 +176,13 @@ def fix_logs(emergency=False):
     # is the hand reclaim that pulled the host back from 0KB, now automatic.
     min_size = "0" if emergency else str(20 * 1024 * 1024)
     journal_keep = "30M" if emergency else "100M"
-    apt_line = ("subprocess.run(['apt-get','clean'],capture_output=True,timeout=30)"
+    # Emergency also clears REGENERABLE non-customer caches — apt, snap downloads, and
+    # the npm cache. On 2026-09-06 /root/.npm (~430M) + snap cache were what actually
+    # recovered prod (logs gave only 8-21M; the gateway needs sustained headroom to
+    # SERVE, not just start), so the emergency reclaim must include them (AC-414).
+    apt_line = ("subprocess.run(['apt-get','clean'],capture_output=True,timeout=30); "
+                "subprocess.run(['bash','-c','rm -rf /var/lib/snapd/cache/* 2>/dev/null'],timeout=30); "
+                "subprocess.run(['bash','-c','npm cache clean --force 2>/dev/null || rm -rf /root/.npm/_cacache 2>/dev/null'],timeout=90)"
                 if emergency else "pass")
     script = r'''
 import subprocess, glob, os
