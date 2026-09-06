@@ -549,7 +549,7 @@ def main():
                 _fb = _disk.get("free_gb", 0)
                 # At the cliff (<~300MB free) drop the 20MB log floor and clear the
                 # journal + apt cache too, or the guard reclaims 0 (AC-414 2026-09-05).
-                fix_logs(emergency=_fb < 0.3)
+                fix_logs(emergency=_fb < 0.5)
                 _disk = check_disk(); result["disk"] = _disk
                 trace("disk_preventive", "after truncate: %.1f%% used, %.1fGB free (was %.1fGB)"
                       % (_disk.get("pct", 0), _disk.get("free_gb", 0), _fb), _disk.get("pct", 100) < 95)
@@ -662,7 +662,7 @@ def main():
             if _disk.get("pct", 0) >= 95 and not no_fix:
                 _free_before = _disk.get("free_gb", 0)
                 # At the cliff (<~300MB free), emergency mode: all logs + journal + apt.
-                _truncated_this_tick = fix_logs(emergency=_free_before < 0.3)
+                _truncated_this_tick = fix_logs(emergency=_free_before < 0.5)
                 _disk = check_disk()
                 result["disk"] = _disk
                 trace("disk_preventive", "after truncate: %.1f%% used, %.1fGB free (was %.1fGB)"
