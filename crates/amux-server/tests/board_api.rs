@@ -308,6 +308,114 @@ async fn invalid_decomposition_creates_no_partial_children() {
     assert_eq!(children, 0);
 }
 
+/// AF-523 — a `depends_on` entry of the WRONG TYPE gets amux's message, not
+/// serde's.
+///
+/// `depends_on` is a 1-based index into the sibling `tasks` array. Get it wrong
+/// two ways and, before this fix, you got two qualities of answer with the
+/// worse one first: a card title was rejected by SERDE at the body layer with
+/// "invalid type: string ..., expected usize" (422), while an out-of-range
+/// integer reached the handler and got "must name an earlier task by 1-based
+/// index" (400). Measured 2026-09-06 by the daily log sweep: `backend` hit the
+/// serde arm three times in 42 seconds, then the good arm, then got it right.
+///
+/// BOTH ARMS ARE ASSERTED. The out-of-range case is the control: it passed
+/// before this change, so a test carrying only the string case cannot tell a
+/// real fix from one that broke the path that already worked.
+#[tokio::test]
+async fn a_depends_on_that_is_not_an_index_is_refused_by_the_board_not_by_serde() {
+    let (app, store, _dir) = app_with_store();
+    store
+        .write(|conn| {
+            conn.execute(
+                "INSERT INTO issues \
+                 (id,title,desc,status,session,type,creator,owner_type,source,created,updated) \
+                 VALUES ('ATE-7','Captured request','**Prompt:** plan','doing','lane', \
+                         'code','amux','agent','capture',1,1)",
+                [],
+            )?;
+            Ok(amux_server::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .unwrap();
+
+    // What backend actually sent: the TITLE of the thing being depended on,
+    // which is what `depends_on` means everywhere else on this board.
+    let (st, _, body) = send_with(
+        &app,
+        "POST",
+        "/api/board/ATE-7/decompose",
+        Some(json!({"tasks":[
+            {"title":"First","priority":0,"depends_on":[],"next_action":"Implement the first step"},
+            {"title":"Second","priority":1,
+             "depends_on":["[incident] RCA doc: interactions data loss"],
+             "next_action":"Implement the second step"}
+        ]})),
+        &[("X-Amux-Worker", "lane")],
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "a wrong-typed dependency is the board's refusal (400), not serde's (422): {body}"
+    );
+    let why = body["error"].as_str().unwrap_or_default();
+    assert!(
+        why.contains("1-based index") && why.contains("`tasks` array"),
+        "the message must say what a dependency IS — a position in this request's array: {body}"
+    );
+    assert!(
+        why.contains("not a card id or a title"),
+        "and must name the guess the caller actually made: {body}"
+    );
+    assert_eq!(body["item"], json!("ATE-7"), "the refusal names the card: {body}");
+
+    // CONTROL: the arm that already worked still answers the same way. Without
+    // it, deleting the range check would leave this test green.
+    let (st, _, body) = send_with(
+        &app,
+        "POST",
+        "/api/board/ATE-7/decompose",
+        Some(json!({"tasks":[
+            {"title":"First","priority":0,"depends_on":[],"next_action":"Implement the first step"},
+            {"title":"Second","priority":1,"depends_on":[0],"next_action":"Implement the second step"}
+        ]})),
+        &[("X-Amux-Worker", "lane")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap_or_default().contains("1-based index"),
+        "the out-of-range arm is unchanged: {body}"
+    );
+
+    // Neither refusal may leave a partial plan behind.
+    let children: i64 = store
+        .read()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM issues WHERE epic='ATE-7'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(children, 0, "a refused decomposition creates nothing");
+
+    // AND THE GOOD PATH STILL WORKS. A permissive type is exactly the change
+    // that could start ACCEPTING what it should refuse, so the positive case
+    // belongs beside the negative ones: a real index must still wire the edge.
+    let (st, _, made) = send_with(
+        &app,
+        "POST",
+        "/api/board/ATE-7/decompose",
+        Some(json!({"tasks":[
+            {"title":"First","priority":0,"depends_on":[],"next_action":"Implement the first step"},
+            {"title":"Second","priority":1,"depends_on":[1],"next_action":"Implement the second step"}
+        ]})),
+        &[("X-Amux-Worker", "lane")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{made}");
+    let tasks = made["tasks"].as_array().unwrap();
+    assert_eq!(tasks[1]["depends_on"], json!([tasks[0]["id"].clone()]), "{made}");
+    assert_eq!(tasks[1]["status"], json!("backlog"), "a dependent leaf parks: {made}");
+}
+
 // ---- List payload shapes: slim by default, prose on request --------------
 //
 // History, because this contract moved TWICE and each move was deliberate.

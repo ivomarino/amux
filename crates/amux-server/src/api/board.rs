@@ -4468,8 +4468,47 @@ struct DecomposeTask {
     item_type: String,
     priority: u8,
     #[serde(default)]
-    depends_on: Vec<usize>,
+    depends_on: Vec<DepRef>,
     next_action: String,
+}
+
+/// One `depends_on` entry AS THE CALLER WROTE IT (AF-523).
+///
+/// The field is a 1-based index into the sibling `tasks` array, and this used
+/// to be typed `Vec<usize>` — so a caller who sent something else was answered
+/// by SERDE, at the body layer, before the handler that owns the real message
+/// ever ran. The same mistake made two ways got two qualities of answer, and
+/// the worse one came first:
+///
+///   depends_on: ["[incident] RCA doc: ..."]  -> 422, axum's raw rejection:
+///     "tasks[1].depends_on[0]: invalid type: string \"...\", expected usize"
+///   depends_on: [0]                          -> 400, amux's own:
+///     "task 2 dependency 0 must name an earlier task by 1-based index"
+///
+/// Measured 2026-09-06 by the daily log sweep: `backend` hit the first three
+/// times in 42 seconds, then the second, then got it right — four attempts for
+/// one field. `expected usize` is true and does not say that the usize is a
+/// position in the array they just wrote. Naming the thing you depend on is
+/// what `depends_on` means everywhere else on this board, so it is the honest
+/// guess, and it was the one answered by the framework.
+///
+/// Accepting the value here does not accept the MISTAKE — it routes it to
+/// `validate_decomposition`, which already has the sentence worth reading.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum DepRef {
+    Index(usize),
+    Other(serde_json::Value),
+}
+
+impl DepRef {
+    /// How the caller wrote it, for an error message that quotes them back.
+    fn shown(&self) -> String {
+        match self {
+            DepRef::Index(n) => n.to_string(),
+            DepRef::Other(v) => v.to_string(),
+        }
+    }
 }
 
 fn default_decompose_type() -> String {
@@ -4481,10 +4520,17 @@ struct DecomposeBody {
     tasks: Vec<DecomposeTask>,
 }
 
-fn validate_decomposition(tasks: &[DecomposeTask]) -> Result<(), String> {
+/// Validate, and return the NORMALIZED 1-based dependency indices per task.
+///
+/// Returning them rather than re-reading `depends_on` downstream is what makes
+/// the "not an index" branch impossible to reach twice: after this returns Ok
+/// there is no `DepRef::Other` left in play, so the child-creation loop has no
+/// can't-happen arm to guess at (AF-523).
+fn validate_decomposition(tasks: &[DecomposeTask]) -> Result<Vec<Vec<usize>>, String> {
     if !(2..=50).contains(&tasks.len()) {
         return Err("decomposition requires 2 to 50 child tasks".into());
     }
+    let mut out: Vec<Vec<usize>> = Vec::with_capacity(tasks.len());
     for (idx, task) in tasks.iter().enumerate() {
         let n = idx + 1;
         if task.title.trim().is_empty() {
@@ -4505,7 +4551,16 @@ fn validate_decomposition(tasks: &[DecomposeTask]) -> Result<(), String> {
             ));
         }
         let mut seen = std::collections::HashSet::new();
+        let mut deps: Vec<usize> = Vec::with_capacity(task.depends_on.len());
         for dep in &task.depends_on {
+            let DepRef::Index(dep) = dep else {
+                return Err(format!(
+                    "task {n} dependency {} must name an earlier task by 1-based index \
+                     (a POSITION in this request's `tasks` array, 1 for the first), not a \
+                     card id or a title",
+                    dep.shown()
+                ));
+            };
             if *dep == 0 || *dep >= n {
                 return Err(format!(
                     "task {n} dependency {dep} must name an earlier task by 1-based index"
@@ -4514,9 +4569,11 @@ fn validate_decomposition(tasks: &[DecomposeTask]) -> Result<(), String> {
             if !seen.insert(*dep) {
                 return Err(format!("task {n} repeats dependency {dep}"));
             }
+            deps.push(*dep);
         }
+        out.push(deps);
     }
-    Ok(())
+    Ok(out)
 }
 
 /// POST /api/board/{id}/decompose — atomically turn a capture shell into an
@@ -4527,9 +4584,10 @@ async fn decompose_item(
     headers: HeaderMap,
     Json(body): Json<DecomposeBody>,
 ) -> Response {
-    if let Err(why) = validate_decomposition(&body.tasks) {
-        return err(StatusCode::BAD_REQUEST, json!({"error": why, "item": id}));
-    }
+    let dep_indices = match validate_decomposition(&body.tasks) {
+        Ok(d) => d,
+        Err(why) => return err(StatusCode::BAD_REQUEST, json!({"error": why, "item": id})),
+    };
     let (_, actor) = actor_from_headers(&headers);
     if actor == "api-anonymous" {
         return err(
@@ -4608,8 +4666,7 @@ async fn decompose_item(
             let mut events = vec![ev_snap(&parent, MutationKind::Updated)];
             let mut children: Vec<IssueRow> = Vec::with_capacity(tasks.len());
             for (idx, task) in tasks.iter().enumerate() {
-                let deps = task
-                    .depends_on
+                let deps = dep_indices[idx]
                     .iter()
                     .map(|n| children[*n - 1].id.clone())
                     .collect::<Vec<_>>();
