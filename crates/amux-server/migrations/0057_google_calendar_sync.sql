@@ -1,4 +1,4 @@
--- Migration 0049: Google Calendar account storage.
+-- Migration 0057: Google Calendar account storage.
 --
 -- Just the connected-account list (which Google accounts have a usable
 -- OAuth grant, reusing the same per-account Gmail OAuth flow gmail_auth.rs

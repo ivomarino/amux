@@ -345,9 +345,9 @@ const MIGRATIONS: &[Migration] = &[
     // dropped entirely along with that mirror — see the gcal re-scope
     // commit.
     Migration {
-        version: 58,
-        name: "0058_google_calendar_sync",
-        sql: include_str!("../../migrations/0058_google_calendar_sync.sql"),
+        version: 57,
+        name: "0057_google_calendar_sync",
+        sql: include_str!("../../migrations/0057_google_calendar_sync.sql"),
     },
 ];
 
