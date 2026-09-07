@@ -1084,9 +1084,9 @@ async fn get_contract(
             "api": "POST /api/board with a different session plus optional request_parent and callback:true, a prompt string, or {prompt}; X-Amux-Worker is the verified requester",
             "lifecycle": "the delegated child is created in backlog and added to the requester task's depends_on; the parent moves doing -> todo so it releases WIP, stays dependency-blocked while the child is open, and becomes ready automatically when the child closes",
             "parent_resolution": "request_parent/--for is authoritative. Otherwise the latest durable message->task link identifies the current task, with a unique doing task as fallback. No active task creates an intentional standalone request; multiple doing tasks are refused rather than linked incorrectly",
-            "callback": "optional; request CLI arms it by default. It fires exactly when the card first enters done, verified, or discarded and queues a durable message to the verified requester",
+            "callback": "optional; request CLI arms it by default. It fires when the dependency is resolved: verified for runtime-changing types, done for types without verification. Discarded sends a failure indicator and stays blocking. It queues a durable message to the verified requester",
             "durability": "requested_by, callback target/prompt/state/message id/fired time/error live on the task. A stable steering id makes restart recovery idempotent; model/provider context is not involved",
-            "visibility": "the initial request and terminal callback are Messages rows linked to the same task id; the card carries requester, callback state, action log and produced assets",
+            "visibility": "the initial request links to the dependency; its completion callback links to the original requesting task when unique, with producer origin and both task IDs in history",
             "security": "a callback can return only to the server-verified requester; isolated raw workers remain outside harness delivery",
         },
         "capture_decomposition": {
@@ -1094,7 +1094,7 @@ async fn get_contract(
             "atomicity": "the root becomes an epic and all 2-50 children are created in one SQLite writer transaction; any invalid child creates zero",
             "required_per_child": ["unique title", "concrete description", "non-epic type", "p0-p3 priority", "earlier-task dependency indexes", "concrete next_action", "1-12 falsifiable acceptance_criteria"],
             "idempotency": "the normalized plan SHA-256 is durable on the root epic; an identical retry returns idempotent=true and a different retry returns 409 decomposition_plan_conflict",
-            "dependency_execution": "todo/backlog claims are refused while any dependency is open; board-drive promotes dependency-backed backlog only after every dependency is done or verified, and a committed successor is not stranded by unrelated todo queue depth",
+            "dependency_execution": "todo/backlog claims are refused until every dependency is resolved: runtime-changing types require verified; other types may finish at done; missing or discarded dependencies remain blocking, and a committed successor is not stranded by unrelated todo queue depth",
             "graph": "GET /api/graph/board: versioned snapshot of tasks, workers, artifacts and recorded messages, typed provenance, cycle/missing-reference verification, and deterministic prerequisite-first layers. GET /api/graph/board/verify or amux board graph --check: lightweight structural preflight using the same verifier, without task prose. Structural order is not a workflow readiness or artifact-existence claim. Mutate through board/decompose/artifacts APIs; periodic board.graph_integrity detects legacy corruption.",
             "completion": "when every child is done, verified, discarded, or quarantined, board-drive closes the root epic and records the child-status summary as evidence",
         },
@@ -2053,6 +2053,17 @@ pub(crate) async fn dispatch_pending_callbacks(
                 if !matches!(row.callback_state.as_deref(), Some("pending" | "dispatching")) {
                     return Ok(no_write());
                 }
+                if !bs::dependency_is_resolved(&row.status, &row.item_type) && row.status != "discarded" {
+                    tracing::warn!(marker = "dependency_callback_not_resolved", task_id = %row.id,
+                        status = %row.status, measured = true, n_considered = 1,
+                        "withholding pending callback because dependency no longer resolves");
+                    row.callback_state = Some("armed".into());
+                    row.callback_error = Some("Waiting for verified dependency resolution".into());
+                    row.rev += 1;
+                    row.version += 1;
+                    bs::save_patched(conn, &mut row)?;
+                    return Ok(WriteOutcome { applied: true, events: vec![ev_snap(&row, MutationKind::Updated)] });
+                }
                 row.callback_state = Some("dispatching".into());
                 row.callback_message_id = Some(stable_w);
                 row.callback_error = None;
@@ -2074,17 +2085,49 @@ pub(crate) async fn dispatch_pending_callbacks(
             continue;
         };
         let sender = row.session.clone().unwrap_or_else(|| "board".into());
+        // Derive the return address from the durable dependency graph, never
+        // from remembered prose. A callback must resume the requester's task,
+        // not make the producer's child its new current-task context.
+        let parents: Vec<IssueRow> = match state.store.read().and_then(|conn| {
+            Ok(bs::list_issues(&conn, &[], std::slice::from_ref(&target), bs::ArchivedFilter::ActiveOnly)?)
+        }) {
+            Ok(rows) => rows.into_iter()
+                .filter(|parent| parent.depends_on.contains(&row.id) && !bs::is_terminal_status(&parent.status))
+                .collect(),
+            Err(error) => {
+                tracing::warn!(marker = "dependency_callback_graph_unmeasured", task_id = %row.id,
+                    %error, measured = false, n_considered = 0,
+                    "callback awaits a successful graph lookup before delivery");
+                continue;
+            }
+        };
+        let context_card = if parents.len() == 1 { parents[0].id.clone() } else { row.id.clone() };
         let outcome = row
             .last_result
             .as_deref()
             .or(row.evidence.as_deref())
             .unwrap_or("The complete action log and produced assets are on the task card.");
+        let resolution = if bs::dependency_is_resolved(&row.status, &row.item_type) {
+            "resolved the dependency"
+        } else { "closed the request without resolving the dependency" };
         let mut prompt = format!(
-            "[task callback {}: {}] {} finished the task you requested. \
-             Terminal state: {}.\nOutcome: {}\nOpen board card {} for gates, action history, \
-             source message, epic, and produced assets.",
-            row.id, row.title, sender, row.status, outcome, row.id
+            "[task callback {}: {}] {} {}. \
+             State: {}.\nOutcome: {}\nOpen board card {} for verification evidence, action history, \
+             source message, and produced assets.",
+            row.id, row.title, sender, resolution, row.status, outcome, row.id
         );
+        if let Ok(conn) = state.store.read() {
+            for parent in &parents {
+                let blocking = crate::runtime_jobs::board_drive::deps_blocking(&conn, parent);
+                prompt.push_str(&format!("\nOriginal task {} — {}. Next action: {}.",
+                    parent.id, parent.title, parent.next_action.as_deref().unwrap_or("Read the original task and continue its work")));
+                if blocking.is_empty() {
+                    prompt.push_str(" All linked dependencies are resolved. Re-read and resume this original task now through its normal board claim. Keep the links as history; they no longer block it.");
+                } else {
+                    prompt.push_str(&format!(" Still blocked by: {}. Do not claim it until these dependencies resolve.", blocking.join(", ")));
+                }
+            }
+        }
         if let Some(instruction) = row.callback_prompt.as_deref().filter(|s| !s.trim().is_empty()) {
             prompt.push_str("\nCallback instruction: ");
             prompt.push_str(instruction.trim());
@@ -2113,6 +2156,8 @@ pub(crate) async fn dispatch_pending_callbacks(
         let sender_w = sender.clone();
         let prompt_w = prompt.clone();
         let stable_w = stable_id.clone();
+        let parents_w: Vec<String> = parents.iter().map(|parent| parent.id.clone()).collect();
+        let context_w = context_card.clone();
         match delivered {
             Ok(_) => {
                 report.queued += 1;
@@ -2137,8 +2182,8 @@ pub(crate) async fn dispatch_pending_callbacks(
                     ));
                     bs::save_patched(conn, &mut latest)?;
                     let exists = conn.query_row(
-                        "SELECT 1 FROM cmd_history WHERE card_id=?1 AND type='task-callback' LIMIT 1",
-                        rusqlite::params![id_w], |_| Ok(true),
+                        "SELECT 1 FROM cmd_history WHERE session=?1 AND type='task-callback' AND text LIKE ?2 LIMIT 1",
+                        rusqlite::params![target_w, format!("[task callback {id_w}:%")], |_| Ok(true),
                     ).unwrap_or(false);
                     let mut events = vec![ev_snap(&latest, MutationKind::Updated)];
                     if !exists {
@@ -2146,9 +2191,23 @@ pub(crate) async fn dispatch_pending_callbacks(
                             "INSERT INTO cmd_history \
                              (text,type,session,ts,origin,card_id,delivery,queued_at) \
                              VALUES (?1,'task-callback',?2,?3,?4,?5,'queued',?3)",
-                            rusqlite::params![prompt_w, target_w, now * 1000, sender_w, id_w],
+                            rusqlite::params![prompt_w, target_w, now * 1000, sender_w, context_w],
                         )?;
                         let message_id = conn.last_insert_rowid();
+                        for parent_id in &parents_w {
+                            let Some(mut parent) = bs::get_issue(conn, parent_id)? else { continue; };
+                            if !parent.depends_on.contains(&id_w) { continue; }
+                            parent.log = Some(bs::append_log(parent.log.as_deref(), &hhmm(),
+                                &format!("dependency {id_w} reported {} by {sender_w}; callback {stable_w}, message MSG-{message_id} completion indicator queued for this task", latest.status)));
+                            parent.updated = now;
+                            parent.rev += 1;
+                            parent.version += 1;
+                            bs::save_patched(conn, &mut parent)?;
+                            events.push(ev_snap(&parent, MutationKind::Updated));
+                        }
+                        tracing::info!(marker = "dependency_callback_linked", task_id = %id_w,
+                            original_task = %context_w, message_id, measured = true,
+                            n_considered = parents_w.len(), "completion callback linked to its original work");
                         events.push(crate::db::PendingEvent {
                             entity_type: amux_core::revision::EntityType::Message,
                             entity_id: format!("MSG-{message_id}"),
@@ -2206,6 +2265,11 @@ mod callback_dispatch_tests {
     }
 
     fn pending_request(state: &AppState) -> String {
+        request_at(state, "verified")
+    }
+
+    fn request_at(state: &AppState, status: &str) -> String {
+        let status = status.to_owned();
         let new = bs::NewIssue {
             title: "Produce the launch report".into(),
             desc: "Requested by another worker.".into(),
@@ -2234,7 +2298,7 @@ mod callback_dispatch_tests {
         let id_w = id.clone();
         state.store.write(move |conn| {
             let mut row = bs::create_issue(conn, &new, 1000)?;
-            row.status = "done".into();
+            row.status = status;
             row.last_result = Some("Report written to /tmp/launch-report.md".into());
             row.updated = 2000;
             row.rev += 1;
@@ -2245,6 +2309,92 @@ mod callback_dispatch_tests {
         }).expect("create and complete request");
         let created_id = id.lock().unwrap().clone();
         created_id
+    }
+
+    /// Code completion has two edges: done records implementation, verified
+    /// releases the graph and its durable return message. Drive the real store,
+    /// dispatcher and steering outbox, including recovery, as one scenario.
+    #[tokio::test(flavor = "current_thread")]
+    async fn verified_dependency_returns_to_original_task_once() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        for worker in ["worker-a", "worker-b"] {
+            std::fs::write(home.path().join(format!("sessions/{worker}.env")), "CC_TAGS=\"test\"\n").unwrap();
+        }
+        let state = state(home.path());
+        let id = request_at(&state, "done");
+        let child = id.clone();
+        state.store.write(move |conn| {
+            conn.execute("INSERT INTO issues(id,title,status,session,type,owner_type,created,updated,depends_on,next_action) \
+                VALUES ('P-1','Integrate the verified report','todo','worker-a','chore','agent',1,1,?1,'Integrate the returned report into the final output')",
+                [serde_json::to_string(&vec![child]).unwrap()])?;
+            Ok(crate::db::WriteOutcome {applied:true,events:vec![]})
+        }).unwrap();
+        {
+            let conn = state.store.read().unwrap();
+            let parent = bs::get_issue(&conn, "P-1").unwrap().unwrap();
+            assert_eq!(crate::runtime_jobs::board_drive::deps_blocking(&conn, &parent), vec![id.clone()]);
+            assert_eq!(bs::get_issue(&conn, &id).unwrap().unwrap().callback_state.as_deref(), Some("armed"));
+        }
+        assert_eq!(dispatch_pending_callbacks(&state, Some(&id)).await.attempted, 0,
+            "done without verification must neither notify nor resume the original worker");
+        let child = id.clone();
+        state.store.write(move |conn| {
+            let mut row = bs::get_issue(conn, &child)?.unwrap();
+            row.status = "verified".into(); row.updated = 3000; row.rev += 1; row.version += 1;
+            row.evidence = Some("python verify_report.py -> PASS: report content checked independently".into());
+            bs::save_patched(conn, &mut row)?;
+            Ok(crate::db::WriteOutcome {applied:true,events:vec![]})
+        }).unwrap();
+        let delivered = dispatch_pending_callbacks(&state, Some(&id)).await;
+        assert_eq!((delivered.attempted, delivered.queued, delivered.refused), (1, 1, 0));
+        {
+            let conn = state.store.read().unwrap();
+            let parent = bs::get_issue(&conn, "P-1").unwrap().unwrap();
+            assert!(crate::runtime_jobs::board_drive::deps_blocking(&conn, &parent).is_empty());
+            assert_eq!(parent.depends_on, vec![id.clone()], "keep the linkage as durable history");
+            assert!(parent.log.unwrap().contains(&format!("dependency {id} reported verified by worker-b")));
+            let (text, card, origin): (String, String, String) = conn.query_row(
+                "SELECT text,card_id,origin FROM cmd_history WHERE session='worker-a' AND type='task-callback'",
+                [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+            assert_eq!(card, "P-1", "the worker's current task must remain the original task");
+            assert_eq!(origin, "worker-b");
+            assert!(text.contains("Original task P-1"));
+            assert!(text.contains("All linked dependencies are resolved"));
+            assert!(text.contains("Integrate the returned report"));
+        }
+        let child = id.clone();
+        state.store.write(move |conn| {
+            conn.execute("UPDATE issues SET callback_state='dispatching' WHERE id=?1",[child])?;
+            Ok(crate::db::WriteOutcome {applied:true,events:vec![]})
+        }).unwrap();
+        assert_eq!(dispatch_pending_callbacks(&state, Some(&id)).await.queued, 1);
+        let conn = state.store.read().unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM steering_queue WHERE id=?1",
+            [format!("task-callback-{id}")], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM cmd_history WHERE card_id='P-1' AND type='task-callback'",
+            [], |r| r.get::<_, i64>(0)).unwrap(), 1, "recovery cannot duplicate the linked message");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reopened_dependency_cannot_dispatch_a_stale_completion() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::api::settings::test_env::set_home(home.path());
+        let state = state(home.path());
+        let id = pending_request(&state);
+        let child = id.clone();
+        state.store.write(move |conn| {
+            let mut row = bs::get_issue(conn, &child)?.unwrap();
+            row.status = "doing".into();
+            bs::save_patched(conn, &mut row)?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let result = dispatch_pending_callbacks(&state, Some(&id)).await;
+        assert_eq!((result.attempted, result.queued), (1, 0));
+        let conn = state.store.read().unwrap();
+        assert_eq!(bs::get_issue(&conn, &id).unwrap().unwrap().callback_state.as_deref(), Some("armed"));
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM steering_queue", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
     }
 
     /// Happy path plus the crash window: enqueue succeeds, but the process dies

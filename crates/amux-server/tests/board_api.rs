@@ -4375,6 +4375,11 @@ async fn terminal_status_paths_preserve_summary_and_record_audit_for_provider_sh
         assert_eq!(status_request["logged"], json!(true));
 
         let (_, _, after) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+        let displayed_latest = after["last_result"].as_str().unwrap_or("");
+        assert_eq!(
+            displayed_latest, summary,
+            "{provider} terminal displayed latest status was replaced by late provider output"
+        );
         assert_eq!(
             after["last_result"],
             json!(summary),

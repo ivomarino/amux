@@ -9044,7 +9044,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.827';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.830';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -10450,11 +10450,12 @@ function highlightPrompts(html) {
     const text = plain.slice(i, end).join('\n');
     const kind = _classifyPromptKind(text);
     // Codex's final input hint sits immediately above its model/status footer.
-    // It is not a submitted turn; a real recorded message remains navigable.
+    // Saved output contains older copies of this footer too, followed by later
+    // frames. Only the adjacent footer matters; a recorded message still wins.
     const tail = plain.slice(end).filter(line => line.trim());
-    const composer = kind === 'unknown' && tail.length > 0 && tail.length <= 3 && tail.every(line =>
-      /^\s*(?:gpt-[\w.-]+|o[1-9][\w.-]*|\d+% context left|\? for shortcuts|⏵⏵)/i.test(line));
-    if (composer) { out.push(...lines.slice(i, end)); i = end; continue; }
+    const composer = kind === 'unknown' && tail.length > 0 &&
+      /^\s*(?:gpt-[\w.-]+|o[1-9][\w.-]*)\s.*(?:·|context left)/i.test(tail[0]);
+    if (composer) { out.push('<span class="peek-composer-hint">' + lines.slice(i, end).join('\n') + '</span>'); i = end; continue; }
     const label = (_MSG_KIND[kind] || _MSG_KIND.unknown).label;
     // Close each block before opening its successor. Nested prompt wrappers
     // made scrollIntoView target a whole conversation instead of one message.
@@ -10800,7 +10801,7 @@ async function refreshPeek(liveOnly, bypassTrim) {
       histChanged = true;
     }
     const atBottom = _isScrolledToBottom(body);
-    if (atBottom) _peekScrollLocked = false;
+    if (atBottom && !body.querySelector('.peek-msg-current, .peek-highlight.current')) _peekScrollLocked = false;
     const newHTML = _peekHtml(output);
     if (peekSelecting || (window.getSelection()?.toString().length > 0)) return;
     if (_sendingSnapshot && newHTML !== _sendingSnapshot) clearSendingIndicator();
@@ -10813,8 +10814,10 @@ async function refreshPeek(liveOnly, bypassTrim) {
     const hasSearch = peekSearchQuery.trim().length > 0;
     // When user has scrolled up, skip DOM update to avoid fidgeting the view.
     // Buffer in lastPeekHTML and flush when they resume.
-    if (hasSearch) {
-      // Output changed while a search is active: re-highlight matches in the new
+    if (hasSearch && (!_peekScrollLocked || _peekPendingFindScroll)) {
+      // A selected search result stays pinned while output is buffered, just
+      // like message navigation. Only an unlocked search or pending Locate
+      // should replace its nodes. Re-highlight matches in the new
       // DOM but DON'T scroll to the current match — preserve wherever the user
       // scrolled. Auto-scroll only happens on explicit search actions (typing /
       // next / prev). Restoring scrollTop keeps position across the innerHTML swap.
@@ -10889,23 +10892,44 @@ function applyPeekSearch(keepIndex, doScroll) {
     if (countEl) countEl.textContent = '';
     return;
   }
-  // Highlight all matches in text nodes only (not inside tags)
+  // Search the rendered text, not serialized HTML. Entities and ANSI/link
+  // spans must not turn one visible phrase into missing or duplicate matches.
+  body.innerHTML = lastPeekHTML;
+  const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+  const nodes = [];
+  let text = '', node;
+  while ((node = walker.nextNode())) {
+    nodes.push({node, start:text.length, end:text.length + node.data.length});
+    text += node.data;
+  }
   const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const re = new RegExp('(' + escaped + ')', 'gi');
-  const parts = lastPeekHTML.split(/(<[^>]+>)/);
-  let idx = 0;
-  body.innerHTML = parts.map(p => {
-    if (p.startsWith('<')) return p;
-    return p.replace(re, (match) => `<span class="peek-highlight" data-idx="${idx++}">${esc(match)}</span>`);
-  }).join('');
-  _peekMatches = Array.from(body.querySelectorAll('.peek-highlight'));
+  const ranges = [...text.matchAll(new RegExp(escaped, 'gi'))].map(m => ({start:m.index,end:m.index + m[0].length}));
+  _peekMatches = [];
+  let firstRange = 0;
+  for (const entry of nodes) {
+    while (firstRange < ranges.length && ranges[firstRange].end <= entry.start) firstRange++;
+    if (firstRange >= ranges.length || ranges[firstRange].start >= entry.end) continue;
+    const fragment = document.createDocumentFragment();
+    let offset = 0;
+    for (let i = firstRange; i < ranges.length && ranges[i].start < entry.end; i++) {
+      const start = Math.max(0, ranges[i].start - entry.start), end = Math.min(entry.node.length, ranges[i].end - entry.start);
+      fragment.append(document.createTextNode(entry.node.data.slice(offset, start)));
+      const mark = document.createElement('span');
+      mark.className = 'peek-highlight'; mark.dataset.idx = String(i);
+      mark.textContent = entry.node.data.slice(start, end); fragment.append(mark);
+      if (!_peekMatches[i]) _peekMatches[i] = mark;
+      offset = end;
+    }
+    fragment.append(document.createTextNode(entry.node.data.slice(offset)));
+    entry.node.replaceWith(fragment);
+  }
   _peekReclassifyPrompts();
   if (!keepIndex || peekSearchIndex >= _peekMatches.length) peekSearchIndex = 0;
   _peekScrollTo(peekSearchIndex, doScroll);
   if (countEl) countEl.textContent = _peekMatches.length > 0 ? (peekSearchIndex + 1) + '/' + _peekMatches.length : 'no matches';
 }
 function _peekScrollTo(i, doScroll, instant) {
-  _peekMatches.forEach((m, j) => m.classList.toggle('current', j === i));
+  document.querySelectorAll('#peek-body .peek-highlight').forEach(m => m.classList.toggle('current', Number(m.dataset.idx) === i));
   const cur = _peekMatches[i];
   // instant: the one-shot Locate jump — a smooth animation would be frozen
   // mid-flight by the next poll tick's savedTop restore.
@@ -11000,7 +11024,7 @@ function _peekMsgNavIsExplicit(e) {
 function _peekMsgPrompts() {
   const body = document.getElementById('peek-body');
   if (!body) return [];
-  if (peekSearchQuery.trim()) return Array.from(body.querySelectorAll('.peek-highlight'));
+  if (peekSearchQuery.trim()) return _peekMatches.filter(el => el.isConnected);
   return Array.from(body.querySelectorAll('.peek-prompt')).filter(el =>
     _peekMsgNavKind === 'all' || el.dataset.msgKind === _peekMsgNavKind);
 }
@@ -11053,25 +11077,63 @@ function _peekToolbarCheck() {
   });
 }
 window.addEventListener('resize', _peekToolbarCheck);
-function _peekJumpTo(el) {
+// getBoundingClientRect uses rendered pixels; scrollTop uses unzoomed layout
+// pixels. Use computed border-box height (not rounded offsetHeight) to convert.
+function _peekScrollScale(el) {
+  const style = getComputedStyle(el);
+  const extra = style.boxSizing === 'border-box' ? 0 : ['paddingTop','paddingBottom','borderTopWidth','borderBottomWidth']
+    .reduce((sum, key) => sum + (parseFloat(style[key]) || 0), 0);
+  return el.getBoundingClientRect().height / (parseFloat(style.height) + extra) || 1;
+}
+function _peekJumpGeometry(el) {
   const body = document.getElementById('peek-body');
-  // Lock before changing scrollTop: a polling tick must not replace the target
-  // while a smooth animation is still in flight. Scroll only this container.
+  const bounds = body.getBoundingClientRect(), rect = el.getBoundingClientRect();
+  const scale = _peekScrollScale(body);
+  const viewportTop = bounds.top + body.clientTop * scale;
+  // Padding protects the first line at rest; explicit jumps must also respect
+  // the controls that float above the scrolling output.
+  let inset = Math.max(12, parseFloat(getComputedStyle(body).paddingTop) || 0);
+  for (const control of document.querySelectorAll('#peek-overlay .peek-copy-btn, #peek-overlay .peek-agent-nav')) {
+    if (!control.getClientRects().length) continue;
+    const r = control.getBoundingClientRect();
+    if (r.bottom > viewportTop && r.top < bounds.bottom) inset = Math.max(inset, (r.bottom - viewportTop) / scale + 6);
+  }
+  const offset = (rect.top - viewportTop) / scale;
+  const max = Math.max(0, body.scrollHeight - body.clientHeight);
+  const wanted = Math.max(0, Math.min(max, body.scrollTop + offset - inset));
+  return {body, bounds, rect, scale, inset, offset, wanted, max,
+    visible: rect.top >= viewportTop + inset * scale - 1 && rect.top < bounds.bottom
+      && rect.right > bounds.left && rect.left < bounds.right};
+}
+function _peekJumpTo(el) {
+  const g = _peekJumpGeometry(el);
   _peekScrollLocked = true;
-  const top = el.getBoundingClientRect().top - body.getBoundingClientRect().top + body.scrollTop - 12;
-  body.scrollTo({ top: Math.max(0, top), behavior: 'instant' });
+  // A search match inside a wide terminal table also needs its own horizontal
+  // scroller moved. Never scroll the page or an unrelated overlay.
+  for (let box = el.parentElement; box && box !== g.body; box = box.parentElement) {
+    if (box.scrollWidth <= box.clientWidth) continue;
+    const r = box.getBoundingClientRect(), match = el.getBoundingClientRect(), scale = _peekScrollScale(box);
+    if (match.left < r.left || match.right > r.right) box.scrollLeft += (match.left - r.left) / scale - 8;
+  }
+  g.body.scrollTo({top:g.wanted, behavior:'instant'});
 }
 function _peekNavBeacon(verdict, prompts, target) {
   const body = document.getElementById('peek-body');
-  const bounds = body.getBoundingClientRect();
-  const rect = target && target.getBoundingClientRect();
+  const geometry = target && _peekJumpGeometry(target);
+  const searching = !!peekSearchQuery.trim();
   try {
     fetch(API + '/api/client-debug', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ kind: 'peek-message-nav', verdict, session: peekSession, ver: APP_VER,
-        measured: true, n_considered: prompts.length, filter: _peekMsgNavKind,
-        index: _peekMsgIndex, target_kind: target?.dataset.msgKind || null,
-        target_visible: !!rect && rect.top >= bounds.top - 1 && rect.top < bounds.bottom,
+        measured: true, n_considered: prompts.length, filter: searching ? 'matches' : _peekMsgNavKind,
+        mode: searching ? 'search' : 'messages',
+        index: searching ? peekSearchIndex : _peekMsgIndex, target_kind: target?.closest('.peek-prompt')?.dataset.msgKind || null,
+        target_visible: !!geometry && geometry.visible,
+        target_offset: geometry ? Math.round(geometry.offset * 100) / 100 : null,
+        desired_inset: geometry ? Math.round(geometry.inset * 100) / 100 : null,
+        scroll_error_px: geometry ? Math.round((geometry.wanted - body.scrollTop) * 100) / 100 : null,
+        zoom: geometry ? Math.round(geometry.scale * 1000) / 1000 : null,
         scroll_top: Math.round(body.scrollTop),
+        composer_hints_excluded: body.querySelectorAll('.peek-composer-hint').length,
         unclassified: body.querySelectorAll('.peek-prompt-unknown').length }) }).catch(() => {});
   } catch (e) {}
 }
@@ -11105,7 +11167,8 @@ async function _peekMsgMove(direction, event) {
   const selected = prompts.findIndex(p => p.classList.contains(peekSearchQuery.trim() ? 'current' : 'peek-msg-current'));
   if (selected >= 0) _peekMsgIndex = (selected + direction + prompts.length) % prompts.length;
   else {
-    const top = document.getElementById('peek-body').getBoundingClientRect().top + 13;
+    const g = _peekJumpGeometry(prompts[0]);
+    const top = g.bounds.top + g.inset * g.scale + 1;
     const visible = prompts.findIndex(p => p.getBoundingClientRect().top >= top);
     _peekMsgIndex = direction > 0 ? (visible < 0 ? 0 : visible)
       : (visible <= 0 ? prompts.length - 1 : visible - 1);
@@ -11119,9 +11182,8 @@ async function _peekMsgMove(direction, event) {
   }
   _peekJumpTo(target);
   _peekMsgCount(prompts);
-  const rect = target.getBoundingClientRect();
-  const bounds = document.getElementById('peek-body').getBoundingClientRect();
-  _peekNavBeacon(rect.top >= bounds.top - 1 && rect.top < bounds.bottom ? 'landed' : 'target-not-visible', prompts, target);
+  const landed = _peekJumpGeometry(target);
+  _peekNavBeacon(landed.visible && Math.abs(landed.wanted - landed.body.scrollTop) < 2 ? 'landed' : 'target-not-visible', prompts, target);
 }
 function peekMsgNext(event) { _peekMsgMove(1, event); }
 function peekMsgPrev(event) { _peekMsgMove(-1, event); }
@@ -20445,7 +20507,9 @@ function peekCheckSelection() {
 document.getElementById('peek-body').addEventListener('mousedown', () => { peekSelecting = true; clearTimeout(peekSelectTimer); });
 document.getElementById('peek-body').addEventListener('touchstart', () => { peekSelecting = true; clearTimeout(peekSelectTimer); }, {passive: true});
 document.getElementById('peek-body').addEventListener('scroll', function() {
-  if (_isScrolledToBottom(this)) {
+  // Programmatic message/search jumps can land at the finite scroll boundary.
+  // That scroll event is still navigation, not a request to resume live output.
+  if (_isScrolledToBottom(this) && !this.querySelector('.peek-msg-current, .peek-highlight.current')) {
     _peekScrollLocked = false;
     _hideScrollLockBadge(this);
   } else {
@@ -27110,6 +27174,51 @@ function _boardDraftsPersist() {
   try { localStorage.setItem('amux_board_drafts', JSON.stringify(_boardDrafts)); } catch (e) {}
 }
 
+// A status-only draft is not an edit to the card's content. It can be left
+// behind by a long-lived tab after another client closes the card, and must
+// not make an authoritative terminal GET reopen the card as `doing`. Content
+// drafts remain local: only fields that the draft actually carries participate
+// in this comparison so old/partial drafts are not treated as edits merely
+// because the server now has fields they never knew about.
+function _bdDraftHasActiveEdits(draft, full) {
+  if (!draft || !full) return false;
+  const own = Object.prototype.hasOwnProperty;
+  const same = (a, b) => JSON.stringify(a == null ? '' : a) === JSON.stringify(b == null ? '' : b);
+  const fields = [
+    ['title', 'title'], ['desc', 'desc'], ['session', 'session'],
+    ['worker', 'session'], ['due', 'due'], ['due_time', 'due_time'],
+    ['tags', 'tags'], ['gate', 'gate'],
+  ];
+  const compared = new Set();
+  return fields.some(([draftKey, serverKey]) => {
+    if (compared.has(serverKey) || !own.call(draft, draftKey)) return false;
+    compared.add(serverKey);
+    return !same(draft[draftKey], full[serverKey]);
+  });
+}
+function _bdDraftField(draft, key, fallback) {
+  return draft && Object.prototype.hasOwnProperty.call(draft, key) ? draft[key] : fallback;
+}
+function _bdDraftSession(draft, fallback) {
+  if (!draft) return fallback;
+  if (Object.prototype.hasOwnProperty.call(draft, 'session')) return draft.session;
+  if (Object.prototype.hasOwnProperty.call(draft, 'worker')) return draft.worker;
+  return fallback;
+}
+
+// This is deliberately client-edit state, not a guess based on draft age or
+// provider prose. Programmatic hydration does not dispatch these events;
+// actual typing/selection does, so a Refresh can preserve an edit in progress.
+let _bdActiveDirty = false;
+document.addEventListener('input', e => {
+  if (!boardDetailId || !e.target || !/^bd-(title|desc|session|due|due-time|gate)$/.test(e.target.id || '')) return;
+  _bdActiveDirty = true;
+}, true);
+document.addEventListener('change', e => {
+  if (!boardDetailId || !e.target || !/^bd-(title|desc|session|due|due-time|gate)$/.test(e.target.id || '')) return;
+  _bdActiveDirty = true;
+}, true);
+
 // Set false on every open, true once GET /api/board/<id> has filled desc/log.
 // The SAVE path refuses to write a desc while this is false and the card is
 // known to have one — see the guard in the save handler (AMUX-2840).
@@ -27332,20 +27441,32 @@ async function _bdHydrate(id) {
     const cached = idx >= 0 ? { ...boardItems[idx] } : {};
     if (idx >= 0) boardItems[idx] = Object.assign({}, boardItems[idx], full);
     const merged = idx >= 0 ? boardItems[idx] : full;
-    const hasDraft = Boolean(_boardDrafts[id]);
+    let draft = _boardDrafts[id];
+    const terminal = /^(done|verified|discarded)$/i.test(String(full.status || ''));
+    const keepLocalDraft = Boolean(_bdActiveDirty || _bdDraftHasActiveEdits(draft, full));
+    if (terminal && draft && !keepLocalDraft) {
+      // The persisted draft only differed by status (or was empty/partial),
+      // so it is stale state from the old client rather than an active edit.
+      // Remove it before painting controls; otherwise every Refresh would
+      // restore the fossil immediately after the GET corrected the cache.
+      delete _boardDrafts[id];
+      _boardDraftsPersist();
+      draft = null;
+    }
+    const preserveLocalStatus = Boolean(_bdActiveDirty || (draft && _bdDraftHasActiveEdits(draft, full)));
     // The selected status is a rendered copy of the server row, not a second
-    // source of truth. Keep an intentional local draft, but whenever the user
-    // has not edited this card, apply the authoritative GET before painting
-    // the controls. This also removes the timing window in openBoardDetail,
-    // where hydration used to start before boardDetailStatus was initialized.
-    if (!hasDraft && boardDetailId === id) {
+    // source of truth. Keep an intentional local content edit, but whenever
+    // the user has not edited this card, apply the authoritative GET before
+    // painting the controls. This also removes the timing window in
+    // openBoardDetail, where hydration used to start before the status was
+    // initialized.
+    if (!preserveLocalStatus && boardDetailId === id) {
       boardDetailStatus = full.status || 'todo';
       _renderDetailStatusBtns();
     }
     _bdRenderHistory(merged);
     if (typeof _bdRenderStatusBanner === 'function') _bdRenderStatusBanner(merged);
     _bdRenderMeta(merged);
-    if (hasDraft) { _bdHydrated = true; return true; }  // user's draft wins
     const title = document.getElementById('bd-title');
     if (title && title.value === (cached.title || '')) {
       title.value = full.title || '';
@@ -27405,14 +27526,15 @@ async function openBoardDetail(id) {
   // modal on a fetch would make every card open feel slow for a field most
   // opens never edit.
   const draft = _boardDrafts[id];
+  _bdActiveDirty = false;
   boardDetailStatus = draft ? draft.status : (item.status || 'todo');
   _bdHydrated = (item.desc !== undefined);
   _bdHydrate(id);
   const titleEl = document.getElementById('bd-title');
-  titleEl.value = draft ? draft.title : item.title;
+  titleEl.value = _bdDraftField(draft, 'title', item.title);
   titleEl.style.height = 'auto';
   titleEl.style.height = titleEl.scrollHeight + 'px';
-  document.getElementById('bd-desc').value = draft ? draft.desc : (item.desc || '');
+  document.getElementById('bd-desc').value = _bdDraftField(draft, 'desc', item.desc || '');
   // History is now a TAB (below); the inline strip is retired.
   const logEl = document.getElementById('bd-log');
   if (logEl) { logEl.style.display = 'none'; }
@@ -27424,12 +27546,12 @@ async function openBoardDetail(id) {
   _renderDetailStatusBtns();
   const keyEl = document.getElementById('bd-key');
   if (keyEl) keyEl.textContent = item.id || '';
-  _populateSessionSelect('bd-session', draft ? draft.session : (item.session || ''));
-  _bdConfigureGo({ ...item, session: draft ? draft.session : item.session });
+  _populateSessionSelect('bd-session', _bdDraftSession(draft, item.session || ''));
+  _bdConfigureGo({ ...item, session: _bdDraftSession(draft, item.session) });
   const dueEl = document.getElementById('bd-due');
-  if (dueEl) { dueEl.value = draft ? (draft.due || '') : (item.due || ''); try { _dpSyncLabel(dueEl); } catch (e) {} }
+  if (dueEl) { dueEl.value = _bdDraftField(draft, 'due', item.due || '') || ''; try { _dpSyncLabel(dueEl); } catch (e) {} }
   const dueTimeEl = document.getElementById('bd-due-time');
-  if (dueTimeEl) dueTimeEl.value = draft ? (draft.due_time || '') : (item.due_time || '');
+  if (dueTimeEl) dueTimeEl.value = _bdDraftField(draft, 'due_time', item.due_time || '') || '';
   const gateEl = document.getElementById('bd-gate');
   if (gateEl) gateEl.value = (Array.isArray(item.gate) ? item.gate : []).join('\n');
   boardDetailTab('preview');
@@ -27507,8 +27629,20 @@ function _bdRenderHistory(item) {
 function _bdRenderStatusBanner(item) {
   const el = document.getElementById('bd-status-banner');
   if (!el) return;
+  const terminal = /^(done|verified|discarded)$/i.test(String(item.status || ''));
   const evs = _bdParseHistory(item.log).filter(e => e.kind === 'status');
   const sess = item.session || '';
+  if (terminal) {
+    // Terminal cards have one authoritative displayed status: the durable
+    // final outcome. Their audit log may legitimately receive late provider
+    // evidence, but that evidence is not a replacement for this summary.
+    const summary = String(item.last_result || 'No final outcome recorded.');
+    el.style.display = '';
+    el.innerHTML = '<div class="bd-sb-label">\uD83D\uDCCD Final outcome</div>'
+      + '<div class="bd-sb-text">' + _linkifyUrls(_linkifyCardIds(esc(summary))) + '</div>'
+      + (sess ? '<button class="btn" style="margin-top:8px;font-size:0.74rem;min-height:36px;" onclick="_askCardStatus(\'' + escJs(item.id) + '\',\'' + escJs(sess) + '\')">\uD83D\uDD04 Refresh from ' + esc(sess) + '</button>' : '');
+    return;
+  }
   if (evs.length) {
     const last = evs[evs.length - 1];
     el.style.display = '';
@@ -27580,6 +27714,7 @@ function _renderDetailStatusBtns() {
 }
 
 function boardDetailSetStatus(st) {
+  if (boardDetailId && boardDetailStatus !== st) _bdActiveDirty = true;
   boardDetailStatus = st;
   _renderDetailStatusBtns();
 }
@@ -27610,6 +27745,7 @@ function closeBoardDetail() {
   }
   document.getElementById('board-detail-overlay').classList.remove('active');
   boardDetailId = null;
+  _bdActiveDirty = false;
   // Refresh peek issues panel if open
   if (_peekTab === 'issues') renderPeekIssues();
 }

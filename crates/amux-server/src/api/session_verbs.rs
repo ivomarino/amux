@@ -20664,6 +20664,17 @@ mod tests {
                 assert_eq!(done_status, StatusCode::OK, "step {idx}: {done}");
                 assert_eq!(done["status"], json!("done"));
                 assert_eq!(done["applied"], json!(true));
+                if idx == 0 {
+                    // The code predecessor remains blocked at Done until its
+                    // separate verification edge; docs/investigations end at Done.
+                    assert_eq!(crate::runtime_jobs::board_drive::promote_ready_backlog(&st).await.0, 0);
+                    let (verified_status, verified) = call_with(&app, "PATCH", &format!("/api/board/{id}"),
+                        Some(json!({"status":"verified","gate":["Fixture implementation independently checked"],
+                            "gate_checked":["Fixture implementation independently checked"],
+                            "evidence":"crates/amux-server/tests/board_api.rs"})),
+                        &[("X-Amux-Session", lane)]).await;
+                    assert_eq!(verified_status, StatusCode::OK, "{verified}");
+                }
             }
         }
 
@@ -20676,12 +20687,13 @@ mod tests {
         assert!(root_detail["last_result"].as_str().unwrap_or_default().contains("Completed child plan"));
         assert_eq!(root_detail["messages"][0]["card_id"], json!(root));
 
-        for id in &ids {
+        for (idx, id) in ids.iter().enumerate() {
             let (_, child) = call(&app, "GET", &format!("/api/board/{id}"), None).await;
-            assert_eq!(child["status"], json!("done"));
+            assert_eq!(child["status"], json!(if idx == 0 { "verified" } else { "done" }));
             assert!(child["closed_at"].as_i64().is_some());
             assert!(child["evidence"].as_str().is_some_and(|v| v.contains("board_api.rs")));
-            assert!(child["last_result"].as_str().is_some_and(|v| v.contains("terminal state")));
+            let summary = child["last_result"].as_str().unwrap_or_default();
+            assert!(summary.contains(if idx == 0 { "Final outcome: verified" } else { "terminal state" }), "{child}");
             assert_eq!(child["messages"][0]["card_id"], json!(root));
         }
     }

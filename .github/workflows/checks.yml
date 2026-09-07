@@ -192,6 +192,18 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-send-time-stamp.sh
+      # AF-561, THE RATCHET. A scripts/test-*.sh that prints a verdict without
+      # `set -e` will report PASS after calling a helper that does not exist —
+      # bash writes "command not found" to stderr and the suite carries on, and
+      # nobody reads stderr when the last line says PASS. That was true of 41 of
+      # 43 harnesses this morning (AF-560/AF-562 fixed them). This step exists so
+      # harness 45 cannot quietly reintroduce it. It carries its own fixtures,
+      # including one with `command_not_found_handle` and no `set -e` — the inert
+      # guard that shipped on 2026-09-07 — which it must REJECT.
+      - name: every test harness fails a cell that never ran (AF-561)
+        run: |
+          set -uo pipefail
+          ./scripts/test-harness-guard.sh
       # AF-356. The contention wrapper measured ONE of the two ways a peer
       # reddens your suite. Its clean verdict ("NOT build contention") read as
       # "therefore your bug", while a peer's uncommitted source in the shared

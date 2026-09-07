@@ -220,4 +220,98 @@ test.describe('board card details', () => {
 
     await request.delete(`/api/board/${encodeURIComponent(card)}`, { headers: auth });
   });
+
+  test('terminal hydration clears a persisted stale status draft and keeps late provider text out of the banner', async ({ page, request }) => {
+    let statusRequests = 0;
+    let detailGets = 0;
+    page.on('request', r => {
+      if (r.url().includes('/status-request')) statusRequests += 1;
+    });
+
+    await page.goto('/');
+    const walkthrough = page.locator('#wt-overlay.open');
+    await walkthrough.waitFor({ state: 'visible', timeout: 2_000 }).catch(() => {});
+    if (await walkthrough.isVisible()) await page.locator('#wt-tooltip .wt-skip').click();
+    const token = await page.evaluate(() => (window as any)._AMUX_AUTH_TOKEN);
+    const auth = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+    const worker = 'persisted-terminal-draft-worker';
+    const created = await request.post('/api/board', {
+      headers: { ...auth, 'X-Amux-Worker': worker },
+      data: {
+        title: 'persisted stale terminal draft',
+        desc: 'The authoritative description must survive hydration.',
+        status: 'doing',
+        type: 'chore',
+        session: worker,
+      },
+    });
+    expect(created.ok()).toBeTruthy();
+    const card = (await created.json()).id as string;
+    const seeded = await request.post(`/api/board/${encodeURIComponent(card)}/status-update`, {
+      headers: { ...auth, 'X-Amux-Worker': worker },
+      data: { text: 'provider status before terminal close' },
+    });
+    expect(seeded.ok()).toBeTruthy();
+    const beforeClose = await request.get(`/api/board/${encodeURIComponent(card)}`, { headers: auth });
+    expect(beforeClose.ok()).toBeTruthy();
+    const staleBase = await beforeClose.json();
+
+    // Make the old client durable state explicit, then reload so the SPA
+    // boots with the fossil rather than merely holding it in a test variable.
+    await page.evaluate(({ card, worker, base }) => {
+      localStorage.setItem('amux_board_drafts', JSON.stringify({
+        [card]: {
+          title: base.title,
+          desc: base.desc,
+          worker,
+          status: 'doing',
+          due: base.due || '',
+          due_time: base.due_time || '',
+        },
+      }));
+    }, { card, worker, base: staleBase });
+    await page.reload();
+    await page.evaluate(() => (window as any).fetchBoard());
+
+    const finished = await request.patch(`/api/board/${encodeURIComponent(card)}`, {
+      headers: { ...auth, 'X-Amux-Worker': worker },
+      data: {
+        status: 'done',
+        evidence: 'tests: persisted stale draft regression; deployment: https://example.test/ate-84; live acceptance: passed',
+        gate_ack: true,
+      },
+    });
+    expect(finished.ok()).toBeTruthy();
+    const late = await request.post(`/api/board/${encodeURIComponent(card)}/status-update`, {
+      headers: { ...auth, 'X-Amux-Worker': worker },
+      data: { text: 'stale Codex provider output after terminal close' },
+    });
+    expect(late.ok()).toBeTruthy();
+    const authoritative = await request.get(`/api/board/${encodeURIComponent(card)}`, { headers: auth });
+    expect(authoritative.ok()).toBeTruthy();
+    const finalCard = await authoritative.json();
+    expect(finalCard.status).toBe('done');
+    expect(finalCard.last_result).toContain('Final outcome: done');
+    expect(finalCard.last_result).not.toContain('stale Codex provider output after terminal close');
+
+    await page.route(`**/api/board/${card}`, async route => {
+      detailGets += 1;
+      if (detailGets === 1) await new Promise(resolve => setTimeout(resolve, 750));
+      await route.continue();
+    });
+    await page.evaluate((id) => (window as any).openBoardDetail(id), card);
+    await expect(page.locator('#board-detail-overlay')).toHaveClass(/active/, { timeout: 30_000 });
+    const refresh = page.locator('#bd-status-banner button', { hasText: `Refresh from ${worker}` });
+    await expect(refresh).toHaveCount(1);
+    await refresh.click();
+
+    await expect(page.locator('#bd-status-banner')).toContainText('Final outcome: done', { timeout: 15_000 });
+    await expect(page.locator('#bd-status-banner')).not.toContainText('stale Codex provider output after terminal close');
+    await expect(page.locator('#bd-status-row button', { hasText: 'Done' })).toHaveAttribute('style', /background/);
+    await expect(page.locator('#toast')).toHaveText('Refreshed final terminal summary from the board');
+    expect(detailGets).toBeGreaterThanOrEqual(2);
+    expect(statusRequests, 'terminal Refresh must not ask the provider').toBe(0);
+
+    await request.delete(`/api/board/${encodeURIComponent(card)}`, { headers: auth });
+  });
 });

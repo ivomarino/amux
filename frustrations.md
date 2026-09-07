@@ -3656,3 +3656,49 @@ CARD: ATE-84
 SYMPTOM: ATE-75 was Done in the durable board, but a stale client reopened it with In Progress selected. Its old Refresh/status-request path then reached the worker, and the resulting status update replaced the generated Final outcome summary.
 COST: The UI made a terminal card look active and allowed provider prose to overwrite the durable completion record, so Refresh could not restore the evidence reviewers needed.
 FIX: Card-detail hydration now applies the authoritative GET status to the selected controls, and Refresh GETs before deciding whether a provider request is permitted. Terminal status-request calls are refused and logged without delivery; terminal status updates and stale last_result PATCHes preserve Final outcome while appending evidence. Emit terminal_status_request_preserved and terminal_status_update_preserved markers, with Rust provider-shape and desktop/mobile/iOS Playwright regressions.
+
+## Message jumps mixed zoomed screen coordinates with unzoomed scroll offsets
+AREA: browser
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux
+CARD: AMUX-4192
+SYMPTOM: Multi-worker live checks found 80% jumps hundreds or thousands of pixels from the selected message. At 100%, the fixed 12px landing put the first line beneath the terminal's floating controls. Search also matched serialized HTML, so entities and ANSI-split phrases could not be found, and a working worker's refresh could replace the selected search result.
+COST: The preceding live check at one normal zoom did not cover these cases; Ethan requested cross-worker verification again. The baseline reproduced unreadable landings on amux-frustrations and mixpeek-general.
+FIX: Convert rendered geometry to layout coordinates, reserve the actual floating-control inset, reveal nested horizontal table matches, and publish zoom/inset/scroll-error/visibility in navigation beacons. Search rendered text across inline spans as one result. Pin selected search/message nodes while newer output is buffered. Regression cases cover long/wrapped text, symbols, Unicode paths, ANSI spans, wide tables, start/end wrapping and real refreshes across desktop, 375px and WebKit.
+
+
+## Saved Codex composer hints became false message-navigation targets
+AREA: browser
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux
+CARD: AMUX-4192
+SYMPTOM: The six-worker sweep found four copies of Ask Codex to do anything in amux's saved output being treated as messages. The composer exclusion only applied at the very end of the entire log, so historical frames escaped it.
+COST: Geometrically correct jumps still landed on terminal input hints instead of submitted messages.
+FIX: Detect the adjacent model footer for each unclassified block, including historical frames; authoritative submitted-message history still wins. A browser test covers old composer frames followed by later output and the same literal text recorded as a real human message.
+
+
+## Dependency completion released code at Done and returned to the child task
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux
+CARD: AMUX-4193
+SYMPTOM: Code dependencies became runnable at Done before verification. The completion callback was linked to the producer child instead of the original requester task and lacked its next action. Claims and backlog promotion disagreed on missing and discarded dependencies.
+COST: Ethan requested explicit end-to-end proof that verified dependency completion actually wakes and resumes the original worker. Existing unit fixtures encoded the earlier, weaker completion boundary.
+FIX: Use the existing type-specific verification boundary for claims, promotion and durable callbacks. Derive the original return task from depends_on, retain graph edges, link the producer-origin message to the original task, include remaining blockers and next action, and record both task histories. Log dependency_waiting_for_verification, dependency_callback_linked and withheld or unmeasured delivery cases.
+
+## A bottom-clamped message jump was mistaken for resuming live output
+AREA: browser
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux
+CARD: AMUX-4192
+SYMPTOM: The deployed multi-worker sweep lost the selected message on amux-testing-e2e when a jump hit the bottom. The async scroll listener unlocked live updates even though refreshPeek itself preserved selected targets.
+COST: One live navigation failure survived synchronous refresh tests; a working worker replaced the selected message after a geometrically correct jump.
+FIX: The scroll listener now preserves the navigation lock for selected messages and search results at the finite scroll boundary. Regression tests wait for actual scroll events before refreshing and cover both trailing-output and end-of-output targets. Existing navigation beacons expose missing targets and scroll errors.

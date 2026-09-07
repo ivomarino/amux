@@ -51,6 +51,65 @@ if [ "$_ec_files" = "0" ] && [ "${_ec_parents:-0}" -lt 3 ]; then
   echo "" >&2
 fi
 
+# ── THE COMMIT CONTAINS FILES NOBODY STAGED (AF-565) ─────────────────────────
+#
+# The inverse of the zero-files check above, and strictly worse. That one costs a
+# re-run; this one puts a PEER'S work under YOUR message and leaves a
+# bisect-hostile subject on main.
+#
+# Measured 2026-09-07: `git commit -F - -- e2e/settings.spec.ts`, naming ONE file,
+# printed "fatal: cannot lock ref 'HEAD': is at 19dc0ecc but expected d2546616"
+# and then EXITED 0. The commit carried that message over a peer's five files and
+# 236 lines; the change actually named was not in it and was still unstaged. Two
+# contradictory signals in one run, and the exit status -- the thing every hook
+# keys on -- was the wrong one.
+#
+# `git diff` before committing cannot catch this: the divergence happens BETWEEN
+# the check and the commit, which is what makes it a race rather than the scoping
+# mistake AF-541 records. So the check has to be on the OUTCOME.
+#
+# pre-commit wrote the intended set to $AMUX_HOME/commit-intent while holding the
+# pathspec's own temporary index. Compare it with what landed.
+_ci_f="${AMUX_HOME:-$HOME/.amux}/commit-intent/$(git rev-parse --show-toplevel 2>/dev/null | tr '/' '_').txt"
+if [ -f "$_ci_f" ]; then
+  _ci_head=$(sed -n '1s/^head //p' "$_ci_f" 2>/dev/null)
+  _ci_parent=$(git rev-parse HEAD^ 2>/dev/null || echo none)
+  _ci_parents=$(git rev-list --parents -n 1 HEAD 2>/dev/null | wc -w | tr -d ' ')
+  # Only compare when this commit sits directly on the HEAD pre-commit saw. An
+  # amend or a rebase replay leaves a stale manifest, and comparing it would
+  # manufacture an alarm -- a false positive trains people to ignore the guard,
+  # which is how one stops being read.
+  if [ "$_ci_head" = "$_ci_parent" ] && [ "${_ci_parents:-0}" -lt 3 ]; then
+    # TEMP FILES, not `comm <(...) <(...)`: this hook is #!/bin/sh and process
+    # substitution is a bashism that happens to work where /bin/sh is bash in
+    # POSIX mode -- exactly the accident that ships and breaks on a real dash.
+    _ci_w=$(mktemp "${TMPDIR:-/tmp}/amux-ci-w-XXXXXX" 2>/dev/null) || _ci_w=""
+    _ci_g=$(mktemp "${TMPDIR:-/tmp}/amux-ci-g-XXXXXX" 2>/dev/null) || _ci_g=""
+    _ci_extra=""
+    if [ -n "$_ci_w" ] && [ -n "$_ci_g" ]; then
+      sed '1d' "$_ci_f" 2>/dev/null | sort -u > "$_ci_w"
+      git diff-tree --no-commit-id --name-only -r HEAD 2>/dev/null | sort -u > "$_ci_g"
+      _ci_extra=$(comm -13 "$_ci_w" "$_ci_g" 2>/dev/null)
+      rm -f "$_ci_w" "$_ci_g" 2>/dev/null || true
+    fi
+    _ci_n=$(printf '%s' "$_ci_extra" | grep -c . || true)
+    if [ "${_ci_n:-0}" -gt 0 ]; then
+      echo "" >&2
+      echo "amux: THIS COMMIT CONTAINS $_ci_n FILE(S) YOU DID NOT STAGE -- $(git rev-parse --short HEAD 2>/dev/null)" >&2
+      echo "      pre-commit saw a different set from what landed. On a shared checkout" >&2
+      echo "      that usually means a concurrent commit won a race and your message is" >&2
+      echo "      now sitting on somebody else tree (AF-565). git can print a FATAL ref" >&2
+      echo "      lock error and still exit 0, so nothing upstream of here noticed." >&2
+      printf '%s\n' "$_ci_extra" | sed 's/^/        + /' >&2
+      echo "      Check whose they are before you push:  git show --stat HEAD" >&2
+      echo "      If they are a peer's, do NOT reset -- the commit may be the only copy" >&2
+      echo "      of their work. Record it in a follow-up and tell them." >&2
+      echo "" >&2
+    fi
+  fi
+  rm -f "$_ci_f" 2>/dev/null || true
+fi
+
 # ── A COMMITTED HOOK IS NOT AN INSTALLED HOOK (AF-375) ───────────────────────
 #
 # The hooks in scripts/git-hooks/ ship by COPY: install-hooks.sh cp's them into

@@ -1426,36 +1426,21 @@ fn status_applies(conn: &Connection, status_id: &str, session: &str, tags: &[Str
     opted
 }
 
-/// py:14189 `_deps_blocking` — card ids in `depends_on` that are still OPEN.
-/// Deleted or absent ids do NOT block: an id that resolves to nothing cannot be
-/// worked, and treating it as a blocker parks the holder forever.
-/// PUBLIC so the ready-frontier query reuses THIS predicate rather than
-/// re-deriving it (AMUX-3948). AMUX-3814 is the specimen for why: a parallel
-/// re-derivation of "which reasons are terminal" swept in `rate-limited` and
-/// reddened an invariant for 8 days. One list, two consumers.
+/// The same verified-completion predicate governs explicit claims, ready
+/// queries and automatic pickup. Missing/discarded dependencies stay blocked
+/// until the owner explicitly removes or replaces the required relationship.
 pub(crate) fn deps_blocking(conn: &Connection, row: &bs::IssueRow) -> Vec<String> {
-    row.depends_on
-        .iter()
-        .filter(|d| {
-            let st: Option<String> = conn
-                .query_row(
-                    "SELECT status FROM issues WHERE id=?1 AND deleted IS NULL",
-                    rusqlite::params![d],
-                    |r| r.get(0),
-                )
-                .optional()
-                .ok()
-                .flatten();
-            match st.as_deref().map(bs::parse_status) {
-                Some(Some(TaskStatus::Done))
-                | Some(Some(TaskStatus::Verified))
-                | Some(Some(TaskStatus::Discarded)) => false,
-                Some(_) => true,
-                None => false,
+    row.depends_on.iter()
+        .filter(|id| match bs::dependency_resolved(conn, id) {
+            Ok(resolved) => !resolved,
+            Err(error) => {
+                tracing::warn!(marker = "dependency_resolution_unmeasured", task_id = %row.id,
+                    dependency = %id, %error, measured = false, n_considered = 1,
+                    "dependency lookup failed; keeping the original task blocked");
+                true
             }
         })
-        .cloned()
-        .collect()
+        .cloned().collect()
 }
 
 /// For a set of blocking dep ids, return the subset that are `backlog` cards
@@ -1760,63 +1745,11 @@ fn is_dormant_type(t: &str) -> bool {
     matches!(t, "tripwire" | "watch" | "epic")
 }
 
-/// Is a single dependency's stored status TERMINAL for the promotion pass?
-/// Terminal here means COMPLETED: `done` or `verified` only. `discarded` is
-/// deliberately excluded — a discarded dependency is an abandonment a human
-/// should notice, not an all-clear that should silently re-activate the work
-/// that depended on it. This is narrower than [`deps_blocking`] (which lets a
-/// `discarded` dep un-block, because you cannot work an id that resolves to
-/// nothing) on purpose: not-blocking is not the same as cleared.
-fn dep_status_terminal(status: &str) -> bool {
-    matches!(
-        bs::parse_status(status),
-        Some(TaskStatus::Done) | Some(TaskStatus::Verified)
-    )
-}
-
-/// Pure: does this dependency set license a promotion? True iff there is at
-/// least one dependency AND every one is terminal. An EMPTY slice returns
-/// `false` — a card with no `depends_on` is not dependency-parked and this pass
-/// must never touch it (a triggers-only park stays parked). Split out as a pure
-/// function so the promotion rule is tested without a live DB.
-fn deps_all_terminal(dep_statuses: &[&str]) -> bool {
-    !dep_statuses.is_empty() && dep_statuses.iter().all(|s| dep_status_terminal(s))
-}
-
-/// If `row` is a dependency-parked card whose EVERY dependency resolves to a
-/// live card in a terminal status, return the dependency ids (so the promotion
-/// log can name what cleared); otherwise `None`. Conservative by construction:
-/// a `depends_on` id that resolves to no live row (missing/deleted) is treated
-/// as non-terminal, so a card is promoted ONLY when all its deps are provably
-/// terminal. Mirrors [`deps_blocking`]'s per-id status lookup.
+/// A dependency-backed backlog task becomes runnable only when every named
+/// dependency has proven completion. An empty set is not a dependency wakeup.
 fn promotable_deps(conn: &Connection, row: &bs::IssueRow) -> Option<Vec<String>> {
-    if row.depends_on.is_empty() {
-        return None;
-    }
-    let statuses: Vec<Option<String>> = row
-        .depends_on
-        .iter()
-        .map(|d| {
-            conn.query_row(
-                "SELECT status FROM issues WHERE id=?1 AND deleted IS NULL",
-                rusqlite::params![d],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()
-            .ok()
-            .flatten()
-        })
-        .collect();
-    // A dependency that did not resolve to a live row is not terminal.
-    if statuses.iter().any(Option::is_none) {
-        return None;
-    }
-    let refs: Vec<&str> = statuses.iter().map(|s| s.as_deref().unwrap_or("")).collect();
-    if deps_all_terminal(&refs) {
-        Some(row.depends_on.clone())
-    } else {
-        None
-    }
+    (!row.depends_on.is_empty() && deps_blocking(conn, row).is_empty())
+        .then(|| row.depends_on.clone())
 }
 
 /// Is this card parked on a live `source_ref` trigger? A non-empty `source_ref`
@@ -7713,32 +7646,20 @@ mod tests {
         );
     }
 
-    /// The promotion RULE, pure. Terminal for drive-to-verified is COMPLETION —
-    /// `done`/`verified` only — and there must be at least one dependency, so a
-    /// card with no `depends_on` (empty slice) is never "all terminal".
+    /// Resolution follows the existing type-specific verification boundary.
     #[test]
-    fn deps_all_terminal_requires_at_least_one_and_all_completed() {
-        assert!(deps_all_terminal(&["done", "verified"]), "all completed → promote");
-        assert!(deps_all_terminal(&["verified"]), "a single verified dep is terminal");
-        assert!(
-            !deps_all_terminal(&[]),
-            "no deps is not 'all terminal' — an unparked card must never be touched"
-        );
-        assert!(!deps_all_terminal(&["done", "doing"]), "one open dep blocks promotion");
-        assert!(!deps_all_terminal(&["backlog"]), "backlog is not completion");
-        assert!(
-            !deps_all_terminal(&["discarded"]),
-            "discarded is an abandonment, not a completion — must NOT re-activate"
-        );
+    fn dependencies_require_verified_completion_for_runtime_changes() {
+        assert!(bs::dependency_is_resolved("done", "chore"));
+        assert!(bs::dependency_is_resolved("done", "doc"));
+        assert!(bs::dependency_is_resolved("verified", "code"));
+        for item_type in ["code", "ops", "blocker", "tripwire"] {
+            assert!(!bs::dependency_is_resolved("done", item_type), "{item_type} still needs verification");
+        }
+        for status in ["doing", "review", "discarded", "quarantined", "backlog"] {
+            assert!(!bs::dependency_is_resolved(status, "chore"), "{status} is not successful resolution");
+        }
     }
 
-    /// Drive-to-verified (the "board doesn't drive to completion" case). A card
-    /// parked in `backlog` on a `depends_on` re-activates to `todo` ONLY when
-    /// every dependency has completed, is NOT promoted while any dep is still
-    /// open or missing, is NOT promoted when it has no deps (a triggers-only
-    /// park), and is NEVER promoted for a container/dormant type or a human's
-    /// card. Each `assert!` has a control on the same board so none passes
-    /// vacuously (the one card that DOES promote proves the selector fires).
     #[test]
     fn backlog_promotes_only_when_every_dependency_is_terminal() {
         let conn = board_db();
@@ -7752,6 +7673,9 @@ mod tests {
             .expect("dep");
         };
         dep("A-done", "done");
+        conn.execute("UPDATE issues SET type='chore' WHERE id='A-done'", []).unwrap();
+        dep("A-code-done", "done");
+        dep("A-discarded", "discarded");
         dep("A-verified", "verified");
         dep("A-open", "doing");
 
@@ -7765,6 +7689,8 @@ mod tests {
             .expect("parked");
         };
         parked("P-all-terminal", "code", r#"["A-done","A-verified"]"#); // promote
+        parked("P-unverified", "code", r#"["A-code-done"]"#);
+        parked("P-discarded", "code", r#"["A-discarded"]"#);
         parked("P-one-open", "code", r#"["A-done","A-open"]"#); // NOT: one dep still open
         parked("P-missing", "code", r#"["A-done","GONE"]"#); // NOT: a dep resolves to nothing
         parked("W-watch", "watch", r#"["A-done"]"#); // NOT: dormant type
@@ -7788,6 +7714,8 @@ mod tests {
         let ids: std::collections::HashSet<&str> = got.iter().map(|(i, _)| i.as_str()).collect();
 
         assert!(ids.contains("P-all-terminal"), "all-terminal deps must promote: {ids:?}");
+        assert!(!ids.contains("P-unverified"), "done code has not been verified");
+        assert!(!ids.contains("P-discarded"), "discarded is not successful completion");
         assert!(!ids.contains("P-one-open"), "one open dep must NOT promote");
         assert!(!ids.contains("P-missing"), "a missing dep must NOT promote (conservative)");
         assert!(!ids.contains("W-watch"), "a watch is dormant — never promote");
@@ -7812,7 +7740,7 @@ mod tests {
         let conn = board_db();
         conn.execute(
             "INSERT INTO issues (id,title,status,session,owner_type,type,updated,created) \
-             VALUES ('A-done','A-done','done','me','agent','code',100,100)",
+             VALUES ('A-done','A-done','verified','me','agent','code',100,100)",
             [],
         )
         .unwrap();

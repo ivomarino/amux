@@ -314,11 +314,22 @@ test('settings_default_model', async ({ page, request }, testInfo) => {
   const sel = page.locator('#settings-default-model');
   await expect(sel).toHaveValue('sonnet'); // fallback default
 
+  // 322f76c8 turned this control from a <select> into an <input list=...> plus a
+  // <datalist>, so a newer exact model ID can be typed rather than only chosen —
+  // and `selectOption` only works on a <select>. The product change is right; this
+  // test was left behind and reddened main's e2e for six hours (AF-564).
+  //
+  // fill() ALONE IS NOT ENOUGH, and this is measured rather than read: against a
+  // real <input list> with an onchange handler, fill() dispatched `change` ZERO
+  // times and fill()+blur() dispatched it once. The handler here is
+  // onchange="saveDefaultModel(this.value)", so blur is the action that triggers
+  // the PATCH and must be the one inside Promise.all.
+  await sel.fill('haiku');
   const [res] = await Promise.all([
     page.waitForResponse(
       (r) => r.url().includes('/api/settings/default-model') && r.request().method() === 'PATCH',
     ),
-    sel.selectOption('haiku'),
+    sel.blur(),
   ]);
   expect(res.status()).toBe(200);
   expect(await res.json()).toMatchObject({ ok: true, model: 'haiku' });
@@ -332,7 +343,7 @@ test('settings_default_model', async ({ page, request }, testInfo) => {
   await settle(page);
   const get2 = await request.get('/api/settings/default-model', { headers: authHeaders(token) });
   expect((await get2.json()).model).toBe('haiku');
-  // …but the select repopulates from window._AMUX_DEFAULT_MODEL, which
+  // …but the input repopulates from window._AMUX_DEFAULT_MODEL, which
   // static_files.rs currently injects as the hardcoded literal "sonnet"
   // (inject_bootstrap, jstr("sonnet")) instead of reading defaults.env the way
   // the Python server does. Recorded as an annotation, not an assertion, so
@@ -342,7 +353,7 @@ test('settings_default_model', async ({ page, request }, testInfo) => {
   testInfo.annotations.push({
     type: shown === 'haiku' ? 'note' : 'bootstrap-gap',
     description:
-      `after reload the API serves model=haiku but the select shows "${shown}" — ` +
+      `after reload the API serves model=haiku but the input shows "${shown}" — ` +
       'window._AMUX_DEFAULT_MODEL is hardcoded to "sonnet" in ' +
       'crates/amux-server/src/api/static_files.rs inject_bootstrap (Python injects the real default)',
   });
