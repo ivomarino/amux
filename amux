@@ -4122,6 +4122,24 @@ for raw in paths:
         raise SystemExit(2)
     try:
         content = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        # GMA-123: this died on the FIRST byte of any PNG (0x89) with a raw
+        # traceback, and the bulk-read guard was actively routing images here —
+        # the guard's remedy could not open the file type the guard blocks. For
+        # a lane that ships images, the blocked artifact IS the deliverable.
+        #
+        # A binary branch is not the fix. The helper is a text summarizer; it
+        # cannot look at a picture. The primary model can, so the honest answer
+        # names the path AND the thing that actually works, which the filer found
+        # by re-reading the guard rather than from anything this command said.
+        sys.stderr.write(
+            f"amux delegate read: {raw} is not UTF-8 text, so the helper cannot read it.\n"
+            "If it is an image, do NOT delegate — read it with the primary model, which\n"
+            "can see images, using an explicit small limit so the bulk-read guard allows it:\n"
+            f"    Read({raw}, limit=350)\n"
+            "That alone satisfies the guard; downscaling is not required.\n"
+        )
+        raise SystemExit(2)
     except OSError as exc:
         sys.stderr.write(f"amux delegate read: cannot read {raw}: {exc}\n")
         raise SystemExit(2)

@@ -13719,10 +13719,15 @@ pub(crate) fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static
          (AMUX-4015). For a ONE-OFF instead, this refusal mints a grant the owner \
          approves from the dashboard. A human send is never \
          restricted — this applies only to sends carrying a worker origin. For a \
-         cross-group HANDOFF, use the board on a card owned by {target}: \
-         `amux board progress <CARD> --stdin` notifies the owner at their next turn, \
-         and `amux board ask <CARD>` requests a status update from them (AVE-36: a \
-         bare desc PATCH records without notifying).",
+         cross-group HANDOFF with a NEW finding, create the card in YOUR OWN lane and \
+         hand it over: `amux board add` then `amux board assign <ID> {target}`. That is \
+         the path that works when no card exists yet, and it is the one this refusal used \
+         to omit (GMA-123) — a lane with a new cross-group finding read the two verbs \
+         below, found both need a card the target ALREADY owns, and concluded there was \
+         no path at all. On an EXISTING card owned by {target}: `amux board progress \
+         <CARD> --stdin` notifies the owner at their next turn, and `amux board ask \
+         <CARD>` requests a status update from them (AVE-36: a bare desc PATCH records \
+         without notifying).",
         fmt(&og), fmt(&tg)
     ))
 }
@@ -18432,6 +18437,35 @@ mod tests {
         std::fs::write(sessions.join("raw.env"), "CC_TAGS=\"b\"\nCC_ISOLATED=1\n").unwrap();
         let err = cross_group_send_ok("roamer", "raw").expect_err("isolation must hold");
         assert!(err.contains("isolated"), "and must say why: {err}");
+    }
+
+    /// GMA-123: the cross-group refusal named two verbs that both need a card
+    /// the TARGET already owns, which is exactly what a lane with a NEW finding
+    /// does not have. gtm-media-assets read it, tried to create the card owned by
+    /// the target, got the identical refusal, and concluded there was no path.
+    /// There is one — `board add` in your own lane, then `board assign` — and
+    /// they found it in the auto-pickup dispatcher's instructions rather than
+    /// here. A remedy that only works in the case you are not in is worse than no
+    /// remedy, because it reads as an answer.
+    #[test]
+    fn the_cross_group_refusal_names_the_verb_that_works_without_an_existing_card() {
+        let msg = cross_group_send_ok("gtm-media-assets", "amux-frustrations")
+            .err()
+            .unwrap_or_else(|| {
+                // If the fleet default is open on this box the send is allowed and
+                // there is no refusal to inspect. Say so rather than pass silently.
+                panic!("expected a refusal to inspect; the gate is open between these lanes")
+            });
+        assert!(
+            msg.contains("board assign"),
+            "the refusal must name the verb that works when NO card exists yet: {msg}"
+        );
+        assert!(
+            msg.contains("board add"),
+            "assign alone is not a path — the card has to be created first: {msg}"
+        );
+        // The existing-card advice must survive; it is correct for its own case.
+        assert!(msg.contains("board progress"), "{msg}");
     }
 
     /// AF-534 / AF-352, the same shape twice in five days. Isolation is enforced

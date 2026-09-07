@@ -185,6 +185,28 @@ def shell_reader_paths(command: str, cwd: str, limit: int) -> list[tuple[str, in
     return blocked
 
 
+# GMA-123. The refusal recommended `amux delegate read`, which is a TEXT
+# summarizer and died on the first byte of any PNG. So the guard was routing the
+# one file type its remedy cannot open — and for a lane that ships images, the
+# blocked artifact IS the deliverable.
+#
+# Extension-based, deliberately, not content sniffing: this runs on every Read,
+# the path is all it has cheaply, and a wrong guess costs only a slightly worse
+# suggestion. It is not a security boundary.
+BINARY_SUFFIXES = frozenset(
+    {
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif", ".ico",
+        ".pdf", ".zip", ".gz", ".tar", ".bz2", ".xz", ".7z",
+        ".mp4", ".mov", ".webm", ".mp3", ".wav", ".ogg",
+        ".woff", ".woff2", ".ttf", ".otf", ".so", ".dylib", ".wasm",
+    }
+)
+
+
+def looks_binary(label: str) -> bool:
+    return Path(label).suffix.lower() in BINARY_SUFFIXES
+
+
 def refusal(paths: list[tuple[str, int]], limit: int) -> int:
     labels = [raw for raw, _seen in paths]
     shown = ", ".join(shlex.quote(path) for path in labels)
@@ -196,6 +218,24 @@ def refusal(paths: list[tuple[str, int]], limit: int) -> int:
         threshold_lines=limit,
         lines_seen_min=minimum,
     )
+    # Name the remedy that WORKS for what was actually blocked. Recommending the
+    # text helper for an image is worse than no advice: it sends the caller down
+    # a path that ends in a decode error, which is how GMA-123 was found.
+    binary = [lbl for lbl in labels if looks_binary(lbl)]
+    if binary:
+        audit("delegation_required_binary", tool="large_read", paths=binary)
+        sys.stderr.write(
+            f"BLOCKED by amux bulk-read router: {shown} would send more than {limit} "
+            "untargeted lines to the primary model.\n"
+            f"This looks BINARY ({', '.join(shlex.quote(b) for b in binary)}), so do NOT "
+            "delegate — `amux delegate read` is a text summarizer and cannot open it.\n"
+            "The primary model can see images directly. Read it with an explicit small "
+            "limit, which is all this guard asks for:\n"
+            f"  Read({shlex.quote(labels[0])}, limit={limit})\n"
+            "Downscaling is not required.\n"
+            "Audit: ~/.amux/logs/read-delegation.jsonl verdict=delegation_required_binary\n"
+        )
+        return 2
     sys.stderr.write(
         f"BLOCKED by amux bulk-read router: {shown} would send more than {limit} "
         "untargeted lines to the primary model.\n"
