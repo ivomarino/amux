@@ -360,11 +360,13 @@ test('settings_default_model', async ({ page, request }, testInfo) => {
 
   // Restore through the UI. (Writes an explicit --model sonnet, observably
   // identical to the original fallback.)
+  const restore = page.locator('#settings-default-model');
+  await restore.fill('sonnet');
   const [res2] = await Promise.all([
     page.waitForResponse(
       (r) => r.url().includes('/api/settings/default-model') && r.request().method() === 'PATCH',
     ),
-    page.locator('#settings-default-model').selectOption('sonnet'),
+    restore.blur(),
   ]);
   expect(res2.status()).toBe(200);
   const get3 = await request.get('/api/settings/default-model', { headers: authHeaders(token) });
