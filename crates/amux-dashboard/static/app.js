@@ -3999,6 +3999,16 @@ function _taskIdChip(s) {
     + 'style="cursor:pointer;font-size:0.7rem;font-weight:600;color:var(--accent);border:1px solid var(--accent);border-radius:6px;padding:0 6px;margin-left:4px;white-space:nowrap;">' + esc(id) + '</span>';
 }
 async function _askCardStatus(id, sess) {
+  // The list item can be stale exactly when this button is most useful: an old
+  // client may still call the terminal Refresh button after a worker has
+  // closed the card. Read the detail record FIRST, then decide whether a
+  // provider request is allowed. Deciding from `boardItems` before the GET
+  // reopens the ATE-75 race and lets a stale client overwrite a final outcome.
+  const refreshed = await _bdHydrate(id);
+  if (!refreshed) {
+    showToast('Could not refresh card status from the board');
+    return;
+  }
   const current = boardItems.find(i => i.id === id);
   const terminal = /^(done|verified|discarded)$/i.test(String(
     (current && current.status) || (id === boardDetailId && boardDetailStatus) || ''));
@@ -4007,7 +4017,6 @@ async function _askCardStatus(id, sess) {
     // from the durable detail record; asking a worker here would reintroduce
     // provider-text parsing and could overwrite the final outcome with stale
     // model prose.
-    const refreshed = await _bdHydrate(id);
     showToast(refreshed
       ? 'Refreshed final terminal summary from the board'
       : 'Could not refresh final terminal summary');
@@ -9035,7 +9044,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.829';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.830';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -27165,6 +27174,51 @@ function _boardDraftsPersist() {
   try { localStorage.setItem('amux_board_drafts', JSON.stringify(_boardDrafts)); } catch (e) {}
 }
 
+// A status-only draft is not an edit to the card's content. It can be left
+// behind by a long-lived tab after another client closes the card, and must
+// not make an authoritative terminal GET reopen the card as `doing`. Content
+// drafts remain local: only fields that the draft actually carries participate
+// in this comparison so old/partial drafts are not treated as edits merely
+// because the server now has fields they never knew about.
+function _bdDraftHasActiveEdits(draft, full) {
+  if (!draft || !full) return false;
+  const own = Object.prototype.hasOwnProperty;
+  const same = (a, b) => JSON.stringify(a == null ? '' : a) === JSON.stringify(b == null ? '' : b);
+  const fields = [
+    ['title', 'title'], ['desc', 'desc'], ['session', 'session'],
+    ['worker', 'session'], ['due', 'due'], ['due_time', 'due_time'],
+    ['tags', 'tags'], ['gate', 'gate'],
+  ];
+  const compared = new Set();
+  return fields.some(([draftKey, serverKey]) => {
+    if (compared.has(serverKey) || !own.call(draft, draftKey)) return false;
+    compared.add(serverKey);
+    return !same(draft[draftKey], full[serverKey]);
+  });
+}
+function _bdDraftField(draft, key, fallback) {
+  return draft && Object.prototype.hasOwnProperty.call(draft, key) ? draft[key] : fallback;
+}
+function _bdDraftSession(draft, fallback) {
+  if (!draft) return fallback;
+  if (Object.prototype.hasOwnProperty.call(draft, 'session')) return draft.session;
+  if (Object.prototype.hasOwnProperty.call(draft, 'worker')) return draft.worker;
+  return fallback;
+}
+
+// This is deliberately client-edit state, not a guess based on draft age or
+// provider prose. Programmatic hydration does not dispatch these events;
+// actual typing/selection does, so a Refresh can preserve an edit in progress.
+let _bdActiveDirty = false;
+document.addEventListener('input', e => {
+  if (!boardDetailId || !e.target || !/^bd-(title|desc|session|due|due-time|gate)$/.test(e.target.id || '')) return;
+  _bdActiveDirty = true;
+}, true);
+document.addEventListener('change', e => {
+  if (!boardDetailId || !e.target || !/^bd-(title|desc|session|due|due-time|gate)$/.test(e.target.id || '')) return;
+  _bdActiveDirty = true;
+}, true);
+
 // Set false on every open, true once GET /api/board/<id> has filled desc/log.
 // The SAVE path refuses to write a desc while this is false and the card is
 // known to have one — see the guard in the save handler (AMUX-2840).
@@ -27387,10 +27441,32 @@ async function _bdHydrate(id) {
     const cached = idx >= 0 ? { ...boardItems[idx] } : {};
     if (idx >= 0) boardItems[idx] = Object.assign({}, boardItems[idx], full);
     const merged = idx >= 0 ? boardItems[idx] : full;
+    let draft = _boardDrafts[id];
+    const terminal = /^(done|verified|discarded)$/i.test(String(full.status || ''));
+    const keepLocalDraft = Boolean(_bdActiveDirty || _bdDraftHasActiveEdits(draft, full));
+    if (terminal && draft && !keepLocalDraft) {
+      // The persisted draft only differed by status (or was empty/partial),
+      // so it is stale state from the old client rather than an active edit.
+      // Remove it before painting controls; otherwise every Refresh would
+      // restore the fossil immediately after the GET corrected the cache.
+      delete _boardDrafts[id];
+      _boardDraftsPersist();
+      draft = null;
+    }
+    const preserveLocalStatus = Boolean(_bdActiveDirty || (draft && _bdDraftHasActiveEdits(draft, full)));
+    // The selected status is a rendered copy of the server row, not a second
+    // source of truth. Keep an intentional local content edit, but whenever
+    // the user has not edited this card, apply the authoritative GET before
+    // painting the controls. This also removes the timing window in
+    // openBoardDetail, where hydration used to start before the status was
+    // initialized.
+    if (!preserveLocalStatus && boardDetailId === id) {
+      boardDetailStatus = full.status || 'todo';
+      _renderDetailStatusBtns();
+    }
     _bdRenderHistory(merged);
     if (typeof _bdRenderStatusBanner === 'function') _bdRenderStatusBanner(merged);
     _bdRenderMeta(merged);
-    if (_boardDrafts[id]) { _bdHydrated = true; return true; }  // user's draft wins
     const title = document.getElementById('bd-title');
     if (title && title.value === (cached.title || '')) {
       title.value = full.title || '';
@@ -27409,10 +27485,6 @@ async function _bdHydrate(id) {
       if (previewTab && previewTab.classList.contains('active') && preview) {
         preview.innerHTML = d.value.trim() ? renderMarkdown(d.value) : '';
       }
-    }
-    if (boardDetailStatus === (cached.status || 'todo')) {
-      boardDetailStatus = full.status || 'todo';
-      _renderDetailStatusBtns();
     }
     const sess = document.getElementById('bd-session');
     if (sess && sess.value === (cached.session || '')) _populateSessionSelect('bd-session', full.session || '');
@@ -27453,15 +27525,16 @@ async function openBoardDetail(id) {
   // Render instantly from cache, then correct it from the server. Blocking the
   // modal on a fetch would make every card open feel slow for a field most
   // opens never edit.
+  const draft = _boardDrafts[id];
+  _bdActiveDirty = false;
+  boardDetailStatus = draft ? draft.status : (item.status || 'todo');
   _bdHydrated = (item.desc !== undefined);
   _bdHydrate(id);
-  const draft = _boardDrafts[id];
-  boardDetailStatus = draft ? draft.status : (item.status || 'todo');
   const titleEl = document.getElementById('bd-title');
-  titleEl.value = draft ? draft.title : item.title;
+  titleEl.value = _bdDraftField(draft, 'title', item.title);
   titleEl.style.height = 'auto';
   titleEl.style.height = titleEl.scrollHeight + 'px';
-  document.getElementById('bd-desc').value = draft ? draft.desc : (item.desc || '');
+  document.getElementById('bd-desc').value = _bdDraftField(draft, 'desc', item.desc || '');
   // History is now a TAB (below); the inline strip is retired.
   const logEl = document.getElementById('bd-log');
   if (logEl) { logEl.style.display = 'none'; }
@@ -27473,12 +27546,12 @@ async function openBoardDetail(id) {
   _renderDetailStatusBtns();
   const keyEl = document.getElementById('bd-key');
   if (keyEl) keyEl.textContent = item.id || '';
-  _populateSessionSelect('bd-session', draft ? draft.session : (item.session || ''));
-  _bdConfigureGo({ ...item, session: draft ? draft.session : item.session });
+  _populateSessionSelect('bd-session', _bdDraftSession(draft, item.session || ''));
+  _bdConfigureGo({ ...item, session: _bdDraftSession(draft, item.session) });
   const dueEl = document.getElementById('bd-due');
-  if (dueEl) { dueEl.value = draft ? (draft.due || '') : (item.due || ''); try { _dpSyncLabel(dueEl); } catch (e) {} }
+  if (dueEl) { dueEl.value = _bdDraftField(draft, 'due', item.due || '') || ''; try { _dpSyncLabel(dueEl); } catch (e) {} }
   const dueTimeEl = document.getElementById('bd-due-time');
-  if (dueTimeEl) dueTimeEl.value = draft ? (draft.due_time || '') : (item.due_time || '');
+  if (dueTimeEl) dueTimeEl.value = _bdDraftField(draft, 'due_time', item.due_time || '') || '';
   const gateEl = document.getElementById('bd-gate');
   if (gateEl) gateEl.value = (Array.isArray(item.gate) ? item.gate : []).join('\n');
   boardDetailTab('preview');
@@ -27556,8 +27629,20 @@ function _bdRenderHistory(item) {
 function _bdRenderStatusBanner(item) {
   const el = document.getElementById('bd-status-banner');
   if (!el) return;
+  const terminal = /^(done|verified|discarded)$/i.test(String(item.status || ''));
   const evs = _bdParseHistory(item.log).filter(e => e.kind === 'status');
   const sess = item.session || '';
+  if (terminal) {
+    // Terminal cards have one authoritative displayed status: the durable
+    // final outcome. Their audit log may legitimately receive late provider
+    // evidence, but that evidence is not a replacement for this summary.
+    const summary = String(item.last_result || 'No final outcome recorded.');
+    el.style.display = '';
+    el.innerHTML = '<div class="bd-sb-label">\uD83D\uDCCD Final outcome</div>'
+      + '<div class="bd-sb-text">' + _linkifyUrls(_linkifyCardIds(esc(summary))) + '</div>'
+      + (sess ? '<button class="btn" style="margin-top:8px;font-size:0.74rem;min-height:36px;" onclick="_askCardStatus(\'' + escJs(item.id) + '\',\'' + escJs(sess) + '\')">\uD83D\uDD04 Refresh from ' + esc(sess) + '</button>' : '');
+    return;
+  }
   if (evs.length) {
     const last = evs[evs.length - 1];
     el.style.display = '';
@@ -27629,6 +27714,7 @@ function _renderDetailStatusBtns() {
 }
 
 function boardDetailSetStatus(st) {
+  if (boardDetailId && boardDetailStatus !== st) _bdActiveDirty = true;
   boardDetailStatus = st;
   _renderDetailStatusBtns();
 }
@@ -27659,6 +27745,7 @@ function closeBoardDetail() {
   }
   document.getElementById('board-detail-overlay').classList.remove('active');
   boardDetailId = null;
+  _bdActiveDirty = false;
   // Refresh peek issues panel if open
   if (_peekTab === 'issues') renderPeekIssues();
 }

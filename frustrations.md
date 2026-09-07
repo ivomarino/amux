@@ -3590,6 +3590,72 @@ SYMPTOM: ATE-75 reached Done with a 12:05 validation note still shown as Latest 
 COST: Reviewers could not tell whether the completed work had actually deployed or passed live acceptance, and the visible worker-action summary omitted the final evidence.
 FIX: The save_patched durable write choke point now atomically records a provider-independent final summary in last_result and a STATUS (board) history line, including outcome, recorded actions, tests/deployment/live evidence, and linked assets. Terminal Refresh rehydrates the authoritative board detail instead of requesting provider text. Legacy terminal rows are repaired on their next durable board write, and terminal_summary_recorded is logged for sweeps.
 
+## Local multiplayer passed localhost while its Tailscale invite links were unusable
+AREA: tests
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: Codex local Tailscale multiplayer
+CARD: ATE-79
+SYMPTOM: The checked-in local multiplayer Playwright test passed in three browser
+ projects, but it ran only on localhost. A real browser negotiated HTTP/2 on the
+ Tailscale TLS listener, where authority and scheme live on the request URI rather
+ than the HTTP/1.1 Host header, and Team generated an http://localhost invite link
+ that no second tailnet node could open.
+COST: The original green E2E result gave the wrong release verdict and about 45
+ minutes went to repeating the flow at the real Tailscale origin before the protocol
+ difference became visible.
+FIX: ATE-79 reads authority and scheme from either HTTP version, pins the HTTP/2
+ request shape in the route test, and logs `origin_fallback` when neither source is
+ present.
+
+## Local multiplayer called a member revoked before testing a reload
+AREA: tests
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: Codex local Tailscale multiplayer
+CARD: ATE-79
+SYMPTOM: The revocation E2E asserted that the already-open member page received 401
+ after deletion and stopped. The HttpOnly cookie remained in the browser; reloading
+ made its DB lookup fail, classified the request as an ordinary public shell, and
+ injected the owner bearer into JavaScript. The member was therefore promoted to
+ owner by the first recovery action a user would try.
+COST: A revocable-invite feature carried a privilege-escalation path despite a green
+ browser test, and the missing lifecycle edge added about an hour of independent
+ cookie, reload, mutation, and request-log checks.
+FIX: ATE-79 distinguishes absent, verified, and revoked member cookies before owner
+ bootstrap, adds the reload assertion to all three Playwright projects, and emits
+ `revoked_member_bootstrap_withheld` when the blocked transition is attempted.
+
+## The PWA cache discarded a valid remote-owner bootstrap credential
+AREA: auth
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: Codex local Tailscale multiplayer
+CARD: ATE-79
+SYMPTOM: A remote owner opened the dashboard with the correct `?_token`, but the
+ service worker canonicalized every root navigation to cached `/` before the server
+ could see the query. The UI loaded, reported Polling, and every Team mutation failed
+ unauthorized, while direct HTTP with the same credential succeeded.
+COST: Two fresh browser origins and two server rebuilds were needed to separate a
+ server-auth failure from a cached-shell failure; without the browser check the new
+ secure remote-owner boundary would have shipped with no usable recovery path.
+FIX: ATE-79 exchanges the one-time URL bearer for a derived HttpOnly owner-session
+cookie, removes it from the address bar, bypasses the canonical shell cache for the
+exchange request, and pins the app/service-worker version seam.
+
+## A stale card detail routed a terminal Refresh to the provider
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux-testing-e2e
+CARD: ATE-84
+SYMPTOM: ATE-75 was Done in the durable board, but a stale client reopened it with In Progress selected. Its old Refresh/status-request path then reached the worker, and the resulting status update replaced the generated Final outcome summary.
+COST: The UI made a terminal card look active and allowed provider prose to overwrite the durable completion record, so Refresh could not restore the evidence reviewers needed.
+FIX: Card-detail hydration now applies the authoritative GET status to the selected controls, and Refresh GETs before deciding whether a provider request is permitted. Terminal status-request calls are refused and logged without delivery; terminal status updates and stale last_result PATCHes preserve Final outcome while appending evidence. Emit terminal_status_request_preserved and terminal_status_update_preserved markers, with Rust provider-shape and desktop/mobile/iOS Playwright regressions.
 
 ## Message jumps mixed zoomed screen coordinates with unzoomed scroll offsets
 AREA: browser
@@ -3625,7 +3691,6 @@ CARD: AMUX-4193
 SYMPTOM: Code dependencies became runnable at Done before verification. The completion callback was linked to the producer child instead of the original requester task and lacked its next action. Claims and backlog promotion disagreed on missing and discarded dependencies.
 COST: Ethan requested explicit end-to-end proof that verified dependency completion actually wakes and resumes the original worker. Existing unit fixtures encoded the earlier, weaker completion boundary.
 FIX: Use the existing type-specific verification boundary for claims, promotion and durable callbacks. Derive the original return task from depends_on, retain graph edges, link the producer-origin message to the original task, include remaining blockers and next action, and record both task histories. Log dependency_waiting_for_verification, dependency_callback_linked and withheld or unmeasured delivery cases.
-
 
 ## A bottom-clamped message jump was mistaken for resuming live output
 AREA: browser

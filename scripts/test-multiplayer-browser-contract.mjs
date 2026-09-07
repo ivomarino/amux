@@ -7,6 +7,14 @@ const root = new URL('../', import.meta.url);
 const read = path => readFileSync(new URL(path, root), 'utf8');
 
 const app = read('crates/amux-dashboard/static/app.js');
+const serviceWorker = read('crates/amux-dashboard/static/sw.js');
+assert.ok(serviceWorker.includes("url.searchParams.has('_token')"),
+  'the service worker must send remote-owner token exchange navigations to the server');
+assert.ok(serviceWorker.includes('e.respondWith(fetch(e.request))'),
+  'the remote-owner token exchange must preserve the original request and redirect cookies');
+const appVersion = app.match(/const APP_VER = '([^']+)'/)?.[1];
+const cacheVersion = serviceWorker.match(/const CACHE = 'amux-v([^']+)'/)?.[1];
+assert.equal(appVersion, cacheVersion, 'app and service-worker cache versions must move together');
 const skipLine = app.split('\n').find(line => line.startsWith('const _OUTBOX_SKIP = '));
 assert.ok(skipLine, 'dashboard must define the offline-outbox exclusion list');
 const skip = Function(`return ${skipLine.slice(skipLine.indexOf('=') + 1, skipLine.lastIndexOf(';'))}`)();

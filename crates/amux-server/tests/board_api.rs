@@ -4261,6 +4261,142 @@ async fn refused_terminal_transition_does_not_record_summary_for_provider_shapes
     }
 }
 
+/// A stale provider response may arrive after a card is terminal, either from
+/// the old dashboard status-request path or from a worker's status update. It
+/// may add durable evidence, but it must never replace the board-generated
+/// Final outcome. Exercise the same race shape through every provider's output
+/// spelling, including a generic stale PATCH that carries last_result.
+#[tokio::test]
+async fn terminal_status_paths_preserve_summary_and_record_audit_for_provider_shapes() {
+    let (app, _dir) = app();
+    let cases = [
+        ("claude", "claude-output.md"),
+        ("codex", "codex-output.png"),
+        ("gemini", "https://example.test/gemini-output"),
+        ("opencode", "53a868f"),
+    ];
+
+    for (provider, artifact_ref) in cases {
+        let lane = format!("terminal-race-{provider}");
+        let made = create(
+            &app,
+            json!({
+                "title": format!("{provider} terminal race"),
+                "status": "doing",
+                "type": "chore",
+                "session": lane,
+            }),
+        )
+        .await;
+        let id = made["id"].as_str().unwrap().to_string();
+
+        let (st, _, update) = send_with(
+            &app,
+            "POST",
+            &format!("/api/board/{id}/status-update"),
+            Some(json!({
+                "text": format!("Produced {artifact_ref}; provider={provider}; ready to close.")
+            })),
+            &[("X-Amux-Worker", lane.as_str())],
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{provider} setup update failed: {update}");
+
+        let (st, _, finished) = send_with(
+            &app,
+            "PATCH",
+            &format!("/api/board/{id}"),
+            Some(json!({
+                "status": "done",
+                "evidence": format!("tests: {provider} focused test; deployment: https://example.test/{provider}; live acceptance: passed"),
+                "gate_ack": true,
+            })),
+            &[("X-Amux-Worker", lane.as_str())],
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{provider} close failed: {finished}");
+        let (_, _, before) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+        let summary = before["last_result"].as_str().unwrap().to_string();
+        assert!(summary.starts_with("Final outcome: done"), "{provider}: {summary}");
+        assert!(summary.contains(artifact_ref), "{provider} asset missing: {summary}");
+
+        // The stale-old-client shape: provider prose arrives as a PATCH after
+        // the terminal summary was already committed. It is acknowledged as an
+        // ignored field, not allowed to become the new outcome.
+        let (stale_st, _, stale) = send_with(
+            &app,
+            "PATCH",
+            &format!("/api/board/{id}"),
+            Some(json!({"last_result": format!("stale {provider} provider response")})),
+            &[("X-Amux-Worker", lane.as_str())],
+        )
+        .await;
+        assert_eq!(stale_st, StatusCode::OK, "{provider} stale patch failed: {stale}");
+        assert!(
+            stale["ignored_fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "last_result"),
+            "{provider}: {stale}"
+        );
+
+        let (st, _, status_update) = send_with(
+            &app,
+            "POST",
+            &format!("/api/board/{id}/status-update"),
+            Some(json!({"text": format!("stale {provider} status update evidence appended")})),
+            &[("X-Amux-Worker", lane.as_str())],
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "{provider} terminal status update failed: {status_update}"
+        );
+
+        // The old status-request route is refused at the server boundary, so
+        // it cannot enqueue a provider turn. Its attempted action is still a
+        // durable log entry for the card.
+        let (st, _, status_request) = send_with(
+            &app,
+            "POST",
+            &format!("/api/board/{id}/status-request"),
+            Some(json!({"question": format!("what did {provider} finish?")})),
+            &[("X-Amux-Worker", lane.as_str())],
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::CONFLICT,
+            "{provider} terminal request was delivered: {status_request}"
+        );
+        assert_eq!(status_request["delivered"], json!(false));
+        assert_eq!(status_request["logged"], json!(true));
+
+        let (_, _, after) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+        let displayed_latest = after["last_result"].as_str().unwrap_or("");
+        assert_eq!(
+            displayed_latest, summary,
+            "{provider} terminal displayed latest status was replaced by late provider output"
+        );
+        assert_eq!(
+            after["last_result"],
+            json!(summary),
+            "{provider} stale path replaced Final outcome"
+        );
+        let log = after["log"].as_str().unwrap_or("");
+        assert!(
+            log.contains(&format!("stale {provider} status update evidence appended")),
+            "{provider}: {log}"
+        );
+        assert!(
+            log.contains("terminal; authoritative Final outcome preserved"),
+            "{provider}: {log}"
+        );
+    }
+}
+
 /// GCA-153: the provider-independent status endpoint must turn a worker's
 /// exact actionable card into current work. A stale source ref is provenance,
 /// not an eternal trigger block.
