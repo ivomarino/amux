@@ -130,3 +130,18 @@ for (const mode of ['message', 'search']) {
     await readable(page, selector);
   });
 }
+
+
+test('saved Codex input hints stay out of navigation while recorded messages remain', async ({ page }) => {
+  const raw = '› Ask Codex to do anything\n\n  gpt-6-astra xhigh · ~/project\n'
+    + 'later assistant output\n'.repeat(8) + '› actual submitted request\nAssistant reply\n';
+  await render(page, raw);
+  await expect(page.locator('#peek-body .peek-prompt')).toHaveCount(1);
+  await expect(page.locator('#peek-body .peek-composer-hint')).toHaveCount(1);
+  await expect(page.locator('#peek-body .peek-prompt')).toContainText('actual submitted request');
+  await page.evaluate(() => {
+    eval("_peekMsgRows=[{session:peekSession,type:'direct',text:'Ask Codex to do anything'}];");
+  });
+  await render(page, raw);
+  await expect(page.locator('#peek-body .peek-prompt-human')).toContainText('Ask Codex to do anything');
+});

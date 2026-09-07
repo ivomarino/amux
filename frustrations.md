@@ -3601,3 +3601,15 @@ CARD: AMUX-4192
 SYMPTOM: Multi-worker live checks found 80% jumps hundreds or thousands of pixels from the selected message. At 100%, the fixed 12px landing put the first line beneath the terminal's floating controls. Search also matched serialized HTML, so entities and ANSI-split phrases could not be found, and a working worker's refresh could replace the selected search result.
 COST: The preceding live check at one normal zoom did not cover these cases; Ethan requested cross-worker verification again. The baseline reproduced unreadable landings on amux-frustrations and mixpeek-general.
 FIX: Convert rendered geometry to layout coordinates, reserve the actual floating-control inset, reveal nested horizontal table matches, and publish zoom/inset/scroll-error/visibility in navigation beacons. Search rendered text across inline spans as one result. Pin selected search/message nodes while newer output is buffered. Regression cases cover long/wrapped text, symbols, Unicode paths, ANSI spans, wide tables, start/end wrapping and real refreshes across desktop, 375px and WebKit.
+
+
+## Saved Codex composer hints became false message-navigation targets
+AREA: browser
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux
+CARD: AMUX-4192
+SYMPTOM: The six-worker sweep found four copies of Ask Codex to do anything in amux's saved output being treated as messages. The composer exclusion only applied at the very end of the entire log, so historical frames escaped it.
+COST: Geometrically correct jumps still landed on terminal input hints instead of submitted messages.
+FIX: Detect the adjacent model footer for each unclassified block, including historical frames; authoritative submitted-message history still wins. A browser test covers old composer frames followed by later output and the same literal text recorded as a real human message.

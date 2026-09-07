@@ -9035,7 +9035,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.827';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.828';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -10441,11 +10441,12 @@ function highlightPrompts(html) {
     const text = plain.slice(i, end).join('\n');
     const kind = _classifyPromptKind(text);
     // Codex's final input hint sits immediately above its model/status footer.
-    // It is not a submitted turn; a real recorded message remains navigable.
+    // Saved output contains older copies of this footer too, followed by later
+    // frames. Only the adjacent footer matters; a recorded message still wins.
     const tail = plain.slice(end).filter(line => line.trim());
-    const composer = kind === 'unknown' && tail.length > 0 && tail.length <= 3 && tail.every(line =>
-      /^\s*(?:gpt-[\w.-]+|o[1-9][\w.-]*|\d+% context left|\? for shortcuts|⏵⏵)/i.test(line));
-    if (composer) { out.push(...lines.slice(i, end)); i = end; continue; }
+    const composer = kind === 'unknown' && tail.length > 0 &&
+      /^\s*(?:gpt-[\w.-]+|o[1-9][\w.-]*)\s.*(?:·|context left)/i.test(tail[0]);
+    if (composer) { out.push('<span class="peek-composer-hint">' + lines.slice(i, end).join('\n') + '</span>'); i = end; continue; }
     const label = (_MSG_KIND[kind] || _MSG_KIND.unknown).label;
     // Close each block before opening its successor. Nested prompt wrappers
     // made scrollIntoView target a whole conversation instead of one message.
@@ -11123,6 +11124,7 @@ function _peekNavBeacon(verdict, prompts, target) {
         scroll_error_px: geometry ? Math.round((geometry.wanted - body.scrollTop) * 100) / 100 : null,
         zoom: geometry ? Math.round(geometry.scale * 1000) / 1000 : null,
         scroll_top: Math.round(body.scrollTop),
+        composer_hints_excluded: body.querySelectorAll('.peek-composer-hint').length,
         unclassified: body.querySelectorAll('.peek-prompt-unknown').length }) }).catch(() => {});
   } catch (e) {}
 }
