@@ -110,15 +110,18 @@ test('Find reveals text inside a wide terminal table', async ({ page }) => {
   expect(await page.locator('.peek-box').evaluate(el => el.scrollLeft)).toBeGreaterThan(0);
 });
 
-for (const mode of ['message', 'search']) {
-  test(`a working worker refresh keeps the selected ${mode} and its position`, async ({ page }) => {
-    const raw = 'before\n'.repeat(45) + '› selected original text\nAssistant\n' + 'after\n'.repeat(50);
+for (const mode of ['message', 'search']) for (const tail of [50, 0]) {
+  test(`a working worker refresh keeps the selected ${mode} and its position with ${tail} trailing lines`, async ({ page }) => {
+    const raw = 'before\n'.repeat(45) + '› selected original text\nAssistant\n' + 'after\n'.repeat(tail);
     await render(page, raw);
     if (mode === 'search') {
       await page.getByRole('button', { name: 'Find in terminal', exact: true }).click();
       await page.getByRole('searchbox', { name: 'Find in terminal', exact: true }).fill('selected original text');
     } else await page.getByRole('button', { name: 'Next message', exact: true }).click();
     const selector = mode === 'search' ? '.peek-highlight.current' : '.peek-msg-current';
+    // Let the asynchronous browser scroll event run, including bottom-clamped
+    // jumps. Calling refresh synchronously hid the second unlock path.
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
     const target = await page.locator(selector).elementHandle();
     const top = await page.locator('#peek-body').evaluate(el => el.scrollTop);
     await page.route('**/api/sessions/scroll-worker/peek?*', route => route.fulfill({ json: {

@@ -9035,7 +9035,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.828';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.829';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -20498,7 +20498,9 @@ function peekCheckSelection() {
 document.getElementById('peek-body').addEventListener('mousedown', () => { peekSelecting = true; clearTimeout(peekSelectTimer); });
 document.getElementById('peek-body').addEventListener('touchstart', () => { peekSelecting = true; clearTimeout(peekSelectTimer); }, {passive: true});
 document.getElementById('peek-body').addEventListener('scroll', function() {
-  if (_isScrolledToBottom(this)) {
+  // Programmatic message/search jumps can land at the finite scroll boundary.
+  // That scroll event is still navigation, not a request to resume live output.
+  if (_isScrolledToBottom(this) && !this.querySelector('.peek-msg-current, .peek-highlight.current')) {
     _peekScrollLocked = false;
     _hideScrollLockBadge(this);
   } else {
