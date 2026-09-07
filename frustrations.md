@@ -3507,3 +3507,35 @@ CARD: ATE-36
 SYMPTOM: An empty Codex composer rendered `model · path · Main [default]`, but the footer recognizer required `path` to be the final middle-dot segment and exactly one dim separator. The live session therefore reported `composer_preview=gpt-5.6-solxhigh~/Dev/amux` and retained an UNSUBMITTED TEXT badge overnight.
 COST: The owner had to ask why the worker claimed to hold text, and the status surface asserted a nonexistent pending command for more than ten hours.
 FIX: Parse the stable plain model/path prefix plus any fully dim trailing footer context, preserve the typed-text control, and annotate stuck-composer WARN/event payloads with `possible_codex_footer_chrome` so future TUI drift is sweep-visible.
+
+## The staged-guard told a peer their work was at risk from me, because I had read the file
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-07
+SESSION: amux-frustrations
+CARD: AF-550
+SYMPTOM: amux-testing-e2e held an uncommitted fix to a test I had broken on origin/main.
+  To ask them to land it with evidence rather than a guess, I read the file (sed/awk) and
+  copied it OUT to a detached scratch worktree to prove their fix compiled and passed —
+  shared -> scratch, never the reverse, zero writes to the shared tree. When they went to
+  commit, the guard told them: "the staged set includes 1 file(s) whose edit records are
+  YOURS ... differs from HEAD and you have no commit for it; the WORK ITSELF is at risk —
+  CHECK THIS ONE". Nothing in that file was mine. `git diff HEAD` showed 10 added lines,
+  all of them their fixture; both of my commits to the path (4c068e80, b1f8f9e5) were
+  already on origin.
+COST: A commit stalled on a warning about a lane that had only verified it. The specific
+  cost is the phrasing "the WORK ITSELF is at risk", which is the one line that should stop
+  a commit outright, spent on a false positive — and it fires most readily against the
+  careful behaviour, since the sessions that touch a peer's file to CHECK it are exactly
+  the ones that generate reads. It also cost me the reciprocal warning ("scripts/
+  push-consent.sh was also edited by amux-cloud") on a file I had created minutes earlier,
+  which was my own mutate.sh runs moving the mtime.
+FIX: The edit record is built from Bash commands that MENTION a path, and a mention cannot
+  separate `cat`/`sed`/`awk`/`cp <src>` from a write. Two options, and the second is the
+  real one: (1) classify the verb — a read-only command naming a path is not an edit
+  record, and READ_ONLY_VERBS already exists in git_guard.rs for the shared-checkout guard;
+  (2) stop inferring from commands at all and use the tool-call record, which knows Edit
+  from Read exactly. AF-179 records the mirror of this on the co-edit side, where the guard
+  itself prints "OBSERVED claim, not a recorded write" — the victim column has the same
+  defect and no such caveat, so the weaker signal carries the stronger words.
