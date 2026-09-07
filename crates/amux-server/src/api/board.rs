@@ -6521,7 +6521,6 @@ pub async fn patch_item(
             // applied write. A new terminal entry still flows through the
             // normal setter and save_patched replaces it atomically.
             let terminal_summary_locked = bs::is_terminal_status(&row.status)
-                && bs::is_terminal_status(&next.status)
                 && row
                     .last_result
                     .as_deref()
@@ -9318,18 +9317,55 @@ async fn status_request(
         requester
     };
 
-    let (session, title) = {
+    let (session, title, terminal) = {
         let conn = match state.store.read() {
             Ok(c) => c,
             Err(e) => return internal(e),
         };
         match bs::get_issue(&conn, &id) {
-            Ok(Some(row)) => (row.session.clone().unwrap_or_default(), row.title.clone()),
+            Ok(Some(row)) => (
+                row.session.clone().unwrap_or_default(),
+                row.title.clone(),
+                bs::is_terminal_status(&row.status),
+            ),
             Ok(None) => return not_found(&id),
             Err(e) => return internal(e),
         }
     };
     let session = session.trim().to_string();
+    // A stale client can still invoke the old Refresh/status-request path after
+    // the card closed. Do not route that request to a provider: the board's
+    // terminal outcome is authoritative. Still append the attempted action so
+    // the durable record explains why no provider message appeared.
+    if terminal {
+        let question_part = if question.is_empty() {
+            String::new()
+        } else {
+            format!(" — \\\"{question}\\\"")
+        };
+        let line = format!(
+            "status request by {requester} ignored: card is terminal; authoritative Final outcome preserved{question_part}"
+        );
+        if let Err(e) = append_card_log(&state, &id, &line, None).await {
+            return internal(e);
+        }
+        tracing::info!(
+            target: "amux::board", marker = "terminal_status_request_preserved",
+            task = %id, requester = %requester,
+            "terminal status request was recorded without provider delivery"
+        );
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "delivered": false,
+                "session": session,
+                "reason": "card is terminal; authoritative Final outcome is preserved",
+                "logged": true,
+            })),
+        )
+            .into_response();
+    }
     if session.is_empty() {
         return (
             StatusCode::CONFLICT,
@@ -10109,6 +10145,18 @@ async fn apply_status_update(
             conn, &id, refs,
             &format!("automatically captured from status update by {actor}"), now_secs(),
         )?;
+        if bs::is_terminal_status(&prior_status)
+            && row
+                .last_result
+                .as_deref()
+                .is_some_and(|summary| summary.starts_with("Final outcome:"))
+        {
+            tracing::info!(
+                target: "amux::board", marker = "terminal_status_update_preserved",
+                task = %id, worker = %actor,
+                "terminal status update appended its audit evidence without replacing Final outcome"
+            );
+        }
         events.extend(inserted.iter().map(|artifact| crate::db::PendingEvent {
             entity_type: amux_core::revision::EntityType::Other("artifact".into()),
             entity_id: artifact.id.clone(),

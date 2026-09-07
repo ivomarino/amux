@@ -3643,5 +3643,16 @@ COST: Two fresh browser origins and two server rebuilds were needed to separate 
  server-auth failure from a cached-shell failure; without the browser check the new
  secure remote-owner boundary would have shipped with no usable recovery path.
 FIX: ATE-79 exchanges the one-time URL bearer for a derived HttpOnly owner-session
- cookie, removes it from the address bar, bypasses the canonical shell cache for the
- exchange request, and pins the app/service-worker version seam.
+cookie, removes it from the address bar, bypasses the canonical shell cache for the
+exchange request, and pins the app/service-worker version seam.
+
+## A stale card detail routed a terminal Refresh to the provider
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux-testing-e2e
+CARD: ATE-84
+SYMPTOM: ATE-75 was Done in the durable board, but a stale client reopened it with In Progress selected. Its old Refresh/status-request path then reached the worker, and the resulting status update replaced the generated Final outcome summary.
+COST: The UI made a terminal card look active and allowed provider prose to overwrite the durable completion record, so Refresh could not restore the evidence reviewers needed.
+FIX: Card-detail hydration now applies the authoritative GET status to the selected controls, and Refresh GETs before deciding whether a provider request is permitted. Terminal status-request calls are refused and logged without delivery; terminal status updates and stale last_result PATCHes preserve Final outcome while appending evidence. Emit terminal_status_request_preserved and terminal_status_update_preserved markers, with Rust provider-shape and desktop/mobile/iOS Playwright regressions.

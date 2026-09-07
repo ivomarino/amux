@@ -3999,6 +3999,16 @@ function _taskIdChip(s) {
     + 'style="cursor:pointer;font-size:0.7rem;font-weight:600;color:var(--accent);border:1px solid var(--accent);border-radius:6px;padding:0 6px;margin-left:4px;white-space:nowrap;">' + esc(id) + '</span>';
 }
 async function _askCardStatus(id, sess) {
+  // The list item can be stale exactly when this button is most useful: an old
+  // client may still call the terminal Refresh button after a worker has
+  // closed the card. Read the detail record FIRST, then decide whether a
+  // provider request is allowed. Deciding from `boardItems` before the GET
+  // reopens the ATE-75 race and lets a stale client overwrite a final outcome.
+  const refreshed = await _bdHydrate(id);
+  if (!refreshed) {
+    showToast('Could not refresh card status from the board');
+    return;
+  }
   const current = boardItems.find(i => i.id === id);
   const terminal = /^(done|verified|discarded)$/i.test(String(
     (current && current.status) || (id === boardDetailId && boardDetailStatus) || ''));
@@ -4007,7 +4017,6 @@ async function _askCardStatus(id, sess) {
     // from the durable detail record; asking a worker here would reintroduce
     // provider-text parsing and could overwrite the final outcome with stale
     // model prose.
-    const refreshed = await _bdHydrate(id);
     showToast(refreshed
       ? 'Refreshed final terminal summary from the board'
       : 'Could not refresh final terminal summary');
@@ -27323,10 +27332,20 @@ async function _bdHydrate(id) {
     const cached = idx >= 0 ? { ...boardItems[idx] } : {};
     if (idx >= 0) boardItems[idx] = Object.assign({}, boardItems[idx], full);
     const merged = idx >= 0 ? boardItems[idx] : full;
+    const hasDraft = Boolean(_boardDrafts[id]);
+    // The selected status is a rendered copy of the server row, not a second
+    // source of truth. Keep an intentional local draft, but whenever the user
+    // has not edited this card, apply the authoritative GET before painting
+    // the controls. This also removes the timing window in openBoardDetail,
+    // where hydration used to start before boardDetailStatus was initialized.
+    if (!hasDraft && boardDetailId === id) {
+      boardDetailStatus = full.status || 'todo';
+      _renderDetailStatusBtns();
+    }
     _bdRenderHistory(merged);
     if (typeof _bdRenderStatusBanner === 'function') _bdRenderStatusBanner(merged);
     _bdRenderMeta(merged);
-    if (_boardDrafts[id]) { _bdHydrated = true; return true; }  // user's draft wins
+    if (hasDraft) { _bdHydrated = true; return true; }  // user's draft wins
     const title = document.getElementById('bd-title');
     if (title && title.value === (cached.title || '')) {
       title.value = full.title || '';
@@ -27345,10 +27364,6 @@ async function _bdHydrate(id) {
       if (previewTab && previewTab.classList.contains('active') && preview) {
         preview.innerHTML = d.value.trim() ? renderMarkdown(d.value) : '';
       }
-    }
-    if (boardDetailStatus === (cached.status || 'todo')) {
-      boardDetailStatus = full.status || 'todo';
-      _renderDetailStatusBtns();
     }
     const sess = document.getElementById('bd-session');
     if (sess && sess.value === (cached.session || '')) _populateSessionSelect('bd-session', full.session || '');
@@ -27389,10 +27404,10 @@ async function openBoardDetail(id) {
   // Render instantly from cache, then correct it from the server. Blocking the
   // modal on a fetch would make every card open feel slow for a field most
   // opens never edit.
-  _bdHydrated = (item.desc !== undefined);
-  _bdHydrate(id);
   const draft = _boardDrafts[id];
   boardDetailStatus = draft ? draft.status : (item.status || 'todo');
+  _bdHydrated = (item.desc !== undefined);
+  _bdHydrate(id);
   const titleEl = document.getElementById('bd-title');
   titleEl.value = draft ? draft.title : item.title;
   titleEl.style.height = 'auto';

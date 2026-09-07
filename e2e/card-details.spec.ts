@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 
 /**
  * The card is the work record. Pin the compact contract requested in the live
@@ -155,6 +155,68 @@ test.describe('board card details', () => {
     await expect(page.locator('#bd-status-banner')).toContainText('Final outcome: done');
     await expect(page.locator('#bd-meta')).toContainText('focused board API and Playwright acceptance passed');
     expect(statusRequests, 'terminal Refresh must read the board, not ask the provider').toBe(0);
+
+    await request.delete(`/api/board/${encodeURIComponent(card)}`, { headers: auth });
+  });
+
+  test('authoritative status wins a stale cached detail and old Refresh never asks the provider', async ({ page, request }) => {
+    let statusRequests = 0;
+    let detailGets = 0;
+    page.on('request', r => {
+      if (r.url().includes('/status-request')) statusRequests += 1;
+    });
+
+    await page.goto('/');
+    const walkthrough = page.locator('#wt-overlay.open');
+    await walkthrough.waitFor({ state: 'visible', timeout: 2_000 }).catch(() => {});
+    if (await walkthrough.isVisible()) await page.locator('#wt-tooltip .wt-skip').click();
+    const token = await page.evaluate(() => (window as any)._AMUX_AUTH_TOKEN);
+    const auth = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+    const worker = 'stale-detail-hydration-worker';
+    const created = await request.post('/api/board', {
+      headers: { ...auth, 'X-Amux-Worker': worker },
+      data: { title: 'stale detail hydration race', status: 'doing', type: 'chore', session: worker },
+    });
+    expect(created.ok()).toBeTruthy();
+    const card = (await created.json()).id as string;
+    const seeded = await request.post(`/api/board/${encodeURIComponent(card)}/status-update`, {
+      headers: { ...auth, 'X-Amux-Worker': worker },
+      data: { text: 'provider status seeded before the terminal transition' },
+    });
+    expect(seeded.ok()).toBeTruthy();
+
+    // Load the doing row into the SPA cache, then close the card behind the
+    // old client's back. Opening the detail now starts from stale `doing`.
+    await page.evaluate(() => (window as any).fetchBoard());
+    const finished = await request.patch(`/api/board/${encodeURIComponent(card)}`, {
+      headers: { ...auth, 'X-Amux-Worker': worker },
+      data: {
+        status: 'done',
+        evidence: 'tests: stale hydration regression; deployment: https://example.test/stale-hydration; live acceptance: passed',
+        gate_ack: true,
+      },
+    });
+    expect(finished.ok()).toBeTruthy();
+
+    // Hold the first detail GET open so the stale Refresh button is clicked
+    // while the initial hydration is still in flight. The fixed client must
+    // make the GET-first decision and issue zero status-request POSTs.
+    await page.route(`**/api/board/${card}`, async route => {
+      detailGets += 1;
+      if (detailGets === 1) await new Promise(resolve => setTimeout(resolve, 750));
+      await route.continue();
+    });
+    await page.evaluate((id) => (window as any).openBoardDetail(id), card);
+    await expect(page.locator('#board-detail-overlay')).toHaveClass(/active/, { timeout: 30_000 });
+    const refresh = page.locator('#bd-status-banner button', { hasText: `Refresh from ${worker}` });
+    await expect(refresh).toHaveCount(1);
+    await refresh.click();
+
+    await expect(page.locator('#bd-status-banner')).toContainText('Final outcome: done', { timeout: 15_000 });
+    const doneButton = page.locator('#bd-status-row button', { hasText: 'Done' });
+    await expect(doneButton).toHaveAttribute('style', /background/);
+    expect(detailGets).toBeGreaterThanOrEqual(2);
+    expect(statusRequests, 'a stale old client must not route a terminal Refresh to the worker').toBe(0);
 
     await request.delete(`/api/board/${encodeURIComponent(card)}`, { headers: auth });
   });
