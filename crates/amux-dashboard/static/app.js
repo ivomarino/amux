@@ -8998,7 +8998,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.818';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.819';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -9290,6 +9290,7 @@ function openPeek(name, opts) {
     if (el) { el.textContent = ''; el.classList.remove('has-count', 'has-pending', 'sched-on', 'sched-off'); }
   });
   _peekUpdateTabCounts();
+  _peekMessagesLoad(false);
   // Every worker opens on its live terminal. A provider-specific default made
   // Codex/Ollama workers jump to Transcript after the reset above, so the
   // default differed by provider and hid the interactive pane at the moment a
@@ -10131,7 +10132,8 @@ function ansiToHtml(text) {
       }
       out+=openSpan();
     } else if(p){
-      out+=linkChunk(p);
+      out += p.split('\n').map((line, index) =>
+        (index ? closeSpan() + '\n' + openSpan() : '') + linkChunk(line)).join('');
     }
   }
   return _osc8Resolve(out+closeSpan(), _osc8);
@@ -10334,67 +10336,93 @@ const _NON_HUMAN_PROMPT_MARKS = [
   ['/compact Context is at', 'amux'],
 ];
 
+// Normalize terminal wrapping without losing provenance. A different worker's
+// "continue" must never classify this worker's command.
+function _peekPromptNormalized(text) {
+  return String(text || '').replace(/^[ \t\u00a0]*[❯›][ \t\u00a0]*/, '')
+    .replace(/^\[\d{1,2}:\d{2}(?:\s*[AP]M)?\]\s*/i, '').replace(/\s+/g, ' ').trim();
+}
 function _classifyPromptKind(promptText) {
-  const clean = promptText.replace(/^❯\s*/, '').trim();
-  if (!clean) return 'human';
-  // STRUCTURE FIRST, BEFORE THE ROW LOOKUP (Ethan, 2026-08-11: the navigator
-  // "should scroll thru human messages not amux/session/system/peer messages
-  // by default").
-  //
-  // The row match below is the precise path and stays the primary one, but it
-  // FAILS OPEN TO 'human': a prompt that matches no known row — because the
-  // rows are not loaded yet, or the window has scrolled past it, or the
-  // terminal wrapped the text so the first line no longer starts with the
-  // message's first 60 chars — was classified as a person typing. So amux's
-  // own nudges and peer relays landed in the human filter, which is exactly
-  // the set the navigator exists to isolate. Observed as "H 3/9" on a pane
-  // whose 9 prompts were mostly system traffic.
-  //
-  // Checking the marker first also makes the classification independent of
-  // whether the message trail happens to be loaded, which is why it goes
-  // BEFORE the lookup rather than into the fallback.
+  const clean = _peekPromptNormalized(promptText);
+  if (!clean) return 'unknown';
+  const rows = _peekMsgRowsFor === peekSession && Array.isArray(_peekMsgRows)
+    ? _peekMsgRows : (typeof _cmdHistory !== 'undefined' ? _cmdHistory : []);
+  const kinds = new Set();
+  let best = 0;
+  for (const row of rows) {
+    if (!row || typeof row === 'string' || row.session !== peekSession) continue;
+    const text = _peekPromptNormalized(row.text);
+    if (!text) continue;
+    const exact = text === clean;
+    const length = Math.min(text.length, clean.length);
+    if (!exact && (length < 32 || !(clean.startsWith(text) || text.startsWith(clean)))) continue;
+    const score = exact ? Number.MAX_SAFE_INTEGER : length;
+    if (score > best) { kinds.clear(); best = score; }
+    if (score === best) kinds.add(_msgKind(row));
+  }
+  if (kinds.size === 1) return [...kinds][0];
+  if (kinds.size > 1) return 'unknown';
   for (const [mark, kind] of _NON_HUMAN_PROMPT_MARKS) {
     if (clean.startsWith(mark)) return kind;
   }
-  if (typeof _peekMsgRows === 'undefined') return 'human';
-  const rows = (_peekMsgRows || _cmdHistory || []);
-  for (let i = rows.length - 1; i >= 0; i--) {
-    const r = rows[i];
-    if (!r || typeof r === 'string') continue;
-    const t = (r.text || '').trim();
-    if (t && clean.startsWith(t.slice(0, 60))) return _msgKind(r);
-  }
-  return 'human';
+  // Absence from a loaded history window is not evidence of human authorship.
+  return 'unknown';
 }
 function highlightPrompts(html) {
   const lines = html.split('\n');
-  let inPrompt = false;
-  let promptText = '';
+  const decoder = document.createElement('textarea');
+  const plain = lines.map(line => {
+    decoder.innerHTML = line.replace(/<[^>]*>/g, '');
+    return decoder.value.replace(/\u00a0/g, ' ');
+  });
   const out = [];
-  for (let i = 0; i < lines.length; i++) {
-    const raw = lines[i];
-    const textStart = raw.replace(/^(<[^>]*>)+/, '');
-    const isPromptStart = textStart.startsWith('❯');
-    const isContinuation = inPrompt && /^  \S/.test(textStart);
-    if (isPromptStart) {
-      inPrompt = true;
-      promptText = textStart;
-      const kind = _classifyPromptKind(textStart);
-      out.push('<span class="peek-prompt peek-prompt-' + kind + '" data-msg-kind="' + kind + '">' + raw);
-    } else if (isContinuation) {
-      promptText += '\n' + textStart;
-      out.push(raw);
-    } else {
-      if (inPrompt) {
-        out[out.length - 1] += '</span>';
-        inPrompt = false;
-        promptText = '';
+  for (let i = 0; i < lines.length;) {
+    const start = /^[ \t]{0,2}[❯›](?:[ \t]+|$)/.test(plain[i]);
+    const content = _peekPromptNormalized(plain[i]);
+    // Empty composers and numbered selectors are controls, not messages.
+    if (!start || !content || /^\d+\.\s/.test(content)) { out.push(lines[i++]); continue; }
+    let end = i + 1;
+    while (end < lines.length) {
+      if (/^[ \t]{0,2}[❯›](?:[ \t]+|$)/.test(plain[end])) break;
+      if (/^[ \t]{2,}\S/.test(plain[end]) && !/^\s*[│┃⏵]/.test(plain[end])) { end++; continue; }
+      // Paragraph breaks belong to a message only when followed by another
+      // indented paragraph, not by assistant output or terminal chrome.
+      if (!plain[end].trim()) {
+        let next = end + 1;
+        while (next < lines.length && !plain[next].trim()) next++;
+        if (next < lines.length && /^[ \t]{2,}\S/.test(plain[next])
+            && !/^\s*[│┃⏵❯›]/.test(plain[next])) { end = next; continue; }
       }
-      out.push(raw);
+      break;
     }
+    const text = plain.slice(i, end).join('\n');
+    const kind = _classifyPromptKind(text);
+    // Codex's final input hint sits immediately above its model/status footer.
+    // It is not a submitted turn; a real recorded message remains navigable.
+    const tail = plain.slice(end).filter(line => line.trim());
+    const composer = kind === 'unknown' && tail.length > 0 && tail.length <= 3 && tail.every(line =>
+      /^\s*(?:gpt-[\w.-]+|o[1-9][\w.-]*|\d+% context left|\? for shortcuts|⏵⏵)/i.test(line));
+    if (composer) { out.push(...lines.slice(i, end)); i = end; continue; }
+    const label = (_MSG_KIND[kind] || _MSG_KIND.unknown).label;
+    // Close each block before opening its successor. Nested prompt wrappers
+    // made scrollIntoView target a whole conversation instead of one message.
+    out.push('<span class="peek-prompt peek-prompt-' + kind + '" data-msg-kind="' + kind
+      + '" data-msg-label="' + esc(label) + '">' + lines.slice(i, end).join('\n') + '</span>');
+    i = end;
   }
-  if (inPrompt) out[out.length - 1] += '</span>';
   return out.join('\n');
+}
+function _peekReclassifyPrompts() {
+  const body = document.getElementById('peek-body');
+  if (!body) return;
+  for (const el of body.querySelectorAll('.peek-prompt')) {
+    const kind = _classifyPromptKind(el.textContent);
+    for (const previous of _MSG_KIND_ORDER) el.classList.remove('peek-prompt-' + previous);
+    el.classList.add('peek-prompt-' + kind);
+    el.dataset.msgKind = kind;
+    el.dataset.msgLabel = (_MSG_KIND[kind] || _MSG_KIND.unknown).label;
+  }
+  _peekMsgCount(_peekMsgPrompts());
 }
 
 // Wrap each contiguous run of box-drawing lines (tables, framed boxes, wide rules)
@@ -10741,7 +10769,7 @@ async function refreshPeek(liveOnly, bypassTrim) {
       }
     } else if (!_peekScrollLocked) {
       const _liveEl = document.getElementById('pk-live');
-      if (!histChanged && _liveEl) _liveEl.innerHTML = _lastLiveHTML;   // live tick → swap the small region only
+      if (!histChanged && _liveEl) { _liveEl.innerHTML = _lastLiveHTML; _peekReclassifyPrompts(); }   // live tick → swap the small region only
       else applyPeekSearch(false);
     }
     if (!_peekScrollLocked && atBottom && !hasSearch) {
@@ -10784,8 +10812,9 @@ async function refreshPeek(liveOnly, bypassTrim) {
 // reflow was the visible "janky" churn when watching an active session.
 function _paintPeekRegions(body) {
   const hist = _peekEarlierHTML() + _peekHistoryHTML;
-  if (!hist && !_lastLiveHTML && lastPeekHTML) { body.innerHTML = lastPeekHTML; return; }  // IDB cached open paint
+  if (!hist && !_lastLiveHTML && lastPeekHTML) { body.innerHTML = lastPeekHTML; _peekReclassifyPrompts(); return; }  // IDB cached open paint
   body.innerHTML = '<div id="pk-hist">' + hist + '</div><div id="pk-live">' + _lastLiveHTML + '</div>';
+  _peekReclassifyPrompts();
 }
 function applyPeekSearch(keepIndex, doScroll) {
   const body = document.getElementById('peek-body');
@@ -10809,6 +10838,7 @@ function applyPeekSearch(keepIndex, doScroll) {
     return p.replace(re, (match) => `<span class="peek-highlight" data-idx="${idx++}">${esc(match)}</span>`);
   }).join('');
   _peekMatches = Array.from(body.querySelectorAll('.peek-highlight'));
+  _peekReclassifyPrompts();
   if (!keepIndex || peekSearchIndex >= _peekMatches.length) peekSearchIndex = 0;
   _peekScrollTo(peekSearchIndex, doScroll);
   if (countEl) countEl.textContent = _peekMatches.length > 0 ? (peekSearchIndex + 1) + '/' + _peekMatches.length : 'no matches';
@@ -10818,7 +10848,7 @@ function _peekScrollTo(i, doScroll, instant) {
   const cur = _peekMatches[i];
   // instant: the one-shot Locate jump — a smooth animation would be frozen
   // mid-flight by the next poll tick's savedTop restore.
-  if (cur && doScroll !== false) cur.scrollIntoView({ block: 'center', behavior: instant ? 'auto' : 'smooth' });
+  if (cur && doScroll !== false) _peekJumpTo(cur);
   const countEl = document.getElementById('peek-search-count');
   if (countEl && _peekMatches.length) countEl.textContent = (i + 1) + '/' + _peekMatches.length;
 }
@@ -10857,58 +10887,83 @@ let _peekMsgNavKind = 'human';
 function _peekMsgPrompts() {
   const body = document.getElementById('peek-body');
   if (!body) return [];
-  if (peekSearchQuery) {
-    return Array.from(body.querySelectorAll('.peek-search-match'));
-  }
-  const all = Array.from(body.querySelectorAll('.peek-prompt'));
-  if (_peekMsgNavKind === 'all') return all;
-  // Classify FRESH here, not from the render-time `data-msg-kind`. Prompts are
-  // rendered (and their kind stamped) BEFORE `_loadCmdHistoryFromServer`
-  // resolves, so at render time a prompt that matches no marker and no loaded
-  // row FAILS OPEN to 'human' — a scheduled command ("Board push …"), a peer
-  // relay, or an amux nudge then pollutes the human navigator and it never gets
-  // re-stamped. By the time a human presses ↑/↓, cmd_history IS loaded, so
-  // re-running the classifier yields the TRUE kind and the default human filter
-  // shows only real human messages (Ethan 2026-08-13: "simple default scroll
-  // thru + highlight human messages, not amux/session/schedule/peer").
-  return all.filter(el => _classifyPromptKind(el.textContent) === _peekMsgNavKind);
+  if (peekSearchQuery.trim()) return Array.from(body.querySelectorAll('.peek-highlight'));
+  return Array.from(body.querySelectorAll('.peek-prompt')).filter(el =>
+    _peekMsgNavKind === 'all' || el.dataset.msgKind === _peekMsgNavKind);
 }
-function _peekMsgUpdate(prompts) {
-  const countEl = document.getElementById('peek-msg-count');
-  if (!countEl) return;
-  document.querySelectorAll('.peek-prompt.peek-msg-current').forEach(p => p.classList.remove('peek-msg-current'));
+function _peekMsgCount(prompts) {
+  const label = peekSearchQuery.trim() ? 'Matches' : _peekMsgNavKind === 'all' ? 'All'
+    : (_MSG_KIND[_peekMsgNavKind] || _MSG_KIND.unknown).label;
+  const count = document.getElementById('peek-msg-count');
+  if (count) {
+    const selected = prompts.findIndex(p => p.classList.contains('peek-msg-current'));
+    count.textContent = label + ' ' + (selected < 0 ? prompts.length : (selected + 1) + '/' + prompts.length);
+    count.title = 'Choose message kind. Showing ' + label.toLowerCase() + ': ' + prompts.length;
+  }
+  for (const btn of document.querySelectorAll('#peek-msg-nav .peek-nav-btn')) {
+    btn.setAttribute('aria-disabled', String(!prompts.length));
+  }
+}
+function _peekJumpTo(el) {
+  const body = document.getElementById('peek-body');
+  // Lock before changing scrollTop: a polling tick must not replace the target
+  // while a smooth animation is still in flight. Scroll only this container.
+  _peekScrollLocked = true;
+  const top = el.getBoundingClientRect().top - body.getBoundingClientRect().top + body.scrollTop - 12;
+  body.scrollTo({ top: Math.max(0, top), behavior: 'instant' });
+}
+function _peekNavBeacon(verdict, prompts, target) {
+  const body = document.getElementById('peek-body');
+  const bounds = body.getBoundingClientRect();
+  const rect = target && target.getBoundingClientRect();
+  try {
+    fetch(API + '/api/client-debug', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind: 'peek-message-nav', verdict, session: peekSession, ver: APP_VER,
+        measured: true, n_considered: prompts.length, filter: _peekMsgNavKind,
+        index: _peekMsgIndex, target_kind: target?.dataset.msgKind || null,
+        target_visible: !!rect && rect.top >= bounds.top - 1 && rect.top < bounds.bottom,
+        scroll_top: Math.round(body.scrollTop),
+        unclassified: body.querySelectorAll('.peek-prompt-unknown').length }) }).catch(() => {});
+  } catch (e) {}
+}
+function _peekMsgMove(direction) {
+  _peekReclassifyPrompts();
+  const prompts = _peekMsgPrompts();
   if (!prompts.length) {
-    countEl.textContent = peekSearchQuery ? '0' : '❯';
+    _peekMsgCount(prompts);
+    _peekNavBeacon('no-targets', prompts, null);
+    showToast('No matching messages in loaded output. Choose another message kind or load earlier output.');
     return;
   }
-  if (_peekMsgIndex < 0 || _peekMsgIndex >= prompts.length) _peekMsgIndex = prompts.length - 1;
-  prompts[_peekMsgIndex].classList.add('peek-msg-current');
-  prompts[_peekMsgIndex].scrollIntoView({ block: 'center', behavior: 'smooth' });
-  const label = peekSearchQuery ? '' : (_peekMsgNavKind === 'all' ? '' : _peekMsgNavKind.slice(0,1).toUpperCase());
-  countEl.textContent = (label ? label + ' ' : '') + (_peekMsgIndex + 1) + '/' + prompts.length;
+  const selected = prompts.findIndex(p => p.classList.contains('peek-msg-current'));
+  if (selected >= 0) _peekMsgIndex = (selected + direction + prompts.length) % prompts.length;
+  else {
+    const top = document.getElementById('peek-body').getBoundingClientRect().top + 13;
+    const visible = prompts.findIndex(p => p.getBoundingClientRect().top >= top);
+    _peekMsgIndex = direction > 0 ? (visible < 0 ? 0 : visible)
+      : (visible <= 0 ? prompts.length - 1 : visible - 1);
+  }
+  document.querySelectorAll('#peek-body .peek-msg-current').forEach(p => p.classList.remove('peek-msg-current'));
+  const target = prompts[_peekMsgIndex];
+  target.classList.add('peek-msg-current');
+  if (peekSearchQuery.trim()) {
+    peekSearchIndex = _peekMsgIndex;
+    _peekScrollTo(peekSearchIndex, false);
+  }
+  _peekJumpTo(target);
+  _peekMsgCount(prompts);
+  const rect = target.getBoundingClientRect();
+  const bounds = document.getElementById('peek-body').getBoundingClientRect();
+  _peekNavBeacon(rect.top >= bounds.top - 1 && rect.top < bounds.bottom ? 'landed' : 'target-not-visible', prompts, target);
 }
-function peekMsgNext() {
-  const p = _peekMsgPrompts();
-  if (!p.length) return;
-  _peekMsgIndex = _peekMsgIndex < p.length - 1 ? _peekMsgIndex + 1 : 0;
-  _peekMsgUpdate(p);
-}
-function peekMsgPrev() {
-  const p = _peekMsgPrompts();
-  if (!p.length) return;
-  _peekMsgIndex = _peekMsgIndex <= 0 ? p.length - 1 : _peekMsgIndex - 1;
-  _peekMsgUpdate(p);
-}
+function peekMsgNext() { _peekMsgMove(1); }
+function peekMsgPrev() { _peekMsgMove(-1); }
 function _peekMsgNavCycle() {
-  const kinds = ['human', 'session', 'schedule', 'amux', 'all'];
-  const i = kinds.indexOf(_peekMsgNavKind);
-  _peekMsgNavKind = kinds[(i + 1) % kinds.length];
+  const kinds = ['human', 'session', 'schedule', 'amux', 'unstamped', 'unknown', 'all'];
+  _peekMsgNavKind = kinds[(kinds.indexOf(_peekMsgNavKind) + 1) % kinds.length];
   _peekMsgIndex = -1;
-  const p = _peekMsgPrompts();
-  const label = _peekMsgNavKind === 'all' ? 'All' : (_MSG_KIND[_peekMsgNavKind] || {}).label || _peekMsgNavKind;
-  const countEl = document.getElementById('peek-msg-count');
-  if (countEl) countEl.textContent = label + ' ' + p.length;
-  showToast('Navigate: ' + label + ' messages (' + p.length + ')');
+  document.querySelectorAll('#peek-body .peek-msg-current').forEach(p => p.classList.remove('peek-msg-current'));
+  _peekReclassifyPrompts();
 }
 
 // ── Peek command bar ──
@@ -14617,7 +14672,9 @@ async function _peekMessagesLoad(more) {
   } catch(e) {
     if (!more) { try { await _loadCmdHistoryFromServer(); } catch(e2) {} } // fall back to the shared cache on first load only
   }
+  if (peekSession !== sess) return;
   _peekMessagesRender();
+  _peekReclassifyPrompts();
 }
 
 // ── Dictation tab ───────────────────────────────────────────────────────────

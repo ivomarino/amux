@@ -3463,3 +3463,14 @@ CARD: AMUX-4168
 SYMPTOM: BR-51 was reclaimed at 04:25 and picked again at 04:26, then reclaimed at 10:26 and picked again at 10:27. Selection ignores pickup.reclaimed_stale when applying its per-card cooldown, so recovery does not yield to the other queued work.
 COST: Two six-hour recovery cycles left byo-ray holding the same WIP slot over eight/nine eligible todo candidates.
 FIX: Apply the existing bounded per-card cooldown to the reclaim event too, and log stale_reclaim_yields_to_next_card. Fixed in af53a6bb (AMUX-4168). The regression fails without the reclaim event in the cooldown. The actual byo-ray snapshot selected BR-137 after reclaiming BR-51; its live current CI run remains in progress, so no live reclaim was forced.
+
+## Worker message arrows did nothing on Codex output
+AREA: browser
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux
+CARD: AMUX-4178
+SYMPTOM: Live amux terminal contained three Codex prompt lines but zero navigable message elements. Previous message did not move. Consecutive Claude prompts could nest, and terminal provenance was classified before worker-scoped history loaded.
+COST: User could not navigate the conversation; reproduced a zero-target click on the live worker.
+FIX: Recognize both prompt glyphs, balance ANSI and message blocks, classify from scoped history, land at message starts, and emit peek-message-nav beacons with landed/no-targets/target-not-visible verdicts. Desktop, mobile and WebKit: 9 passed; removing Codex detection fails the regression.
