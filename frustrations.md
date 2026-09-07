@@ -3474,3 +3474,14 @@ CARD: AMUX-4178
 SYMPTOM: Live amux terminal contained three Codex prompt lines but zero navigable message elements. Previous message did not move. Consecutive Claude prompts could nest, and terminal provenance was classified before worker-scoped history loaded.
 COST: User could not navigate the conversation; reproduced a zero-target click on the live worker.
 FIX: Recognize both prompt glyphs, balance ANSI and message blocks, classify from scoped history, land at message starts, and emit peek-message-nav beacons with landed/no-targets/target-not-visible verdicts. Desktop, mobile and WebKit: 9 passed; removing Codex detection fails the regression.
+
+## Codex's worktree suffix revived the false unsubmitted-text badge
+AREA: status
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux-testing-e2e
+CARD: ATE-36
+SYMPTOM: An empty Codex composer rendered `model · path · Main [default]`, but the footer recognizer required `path` to be the final middle-dot segment and exactly one dim separator. The live session therefore reported `composer_preview=gpt-5.6-solxhigh~/Dev/amux` and retained an UNSUBMITTED TEXT badge overnight.
+COST: The owner had to ask why the worker claimed to hold text, and the status surface asserted a nonexistent pending command for more than ten hours.
+FIX: Parse the stable plain model/path prefix plus any fully dim trailing footer context, preserve the typed-text control, and annotate stuck-composer WARN/event payloads with `possible_codex_footer_chrome` so future TUI drift is sweep-visible.

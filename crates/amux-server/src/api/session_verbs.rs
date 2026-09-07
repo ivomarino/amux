@@ -4966,13 +4966,12 @@ fn gemini_composer_state(raw_lines: &[&str], stripped: &[String]) -> Option<Comp
 /// falsely claiming that it was submitted.
 fn codex_model_footer_chrome(raw: &str, stripped: &str) -> bool {
     let text = stripped.trim();
-    let Some((identity, location)) = text.rsplit_once('\u{b7}') else {
+    let parts: Vec<&str> = text.split('\u{b7}').map(str::trim).collect();
+    if parts.len() < 2 || parts.iter().any(|part| part.is_empty()) {
         return false;
-    };
-    let location = location.trim();
-    if identity.trim().is_empty()
-        || !(location == "~" || location.starts_with("~/") || location.starts_with('/'))
-    {
+    }
+    let (identity, location) = (parts[0], parts[1]);
+    if !(location == "~" || location.starts_with("~/") || location.starts_with('/')) {
         return false;
     }
 
@@ -4980,7 +4979,26 @@ fn codex_model_footer_chrome(raw: &str, stripped: &str) -> bool {
     let plain_squashed: String = plain.split_whitespace().collect();
     let expected_plain: String = format!("{identity}{location}").split_whitespace().collect();
     let dim_squashed: String = dim.split_whitespace().collect();
-    dim_squashed == "\u{b7}" && plain_squashed == expected_plain
+    let expected_dim: String = std::iter::once("\u{b7}")
+        .chain(parts.iter().skip(2).flat_map(|part| ["\u{b7}", *part]))
+        .flat_map(str::split_whitespace)
+        .collect();
+    dim_squashed == expected_dim && plain_squashed == expected_plain
+}
+
+/// A broad diagnostic only: a path-bearing middle-dot row near the composer
+/// looks like Codex footer chrome, but failed the strict style/position proof.
+/// It never changes the composer verdict; it makes future TUI drift explicit in
+/// the existing stuck-composer warning instead of presenting model chrome as a
+/// confidently typed human message.
+fn possible_codex_footer_chrome(raw: &str) -> bool {
+    let stripped = strip_ansi(raw);
+    let parts: Vec<&str> = stripped.trim().split('\u{b7}').map(str::trim).collect();
+    parts.len() >= 2
+        && parts.iter().skip(1).any(|part| {
+            *part == "~" || part.starts_with("~/") || part.starts_with('/')
+        })
+        && !codex_model_footer_chrome(raw, &stripped)
 }
 
 pub(crate) fn composer_state(raw_frame: &str) -> ComposerState {
@@ -11571,6 +11589,8 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
                 .as_deref()
                 .map(|t| chars_truncate(t, 120))
                 .unwrap_or_default();
+            let possible_codex_footer_drift =
+                stuck_now && pane.lines().any(possible_codex_footer_chrome);
             update_meta(
                 name,
                 &[
@@ -11580,12 +11600,17 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
             );
             if stuck_now {
                 tracing::warn!(session = %name, preview = %preview,
+                    possible_codex_footer_chrome = possible_codex_footer_drift,
                     "unsubmitted text is stuck in the composer with no live turn or agents — the lane will read `waiting` until it is submitted or cleared");
                 emit_event(
                     state,
                     name,
                     "session.composer_stuck",
-                    Some(json!({"preview": preview, "detected_by": "sweep"})),
+                    Some(json!({
+                        "preview": preview,
+                        "detected_by": "sweep",
+                        "possible_codex_footer_chrome": possible_codex_footer_drift,
+                    })),
                     Some(format!("composerstuck:{name}:{}", now_i64() / 3600)),
                     "status",
                 )
@@ -23606,6 +23631,12 @@ mod composer_state_tests {
     /// the same composer block and promoted the whole thing to `Typed`.
     const LIVE_CODEX_IDLE: &str = "\u{1b}[1m\u{203a}\u{1b}[0m \u{1b}[2mAsk Codex to do anything\u{1b}[0m\n\n  \u{1b}[38;2;246;226;183mgpt-5.6-sol xhigh\u{1b}[2m\u{1b}[39m \u{b7} \u{1b}[0m\u{1b}[38;2;171;223;167m~/Dev/amux\u{1b}[39m\n";
 
+    /// The same empty prompt after Codex added the active worktree/branch as a
+    /// third, dim footer segment. Captured verbatim from amux-testing-e2e on
+    /// 2026-09-07 when the dashboard again showed `UNSUBMITTED TEXT` with
+    /// preview `gpt-5.6-solxhigh~/Dev/amux`.
+    const LIVE_CODEX_IDLE_WITH_BRANCH: &str = "\u{1b}[1m\u{203a}\u{1b}[0m \u{1b}[2mAsk Codex to do anything\u{1b}[0m\n\n  \u{1b}[38;2;246;226;183mgpt-5.6-sol xhigh\u{1b}[2m\u{1b}[39m \u{b7} \u{1b}[0m\u{1b}[38;2;171;223;167m~/Dev/amux\u{1b}[2m\u{1b}[39m \u{b7} Main [default]\u{1b}[0m\n";
+
     /// `backend`, captured 2026-08-09 while it was being reported as "holding
     /// unsubmitted text for hours". The composer is EMPTY; `continue with the
     /// queue` is Claude Code's dim suggestion. Three people pressed Enter,
@@ -23778,24 +23809,37 @@ mod composer_state_tests {
 
     #[test]
     fn a_codex_model_footer_is_chrome_not_unsubmitted_text() {
-        assert_eq!(
-            composer_state(LIVE_CODEX_IDLE),
-            ComposerState::Placeholder("AskCodextodoanything".into())
-        );
-        assert_eq!(
-            composer_state(LIVE_CODEX_IDLE).typed(),
-            None,
-            "an idle Codex prompt must not inherit its model/path footer as typed input"
-        );
+        for frame in [LIVE_CODEX_IDLE, LIVE_CODEX_IDLE_WITH_BRANCH] {
+            assert_eq!(
+                composer_state(frame),
+                ComposerState::Placeholder("AskCodextodoanything".into())
+            );
+            assert_eq!(
+                composer_state(frame).typed(),
+                None,
+                "an idle Codex prompt must not inherit its model/path/footer context as typed input"
+            );
+        }
 
         // CONTROL: only Codex's dim placeholder is replaced. Ordinary typed
-        // text in the same live frame must remain pending; otherwise a send
-        // could falsely claim success while the user's command is still there.
-        let typed = LIVE_CODEX_IDLE.replace(
+        // text in the current three-segment live frame must remain pending;
+        // otherwise a send could falsely claim success while the user's
+        // command is still there.
+        let typed = LIVE_CODEX_IDLE_WITH_BRANCH.replace(
             "\u{1b}[2mAsk Codex to do anything\u{1b}[0m",
             "ship the current task",
         );
         assert_eq!(composer_state(&typed).typed(), Some("shipthecurrenttask"));
+
+        // Observability control: path-bearing prose without Codex's raw style
+        // proof stays typed, but is called out as possible footer drift by the
+        // existing session.composer_stuck WARN/event.
+        let unstyled = "\u{1b}[1m\u{203a}\u{1b}[0m \u{1b}[2mAsk Codex to do anything\u{1b}[0m\n\n  gpt-5.6-sol xhigh \u{b7} ~/Dev/amux \u{b7} Main [default]\n";
+        assert!(possible_codex_footer_chrome(unstyled.lines().last().unwrap()));
+        assert_eq!(
+            composer_state(unstyled).typed(),
+            Some("gpt-5.6-solxhigh\u{b7}~/Dev/amux\u{b7}Main[default]")
+        );
     }
 
     #[test]
