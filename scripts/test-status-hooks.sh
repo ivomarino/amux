@@ -39,6 +39,8 @@ for event, groups in hooks.items():
 reports=[r for r in rows if "hook-report.sh" in r[2]]
 assert len(reports) == 6, reports
 assert len([r for r in reports if r[0] == "PostToolUse" and r[1] == ".*"]) == 1
+read_guards=[r for r in rows if "large-read-guard.py" in r[2]]
+assert sorted((r[0],r[1]) for r in read_guards)==[("PreToolUse","Bash"),("PreToolUse","Read")],read_guards
 assert any(r[2] == "echo unrelated" for r in rows)
 assert any(r[2] == "bash check-format.sh" for r in rows)
 assert not any("/api/sessions/" in r[2] and "hook-report.sh" not in r[2] for r in rows)

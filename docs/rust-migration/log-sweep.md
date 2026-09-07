@@ -276,7 +276,18 @@ fallback when a finding needs row-level inspection.
 
    - **Attribute on `amux_session` ONLY. Never fall back to `worker`.** NOW
      ENFORCED BY THE ENDPOINT: its query does not select `worker` at all, so the
-     mistake is not available. Note that the old headline for this step said
+     mistake is not available.
+
+     **That is true of `/api/logs/writers`. On the raw `/api/logs` deep-dive
+     below, use `amux_session=<lane>` — NOT `session=` (AF-521).** `session=` is
+     deliberately `(worker OR amux_session)`, so it hands you the forbidden
+     fallback under the name that reads like the safe one. Until 2026-09-06 the
+     right filter did not exist at all and was silently dropped, which returned
+     the WHOLE LOG: measured that morning, `session=nissan` gave 146 rows of
+     which 137 were not nissan's, and `amux_session=nissan` gave 46,729 — every
+     row in the window, under one lane's name. Every response now carries
+     `ignored_params`; a non-empty one means your filter did not run and the
+     rows you are holding are a superset, not an answer. Note that the old headline for this step said
      "collect distinct `worker` values" while this bullet forbade it, so a reader
      who followed the bold line did the forbidden thing. `worker`
      is PATH-derived (`/api/sessions/{name}/*`), so an UNATTRIBUTED report *about*
@@ -404,6 +415,15 @@ fallback when a finding needs row-level inspection.
    was healthy, the derivation was healthy, the pane was healthy, and only the
    SEAM between them was wrong.
 
+   **SAY HOW MANY LANES IT JUDGED, not just that it passed.** The check only
+   reaches a verdict for a lane whose pane is unambiguously mid-turn, so its
+   population is a handful, not the fleet: on 2026-09-06 it returned 3 pass and
+   0 fail over THREE lanes out of ~50. "Step 6 clean" reads as a fleet
+   all-clear and is a statement about three panes. `GET /api/debug/invariants`
+   -> `latest_per_invariant` gives the per-entity rows the health summary
+   collapses; count the `status.agrees_with_pane` entries there and report that
+   number beside the verdict.
+
    Read the direction of the check before acting on it. Only `idle`-over-a-
    working-pane is a contradiction; `active` over a quiet pane is normal (a long
    tool call, a subagent) and is deliberately not flagged. If it ever starts
@@ -420,8 +440,13 @@ fallback when a finding needs row-level inspection.
    histogram. Read the histogram too: a disagreement count of 0 is also what a
    fleet that has flipped entirely to `active` would report.
 
-Also skim `GET /api/logs/raw?lines=500` for `sources:"server_log"` lines matching
-ERROR/WARN — the tracing tail carries failures that never became a request row.
+Also skim `GET /api/logs/raw?lines=500` for server-log lines matching ERROR/WARN
+— the tracing tail carries failures that never became a request row.
+
+`sources` is a PARALLEL ARRAY to `lines`, not a field on each line, so
+`if "server_log" in line` matches nothing and reports a clean tail:
+`zip(d["lines"], d["sources"])`. And 500 lines is ~4 MINUTES at current volume
+— a spot check, not a window. Say which it was.
 
 ## Standing checks — open verdicts a past sweep staked on a FUTURE window
 
@@ -437,6 +462,22 @@ a line when it resolves; do not let one rot unchecked.
   the line: a check that has never once had an input to judge is not accumulating
   evidence, and if this reaches a month it is worth asking whether the helper
   timeout path is reachable at all rather than continuing to wait for it.
+
+  **HALF-ANSWERED 2026-09-06, and the half that moved is the one this line was
+  really asking.** Still 0 in-window, but WIDEN THE QUERY before concluding
+  anything about reachability — the 24h zero was hiding a live answer:
+
+  ```
+  curl -sk "$(amux url)/api/logs?since=$(( $(date +%s) - 14*86400 ))&min_status=504&max_status=504&limit=5"
+  ```
+
+  4 rows, all `POST /api/files/mdai/run`, latencies 150s-298s (carded
+  AMUX-3966). So the 504 code path is DEMONSTRABLY REACHABLE and this check has
+  a working probe; what is unproven is still the HELPER 504 specifically, which
+  is AF-86's question and a different family. Keep the line, and stop treating
+  the in-window zero as evidence about reachability — it never was. The general
+  move: before asking whether a path is dead, ask the same question over the
+  retention window, not the sweep window.
 
 - **RESOLVED 2026-09-03 — the CDP wait now says WHICH way.** (Was: 2026-08-25,
   AMUX-3689.) Both open questions are answered, and the specimen check the line

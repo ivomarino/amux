@@ -8930,7 +8930,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.816';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.818';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -21427,6 +21427,7 @@ let boardViewMode = localStorage.getItem('amux_board_view') || 'status';
 if (boardViewMode === 'session') boardViewMode = 'worker';
 let boardOwnerFilter = localStorage.getItem('amux_board_owner') || 'human';
 let _sessionGroupCollapsed = JSON.parse(localStorage.getItem('amux_board_collapsed') || '{}');
+let _boardWorkerDensityBeaconSent = false;
 let _tagGroupCollapsed = JSON.parse(localStorage.getItem('amux_status_collapsed') || '{}');
 // First visit collapses the archive columns. backlog + todo are 1082 of 1553
 // items — they are the reason the ~64 in-flight cards are invisible. Collapsed
@@ -25607,10 +25608,26 @@ function setBoardOwner(type) {
   renderBoard();
 }
 
-function toggleSessionGroup(name) {
-  _sessionGroupCollapsed[name] = !_sessionGroupCollapsed[name];
+function toggleSessionGroup(name, currentlyCollapsed) {
+  // `undefined` no longer means open for every historical worker: idle groups
+  // default closed below. Toggle the state the user ACTUALLY saw, or the first
+  // click on a default-closed group writes `true` and appears to do nothing.
+  _sessionGroupCollapsed[name] = !currentlyCollapsed;
   localStorage.setItem('amux_board_collapsed', JSON.stringify(_sessionGroupCollapsed));
   renderBoard();
+}
+
+function _boardWorkerGroupCollapsed(name, items) {
+  // A saved human choice always wins. For a worker never seen on this device,
+  // open only real in-flight work; the 1,595-card live board otherwise expands
+  // every historical lane and turns the Workers view into hundreds of cards.
+  if (Object.prototype.hasOwnProperty.call(_sessionGroupCollapsed, name)) {
+    return !!_sessionGroupCollapsed[name];
+  }
+  return !items.some(function(item) {
+    const status = _statusCanon(item.status || 'todo');
+    return status === 'doing' || status === 'review';
+  });
 }
 
 // Shared Linear-dense issue row (AMUX-2152): status dot · id · one-line
@@ -26011,12 +26028,14 @@ function _renderBoardBySession(visible, container) {
   }
 
   let html = '';
+  let defaultCollapsedGroups = 0;
+  let defaultOpenGroups = 0;
 
   // ── Yours (human tasks) at the top ──
   if (humanItems.length) {
     const collapsed = _sessionGroupCollapsed['__human__'];
     html += '<div class="board-session-group board-human-group">';
-    html += '<div class="board-session-header" onclick="toggleSessionGroup(\'__human__\')">';
+    html += '<div class="board-session-header" onclick="toggleSessionGroup(\'__human__\',' + (!!collapsed) + ')">';
     html += '<span class="board-session-chevron' + (collapsed ? '' : ' open') + '">\u25B6</span>';
     html += '<span class="board-session-name">&#x1F464; Yours</span>';
     html += '<div class="board-session-counts">' + _sessionCountsHtml(humanItems) + '</div></div>';
@@ -26035,10 +26054,15 @@ function _renderBoardBySession(visible, container) {
   // ── Agent tasks grouped by session ──
   sessionNames.forEach(function(name) {
     const items = name ? groups[name] : noSession;
-    const collapsed = _sessionGroupCollapsed[name || '__none__'];
     const groupKey = name || '__none__';
+    const saved = Object.prototype.hasOwnProperty.call(_sessionGroupCollapsed, groupKey);
+    const collapsed = _boardWorkerGroupCollapsed(groupKey, items);
+    if (!saved) {
+      if (collapsed) defaultCollapsedGroups++;
+      else defaultOpenGroups++;
+    }
     html += '<div class="board-session-group">';
-    html += '<div class="board-session-header" onclick="toggleSessionGroup(\'' + esc(groupKey) + '\')">';
+    html += '<div class="board-session-header" onclick="toggleSessionGroup(\'' + esc(groupKey) + '\',' + collapsed + ')">';
     html += '<span class="board-session-chevron' + (collapsed ? '' : ' open') + '">\u25B6</span>';
     html += '<span class="board-session-name">' + (name ? esc(name) : '<span style="color:var(--dim)">Unassigned</span>') + '</span>';
     html += '<div class="board-session-counts">' + _sessionCountsHtml(items) + '</div></div>';
@@ -26053,6 +26077,26 @@ function _renderBoardBySession(visible, container) {
     }
     html += '</div>';
   });
+
+  if (defaultCollapsedGroups > 0) {
+    html = '<div class="board-session-summary">In-progress work is open · '
+      + defaultCollapsedGroups + ' idle worker group' + (defaultCollapsedGroups === 1 ? '' : 's')
+      + ' collapsed</div>' + html;
+  }
+  // Two-fix signal: a sweep can now see the population that made this surface
+  // unusable, and how much the default collapse removed, without screen video.
+  if (!_boardWorkerDensityBeaconSent && sessionNames.length) {
+    _boardWorkerDensityBeaconSent = true;
+    try {
+      fetch(API + '/api/client-debug', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
+        body: JSON.stringify({ kind: 'board-worker-density', verdict: 'idle-history-collapsed',
+          measured: true, n_considered: sessionNames.length, cards: agentVisible.length,
+          default_collapsed: defaultCollapsedGroups, default_open: defaultOpenGroups,
+          ver: APP_VER })
+      }).catch(() => {});
+    } catch (e) {}
+  }
 
   if (!visible.length) {
     html = '<div class="board-session-empty">No board items yet</div>';
@@ -36506,8 +36550,9 @@ async function _bwClickIndex(index) {
 }
 
 // ── Inspect panel: console / network / errors (full browser troubleshooting) ──
-let _bwInspData = { console: [], network: [], errors: [] };
+let _bwInspData = { console: [], network: [], errors: [], trail: [] };
 let _bwInspActiveTab = 'console';
+let _bwTrailMeta = { measured: false, n_considered: 0, returned: 0, truncated: false };
 async function _bwToggleInspect() {
   const panel = document.getElementById('bw-inspect-panel');
   const btn = document.getElementById('bw-inspect-btn');
@@ -36519,7 +36564,12 @@ async function _bwToggleInspect() {
 function _bwInspTab(t) {
   _bwInspActiveTab = t;
   document.querySelectorAll('#browser-view .bw-itab').forEach(b => b.classList.toggle('active', b.dataset.itab === t));
+  if (t === 'trail') { _bwLoadTrail(); return; }
   _bwRenderInspect();
+}
+function _bwRefreshInspect() {
+  if (_bwInspActiveTab === 'trail') return _bwLoadTrail();
+  return _bwLoadInspect();
 }
 async function _bwLoadInspect() {
   const list = document.getElementById('bw-inspect-list');
@@ -36541,7 +36591,16 @@ async function _bwLoadInspect() {
 function _bwRenderInspect() {
   const list = document.getElementById('bw-inspect-list');
   const rows = _bwInspData[_bwInspActiveTab] || [];
-  if (!rows.length) { list.innerHTML = '<div class="il-empty">No ' + _bwInspActiveTab + ' entries. Interact with the page, then refresh.</div>'; return; }
+  if (!rows.length) {
+    if (_bwInspActiveTab === 'trail') {
+      list.innerHTML = '<div class="il-empty">' + (_bwTrailMeta.measured
+        ? 'No recorded browser actions for this worker yet.'
+        : 'Browser trail was not measured. Refresh to retry.') + '</div>';
+    } else {
+      list.innerHTML = '<div class="il-empty">No ' + _bwInspActiveTab + ' entries. Interact with the page, then refresh.</div>';
+    }
+    return;
+  }
   let html = '';
   if (_bwInspActiveTab === 'console') {
     html = rows.map(e => '<div class="il ' + esc(e.level) + '"><span class="lv ' + esc(e.level) + '">' + esc(e.level) + '</span><span>' + esc(e.text || '') + '</span></div>').join('');
@@ -36553,14 +36612,63 @@ function _bwRenderInspect() {
              '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;">' + esc(n.url || '') + '</span>' +
              '<span class="ms">' + (n.ms != null ? n.ms + 'ms' : '') + '</span></div>';
     }).join('');
-  } else {
+  } else if (_bwInspActiveTab === 'errors') {
     html = rows.map(e => '<div class="il error"><span class="lv error">err</span><span>' + esc(e.text || '') + (e.stack ? '\n' + esc(e.stack) : '') + '</span></div>').join('');
+  } else {
+    html = rows.map(e => {
+      const d = e.data || {};
+      const kind = String(e.event || 'browser').replace(/^browser\./, '').replace(/_/g, ' ');
+      let detail = '';
+      if (d.action) {
+        detail = d.action;
+        if (d.target && d.target.kind === 'index') detail += ' [' + d.target.index + ']';
+        else if (d.target && d.target.kind === 'selector') detail += ' selector (' + (d.target.selector_chars || 0) + ' chars withheld)';
+        else if (d.target && d.target.kind === 'coordinates') detail += ' at ' + d.target.x + ',' + d.target.y;
+        if (d.typed_chars != null) detail += ' · ' + d.typed_chars + ' chars (contents withheld)';
+        if (d.script_chars != null) detail += ' · ' + d.script_chars + ' script chars (contents withheld)';
+        if (d.file_count != null) detail += ' · ' + d.file_count + ' file(s) (paths withheld)';
+      } else if (d.profile) {
+        detail = d.profile;
+      }
+      const url = d.url || d.requested_url || '';
+      if (url) detail += (detail ? ' · ' : '') + url;
+      const when = e.at ? new Date(e.at).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'}) : '';
+      const status = d.http_status ? ' · HTTP ' + d.http_status : '';
+      return '<div class="il"><span class="lv">' + esc(kind) + '</span>'
+        + '<span style="flex:1;min-width:0;word-break:break-word;">' + esc(detail || 'recorded') + esc(status) + '</span>'
+        + '<span class="ms">' + esc(when) + '</span></div>';
+    }).join('');
   }
   list.innerHTML = html;
 }
+async function _bwLoadTrail() {
+  const list = document.getElementById('bw-inspect-list');
+  if (list) list.innerHTML = '<div class="il-empty">Loading durable trail…</div>';
+  try {
+    const r = await fetch('/api/browser/history?session=' + encodeURIComponent(_bwSession) + '&limit=100');
+    const d = await r.json();
+    if (!r.ok || d.error) throw new Error(d.error || ('HTTP ' + r.status));
+    _bwTrailMeta = {
+      measured: d.measured === true,
+      n_considered: Number(d.n_considered || 0),
+      returned: Number(d.returned || 0),
+      truncated: d.truncated === true,
+    };
+    _bwInspData.trail = d.events || [];
+    const count = document.getElementById('bw-ic-trail');
+    if (count) count.textContent = _bwTrailMeta.n_considered
+      ? '(' + _bwTrailMeta.returned + (_bwTrailMeta.truncated ? '/' + _bwTrailMeta.n_considered : '') + ')'
+      : '';
+    _bwRenderInspect();
+  } catch(e) {
+    _bwTrailMeta = { measured: false, n_considered: 0, returned: 0, truncated: false };
+    _bwInspData.trail = [];
+    if (list) list.innerHTML = '<div class="il-empty">Trail unavailable: ' + esc(e.message) + '</div>';
+  }
+}
 async function _bwClearInspect() {
   try { await fetch('/api/browser/inspect/clear', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ session: _bwSession }) }); } catch(e) {}
-  _bwInspData = { console: [], network: [], errors: [] };
+  _bwInspData = { console: [], network: [], errors: [], trail: _bwInspData.trail || [] };
   ['console','network','errors'].forEach(k => { const el = document.getElementById('bw-ic-' + k); if (el) el.textContent = ''; });
   _bwRenderInspect();
 }

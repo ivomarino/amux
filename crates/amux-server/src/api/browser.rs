@@ -52,6 +52,7 @@
 //! - `GET  /inspect` + `POST /inspect/clear` — console/network/error capture
 //! - `GET  /search?q=`                  — google scrape (mechanical)
 //! - `GET  /sessions`                   — session→tab bindings
+//! - `GET  /history`                    — durable, redacted action trail
 //! - `GET  /pw-profiles`                — playwright profile dirs
 //! - `POST /save-profile`               — register profile↔domain
 //! - `POST /agent`                      — 501 (see above)
@@ -88,6 +89,7 @@ pub fn routes() -> Router<AppState> {
         .route("/inspect/clear", post(inspect_clear))
         .route("/search", get(search))
         .route("/sessions", get(sessions))
+        .route("/history", get(history))
         .route("/pw-profiles", get(pw_profiles_list))
         .route("/save-profile", post(save_profile))
         .route("/agent", post(agent))
@@ -173,6 +175,264 @@ fn now_epoch() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Durable browser trail
+// ---------------------------------------------------------------------------
+
+/// URLs are useful browser evidence, but OAuth callbacks and signed download
+/// links routinely carry credentials in their query string. Keep ordinary
+/// research parameters while redacting credential-shaped values, userinfo and
+/// every fragment (implicit-flow tokens live there). The action trail must be
+/// safer than the browser history it replaces, not a second credential store.
+fn audit_url(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    let Ok(mut url) = reqwest::Url::parse(raw) else {
+        return format!("[unparseable URL: {} chars]", raw.chars().count());
+    };
+    if !matches!(
+        url.scheme(),
+        "http" | "https" | "about" | "chrome" | "chrome-error"
+    ) {
+        return format!("{}:[contents withheld]", url.scheme());
+    }
+    if !url.username().is_empty() {
+        let _ = url.set_username("REDACTED");
+    }
+    if url.password().is_some() {
+        let _ = url.set_password(Some("REDACTED"));
+    }
+    let pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(k, v)| {
+            let key = k.into_owned();
+            let lower = key.to_ascii_lowercase();
+            let sensitive = [
+                "token",
+                "secret",
+                "password",
+                "passwd",
+                "credential",
+                "auth",
+                "session",
+                "signature",
+                "sig",
+                "api_key",
+                "apikey",
+                "access_key",
+                "key",
+                "code",
+                "state",
+                "nonce",
+                "assertion",
+                "samlresponse",
+                "ticket",
+            ]
+            .iter()
+            .any(|needle| lower.contains(needle));
+            (
+                key,
+                if sensitive {
+                    "REDACTED".into()
+                } else {
+                    v.into_owned()
+                },
+            )
+        })
+        .collect();
+    if url.query().is_some() {
+        url.query_pairs_mut().clear().extend_pairs(pairs);
+    }
+    if url.fragment().is_some() {
+        url.set_fragment(Some("REDACTED"));
+    }
+    url.to_string().chars().take(2_048).collect()
+}
+
+fn action_text_chars(body: &Value, key: &str) -> usize {
+    body.get(key)
+        .and_then(Value::as_str)
+        .map(|s| s.chars().count())
+        .unwrap_or(0)
+}
+
+/// Describe a browser action without retaining what the user typed, the code
+/// they evaluated, or local file paths. Those are precisely the values most
+/// likely to contain passwords, tokens, private prompts or customer data.
+fn action_audit_fields(body: &Value, page_url: &str) -> Value {
+    let action = body.get("action").and_then(Value::as_str).unwrap_or("");
+    let mut out = json!({
+        "action": action,
+        "url": audit_url(page_url),
+        "sensitive_values_recorded": false,
+    });
+    let o = out.as_object_mut().expect("browser action audit object");
+    match action {
+        "click" => {
+            let target = if let Some(selector) = body.get("selector").and_then(Value::as_str) {
+                json!({"kind": "selector", "selector_chars": selector.chars().count()})
+            } else if let Some(index) = body.get("index").and_then(Value::as_u64) {
+                json!({"kind": "index", "index": index})
+            } else {
+                json!({
+                    "kind": "coordinates",
+                    "x": body.get("x").and_then(Value::as_f64),
+                    "y": body.get("y").and_then(Value::as_f64),
+                })
+            };
+            o.insert("target".into(), target);
+        }
+        "type" => {
+            o.insert("typed_chars".into(), json!(action_text_chars(body, "text")));
+        }
+        "input" => {
+            o.insert(
+                "index".into(),
+                body.get("index").cloned().unwrap_or(Value::Null),
+            );
+            o.insert("typed_chars".into(), json!(action_text_chars(body, "text")));
+        }
+        "key" => {
+            // Only named keys pass the action validator; printable keystrokes
+            // use `type`, whose contents are deliberately omitted above.
+            o.insert(
+                "key".into(),
+                body.get("key").cloned().unwrap_or(Value::Null),
+            );
+        }
+        "scroll" => {
+            o.insert(
+                "dy".into(),
+                json!(body.get("dy").and_then(Value::as_i64).unwrap_or(500)),
+            );
+        }
+        "eval" => {
+            o.insert(
+                "script_chars".into(),
+                json!(action_text_chars(body, "script")),
+            );
+        }
+        "files" => {
+            o.insert(
+                "file_count".into(),
+                json!(body
+                    .get("files")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0)),
+            );
+        }
+        "wait" => {
+            if let Some(selector) = body.get("selector").and_then(Value::as_str) {
+                o.insert(
+                    "wait_for".into(),
+                    json!({"kind": "selector", "selector_chars": selector.chars().count()}),
+                );
+            } else {
+                o.insert(
+                    "wait_for".into(),
+                    json!({
+                        "kind": "text",
+                        "text_chars": action_text_chars(body, "text"),
+                    }),
+                );
+            }
+        }
+        "viewport" => {
+            o.insert(
+                "device".into(),
+                body.get("device").cloned().unwrap_or(Value::Null),
+            );
+            o.insert(
+                "width".into(),
+                body.get("width").cloned().unwrap_or(Value::Null),
+            );
+            o.insert(
+                "height".into(),
+                body.get("height").cloned().unwrap_or(Value::Null),
+            );
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Append to the existing session ledger: browser work is part of a worker's
+/// history, not a ninth storage primitive. A failed audit write cannot undo a
+/// browser action, but it is WARNed with a machine-readable verdict so the log
+/// sweep catches the missing record instead of silently claiming completeness.
+async fn record_browser_event(
+    state: &AppState,
+    actor: Option<&str>,
+    binding_session: &str,
+    suffix: &str,
+    mut data: Value,
+) {
+    let actor = actor.unwrap_or("").trim().to_string();
+    let event_type = format!("browser.{suffix}");
+    if let Some(o) = data.as_object_mut() {
+        o.insert("binding_session".into(), json!(binding_session));
+        o.insert("attributed".into(), json!(!actor.is_empty()));
+        o.insert("schema".into(), json!(1));
+    }
+    let event_for_write = event_type.clone();
+    let actor_for_write = actor.clone();
+    let result = state
+        .store
+        .write_async(move |conn| {
+            conn.execute(
+                "INSERT INTO session_events (ts, session, type, data, source) VALUES (?1,?2,?3,?4,'browser-api')",
+                rusqlite::params![
+                    crate::config::now_f64(),
+                    actor_for_write,
+                    event_for_write,
+                    data.to_string(),
+                ],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .await;
+    match result {
+        Ok(_) => tracing::info!(
+            target: "amux::browser_audit",
+            session = %actor,
+            binding_session,
+            event = %event_type,
+            verdict = "recorded",
+            "browser audit event recorded"
+        ),
+        Err(error) => tracing::warn!(
+            target: "amux::browser_audit",
+            session = %actor,
+            binding_session,
+            event = %event_type,
+            verdict = "dropped",
+            error = %error,
+            "browser action completed but its durable audit event could not be written"
+        ),
+    }
+}
+
+async fn record_action_response(
+    state: &AppState,
+    actor: Option<&str>,
+    binding_session: &str,
+    mut data: Value,
+    status: StatusCode,
+) {
+    if let Some(o) = data.as_object_mut() {
+        o.insert("http_status".into(), json!(status.as_u16()));
+        o.insert("http_success".into(), json!(status.is_success()));
+        // This deliberately says only what the audit layer can prove. In
+        // particular, action:wait returns HTTP 200 with ok:false on timeout;
+        // calling every 2xx a completed page action would be a lie.
+        o.insert("completion".into(), json!("response_returned"));
+    }
+    record_browser_event(state, actor, binding_session, "action", data).await;
 }
 
 /// The takeover refusal, with enough evidence to JUDGE it (AMUX-3610).
@@ -1033,6 +1293,21 @@ async fn start(
                     "not part of POST /api/browser/start and did nothing; viewport at start is device or width+height"
                 );
             }
+            record_browser_event(
+                &state,
+                attrib.as_deref(),
+                &session,
+                "started",
+                json!({
+                    "profile": body.profile,
+                    "requested_url": audit_url(&body.url),
+                    "url": v.get("launch_url").and_then(Value::as_str).map(audit_url),
+                    "headless": body.headless.unwrap_or(false),
+                    "pid": v.get("pid"),
+                    "cdp_port": v.get("cdp_port"),
+                }),
+            )
+            .await;
             Json(v).into_response()
         }
         Err(e) => {
@@ -1561,8 +1836,13 @@ async fn identify(headers: HeaderMap, body: Option<Json<IdentifyBody>>) -> Respo
     .into_response()
 }
 
-async fn stop(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+async fn stop(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
     let body = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
+    let binding_session = resolve_session(body.get("session").and_then(Value::as_str), &headers);
     // Explicit attribution only — the tab-binding default must not sign the
     // stop record as "amux" for an anonymous caller (amux-cloud's catch).
     let attrib = explicit_session(body.get("session").and_then(Value::as_str), &headers);
@@ -1588,6 +1868,19 @@ async fn stop(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
     if let Some(o) = owner {
         v["owner"] = json!(o);
     }
+    record_browser_event(
+        &state,
+        attrib.as_deref(),
+        &binding_session,
+        "stopped",
+        json!({
+            "stopped": v.get("stopped").and_then(Value::as_bool).unwrap_or(false),
+            "profile": v.get("profile"),
+            "clean_exit": v.get("clean_exit"),
+            "owner": v.get("owner"),
+        }),
+    )
+    .await;
     Json(v).into_response()
 }
 
@@ -1672,7 +1965,11 @@ struct CreateBody {
     session: Option<String>,
 }
 
-async fn profile_create(headers: HeaderMap, Json(body): Json<CreateBody>) -> Response {
+async fn profile_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateBody>,
+) -> Response {
     let started = std::time::Instant::now();
     let name = body.name.trim().to_string();
     if name.is_empty()
@@ -1720,7 +2017,7 @@ async fn profile_create(headers: HeaderMap, Json(body): Json<CreateBody>) -> Res
         }
         launch_ms = launch_started.elapsed().as_millis();
     }
-    let body_v = Json(json!({
+    let body_json = json!({
         "ok": true,
         "profile": name,
         "path": dir.display().to_string(),
@@ -1728,8 +2025,23 @@ async fn profile_create(headers: HeaderMap, Json(body): Json<CreateBody>) -> Res
         "launch_ms": launch_ms,
         "launch_error": launch_error,
         "note": "sign in through the opened window, then POST /api/browser/stop to flush the profile",
-    }))
-    .into_response();
+    });
+    let binding_session = resolve_session(body.session.as_deref(), &headers);
+    let actor = explicit_session(body.session.as_deref(), &headers);
+    record_browser_event(
+        &state,
+        actor.as_deref(),
+        &binding_session,
+        "profile_created",
+        json!({
+            "profile": name,
+            "requested_url": audit_url(&body.url),
+            "launched": launched,
+            "launch_error": !launch_error.is_null(),
+        }),
+    )
+    .await;
+    let body_v = Json(body_json).into_response();
     // Declare the wait as the LAUNCH's only when the launch dominated it. A
     // create that took 11s around a 200ms launch is amux being slow and must
     // still file — which is what keeps this a per-request declaration rather
@@ -1772,13 +2084,18 @@ struct NavigateBody {
     profile: Option<String>,
 }
 
-async fn navigate(headers: HeaderMap, body: Option<Json<NavigateBody>>) -> Response {
+async fn navigate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<NavigateBody>>,
+) -> Response {
     let Json(b) = body.unwrap_or_default();
     let url = b.url.trim().to_string();
     if url.is_empty() {
         return err(StatusCode::BAD_REQUEST, json!({ "error": "url required" }));
     }
     let session = resolve_session(b.session.as_deref(), &headers);
+    let actor = explicit_session(b.session.as_deref(), &headers);
     let (page, mut cdp) = match connect_session(&session, Some(&url)).await {
         Ok(x) => x,
         Err(r) => return r,
@@ -1799,6 +2116,19 @@ async fn navigate(headers: HeaderMap, body: Option<Json<NavigateBody>>) -> Respo
                     );
                 }
             }
+            record_browser_event(
+                &state,
+                actor.as_deref(),
+                &session,
+                "navigated",
+                json!({
+                    "requested_url": audit_url(&url),
+                    "url": v.get("url").and_then(Value::as_str).map(audit_url),
+                    "ready_state": v.get("ready_state"),
+                    "nav_failed": v.get("nav_failed").and_then(Value::as_bool).unwrap_or(false),
+                }),
+            )
+            .await;
             Json(v).into_response()
         }
         Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
@@ -1924,15 +2254,36 @@ async fn state_payload(cdp: &mut chrome::CdpClient, session: &str) -> Result<Val
     Ok(v)
 }
 
-async fn state_verb(headers: HeaderMap, Query(q): Query<SessionQuery>) -> Response {
+async fn state_verb(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<SessionQuery>,
+) -> Response {
     let session = resolve_session(q.session.as_deref(), &headers);
+    let actor = explicit_session(q.session.as_deref(), &headers);
     let (_page, mut cdp) = match connect_session(&session, None).await {
         Ok(x) => x,
         Err(r) => return r,
     };
     crate::integrations::browser::touch_verb_for_session(&session);
     match state_payload(&mut cdp, &session).await {
-        Ok(v) => Json(v).into_response(),
+        Ok(v) => {
+            record_browser_event(
+                &state,
+                actor.as_deref(),
+                &session,
+                "observed",
+                json!({
+                    "observation": "state",
+                    "url": v.get("url").and_then(Value::as_str).map(audit_url),
+                    "title_chars": v.get("title").and_then(Value::as_str).map(|s| s.chars().count()).unwrap_or(0),
+                    "text_chars": v.get("text").and_then(Value::as_str).map(|s| s.chars().count()).unwrap_or(0),
+                    "element_count": v.get("elements").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
+                }),
+            )
+            .await;
+            Json(v).into_response()
+        }
         Err(r) => r,
     }
 }
@@ -1945,10 +2296,15 @@ const VIEWPORT_DEVICES: &[(&str, u32, u32)] = &[
     ("desktop", 1280, 900),
 ];
 
-async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+async fn action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
     let body = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
     let action = body.get("action").and_then(Value::as_str).unwrap_or("").to_string();
     let session = resolve_session(body.get("session").and_then(Value::as_str), &headers);
+    let actor = explicit_session(body.get("session").and_then(Value::as_str), &headers);
 
     let get_str = |k: &str| body.get(k).and_then(Value::as_str).map(str::to_string);
     let get_f64 = |k: &str| body.get(k).and_then(Value::as_f64);
@@ -2075,14 +2431,24 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
         }
     }
 
-    let (_page, mut cdp) = match connect_session(&session, None).await {
+    let (page, mut cdp) = match connect_session(&session, None).await {
         Ok(x) => x,
         Err(r) => return r,
     };
     crate::integrations::browser::touch_verb_for_session(&session);
     let ten = Duration::from_secs(10);
+    let audit = action_audit_fields(&body, &page.url);
 
-    match action.as_str() {
+    macro_rules! audited_return {
+        ($response:expr) => {{
+            let response = $response;
+            let status = response.status();
+            record_action_response(&state, actor.as_deref(), &session, audit.clone(), status).await;
+            return response;
+        }};
+    }
+
+    let response = match action.as_str() {
         "click" => {
             let out = if let Some(sel) = get_str("selector") {
                 // Selector first, matching Python's precedence (AMUX-2272).
@@ -2128,7 +2494,7 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
             );
             let raw = match cdp.eval(&js, 20).await {
                 Ok(r) => r,
-                Err(e) => return err(cdp_status(&e), json!({ "error": with_cause(&e) })),
+                Err(e) => audited_return!(err(cdp_status(&e), json!({ "error": with_cause(&e) }),)),
             };
             if raw.as_str() != Some("FOCUSED") {
                 let v = chrome::click_outcome(
@@ -2136,7 +2502,7 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
                     &format!("element index {idx}"),
                     "indexes come from GET /api/browser/state — re-fetch it",
                 );
-                return err(StatusCode::BAD_REQUEST, v);
+                audited_return!(err(StatusCode::BAD_REQUEST, v));
             }
             match cdp.call("Input.insertText", json!({ "text": text }), ten).await {
                 Ok(_) => Json(json!({ "ok": true, "index": idx, "typed": text.chars().count() }))
@@ -2268,7 +2634,7 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
             loop {
                 match cdp.eval(&probe, 10).await {
                     Ok(v) if v.as_bool() == Some(true) => {
-                        return (
+                        audited_return!((
                             slow_ok,
                             Json(json!({
                                 "ok": true,
@@ -2276,26 +2642,28 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
                                 "waited_ms": started.elapsed().as_millis() as u64,
                             })),
                         )
-                            .into_response();
+                            .into_response());
                     }
                     Ok(_) => {}
                     // AMUX-98: `probe` interpolates the caller's own
                     // selector when one was given (the text-search branch
                     // above has no selector to be malformed), so this is
                     // the same class of caller mistake as "click".
-                    Err(e) => return err(cdp_status(&e), json!({ "error": with_cause(&e) })),
+                    Err(e) => {
+                        audited_return!(err(cdp_status(&e), json!({ "error": with_cause(&e) }),))
+                    }
                 }
                 if std::time::Instant::now() >= deadline {
                     // A timeout is an OUTCOME, not a malformed request: 200
                     // with ok:false, like the CLI shape Python relays.
-                    return (
+                    audited_return!((
                         slow_ok,
                         Json(json!({
                             "ok": false,
                             "error": format!("timed out after {timeout_ms}ms waiting for {what}"),
                         })),
                     )
-                        .into_response();
+                        .into_response());
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
@@ -2324,7 +2692,10 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
             }
         }
         _ => unreachable!("validated above"),
-    }
+    };
+    let status = response.status();
+    record_action_response(&state, actor.as_deref(), &session, audit, status).await;
+    response
 }
 
 #[derive(Deserialize, Default)]
@@ -2457,6 +2828,171 @@ async fn sessions() -> Response {
     .into_response()
 }
 
+/// GET /api/browser/history — the durable browser subset of `session_events`.
+///
+/// The generic `amux why session <name>` view also sees these rows, but a
+/// first-class route keeps the Browser UI and API callers from reverse-
+/// engineering the shared ledger. Counts sit beside the bounded result so an
+/// empty page means "measured and empty", while `truncated` names a partial
+/// answer instead of letting LIMIT masquerade as the whole history.
+async fn history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    const KNOWN: [&str; 4] = ["session", "event", "limit", "since_h"];
+    let mut unknown: Vec<&str> = q
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !KNOWN.contains(k))
+        .collect();
+    if !unknown.is_empty() {
+        unknown.sort_unstable();
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": format!("unknown query param(s): {}", unknown.join(", ")),
+                "accepted": KNOWN,
+            }),
+        );
+    }
+    let session = resolve_session(q.get("session").map(String::as_str), &headers);
+    let limit = match q.get("limit") {
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(n) if n > 0 => n.min(500),
+            _ => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "limit must be a positive integer (maximum 500)" }),
+                )
+            }
+        },
+        None => 100,
+    };
+    let since_h = match q.get("since_h") {
+        Some(raw) => match raw.parse::<f64>() {
+            Ok(n) if n >= 0.0 && n.is_finite() => n,
+            _ => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "since_h must be a non-negative number" }),
+                )
+            }
+        },
+        None => 0.0,
+    };
+    let since_epoch = if since_h == 0.0 {
+        0.0
+    } else {
+        crate::config::now_f64() - since_h * 3_600.0
+    };
+    let event = q.get("event").map(|v| v.trim()).unwrap_or("");
+    if !event.is_empty()
+        && !event
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "event must contain only letters, digits, dot, underscore, or dash" }),
+        );
+    }
+    let event_type = if event.is_empty() {
+        String::new()
+    } else if event.starts_with("browser.") {
+        event.to_string()
+    } else {
+        format!("browser.{event}")
+    };
+
+    let store = state.store.clone();
+    let session_for_query = session.clone();
+    let event_for_query = event_type.clone();
+    let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<(i64, Vec<Value>)> {
+        let conn = store.read()?;
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM session_events
+             WHERE session=?1 AND type LIKE 'browser.%'
+               AND (?2='' OR type=?2) AND ts>=?3",
+            rusqlite::params![session_for_query, event_for_query, since_epoch],
+            |r| r.get(0),
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT id, ts, type, data, source FROM session_events
+             WHERE session=?1 AND type LIKE 'browser.%'
+               AND (?2='' OR type=?2) AND ts>=?3
+             ORDER BY id DESC LIMIT ?4",
+        )?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![session_for_query, event_for_query, since_epoch, limit],
+                |r| {
+                    let id: i64 = r.get(0)?;
+                    let ts: f64 = r.get(1)?;
+                    let event: String = r.get(2)?;
+                    let raw: Option<String> = r.get(3)?;
+                    let source: String = r.get(4)?;
+                    let data = raw
+                        .as_deref()
+                        .and_then(|v| serde_json::from_str::<Value>(v).ok())
+                        .unwrap_or(Value::Null);
+                    let at = chrono::DateTime::from_timestamp(ts as i64, 0).map(|v| v.to_rfc3339());
+                    Ok(json!({
+                        "id": id,
+                        "ts": ts,
+                        "at": at,
+                        "event": event,
+                        "data": data,
+                        "source": source,
+                    }))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((total, rows))
+    })
+    .await;
+    match joined {
+        Ok(Ok((total, events))) => Json(json!({
+            "session": session,
+            "event": if event_type.is_empty() { Value::Null } else { json!(event_type) },
+            "since_h": since_h,
+            "measured": true,
+            "n_considered": total,
+            "returned": events.len(),
+            "truncated": total > events.len() as i64,
+            "sensitive_values_recorded": false,
+            "events": events,
+        }))
+        .into_response(),
+        Ok(Err(error)) => {
+            tracing::warn!(
+                target: "amux::browser_audit",
+                session,
+                verdict = "history_query_failed",
+                error = %error,
+                "browser audit history could not be read"
+            );
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": with_cause(&error), "measured": false, "n_considered": 0 }),
+            )
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "amux::browser_audit",
+                session,
+                verdict = "history_join_failed",
+                error = %error,
+                "browser audit history task failed"
+            );
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": with_cause(&error), "measured": false, "n_considered": 0 }),
+            )
+        }
+    }
+}
+
 async fn pw_profiles_list() -> Response {
     Json(json!({ "profiles": chrome::pw_profiles(&chrome::amux_home()) })).into_response()
 }
@@ -2473,9 +3009,14 @@ struct SaveProfileBody {
     label: Option<String>,
 }
 
-async fn save_profile(headers: HeaderMap, body: Option<Json<SaveProfileBody>>) -> Response {
+async fn save_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<SaveProfileBody>>,
+) -> Response {
     let Json(b) = body.unwrap_or_default();
     let session = resolve_session(b.session.as_deref(), &headers);
+    let actor = explicit_session(b.session.as_deref(), &headers);
     let mut name = b.name.unwrap_or_default().trim().to_string();
     if name.is_empty() {
         // Python defaults to the session's active profile; natively the one
@@ -2511,14 +3052,27 @@ async fn save_profile(headers: HeaderMap, body: Option<Json<SaveProfileBody>>) -
         }
     }
     match chrome::registry_register(&chrome::amux_home(), &name, &host, &label) {
-        Ok(entry) => Json(json!({
-            "success": true,
-            "profile": name,
-            "host": host,
-            "domains": entry.get("domains").cloned().unwrap_or_else(|| json!([])),
-            "label": entry.get("label").cloned().unwrap_or_else(|| json!("")),
-        }))
-        .into_response(),
+        Ok(entry) => {
+            record_browser_event(
+                &state,
+                actor.as_deref(),
+                &session,
+                "profile_saved",
+                json!({
+                    "profile": name,
+                    "domain_count": entry.get("domains").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
+                }),
+            )
+            .await;
+            Json(json!({
+                "success": true,
+                "profile": name,
+                "host": host,
+                "domains": entry.get("domains").cloned().unwrap_or_else(|| json!([])),
+                "label": entry.get("label").cloned().unwrap_or_else(|| json!("")),
+            }))
+            .into_response()
+        }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": with_cause(&e) })),
     }
 }
@@ -2565,6 +3119,7 @@ fn catalog_body(path: &str) -> Response {
             "routes": [
                 "GET /api/browser/status", "GET /api/browser/state", "GET /api/browser/screenshot",
                 "GET /api/browser/profiles", "GET /api/browser/pw-profiles", "GET /api/browser/sessions",
+                "GET /api/browser/history (durable redacted action trail)",
                 "GET /api/browser/inspect", "GET /api/browser/search",
                 "POST /api/browser/start (profile, url, session; viewport at launch via device or width+height)",
                 "POST /api/browser/navigate", "POST /api/browser/action",
@@ -2595,19 +3150,24 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
-    fn app() -> Router {
+    fn test_state() -> AppState {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
         std::mem::forget(dir);
-        let state = AppState {
+        AppState {
             secrets: std::sync::Arc::new(crate::secrets::SecretStore::new(std::path::PathBuf::new(), std::path::PathBuf::new())),
             store,
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
-        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        };
-        Router::new().nest("/api/browser", routes()).with_state(state)
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+
+    fn app() -> Router {
+        Router::new()
+            .nest("/api/browser", routes())
+            .with_state(test_state())
     }
 
     async fn send(
@@ -2630,6 +3190,149 @@ mod tests {
         let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         (status, v, proxied)
+    }
+
+    #[test]
+    fn browser_audit_urls_keep_research_params_but_redact_credentials() {
+        let got = audit_url(
+            "https://alice:pw@example.com/callback?q=browser+agents&access_token=sekret&code=abc#bearer-token",
+        );
+        assert!(
+            got.contains("q=browser+agents") || got.contains("q=browser%20agents"),
+            "{got}"
+        );
+        assert!(got.contains("access_token=REDACTED"), "{got}");
+        assert!(got.contains("code=REDACTED"), "{got}");
+        assert!(got.contains("REDACTED:REDACTED@"), "{got}");
+        assert!(got.ends_with("#REDACTED"), "{got}");
+        for secret in ["alice", "pw@", "sekret", "code=abc", "bearer-token"] {
+            assert!(!got.contains(secret), "audit URL leaked {secret:?}: {got}");
+        }
+        assert_eq!(
+            audit_url("data:text/plain,customer-secret"),
+            "data:[contents withheld]"
+        );
+        assert_eq!(
+            audit_url("not a URL customer-secret"),
+            "[unparseable URL: 25 chars]"
+        );
+    }
+
+    #[test]
+    fn browser_action_audit_omits_typed_eval_and_file_contents() {
+        let specimens = [
+            json!({"action":"type", "text":"raw-password-value"}),
+            json!({"action":"input", "index":7, "text":"private customer prompt"}),
+            json!({"action":"eval", "script":"document.cookie + 'private-code'"}),
+            json!({"action":"files", "selector":"input[type=file]", "files":["/private/customer.csv"]}),
+            json!({"action":"wait", "text":"private response body"}),
+            json!({"action":"click", "selector":"input[value='selector-secret']"}),
+        ];
+        let rendered: Vec<String> = specimens
+            .iter()
+            .map(|body| action_audit_fields(body, "https://example.com/private").to_string())
+            .collect();
+        let all = rendered.join("\n");
+        for secret in [
+            "raw-password-value",
+            "private customer prompt",
+            "document.cookie",
+            "private-code",
+            "/private/customer.csv",
+            "private response body",
+            "selector-secret",
+        ] {
+            assert!(
+                !all.contains(secret),
+                "action audit leaked {secret:?}: {all}"
+            );
+        }
+        assert!(
+            rendered[0].contains("typed_chars"),
+            "type length must remain inspectable"
+        );
+        assert!(
+            rendered[2].contains("script_chars"),
+            "eval length must remain inspectable"
+        );
+        assert!(
+            rendered[3].contains("file_count"),
+            "file count must remain inspectable"
+        );
+        assert!(
+            rendered[4].contains("text_chars"),
+            "wait shape must remain inspectable"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_history_is_attributed_bounded_and_reports_measurement() {
+        let state = test_state();
+        record_browser_event(
+            &state,
+            Some("research-lane"),
+            "research-lane",
+            "action",
+            action_audit_fields(
+                &json!({"action":"type", "text":"never-store-me"}),
+                "https://example.com/?q=kept&token=drop-me",
+            ),
+        )
+        .await;
+        record_browser_event(
+            &state,
+            Some("other-lane"),
+            "other-lane",
+            "action",
+            json!({"action":"back"}),
+        )
+        .await;
+        let app = Router::new()
+            .nest("/api/browser", routes())
+            .with_state(state);
+        let (status, v, _) = send(
+            &app,
+            "GET",
+            "/api/browser/history?session=research-lane&event=action&limit=1",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["measured"], true);
+        assert_eq!(v["n_considered"], 1);
+        assert_eq!(v["returned"], 1);
+        assert_eq!(v["truncated"], false);
+        assert_eq!(v["sensitive_values_recorded"], false);
+        assert_eq!(v["events"][0]["event"], "browser.action");
+        assert_eq!(v["events"][0]["data"]["attributed"], true);
+        assert_eq!(v["events"][0]["data"]["binding_session"], "research-lane");
+        let rendered = v.to_string();
+        assert!(
+            !rendered.contains("never-store-me"),
+            "typed text leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("drop-me"),
+            "URL credential leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("other-lane"),
+            "session filter leaked a peer: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_history_rejects_unknown_filters_instead_of_ignoring_them() {
+        let (status, v, _) = send(
+            &app(),
+            "GET",
+            "/api/browser/history?sesion=misspelled",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(v["error"].as_str().unwrap_or("").contains("sesion"), "{v}");
+        assert!(v["accepted"].as_array().is_some(), "{v}");
     }
 
     /// AMUX-3886. `with_cause` is the renderer every error body in this file

@@ -1298,17 +1298,64 @@ pub async fn run_now(
 /// Recent runs across all schedules, newest first, `source` visible on
 /// every row (ethos rule 4 — the consumer-facing surface of the manual/cron
 /// discriminator, not just a column in a store nobody opens).
-pub async fn recent_runs(State(state): State<AppState>) -> Response {
+pub async fn recent_runs(
+    State(state): State<AppState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    // MF-847. The global LIMIT 50 was the only way in, and with ~192 runs a day
+    // fleet-wide an every-15-min sweep rotates the visible window inside an
+    // hour. So a DAILY schedule — the class whose misses matter most — was
+    // never readable by the time anyone noticed a miss, and mixpeek-finances
+    // reasonably concluded the RECORD was gone.
+    //
+    // It was not. `schedule_runs` retains everything: measured 2026-09-06,
+    // 26,084 rows back to 2026-06-08, ~9k/month, and the table has carried
+    // `idx_sched_runs_sched ON (schedule_id, ran_at DESC)` since the baseline
+    // migration. Three months of forensics existed and no query could reach
+    // them. The cap was a DISPLAY limit that read as a retention limit.
+    //
+    // `schedule_id` uses that index; `limit` raises the ceiling. Both are
+    // rejected rather than ignored when malformed, matching audit_trail below
+    // (AC-228: a filter that silently matches everything answers confidently
+    // and wrongly).
+    let sched_filter = q.get("schedule_id").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let limit: i64 = match q.get("limit") {
+        None => 50,
+        Some(v) => match v.trim().parse::<i64>() {
+            Ok(n) if (1..=2000).contains(&n) => n,
+            _ => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    json!({"error": format!("limit must be an integer 1..=2000, got {v:?}")}),
+                )
+            }
+        },
+    };
+    let unknown: Vec<&String> =
+        q.keys().filter(|k| !matches!(k.as_str(), "schedule_id" | "limit")).collect();
+    if !unknown.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({"error": format!("unknown query param(s): {unknown:?}"),
+                   "accepted": ["schedule_id", "limit"]}),
+        );
+    }
     let store = state.store.clone();
     let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Value>> {
         let conn = store.read()?;
-        let mut stmt = conn.prepare(
+        let sql = format!(
             "SELECT sr.id, sr.schedule_id, sr.ran_at, sr.status, sr.note, sr.source,
                     sr.delivery, sr.submission, s.title
              FROM schedule_runs sr LEFT JOIN schedules s ON s.id = sr.schedule_id
-             ORDER BY sr.ran_at DESC LIMIT 50",
-        )?;
-        let rows = stmt.query_map([], |r| {
+             {} ORDER BY sr.ran_at DESC LIMIT ?1",
+            if sched_filter.is_some() { "WHERE sr.schedule_id = ?2" } else { "" }
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let bound: Vec<&dyn rusqlite::ToSql> = match &sched_filter {
+            Some(id) => vec![&limit, id],
+            None => vec![&limit],
+        };
+        let rows = stmt.query_map(bound.as_slice(), |r| {
             Ok(json!({
                 "id": r.get::<_, i64>(0)?,
                 "schedule_id": r.get::<_, String>(1)?,
@@ -2064,6 +2111,63 @@ mod tests {
     /// including from routine and once mode. If those tripped the gate the
     /// whole editor would 400 — a refusal that cannot be satisfied honestly is
     /// worse than the silence it replaced (ethos rule 3).
+    /// MF-847. The runs endpoint had ONE way in: newest 50 across every
+    /// schedule. At ~192 runs a day fleet-wide an every-15-min sweep rotates
+    /// that window inside an hour, so a DAILY schedule's miss — the class whose
+    /// misses matter most — was unreadable by the time anyone looked, and
+    /// mixpeek-finances concluded the record had been discarded. It had not:
+    /// the table retains everything (26,084 rows back to 2026-06-08 when
+    /// measured). The cap was a DISPLAY limit that read as a retention limit.
+    #[tokio::test]
+    async fn runs_can_be_filtered_to_one_schedule_past_the_default_window() {
+        let (app, _d) = app();
+        // Written straight into the table: the claim under test is that a
+        // per-schedule query reaches rows the global window hides, and going
+        // through the fire path would test the scheduler instead.
+        {
+            let conn =
+                rusqlite::Connection::open(_d.path().join("sched-api-test.db")).unwrap();
+            for (sched, base) in [("SCHED-A", 1_000_000i64), ("SCHED-B", 2_000_000i64)] {
+                for i in 0..60i64 {
+                    conn.execute(
+                        "INSERT INTO schedule_runs(schedule_id,ran_at,status,source) \
+                         VALUES(?1,?2,'delivered','cron-rs')",
+                        rusqlite::params![sched, base + i],
+                    )
+                    .unwrap();
+                }
+            }
+        }
+
+        // Default: the old behaviour, unchanged.
+        let (_, all) = send(&app, "GET", "/api/schedules/runs", None, &[]).await;
+        assert_eq!(all.as_array().unwrap().len(), 50);
+
+        // THE CELL THIS EXISTS FOR: SCHED-A's older runs are past the global
+        // window (60 B-runs are newer) and must still be reachable.
+        let (_, mine) =
+            send(&app, "GET", "/api/schedules/runs?schedule_id=SCHED-A&limit=100", None, &[]).await;
+        let rows = mine.as_array().unwrap();
+        assert_eq!(rows.len(), 60, "per-schedule filter did not reach past the 50 window");
+        assert!(rows.iter().all(|r| r["schedule_id"] == "SCHED-A"),
+                "the filter leaked another schedule's runs");
+    }
+
+    /// A malformed filter is REJECTED, not ignored. An ignored `limit` returns
+    /// 50 rows and looks like an answer, which is the confident-wrong-answer
+    /// shape AC-228 already pins for audit_trail.
+    #[tokio::test]
+    async fn a_bad_runs_filter_is_refused_rather_than_silently_dropped() {
+        let (app, _d) = app();
+        for bad in ["/api/schedules/runs?limit=abc",
+                    "/api/schedules/runs?limit=0",
+                    "/api/schedules/runs?limit=99999",
+                    "/api/schedules/runs?scheduleid=SCHED-A"] {
+            let (st, _) = send(&app, "GET", bad, None, &[]).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "silently accepted {bad}");
+        }
+    }
+
     #[tokio::test]
     async fn inert_values_for_those_fields_still_save() {
         let (app, _dir) = app();

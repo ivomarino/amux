@@ -91,6 +91,11 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Route bulk file navigation through the configured fast helper model.
+    Delegate {
+        #[command(subcommand)]
+        cmd: DelegateCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -138,6 +143,24 @@ enum WorkerCmd {
 enum SchedCmd {
     List,
     Run { id: String },
+}
+
+#[derive(Subcommand)]
+enum DelegateCmd {
+    /// Read and compress files without spending the primary model's context.
+    Read {
+        #[arg(long)]
+        question: String,
+        /// Attach the receipt to this task. Otherwise the current task is
+        /// resolved from the worker's durable message link.
+        #[arg(long = "for")]
+        task: Option<String>,
+        #[arg(required = true, num_args = 1..)]
+        files: Vec<std::path::PathBuf>,
+        /// Print the complete measured server receipt.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 struct Client {
@@ -289,6 +312,7 @@ fn run(cmd: &Cmd, c: &Client) -> anyhow::Result<i32> {
         Cmd::Board { cmd } => board(cmd, c),
         Cmd::Workers { cmd } => workers(cmd, c),
         Cmd::Schedules { cmd } => schedules(cmd, c),
+        Cmd::Delegate { cmd } => delegate(cmd, c),
         Cmd::Search { query, types, limit, status, reindex, json } => {
             search(query.as_deref(), types.as_deref(), *limit, *status, *reindex, *json, c)
         }
@@ -317,6 +341,68 @@ fn run(cmd: &Cmd, c: &Client) -> anyhow::Result<i32> {
                 eprintln!("send failed ({status}): {v}");
                 Ok(3)
             }
+        }
+    }
+}
+
+fn delegate(cmd: &DelegateCmd, c: &Client) -> anyhow::Result<i32> {
+    match cmd {
+        DelegateCmd::Read { question, task, files, json: as_json } => {
+            if question.trim().is_empty() {
+                eprintln!("delegate read requires a non-empty --question");
+                return Ok(2);
+            }
+            if files.len() > 16 {
+                eprintln!("delegate read accepts at most 16 files");
+                return Ok(2);
+            }
+            let mut total = 0usize;
+            let mut payload = Vec::with_capacity(files.len());
+            for path in files {
+                let bytes = std::fs::read(path)?;
+                total = total.saturating_add(bytes.len());
+                if total > 512 * 1024 {
+                    eprintln!("delegate read file content exceeds the 512 KiB request limit");
+                    return Ok(2);
+                }
+                let content = String::from_utf8(bytes)
+                    .map_err(|_| anyhow::anyhow!("{} is not UTF-8 text", path.display()))?;
+                payload.push(json!({"path": path.to_string_lossy(), "content": content}));
+            }
+            let mut body = json!({"question": question, "files": payload});
+            if let Some(task) = task {
+                body["task"] = json!(task);
+            }
+            let response = c
+                .req(reqwest::Method::POST, "/api/lookup/bulk")
+                .timeout(std::time::Duration::from_secs(100))
+                .json(&body)
+                .send()?;
+            let status = response.status().as_u16();
+            let value: Value = response.json().unwrap_or(Value::Null);
+            if !(200..300).contains(&status) {
+                eprintln!(
+                    "delegate read failed ({status}): {}",
+                    value["error"].as_str().unwrap_or("non-JSON or empty response")
+                );
+                return Ok(3);
+            }
+            if *as_json {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                println!("{}", value["text"].as_str().unwrap_or(""));
+                eprintln!(
+                    "amux delegate: verdict=completed via={} files={} lines={} bytes={} elapsed_ms={} board={}:{}",
+                    value["via"].as_str().unwrap_or("?"),
+                    value["n_considered"],
+                    value["input_lines"],
+                    value["input_bytes"],
+                    value["elapsed_ms"],
+                    value["board_evidence"]["verdict"].as_str().unwrap_or("?"),
+                    value["board_evidence"]["card_id"].as_str().unwrap_or("-")
+                );
+            }
+            Ok(0)
         }
     }
 }

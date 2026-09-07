@@ -815,3 +815,39 @@ fn worker_configurations_are_editable_from_backlog_through_terminal_states() {
         assert!(css.contains(needle), "Configurations layout lost `{needle}`");
     }
 }
+
+#[test]
+fn worker_board_opens_current_work_without_expanding_every_idle_lane() {
+    let app = asset("app.js");
+    let start = app
+        .find("function toggleSessionGroup(name, currentlyCollapsed)")
+        .expect("worker board needs a visible-state toggle");
+    let tail = &app[start..];
+    let end = tail
+        .find("function _issueRowHTML")
+        .expect("collapse predicate must remain in the board-view section");
+    let board = &tail[..end];
+
+    assert!(
+        board.contains("Object.prototype.hasOwnProperty.call(_sessionGroupCollapsed, name)"),
+        "a saved user choice must beat the automatic default"
+    );
+    assert!(
+        board.contains("status === 'doing' || status === 'review'"),
+        "in-flight work must default open"
+    );
+    assert!(
+        board.contains("_sessionGroupCollapsed[name] = !currentlyCollapsed"),
+        "the first click must invert the state on screen, including a default-closed group"
+    );
+    assert!(
+        app.contains("kind: 'board-worker-density'")
+            && app.contains("verdict: 'idle-history-collapsed'")
+            && app.contains("n_considered: sessionNames.length"),
+        "the density fix needs a measured client-log signal"
+    );
+    assert!(
+        !board.contains("const collapsed = _sessionGroupCollapsed[name || '__none__']"),
+        "the old undefined-means-every-worker-open default returned"
+    );
+}

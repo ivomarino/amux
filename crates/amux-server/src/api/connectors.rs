@@ -482,7 +482,7 @@ fn google_redirect_uri() -> String {
 /// `X-Amux-*` and drops inbound copies from clients. If that ever stops holding,
 /// this becomes domain-wide impersonation — keep the gateway's header-strip in
 /// step with this.
-fn impersonation_subject(headers: &HeaderMap) -> Option<String> {
+fn impersonation_subject(headers: &HeaderMap, home: &std::path::Path) -> Option<String> {
     if let Some(v) = headers
         .get("x-amux-user-email")
         .and_then(|h| h.to_str().ok())
@@ -491,7 +491,7 @@ fn impersonation_subject(headers: &HeaderMap) -> Option<String> {
     {
         return Some(v.to_string());
     }
-    super::google_sa::sa_config().map(|(_, subject)| subject)
+    super::google_sa::sa_config_in(home).map(|(_, subject)| subject)
 }
 
 /// Does a provider have an OAuth token on disk? Tokens live under
@@ -865,7 +865,7 @@ async fn mattermost_login(
 /// accepted for parity with the scope explain link but the status here is
 /// global (credential presence + token); per-scope enablement is the scope
 /// read.
-async fn list(State(state): State<AppState>) -> Response {
+async fn list(State(state): State<AppState>, Extension(ctx): Extension<Arc<ConnectorsCtx>>) -> Response {
     let file_env = parse_env_file(&amux_home().join("server.env"));
     // Pre-resolve every (provider, key) credential up front: resolve_cred's
     // SecretStore tier needs an .await, and the per-provider status below is
@@ -899,7 +899,7 @@ async fn list(State(state): State<AppState>) -> Response {
             // Where the credential came from, so the tab can say "reusing the
             // existing Google client" rather than looking un-configured (AMUX-3341).
             let in_server_env = keys.iter().all(|k| env_val(&file_env, k).is_some());
-            let cred_source = if p.category == "Google" && super::google_sa::sa_config().is_some() {
+            let cred_source = if p.category == "Google" && super::google_sa::sa_config_in(&ctx.home).is_some() {
                 json!("service account (domain-wide delegation)")
             } else if !all_creds_set {
                 Value::Null
@@ -931,8 +931,8 @@ async fn list(State(state): State<AppState>) -> Response {
             // if the key file still exists. sa_usable() checks that; reading
             // "connected" off a configured-but-missing key is the dishonest
             // status that turned a moved key into a silent 502 (AMUX-3383).
-            let sa_configured = p.category == "Google" && super::google_sa::sa_config().is_some();
-            let sa_available = p.category == "Google" && super::google_sa::sa_usable();
+            let sa_configured = p.category == "Google" && super::google_sa::sa_config_in(&ctx.home).is_some();
+            let sa_available = p.category == "Google" && super::google_sa::sa_usable_in(&ctx.home);
             let sa_key_gone = sa_configured && !sa_available;
             // Status ladder, most-blocked first.
             let status = if sa_available {
@@ -1885,7 +1885,10 @@ async fn complete_exchange(
 /// (broker) lands, since there is no stored access token to present yet. The
 /// bearer value is NEVER logged — only the provider id, HTTP status and latency
 /// (grep `connector_test`).
-async fn test_connection(Path(id): Path<String>) -> Response {
+async fn test_connection(
+    Extension(ctx): Extension<Arc<ConnectorsCtx>>,
+    Path(id): Path<String>,
+) -> Response {
     // DECLARED CONNECTORS TEST GENERICALLY (AMUX-3993). The builtin ladder below
     // branches per `Auth` because each vendor family has its own shape; a row
     // declared in the tab has no such knowledge, so all amux can honestly do is
@@ -1992,7 +1995,7 @@ async fn test_connection(Path(id): Path<String>) -> Response {
             // service-account domain-wide delegation (AMUX-3347) — no per-user
             // browser grant. If no SA is configured, fall back to the honest
             // "connect first" until the OAuth broker (AMUX-3192) lands.
-            if p.category == "Google" && super::google_sa::sa_config().is_some() {
+            if p.category == "Google" && super::google_sa::sa_config_in(&ctx.home).is_some() {
                 match super::google_sa::mint_token(scopes).await {
                     Ok(tok) => tok,
                     Err(e) => {
@@ -2237,7 +2240,7 @@ async fn mint_connector_token(
             // Named an account nobody holds a grant for: if the SA can
             // impersonate it, fall through to the SA path with it as subject;
             // otherwise the honest answer names how to connect it.
-            if !(p.category == "Google" && super::google_sa::sa_usable()) {
+            if !(p.category == "Google" && super::google_sa::sa_usable_in(&ctx.home)) {
                 return (
                     StatusCode::NOT_FOUND,
                     Json(json!({
@@ -2254,7 +2257,8 @@ async fn mint_connector_token(
         }
         None => None,
     };
-    if user_account.is_none() && !(p.category == "Google" && super::google_sa::sa_config().is_some())
+    if user_account.is_none()
+        && !(p.category == "Google" && super::google_sa::sa_config_in(&ctx.home).is_some())
     {
         // No SA: fall back to the user-grant store. One stored account is
         // unambiguous; several need `?account=`; none is an honest "connect
@@ -2291,7 +2295,7 @@ async fn mint_connector_token(
     if let Some(acct) = user_account {
         return mint_from_user_grant(&ctx, p, family, &acct, &scope).await;
     }
-    let Some(subject) = impersonation_subject(&headers) else {
+    let Some(subject) = impersonation_subject(&headers, &ctx.home) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"ok": false, "status": "error", "detail": "no impersonation subject (GOOGLE_SA_SUBJECT unset and no X-Amux-User-Email)"})),
@@ -3101,17 +3105,24 @@ mod tests {
     fn impersonation_subject_prefers_the_gateway_header_and_ignores_blank() {
         // Cloud path: the gateway-injected user is impersonated verbatim, so a
         // minted token is bound to the requester, not the whole domain.
+        // An empty home, so the fall-through arm resolves against THIS home's
+        // (absent) server.env rather than whatever the box running the suite
+        // has exported (AF-529).
+        let home = tempfile::tempdir().unwrap();
         let mut h = HeaderMap::new();
         h.insert("x-amux-user-email", "alice@mixpeek.com".parse().unwrap());
         assert_eq!(
-            impersonation_subject(&h).as_deref(),
+            impersonation_subject(&h, home.path()).as_deref(),
             Some("alice@mixpeek.com")
         );
         // A blank header must never become the subject — it falls through to the
         // configured subject (or None), never impersonates "   ".
         let mut blank = HeaderMap::new();
         blank.insert("x-amux-user-email", "   ".parse().unwrap());
-        assert_ne!(impersonation_subject(&blank).as_deref(), Some("   "));
+        assert_ne!(
+            impersonation_subject(&blank, home.path()).as_deref(),
+            Some("   ")
+        );
     }
 
     #[test]

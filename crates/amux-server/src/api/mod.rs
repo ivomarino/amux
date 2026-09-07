@@ -308,6 +308,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions-git", axum::routing::get(sessions_git::sessions_git))
         .route("/api/board/themes", axum::routing::get(board_themes::board_themes))
         .route("/api/lookup", axum::routing::post(lookup::lookup))
+        .route(
+            "/api/lookup/bulk",
+            axum::routing::post(lookup::bulk_read)
+                // JSON may escape one source byte as six (`\u0000`); the
+                // handler still enforces 512 KiB of decoded file content.
+                .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024)),
+        )
         .route("/api/skin", axum::routing::get(skin::get_skin))
         .route("/api/config/export", axum::routing::get(config_iac::export))
         .route("/api/config/apply", axum::routing::put(config_iac::apply))

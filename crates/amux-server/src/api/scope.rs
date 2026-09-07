@@ -709,6 +709,52 @@ pub async fn handler(State(state): State<AppState>, req: Request) -> Response {
     };
     let level = level_owned.trim();
     let name = q.get("name").map(|s| s.trim()).unwrap_or("");
+    // AN UNKNOWN PARAM IS REFUSED, NOT DROPPED (AF-518).
+    //
+    // This handler reads `level` and `name` only. Anything else was silently
+    // discarded, and because `level` defaults to "global" and global needs no
+    // name, `?worker=backend` did not fail — it answered a DIFFERENT question
+    // confidently, reporting the global env file and the global key list.
+    //
+    // Measured 2026-09-06: backend set a worker-scoped override, verified it
+    // with `?worker=backend`, saw the global file's keys echoed back, and we
+    // both concluded the write had failed. It had not — `?level=worker&
+    // name=backend` shows ~/.amux/sessions/backend.env with the value in it. The
+    // read was correct the whole time and the request was not the one either of
+    // us thought we were making. I then sent them an urgent, wrong correction
+    // about their own machine off the back of it.
+    //
+    // The response DOES echo `level` and `name`, so it was honest — but an echo
+    // nobody reads is not a disclosure, and the failure mode is a confident
+    // wrong answer rather than an error. Same remedy and same reason as
+    // `audit_trail` in schedules.rs (AC-228): "a filter that silently matches
+    // everything returns a confident wrong answer."
+    //
+    // The message names the likely intent rather than only the rule, because
+    // `worker=` is the natural guess and the correct spelling is two params.
+    let unknown: Vec<&str> =
+        q.keys().map(String::as_str).filter(|k| !matches!(*k, "level" | "name")).collect();
+    if !unknown.is_empty() {
+        let hint = unknown
+            .iter()
+            .find(|k| matches!(**k, "worker" | "session" | "lane" | "group"))
+            .map(|k| {
+                let v = q.get(*k).map(String::as_str).unwrap_or("<name>");
+                let lvl = if *k == "group" { "group" } else { "worker" };
+                format!(" Did you mean `?level={lvl}&name={v}`?")
+            })
+            .unwrap_or_default();
+        return j(
+            400,
+            json!({
+                "error": format!("unknown query param(s): {unknown:?}.{hint}"),
+                "accepted": ["level", "name"],
+                "why": "ignoring it would answer a different question than you asked: \
+                        `level` defaults to global and global needs no name, so an \
+                        unrecognised param silently returns the GLOBAL scope",
+            }),
+        );
+    }
     if !matches!(level, "global" | "group" | "worker") {
         return j(400, json!({"error": "level must be global, group or worker"}));
     }
@@ -1218,6 +1264,51 @@ mod tests {
         let status = res.status();
         let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
         (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    /// AF-518 — an unknown query param must be REFUSED, not dropped.
+    ///
+    /// `level` defaults to "global" and global needs no `name`, so
+    /// `?worker=backend` did not fail: it answered the GLOBAL scope, confidently
+    /// and with a straight face. Measured 2026-09-06 — backend set a
+    /// worker-scoped override, verified it with `?worker=backend`, got the
+    /// global key list back, and we both concluded the write had failed. It had
+    /// not. I then sent them an urgent and wrong correction about their own
+    /// machine.
+    #[tokio::test]
+    async fn an_unknown_scope_param_is_refused_and_names_the_likely_intent() {
+        let st = state();
+        let app = app(&st);
+
+        let (code, body) = call(&app, "GET", "/api/scope?worker=backend", None, None).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "?worker= silently answered global: {body}");
+        let err = body["error"].as_str().unwrap_or_default();
+        assert!(err.contains("worker"), "the refusal does not name the offending param: {err}");
+        assert!(
+            err.contains("level=worker&name=backend"),
+            "the refusal does not teach the correct spelling, which is the whole point: {err}"
+        );
+
+        // Other natural guesses get the same treatment.
+        for (uri, want) in [
+            ("/api/scope?session=alpha", "level=worker&name=alpha"),
+            ("/api/scope?group=amux", "level=group&name=amux"),
+        ] {
+            let (code, body) = call(&app, "GET", uri, None, None).await;
+            assert_eq!(code, StatusCode::BAD_REQUEST, "{uri} was accepted");
+            assert!(
+                body["error"].as_str().unwrap_or_default().contains(want),
+                "{uri} did not suggest {want}: {body}"
+            );
+        }
+
+        // THE CONTROL, and without it the clause could reject everything: the
+        // documented spellings must still work.
+        for uri in ["/api/scope", "/api/scope?level=global",
+                    "/api/scope?level=worker&name=backend"] {
+            let (code, _) = call(&app, "GET", uri, None, None).await;
+            assert_eq!(code, StatusCode::OK, "{uri} — a valid request was refused");
+        }
     }
 
     fn fleet(home: &Path, sessions: &[(&str, &str, bool)]) {
