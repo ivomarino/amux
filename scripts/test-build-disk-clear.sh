@@ -282,8 +282,22 @@ else bad "(l) the override must SAY it overrode a peer, not clear silently" "$ou
 # Recorded rather than deleted, because the next reader will be tempted to
 # "fix" this back to an exit-code test.)
 #
+# AMUX-134: "read the output, not the exit code" describes what the IF BELOW
+# does, not what this ASSIGNMENT does. `{ pgrep -x rustc; pgrep -x cargo; }`
+# exits 1 (from the last pgrep, per the note above) on the overwhelmingly
+# common "no real build running" host — under `pipefail` that 1 survives the
+# pipe into `tr`, and under this script's own `set -euo pipefail` a plain
+# assignment statement that ends nonzero kills the WHOLE SCRIPT right here,
+# silently (bash's own errexit trap leaves no trace beyond the EXIT trap
+# firing) — before the `if` below ever gets to read the output at all. Caught
+# 2026-09-07 (CI red, AMUX-134) because CI runners never have a stray cargo/
+# rustc process to accidentally mask it; this dev box does, most of the time,
+# which is exactly backwards from the host-dependence the comment above
+# already worried about. `|| true` makes "nothing found" the unremarkable
+# case it always was semantically, without changing what the `if` reads.
+#
 # The shipped detector consumes the output too, so it is unaffected either way.
-_real_builds="$( { pgrep -x rustc; pgrep -x cargo; } 2>/dev/null | tr -d '[:space:]')"
+_real_builds="$( { pgrep -x rustc; pgrep -x cargo; } 2>/dev/null | tr -d '[:space:]' || true )"
 if [ -n "$_real_builds" ]; then
   echo "SKIP (m): a real cargo/rustc is running on this host, so the no-peer"
   echo "         precondition cannot be established. Not counted as a pass."
