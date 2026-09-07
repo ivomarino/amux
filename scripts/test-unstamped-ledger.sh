@@ -20,7 +20,7 @@
 #
 # Exit 0 = pass, 1 = failure, 2 = skipped (server unreachable — the test needs a
 # live /api/history and says so rather than passing vacuously).
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PASS=0; FAIL=0

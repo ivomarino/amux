@@ -21,7 +21,7 @@
 # guard infers the repo from the working directory and cannot see a `cd` inside
 # a compound command, so a scratch `git reset` reads as a reset of the real
 # tree. Its own refusal names this form as the fix.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 HOOK="$(pwd)/scripts/git-hooks/pre-commit"
 PASS=0; FAIL=0

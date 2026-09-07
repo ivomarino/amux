@@ -15,7 +15,7 @@
 #
 # Cell B is the one that stops the "fix" being a hollowing-out: a scanner that
 # classified NOTHING as double-delivery would pass cell A perfectly.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 # Overridable so the pre-fix copy can be run through the SAME cells (rule 7:
 # a check that cannot fail on the case that motivated it is theatre).

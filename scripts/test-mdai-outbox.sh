@@ -19,7 +19,7 @@
 # stops any other path handing the panel a 202 it reads as output.
 #
 # Drives the SHIPPED functions extracted from app.js, never a retyped copy.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 APP=crates/amux-dashboard/static/app.js
 PASS=0; FAIL=0

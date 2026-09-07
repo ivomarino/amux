@@ -31,7 +31,7 @@
 # lucky", which is exactly the silent-green this repo keeps getting bitten by. The
 # shape is the invariant; assert the invariant. The race proved the shape matters,
 # once. This proves the shape is still there, every run.
-set -uo pipefail
+set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLI="$ROOT/amux"

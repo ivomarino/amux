@@ -14,7 +14,7 @@
 #
 # The cells exec the SHIPPED rendering block lifted out of the hook file, not a
 # retyped copy: the strings under test are the strings that ship (ethos rule 7).
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 HOOK="${STAGED_GUARD_HOOK:-$(pwd)/scripts/git-hooks/amux-staged-guard}"
 PASS=0; FAIL=0

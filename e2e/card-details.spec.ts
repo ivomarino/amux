@@ -109,4 +109,53 @@ test.describe('board card details', () => {
 
     await request.delete(`/api/board/${encodeURIComponent(card)}`, { headers: auth });
   });
+
+  test('terminal Refresh rehydrates the durable final summary without asking the worker', async ({ page, request }) => {
+    let statusRequests = 0;
+    page.on('request', r => {
+      if (r.url().includes('/status-request')) statusRequests += 1;
+    });
+
+    await page.goto('/');
+    const token = await page.evaluate(() => (window as any)._AMUX_AUTH_TOKEN);
+    const auth = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+    const worker = 'terminal-summary-refresh-worker';
+    const created = await request.post('/api/board', {
+      headers: { ...auth, 'X-Amux-Worker': worker },
+      data: { title: 'durable terminal summary refresh', status: 'doing', type: 'chore', session: worker },
+    });
+    expect(created.ok()).toBeTruthy();
+    const card = (await created.json()).id as string;
+    const artifact = '/tmp/ate-84-terminal-summary.txt';
+    const attached = await request.post(`/api/board/${encodeURIComponent(card)}/artifacts`, {
+      headers: auth,
+      data: { kind: 'verification', ref: artifact, state: 'created', description: 'focused acceptance output' },
+    });
+    expect(attached.ok()).toBeTruthy();
+    const finished = await request.patch(`/api/board/${encodeURIComponent(card)}`, {
+      headers: { ...auth, 'X-Amux-Worker': worker },
+      data: {
+        status: 'done',
+        evidence: 'tests: focused board API and Playwright acceptance passed; deployment: https://example.test/ate-84; live acceptance: passed',
+        gate_ack: true,
+      },
+    });
+    expect(finished.ok()).toBeTruthy();
+
+    await page.goto(`/#issue=${encodeURIComponent(card)}`);
+    await expect(page.locator('#board-detail-overlay')).toHaveClass(/active/, { timeout: 30_000 });
+    await expect(page.locator('#bd-status-banner')).toContainText('Final outcome: done', { timeout: 15_000 });
+    await expect(page.locator('#bd-meta')).toContainText('Tests/deployment/live evidence:');
+    await expect(page.locator('#bd-meta')).toContainText('Produced assets');
+    await expect(page.locator('#bd-meta')).toContainText(artifact);
+
+    const refresh = page.locator('#bd-status-banner button', { hasText: `Refresh from ${worker}` });
+    await expect(refresh).toHaveCount(1);
+    await refresh.click();
+    await expect(page.locator('#bd-status-banner')).toContainText('Final outcome: done');
+    await expect(page.locator('#bd-meta')).toContainText('focused board API and Playwright acceptance passed');
+    expect(statusRequests, 'terminal Refresh must read the board, not ask the provider').toBe(0);
+
+    await request.delete(`/api/board/${encodeURIComponent(card)}`, { headers: auth });
+  });
 });

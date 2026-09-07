@@ -11,7 +11,12 @@
 # Author-only verification of the most safety-critical path is what the peer
 # gate exists to prevent, so the fix is not to argue about it — it is to make
 # the cells runnable by anyone.
-set -uo pipefail
+set -euo
+
+# AF-562: the four `if ... then rc=0; else rc=$?; fi` captures below wrap commands
+# whose NON-ZERO STATUS IS THE ASSERTION. Under `set -e` a bare `cmd; rc=$?`
+# aborts before the capture. `if` is the set -e-safe form; `|| true` is NOT,
+# because it would discard the exact value the next line tests. pipefail
 # Overridable so the cells below can be run against a DELIBERATELY BROKEN copy,
 # which is how they get shown to fail. Never mutate mutate.sh in place to do
 # that: bash reads a running script incrementally, so editing the file being
@@ -28,13 +33,13 @@ fresh() { printf 'alpha\nbeta\ngamma\n' > "$TMP/f.txt"; }
 
 # 1. HAPPY PATH: applies, runs, reverts, file identical.
 fresh; before=$(cat "$TMP/f.txt")
-out=$("$MUT" run "$TMP/f.txt" beta BETA -- true 2>&1); rc=$?
+if out=$("$MUT" run "$TMP/f.txt" beta BETA -- true 2>&1); then rc=0; else rc=$?; fi
 [ "$rc" -eq 0 ] && ok "happy path exits 0" || bad "happy path exit $rc"
 [ "$(cat "$TMP/f.txt")" = "$before" ] && ok "happy path restores the file" || bad "happy path left residue"
 
 # 2. FAILING COMMAND: the command's exit status is preserved, file restored.
 fresh
-"$MUT" run "$TMP/f.txt" beta BETA -- sh -c 'exit 7' >/dev/null 2>&1; rc=$?
+if "$MUT" run "$TMP/f.txt" beta BETA -- sh -c 'exit 7' >/dev/null 2>&1; then rc=0; else rc=$?; fi
 [ "$rc" -eq 7 ] && ok "failing command preserves exit 7" || bad "expected 7, got $rc"
 [ "$(cat "$TMP/f.txt")" = "$before" ] && ok "failing command restores the file" || bad "residue after failure"
 
@@ -57,7 +62,7 @@ mpid=$!
 sleep 1
 [ "$(cat "$TMP/f.txt")" != "$before" ] && ok "mutation is in place while the command runs" || bad "mutation never landed, so the kill below proves nothing"
 kill -TERM "$mpid" 2>/dev/null
-wait "$mpid" 2>/dev/null; rc=$?
+if wait "$mpid" 2>/dev/null; then rc=0; else rc=$?; fi
 out=$(cat "$TMP/out")
 [ "$(cat "$TMP/f.txt")" = "$before" ] && ok "killed TOOL still restores the file" || bad "KILLING THE TOOL LEFT THE MUTATION IN PLACE"
 n=$(printf '%s\n' "$out" | grep -c 'revert: LANDED')
@@ -67,18 +72,23 @@ printf '%s\n' "$out" | grep -q 'NOT applied' && bad "printed a failed-restore me
 # 3b. A child that dies on its own is the ORDINARY path, not the trap path:
 #     exit status preserved, file restored.
 fresh
-"$MUT" run "$TMP/f.txt" beta BETA -- timeout 1 sleep 5 >/dev/null 2>&1; rc=$?
+if "$MUT" run "$TMP/f.txt" beta BETA -- timeout 1 sleep 5 >/dev/null 2>&1; then rc=0; else rc=$?; fi
 [ "$rc" -eq 124 ] && ok "child killed by timeout preserves exit 124" || bad "expected 124, got $rc"
 [ "$(cat "$TMP/f.txt")" = "$before" ] && ok "child killed by timeout restores the file" || bad "residue after child timeout"
 
 # 4. ABSENT TARGET: refuses, and the command must never run.
 fresh; rm -f "$TMP/ran"
-"$MUT" run "$TMP/f.txt" nosuchstring X -- touch "$TMP/ran" >/dev/null 2>&1
+# EXPECTED TO REFUSE (non-zero). The assertion is the ABSENCE of $TMP/ran on the
+# next line, so the status is deliberately discarded here — and `|| true` is the
+# right form precisely because nothing reads it (AF-562).
+"$MUT" run "$TMP/f.txt" nosuchstring X -- touch "$TMP/ran" >/dev/null 2>&1 || true
 [ ! -f "$TMP/ran" ] && ok "absent target never runs the command" || bad "ran the command despite refusing"
 
 # 5. AMBIGUOUS TARGET: refuses rather than half-mutating (the cell amux hit for real).
 printf 'dup\ndup\n' > "$TMP/g.txt"; rm -f "$TMP/ran"
-"$MUT" run "$TMP/g.txt" dup X -- touch "$TMP/ran" >/dev/null 2>&1
+# Same: refusal is expected, and the two assertions below read the FILESYSTEM,
+# not the status.
+"$MUT" run "$TMP/g.txt" dup X -- touch "$TMP/ran" >/dev/null 2>&1 || true
 [ ! -f "$TMP/ran" ] && ok "ambiguous target never runs the command" || bad "ran the command on an ambiguous target"
 [ "$(cat "$TMP/g.txt")" = "$(printf 'dup\ndup\n')" ] && ok "ambiguous target leaves the file untouched" || bad "half-mutated an ambiguous file"
 

@@ -2760,6 +2760,83 @@ pub fn is_terminal_status(s: &str) -> bool {
     TERMINAL_STATUSES.contains(&s)
 }
 
+/// Keep the durable terminal outcome compact enough for the board list/detail
+/// payload while leaving the complete evidence and append-only log untouched.
+/// This is deliberately mechanical: the board records what was written, it
+/// does not ask a provider to reinterpret its own output.
+fn compact_terminal_text(text: &str, limit: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= limit {
+        compact
+    } else {
+        let mut truncated = compact.chars().take(limit.saturating_sub(1)).collect::<String>();
+        truncated.push('…');
+        truncated
+    }
+}
+
+fn terminal_action_digest(log: Option<&str>) -> (usize, String) {
+    let mut count = 0;
+    let mut latest = None;
+    for line in log.unwrap_or_default().lines() {
+        let body = line
+            .strip_prefix('`')
+            .and_then(|rest| rest.find('`').map(|end| &rest[end + 1..]))
+            .unwrap_or(line)
+            .trim();
+        if body.is_empty() || body.starts_with("authz:") {
+            continue;
+        }
+        count += 1;
+        latest = Some(compact_terminal_text(body, 240));
+    }
+    (count, latest.unwrap_or_else(|| "none recorded".into()))
+}
+
+/// Build the one terminal summary that both the API and dashboard can render.
+/// Artifact-registry refs are combined with refs in evidence so a proof link
+/// cannot disappear merely because an older producer did not register it.
+fn terminal_summary(
+    conn: &Connection,
+    row: &IssueRow,
+    from: &str,
+) -> rusqlite::Result<(String, usize)> {
+    let (action_count, latest_action) = terminal_action_digest(row.log.as_deref());
+    let evidence = compact_terminal_text(row.evidence.as_deref().unwrap_or("not recorded"), 1200);
+    let recorded_outcome = row
+        .last_result
+        .as_deref()
+        .filter(|summary| !summary.starts_with("Final outcome:"))
+        .map(|summary| compact_terminal_text(summary, 600))
+        .unwrap_or_else(|| "not supplied".to_string());
+    let mut assets = Vec::new();
+    let mut seen = HashSet::new();
+    for artifact in crate::db::artifact_store::list_for_task(conn, &row.id)? {
+        if !artifact.ref_value.trim().is_empty() && seen.insert(artifact.ref_value.clone()) {
+            assets.push(artifact.ref_value);
+        }
+    }
+    if let Some(evidence_text) = row.evidence.as_deref() {
+        for reference in asset_refs(evidence_text) {
+            if seen.insert(reference.clone()) {
+                assets.push(reference);
+            }
+        }
+    }
+    let linked_assets = if assets.is_empty() {
+        "none recorded".to_string()
+    } else {
+        assets.join(", ")
+    };
+    Ok((
+        format!(
+            "Final outcome: {} (from {}). Recorded terminal outcome: {}. Actions: {} recorded; latest: {}. Tests/deployment/live evidence: {}. Linked assets: {}.",
+            row.status, from, recorded_outcome, action_count, latest_action, evidence, linked_assets
+        ),
+        assets.len(),
+    ))
+}
+
 /// `closed_at` for the row about to be written (AMUX-3609).
 ///
 /// Lives INSIDE `save_patched` rather than at the nine call sites that change a
@@ -2848,6 +2925,32 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
     let previous_status: Option<String> = conn
         .query_row("SELECT status FROM issues WHERE id = ?1", params![row.id], |r| r.get(0))
         .ok();
+    let terminal_transition = previous_status
+        .as_deref()
+        .is_some_and(|status| status != row.status && is_terminal_status(&row.status));
+    // A card closed before this rule shipped has no authoritative final
+    // summary. Repair it on the next durable board write using only its
+    // structured evidence, log, and registered assets; this makes the failing
+    // ATE-75 specimen recoverable without mutating its relations or source.
+    let needs_terminal_summary = terminal_transition
+        || (is_terminal_status(&row.status)
+            && !row
+                .last_result
+                .as_deref()
+                .is_some_and(|summary| summary.starts_with("Final outcome:")));
+    let mut terminal_summary_assets = 0;
+    if needs_terminal_summary {
+        let from = previous_status.as_deref().unwrap_or("new");
+        let (summary, asset_count) = terminal_summary(conn, row, from)?;
+        row.last_result = Some(summary.clone());
+        let hhmm = chrono::Local::now().format("%H:%M").to_string();
+        row.log = Some(append_log(
+            row.log.as_deref(),
+            &hhmm,
+            &format!("STATUS (board): {summary}"),
+        ));
+        terminal_summary_assets = asset_count;
+    }
     if previous_status
         .as_deref()
         .is_some_and(|s| !is_terminal_status(s))
@@ -2858,7 +2961,7 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
         row.callback_state = Some("pending".into());
         row.callback_error = None;
     }
-    conn.execute(
+    let changed = conn.execute(
         "UPDATE issues SET title = ?1, \"desc\" = ?2, status = ?3, session = ?4, due = ?5, \
              due_time = ?6, owner_type = ?7, pinned = ?8, pos = ?9, gate = ?10, shepherd = ?11, \
              type = ?12, archived = ?13, depends_on = ?14, reviewer = ?15, log = ?16, \
@@ -2921,7 +3024,19 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
             row.callback_error,
             row.ask_actor,
         ],
-    )
+    )?;
+    if needs_terminal_summary && changed == 1 {
+        tracing::info!(
+            target: "amux::board",
+            marker = "terminal_summary_recorded",
+            task_id = %row.id,
+            from = previous_status.as_deref().unwrap_or("new"),
+            to = %row.status,
+            artifacts = terminal_summary_assets,
+            "board terminal transition recorded a final summary"
+        );
+    }
+    Ok(changed)
 }
 
 /// Replace the tag set (Python PATCH semantics: `tags` is the full new set).

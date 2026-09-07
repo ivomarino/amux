@@ -12,7 +12,7 @@
 #
 # Runs the SHIPPED fleet-boot.sh, with AMUX_BIN and AMUX_FLEET_BOOT_BASE pointed
 # at stubs. No real worker is ever started by this file.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 BOOT="${FLEET_BOOT_SH:-$(pwd)/scripts/fleet-boot.sh}"
 PASS=0; FAIL=0

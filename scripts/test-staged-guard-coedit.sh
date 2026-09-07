@@ -16,7 +16,7 @@
 # hollowed out, which is the failure this whole file family exists to prevent.
 #
 # Runs the SHIPPED loop body against a real git fixture, not a paraphrase.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 HOOK="${STAGED_GUARD_HOOK:-$(pwd)/scripts/git-hooks/amux-staged-guard}"
 PASS=0; FAIL=0

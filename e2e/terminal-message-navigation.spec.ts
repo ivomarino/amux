@@ -3,6 +3,7 @@ import { test, expect } from './fixtures';
 // Exercise the shipped renderer and actual header buttons, including ANSI spans
 // that used to cross block boundaries and Codex's different prompt glyph.
 test.beforeEach(async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem('amux_walkthrough_done', '1'));
   await page.goto('/');
   await page.waitForFunction(() => typeof (window as any).highlightPrompts === 'function');
   await page.evaluate(() => {
@@ -68,32 +69,121 @@ test('header arrows land at the start of a long message and hold through refresh
 });
 
 test('search navigation shares real matches and reports an empty filter', async ({ page }) => {
-  const positions = await page.locator('#peek-search-wrap').evaluate(el => {
-    const input = el.querySelector('input')!.getBoundingClientRect();
-    return [...el.querySelectorAll('.peek-nav-btn')].map(button => ({left: button.getBoundingClientRect().left - input.left, width: input.width}));
-  });
-  for (const position of positions) expect(position.left).toBeGreaterThan(position.width - 65);
+  await expect(page.locator('#peek-search-wrap')).toBeHidden();
   const beacons: any[] = [];
   await page.route('**/api/client-debug', async route => {
     beacons.push(route.request().postDataJSON());
     await route.fulfill({ json: { ok: true } });
   });
   await page.evaluate(() => {
-    eval('lastPeekHTML = "needle\\n" + "output\\n".repeat(60) + "needle"; peekSearchQuery = "needle";');
-    (window as any).applyPeekSearch();
+    eval('lastPeekHTML = "needle\\n" + "output\\n".repeat(60) + "needle";');
   });
+  await page.getByRole('button', { name: 'Find in terminal', exact: true }).click();
+  await page.getByRole('searchbox', { name: 'Find in terminal', exact: true }).fill('needle');
+  await expect(page.locator('#peek-msg-kind')).toHaveValue('matches');
+  await expect(page.locator('#peek-msg-kind')).toBeDisabled();
   await page.getByRole('button', { name: 'Next message', exact: true }).click();
-  await expect(page.locator('#peek-msg-count')).toHaveText('Matches 2/2');
+  await expect(page.locator('#peek-msg-count')).toHaveText('2/2');
   await expect.poll(() => beacons.filter(b => b.verdict === 'landed').length).toBe(1);
+  await page.locator('#peek-search').press('Enter');
+  await expect(page.locator('#peek-msg-count')).toHaveText('1/2');
+  await page.getByRole('button', { name: 'Next message', exact: true }).click();
+  await expect(page.locator('#peek-msg-count')).toHaveText('2/2');
+  await page.locator('#peek-search').press('Escape');
+  await expect(page.locator('#peek-search-wrap')).toBeHidden();
+  await expect(page.locator('#peek-overlay')).toBeVisible();
+  await expect(page.locator('#peek-msg-kind')).toBeEnabled();
+  await page.locator('#peek-msg-kind').selectOption('human');
   await page.evaluate(() => {
-    eval('peekSearchQuery = ""; _peekMsgNavKind = "human";');
     document.getElementById('peek-body')!.innerHTML = '';
   });
   await page.route('**/api/sessions/nav-probe/log?*', route => route.fulfill({ status: 404, json: { error: 'missing' } }));
   await page.getByRole('button', { name: 'Next message', exact: true }).click();
   await expect.poll(() => beacons.filter(b => b.verdict === 'no-targets').length).toBe(1);
-  await expect(page.locator('#peek-msg-count')).toHaveText('Human 0');
+  await expect(page.locator('#peek-msg-count')).toHaveText('0');
   await expect(page.locator('#toast')).toContainText('This worker has no saved earlier output.');
+});
+
+test('toolbar has one horizontal row, explicit filters and reachable named actions', async ({ page }) => {
+  await page.evaluate(() => {
+    eval("sessions.push({name:'nav-probe',dir:'/tmp/toolbar-probe',running:true}); peekSessionDir='/tmp/toolbar-probe';");
+    (window as any)._peekMsgCount([]);
+  });
+  const geometry = await page.locator('.peek-toolbar').evaluate(el => ({
+    height: el.getBoundingClientRect().height,
+    overflow: el.scrollWidth > el.clientWidth + 1,
+    controls: [...el.querySelectorAll('button,select')].map(c => {
+      const r = c.getBoundingClientRect();
+      // WebKit may return 43.999996 for a 44px control. Keep subpixel precision.
+      return { width: Number(r.width.toFixed(3)), height: Number(r.height.toFixed(3)), visible: c.contains(document.elementFromPoint(r.x + r.width/2, r.y + r.height/2)) };
+    }),
+  }));
+  expect(geometry.height).toBeLessThanOrEqual(48);
+  expect(geometry.overflow).toBe(false);
+  for (const c of geometry.controls) {
+    expect(c.width).toBeGreaterThanOrEqual(44);
+    expect(c.height).toBeGreaterThanOrEqual(44);
+    expect(c.visible).toBe(true);
+  }
+  await page.getByRole('combobox', { name: 'Message type' }).selectOption('session');
+  expect(await page.evaluate(() => eval('_peekMsgNavKind'))).toBe('session');
+  await expect(page.locator('#peek-msg-count')).toHaveText('0');
+  // Empty loaded output may still have earlier messages; these remain actions.
+  await expect(page.getByRole('button', { name: 'Previous message', exact: true })).not.toHaveAttribute('aria-disabled', 'true');
+  await page.locator('#peek-overlay').getByRole('button', { name: 'Worker actions', exact: true }).click();
+  await expect(page.locator('#peek-more-dropdown [data-worker-action="directory"]')).toHaveText('📁Change directory');
+  await expect(page.locator('#peek-more-dropdown [data-worker-action="copy-directory-link"]')).toHaveText('🔗Copy directory link');
+  await expect(page.locator('.peek-dir-bar .card-dir-edit')).toHaveCount(0);
+  // An action stops event propagation. Its outside-click listener must still
+  // be retired, or the next opening click immediately dismisses the menu.
+  const workerMenu = page.locator('#peek-overlay').getByRole('button', { name: 'Worker actions', exact: true });
+  await page.locator('#peek-more-dropdown [data-worker-action="copy-directory-link"]').click();
+  await expect(page.locator('#peek-more-dropdown')).not.toBeVisible();
+  await workerMenu.click();
+  await expect(workerMenu).toHaveAttribute('aria-expanded', 'true');
+  await expect(page.locator('#peek-more-dropdown')).toBeVisible();
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await page.locator('#peek-more-dropdown [data-worker-action="directory"]').click();
+    await expect(page.locator('#edit-title')).toHaveText('Change directory');
+    await expect(page.locator('#edit-input')).toHaveValue('/tmp/toolbar-probe');
+    await page.locator('#edit-overlay').getByRole('button', { name: 'Cancel', exact: true }).click();
+    await workerMenu.click();
+    await expect(workerMenu).toHaveAttribute('aria-expanded', 'true');
+    await expect(page.locator('#peek-more-dropdown')).toBeVisible();
+  }
+
+  await page.locator('#peek-overlay').getByRole('button', { name: 'Worker actions', exact: true }).click();
+  const tabs = page.getByRole('button', { name: 'Customize worker tabs' });
+  await expect(tabs).toContainText('Tabs');
+  const box = await tabs.boundingBox();
+  expect(box!.width).toBeGreaterThanOrEqual(44);
+  expect(box!.height).toBeGreaterThanOrEqual(44);
+  expect(box!.x + box!.width).toBeLessThanOrEqual(page.viewportSize()!.width);
+  await tabs.click();
+  await expect(page.locator('#peek-tab-customizer-menu')).toBeVisible();
+  await expect(tabs).toHaveAttribute('aria-expanded', 'true');
+});
+
+test('a toolbar layout regression announces itself to client diagnostics', async ({ page }) => {
+  const beacons: any[] = [];
+  await page.route('**/api/client-debug', async route => {
+    beacons.push(route.request().postDataJSON());
+    await route.fulfill({ json: { ok: true } });
+  });
+  await page.evaluate(async () => {
+    document.body.style.zoom = '0.8';
+    (window as any)._peekToolbarCheck();
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  });
+  expect(beacons.filter(b => b.kind === 'peek-toolbar-layout')).toHaveLength(0);
+  await page.locator('#peek-msg-nav').evaluate(el => { (el as HTMLElement).style.flexDirection = 'column'; });
+  await page.evaluate(() => (window as any)._peekToolbarCheck());
+  await expect.poll(() => beacons.filter(b => b.kind === 'peek-toolbar-layout').length).toBe(1);
+  const signal = beacons.find(b => b.kind === 'peek-toolbar-layout');
+  expect(signal.verdict).toBe('unusable-controls');
+  expect(signal.measured).toBe(true);
+  expect(signal.n_considered).toBeGreaterThan(0);
 });
 
 test('a scroll gesture ending over a message arrow is inert', async ({ page }) => {
@@ -147,4 +237,23 @@ test('an explicit empty navigation loads earlier output and lands on its message
   await expect.poll(() => beacons.filter(b => b.verdict === 'loaded-earlier').length).toBe(1);
   await expect.poll(() => beacons.filter(b => b.verdict === 'landed').length).toBe(1);
   await expect(page.locator('#toast')).not.toHaveClass(/visible/);
+});
+
+
+test('a worker menu that loses its opening announces the failure', async ({ page }) => {
+  const beacons: any[] = [];
+  await page.route('**/api/client-debug', async route => {
+    beacons.push(route.request().postDataJSON());
+    await route.fulfill({ json: { ok: true } });
+  });
+  await page.evaluate(() => {
+    eval("sessions.push({name:'nav-probe',dir:'/tmp/toolbar-probe',running:true});");
+    (window as any).togglePeekMoreMenu();
+    // Positive diagnostic control: lose the opening before the first paint.
+    (window as any)._closePeekMore();
+  });
+  await expect.poll(() => beacons.filter(b => b.kind === 'worker-action-menu').length).toBe(1);
+  const signal = beacons.find(b => b.kind === 'worker-action-menu');
+  expect(signal).toMatchObject({ verdict: 'open-lost', measured: true, session: 'nav-probe' });
+  expect(signal.n_considered).toBeGreaterThan(20);
 });

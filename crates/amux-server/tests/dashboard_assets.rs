@@ -224,8 +224,8 @@ fn worker_card_and_peek_share_actions_and_the_canonical_file_entry() {
     let inventory = &inventory_tail[..inventory_end];
     assert_eq!(
         inventory.matches("{ key: '").count(),
-        25,
-        "the full running Claude worker fixture has 25 shared worker actions"
+        26,
+        "the full running Claude worker fixture has 26 shared worker actions"
     );
 
     let browse_start = app.find("function _browseWorkerFiles(name, source)")

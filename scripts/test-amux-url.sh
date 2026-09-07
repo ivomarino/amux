@@ -14,7 +14,7 @@
 #
 # Runs the REAL dispatch path as a subprocess with HOME + $AMUX_URL controlled,
 # so it exercises the shipped `url)` case, not a paraphrase of it.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 AMUX_BIN="${AMUX_BIN:-./amux}"
 PASS=0; FAIL=0

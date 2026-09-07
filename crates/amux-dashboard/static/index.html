@@ -2142,26 +2142,42 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <span style="font-size:0.72rem;color:var(--dim);flex-shrink:0;">Task:</span>
       <span id="peek-task-label" style="font-size:0.82rem;font-weight:600;color:var(--text);white-space:nowrap;overflow-x:auto;overflow-y:hidden;flex:0 1 auto;min-width:0;-webkit-overflow-scrolling:touch;scrollbar-width:none;touch-action:pan-x;overscroll-behavior-x:contain;cursor:pointer;" onclick="editField(peekSession,'task',this.textContent.trim())" title="Click to edit task label"></span>
     </div>
-    <div style="display:flex;gap:6px;align-items:center;">
-      <div class="peek-find-wrap" id="peek-search-wrap">
-        <input class="search-input" id="peek-search" type="text" placeholder="Find..." autocomplete="off" autocorrect="off"
-          oninput="peekSearchQuery=this.value;document.getElementById('peek-search-wrap').classList.toggle('has-value',!!this.value);applyPeekSearch()"
-          onkeydown="if(event.key==='Enter'){event.preventDefault();event.shiftKey?peekSearchPrev():peekSearchNext();}">
-        <span class="peek-find-count" id="peek-search-count"></span>
-        <button class="peek-nav-btn" onclick="peekSearchPrev()" title="Previous match (Shift+Enter)">&#x2191;</button>
-        <button class="peek-nav-btn" onclick="peekSearchNext()" title="Next match (Enter)">&#x2193;</button>
-        <button class="search-clear" onclick="event.stopPropagation();clearPeekSearch()">&#x2715;</button>
-      </div>
-      <div class="peek-msg-nav" id="peek-msg-nav" title="Navigate messages (click counter to change kind)">
+    <div class="peek-toolbar">
+      <div class="peek-msg-nav" id="peek-msg-nav" role="group" aria-label="Terminal navigation">
+        <label class="peek-msg-filter" for="peek-msg-kind">
+          <span class="peek-msg-label" id="peek-nav-label">Messages</span>
+          <span class="peek-msg-count" id="peek-msg-count" role="status" aria-live="polite">0</span>
+          <select id="peek-msg-kind" aria-label="Message type" onchange="_peekMsgNavSelect(this.value)">
+            <option value="all">All messages</option>
+            <option value="human">Human</option>
+            <option value="session">Worker</option>
+            <option value="schedule">Scheduled</option>
+            <option value="amux">Harness</option>
+            <option value="unstamped">Unstamped</option>
+            <option value="unknown">Unclassified</option>
+            <option value="matches" hidden>Search results</option>
+          </select>
+        </label>
         <button class="peek-nav-btn" onpointerdown="_peekMsgNavArm(event)" onclick="peekMsgPrev(event)" title="Previous message" aria-label="Previous message">&#x2191;</button>
-        <button class="peek-msg-count" id="peek-msg-count" onclick="_peekMsgNavCycle()" aria-label="Choose message kind" title="Choose message kind">Human 0</button>
         <button class="peek-nav-btn" onpointerdown="_peekMsgNavArm(event)" onclick="peekMsgNext(event)" title="Next message" aria-label="Next message">&#x2193;</button>
       </div>
+      <button class="btn peek-toolbar-btn" id="peek-find-toggle" onclick="togglePeekFind()" title="Find in terminal" aria-label="Find in terminal" aria-expanded="false" aria-controls="peek-search-wrap">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg>
+      </button>
       <div class="peek-more-wrap">
-        <button class="btn" onclick="togglePeekMoreMenu()" id="peek-worker-menu-btn" title="Worker actions">&#x22EE;</button>
+        <button class="btn peek-toolbar-btn" onclick="togglePeekMoreMenu()" id="peek-worker-menu-btn" title="Worker actions" aria-label="Worker actions" aria-haspopup="menu" aria-expanded="false">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
+        </button>
         <div class="peek-more-dropdown" id="peek-more-dropdown" role="menu"></div>
       </div>
-      <button class="btn" id="peek-close-btn" onclick="closePeek()" title="Close" style="font-size:1.1rem;line-height:1;padding:4px 8px;">&#x2715;</button>
+      <button class="btn peek-toolbar-btn" id="peek-close-btn" onclick="closePeek()" title="Close worker" aria-label="Close worker">&#x2715;</button>
+    </div>
+    <div class="peek-find-wrap" id="peek-search-wrap" hidden>
+      <input class="search-input" id="peek-search" type="search" placeholder="Find in terminal…" aria-label="Find in terminal" autocomplete="off" autocorrect="off"
+        oninput="peekSearchQuery=this.value;document.getElementById('peek-search-wrap').classList.toggle('has-value',!!this.value);applyPeekSearch()"
+        onkeydown="if(event.key==='Enter'){event.preventDefault();event.shiftKey?peekSearchPrev():peekSearchNext();}else if(event.key==='Escape'){event.preventDefault();event.stopPropagation();togglePeekFind(false);}">
+      <span class="peek-find-count" id="peek-search-count" aria-live="polite"></span>
+      <button class="search-clear" onclick="clearPeekSearch();document.getElementById('peek-search').focus()" title="Clear search" aria-label="Clear terminal search">&#x2715;</button>
     </div>
   </div>
   <!-- Focus mode minimal bar (visible only in focus mode) -->
@@ -2187,7 +2203,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="peek-tab" id="peek-tab-memory" onclick="setPeekTab('memory')"><span class="tab-ico">&#x1F4DD;</span><span class="tab-lbl">Memory</span></button>
     <button class="peek-tab" id="peek-tab-git" onclick="setPeekTab('git')"><span class="tab-ico">⎇</span><span class="tab-lbl">Worktree</span></button>
     <button class="peek-tab" id="peek-tab-logs" onclick="setPeekTab('logs')" title="HTTP request log for this worker"><span class="tab-ico">≡</span><span class="tab-lbl">Logs</span><span class="peek-tab-count" id="peek-tab-logs-count"></span></button>
-    <button class="tab-customize-btn" id="peek-tab-customize" onclick="event.stopPropagation();togglePeekTabCustomizer()" title="Show/hide/reorder worker tabs" style="flex:0 0 auto;">&#x229E;</button>
+    <button class="tab-customize-btn" id="peek-tab-customize" onclick="event.stopPropagation();togglePeekTabCustomizer()" title="Show, hide or reorder worker tabs" aria-label="Customize worker tabs" aria-expanded="false" style="flex:0 0 auto;">Tabs &#x25BE;</button>
     <!-- The menu itself is NOT here on purpose — it is a direct child of the
          document body, at the end of this file. `.peek-tabs` is a ~44px
          horizontal scroller (overflow-x:auto; overflow-y:hidden;
@@ -2199,8 +2215,6 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <span style="flex-shrink:0;opacity:0.6;">&#x1F4C1;</span>
     <span id="peek-dir-text" onclick="peekSession&&_browseWorkerFiles(peekSession,'peek-directory')" title="Browse directory" style="cursor:pointer;text-decoration:underline;text-decoration-color:var(--dim);text-underline-offset:2px;"></span>
     <span id="peek-dir-branch" class="peek-dir-branch" style="display:none;"></span>
-    <span class="card-dir-edit" onclick="peekSessionDir&&_copyFileDeeplink(peekSessionDir)" title="Copy link to this directory" style="opacity:0.6;font-size:0.85rem;">&#x1F517;</span>
-    <span class="card-dir-edit" id="peek-dir-edit" onclick="editField(peekSession,'dir',peekSessionDir)" title="Change directory">&#x270E;</span>
   </div>
   <!-- Split wrap: terminal + optional file browser side-by-side -->
   <div id="peek-split-wrap" class="peek-split-wrap">

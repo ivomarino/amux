@@ -26,7 +26,7 @@
 # Hence: cwd first, then the rest of the repo with the remaining budget, and a
 # distinct marker when the budget or cap cuts. Never less coverage than before,
 # more when it fits, and the shortfall is named rather than silent.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 HOOK="${OBSERVED_EDITS_HOOK:-$(pwd)/scripts/claude-hooks/observed-edits-post.py}"
 PASS=0; FAIL=0

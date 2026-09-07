@@ -36,7 +36,7 @@
 # the trailer to be ABSENT.
 #
 # Exit 0 = pass, 1 = failure.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
 # GRAFT_STAMP_HOOK exists so these cells can be shown to FAIL: point it at a

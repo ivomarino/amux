@@ -15,7 +15,7 @@
 #
 # The cells exec the SHIPPED renderer lifted out of the hook file, not a retyped
 # copy, so the strings under test are the strings that ship (ethos rule 7).
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 HOOK="${SHARED_GUARD_HOOK:-$(pwd)/scripts/git-hooks/git-shared-guard.py}"
 PASS=0; FAIL=0

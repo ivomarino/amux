@@ -61,6 +61,12 @@ for c in $shas; do
 "
 done
 
+# NUL-DELIMITED, and the loop below reads it line by line. `for lane in $lanes`
+# WORD-SPLITS, and the untrailered placeholder is three words — so one commit
+# with no Amux-Session trailer minted three fake lanes named `<no`,
+# `Amux-Session` and `trailer>`, each reported as needing consent. Found by
+# running this script against a throwaway repo rather than by reading it
+# (AF-559's probe).
 lanes=$(printf '%s' "$facts" | cut -f1 | sort -u)
 
 # ---- reachability -----------------------------------------------------------
@@ -83,7 +89,8 @@ print("isolated" if d["isolated"] else "reachable")
 }
 
 ask=""; cannot=""; unknown=""; mine=""
-for lane in $lanes; do
+while IFS= read -r lane; do
+  [ -z "$lane" ] && continue
   n=$(printf '%s' "$facts" | awk -F'\t' -v l="$lane" '$1==l' | grep -c . || true)
   nors=$(printf '%s' "$facts" | awk -F'\t' -v l="$lane" '$1==l && $3==0' | grep -c . || true)
   row="  $lane — $n commit(s), $nors with no Rust"
@@ -98,7 +105,9 @@ for lane in $lanes; do
     unknown:*)  unknown="${unknown}${row}   [${state#unknown:}]
 " ;;
   esac
-done
+done <<EOF
+$lanes
+EOF
 
 [ -n "$mine" ]   && { echo "YOURS (no consent needed):"; printf '%s' "$mine"; echo; }
 [ -n "$ask" ]    && { echo "MUST ASK — reachable, send them 'amux send <lane>':"; printf '%s' "$ask"; echo; }

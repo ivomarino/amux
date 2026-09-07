@@ -3423,8 +3423,10 @@ function _workerActionDefinitions(s) {
       labelHtml: 'Spans groups' + _spansLabel(s),
       title: 'Let this worker message workers in other groups according to its resolved cross-group configuration.',
       run: "toggleSpansGroups('" + name + "')" },
-    { key: 'directory', icon: '&#x1F4C1;', label: 'Directory',
+    { key: 'directory', icon: '&#x1F4C1;', label: 'Change directory',
       run: "editField('" + name + "','dir','" + escJs(s.dir || '') + "')" },
+    s.dir ? { key: 'copy-directory-link', icon: '&#x1F517;', label: 'Copy directory link',
+      run: "closeAllMenus();_copyFileDeeplink('" + escJs(s.dir) + "')" } : null,
     s.running ? { key: 'restart', icon: '&#x21BB;', label: 'Restart',
       run: "closeAllMenus();doRestart('" + name + "')" } : null,
     s.running ? { key: 'stop', icon: '&#x23F9;', label: 'Stop',
@@ -3997,6 +3999,20 @@ function _taskIdChip(s) {
     + 'style="cursor:pointer;font-size:0.7rem;font-weight:600;color:var(--accent);border:1px solid var(--accent);border-radius:6px;padding:0 6px;margin-left:4px;white-space:nowrap;">' + esc(id) + '</span>';
 }
 async function _askCardStatus(id, sess) {
+  const current = boardItems.find(i => i.id === id);
+  const terminal = /^(done|verified|discarded)$/i.test(String(
+    (current && current.status) || (id === boardDetailId && boardDetailStatus) || ''));
+  if (terminal) {
+    // A terminal card already has an authoritative board outcome. Refresh it
+    // from the durable detail record; asking a worker here would reintroduce
+    // provider-text parsing and could overwrite the final outcome with stale
+    // model prose.
+    const refreshed = await _bdHydrate(id);
+    showToast(refreshed
+      ? 'Refreshed final terminal summary from the board'
+      : 'Could not refresh final terminal summary');
+    return;
+  }
   // Ask the owning session to report status onto the board (AMUX-2174). The
   // session's model authors the answer; amux only routes + records.
   try {
@@ -4726,10 +4742,11 @@ let _peekTabCustomizerOpen = false, _peekTabMenuSortable = null;
 function _peekCustOutside(e) {
   const menu = document.getElementById('peek-tab-customizer-menu');
   const btn = document.getElementById('peek-tab-customize');
-  if (menu && !menu.contains(e.target) && e.target !== btn) { _peekTabCustomizerOpen = false; menu.style.display = 'none'; document.removeEventListener('click', _peekCustOutside, true); }
+  if (menu && !menu.contains(e.target) && !btn?.contains(e.target)) { _peekTabCustomizerOpen = false; menu.style.display = 'none'; btn?.setAttribute('aria-expanded', 'false'); document.removeEventListener('click', _peekCustOutside, true); }
 }
 function togglePeekTabCustomizer() {
   _peekTabCustomizerOpen = !_peekTabCustomizerOpen;
+  document.getElementById('peek-tab-customize')?.setAttribute('aria-expanded', String(_peekTabCustomizerOpen));
   const menu = document.getElementById('peek-tab-customizer-menu');
   if (!menu) return;
   if (_peekTabCustomizerOpen) {
@@ -9018,7 +9035,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.824';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.827';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -9042,6 +9059,9 @@ _loadModelCatalog().then(() => { if (!_initialLoad) render(); }).catch(() => {})
       const text = String(msg || 'unknown error').slice(0, 140);
       if (typeof showToast === 'function') showToast('\u26a0 ' + kind + ': ' + text);
       console.error('amux ' + kind + ':', msg);
+      fetch(API + '/api/client-debug', {method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({kind:'client-action-error',verdict:kind,message:text,
+          measured:true,n_considered:1,ver:APP_VER})}).catch(() => {});
     } catch (e) {}
   }
   window.addEventListener('unhandledrejection', function (ev) {
@@ -9283,6 +9303,8 @@ function openPeek(name, opts) {
   if (searchInp) {
     searchInp.value = prefillQuery;
     document.getElementById('peek-search-wrap').classList.toggle('has-value', !!prefillQuery);
+    document.getElementById('peek-search-wrap').hidden = !prefillQuery;
+    document.getElementById('peek-find-toggle').setAttribute('aria-expanded', String(!!prefillQuery));
   }
   // Same draft the session-list card composer uses. Start typing in one, open
   // the other, and the text is already there.
@@ -10881,6 +10903,16 @@ function _peekScrollTo(i, doScroll, instant) {
   if (cur && doScroll !== false) _peekJumpTo(cur);
   const countEl = document.getElementById('peek-search-count');
   if (countEl && _peekMatches.length) countEl.textContent = (i + 1) + '/' + _peekMatches.length;
+  _peekMsgCount(_peekMsgPrompts());
+}
+function togglePeekFind(open) {
+  const wrap = document.getElementById('peek-search-wrap');
+  const btn = document.getElementById('peek-find-toggle');
+  open = open == null ? wrap.hidden : open;
+  wrap.hidden = !open;
+  btn.setAttribute('aria-expanded', String(open));
+  if (open) document.getElementById('peek-search').focus();
+  else { clearPeekSearch(); btn.focus(); }
 }
 function peekSearchNext() {
   if (!_peekMatches.length) return;
@@ -10894,26 +10926,43 @@ function peekSearchPrev() {
 }
 
 // ── Peek more-menu ──
+let _peekMoreDismissTimer = 0;
 function togglePeekMoreMenu() {
   const dd = document.getElementById('peek-more-dropdown');
   if (!dd) return;
   const s = (sessions || []).find(row => row.name === peekSession);
   if (s) _renderPeekWorkerActions(s);
   const opening = !dd.classList.contains('open');
-  dd.classList.toggle('open');
-  if (opening) {
-    if (s) requestAnimationFrame(() => _reportWorkerActionParity(s));
-    setTimeout(() => document.addEventListener('click', _closePeekMore, {once: true}), 0);
-  }
+  if (!opening) { _closePeekMore(); return; }
+  dd.classList.add('open');
+  document.getElementById('peek-worker-menu-btn')?.setAttribute('aria-expanded', 'true');
+  requestAnimationFrame(() => {
+    if (s) _reportWorkerActionParity(s);
+    if (!dd.classList.contains('open')) {
+      fetch(API + '/api/client-debug', {method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({kind:'worker-action-menu',verdict:'open-lost',session:peekSession,
+          measured:true,n_considered:dd.querySelectorAll('[role="menuitem"]').length,ver:APP_VER})}).catch(() => {});
+    }
+  });
+  _peekMoreDismissTimer = setTimeout(() => {
+    _peekMoreDismissTimer = 0;
+    document.addEventListener('click', _closePeekMore, {once: true});
+  }, 0);
 }
 function _closePeekMore() {
+  // Menu actions stop propagation, so the document's one-shot listener never
+  // fires for them. Retire it here or it consumes the next opening click.
+  clearTimeout(_peekMoreDismissTimer);
+  _peekMoreDismissTimer = 0;
+  document.removeEventListener('click', _closePeekMore);
   const dd = document.getElementById('peek-more-dropdown');
   if (dd) dd.classList.remove('open');
+  document.getElementById('peek-worker-menu-btn')?.setAttribute('aria-expanded', 'false');
 }
 
 // ── Peek message navigation ──
 let _peekMsgIndex = -1;
-let _peekMsgNavKind = 'human';
+let _peekMsgNavKind = 'all';
 let _peekMsgNavGesture = null;
 function _peekMsgNavArm(e) {
   const body = document.getElementById('peek-body');
@@ -10947,18 +10996,54 @@ function _peekMsgPrompts() {
     _peekMsgNavKind === 'all' || el.dataset.msgKind === _peekMsgNavKind);
 }
 function _peekMsgCount(prompts) {
-  const label = peekSearchQuery.trim() ? 'Matches' : _peekMsgNavKind === 'all' ? 'All'
+  const searching = !!peekSearchQuery.trim();
+  const label = searching ? 'Matches' : _peekMsgNavKind === 'all' ? 'All'
     : (_MSG_KIND[_peekMsgNavKind] || _MSG_KIND.unknown).label;
   const count = document.getElementById('peek-msg-count');
   if (count) {
-    const selected = prompts.findIndex(p => p.classList.contains('peek-msg-current'));
-    count.textContent = label + ' ' + (selected < 0 ? prompts.length : (selected + 1) + '/' + prompts.length);
-    count.title = 'Choose message kind. Showing ' + label.toLowerCase() + ': ' + prompts.length;
+    const selected = prompts.findIndex(p => p.classList.contains(searching ? 'current' : 'peek-msg-current'));
+    const value = String(selected < 0 ? prompts.length : (selected + 1) + '/' + prompts.length);
+    if (count.textContent !== value) count.textContent = value;
+    count.setAttribute('aria-label', label + ': ' + value + ' in loaded output');
   }
+  const select = document.getElementById('peek-msg-kind');
+  if (select) { select.value = searching ? 'matches' : _peekMsgNavKind; select.disabled = searching; }
+  document.getElementById('peek-nav-label').textContent = searching ? 'Find' : 'Messages';
   for (const btn of document.querySelectorAll('#peek-msg-nav .peek-nav-btn')) {
-    btn.setAttribute('aria-disabled', String(!prompts.length));
+    // Zero loaded matches still permits loading earlier output. It is not a
+    // disabled action; explain that fallback instead of drawing a dead arrow.
+    btn.removeAttribute('aria-disabled');
+    const direction = btn.getAttribute('aria-label').startsWith('Previous') ? 'Previous' : 'Next';
+    btn.title = direction + (searching ? ' search result' : ' message')
+      + (!prompts.length ? ' — look in earlier output' : '');
   }
+  _peekToolbarCheck();
 }
+let _peekToolbarFrame = 0, _peekToolbarFault = '';
+function _peekToolbarCheck() {
+  if (_peekToolbarFrame) return;
+  _peekToolbarFrame = requestAnimationFrame(() => {
+    _peekToolbarFrame = 0;
+    const toolbar = document.querySelector('.peek-toolbar');
+    if (!toolbar || !toolbar.getClientRects().length) return;
+    const controls = [...toolbar.querySelectorAll('button,select')];
+    const rect = toolbar.getBoundingClientRect();
+    // Layout sizes are independent of the user's deliberate UI zoom. Comparing
+    // scaled screen rectangles to CSS sizes falsely flagged every 80% control.
+    const small = controls.filter(el => el.offsetWidth < 43 || el.offsetHeight < 43);
+    const overflow = rect.right > document.documentElement.clientWidth + 1 || toolbar.scrollWidth > toolbar.clientWidth + 1;
+    const fault = overflow || small.length || toolbar.offsetHeight > 48;
+    const key = fault ? [innerWidth, toolbar.offsetHeight, overflow, small.length].join(':') : '';
+    if (key && key !== _peekToolbarFault) {
+      try { fetch(API + '/api/client-debug', {method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({kind:'peek-toolbar-layout',verdict:'unusable-controls',session:peekSession,
+          measured:true,n_considered:controls.length,viewport:innerWidth,height:toolbar.offsetHeight,rendered_height:rect.height,
+          overflow,small_targets:small.length,ver:APP_VER})}).catch(() => {}); } catch(e) {}
+    }
+    _peekToolbarFault = key;
+  });
+}
+window.addEventListener('resize', _peekToolbarCheck);
 function _peekJumpTo(el) {
   const body = document.getElementById('peek-body');
   // Lock before changing scrollTop: a polling tick must not replace the target
@@ -11008,7 +11093,7 @@ async function _peekMsgMove(direction, event) {
       return;
     }
   }
-  const selected = prompts.findIndex(p => p.classList.contains('peek-msg-current'));
+  const selected = prompts.findIndex(p => p.classList.contains(peekSearchQuery.trim() ? 'current' : 'peek-msg-current'));
   if (selected >= 0) _peekMsgIndex = (selected + direction + prompts.length) % prompts.length;
   else {
     const top = document.getElementById('peek-body').getBoundingClientRect().top + 13;
@@ -11031,9 +11116,9 @@ async function _peekMsgMove(direction, event) {
 }
 function peekMsgNext(event) { _peekMsgMove(1, event); }
 function peekMsgPrev(event) { _peekMsgMove(-1, event); }
-function _peekMsgNavCycle() {
-  const kinds = ['human', 'session', 'schedule', 'amux', 'unstamped', 'unknown', 'all'];
-  _peekMsgNavKind = kinds[(kinds.indexOf(_peekMsgNavKind) + 1) % kinds.length];
+function _peekMsgNavSelect(kind) {
+  if (!['all', 'human', 'session', 'schedule', 'amux', 'unstamped', 'unknown'].includes(kind)) return;
+  _peekMsgNavKind = kind;
   _peekMsgIndex = -1;
   document.querySelectorAll('#peek-body .peek-msg-current').forEach(p => p.classList.remove('peek-msg-current'));
   _peekReclassifyPrompts();
@@ -27231,9 +27316,9 @@ function _bdRenderMeta(item) {
 async function _bdHydrate(id) {
   try {
     const r = await apiCall(API + '/api/board/' + id);
-    if (!r || !r.ok) return;
+    if (!r || !r.ok) return false;
     const full = await r.json();
-    if (!full || full.id !== id || boardDetailId !== id) return;  // modal moved on
+    if (!full || full.id !== id || boardDetailId !== id) return false;  // modal moved on
     const idx = boardItems.findIndex(i => i.id === id);
     const cached = idx >= 0 ? { ...boardItems[idx] } : {};
     if (idx >= 0) boardItems[idx] = Object.assign({}, boardItems[idx], full);
@@ -27241,7 +27326,7 @@ async function _bdHydrate(id) {
     _bdRenderHistory(merged);
     if (typeof _bdRenderStatusBanner === 'function') _bdRenderStatusBanner(merged);
     _bdRenderMeta(merged);
-    if (_boardDrafts[id]) { _bdHydrated = true; return; }  // user's draft wins
+    if (_boardDrafts[id]) { _bdHydrated = true; return true; }  // user's draft wins
     const title = document.getElementById('bd-title');
     if (title && title.value === (cached.title || '')) {
       title.value = full.title || '';
@@ -27279,7 +27364,8 @@ async function _bdHydrate(id) {
       _tagState['bd'] = [...(full.tags || [])]; _beTagRenderChips('bd'); _beTagInputUpdate('bd');
     }
     _bdHydrated = true;
-  } catch (e) { /* leave unhydrated; the save guard covers it */ }
+    return true;
+  } catch (e) { /* leave unhydrated; the save guard covers it */ return false; }
 }
 
 async function openBoardDetail(id) {
@@ -32006,8 +32092,8 @@ async function _handleDeeplink(hash) {
     }
   } catch(e) {}
 }
-// On page load
-_handleDeeplink(location.hash);
+// Initial routing is scheduled with restoration below, after both the DOM and
+// the complete bundle (including late message-selection state) are initialized.
 // Restore the screen you were on — INCLUDING after iOS evicts a backgrounded
 // PWA (which wipes sessionStorage but keeps localStorage): the active tab and
 // any open session peek. Bounded to 24h so a days-later open still lands on a
@@ -32083,8 +32169,12 @@ function _restoreScreen() {
     }, 200);
   }
 }
-if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', _restoreScreen);
-else _restoreScreen();
+function _restoreAppScreen() {
+  _handleDeeplink(location.hash);
+  _restoreScreen();
+}
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', _restoreAppScreen, {once:true});
+else queueMicrotask(_restoreAppScreen);
 // On hash change (e.g. paste URL into address bar while app already open — no page reload)
 window.addEventListener('hashchange', () => _handleDeeplink(location.hash));
 
