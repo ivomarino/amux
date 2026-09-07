@@ -1335,7 +1335,28 @@ PYEOF
       -d "$body" "$AMUX_API/api/workers/$name/send" 2>/dev/null) || resp=""
     if [[ -n "$resp" ]]; then
       rc=0
-      RESP="$resp" TGT="$name" python3 - <<'PYEOF' || rc=$?
+      # AF-556: `_R` is PASSED here. It used to be read from the environment and
+      # nothing in this file ever set it, so the attempt number interpolated to
+      # '' on every execution forever and the line read "retry ) ". The
+      # `.get(_,'')` default is what hid it: an unset variable would have
+      # raised, and the empty-string fallback made a dead field look like a
+      # formatting nit. A value no input can change is the hardcoded-summary
+      # class, and it looked measured.
+      #
+      # It is not cosmetic here. This annotation is the ONLY thing in the output
+      # separating a send that reached the server first try from one that
+      # recovered across a restart — and the comment above says exactly when
+      # that happens: the builder installs a new binary and the server
+      # relaunches. So a send can be evaluated by a DIFFERENT BINARY than the
+      # caller pinned, and the marker meant to say so could not.
+      #
+      # Measured 2026-09-07 during AMUX-4018's policy probes: an allow probe
+      # returned exit 0 with "retry " while /health moved 6b72d65e -> 67ab58c7
+      # underneath it. The probe was void and only a hand-run /health bracket
+      # on both sides caught it. The ELAPSED wait ships too, because "retry 2"
+      # alone does not say how long the gap was, and the gap is the window a
+      # deploy fits into.
+      _R="$_retry" _R_WAITED="$(( _retry * 2 ))" RESP="$resp" TGT="$name" python3 - <<'PYEOF' || rc=$?
 import json, os, sys
 try:
     d = json.loads(os.environ["RESP"])
@@ -1344,7 +1365,17 @@ except Exception:
 tgt = os.environ["TGT"]
 if d.get("error") or d.get("ok") is False:
     sys.exit(2)
-print(f"sent to {tgt} (origin-stamped, retry {os.environ.get('_R','')}): {d.get('message', 'ok')}")
+# Both operands are REQUIRED, not defaulted: a missing one must crash here
+# rather than print an empty field that reads as a measured zero. That default
+# is the whole bug this line is fixing.
+attempt = os.environ["_R"]
+waited = os.environ["_R_WAITED"]
+print(
+    f"sent to {tgt} (origin-stamped, retry {attempt} after {waited}s — "
+    f"the server was unreachable on the first try, so this was evaluated by "
+    f"whatever binary is live NOW; check /health if you pinned a build): "
+    f"{d.get('message', 'ok')}"
+)
 PYEOF
       # Same reconciliation point as the first attempt: the server answered.
       [[ $rc -eq 0 ]] && { _flush_unstamped_ledger || true; return 0; }
