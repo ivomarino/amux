@@ -55,6 +55,7 @@
 //!  "foreign":   [{"path","owner","age_secs","provenance","has_unstaged_changes","why"}],
 //!  "shared":    [{"path","owner","peer","age_secs","has_unstaged_changes"}],
 //!  "unclaimed": [{"path","has_unstaged_changes"}],
+//!  "observations": [{"path","mine_age_secs","observers","provenance","establishes_ownership","why"}],
 //!  "cotenants": ["<session>"], "window_secs": 21600}
 //! ```
 //! Every key is present on EVERY return path, including the disabled and
@@ -1665,8 +1666,9 @@ fn is_restore_only_command(cmd: &str) -> bool {
 //
 // So the record is OBSERVED instead of parsed: a Bash hook pair marks t0
 // before the command and reports every file whose mtime moved during it.
-// Observed records rank WITH firsthand — they are facts about the disk, not
-// guesses about a command string — and no quoting can hide an mtime.
+// The mtime is a fact about the disk, but every concurrent reader can observe
+// the same fact. MOS-33 keeps these records as uncertainty, separate from named
+// edit claims; they cannot establish a peer owner or replace a recorded writer.
 
 /// Matches the guard's default window; observed rows older than this are
 /// pruned at write.
@@ -1814,84 +1816,37 @@ fn gates_unclaimed(blind_live: &[String]) -> bool {
     !blind_live.is_empty()
 }
 
-/// Merge observed records into the guard inputs AT FIRSTHAND RANK (AF-123).
-/// Pure, so the rank claim is testable: a lane whose only signal is observed
-/// must read exactly like a lane that used the Edit tool.
+/// Keep mtime observations separate from evidence of who wrote a path (MOS-33).
+/// A Bash window sees every concurrent writer in its cwd; its observer is not
+/// the author, regardless of how far the mtime is from a recorded edit.
 pub(crate) fn apply_observed(
     inputs: &mut GuardInputs,
     mine_obs: &HashMap<String, f64>,
     theirs_obs: &[(String, HashMap<String, f64>)],
 ) {
-    // AMUX-3497: an observed row EXPLAINED by the other side's TRANSCRIPT
-    // record of the same path at the same instant is one write seen twice —
-    // the mtime the observer's Bash window caught is the tool edit the other
-    // session's transcript already attributes. Merging the echo minted a
-    // phantom co-editor (live specimen: a session whose window held only
-    // HTTP probes was named co-editor of board_store.rs, costing the
-    // committer a wipe-apology sweep to an innocent peer). The echo test
-    // runs against the ENTRY state of the firsthand sets — after the loop
-    // below starts inserting, "firsthand" no longer means transcript.
-    //
-    // Both drops degrade toward protection: dropping a peer's echo of MY
-    // transcript edit removes a warn about my own write; dropping MY echo of
-    // a peer's transcript edit removes my counterclaim, so their firsthand
-    // BLOCKS me (the AF-19 tie already blocked deliberately). The margin is
-    // RECENCY_SKEW_MARGIN_S — the same transcript-clock vs mtime unit
-    // conversion that constant exists for.
-    let echo_of_theirs = |p: &String, ts: &f64| -> bool {
-        inputs.theirs_firsthand.contains(p)
-            && matches!(inputs.theirs.get(p), Some((_, tts)) if (*ts - *tts).abs() <= RECENCY_SKEW_MARGIN_S)
-    };
-    let echo_of_mine = |p: &String, ts: &f64| -> bool {
-        inputs.mine_firsthand.contains(p)
-            && matches!(inputs.mine.get(p), Some(mts) if (*ts - *mts).abs() <= RECENCY_SKEW_MARGIN_S)
-    };
-    let mine_keep: Vec<(String, f64)> = mine_obs
-        .iter()
-        .filter(|(p, ts)| !echo_of_theirs(p, ts))
-        .map(|(p, ts)| (p.clone(), *ts))
-        .collect();
-    let theirs_keep: Vec<(String, String, f64)> = theirs_obs
-        .iter()
-        .flat_map(|(owner, obs)| {
-            obs.iter()
-                .filter(|(p, ts)| !echo_of_mine(p, ts))
-                .map(move |(p, ts)| (owner.clone(), p.clone(), *ts))
-        })
-        .collect();
-    for (p, ts) in mine_keep {
-        // PROVENANCE FOR MY OWN CLAIM (AMUX-3662), the mirror of
-        // `theirs_observed_only` below. Transcript rows are all loaded before
-        // this runs, so `mine_firsthand` at this point means "I have a RECORDED
-        // write here" — anything else is an mtime my Bash window caught, which
-        // on a shared checkout includes writes I did not make.
-        //
-        // Checked BEFORE the insert, or the insert three lines down would make
-        // every observed row look firsthand and mark nothing.
-        if !inputs.mine_firsthand.contains(&p) {
-            inputs.mine_observed_only.insert(p.clone());
+    inputs.observed_mine.clone_from(mine_obs);
+    inputs.observed_peers.clear();
+    for (observer, paths) in theirs_obs {
+        for (path, ts) in paths {
+            inputs
+                .observed_peers
+                .entry(path.clone())
+                .or_default()
+                .insert(observer.clone(), *ts);
         }
-        let slot = inputs.mine.entry(p.clone()).or_insert(0.0);
-        if ts > *slot {
-            *slot = ts;
-        }
-        inputs.mine_firsthand.insert(p);
     }
-    for (owner, p, ts) in theirs_keep {
-        match inputs.theirs.get(&p) {
-            Some((_, cur)) if *cur >= ts => {}
-            _ => {
-                // Kind-follows-latest: an observed write is authored
-                // content as far as anyone can tell, never a restore.
-                inputs.theirs_restore.remove(&p);
-                // The WINNING claim for this path is now observation-based
-                // (transcript rows are all loaded before this runs, so
-                // nothing re-wins after; a losing observed row marks nothing).
-                inputs.theirs.insert(p.clone(), (owner, ts));
-                inputs.theirs_observed_only.insert(p.clone());
-            }
+    for (path, ts) in mine_obs {
+        // Preserve the own-shell fallback where nobody else has a recorded
+        // claim and all cotenants are visible. It must not overwrite an actual
+        // edit timestamp, weaken a peer claim, or hide an invisible cotenant.
+        // The uncertainty itself is retained above even when no fallback is safe.
+        if !inputs.mine.contains_key(path)
+            && !inputs.theirs.contains_key(path)
+            && !inputs.blind_cotenant
+        {
+            inputs.mine.insert(path.clone(), *ts);
+            inputs.mine_observed_only.insert(path.clone());
         }
-        inputs.theirs_firsthand.insert(p);
     }
 }
 
@@ -2013,8 +1968,9 @@ pub(crate) enum LineAccounting {
     /// so "we did not look" is the honest reading and "we looked and it was
     /// fine" is not.
     Skip,
-    /// Firsthand content EXISTS, but the committer ALSO has a write here that
-    /// recorded no content. That is the general property, not "a shell edit"
+    /// Firsthand content EXISTS, and an mtime changed during the committer's
+    /// command. Their content record MAY omit a write; the mtime does not say
+    /// who made it. That is the general property, not "a shell edit"
     /// (ts-gke's correction on AF-342): a heredoc is one way for a write to
     /// carry no content record, and a codegen step, a `git checkout` and an
     /// editor outside the harness are three more. Whatever produced it, a line
@@ -2094,12 +2050,38 @@ pub(crate) fn line_accounting_mode(
 ) -> LineAccounting {
     match (has_firsthand, mine_observed, peer_claims) {
         (false, _, _) => LineAccounting::Skip,
-        // My shell write, and nobody else is anywhere near this path.
+        // An observed change may be my shell write; no peer content is recorded.
         (true, true, false) => LineAccounting::Undecidable,
         // A peer claims it too: keep the line detail, noise and all.
         (true, true, true) => LineAccounting::Check,
         (true, false, _) => LineAccounting::Check,
     }
+}
+
+/// The production line-check decision and its wire diagnostic travel together,
+/// so an observation cannot become an authorship assertion in a second renderer.
+fn line_accounting_diagnostic(
+    path: &str,
+    now: f64,
+    has_firsthand: bool,
+    observed_at: Option<f64>,
+    peer_claims: bool,
+) -> (LineAccounting, Option<Value>) {
+    let mode = line_accounting_mode(has_firsthand, observed_at.is_some(), peer_claims);
+    let diagnostic = if mode == LineAccounting::Undecidable {
+        Some(json!({
+            "path": path,
+            // Legacy key retained for installed hooks; it identifies an mtime,
+            // not a write attributed to the requesting session.
+            "observed_write_age_s": (now - observed_at.unwrap_or(now)).max(0.0) as i64,
+            "provenance": "observed",
+            "establishes_ownership": false,
+            "why_undecidable": "an mtime change was observed during your command. Its writer is unknown: an unrecorded write may be yours or a concurrent writer's, so your content record may be incomplete. Unaccounted-line accounting cannot separate those cases; recorded ownership evidence is unchanged.",
+        }))
+    } else {
+        None
+    };
+    (mode, diagnostic)
 }
 
 /// AMUX-3128 surfacing half: every INFERRED edit record (a Bash command whose
@@ -2525,60 +2507,19 @@ pub(crate) struct GuardInputs {
     pub mine_firsthand: HashSet<String>,
     /// abs realpath -> (owner session, newest ts), all cotenants.
     pub theirs: HashMap<String, (String, f64)>,
-    /// abs realpath, any cotenant, first-hand only.
-    ///
-    /// NB `apply_observed` INSERTS INTO THIS at firsthand rank (AF-123, and
-    /// deliberately: an mtime is a fact about the disk). So after that call it
-    /// means "a peer has a record here", NOT "a peer authored content here".
-    /// If you need the second question, use `theirs_transcript`.
+    /// abs realpath, any cotenant, recorded first-hand edits only.
     pub theirs_firsthand: HashSet<String>,
-    /// abs realpath where a cotenant has a TRANSCRIPT (Edit/Write) record, so
-    /// their authored CONTENT for it exists somewhere. Snapshotted before
-    /// `apply_observed` runs and never written by it, which is the whole
-    /// point: `theirs_firsthand` answers "is there a peer record here" and
-    /// this answers "did a peer author content here".
-    ///
-    /// AF-342 shipped once without this and was inert in production. It gated
-    /// on `theirs`, which any mtime satisfies, and on a 52-lane shared
-    /// checkout a peer's Bash window catches nearly every actively-edited
-    /// path. The live response said it out loud in its own `co_signal`:
-    /// "observed mtime coinciding with your own edit - possibly one write seen
-    /// through two sessions' Bash windows, not a real co-editor (AMUX-3497)".
-    /// A phantom co-editor was therefore enough to keep the noisy arm on
-    /// everywhere, which is authorship inferred from an mtime, the exact move
-    /// `line_accounting_mode` exists to refuse.
+    /// Paths with peer transcript content, used by line accounting and split
+    /// risk. Observations never write this set or `theirs_firsthand`.
     pub theirs_transcript: HashSet<String>,
-    /// abs realpath whose WINNING peer claim came from an OBSERVED (mtime)
-    /// row rather than a transcript record (AMUX-3497). An observed row is a
-    /// fact about the disk, but on a shared checkout its attribution to the
-    /// observing session is an inference — any concurrent session's write
-    /// lands in the observer's mtime window. classify() uses this to say HOW
-    /// a co-edit signal knows what it claims, so a phantom co-editor is
-    /// labeled as possibly your own write seen twice instead of asserted.
-    pub theirs_observed_only: HashSet<String>,
-    /// abs realpath where the REQUESTING session's own claim is an OBSERVED
-    /// (mtime) row rather than a transcript record (AMUX-3662).
-    ///
-    /// The mirror of `theirs_observed_only`, and its absence was the bug. The
-    /// guard tracked provenance for the PEER's claim and not for the reader's,
-    /// so `mine_age_secs` rendered identically whether it came from a write
-    /// this session recorded or from an mtime that moved during one of its Bash
-    /// commands. On a shared checkout those are very different facts.
-    ///
-    /// Live specimen 2026-08-24: probing `api/board.rs` returned
-    /// `age_secs: 455, mine_age_secs: 455, owner: amux-frustrations` with no
-    /// signal of any kind. The PEER's claim was real (commit 8575cc6f touched
-    /// that file at 12:18:08); MY only contact was `sed -n '2270,2300p'`, a
-    /// read. The equal ages are the tell of one write seen twice, and the
-    /// response presented both claims in the same shape, so which one was
-    /// inferred was not recoverable from the output.
-    ///
-    /// That symmetry is worse than a missing warning, because it gets read in
-    /// whichever direction the reader already leans: the day before, the same
-    /// signature was read as "the peer is a phantom co-editor" and cost a
-    /// wipe-apology sweep to an innocent peer. On this specimen the phantom was
-    /// the reader's own.
+    /// The requesting session's own observation-only fallback. This permits
+    /// shell-authored work when there is no conflicting or invisible peer;
+    /// it is never first-hand evidence and never displaces recorded edits.
     pub mine_observed_only: HashSet<String>,
+    /// Raw mtime observations retained separately from ownership, including
+    /// observations that coincide with (or postdate) a recorded writer.
+    pub observed_mine: HashMap<String, f64>,
+    pub observed_peers: HashMap<String, BTreeMap<String, f64>>,
     /// abs realpath whose WINNING owner's latest record is a restore
     /// (MG-1484): an edit record without authored content. Drives the
     /// `provenance` field on foreign verdicts so the victim notice never
@@ -2605,6 +2546,8 @@ pub(crate) struct Verdict {
     pub foreign: Vec<Value>,
     pub shared: Vec<Value>,
     pub unclaimed: Vec<Value>,
+    /// Advisory uncertainty, never a named foreign owner or co-author.
+    pub observations: Vec<Value>,
     /// A peer's work is being SPLIT by this commit (AF-190).
     ///
     /// One row per (staged file a peer co-edited, that peer's dirty files this
@@ -2620,25 +2563,6 @@ pub(crate) struct Verdict {
 fn provenance_of(inp: &GuardInputs, ap: &str) -> &'static str {
     if inp.theirs_restore.contains(ap) {
         "restore"
-    // OBSERVED BEFORE FIRSTHAND, and the order is the whole fix (AMUX-3778).
-    //
-    // `apply_observed` inserts observed rows INTO `theirs_firsthand` on
-    // purpose — AF-123, so a Bash-editing lane stops being penalised for a
-    // signal the harness makes unobtainable for it (ethos rule 3). Correct,
-    // and it made this function report every observed row as `firsthand`,
-    // because the firsthand check came first and the set had just been
-    // widened to include them.
-    //
-    // So the VICTIM NOTICE asserted a recorded write where the evidence was a
-    // cwd mtime — while the JSON verdict, three hundred lines up, already
-    // reported `their_provenance: "observed"` correctly off the same set. The
-    // machine-readable field was right and the sentence a human reads was
-    // wrong, which is the worse half to have wrong.
-    //
-    // This does NOT demote the record. Rank is unchanged and AF-123 holds; the
-    // claim is still made, it is just described honestly.
-    } else if inp.theirs_observed_only.contains(ap) {
-        "observed"
     } else if inp.theirs_firsthand.contains(ap) {
         "firsthand"
     } else {
@@ -2660,6 +2584,28 @@ pub(crate) fn classify(
         }
         let hit = inp.theirs.get(ap);
         let is_dirty = inp.dirty.contains(ap);
+        let own_observation = inp.observed_mine.get(ap);
+        let peer_observations = inp.observed_peers.get(ap);
+        if own_observation.is_some() || peer_observations.is_some_and(|rows| !rows.is_empty()) {
+            let observers: Vec<Value> = peer_observations
+                .into_iter()
+                .flat_map(|rows| rows.iter())
+                .map(|(session, ts)| {
+                    json!({
+                        "session": session,
+                        "age_secs": (now - ts).max(0.0) as i64,
+                    })
+                })
+                .collect();
+            v.observations.push(json!({
+                "path": rel,
+                "mine_age_secs": own_observation.map(|ts| (now - ts).max(0.0) as i64),
+                "observers": observers,
+                "provenance": "observed",
+                "establishes_ownership": false,
+                "why": "mtime changed during a Bash command; this records who observed it, not who wrote it. Concurrent readers see the same writes.",
+            }));
+        }
         // PROVENANCE STRENGTH, not mere presence (AF-19). `mine` includes the
         // INFERRED half, and this branch `continue`s — so an inferred
         // self-claim used to SUPPRESS the block below and downgrade it to a
@@ -2736,7 +2682,7 @@ pub(crate) fn classify(
                 // said "also edited by session '(unknown)'" for the second
                 // case — a phantom co-editor on a solo edit, which is how a
                 // real co-edit warning stops being read.
-                let mut row = json!({
+                let row = json!({
                     "path": rel,
                     "owner": hit.map(|(o, _)| o.as_str()).unwrap_or("(unknown)"),
                     "peer": hit.is_some(),
@@ -2766,73 +2712,15 @@ pub(crate) fn classify(
                     } else {
                         "transcript"
                     },
-                    "their_provenance": if inp.theirs_observed_only.contains(ap) {
-                        "observed"
-                    } else {
+                    "their_provenance": if inp.theirs_firsthand.contains(ap) {
                         "transcript"
+                    } else if hit.is_some() {
+                        provenance_of(inp, ap)
+                    } else {
+                        "none"
                     },
                     "has_unstaged_changes": is_dirty,
                 });
-                // AMUX-3497, rule-4 half: when the peer's claim is an OBSERVED
-                // mtime that COINCIDES with the committer's own record, the
-                // co-edit signal may be one write seen through two sessions'
-                // Bash windows — say so, instead of asserting a co-editor the
-                // reader will go apologize to. Old hooks ignore unknown keys.
-                //
-                // AF-179 WIDENS THE GATE AND STOPS IT DECIDING. The conjunct
-                // below used to be `coincident`, a 5-SECOND window, and that
-                // encodes exactly one story: two sessions observed ONE write.
-                // It cannot express the story that actually produces a wrong
-                // name — one session's ONGOING AUTHORSHIP, sampled once by a
-                // peer's long Bash window. Measured on the reported specimen:
-                // amux authored scripts/token-baseline.py until ~20:29 and
-                // committed at 20:30; amux-frustrations' `cargo test` walk had
-                // sampled it at 20:10 and filed an observed record. The gap was
-                // ~1000s against a 5s margin, 200x over, so the caveat stayed
-                // silent and the guard asserted a co-editor who had never opened
-                // the file. The two clocks drift apart in proportion to how long
-                // the real author kept working, so the hedge was LEAST able to
-                // fire exactly where the false attribution is most confusing.
-                //
-                // The fix is not a wider window. Picking a window at all is the
-                // tell that we are guessing (ethos rule 7), and the server
-                // genuinely cannot resolve observed-vs-observed — the comment on
-                // case (d) in the tests has said so all along. So stop deciding
-                // and state PROVENANCE, which is a fact: an observed claim is an
-                // mtime that moved during that session's Bash command, not a
-                // write that session recorded. The skew now only picks WORDING;
-                // it no longer gates whether the reader is told anything.
-                let coincident = hit
-                    .map(|(_, tts)| {
-                        inp.mine
-                            .get(ap)
-                            .map(|m| (m - tts).abs() <= RECENCY_SKEW_MARGIN_S)
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                if hit.is_some() && inp.theirs_observed_only.contains(ap) {
-                    let gap = hit.and_then(|(_, tts)| inp.mine.get(ap).map(|m| m - tts));
-                    let signal = match (coincident, gap) {
-                        (true, _) => "observed mtime coinciding with your own edit — possibly \
-                             one write seen through two sessions' Bash windows, not a real \
-                             co-editor (AMUX-3497)"
-                            .to_string(),
-                        (false, Some(g)) if g > 0.0 => format!(
-                            "OBSERVED claim, not a recorded write: that session's Bash command \
-                             saw this file's mtime move. Your own record is {}s NEWER, so their \
-                             sample may be a snapshot of YOUR ongoing authorship rather than an \
-                             edit of theirs (AF-179)",
-                            g as i64
-                        ),
-                        (false, _) => "OBSERVED claim, not a recorded write: that session's \
-                             Bash command saw this file's mtime move under the repo, which on a \
-                             shared checkout includes writes it did not make (AF-179)"
-                            .to_string(),
-                    };
-                    row.as_object_mut()
-                        .expect("shared row is an object")
-                        .insert("co_signal".into(), json!(signal));
-                }
                 v.shared.push(row);
             }
             continue;
@@ -2964,14 +2852,11 @@ fn split_risk(paths: &[(String, String)], inp: &GuardInputs, v: &mut Verdict) {
         left.sort();
         // AF-414: IS THIS OWNERSHIP CLAIM AUTHORSHIP, OR AN MTIME?
         //
-        // `inp.theirs` is satisfied by an MTIME. `apply_observed` inserts into
-        // `theirs_firsthand` at firsthand rank deliberately, so on a shared
-        // checkout a peer's Bash window catches nearly every actively-edited
-        // path. `peer_authored_content` is the discriminator this file already
-        // built for exactly this distinction, and its docstring records that
-        // AF-342 shipped reading `theirs`, stayed INERT FOR A FULL RELEASE for
-        // this reason, and has a test refusing a mutation that puts `theirs`
-        // back. split_risk was never migrated.
+        // Before MOS-33, bare observations entered `inp.theirs`; they now
+        // stay separate. A path-specific inferred command record can still
+        // lack authored content, so the content discriminator remains needed.
+        // The narrower fallback names a possible build hazard without claiming
+        // the peer authored the bytes.
         //
         // MEASURED ON ITSELF, 2026-09-02. Committing a frustrations.md entry,
         // this warning announced "amux's work is being cut in half" and named
@@ -3060,8 +2945,8 @@ struct Envelope {
     /// and a partial Edit+sed workflow can false-positive, so the hook WARNs.
     unaccounted: Vec<Value>,
     /// AF-342: staged paths where unaccounted-line accounting COULD NOT RUN,
-    /// because the committer also wrote the file in the window through
-    /// something that records no content. Published beside
+    /// because an observed mtime change may come from an unrecorded write by
+    /// the committer or a concurrent writer. Published beside
     /// `unaccounted` so an empty list there is readable as "nothing found"
     /// rather than "nothing looked" — the measured/n_considered contract
     /// (AF-320) applied to this probe.
@@ -3086,6 +2971,7 @@ impl Envelope {
             "foreign": self.verdict.foreign,
             "shared": self.verdict.shared,
             "unclaimed": self.verdict.unclaimed,
+            "observations": self.verdict.observations,
             // AF-190. A NEW KEY, not folded into `foreign`, and the reason is
             // the one stated a few lines up in `classify`: installed hooks block
             // on `foreign` being non-empty, and this is a WARNING about a build,
@@ -3623,14 +3509,13 @@ pub async fn staged_guard_inner(
     let inputs = GuardInputs {
         mine: mine.paths,
         mine_firsthand: mine_fh.paths.keys().cloned().collect(),
-        // Filled by apply_observed, same as theirs_observed_only below.
         mine_observed_only: HashSet::new(),
+        observed_mine: HashMap::new(),
+        observed_peers: HashMap::new(),
         theirs,
-        // Same source, two fields on purpose: `apply_observed` will merge
-        // mtime rows into `theirs_firsthand` and must never touch this one.
+        // Content-accounting and ownership both retain recorded edits only.
         theirs_transcript: theirs_fh.clone(),
         theirs_firsthand: theirs_fh,
-        theirs_observed_only: HashSet::new(), // filled by apply_observed
         theirs_restore,
         dirty,
         // Live or stopped alike: a stopped lane's PRE-STOP staged work is exactly
@@ -3640,10 +3525,7 @@ pub async fn staged_guard_inner(
         // BLIND only — absent lanes are excluded (see the partition above).
         blind_cotenant: gates_unclaimed(&blind_live),
     };
-    // AF-123: merge OBSERVED records (the Bash hook pair's mtime reports) at
-    // firsthand rank, for the committer and every cotenant. This is what ends
-    // the structural firsthand=0 penalty on Bash-editing lanes: their writes
-    // become facts here regardless of how the command spelled the path.
+    // Retain observed mtimes as uncertainty; they cannot name a peer owner.
     let mut inputs = inputs;
     // Hoisted out of the block below because the per-line check further down
     // needs it too (AF-342): "does my own content record for this path have a
@@ -3666,6 +3548,21 @@ pub async fn staged_guard_inner(
         }
     }
     let v = classify(&pairs, now, window, &inputs);
+    if !v.observations.is_empty() {
+        let peer_observations: usize = v
+            .observations
+            .iter()
+            .map(|row| row["observers"].as_array().map_or(0, Vec::len))
+            .sum();
+        tracing::info!(
+            target: "staged_guard",
+            session = %session,
+            observed_paths = v.observations.len(),
+            peer_observations,
+            staged_paths = pairs.len(),
+            "[staged-guard/MOS-33] mtime observations retained as uncertainty; observers are not owners"
+        );
+    }
 
     // AMUX-3446: account each staged path's ADDED lines against the
     // committer's own firsthand edit content. Skipped entirely for a path
@@ -3697,38 +3594,28 @@ pub async fn staged_guard_inner(
             // `Envelope::unaccounted` has named this false positive since
             // AMUX-3446 ("a partial Edit+sed workflow can false-positive").
             //
-            // An observed record (AF-123) is the missing half: the hook pair
-            // saw this file's mtime move during one of my own commands. Content
-            // for that write exists nowhere — no extractor can recover what a
-            // heredoc or a generator wrote — so the comparison's premise
-            // ("these lines match nothing you edited") is simply false here,
-            // and the honest answer is that the probe cannot decide.
-            //
-            // Reported, not dropped (ethos rule 4): a check that silently stops
-            // running is worse than the false positive it replaced, so the path
-            // moves to `unaccounted_undecidable` and travels in the same
-            // payload. The check stays FULLY LIVE for its real target, a file
-            // with firsthand content and NO observed write of mine — which is
-            // exactly the 7797e45 peer-hunk shape it was built for, since a
-            // peer's hunk riding my `git add` moves no mtime in MY window.
+            // An observed record says only that the mtime moved during my
+            // command. An unrecorded write could be mine or a concurrent peer's,
+            // so the content comparison may be incomplete. Report that uncertainty
+            // instead of asserting authorship or silently dropping the path.
             let observed = mine_obs.get(ap);
             // A peer claim gates the line check only when that peer has
             // CONTENT behind it, because content is the only thing the
-            // comparison can attribute. `theirs` alone is satisfied by an
-            // mtime, which made this arm inert in production (see the field
-            // doc on `theirs_transcript`).
+            // comparison can attribute. Inferred command records alone have
+            // no content against which to compare staged lines.
             let peer_claims = peer_authored_content(&inputs, ap);
-            match line_accounting_mode(own.contains_key(ap), observed.is_some(), peer_claims) {
-                LineAccounting::Skip => continue,
-                LineAccounting::Undecidable => {
-                    let ts = observed.copied().unwrap_or(now);
-                    unaccounted_undecidable.push(json!({
-                        "path": rel,
-                        "observed_write_age_s": (now - ts).max(0.0) as i64,
-                        "why_undecidable": "you also wrote this file in the window through something that records no content (observed record, AF-123: a heredoc, a generator, a checkout). Your own content record is therefore incomplete here, so unaccounted-line accounting cannot tell your lines from a peer's hunk. Path-level ownership above is unaffected.",
-                    }));
-                    continue;
-                }
+            let (mode, diagnostic) = line_accounting_diagnostic(
+                rel,
+                now,
+                own.contains_key(ap),
+                observed.copied(),
+                peer_claims,
+            );
+            if let Some(row) = diagnostic {
+                unaccounted_undecidable.push(row);
+            }
+            match mode {
+                LineAccounting::Skip | LineAccounting::Undecidable => continue,
                 LineAccounting::Check => {}
             }
             let Some(content) = own.get(ap) else { continue };
@@ -3766,8 +3653,8 @@ pub async fn staged_guard_inner(
             session = %session,
             undecidable_paths = unaccounted_undecidable.len(),
             unaccounted_paths = unaccounted_rows.len(),
-            "unaccounted-line accounting skipped on {} path(s): the committer also wrote them \
-             in the window through something that records no content (AF-342)",
+            "unaccounted-line accounting undecidable on {} path(s): observed mtime changes \
+             have unknown writers, so the committer's content record may be incomplete (AF-342)",
             unaccounted_undecidable.len()
         );
     }
@@ -4782,7 +4669,10 @@ mod tests {
             PathFate::SettledByOwner("abc1234".into()),
             PathFate::SettledByOwner("def5678".into()),
         ];
-        assert_eq!(victim_headline(&mine, owner), "whose edit records are YOURS");
+        assert_eq!(
+            victim_headline(&mine, owner),
+            "whose edit records are YOURS"
+        );
 
         // Every path attributed to somebody else — the exact shape of
         // mixpeek-cicd's instance 1, where the per-path line already said
@@ -4796,7 +4686,10 @@ mod tests {
             !h.contains("YOURS"),
             "the headline still claims ownership over paths the body disowns: {h}"
         );
-        assert!(h.contains("NONE"), "it must say so plainly, not merely soften: {h}");
+        assert!(
+            h.contains("NONE"),
+            "it must say so plainly, not merely soften: {h}"
+        );
 
         // Mixed: name how many, so the reader knows the headline is not a verdict.
         let mixed = vec![
@@ -4805,7 +4698,10 @@ mod tests {
         ];
         let m = victim_headline(&mixed, owner);
         assert!(!m.contains("YOURS"), "a mixed set is not wholly yours: {m}");
-        assert!(m.contains("1 of 2"), "a count beside the claim is the whole point: {m}");
+        assert!(
+            m.contains("1 of 2"),
+            "a count beside the claim is the whole point: {m}"
+        );
     }
 
     /// The two tests above call `victim_headline` DIRECTLY, so they stay green
@@ -4848,8 +4744,14 @@ mod tests {
             &[PathFate::AbsorbedBy("ed4187d1".into(), "mvs-infra".into())],
             "mixpeek-cicd",
         );
-        assert!(!h.contains("YOURS"), "the reported instance still over-claims: {h}");
-        assert!(h.contains("NONE"), "one path, all disowned, must say so plainly: {h}");
+        assert!(
+            !h.contains("YOURS"),
+            "the reported instance still over-claims: {h}"
+        );
+        assert!(
+            h.contains("NONE"),
+            "one path, all disowned, must say so plainly: {h}"
+        );
     }
 
     /// The CONTROL that keeps the above from being satisfied by never saying
@@ -4859,10 +4761,16 @@ mod tests {
     fn absorption_by_the_owner_themselves_is_not_a_disownment() {
         let owner = "mixpeek-cicd";
         let by_self = vec![PathFate::AbsorbedBy("abc1234".into(), owner.into())];
-        assert_eq!(victim_headline(&by_self, owner), "whose edit records are YOURS");
+        assert_eq!(
+            victim_headline(&by_self, owner),
+            "whose edit records are YOURS"
+        );
 
         let risky = vec![PathFate::AtRisk, PathFate::LandedOnOrigin("f00".into())];
-        assert_eq!(victim_headline(&risky, owner), "whose edit records are YOURS");
+        assert_eq!(
+            victim_headline(&risky, owner),
+            "whose edit records are YOURS"
+        );
 
         // Empty is not a claim about anything; it must not crash or accuse.
         assert_eq!(victim_headline(&[], owner), "whose edit records are YOURS");
@@ -5286,26 +5194,62 @@ mod tests {
         (rel.to_string(), format!("/repo/{rel}"))
     }
 
+    #[test]
+    fn concurrent_reader_observations_cannot_claim_the_ops_research_files() {
+        // Incident: a lane running repo-wide Bash reads was named owner of
+        // another lane's three research files solely from moving mtimes.
+        for rel in [
+            "research/ops-success-plan-20260907.md",
+            "research/ops-success-matrix-20260907.json",
+            "research/ops-success-results-20260907.md",
+        ] {
+            let observations = [(
+                "reader-lane".to_string(),
+                HashMap::from([(format!("/repo/{rel}"), 1500.0)]),
+            )];
+            let mut inputs = GuardInputs::default();
+            apply_observed(&mut inputs, &HashMap::new(), &observations);
+            let verdict = classify(&[pair(rel)], 2000.0, 3600.0, &inputs);
+            assert!(
+                verdict.foreign.is_empty(),
+                "a concurrent observer is not a foreign owner: {:?}",
+                verdict.foreign
+            );
+            assert!(
+                verdict
+                    .shared
+                    .iter()
+                    .all(|row| row["owner"] != "reader-lane"),
+                "a concurrent observer is not a co-author: {:?}",
+                verdict.shared
+            );
+
+            // The same later observation must not erase a real writer's
+            // recorded edit or turn their protected work into unclaimed work.
+            let mut authored = peer_wrote(rel, "writer-lane", 1000.0);
+            apply_observed(&mut authored, &HashMap::new(), &observations);
+            let protected = classify(&[pair(rel)], 2000.0, 3600.0, &authored);
+            assert_eq!(protected.foreign.len(), 1);
+            assert_eq!(protected.foreign[0]["owner"], "writer-lane");
+            assert_eq!(protected.foreign[0]["provenance"], "firsthand");
+        }
+    }
+
     fn peer_wrote(path: &str, owner: &str, ts: f64) -> GuardInputs {
         let mut g = GuardInputs::default();
         g.theirs.insert(format!("/repo/{path}"), (owner.into(), ts));
         g.theirs_firsthand.insert(format!("/repo/{path}"));
-        // AF-414: the helper is named for AUTHORSHIP, so it must set the set that
-        // MEANS authorship. It set only `theirs`/`theirs_firsthand`, both of
-        // which a bare mtime satisfies — so every split_risk cell was really
-        // exercising the mtime case while reading as if it proved the authored
-        // one. `peer_touched` below is the mtime case, named honestly.
+        // Set actual content evidence too, so split-risk controls exercise
+        // recorded authorship rather than an inferred command record.
         g.theirs_transcript.insert(format!("/repo/{path}"));
         g
     }
 
-    /// A peer RECORD with no authored content: an mtime their Bash window
-    /// caught. Differs from `peer_wrote` on exactly the field that decides
-    /// whether an ownership claim is supportable.
-    fn peer_touched(path: &str, owner: &str, ts: f64) -> GuardInputs {
+    /// A path-specific inferred command record, with no recorded edit content.
+    /// Bare cwd observations no longer enter this ownership map (MOS-33).
+    fn peer_inferred(path: &str, owner: &str, ts: f64) -> GuardInputs {
         let mut g = GuardInputs::default();
         g.theirs.insert(format!("/repo/{path}"), (owner.into(), ts));
-        g.theirs_firsthand.insert(format!("/repo/{path}"));
         g
     }
 
@@ -5418,11 +5362,12 @@ mod tests {
     /// being cut in half" and named two files as "THEIR files". Both were mine:
     /// 368 insertions, 0 deletions, written minutes earlier. The prescribed
     /// remedy, "confirm with them", would have sent me to a peer about my own
-    /// code. The claim came from `inp.theirs`, which a bare mtime satisfies.
+    /// code. The claim used to come from a bare mtime. MOS-33 removes that
+    /// source; path-specific inferred commands still need the content caveat.
     #[test]
-    fn an_mtime_only_record_names_the_files_without_claiming_they_are_the_peers() {
-        // MTIME ONLY on both sides: a record exists, no authored content does.
-        let mut g = peer_touched("crates/amux-server/src/api/board.rs", "amux", 100.0);
+    fn an_inferred_record_names_the_files_without_claiming_they_are_the_peers() {
+        // Inferred command records on both sides, no authored content.
+        let mut g = peer_inferred("crates/amux-server/src/api/board.rs", "amux", 100.0);
         g.theirs.insert(
             "/repo/crates/amux-server/src/db/board_store.rs".into(),
             ("amux".into(), 100.0),
@@ -5521,13 +5466,6 @@ mod tests {
         );
     }
 
-    /// AMUX-3497, rebuilt from the live specimen: a session whose Bash window
-    /// held only HTTP probes was named co-editor of board_store.rs, because a
-    /// CONCURRENT session's tool edit moved the mtime inside that window and
-    /// the observed row attributed the write to the observer. An observed row
-    /// explained by the other side's TRANSCRIPT record at the same instant is
-    /// one write seen twice and must attribute nothing; past the skew margin
-    /// it is a real second write and must keep protecting.
     /// AF-550. `cp SRC DST` writes, so `is_pure_read_command` correctly says
     /// no — but SRC is opened read-only and the mtime gate cannot tell a peer's
     /// concurrent write to SRC from ours. The lane that copies a peer's file
@@ -5551,7 +5489,10 @@ mod tests {
         // copy-then-copy chain would launder a real write into a read.
         let chain = source_only_paths("cp a.rs b.rs; cp b.rs c.rs");
         assert!(chain.contains("a.rs"), "{chain:?}");
-        assert!(!chain.contains("b.rs"), "b.rs is written by the first cp: {chain:?}");
+        assert!(
+            !chain.contains("b.rs"),
+            "b.rs is written by the first cp: {chain:?}"
+        );
 
         // Not a copy verb, and a lone operand with no identifiable destination:
         // claim nothing rather than guess.
@@ -5573,87 +5514,73 @@ mod tests {
 
     #[test]
     fn an_observed_echo_of_a_transcript_edit_attributes_nothing() {
-        // (a) THE SPECIMEN: committer transcript-firsthand at t=1000; the
-        // peer's observed row carries the same write's mtime (within skew).
-        // The echo must not mint a co-editor: no shared row, no foreign row.
-        let mut g = GuardInputs::default();
+        // The incident's echo and a much later sample are equally unable to
+        // identify a writer. A clock window cannot turn an observation into
+        // evidence of authorship; both remain inspectable uncertainty.
+        for observed_at in [1002.0, 1900.0] {
+            let mut g = GuardInputs::default();
+            g.mine.insert("/repo/board_store.rs".into(), 1000.0);
+            g.mine_firsthand.insert("/repo/board_store.rs".into());
+            apply_observed(
+                &mut g,
+                &HashMap::new(),
+                &[(
+                    "amux-cloud".to_string(),
+                    HashMap::from([("/repo/board_store.rs".to_string(), observed_at)]),
+                )],
+            );
+            let v = classify(&[pair("board_store.rs")], 2000.0, 3600.0, &g);
+            assert!(v.foreign.is_empty());
+            assert!(
+                v.shared.is_empty(),
+                "an observer is not a co-editor: {:?}",
+                v.shared
+            );
+            assert_eq!(v.observations.len(), 1);
+            assert_eq!(v.observations[0]["observers"][0]["session"], "amux-cloud");
+            assert_eq!(v.observations[0]["establishes_ownership"], false);
+        }
+
+        // The real-write control needs a recorded edit, not a later mtime.
+        let mut g = peer_wrote("board_store.rs", "amux-cloud", 1900.0);
         g.mine.insert("/repo/board_store.rs".into(), 1000.0);
         g.mine_firsthand.insert("/repo/board_store.rs".into());
-        let mut probe_lane = HashMap::new();
-        probe_lane.insert("/repo/board_store.rs".to_string(), 1002.0);
+        let v = classify(&[pair("board_store.rs")], 2000.0, 3600.0, &g);
+        assert_eq!(v.shared.len(), 1, "recorded co-editing still warns");
+        assert_eq!(v.shared[0]["owner"], "amux-cloud");
+        assert!(v.observations.is_empty());
+
+        // Mirror: even a later observation by ME cannot counter a writer.
+        for observed_at in [1001.0, 1900.0] {
+            let mut g = peer_wrote("theirs.rs", "alice", 1000.0);
+            apply_observed(
+                &mut g,
+                &HashMap::from([("/repo/theirs.rs".to_string(), observed_at)]),
+                &[],
+            );
+            let v = classify(&[pair("theirs.rs")], 2000.0, 3600.0, &g);
+            assert_eq!(v.foreign.len(), 1);
+            assert_eq!(v.foreign[0]["owner"], "alice");
+            assert!(v.shared.is_empty());
+            assert_eq!(v.observations.len(), 1);
+        }
+
+        // Both Bash windows see the same write. Keep both observations without
+        // minting either a foreign owner or a peer co-author.
+        let mut g = GuardInputs::default();
         apply_observed(
             &mut g,
-            &HashMap::new(),
-            &[("amux-cloud".to_string(), probe_lane)],
+            &HashMap::from([("/repo/both.rs".to_string(), 1500.0)]),
+            &[(
+                "bob".to_string(),
+                HashMap::from([("/repo/both.rs".to_string(), 1501.0)]),
+            )],
         );
-        let v = classify(&[pair("board_store.rs")], 2000.0, 3600.0, &g);
-        assert!(v.foreign.is_empty());
-        assert!(
-            v.shared.is_empty(),
-            "the phantom co-editor NOTE must not fire on an mtime echo: {:?}",
-            v.shared
-        );
-
-        // (b) CONTROL — the same peer row 900s LATER than the transcript edit
-        // is a real second write; dropping it too would unprotect genuinely
-        // co-edited files. It stays, and classifies shared.
-        let mut g = GuardInputs::default();
-        g.mine.insert("/repo/board_store.rs".into(), 1000.0);
-        g.mine_firsthand.insert("/repo/board_store.rs".into());
-        let mut real_edit = HashMap::new();
-        real_edit.insert("/repo/board_store.rs".to_string(), 1900.0);
-        apply_observed(
-            &mut g,
-            &HashMap::new(),
-            &[("amux-cloud".to_string(), real_edit)],
-        );
-        let v = classify(&[pair("board_store.rs")], 2000.0, 3600.0, &g);
-        assert_eq!(v.shared.len(), 1, "a real later write must still warn");
-
-        // (c) MIRROR: MY observed echo of a PEER's transcript edit drops my
-        // counterclaim, so their firsthand BLOCKS my commit (the AF-19 tie
-        // blocked deliberately; the echo drop must not soften it to shared).
-        let mut g = peer_wrote("theirs.rs", "alice", 1000.0);
-        let mut my_echo = HashMap::new();
-        my_echo.insert("/repo/theirs.rs".to_string(), 1001.0);
-        apply_observed(&mut g, &my_echo, &[]);
-        let v = classify(&[pair("theirs.rs")], 2000.0, 3600.0, &g);
-        assert_eq!(
-            v.foreign.len(),
-            1,
-            "my echo of alice's write is not a claim"
-        );
-        assert!(v.shared.is_empty());
-
-        // (d) OBSERVED-vs-OBSERVED coincidence cannot be resolved server-side
-        // (two Bash windows saw one mtime; either could own it) — both claims
-        // stay, but the shared row must SAY how it knows (rule 4): co_signal
-        // names the ambiguity instead of asserting a co-editor.
-        let mut g = GuardInputs::default();
-        let mut mine_obs = HashMap::new();
-        mine_obs.insert("/repo/both.rs".to_string(), 1500.0);
-        let mut peer_obs = HashMap::new();
-        peer_obs.insert("/repo/both.rs".to_string(), 1501.0);
-        apply_observed(&mut g, &mine_obs, &[("bob".to_string(), peer_obs)]);
         let v = classify(&[pair("both.rs")], 2000.0, 3600.0, &g);
-        assert_eq!(v.shared.len(), 1);
-        assert!(
-            v.shared[0]["co_signal"]
-                .as_str()
-                .unwrap_or("")
-                .contains("AMUX-3497"),
-            "ambiguous mtime co-signal must name itself: {:?}",
-            v.shared[0]
-        );
-
-        // (e) co_signal control: a TRANSCRIPT peer claim coinciding with mine
-        // carries no ambiguity marker — the transcript says who wrote it.
-        let mut g = peer_wrote("t.rs", "alice", 1000.0);
-        g.mine.insert("/repo/t.rs".into(), 1001.0);
-        g.mine_firsthand.insert("/repo/t.rs".into());
-        let v = classify(&[pair("t.rs")], 2000.0, 3600.0, &g);
-        assert_eq!(v.shared.len(), 1);
-        assert!(v.shared[0].get("co_signal").is_none(), "{:?}", v.shared[0]);
+        assert!(v.foreign.is_empty());
+        assert!(v.shared.is_empty());
+        assert_eq!(v.observations[0]["mine_age_secs"], 500);
+        assert_eq!(v.observations[0]["observers"][0]["age_secs"], 499);
     }
 
     /// AMUX-3662, rebuilt from the live specimen rather than a convenient shape.
@@ -5671,74 +5598,44 @@ mod tests {
     /// peer. A symmetric instrument answering an asymmetric question gets read
     /// whichever way the reader already leans.
     #[test]
-    fn a_shared_row_says_whether_each_side_recorded_the_write_or_only_saw_the_mtime() {
-        // THE SPECIMEN. Peer wrote it for real (transcript); I only observed
-        // the mtime move during a command that merely READ the file. The skew
-        // is deliberately wider than RECENCY_SKEW_MARGIN_S so my echo is NOT
-        // dropped — that drop is a different rule with its own cells above, and
-        // this one is about what the reader is told when a claim survives.
+    fn observations_do_not_dilute_either_sides_recorded_write() {
+        // AMUX-3662: the requester's only contact was a read of board.rs,
+        // while amux-frustrations had actually written it. The observation
+        // remains visible without upgrading the reader to co-author.
         let mut g = peer_wrote("board.rs", "amux-frustrations", 1000.0);
-        let mut my_echo = HashMap::new();
-        my_echo.insert("/repo/board.rs".to_string(), 1600.0);
-        apply_observed(&mut g, &my_echo, &[]);
+        apply_observed(
+            &mut g,
+            &HashMap::from([("/repo/board.rs".to_string(), 1600.0)]),
+            &[],
+        );
         let v = classify(&[pair("board.rs")], 2000.0, 3600.0, &g);
-        assert_eq!(v.shared.len(), 1, "{:?}", v.shared);
-        assert_eq!(
-            v.shared[0]["mine_provenance"], "observed",
-            "my claim came from an mtime, and the row must say so: {:?}",
-            v.shared[0]
-        );
-        assert_eq!(
-            v.shared[0]["their_provenance"], "transcript",
-            "their claim IS a recorded write: {:?}",
-            v.shared[0]
-        );
+        assert_eq!(v.foreign.len(), 1);
+        assert_eq!(v.foreign[0]["provenance"], "firsthand");
+        assert_eq!(v.observations[0]["mine_age_secs"], 400);
+        assert!(v.shared.is_empty());
 
-        // CONTROL 1: the exact inverse must read the exact opposite way.
-        let mut g = GuardInputs::default();
-        g.mine.insert("/repo/board.rs".into(), 1000.0);
-        g.mine_firsthand.insert("/repo/board.rs".into());
-        let mut peer_obs = HashMap::new();
-        peer_obs.insert("/repo/board.rs".to_string(), 1600.0);
-        apply_observed(&mut g, &HashMap::new(), &[("bob".to_string(), peer_obs)]);
-        let v = classify(&[pair("board.rs")], 2000.0, 3600.0, &g);
-        assert_eq!(v.shared.len(), 1, "{:?}", v.shared);
-        assert_eq!(
-            v.shared[0]["mine_provenance"], "transcript",
-            "a write I RECORDED must never read as inferred: {:?}",
-            v.shared[0]
-        );
-        assert_eq!(
-            v.shared[0]["their_provenance"], "observed",
-            "{:?}",
-            v.shared[0]
-        );
-
-        // CONTROL 2, AND IT IS THE LOAD-BEARING ONE. I hold a transcript record
-        // AND my own Bash window also caught the mtime — the ordinary case when
-        // you edit a file and then run anything that touches the tree.
-        //
-        // Control 1 does not reach it: with no observed row of mine, the
-        // marking loop never runs for that path, so a mutation that marks
-        // EVERYTHING observed still leaves it empty and Control 1 passes. That
-        // mutation survived the first draft of this test, which is the whole
-        // reason this case exists — a field hardcoded to "observed" would tell
-        // every author their own recorded work is an inference, and nothing
-        // above would have gone red.
+        // Genuine co-authorship retains both recorded ages/provenances, even
+        // when both sessions later observe mtimes from unrelated commands.
         let mut g = peer_wrote("board.rs", "bob", 1500.0);
         g.mine.insert("/repo/board.rs".into(), 1000.0);
         g.mine_firsthand.insert("/repo/board.rs".into());
-        let mut my_own_echo = HashMap::new();
-        my_own_echo.insert("/repo/board.rs".to_string(), 1010.0);
-        apply_observed(&mut g, &my_own_echo, &[]);
-        let v = classify(&[pair("board.rs")], 2000.0, 3600.0, &g);
-        assert_eq!(v.shared.len(), 1, "{:?}", v.shared);
-        assert_eq!(
-            v.shared[0]["mine_provenance"], "transcript",
-            "a transcript record OUTRANKS my own mtime echo of the same write — \
-             seeing your own edit land is not a second, weaker claim: {:?}",
-            v.shared[0]
+        apply_observed(
+            &mut g,
+            &HashMap::from([("/repo/board.rs".to_string(), 1700.0)]),
+            &[(
+                "reader".to_string(),
+                HashMap::from([("/repo/board.rs".to_string(), 1900.0)]),
+            )],
         );
+        let v = classify(&[pair("board.rs")], 2000.0, 3600.0, &g);
+        assert_eq!(v.shared.len(), 1);
+        assert_eq!(v.shared[0]["owner"], "bob");
+        assert_eq!(v.shared[0]["mine_age_secs"], 1000);
+        assert_eq!(v.shared[0]["age_secs"], 500);
+        assert_eq!(v.shared[0]["mine_provenance"], "transcript");
+        assert_eq!(v.shared[0]["their_provenance"], "transcript");
+        assert_eq!(v.observations[0]["mine_age_secs"], 300);
+        assert_eq!(v.observations[0]["observers"][0]["session"], "reader");
     }
 
     /// AF-179, rebuilt from the reported specimen's own numbers.
@@ -5762,63 +5659,48 @@ mod tests {
     /// observed-only peer claim" must not widen it to firsthand ones.
     #[test]
     fn a_long_authorship_sampled_by_a_peers_bash_window_is_marked_as_observed() {
-        // The specimen: I authored at t=2029, their walk sampled me at t=2010.
-        let mut g = GuardInputs::default();
-        let mut mine = HashMap::new();
-        mine.insert("/repo/token-baseline.py".to_string(), 2029.0);
-        let mut peer = HashMap::new();
-        peer.insert("/repo/token-baseline.py".to_string(), 2010.0);
-        apply_observed(&mut g, &mine, &[("amux-frustrations".to_string(), peer)]);
-        let v = classify(&[pair("token-baseline.py")], 2100.0, 3600.0, &g);
-        assert_eq!(v.shared.len(), 1, "{:?}", v.shared);
-        let sig = v.shared[0]["co_signal"].as_str().unwrap_or("");
-        assert!(
-            sig.contains("AF-179"),
-            "a 19s gap is 4x the 5s skew margin and the old gate said nothing here: {:?}",
-            v.shared[0]
-        );
-        assert!(
-            sig.contains("OBSERVED claim, not a recorded write"),
-            "state the PROVENANCE — that is the fact, where 'is this a real co-editor' is a \
-             guess the server cannot make: {sig:?}"
-        );
-        assert!(
-            sig.contains("NEWER"),
-            "my record is newer than their sample, which is the direction that says they \
-             sampled MY authorship: {sig:?}"
-        );
-
-        // The same shape at the real specimen's distance, ~1000s, must also
-        // speak. A window-based gate gets quieter as the gap grows; provenance
-        // does not depend on the gap at all.
-        let mut g = GuardInputs::default();
-        let mut mine = HashMap::new();
-        mine.insert("/repo/token-baseline.py".to_string(), 3010.0);
-        let mut peer = HashMap::new();
-        peer.insert("/repo/token-baseline.py".to_string(), 2010.0);
-        apply_observed(&mut g, &mine, &[("amux-frustrations".to_string(), peer)]);
-        let v = classify(&[pair("token-baseline.py")], 3100.0, 3600.0, &g);
-        assert!(
-            v.shared[0]["co_signal"]
+        // AF-179: a long cargo test sampled another lane's ongoing authorship.
+        // Both the short and incident-sized gap retain countable observations,
+        // and neither gap establishes an owner.
+        for mine_at in [2029.0, 3010.0] {
+            let mut g = GuardInputs::default();
+            apply_observed(
+                &mut g,
+                &HashMap::from([("/repo/token-baseline.py".to_string(), mine_at)]),
+                &[(
+                    "amux-frustrations".to_string(),
+                    HashMap::from([("/repo/token-baseline.py".to_string(), 2010.0)]),
+                )],
+            );
+            let v = classify(&[pair("token-baseline.py")], 3100.0, 3600.0, &g);
+            assert!(v.shared.is_empty());
+            assert!(v.foreign.is_empty());
+            assert_eq!(v.observations.len(), 1);
+            assert_eq!(
+                v.observations[0]["observers"][0]["session"],
+                "amux-frustrations"
+            );
+            assert_eq!(v.observations[0]["observers"][0]["age_secs"], 1090);
+            assert_eq!(
+                v.observations[0]["mine_age_secs"],
+                (3100.0 - mine_at) as i64
+            );
+            assert_eq!(v.observations[0]["provenance"], "observed");
+            assert!(v.observations[0]["why"]
                 .as_str()
-                .unwrap_or("")
-                .contains("1000s NEWER"),
-            "quote the real gap so the reader can weigh it: {:?}",
-            v.shared[0]
-        );
+                .unwrap()
+                .contains("not who wrote it"));
+        }
 
-        // CONTROL — a peer's TRANSCRIPT claim carries no marker, at any gap.
-        // The transcript says who wrote it; hedging it would teach readers to
-        // ignore the hedge on the claims that are genuinely ambiguous.
         let mut g = peer_wrote("t.rs", "alice", 1000.0);
         g.mine.insert("/repo/t.rs".into(), 3000.0);
         g.mine_firsthand.insert("/repo/t.rs".into());
         let v = classify(&[pair("t.rs")], 4000.0, 3600.0, &g);
-        assert_eq!(v.shared.len(), 1, "{:?}", v.shared);
+        assert_eq!(v.shared.len(), 1);
+        assert_eq!(v.shared[0]["owner"], "alice");
         assert!(
-            v.shared[0].get("co_signal").is_none(),
-            "a firsthand peer claim is not ambiguous and must not be hedged: {:?}",
-            v.shared[0]
+            v.observations.is_empty(),
+            "recorded writes need no observation caveat"
         );
     }
 
@@ -5937,79 +5819,77 @@ mod tests {
         }
     }
 
-    /// AF-123: observed records rank WITH firsthand. The 75%-of-blocks lane
-    /// bias exists because Bash-editing lanes can never mint a firsthand
-    /// record; an observed mtime report is a fact about the disk, so a lane
-    /// whose only signal is observed must classify exactly like one that used
-    /// the Edit tool — here, the committer's fresher observed edit turns a
-    /// would-be AF-27 block into a shared warning.
+    /// AF-123's own-shell workflow stays available, while MOS-33 refuses
+    /// the unsafe extension that ranked a concurrent observation as a write.
     #[test]
-    fn observed_records_rank_with_firsthand_and_lift_the_bash_lane_penalty() {
-        // Without observed: peer firsthand vs committer NOTHING -> foreign block.
-        let g = peer_wrote("f.rs", "alice", 1000.0);
-        let v = classify(&[pair("f.rs")], 2000.0, 3600.0, &g);
-        assert_eq!(
-            v.foreign.len(),
-            1,
-            "control: the bash lane is blocked today"
+    fn own_shell_observations_work_without_weakening_recorded_or_blind_protection() {
+        // AF-123's legitimate case: an own shell edit and a fully visible
+        // checkout with no peer claim must remain committable.
+        let mut own = GuardInputs::default();
+        apply_observed(
+            &mut own,
+            &HashMap::from([("/repo/f.rs".to_string(), 1900.0)]),
+            &[],
         );
+        let v = classify(&[pair("f.rs")], 2000.0, 3600.0, &own);
+        assert!(v.foreign.is_empty());
+        assert!(v.unclaimed.is_empty());
+        assert_eq!(v.observations.len(), 1);
+        assert!(!own.mine_firsthand.contains("/repo/f.rs"));
 
-        // With an observed record 900s fresher than alice's claim: firsthand
-        // rank + the AF-27 recency rule -> shared (warned), never blocked.
-        let mut g = peer_wrote("f.rs", "alice", 1000.0);
-        let mut mine_obs = HashMap::new();
-        mine_obs.insert("/repo/f.rs".to_string(), 1900.0);
-        apply_observed(&mut g, &mine_obs, &[]);
-        let v = classify(&[pair("f.rs")], 2000.0, 3600.0, &g);
-        assert!(v.foreign.is_empty(), "{:?}", v.foreign);
-        assert_eq!(
-            v.shared.len(),
-            1,
-            "both claims real -> shared, warned not blocked"
-        );
+        // A reader's mtime must never displace an actual writer, whether its
+        // sample is older, tied, or much later. Recency cannot prove authorship.
+        for observed_at in [100.0, 1000.0, 1900.0] {
+            let mut g = peer_wrote("f.rs", "alice", 1000.0);
+            apply_observed(
+                &mut g,
+                &HashMap::from([("/repo/f.rs".to_string(), observed_at)]),
+                &[],
+            );
+            let v = classify(&[pair("f.rs")], 2000.0, 3600.0, &g);
+            assert_eq!(v.foreign.len(), 1, "sample={observed_at}: {:?}", v.foreign);
+            assert_eq!(v.foreign[0]["owner"], "alice");
+            assert_eq!(v.foreign[0]["provenance"], "firsthand");
+            assert!(v.shared.is_empty());
+        }
 
-        // AF-125, the cell where ONLY RANK decides — written across the
-        // reverse-recency case amux-frustrations' mutation exposed. The
-        // committer's observed record is 900s STALER than the peer's
-        // firsthand claim, so the AF-27 recency rule alone would block
-        // (committer_fresher=false); firsthand rank skips that branch
-        // entirely and both real claims read shared. Deleting the
-        // mine_firsthand insert in apply_observed fails THIS assert on
-        // behavior, not on the insert's own inverse.
-        let mut g = peer_wrote("stale-mine.rs", "alice", 1900.0);
-        let mut mine_obs = HashMap::new();
-        mine_obs.insert("/repo/stale-mine.rs".to_string(), 1000.0);
-        apply_observed(&mut g, &mine_obs, &[]);
-        let v = classify(&[pair("stale-mine.rs")], 2000.0, 3600.0, &g);
-        assert!(
-            v.foreign.is_empty(),
-            "rank must carry the staler-self cell — recency alone blocks it: {:?}",
-            v.foreign
-        );
-        assert_eq!(
-            v.shared.len(),
-            1,
-            "two real claims are a contest, not a sweep"
-        );
-        // Mechanism check, deliberately BELOW the cell (amux-frustrations'
-        // AF-125 correction, 2026-08-21): asserting the insert directly is the
-        // mutation's own inverse, and placed above the behavioral cell it
-        // panicked first and masked it in a plain mutation run. It stays
-        // because a right verdict via the wrong channel (recency) lapses; it
-        // just must never be the first thing the mutation hits.
-        assert!(g.mine_firsthand.contains("/repo/stale-mine.rs"));
-
-        // A PEER's observed record beats their stale entry and clears
-        // restore-kind (kind follows the latest record).
+        // A reader also cannot supersede an inferred command record or change
+        // its restore provenance, even when the observer is the same session.
         let mut g = GuardInputs::default();
         g.theirs.insert("/repo/g.rs".into(), ("bob".into(), 100.0));
         g.theirs_restore.insert("/repo/g.rs".into());
-        let mut bob_obs = HashMap::new();
-        bob_obs.insert("/repo/g.rs".to_string(), 500.0);
-        apply_observed(&mut g, &HashMap::new(), &[("bob".to_string(), bob_obs)]);
-        assert_eq!(g.theirs.get("/repo/g.rs").map(|(_, t)| *t), Some(500.0));
-        assert!(!g.theirs_restore.contains("/repo/g.rs"));
-        assert!(g.theirs_firsthand.contains("/repo/g.rs"));
+        apply_observed(
+            &mut g,
+            &HashMap::new(),
+            &[(
+                "bob".to_string(),
+                HashMap::from([("/repo/g.rs".to_string(), 500.0)]),
+            )],
+        );
+        let v = classify(&[pair("g.rs")], 2000.0, 3600.0, &g);
+        assert_eq!(v.foreign[0]["provenance"], "restore");
+        assert_eq!(v.foreign[0]["age_secs"], 1900);
+        assert_eq!(v.observations[0]["observers"][0]["age_secs"], 1500);
+
+        // A bare observation is not grounds to release unknown staged work
+        // while a cotenant is invisible. Both observer identities remain visible
+        // only as observations; the old-client blocker keeps its anonymous owner.
+        let mut blind = GuardInputs {
+            blind_cotenant: true,
+            ..Default::default()
+        };
+        apply_observed(
+            &mut blind,
+            &HashMap::from([("/repo/unknown.rs".to_string(), 1500.0)]),
+            &[(
+                "reader".to_string(),
+                HashMap::from([("/repo/unknown.rs".to_string(), 1501.0)]),
+            )],
+        );
+        let v = classify(&[pair("unknown.rs")], 2000.0, 3600.0, &blind);
+        assert_eq!(v.foreign.len(), 1);
+        assert_eq!(v.foreign[0]["owner"], "");
+        assert_eq!(v.observations.len(), 1);
     }
 
     /// AF-130, rebuilt from the incident's own timeline: f84a485 committed at
@@ -6135,6 +6015,195 @@ mod tests {
         assert!(
             !m.contains_key("/repo-obs/p000.rs"),
             "the OLDEST record is the cap's victim, per the design comment"
+        );
+    }
+
+    /// Restore this test-only process setting independently of HomeGuard,
+    /// whose restoration is intentionally scoped to the server.env channel.
+    /// Callers hold settings::test_env::LOCK (directly or through HomeGuard).
+    struct StagedGuardSettingRestore(Option<std::ffi::OsString>);
+
+    impl StagedGuardSettingRestore {
+        fn enable() -> Self {
+            let prior = Self(std::env::var_os("AMUX_STAGED_GUARD"));
+            std::env::set_var("AMUX_STAGED_GUARD", "1");
+            prior
+        }
+    }
+
+    impl Drop for StagedGuardSettingRestore {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("AMUX_STAGED_GUARD", value),
+                None => std::env::remove_var("AMUX_STAGED_GUARD"),
+            }
+        }
+    }
+
+    #[test]
+    fn staged_guard_fixture_restores_absent_and_present_settings() {
+        let _lock = crate::api::settings::test_env::LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _original = StagedGuardSettingRestore(std::env::var_os("AMUX_STAGED_GUARD"));
+        for prior in [None, Some(std::ffi::OsString::from("off"))] {
+            match &prior {
+                Some(value) => std::env::set_var("AMUX_STAGED_GUARD", value),
+                None => std::env::remove_var("AMUX_STAGED_GUARD"),
+            }
+            {
+                let _enabled = StagedGuardSettingRestore::enable();
+                assert!(guard_enabled());
+            }
+            assert_eq!(std::env::var_os("AMUX_STAGED_GUARD"), prior);
+        }
+    }
+
+    /// MOS-33's stored-data caller control. This intentionally has no Claude
+    /// transcript: the resolver's root is the real HOME, so the test uses
+    /// unique, nonexistent project/session paths and never writes there.
+    /// Recorded-writer protection is covered separately through the real
+    /// apply_observed -> classify -> Envelope path above.
+    #[tokio::test]
+    async fn stored_observations_reach_the_actual_guard_without_naming_the_reader() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("amux-home");
+        let repo = fixture.path().join("repo");
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        std::fs::create_dir_all(repo.join("research")).unwrap();
+        let repo = std::fs::canonicalize(repo).unwrap();
+        let mut init_command = std::process::Command::new("git");
+        init_command.args(["init", "-q"]).current_dir(&repo);
+        // A hook/test runner may export GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE,
+        // or other repository-local overrides. Strip them for this mutating
+        // child only, so initialization cannot escape the disposable fixture.
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                init_command.env_remove(key);
+            }
+        }
+        let init = init_command.output().unwrap();
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        assert!(
+            repo.join(".git").is_dir(),
+            "git init must create the fixture's own repository"
+        );
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let requester = format!("mos33-committer-{}-{stamp}", std::process::id());
+        let reader = format!("mos33-reader-{}-{stamp}", std::process::id());
+        for name in [&requester, &reader] {
+            std::fs::write(
+                home.join("sessions").join(format!("{name}.env")),
+                format!(
+                    "CC_DIR=\"{}\"\nCC_ITERM2_SESSION_ID=\"unit-test-no-runtime\"\n",
+                    repo.display(),
+                ),
+            )
+            .unwrap();
+        }
+        let _env = crate::api::settings::test_env::set_home(&home);
+        // Declared after HomeGuard so this restores before its lock is released.
+        let _guard_setting = StagedGuardSettingRestore::enable();
+        assert_eq!(crate::config::amux_home(), home);
+        assert!(session_jsonl_path(&requester).is_none());
+        assert!(session_jsonl_path(&reader).is_none());
+        let paths = [
+            "research/ops-success-plan-20260907.md",
+            "research/ops-success-matrix-20260907.json",
+            "research/ops-success-results-20260907.md",
+        ];
+        for path in paths {
+            std::fs::write(repo.join(path), "owned test fixture\n").unwrap();
+        }
+        let store = std::sync::Arc::new(crate::db::Store::open(&home.join("test.db")).unwrap());
+        let state = crate::api::AppState {
+            store: store.clone(),
+            started: std::time::Instant::now(),
+            build_hash: "mos33-test".into(),
+            auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let headers = |name: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("x-amux-session", name.parse().unwrap());
+            h
+        };
+        let request = json!({
+            "dir": repo, "paths": paths, "session": requester,
+            "op": "commit", "guard_version": 6,
+        });
+        let body = axum::body::Bytes::from(serde_json::to_vec(&request).unwrap());
+        // Same handler and three-path denominator before any reports.
+        let (code, before) =
+            staged_guard_inner(Some(state.clone()), headers(&requester), body.clone()).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(before.0["undecided"], false, "{}", before.0);
+        assert_eq!(before.0["cotenants"], json!([reader]));
+        assert_eq!(before.0["observations"], json!([]));
+        assert_eq!(before.0["unclaimed"].as_array().unwrap().len(), paths.len());
+
+        let now = now_epoch();
+        let reports: Vec<Value> = paths
+            .iter()
+            .map(|path| {
+                json!({
+                    "path": repo.join(path), "mtime": now - 10.0,
+                })
+            })
+            .collect();
+        let (code, posted) = observed_edits(
+            axum::extract::State(state.clone()),
+            headers(&reader),
+            Json(json!({"paths": reports})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(posted.0["stored"], paths.len());
+        let saved: String = store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM prefs WHERE key=?1",
+                [observed_key(&reader)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let legacy_map: HashMap<String, f64> = serde_json::from_str(&saved).unwrap();
+        assert_eq!(legacy_map.len(), paths.len());
+        assert_eq!(legacy_map[&realpath(&repo.join(paths[0]))], now - 10.0);
+
+        // This is the production loader, not a manually populated GuardInputs.
+        let (code, after) = staged_guard_inner(Some(state), headers(&requester), body).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(after.0["undecided"], false, "{}", after.0);
+        assert_eq!(after.0["foreign"], json!([]), "{}", after.0);
+        assert_eq!(after.0["shared"], json!([]), "{}", after.0);
+        assert_eq!(after.0["unclaimed"].as_array().unwrap().len(), paths.len());
+        let rows = after.0["observations"].as_array().unwrap();
+        assert_eq!(rows.len(), paths.len());
+        for (row, path) in rows.iter().zip(paths) {
+            assert_eq!(row["path"], path);
+            assert_eq!(row["establishes_ownership"], false);
+            assert_eq!(row["mine_age_secs"], Value::Null);
+            assert_eq!(row["observers"].as_array().unwrap().len(), 1);
+            assert_eq!(row["observers"][0]["session"], reader);
+            assert!(row["observers"][0]["age_secs"].as_i64().unwrap() >= 10);
+        }
+        let queued: i64 = store
+            .read()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM steering_queue", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            queued, 0,
+            "an observation cannot enqueue an owner notice, even in this private store"
         );
     }
 
@@ -6438,6 +6507,44 @@ mod tests {
     /// v1: four green cells over a correct pure function, a one-line call site
     /// nobody could test, and a fix that did nothing in production.
     #[test]
+    fn observed_line_accounting_advice_does_not_claim_the_requester_wrote_it() {
+        let (mode, row) = line_accounting_diagnostic(
+            "research/ops-success-results-20260907.md",
+            2000.0,
+            true,
+            Some(1500.0),
+            false,
+        );
+        assert_eq!(mode, LineAccounting::Undecidable);
+        let row = row.expect("uncertainty must be visible on the wire");
+        assert_eq!(row["observed_write_age_s"], 500);
+        assert_eq!(row["establishes_ownership"], false);
+        assert_eq!(row["provenance"], "observed");
+        let why = row["why_undecidable"].as_str().unwrap();
+        assert!(why.contains("writer is unknown"), "{why}");
+        assert!(
+            !why.contains("you also wrote"),
+            "the incident's false authorship assertion: {why}"
+        );
+
+        // A real peer content record keeps line accounting active even when
+        // the requester also saw the mtime. Merely observing a write must not
+        // suppress the peer-hunk protection or produce an uncertainty escape.
+        let (mode, row) = line_accounting_diagnostic(
+            "research/ops-success-results-20260907.md",
+            2000.0,
+            true,
+            Some(1500.0),
+            true,
+        );
+        assert_eq!(mode, LineAccounting::Check);
+        assert!(row.is_none());
+        let (mode, row) = line_accounting_diagnostic("own.rs", 2000.0, true, None, false);
+        assert_eq!(mode, LineAccounting::Check);
+        assert!(row.is_none());
+    }
+
+    #[test]
     fn peer_content_is_not_peer_mtime() {
         let path = "/repo/shared.rs".to_string();
         let mut inputs = GuardInputs::default();
@@ -6452,6 +6559,10 @@ mod tests {
             "an observed mtime must NOT count as a peer authoring content, or the \
              Undecidable arm goes inert on every actively-edited path in the fleet"
         );
+        // Path-specific inferred commands still enter `theirs` without
+        // recorded content; this control keeps that remaining distinction live.
+        let inferred = peer_inferred("shared.rs", "peer", 100.0);
+        assert!(!peer_authored_content(&inferred, &path));
         // And the real thing still counts: a peer with a transcript record.
         let mut real = GuardInputs::default();
         real.theirs_transcript.insert(path.clone());
@@ -6471,42 +6582,22 @@ mod tests {
     /// nearly every actively-edited path, so that arm stayed on everywhere and
     /// the fix did nothing in production while every unit test passed.
     ///
-    /// The property that makes the derivation safe is an ORDERING one:
-    /// `apply_observed` merges mtime rows into `theirs_firsthand` at firsthand
-    /// rank, on purpose, so only a set it never writes can answer "did a peer
-    /// author content here". This pins that `theirs_transcript` is that set.
-    /// If a future change starts maintaining it inside `apply_observed`, the
-    /// arm silently goes inert again and no other test in this file notices.
+    /// MOS-33 separates observations from all named ownership maps. Both
+    /// the content and ownership sets must stay free of bare observations.
     #[test]
     fn apply_observed_never_writes_the_peer_transcript_set() {
         let path = "/repo/shared.rs".to_string();
         let mut inputs = GuardInputs::default();
-        // A peer with NO transcript record, whose only signal is an mtime that
-        // coincides with my own write: the AMUX-3497 phantom co-editor, and
-        // the exact shape the live response reported.
         let theirs_obs = vec![("peer".to_string(), HashMap::from([(path.clone(), 100.0)]))];
         apply_observed(&mut inputs, &HashMap::new(), &theirs_obs);
-
-        assert!(
-            inputs.theirs_firsthand.contains(&path),
-            "apply_observed must still rank observed rows WITH firsthand (AF-123)"
-        );
-        assert!(
-            inputs.theirs.contains_key(&path),
-            "and the observed row must still win the path-level claim"
-        );
-        assert!(
-            !inputs.theirs_transcript.contains(&path),
-            "an mtime is not authorship: theirs_transcript must stay empty, or \
-             a phantom co-editor re-inerts the Undecidable arm"
-        );
-        // The two questions must be answerable apart. If these ever agree for
-        // an observed-only row, the derivation has nothing left to key on.
-        assert_ne!(
-            inputs.theirs_firsthand.contains(&path),
-            inputs.theirs_transcript.contains(&path),
-            "the 'has a record' and 'authored content' questions must differ here"
-        );
+        let v = classify(&[pair("shared.rs")], 2000.0, 3600.0, &inputs);
+        assert!(v.foreign.is_empty());
+        assert_eq!(v.unclaimed.len(), 1);
+        assert_eq!(v.observations.len(), 1);
+        assert_eq!(v.observations[0]["observers"][0]["session"], "peer");
+        assert!(!inputs.theirs_firsthand.contains(&path));
+        assert!(!inputs.theirs.contains_key(&path));
+        assert!(!inputs.theirs_transcript.contains(&path));
     }
 
     /// MG-1484: a restore writes bytes equal to a committed ref — an edit
@@ -6583,30 +6674,28 @@ mod tests {
     /// "you restored this" instead of "you edited this".
     /// AMUX-3778: an OBSERVED claim must not be described as a recorded write.
     ///
-    /// `apply_observed` inserts observed rows into `theirs_firsthand` on
-    /// purpose (AF-123 — a Bash-editing lane must not be penalised for a signal
-    /// the harness denies it). That widened the set the provenance lookup
-    /// checked FIRST, so every observed row reported as `firsthand`, and the
-    /// victim notice asserted a recorded write over a cwd mtime. The JSON
-    /// verdict already reported "observed" correctly off the same data, so the
-    /// machine field was right and the human sentence was wrong.
-    ///
-    /// The specimen is AMUX-3763: mixpeek-general warned about radio-canada's
-    /// brand-new file, both lanes interrupted.
+    /// MOS-33 stops fresh observations becoming ownership verdicts. Older
+    /// persisted notices still need honest rendering, with recorded-write and
+    /// restore controls retaining their stronger provenance.
     #[test]
     fn an_observed_claim_reads_as_circumstantial_and_a_firsthand_one_does_not() {
         let mut inp = GuardInputs::default();
         let p = "/repo/customers/radio-canada/pipeline/s04_faces.py".to_string();
-        // Exactly what apply_observed does: rank it WITH firsthand, and mark
-        // how it was learned.
-        inp.theirs_firsthand.insert(p.clone());
-        inp.theirs_observed_only.insert(p.clone());
-        assert_eq!(
-            provenance_of(&inp, &p),
-            "observed",
-            "an observed row is ranked with firsthand but is not firsthand EVIDENCE"
+        apply_observed(
+            &mut inp,
+            &HashMap::new(),
+            &[("reader".to_string(), HashMap::from([(p.clone(), 1000.0)]))],
         );
+        let v = classify(
+            &[("s04_faces.py".to_string(), p.clone())],
+            2000.0,
+            3600.0,
+            &inp,
+        );
+        assert!(v.foreign.is_empty());
+        assert_eq!(v.observations[0]["provenance"], "observed");
 
+        // Historical persisted notices can still carry observed provenance.
         let (line, at_risk) = victim_path_line("s04_faces.py", &PathFate::AtRisk, "observed", "me");
         assert!(
             at_risk,
@@ -6641,7 +6730,6 @@ mod tests {
         let mut inp3 = GuardInputs::default();
         inp3.theirs_restore.insert(p.clone());
         inp3.theirs_firsthand.insert(p.clone());
-        inp3.theirs_observed_only.insert(p.clone());
         assert_eq!(provenance_of(&inp3, &p), "restore");
     }
 
@@ -7159,6 +7247,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn observation_uncertainty_reaches_the_wire_beside_real_and_blind_blockers() {
+        for blind in [false, true] {
+            let mut inputs = peer_wrote("authored.rs", "writer", 1000.0);
+            inputs.blind_cotenant = blind;
+            apply_observed(
+                &mut inputs,
+                &HashMap::new(),
+                &[(
+                    "reader".to_string(),
+                    HashMap::from([
+                        ("/repo/authored.rs".to_string(), 1500.0),
+                        ("/repo/unclaimed.rs".to_string(), 1500.0),
+                    ]),
+                )],
+            );
+            let v = Envelope {
+                verdict: classify(
+                    &[pair("authored.rs"), pair("unclaimed.rs")],
+                    2000.0,
+                    3600.0,
+                    &inputs,
+                ),
+                ..Default::default()
+            }
+            .json();
+            assert_eq!(v["observations"].as_array().unwrap().len(), 2);
+            assert_eq!(v["observations"][0]["observers"][0]["session"], "reader");
+            assert_eq!(v["observations"][0]["establishes_ownership"], false);
+            assert_eq!(v["foreign"][0]["owner"], "writer");
+            assert_eq!(v["foreign"][0]["provenance"], "firsthand");
+            assert_eq!(
+                v["foreign"].as_array().unwrap().len(),
+                if blind { 2 } else { 1 }
+            );
+            if blind {
+                assert_eq!(v["foreign"][1]["owner"], "");
+            } else {
+                assert_eq!(v["unclaimed"].as_array().unwrap().len(), 1);
+            }
+        }
+    }
+
     /// The envelope shape the installed hooks parse. Every key on every path,
     /// including the short circuits: a hook reading `d["shared"]` gets `[]`.
     #[test]
@@ -7174,6 +7305,7 @@ mod tests {
             "foreign",
             "shared",
             "unclaimed",
+            "observations",
             "cotenants",
             "window_secs",
         ] {
@@ -7183,6 +7315,7 @@ mod tests {
             );
         }
         assert!(v["foreign"].is_array() && v["shared"].is_array() && v["unclaimed"].is_array());
+        assert_eq!(v["observations"], json!([]));
         assert_eq!(v["undecided"], json!(false));
         assert_eq!(v["hook_outdated"], json!(true));
     }

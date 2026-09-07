@@ -243,6 +243,9 @@ jobs:
           # content, a two-sided transcript claim, and a check that could not
           # run must all still print in full.
           ./scripts/test-staged-guard-coedit.sh
+          # Keep the real hook entry point covered when observations cannot
+          # identify a writer, including recorded-owner and blind-peer blocks.
+          python3 ./scripts/git-hooks/test_observed_ownership.py
           ./scripts/test-commit-stamp.sh
           ./scripts/test-mass-delete-gate.sh
           ./scripts/test-observed-edits-walk.sh
