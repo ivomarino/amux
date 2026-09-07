@@ -3567,3 +3567,14 @@ CARD: AMUX-4188
 SYMPTOM: Physical mobile testing copied the directory link successfully, but the next Worker actions click immediately closed the menu. Its old document click listener survived because menu items stop propagation.
 COST: Live verification of the new named directory actions failed; people needed an unexplained second click after using an action.
 FIX: Closing the menu now retires both the pending dismissal timer and the document listener, including action and toggle paths. Browser regression tests repeatedly open Change directory, cancel and reopen the menu. An opening lost before paint emits worker-action-menu verdict=open-lost with measured and the menu-item population.
+
+## An empty composer control was recorded as a confirmed message and failed silently
+AREA: browser
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux-testing-e2e
+CARD: ATE-75
+SYMPTOM: After an interrupted turn, the dashboard accepted `continue`, then recorded a second message.sent event with chars=0 even though the empty suggestion probe found nothing. Its fallback Enter returned no visible effect verdict, and the worker had to be stopped and resumed before the composer/control state was trustworthy again.
+COST: The live acceptance turn was interrupted, a no-op entered the durable audit trail as a confirmed send, and recovery required a worker stop/start.
+FIX: Classify a missing suggestion as submission=no_effect, omit it from send history/last_send, and emit a session.control_noop event plus composer-control WARN. Raw key responses now name effect=unverified, and the dashboard awaits the fallback and displays that verdict or an explicit failure.

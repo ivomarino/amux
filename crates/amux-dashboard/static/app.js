@@ -6321,10 +6321,17 @@ async function doSend(name, text) {
 
 async function doKeys(name, keys) {
   showSendingIndicator();
-  await apiCall(API + '/api/sessions/' + name + '/keys', {
+  const r = await apiCall(API + '/api/sessions/' + name + '/keys', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({keys})
   });
+  if (!r) return { accepted: false, effect: 'not_sent', message: 'key request was not confirmed' };
+  const d = await r.json().catch(() => ({}));
+  return {
+    accepted: d.accepted !== undefined ? !!d.accepted : d.ok === true,
+    effect: d.effect || (d.ok ? 'unverified' : 'not_sent'),
+    message: d.message || ''
+  };
 }
 
 function autoGrow(el) {
@@ -11943,8 +11950,9 @@ async function peekQuickSend(text) {
 }
 async function peekQuickKeys(keys) {
   if (!peekSession) return;
-  await doKeys(peekSession, keys);
+  const result = await doKeys(peekSession, keys);
   _refreshPeekSoon();
+  return result;
 }
 async function _submitSuggestion(name, isPeek, fallbackKeys) {
   showSendingIndicator();
@@ -11954,13 +11962,33 @@ async function _submitSuggestion(name, isPeek, fallbackKeys) {
       body: JSON.stringify({text: ''})
     });
     const d = await r.json().catch(() => ({}));
-    if (d.message === 'no suggestion found') {
-      if (fallbackKeys) { if (isPeek) peekQuickKeys(fallbackKeys); else doKeys(name, fallbackKeys); }
-      else showToast('No suggestion to submit');
+    if (d.submission === 'no_effect' || d.message === 'no suggestion found') {
+      if (fallbackKeys) {
+        const keyResult = isPeek
+          ? await peekQuickKeys(fallbackKeys)
+          : await doKeys(name, fallbackKeys);
+        if (keyResult && keyResult.accepted) {
+          showToast(`No suggestion found — pressed ${fallbackKeys}; effect ${keyResult.effect}. If nothing changes, restart the worker.`);
+          amuxTrack('suggestion_fallback', {
+            session: name, key: fallbackKeys, verdict: keyResult.effect, ver: APP_VER
+          });
+        } else {
+          const why = keyResult && keyResult.message ? ': ' + keyResult.message : '';
+          showToast(`No suggestion found — ${fallbackKeys} was not confirmed${why}`);
+          amuxTrack('suggestion_fallback', {
+            session: name, key: fallbackKeys, verdict: 'not_sent', ver: APP_VER
+          });
+        }
+      } else showToast('No suggestion to submit');
     } else if (d.ok) {
       showToast('Sent suggestion');
+    } else {
+      showToast('Suggestion control failed: ' + (d.message || d.error || `HTTP ${r.status}`));
     }
-  } catch(e) {}
+  } catch(e) {
+    showToast('Suggestion control failed: ' + (e.message || String(e)));
+    amuxTrack('suggestion_fallback', { session: name, verdict: 'request_failed', ver: APP_VER });
+  }
   if (isPeek) _refreshPeekSoon();
   else if (_gridPanes && _gridPanes[name]) setTimeout(() => _updateGridPane(name), 500);
 }
