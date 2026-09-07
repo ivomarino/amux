@@ -38,6 +38,34 @@ set -e
 ROOT="$(git rev-parse --show-toplevel)"
 STAGED=$(git diff --cached --name-only --diff-filter=ACM)
 
+# ── RECORD WHAT THIS COMMIT IS SUPPOSED TO CONTAIN (AF-565) ──────────────────
+#
+# For a pathspec commit (`git commit -- <paths>`) git builds a TEMPORARY index
+# and points GIT_INDEX_FILE at it, so `git diff --cached` here is exactly the set
+# that is about to be committed — the intent, captured before anything can race.
+#
+# post-commit compares the resulting tree against this. Measured 2026-09-07: a
+# `git commit -F - -- e2e/settings.spec.ts` printed "fatal: cannot lock ref
+# 'HEAD'", EXITED 0, and produced a commit carrying my message over a peer's five
+# files and 236 lines, with my own change left unstaged. Nothing warned. The
+# staged-guard's sibling check catches the case where the message ships and the
+# work does NOT; this is its inverse and strictly worse, because it misattributes
+# someone else's work rather than costing a re-run.
+#
+# HEAD is recorded too so post-commit can tell a fresh commit from an amend or a
+# rebase replay, where this manifest would be stale and comparing it would
+# manufacture a false alarm.
+#
+# Fail-open in every arm: a manifest that cannot be written must never wedge a
+# commit.
+_afm_dir="${AMUX_HOME:-$HOME/.amux}/commit-intent"
+if mkdir -p "$_afm_dir" 2>/dev/null; then
+  {
+    echo "head $(git rev-parse HEAD 2>/dev/null || echo none)"
+    git diff --cached --name-only 2>/dev/null
+  } > "$_afm_dir/$(echo "$ROOT" | tr '/' '_').txt" 2>/dev/null || true
+fi
+
 # ── MASS DELETION OF FILES THAT STILL EXIST ON ORIGIN (AMUX-3921) ────────────
 #
 # Handed over from MHC-531. `git ls-files -d` on the shared ~/Dev/mixpeek
