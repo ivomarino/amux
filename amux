@@ -881,7 +881,46 @@ cmd_start() {
   # sanctioned path produces exactly the same unattributed writes as a broken
   # one. Exporting the base is what makes `amux board` work without the worker
   # having to discover the address.
-  tmux new-session -d -s "$tname" -n "$name" -c "$dir" \
+  # AMUX-4203: ECONNREFUSED can mean a live, overloaded server. tmux's
+  # implicit start unlinks that server's socket and strands its entire fleet.
+  local tmux_start_flag=""
+  if tmux -N display-message -p '#{pid}' >/dev/null 2>&1; then
+    tmux_start_flag=-N
+  else
+    local socket_path socket_owners="" socket_err socket_rc=0 reason="" lsof_bin=""
+    socket_path="${TMUX:-}"
+    socket_path="${socket_path%%,*}"
+    [[ -n "$socket_path" ]] || socket_path="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/default"
+    socket_path=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$socket_path")
+    socket_err=$(mktemp) || die "cannot measure tmux socket ownership"
+    if command -v lsof >/dev/null 2>&1; then
+      lsof_bin=lsof
+    elif [[ -x /usr/sbin/lsof ]]; then
+      lsof_bin=/usr/sbin/lsof
+    elif [[ -x /usr/bin/lsof ]]; then
+      lsof_bin=/usr/bin/lsof
+    fi
+    if [[ -z "$lsof_bin" ]]; then
+      reason="socket ownership could not be measured"
+    else
+      socket_owners=$("$lsof_bin" -nP -a -U -u "$(id -u)" -c tmux -Fn 2>"$socket_err") || socket_rc=$?
+    fi
+    if [[ -s "$socket_err" || "$socket_rc" -gt 1 ]]; then
+      reason="socket ownership could not be measured"
+    elif printf '%s\n' "$socket_owners" | python3 -c 'import os,sys
+target=sys.argv[1]
+sys.exit(0 if any(line.startswith("n/") and os.path.realpath(line[1:].strip().split(" type=")[0]) == target for line in sys.stdin) else 1)' "$socket_path"; then
+      reason="a live tmux process still owns the unreachable socket"
+    fi
+    rm -f "$socket_err"
+    if [[ -n "$reason" ]]; then
+      mkdir -p "$CC_HOME/logs"
+      printf '%s WARN amux::tmux verdict=spawn_refused_live_or_unmeasured_server socket=%s reason=%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$socket_path" "$reason" >> "$CC_HOME/logs/server-rs.log"
+      die "refusing to replace tmux socket: $reason. Inspect /api/debug/tmux before starting workers."
+    fi
+  fi
+  tmux ${tmux_start_flag:+-N} new-session -d -s "$tname" -n "$name" -c "$dir" \
     -e "AMUX_SESSION=$name" -e "AMUX_WORKER=$name" -e "AMUX_URL=$AMUX_API" \
     "${shell_setup}cd $(printf '%q' "$dir"); $cmd"
   # Lock the window name so Claude can't overwrite it with escape sequences.

@@ -591,13 +591,28 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
 /// shell served 49, and no log line could say why (ethos rule 4: the
 /// instrument must express the discriminator, from the consumer's vantage).
 pub async fn debug_tmux() -> axum::Json<serde_json::Value> {
-    let out = std::process::Command::new("tmux")
-        .args([
-            "list-sessions",
-            "-F",
-            "#{session_name}\t#{session_activity}\t#{session_created}",
-        ])
-        .output();
+    let socket_ownership = crate::backend::tmux_health::observe().await;
+    let _ = socket_ownership.invariant();
+    let mut command = tokio::process::Command::new("tmux");
+    command.kill_on_drop(true).args([
+        "-N",
+        "list-sessions",
+        "-F",
+        "#{session_name}\t#{session_activity}\t#{session_created}",
+    ]);
+    let list_result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        command.output(),
+    )
+    .await;
+    let out = match list_result {
+        Ok(out) => out.map_err(|e| e.to_string()),
+        Err(_) => {
+            tracing::warn!(target: "amux::tmux", verdict = "diagnostic_probe_timeout",
+                "tmux diagnostic list timed out after 3s; socket ownership evidence is retained");
+            Err("tmux list-sessions timed out after 3s".to_string())
+        }
+    };
     let which = std::process::Command::new("which").arg("tmux").output();
     // AMUX-3700: how often a pane capture had to be KILLED on its deadline.
     // A bounded capture is invisible by construction — the request succeeds and
@@ -619,6 +634,7 @@ pub async fn debug_tmux() -> axum::Json<serde_json::Value> {
         Ok(o) => crate::api::measured::measured(
             serde_json::json!({
             "spawn": "ok",
+            "socket_ownership": socket_ownership,
             "pane_capture_timeouts": pane_timeouts,
             "pane_capture_last_timeout": pane_last,
             "pane_capture_note": "captures killed on AMUX_PANE_CAPTURE_TIMEOUT_S (default 3s). \
@@ -639,8 +655,12 @@ pub async fn debug_tmux() -> axum::Json<serde_json::Value> {
             String::from_utf8_lossy(&o.stdout).lines().count(),
         ),
         Err(e) => crate::api::measured::unmeasured(
-            serde_json::json!({ "spawn": "failed", "error": e.to_string() }),
-            "tmux could not be spawned from this process, so the fleet was never listed",
+            serde_json::json!({
+                "spawn": "failed",
+                "error": e,
+                "socket_ownership": socket_ownership
+            }),
+            "tmux could not be spawned or did not answer within 3s; the fleet was never listed",
         ),
     })
 }

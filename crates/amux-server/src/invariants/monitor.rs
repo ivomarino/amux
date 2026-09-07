@@ -260,6 +260,7 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // path INIT-1's KillMode=process already covers (an OOM kill of the
     // pane, a manual kill, a crash).
     out.extend(registered_lanes_running_check().await);
+    out.push(crate::backend::tmux_health::observe().await.invariant());
 
     tm.mark(&out, "5c. every registered, non-archived lane actually has");
     // -- 5d. did any pane's WHOLE systemd scope just get OOM-killed, not just

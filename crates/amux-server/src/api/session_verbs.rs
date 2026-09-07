@@ -6967,9 +6967,18 @@ async fn poll_shell_prompt(name: &str, timeout_ms: u64) -> bool {
 }
 
 async fn type_line(name: &str, line: &str) {
-    let _ = send_literal(name, line).await;
-    sleep_ms(100).await;
-    send_key(name, "Enter").await;
+    // AMUX-4203: separate clients could lose Enter under load and concatenate
+    // shell setup with the next command. Keep both operations in one queue.
+    let pt = pt(name);
+    let args = shell_line_args(&pt, line);
+    if !matches!(tmux(&args).await, Some(o) if o.status.success()) {
+        tracing::warn!(session = %name, line_bytes = line.len(), verdict = "shell_line_submission_failed",
+            "worker shell setup line was not confirmed by tmux; command text omitted to protect credentials");
+    }
+}
+
+fn shell_line_args<'a>(pt: &'a str, line: &'a str) -> [&'a str; 10] {
+    ["send-keys", "-t", pt, "-l", line, ";", "send-keys", "-t", pt, "Enter"]
 }
 
 fn build_claude_cmd(cfg: &EnvFile, flags: &str, default_flags: &str, session_flag: &str, extra_flags: &str) -> String {
@@ -7667,6 +7676,10 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
         poll_shell_prompt(name, 3000).await;
     } else {
         // Fresh tmux session hosting the user's login shell (py:24647).
+        let create_server = match crate::backend::tmux_health::may_create_server().await {
+            Ok(allowed) => allowed,
+            Err(error) => return (false, error),
+        };
         let cols = tmux_cols();
         let rows = tmux_rows();
         let scheme = if std::env::args().any(|a| a == "--no-tls") { "http" } else { "https" };
@@ -7675,6 +7688,9 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
             "-n".into(), name.into(), "-c".into(), work_dir.clone(),
             "-x".into(), cols, "-y".into(), rows,
         ];
+        if !create_server {
+            args.insert(0, "-N".into());
+        }
         // ISOLATED (AMUX-3232): a raw agent is "just tmux plus Claude Code". The
         // amux harness reaches a lane through these four env vars. AMUX_SESSION
         // and AMUX_URL are what the global Claude Code hooks
@@ -18456,6 +18472,43 @@ fn getrandom_fill(buf: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn tmux_shell_setup_keeps_line_and_enter_in_one_command() {
+        use std::process::Command;
+        if Command::new("tmux").arg("-V").output().is_err() {
+            eprintln!("tmux unavailable; live shell submission test not measured");
+            return;
+        }
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = dir.path().join("socket");
+        struct PrivateServer(std::path::PathBuf);
+        impl Drop for PrivateServer {
+            fn drop(&mut self) {
+                let _ = Command::new("tmux").arg("-S").arg(&self.0).arg("kill-server").output();
+            }
+        }
+        let _server = PrivateServer(socket.clone());
+        let created = Command::new("tmux").arg("-S").arg(&socket)
+            .args(["new-session", "-d", "-s", "amux-shell-line-proof", "/bin/sh"])
+            .output().unwrap();
+        assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+        let pt = super::pt("shell-line-proof");
+        let receipt = dir.path().join("receipt");
+        for value in ["first", "second"] {
+            let line = format!("printf '%s\\n' {value} >> {}", super::sh_quote(&receipt.to_string_lossy()));
+            let out = Command::new("tmux").arg("-S").arg(&socket)
+                .args(super::shell_line_args(&pt, &line)).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let result = std::fs::read_to_string(&receipt).unwrap_or_default();
+            if result == "first\nsecond\n" { break; }
+            assert!(std::time::Instant::now() < deadline, "shell did not receive two complete lines: {result:?}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
 
     /// ATE-75: the suggestion probe ran successfully but found nothing to
     /// submit. That is a measured no-op, never a confirmed message.

@@ -173,6 +173,8 @@ impl SessionBackend for TmuxBackend {
         // -x/-y give the detached pane a real geometry so full-screen TUIs
         // (claude, etc.) render sanely before any client attaches.
         // -e per env var (tmux >= 3.2; this repo targets tmux 3.x).
+        let create_server = super::tmux_health::may_create_server().await
+            .map_err(BackendError::SpawnFailed)?;
         let mut args: Vec<String> = vec![
             "new-session".into(),
             "-d".into(),
@@ -185,6 +187,9 @@ impl SessionBackend for TmuxBackend {
             "-c".into(),
             spec.cwd.clone(),
         ];
+        if !create_server {
+            args.insert(0, "-N".into());
+        }
         for (k, v) in &spec.env {
             args.push("-e".into());
             args.push(format!("{k}={v}"));
