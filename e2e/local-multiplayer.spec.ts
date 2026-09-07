@@ -28,7 +28,7 @@ async function openTeam(page: Page): Promise<void> {
   await expect(page.locator('#settings-team-section')).toBeVisible();
 }
 
-test('local invitee joins, shares work, appears in logs, and can be revoked', async ({
+test('local invitee joins, shares work, uses worker APIs, appears in logs, and can be revoked', async ({
   page: owner,
   browser,
   request,
@@ -36,7 +36,9 @@ test('local invitee joins, shares work, appears in logs, and can be revoked', as
   await owner.goto('/');
   await settle(owner);
   const ownerToken = await owner.evaluate(() => (window as any)._AMUX_AUTH_TOKEN as string);
+  const ownerUiToken = await owner.evaluate(() => (window as any)._AMUX_UI_TOKEN as string);
   expect(ownerToken).toBeTruthy();
+  expect(ownerUiToken).toBeTruthy();
   const ownerHeaders = {
     Authorization: `Bearer ${ownerToken}`,
     'Content-Type': 'application/json',
@@ -65,6 +67,7 @@ test('local invitee joins, shares work, appears in logs, and can be revoked', as
     serviceWorkers: 'block',
   });
   const guest = await guestContext.newPage();
+  let memberWorker: string | undefined;
   try {
     await guest.goto(inviteUrl);
     await expect(guest.getByRole('heading', { name: /^Join / })).toBeVisible();
@@ -98,6 +101,43 @@ test('local invitee joins, shares work, appears in logs, and can be revoked', as
     await openTeam(owner);
     await owner.evaluate(() => (window as any).loadTeamSection());
     await expect(owner.locator('#settings-members-list')).toContainText('Guest User');
+
+    // Multiplayer includes the fleet, not just the board. Exercise the real
+    // worker registry and per-worker read surface with only the invitee's
+    // HttpOnly cookie. The live Tailnet acceptance run starts and sends to this
+    // same shape against a disposable Codex worker; this hermetic case pins the
+    // member-auth contract without auto-waking a model in CI.
+    memberWorker = `e2e-member-worker-${Date.now()}`;
+    const workerAccess = await guest.evaluate(async (workerName) => {
+      const create = await fetch('/api/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: workerName,
+          dir: '/tmp',
+          provider: 'codex',
+          creator: 'guest@example.com',
+          tags: ['e2e-multiplayer'],
+        }),
+      });
+      const fleet = await fetch('/api/sessions');
+      const rows = await fleet.json();
+      const info = await fetch(`/api/sessions/${encodeURIComponent(workerName)}/info`);
+      return {
+        createStatus: create.status,
+        fleetStatus: fleet.status,
+        listed: rows.some((row: any) => row.name === workerName),
+        infoStatus: info.status,
+        infoBody: await info.json(),
+      };
+    }, memberWorker);
+    expect(workerAccess).toMatchObject({
+      createStatus: 201,
+      fleetStatus: 200,
+      listed: true,
+      infoStatus: 200,
+      infoBody: { name: memberWorker },
+    });
 
     // The invitee performs real work with cookie auth. The owner's browser
     // observes the same card after the normal board refresh.
@@ -180,6 +220,19 @@ test('local invitee joins, shares work, appears in logs, and can be revoked', as
     expect(revoked.status()).toBe(200);
     const afterRevoke = await guest.evaluate(async () => (await fetch('/api/org/members')).status);
     expect(afterRevoke).toBe(401);
+    expect(
+      await guest.evaluate(
+        async (workerName) =>
+          (
+            await fetch(`/api/sessions/${encodeURIComponent(workerName)}/send`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ text: 'must remain revoked' }),
+            })
+          ).status,
+        memberWorker,
+      ),
+    ).toBe(401);
 
     // The cookie is HttpOnly and survives member deletion. A full reload must
     // remain revoked; it must never fall through to the public owner shell and
@@ -190,6 +243,11 @@ test('local invitee joins, shares work, appears in logs, and can be revoked', as
     const afterReload = await guest.evaluate(async () => (await fetch('/api/org/members')).status);
     expect(afterReload).toBe(401);
   } finally {
+    if (memberWorker) {
+      await request.delete(`/api/sessions/${encodeURIComponent(memberWorker)}`, {
+        headers: { ...ownerHeaders, 'X-Amux-UI-Token': ownerUiToken },
+      });
+    }
     await guestContext.close();
   }
 });
