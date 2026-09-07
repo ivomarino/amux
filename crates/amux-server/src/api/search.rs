@@ -192,6 +192,40 @@ fn render_snippet(raw: &str) -> String {
         .replace(HL_CLOSE, "</mark>")
 }
 
+/// The entity types the index actually holds, ascending. Read from the DATA,
+/// not restated from the six INSERT sites below, so a newly-indexed family
+/// cannot make this list quietly wrong.
+///
+/// AF-547. `types=` filters `d.entity_type IN (...)`, so a value the index does
+/// not hold returns a clean 200 with zero hits — indistinguishable from "your
+/// query matched nothing". A caller filtering on a name they carried from
+/// another endpoint gets a confident empty answer, which on the approval-
+/// verification path reads as "no approval exists".
+///
+/// Phrased as NOT PRESENT rather than INVALID on purpose: a family with no rows
+/// yet (no journals written, say) is absent without the caller being wrong, and
+/// this cannot tell those apart. It reports what it can prove.
+fn types_in_index(conn: &Connection) -> Vec<String> {
+    conn.prepare("SELECT DISTINCT entity_type FROM search_docs ORDER BY 1")
+        .and_then(|mut st| {
+            st.query_map([], |r| r.get::<_, String>(0)).map(|it| it.flatten().collect())
+        })
+        .unwrap_or_default()
+}
+
+/// Which of `requested` the index does not hold. Extracted so the TEST CALLS
+/// THE SHIPPED CODE instead of recomputing the same expression beside it.
+///
+/// The first version of that test did recompute it, and a mutation that made
+/// the handler's filter never fire left the suite GREEN — the test could not
+/// see a change to the thing it was testing. ts-gke had described that exact
+/// shape an hour earlier, about the bug this card came from: "my control shared
+/// the defect with the measurement ... a control built from the same mistaken
+/// assumption as the measurement cannot fail."
+fn types_missing_from(requested: &[String], have: &[String]) -> Vec<String> {
+    requested.iter().filter(|t| !have.contains(t)).cloned().collect()
+}
+
 fn parse_types(raw: &Option<String>) -> Vec<String> {
     raw.as_deref()
         .map(|s| {
@@ -235,6 +269,24 @@ async fn search(State(st): State<AppState>, Query(p): Query<SearchParams>) -> Re
         Ok(c) => c,
         Err(e) => return internal(e),
     };
+    // Only paid for when the caller actually filtered — a search with no
+    // `types=` cannot have an unknown one, and charging every request a DISTINCT
+    // for a question nobody asked is the arithmetic ethos rule 2 forbids.
+    let (available, not_in_index): (Vec<String>, Vec<String>) = if types.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        let have = types_in_index(&conn);
+        let missing = types_missing_from(&types, &have);
+        (have, missing)
+    };
+    if !not_in_index.is_empty() {
+        tracing::warn!(
+            target: "amux::search",
+            requested = ?types, not_in_index = ?not_in_index, available = ?available,
+            "search filtered on entity type(s) the index does not hold — the zero is the filter, not the data"
+        );
+    }
+
     match run_search(&conn, &match_expr, &types, limit, offset) {
         Ok((hits, total, total_capped)) => {
             // A ZERO MUST SAY WHETHER THE MEASUREMENT RAN (TG-3303, ethos rule 4).
@@ -288,6 +340,13 @@ async fn search(State(st): State<AppState>, Query(p): Query<SearchParams>) -> Re
                 // nothing to look through". Null means the count itself could
                 // not be taken, which is a third answer and not a zero.
                 "index_docs": indexed,
+                // AF-547: named BESIDE the answer, so a zero caused by the
+                // FILTER is distinguishable from a zero caused by the DATA.
+                // Empty on every ordinary query; non-empty only when the caller
+                // asked for a family the index does not hold, which is the one
+                // case where the count means nothing.
+                "types_not_in_index": not_in_index,
+                "types_available": available,
             }))
             .into_response()
         }
@@ -584,6 +643,63 @@ async fn reindex(State(st): State<AppState>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AF-547. A `types=` value the index does not hold returns a clean 200 with
+    /// zero hits, indistinguishable from "your query matched nothing". On the
+    /// approval-verification path that reads as "no approval exists".
+    ///
+    /// Built from a REAL index rather than a hand-made list, because the bug this
+    /// came from was a control that shared its defect with the measurement:
+    /// ts-gke counted `kind` values to prove `kind` held no prompts, when the
+    /// real question was whether `kind` EXISTED. A control that assumes what it
+    /// is testing cannot fail.
+    #[test]
+    fn a_type_the_index_does_not_hold_is_named_beside_the_zero() {
+        let conn = Connection::open_in_memory().expect("mem db");
+        conn.execute_batch(
+            "CREATE TABLE search_docs (doc_id TEXT, entity_type TEXT, entity_id TEXT,
+                 title TEXT, body TEXT, scope TEXT, task_id TEXT, worker_id TEXT,
+                 link TEXT, meta TEXT, updated_at INTEGER);
+             INSERT INTO search_docs (doc_id, entity_type) VALUES
+                 ('task:A-1','task'), ('prompt:1','prompt'), ('prompt:2','prompt');",
+        )
+        .expect("seed");
+
+        let have = types_in_index(&conn);
+        assert_eq!(have, vec!["prompt".to_string(), "task".to_string()], "read from the DATA, sorted");
+
+        // The reported shape: a family name carried from another endpoint.
+        let requested = vec!["kind".to_string()];
+        let missing = types_missing_from(&requested, &have);
+        assert_eq!(missing, vec!["kind".to_string()], "an absent family must be NAMED, not silently empty");
+
+        // CONTROL 1: a real family must NOT be reported missing. Without this the
+        // rule is satisfiable by flagging everything, which would put a false
+        // "not in index" on every correct query.
+        let ok = types_missing_from(&["prompt".to_string()], &have);
+        assert!(ok.is_empty(), "a family the index holds is not missing: {ok:?}");
+
+        // CONTROL 2: mixed — the real one passes, only the bogus one is named.
+        let req: Vec<String> = ["prompt", "kind", "task"].iter().map(|s| s.to_string()).collect();
+        let mixed = types_missing_from(&req, &have);
+        assert_eq!(mixed, vec!["kind".to_string()], "only the absent one: {mixed:?}");
+    }
+
+    /// An EMPTY index must report an empty vocabulary rather than crashing or
+    /// inventing one — and then every requested type reads as missing, which is
+    /// correct and is what the 503 zero-hit path above is for.
+    #[test]
+    fn an_empty_index_has_an_empty_vocabulary() {
+        let conn = Connection::open_in_memory().expect("mem db");
+        conn.execute_batch(
+            "CREATE TABLE search_docs (doc_id TEXT, entity_type TEXT);",
+        ).expect("seed");
+        assert!(types_in_index(&conn).is_empty());
+        // And a missing TABLE must not panic — the helper is called on every
+        // filtered search and an unreadable index is not a crash.
+        let bare = Connection::open_in_memory().expect("mem db");
+        assert!(types_in_index(&bare).is_empty(), "no table -> empty, not a panic");
+    }
 
     #[test]
     fn match_expr_quotes_everything_and_prefixes_the_last_term() {
