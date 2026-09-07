@@ -11,7 +11,13 @@
 # The PASS line is COMPUTED from the cell count, never written: a summary a
 # script hardcodes cannot disagree with its own run, so it reads as measured
 # while being unable to fail.
-set -uo pipefail
+# `-e` IS THE GUARD, and it is the only one that works here (AF-560).
+#
+# A missing command returns 127, and `set -e` aborts on it with bash's own
+# message naming the helper AND the line:
+#     scripts/test-push-consent.sh: line 103: check_not: command not found
+# then exit 127. No verdict is printed, so there is no false PASS.
+set -euo pipefail
 cd "$(dirname "$0")/.."
 
 BASE=c6876cf1
@@ -41,24 +47,22 @@ check_not() {  # check_not <label> <forbidden-substring> <haystack>
   fi
 }
 
-# A CELL THAT CANNOT RUN MUST FAIL, NOT PRINT TO STDERR AND PASS.
+# WHY NOT `command_not_found_handle`, which is the obvious answer and was my
+# first one: it does not exist before bash 4.0, and this machine runs
+# 3.2.57 (the macOS system bash, which `#!/usr/bin/env bash` resolves to).
+# I shipped that handler in 40938593 and it was INERT — deleting a check
+# helper still produced "PASS (9 outcome cells)" with two cells never run,
+# which is the original bug surviving its own fix. Measured, not assumed:
+#     bash -c 'command_not_found_handle(){ echo FIRED; }; nosuch' -> no FIRED
+# Kept out rather than kept as a no-op: a guard that cannot fire on the
+# platform it ships to is worse than an absent one, because the next reader
+# believes the case is covered.
 #
-# Measured here, 2026-09-07: two `check_not` calls were added before the helper
-# existed. bash printed "check_not: command not found" to stderr and carried on,
-# and the suite reported "PASS (9 outcome cells)" while two of its assertions had
-# not executed at all. That is exactly AF-559's shape — an instrument that did
-# not run, reported as a clean result — inside the test file written to catch it.
-#
-# `set -e` is not the fix: it would abort the run rather than name the cell. This
-# turns a missing command into a counted failure, so the verdict line stays
-# computed and the reason survives to the summary.
-command_not_found_handle() {
-  echo "  FAIL  a check helper does not exist: $1"
-  echo "        the cell it was meant to assert DID NOT RUN"
-  FAILED=$((FAILED + 1))
-  CELLS=$((CELLS + 1))
-  return 127
-}
+# The history: two `check_not` calls were added here before that helper
+# existed in this file. bash printed "check_not: command not found" to stderr
+# and the suite reported PASS with two of nine assertions never executed.
+# The verdict was COMPUTED from $CELLS, so even the honest-summary discipline
+# did not catch it — nobody reads stderr when the last line says PASS.
 
 git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null || { echo "SKIP: $BASE not in this clone"; exit 0; }
 git rev-parse --verify --quiet "$TIP^{commit}"  >/dev/null || { echo "SKIP: $TIP not in this clone";  exit 0; }
