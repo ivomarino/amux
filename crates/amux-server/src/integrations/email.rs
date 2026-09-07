@@ -885,6 +885,33 @@ impl GmailClient {
         Some(tf)
     }
 
+    /// Write a token file so a reader never sees a half-written one (AF-117).
+    ///
+    /// `fs::write` opens O_TRUNC and writes in place, so an interrupted write
+    /// leaves the file short — and this file is the only copy of the refresh
+    /// token. Same reasoning as `scripts/atomic-replace.sh` for the shared CLI:
+    /// write a sibling temp file, then `rename(2)`, which is atomic within a
+    /// directory. A reader gets either the old bytes or the new ones.
+    ///
+    /// The temp file is created IN THE DESTINATION'S DIRECTORY on purpose: a
+    /// rename across filesystems fails, and /tmp is routinely a different one.
+    fn write_token_file_atomically(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+        let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::create_dir_all(dir)?;
+        let tmp = dir.join(format!(
+            ".{}.tmp",
+            path.file_name().and_then(|s| s.to_str()).unwrap_or("token")
+        ));
+        std::fs::write(&tmp, contents)?;
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e)
+            }
+        }
+    }
+
     /// Current access token; `force_refresh` bypasses cache + stored token
     /// (the 401-retry path). Persists the refreshed token in Python's exact
     /// file shape so both servers keep working off one file.
@@ -924,16 +951,53 @@ impl GmailClient {
             .ok_or_else(|| format!("token refresh response missing access_token: {body}"))?
             .to_string();
         self.token_cache.lock().expect("token cache").insert(account.into(), access.clone());
-        // Best-effort persist, Python's exact shape (a failed write must not
-        // fail the send).
+        // AF-117. GOOGLE MAY ROTATE THE REFRESH TOKEN, and this used to persist
+        // the one it had just SENT rather than the one it got back. When the
+        // token endpoint returns a `refresh_token`, the one you presented is
+        // invalidated — so writing the old one back means the NEXT refresh
+        // presents a dead credential and fails `invalid_grant`. The account goes
+        // `needs_reauth`, every /api/email/* call for it 502s, and the only
+        // remedy is a human in a browser.
+        //
+        // That is not hypothetical: it is exactly the failure recorded on
+        // hello@amux.io — `token refresh failed (400): {"error":"invalid_grant"}`
+        // on both /api/email/inbox and /api/email/reply. Rotation is silent, so
+        // the account works right up until the access token expires, then dies
+        // permanently, which is why it reads as "the token just went bad".
+        //
+        // Absence means KEEP THE OLD ONE: Google omits `refresh_token` from most
+        // refresh responses, and treating absent as empty would delete a working
+        // credential on every single refresh.
+        let rotated = body
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty());
+        if let Some(new_rt) = rotated {
+            if new_rt != refresh {
+                tracing::warn!(
+                    account = %account,
+                    "[gmail] refresh token ROTATED by the token endpoint — persisting the new \
+                     one; keeping the old would fail the next refresh with invalid_grant (AF-117)"
+                );
+            }
+        }
         let persisted = json!({
             "token": access,
-            "refresh_token": refresh,
+            "refresh_token": rotated.unwrap_or(refresh.as_str()),
             "token_uri": tf.token_uri,
             "client_id": tf.client_id,
             "client_secret": tf.client_secret,
         });
-        let _ = std::fs::write(self.token_path(account), persisted.to_string());
+        // ATOMIC, not a truncating write. This file is the ONLY copy of the
+        // refresh token and both servers read it. A plain `fs::write` opens with
+        // O_TRUNC, so a crash or a builder restart mid-write leaves a truncated
+        // or empty file — and on this box the auto-builder restarts the server
+        // on every landed commit. A torn token file is unrecoverable without a
+        // human in a browser, which is the same cost as the bug above.
+        //
+        // Still best-effort: a failed write must not fail the send, since the
+        // access token in hand is good for the call being made.
+        let _ = Self::write_token_file_atomically(&self.token_path(account), &persisted.to_string());
         Ok(access)
     }
 
@@ -2530,6 +2594,110 @@ mod tests {
         }
         std::fs::write(tokens.join(format!("{account}.json")), tf.to_string()).unwrap();
         dir
+    }
+
+    /// AF-117. Google MAY return a new `refresh_token` on a refresh, and doing
+    /// so invalidates the one you presented. Persisting the old one means the
+    /// NEXT refresh presents a dead credential, fails `invalid_grant`, and the
+    /// account needs a human in a browser. That is the recorded failure on
+    /// hello@amux.io: every /api/email/* call for it 502ing on exactly that
+    /// error.
+    #[tokio::test]
+    async fn a_rotated_refresh_token_is_persisted_instead_of_the_one_we_sent() {
+        let home = temp_home_with_token("acct@example.com", false);
+        let http = MockHttp::new(vec![
+            (
+                "FORM",
+                "oauth2.googleapis.com/token",
+                200,
+                json!({ "access_token": "FRESH", "refresh_token": "ROTATED_RT", "expires_in": 3599 }),
+            ),
+            ("GET", "/settings/sendAs", 200, json!({ "sendAs": [] })),
+        ]);
+        let client = GmailClient::new(http.clone(), home.path().to_path_buf());
+        let _ = client.get_signature("acct@example.com").await;
+
+        // We must have PRESENTED the stored one...
+        let calls = http.calls.lock().unwrap();
+        let form = calls[0].2.as_ref().unwrap();
+        assert_eq!(form["refresh_token"], json!("PLACEHOLDER_REFRESH"));
+        drop(calls);
+
+        // ...and PERSISTED the rotated one. Writing back what we sent is the bug.
+        let persisted: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                home.path().join("gmail-tokens").join("acct@example.com.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            persisted["refresh_token"],
+            json!("ROTATED_RT"),
+            "the rotated token must survive, or the next refresh presents a dead one: {persisted}"
+        );
+        assert_eq!(persisted["token"], json!("FRESH"));
+    }
+
+    /// The other direction, and it is the one a careless fix breaks: Google
+    /// OMITS `refresh_token` from most refresh responses. Treating absent as
+    /// empty would delete a working credential on every single refresh — a
+    /// worse bug than the one being fixed, and it would look like the account
+    /// spontaneously disconnecting.
+    #[tokio::test]
+    async fn an_absent_refresh_token_keeps_the_stored_one_rather_than_clearing_it() {
+        for resp in [
+            json!({ "access_token": "FRESH", "expires_in": 3599 }),
+            json!({ "access_token": "FRESH", "refresh_token": "", "expires_in": 3599 }),
+            json!({ "access_token": "FRESH", "refresh_token": "   ", "expires_in": 3599 }),
+        ] {
+            let home = temp_home_with_token("acct@example.com", false);
+            let http = MockHttp::new(vec![
+                ("FORM", "oauth2.googleapis.com/token", 200, resp.clone()),
+                ("GET", "/settings/sendAs", 200, json!({ "sendAs": [] })),
+            ]);
+            let client = GmailClient::new(http.clone(), home.path().to_path_buf());
+            let _ = client.get_signature("acct@example.com").await;
+            let persisted: Value = serde_json::from_str(
+                &std::fs::read_to_string(
+                    home.path().join("gmail-tokens").join("acct@example.com.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                persisted["refresh_token"],
+                json!("PLACEHOLDER_REFRESH"),
+                "absent/blank must KEEP the stored credential, not clear it. response={resp}"
+            );
+        }
+    }
+
+    /// The token file is the only copy of the refresh token and both servers
+    /// read it. `fs::write` opens O_TRUNC, so an interrupted write leaves it
+    /// short — and this box's auto-builder restarts the server on every landed
+    /// commit. `rename(2)` means a reader sees the old bytes or the new ones.
+    #[test]
+    fn the_token_file_is_replaced_atomically_and_leaves_no_temp_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("acct@example.com.json");
+
+        // Creates the directory it needs.
+        GmailClient::write_token_file_atomically(&path, r#"{"token":"one"}"#).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"token":"one"}"#);
+
+        // Replaces without leaving the sibling temp file behind — a stray
+        // `.acct@example.com.json.tmp` holding a refresh token would be a
+        // credential copy nobody knows about.
+        GmailClient::write_token_file_atomically(&path, r#"{"token":"two"}"#).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"token":"two"}"#);
+        let leftovers: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
     }
 
     #[tokio::test]
