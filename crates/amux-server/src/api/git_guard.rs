@@ -1233,6 +1233,68 @@ const GIT_READ_SUBCMDS: &[&str] = &[
     "show-ref",
     "for-each-ref",
 ];
+/// Paths a command names only as SOURCE operands, which it therefore READS and
+/// never writes.
+///
+/// AF-550. `is_pure_read_command` already spares a command that writes nothing
+/// (AMUX-3128), but `cp SRC DST` writes, so it falls through to the mtime gate
+/// with BOTH paths claimable — and in POSIX `cp` every operand but the last is
+/// a source that is opened read-only. When a peer is editing SRC, their write
+/// moves its mtime while the copy runs and the gate mints an edit record for
+/// the reader on a file the command provably did not touch.
+///
+/// Measured 2026-09-07: amux-testing-e2e held the fix to a test this lane had
+/// broken on origin/main. To verify their fix before asking them to land it,
+/// this lane copied the file OUT to a detached worktree — shared to scratch,
+/// never the reverse. The guard then told them "the WORK ITSELF is at risk"
+/// from the lane that had only checked their work. That warning is the one
+/// sentence meant to stop a commit, and it fired on careful verification. Same
+/// direction as the `git show`/`sed` carve-outs above: the harder a peer checks
+/// your output, the more the guard blocks you.
+///
+/// A path that is a DESTINATION anywhere in the command stays claimable, so
+/// `cp a.rs b.rs; cp b.rs c.rs` still attributes `b.rs`. Only paths that are
+/// exclusively sources are spared.
+fn source_only_paths(cmd: &str) -> std::collections::HashSet<String> {
+    const COPY_VERBS: &[&str] = &["cp", "install"];
+    let mut sources: std::collections::HashSet<String> = Default::default();
+    let mut dests: std::collections::HashSet<String> = Default::default();
+    for seg in cmd.split(['|', ';', '&', '\n', '(', ')', '`']) {
+        let seg = seg.trim();
+        let Some(tok) = seg.split_whitespace().next() else {
+            continue;
+        };
+        let verb = Path::new(tok)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(tok);
+        if !COPY_VERBS.contains(&verb) {
+            continue;
+        }
+        // Operands only: a flag is not a path, and `cp` takes no flag arguments
+        // that could be mistaken for one.
+        let operands: Vec<&str> = seg
+            .split_whitespace()
+            .skip(1)
+            .filter(|t| !t.starts_with('-'))
+            .map(|t| t.trim_matches(|c| "'\"),;:".contains(c)))
+            .filter(|t| !t.is_empty())
+            .collect();
+        // With fewer than two operands there is no identifiable destination, so
+        // claim nothing either way rather than guess.
+        if operands.len() < 2 {
+            continue;
+        }
+        let (last, rest) = operands.split_last().expect("len >= 2");
+        dests.insert((*last).to_string());
+        for src in rest {
+            sources.insert((*src).to_string());
+        }
+    }
+    sources.retain(|p| !dests.contains(p));
+    sources
+}
+
 fn is_pure_read_command(cmd: &str) -> bool {
     if has_output_redirection(cmd) {
         return false;
@@ -2369,9 +2431,17 @@ fn recent_edit_paths(name: &str, since_secs: f64, firsthand_only: bool) -> EditS
                     if is_pure_read_command(cmd) {
                         continue;
                     }
+                    // AF-550: a path this command only READS (a `cp` source) is
+                    // not an edit record, even though the command as a whole
+                    // writes. The mtime gate below cannot tell a peer's
+                    // concurrent write from ours.
+                    let source_only = source_only_paths(cmd);
                     for m in pathlike_re().find_iter(cmd) {
                         let cand = m.as_str().trim_matches(|c| "'\"),;:".contains(c));
                         if cand.len() < 4 {
+                            continue;
+                        }
+                        if source_only.contains(cand) {
                             continue;
                         }
                         let abs = if Path::new(cand).is_absolute() {
@@ -5458,6 +5528,49 @@ mod tests {
     /// explained by the other side's TRANSCRIPT record at the same instant is
     /// one write seen twice and must attribute nothing; past the skew margin
     /// it is a real second write and must keep protecting.
+    /// AF-550. `cp SRC DST` writes, so `is_pure_read_command` correctly says
+    /// no — but SRC is opened read-only and the mtime gate cannot tell a peer's
+    /// concurrent write to SRC from ours. The lane that copies a peer's file
+    /// OUT to verify it then gets an edit record for it, and the peer is warned
+    /// that "the WORK ITSELF is at risk" from their own reviewer.
+    #[test]
+    fn a_copy_source_is_read_not_written_but_a_copy_destination_is_claimed() {
+        let src = "crates/amux-server/src/api/session_verbs.rs";
+        let dst = "/tmp/scratch/session_verbs.rs";
+        let only = source_only_paths(&format!("cp {src} {dst}"));
+        assert!(only.contains(src), "the source is read-only: {only:?}");
+        assert!(!only.contains(dst), "the destination IS written: {only:?}");
+
+        // Flags are not operands, and the LAST path is the destination however
+        // many sources precede it.
+        let many = source_only_paths("cp -r a.rs b.rs dest.rs");
+        assert!(many.contains("a.rs") && many.contains("b.rs"), "{many:?}");
+        assert!(!many.contains("dest.rs"), "{many:?}");
+
+        // A path that is a destination ANYWHERE stays claimable, or a
+        // copy-then-copy chain would launder a real write into a read.
+        let chain = source_only_paths("cp a.rs b.rs; cp b.rs c.rs");
+        assert!(chain.contains("a.rs"), "{chain:?}");
+        assert!(!chain.contains("b.rs"), "b.rs is written by the first cp: {chain:?}");
+
+        // Not a copy verb, and a lone operand with no identifiable destination:
+        // claim nothing rather than guess.
+        assert!(source_only_paths("rm a.rs").is_empty());
+        assert!(source_only_paths("cp a.rs").is_empty());
+
+        // And the whole point: the real command that caused this. It is not a
+        // pure read (it runs cargo), so the carve-out must come from the cp
+        // shape, not from the read-verb list.
+        let real = "cp crates/amux-server/src/api/session_verbs.rs \
+                    /tmp/wt/crates/amux-server/src/api/session_verbs.rs && cargo test";
+        assert!(!is_pure_read_command(real), "it really does write");
+        assert!(
+            source_only_paths(real).contains("crates/amux-server/src/api/session_verbs.rs"),
+            "{:?}",
+            source_only_paths(real)
+        );
+    }
+
     #[test]
     fn an_observed_echo_of_a_transcript_edit_attributes_nothing() {
         // (a) THE SPECIMEN: committer transcript-firsthand at t=1000; the
