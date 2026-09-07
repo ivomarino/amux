@@ -50,7 +50,7 @@ async function boot(page: import('@playwright/test').Page) {
   }, { name: NAME, root: ROOT });
 }
 
-test('worker card and peek share all 25 worker actions, plus both peek-only actions', async ({ page }) => {
+test('worker card and peek share all worker actions, plus both peek-only actions', async ({ page }) => {
   await boot(page);
   const state = await page.evaluate((sample) => {
     const w = window as any;
@@ -93,7 +93,8 @@ test('worker card and peek share all 25 worker actions, plus both peek-only acti
     };
   }, SAMPLE);
 
-  expect(state.card).toHaveLength(25);
+  expect(state.card).toHaveLength(26);
+  expect(state.card).toContain('copy-directory-link');
   expect(state.peek).toEqual(state.card);
   expect(state.peekOnly).toEqual(['File browser', 'Focus mode']);
   expect(state.overflowY).toBe('auto');

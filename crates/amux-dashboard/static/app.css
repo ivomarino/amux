@@ -1935,21 +1935,28 @@
   .stat-row { display:flex;justify-content:space-between;align-items:center;padding:4px 0;font-size:0.72rem; }
   .stat-row-bar { height:4px;border-radius:2px;background:var(--accent);margin-top:2px; }
 
-  /* Peek find bar */
-  .peek-find-wrap { position: relative; display: flex; align-items: center; gap: 0; }
-  .peek-find-wrap .search-input { padding-right: 120px; min-width: 120px; }
+  /* One horizontal navigation row; Find expands only when it is needed. */
+  .peek-toolbar { display: flex; align-items: center; gap: 4px; width: 100%; max-width: 520px; min-width: 0; }
+  .peek-toolbar .peek-toolbar-btn { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 44px; width: 44px; min-width: 44px; height: 44px; padding: 0; color: var(--text); }
+  .peek-toolbar .peek-toolbar-btn[aria-expanded="true"] { color: var(--accent); border-color: var(--accent); }
+  .peek-find-wrap { position: relative; display: flex; align-items: center; gap: 0; width: 100%; max-width: 520px; margin-top: 4px; }
+  .peek-find-wrap[hidden] { display: none; }
+  .peek-find-wrap .search-input { padding-right: 110px; min-width: 0; width: 100%; height: 44px; box-sizing: border-box; }
+  .peek-find-wrap .search-input::-webkit-search-cancel-button { display: none; }
   .peek-find-count { position: absolute; right: 60px; font-size: 0.65rem; color: var(--dim); white-space: nowrap; pointer-events: none; }
   .peek-nav-btn { width: 22px; height: 22px; border: none; background: transparent; color: var(--dim); cursor: pointer; font-size: 0.75rem; display: flex; align-items: center; justify-content: center; position: absolute; }
-  .peek-find-wrap .peek-nav-btn[onclick="peekSearchPrev()"] { right: 36px; }
-  .peek-find-wrap .peek-nav-btn[onclick="peekSearchNext()"] { right: 16px; }
   .peek-nav-btn:hover { color: var(--text); }
-  .peek-find-wrap .search-clear { position: absolute; right: 2px; }
+  .peek-find-wrap .search-clear { position: absolute; right: 0; width: 44px; height: 44px; }
   .peek-find-wrap.has-value .search-clear { display: flex; }
-  .peek-msg-nav { display: flex; flex-direction: column; align-items: center; gap: 0; border: 1px solid var(--border); border-radius: 6px; padding: 1px 0; }
-  .peek-msg-nav .peek-nav-btn { position: static; width: 100%; min-width: 36px; height: 24px; }
-  .peek-msg-nav button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-  .peek-msg-nav .peek-nav-btn[aria-disabled="true"] { opacity: 0.4; }
-  .peek-msg-count { border: 0; background: transparent; cursor: pointer; min-height: 24px; font-size: 0.62rem; color: var(--dim); white-space: nowrap; line-height: 1; padding: 1px 0; min-width: 16px; text-align: center; user-select: none; }
+  .peek-msg-nav { display: flex; flex: 1; min-width: 0; align-items: center; border: 1px solid var(--border); border-radius: 8px; }
+  .peek-msg-nav .peek-nav-btn { position: static; flex: 0 0 44px; width: 44px; height: 44px; border-left: 1px solid var(--border); font-size: 1rem; color: var(--text); }
+  .peek-msg-filter { position: relative; flex: 1; min-width: 0; height: 44px; }
+  .peek-msg-filter select { width: 100%; min-width: 0; height: 44px; border: 0; border-radius: 7px 0 0 7px; padding: 13px 2px 0 7px; background: transparent; color: var(--text); font-size: 0.75rem; cursor: pointer; }
+  .peek-msg-filter select:disabled { opacity: 1; -webkit-text-fill-color: var(--text); cursor: default; }
+  .peek-msg-label, .peek-msg-count { position: absolute; top: 4px; font-size: 0.6rem; line-height: 1; color: var(--dim); pointer-events: none; white-space: nowrap; }
+  .peek-msg-label { left: 7px; }
+  .peek-msg-count { right: 7px; }
+  .peek-toolbar :is(button,select):focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
   .peek-prompt.peek-msg-current { outline: 2px solid var(--accent); outline-offset: 1px; border-radius: 3px; }
   .peek-more-wrap { position: relative; }
   .peek-more-dropdown { display: none; position: absolute; top: calc(100% + 4px); right: 0; background: var(--card); border: 1px solid var(--border); border-radius: 8px; min-width: 260px; max-width:min(340px,calc(100vw - 16px)); max-height:min(500px,calc(100dvh - 120px)); overflow-x:hidden; overflow-y:auto; z-index: 60; box-shadow: 0 6px 20px rgba(0,0,0,0.3); }
@@ -3057,6 +3064,7 @@
     background: var(--bg);
     border-left: 1px solid var(--border);
     box-shadow: -10px 0 10px -8px rgba(0, 0, 0, 0.45);
+    min-width: 60px; min-height: 44px; font-size: 0.75rem; white-space: nowrap; padding: 4px 8px;
   }
   /* AF-45. Ethan, three reports: "I click it and nothing happens. It doesn't show."
      Measured on his viewport (screenshot 1125x2436 @3x = 375x812) under WebKit: the

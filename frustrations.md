@@ -3533,3 +3533,14 @@ CARD: AMUX-4018
 SYMPTOM: Global Settings showed “Workers may message across groups” ON and the global env persisted CC_SEND_ALLOW=*, but amux-frustrations → amux-testing-e2e still entered per-message approval because the resolver returned the sender worker’s nonempty legacy allow-list and ignored the explicit global grant.
 COST: The visible fleet policy contradicted enforcement, ordinary peer handoffs stalled, and neither the refusal nor worker UI identified which layer actually decided the result.
 FIX: Resolve CC_SEND_ALLOW as a layered allow-list: nonempty explicit global/group/worker values compose additively, while an explicit empty more-specific value is the visible deny/reset. Enforcement, both worker config routes, the worker list, and the UI share the resulting value/source/reason. Emit cross_group_policy_refused and cross_group_policy_persisted verdicts with the effective source.
+
+## Worker header stacked tiny message arrows and hid actions behind unexplained icons
+AREA: browser
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux
+CARD: AMUX-4188
+SYMPTOM: Ethan circled the Human 0 tower, tab grid and directory link/edit icons on his phone. The navigation group measured 76px tall with 24px arrow targets; its counter secretly cycled seven message types.
+COST: A second user report after the earlier scrolling fix; 30px of avoidable header height and small ambiguous tap targets remained on the primary phone surface.
+FIX: One horizontal 44px-control toolbar with an explicit message-type select and on-demand Find. Search and message navigation share arrows/counters, including keyboard changes. Tabs is labeled; directory changes and copy links use named worker-menu entries. peek-toolbar-layout emits unusable-controls with measured/population/overflow/target sizes if this layout regresses. Browser checks cover desktop, 375px mobile and iOS WebKit; a negative control restores column stacking to prove the geometry check fails.
