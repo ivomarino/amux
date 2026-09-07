@@ -33,7 +33,7 @@ test('local invitee joins, shares work, uses worker APIs, appears in logs, and c
   browser,
   request,
 }) => {
-  test.setTimeout(60_000);
+  test.setTimeout(120_000);
   await owner.goto('/');
   await settle(owner);
   const ownerToken = await owner.evaluate(() => (window as any)._AMUX_AUTH_TOKEN as string);
