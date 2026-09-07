@@ -3907,6 +3907,32 @@ fn mint_capture_card(
         );
         return Ok(None);
     }
+    // AF-568: the window above is sized for a TRANSPORT RETRY and is also the only
+    // guard on the STEERING delivery path, whose whole purpose is to wait for the
+    // lane's next turn boundary. One broadcast on 2026-09-07 was enqueued at 18:09
+    // and steering-delivered at 18:26; at 17 minutes the 45s window correctly saw
+    // nothing and minted a second card for the same prompt. 46 of 56 lanes got a
+    // duplicate that way and two got three, because the delay a window has to
+    // tolerate here is however long a lane takes to reach a boundary, which is
+    // unbounded by design and so cannot be tuned.
+    //
+    // So dedupe against the table the mint itself writes, with no time box while
+    // the card is still open. `cmd_history` cannot answer this: the duplicates have
+    // no row of their own, since the linking UPDATE claims the most recent UNCARDED
+    // row for the text and the direct delivery already claimed the only one.
+    if let Some(open_id) =
+        crate::db::board_store::open_capture_with_desc(conn, session_name, &captured_desc)?
+    {
+        // Two-fix rule: name the SURVIVOR, so a wrongly suppressed distinct prompt
+        // is a line someone can find rather than an absent card nobody can.
+        // grep "ledger: capture duplicates an open card".
+        tracing::info!(
+            session = %session_name,
+            open_card = %open_id,
+            "ledger: capture duplicates an open card for the same prompt; not minting a second (AF-568)"
+        );
+        return Ok(None);
+    }
     let needs_self = amux_core::board::title_needs_self_description(&title);
     let mut row = crate::db::board_store::create_issue(
         conn,
@@ -22931,6 +22957,65 @@ mod steer_boundary_tests {
                 // classify or decompose it.
                 let rapid = super::mint_capture_card(conn, "s", "also wire slack", now_ms + 2_000)?;
                 assert!(rapid.is_some(), "a distinct rapid task must card immediately");
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+    }
+
+    /// AF-568. The 45s window guards a TRANSPORT RETRY, and the steering path it
+    /// also guards waits for the lane's next turn boundary. On 2026-09-07 one
+    /// broadcast was enqueued at 18:09 and steering-delivered at 18:26: the window
+    /// had long expired, so a second card minted for the same prompt. 46 of 56
+    /// lanes got a duplicate and two got three.
+    ///
+    /// The delay is unbounded by design, so this is bounded by the card's LIFECYCLE
+    /// rather than by a longer window. Both halves are asserted, because a check
+    /// that blocks everything would pass the first one alone.
+    #[tokio::test]
+    async fn a_capture_does_not_double_card_a_prompt_the_lane_still_holds_open() {
+        let (state, _tmp) = tstate();
+        let now_ms = 1_700_000_000_000i64;
+        state
+            .store
+            .write_async(move |conn| {
+                let first = super::mint_capture_card(conn, "s", "recover and continue", now_ms)?;
+                let first_id = first.as_ref().expect("the first delivery must card").id.clone();
+                // The direct path links the minted id to the row it recorded. The
+                // steering duplicate never gets a row of its own, which is why the
+                // cmd_history guard cannot see it.
+                conn.execute(
+                    "INSERT INTO cmd_history(text,type,session,ts,origin,card_id) \
+                     VALUES(?1,'user','s',?2,'test',?3)",
+                    rusqlite::params!["recover and continue", now_ms, first_id],
+                )?;
+
+                // THE BUG: the same prompt, steering-delivered 17 minutes later.
+                // Far outside any retry window, and the card is still open.
+                let late = now_ms + 17 * 60 * 1_000;
+                let dup = super::mint_capture_card(conn, "s", "recover and continue", late)?;
+                assert!(
+                    dup.is_none(),
+                    "a prompt whose capture card is still open must not card twice, \
+                     however late the delivery lands"
+                );
+
+                // AND THE CHECK MUST STILL BE ABLE TO PASS. Once the lane has closed
+                // the card, the same words are a new task and card normally, so a
+                // green above means "deduped" rather than "blocked everything".
+                conn.execute("UPDATE issues SET status='done' WHERE id=?1", rusqlite::params![first_id])?;
+                let after_close =
+                    super::mint_capture_card(conn, "s", "recover and continue", late + 1_000)?;
+                assert!(
+                    after_close.is_some(),
+                    "once the card is closed an identical prompt is new work and must card"
+                );
+
+                // A DIFFERENT lane holding an identical open capture must not block
+                // this one: the duplicate is per-session, and the incident was one
+                // prompt broadcast to 56 lanes that each legitimately needed a card.
+                let peer = super::mint_capture_card(conn, "other", "recover and continue", late)?;
+                assert!(peer.is_some(), "a peer lane's open capture must not suppress this lane's");
                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
             })
             .await

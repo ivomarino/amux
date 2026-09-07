@@ -3738,3 +3738,16 @@ CARD: AMUX-4203
 SYMPTOM: During fleet recovery, handoff-consumer-0907 displayed `unset ANTHROPIC_API_KEYclaude --dangerously-skip-permissions ...`; bash rejected the agent flags as unset identifiers. Two other workers remained at shell prompts after accepted starts. `type_line` used separate tmux clients for literal input and Enter, discarded errors, and proceeded to the next command under capture load.
 COST: Three individual launch retries, plus manual verification that all 57 non-archived workers had live agents rather than merely an accepted start response.
 FIX: Submit each literal line and Enter together in one tmux command queue. WARN with shell_line_submission_failed when tmux does not confirm it, without recording shell command contents. A private-socket regression test verifies two complete shell commands reach the shell.
+
+---
+## One broadcast prompt minted 105 capture cards across 56 lanes: the capture dedupe window is 45s, the delivery it guards waits for a turn boundary
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-07
+SESSION: amux-frustrations
+CARD: AF-568
+SYMPTOM: The 5:59 PM recovery broadcast produced 56 identical cmd_history rows (one per lane, 503 chars, enqueued 18:09-18:10) and 105 board cards. 46 of 56 lanes hold more than one card for that single prompt and two hold three. Every duplicate was minted by the steering-delivery path (session_verbs.rs:10893, "ledger: auto-captured board card from STEERING-delivered prompt (AMUX-3148)"), whose id encodes the ENQUEUE time: AF-567 is `id=steer-1788818960752`, enqueued 18:09:20 and minted 18:26:15. Its "already carded" guard is `cmd_history ... AND card_id IS NOT NULL AND ts > now - AMUX_CAPTURE_DEDUP_WINDOW_S` with a 45s default, so at 17 minutes it saw nothing and minted again. The duplicates then have no cmd_history row of their own, because the linking UPDATE looks for the most recent UNCARDED row for that text and there is none.
+COST: 49 junk cards across 46 lanes, each needing a manual disposition by whoever owns it. gainz is parked on a permission prompt clearing GAINZ-52/53 with `curl -X DELETE`, which also destroys the audit trail `amux board discard` keeps. My own lane spent the recovery turn deciding what two identical `doing` cards meant before any work started.
+FIX: A 45s window is sized for a transport retry and is being asked to guard a path whose entire purpose is to WAIT for a turn boundary, which took 17 to 25 minutes for every duplicate here. Dedupe against `issues` instead, the table the mint itself writes, with no time box while the card is non-terminal: refuse the mint when the session already holds a non-terminal `source='capture'` card whose desc is byte-identical. Log the refusal with the surviving card id so a wrongly suppressed distinct prompt is findable rather than silent.
+NOTE: An earlier draft of this entry blamed a second mint path in orchestrator/runtime.rs. That was wrong and is recorded on AF-568. The orchestrator path stamps `source='orchestrator'`; all 104 sourced cards here read `capture`, which is what sent me back to the log.

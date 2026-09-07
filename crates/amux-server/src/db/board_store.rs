@@ -2649,6 +2649,58 @@ pub struct NewIssue {
     pub callback_prompt: Option<String>,
 }
 
+/// The id of an OPEN capture card this session already holds for a byte-identical
+/// prompt, if there is one (AF-568).
+///
+/// This is the cross-path capture dedupe. It reads `issues` rather than
+/// `cmd_history` for two reasons that are separate and both load-bearing:
+///
+/// - `cmd_history` only records the DIRECT delivery. A steering-delivered capture
+///   claims the most recent UNCARDED row for its text, so when the direct delivery
+///   already carded the only row, the duplicate is minted with no history row at
+///   all. Counting history rows therefore undercounts captures, and a guard reading
+///   it cannot see the very duplicates it exists to stop.
+/// - Every mint writes `issues`, so a third delivery path added later is covered
+///   without knowing this function exists.
+///
+/// NO TIME WINDOW, deliberately. The delay this must tolerate is however long the
+/// lane takes to reach a turn boundary, which is unbounded by design; the incident
+/// that prompted this ran 16 to 25 minutes. The bound is the card's own LIFECYCLE
+/// instead: once the lane has closed or discarded it, an identical prompt is a new
+/// task and mints normally.
+///
+/// `deleted IS NULL` and the terminal-status exclusion are the whole predicate. An
+/// ARCHIVED but still-open card counts as present: archiving hides a card from
+/// views and autonomy loops, and re-minting one the lane deliberately put away is
+/// the noise this is here to prevent.
+///
+/// KNOWN IMPRECISION, stated rather than hidden: `desc` is the prompt TRUNCATED to
+/// 300 chars, so two genuinely different prompts sharing a 300-char prefix compare
+/// equal here and the second is suppressed. The cmd_history guard above does not
+/// have this edge, because it compares the full text. Accepted because the two
+/// cards would be indistinguishable on the board anyway (both descs are the same
+/// 300 chars), and because the caller logs the SURVIVING card id on every
+/// suppression, so a wrongly dropped prompt is a greppable line rather than a
+/// missing card nobody can see. If that line ever shows up for prompts that are not
+/// duplicates, the fix is to store a full-prompt hash on the card, not a longer
+/// desc.
+pub fn open_capture_with_desc(
+    conn: &Connection,
+    session: &str,
+    desc: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT id FROM issues \
+         WHERE session = ?1 AND source = 'capture' AND \"desc\" = ?2 \
+           AND deleted IS NULL \
+           AND status NOT IN ('done', 'verified', 'discarded') \
+         ORDER BY created DESC LIMIT 1",
+        params![session, desc],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+}
+
 /// Insert a new card, replicating the Python POST exactly: id minted from
 /// the shared counter, `pos` = (min non-zero pos in the column) - 1024 (new
 /// card at the top of its lane), int timestamps, `notified` 0. Returns the
