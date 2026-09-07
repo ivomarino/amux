@@ -231,16 +231,37 @@ async fn send_sms(phone: &str, text: &str) -> (bool, String) {
             // TWO-FIXES: the 12s burn used to leave no log line of its own —
             // only the channel string in the ledger, invisible unless every
             // channel failed. The wall is now greppable where sweeps look.
+            // AF-553. This used to say the permission "is missing" and tell the
+            // operator to grant it. Both halves were wrong in a way that cost
+            // 17 days: MI-4933 has recorded "missing Automation permission for
+            // Messages" since 2026-08-21, nobody could find the control to
+            // grant, and the diagnosis was doubted rather than the advice.
+            //
+            // THE REAL MECHANISM, verified 2026-09-07 by walking ppid from a
+            // live session: an osascript run inside a fleet lane is attributed
+            // by TCC to the process that owns the AppleEvent, and that is the
+            // tmux SERVER, not iTerm —
+            //     bash -> claude -> bash -> tmux(ppid 1, launchd)
+            // tmux is not in the Automation allowlist and cannot be added by
+            // hand, and because the server is DETACHED the consent prompt has
+            // no session to draw in. So this is NOT a denial (-1743). It is a
+            // HANG to the timeout (-1712), which is why the breaker above sees
+            // 12.6-12.7s every time rather than a fast error.
+            //
+            // A remedy that only works in a case you are not in reads as an
+            // answer and is worse than none (ethos rule 3). The TWILIO_* half
+            // was always actionable; the grant half never was, and the two sat
+            // in one sentence looking identical.
             tracing::warn!(
-                "[urgent-alert] imessage hit the 12s TCC wall — Automation permission for \
-                 Messages is missing; channel breakered for {}s (AMUX_IMESSAGE_RETRY_S)",
+                error_code = "-1712",
+                failure = "applescript_timeout_not_denial",
+                "[urgent-alert] imessage hit the 12s TCC wall — the AppleEvent is attributed \
+                 to the launchd-rooted tmux server, which cannot be granted Automation \
+                 permission headlessly (AF-553); channel breakered for {}s \
+                 (AMUX_IMESSAGE_RETRY_S)",
                 imessage_retry_s(&home)
             );
-            (
-                false,
-                "imessage timed out — grant Automation permission for Messages, or set TWILIO_* creds"
-                    .into(),
-            )
+            (false, imessage_wall_reason().into())
         }
         Ok(Err(e)) => (false, format!("imessage error: {}", truncate(&e.to_string(), 100))),
         Ok(Ok(out)) if out.status.success() => {
@@ -253,6 +274,18 @@ async fn send_sms(phone: &str, text: &str) -> (bool, String) {
             (false, format!("imessage error: {}", truncate(stderr.trim(), 100)))
         }
     }
+}
+
+/// What the operator is told when the iMessage channel hits the TCC wall.
+///
+/// A FUNCTION, not an inline literal, so the test can assert on the shipped
+/// bytes rather than on a copy of them. A control built from the same string
+/// the code is built from cannot fail.
+pub(crate) fn imessage_wall_reason() -> &'static str {
+    "imessage timed out (-1712, a HANG not a denial): the AppleEvent is attributed to the \
+     launchd-rooted tmux server, which has no Automation entry to grant and no session to \
+     prompt in. Two things that DO work: set TWILIO_* creds, or have Ethan trigger a send \
+     while he is at the Mac so the consent prompt can surface (AF-553)"
 }
 
 /// The wall stamp's file: mtime = when the 12s TCC timeout last fired.
@@ -920,6 +953,44 @@ async fn get_owner_ledger(State(state): State<AppState>, Query(qp): Query<Ledger
 
 #[cfg(test)]
 mod tests {
+
+    /// AF-553. The old text said the Automation permission "is missing" and told
+    /// the operator to grant it. There is no control to grant: the AppleEvent is
+    /// attributed to the launchd-rooted tmux server, which cannot be added to the
+    /// allowlist by hand and, being detached, has no session for the consent
+    /// prompt to appear in. So the operator tried it, found nothing, and doubted
+    /// the diagnosis rather than the advice — MI-4933 carried the wrong cause for
+    /// 17 days, and the same sentence is copied into the fleet-wide CLAUDE.md.
+    #[test]
+    fn the_imessage_wall_names_a_remedy_that_can_actually_be_performed() {
+        let msg = imessage_wall_reason();
+
+        // The advice that cannot be followed must be GONE, not softened.
+        assert!(
+            !msg.contains("grant Automation permission for Messages"),
+            "this instructs an action with no control behind it: {msg}"
+        );
+
+        // It must say WHICH failure this is. -1712 (hang) and -1743 (denied) call
+        // for opposite responses, and reporting the wrong one is the whole bug.
+        assert!(msg.contains("-1712"), "name the code so the claim is checkable: {msg}");
+        assert!(
+            msg.contains("not a denial"),
+            "a timeout read as a denial is what sent everyone at the allowlist: {msg}"
+        );
+
+        // And it must name the attribution, or the reader cannot tell why there
+        // is no entry to grant.
+        assert!(msg.contains("tmux"), "the attributed process is the mechanism: {msg}");
+
+        // BOTH actionable paths, because the old line's fatal property was that
+        // one real remedy and one impossible one sat in it looking identical.
+        assert!(msg.contains("TWILIO_"), "the headless path: {msg}");
+        assert!(
+            msg.contains("at the Mac"),
+            "the interactive path, which is the only way the grant is ever captured: {msg}"
+        );
+    }
     use super::*;
 
     /// AMUX-3492 — the breaker's whole value is at its three boundaries: a
