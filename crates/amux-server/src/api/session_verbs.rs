@@ -6041,7 +6041,14 @@ pub(crate) async fn send_text(
 /// it. Returns `(submitted, submission)`; `None` is the honest third state, not
 /// a failure (ethos rule 3).
 pub(crate) fn submission_verdict(ok: bool, msg: &str) -> (Option<bool>, &'static str) {
-    if msg.starts_with("queued") {
+    if ok && msg == "no suggestion found" {
+        // An empty composer submit is a probe for a suggested prompt. Finding
+        // none means the probe ran and changed nothing; it is not a confirmed
+        // message. ATE-75 was the live counterexample: this arm emitted a
+        // zero-character `message.sent` event and `submission=confirmed`, then
+        // the dashboard silently tried a best-effort Enter fallback.
+        (Some(false), "no_effect")
+    } else if msg.starts_with("queued") {
         (None, "deferred")
     } else if msg.contains("could not be verified") {
         (None, "unverified")
@@ -14242,7 +14249,40 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     let send_origin =
         if origin.is_empty() { SendOrigin::Owner } else { SendOrigin::Automation };
     let (ok, msg) = send_text(state, name, &text, defer_busy, send_origin).await;
-    if ok {
+    let no_effect = ok && msg == "no suggestion found";
+    if no_effect {
+        // A NO-OP IS NOT A SEND (ATE-75). Before this branch, the generic `ok`
+        // arm advanced last_send, emitted message.sent(chars=0), and classified
+        // the response as confirmed. That durable fiction hid the dashboard's
+        // unverified Enter fallback and made the UI, event stream, and actual
+        // pane disagree. Keep it out of send history and make the control
+        // outcome sweep-visible instead.
+        tracing::warn!(
+            session = %name,
+            control = "submit-suggestion",
+            verdict = "no_effect",
+            next = "explicit_key_or_restart_if_stale",
+            "[composer-control/ATE-75] no suggested prompt found; no message was sent"
+        );
+        emit_event(
+            state,
+            name,
+            "session.control_noop",
+            Some(json!({
+                "control": "submit-suggestion",
+                "verdict": "no_effect",
+                "next": "explicit-key-or-restart-if-stale"
+            })),
+            if msg_id.is_empty() { None } else { Some(format!("send:{msg_id}")) },
+            "api-send",
+        )
+        .await;
+        if !msg_id.is_empty() {
+            // The idempotency row was reserved before the probe ran. A retry of
+            // a no-op must not come back as "already delivered".
+            send_dedup_forget(state, name, &msg_id).await;
+        }
+    } else if ok {
         update_meta(
             name,
             &[
@@ -14356,6 +14396,12 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     if let Some(fix) = fix {
         resp["fix"] = json!(fix);
     }
+    if no_effect {
+        resp["effect"] = json!("none");
+        resp["fix"] = json!(
+            "press a key explicitly; if the pane remains unchanged, restart the worker"
+        );
+    }
     if ok && msg.contains("at a selector") {
         resp["held_at_selector"] = json!(true);
     }
@@ -14457,7 +14503,12 @@ pub(crate) async fn keys_verb(name: &str, body: &Value) -> Response {
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
     };
-    jresp(code, json!({"ok": ok, "message": msg}))
+    // tmux accepting bytes proves only that the key request reached the pane;
+    // it cannot prove what the foreground TUI did with them. Publish that
+    // boundary instead of making a successful HTTP response look like a
+    // verified control effect (ATE-75).
+    let effect = if ok { "unverified" } else { "not_sent" };
+    jresp(code, json!({"ok": ok, "accepted": ok, "effect": effect, "message": msg}))
 }
 
 /// `apply-template` as a callable verb.
@@ -18405,6 +18456,22 @@ fn getrandom_fill(buf: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
+
+    /// ATE-75: the suggestion probe ran successfully but found nothing to
+    /// submit. That is a measured no-op, never a confirmed message.
+    #[test]
+    fn missing_suggestion_is_no_effect_not_a_confirmed_send() {
+        assert_eq!(
+            super::submission_verdict(true, "no suggestion found"),
+            (Some(false), "no_effect")
+        );
+        // Controls: the neighbouring outcomes retain their distinct meanings.
+        assert_eq!(super::submission_verdict(true, "sent"), (Some(true), "confirmed"));
+        assert_eq!(
+            super::submission_verdict(true, "queued (steering)"),
+            (None, "deferred")
+        );
+    }
 
     // ---- AF-104: concurrent env writes must not share a temp path -----------
     //

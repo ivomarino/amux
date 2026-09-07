@@ -3999,6 +3999,20 @@ function _taskIdChip(s) {
     + 'style="cursor:pointer;font-size:0.7rem;font-weight:600;color:var(--accent);border:1px solid var(--accent);border-radius:6px;padding:0 6px;margin-left:4px;white-space:nowrap;">' + esc(id) + '</span>';
 }
 async function _askCardStatus(id, sess) {
+  const current = boardItems.find(i => i.id === id);
+  const terminal = /^(done|verified|discarded)$/i.test(String(
+    (current && current.status) || (id === boardDetailId && boardDetailStatus) || ''));
+  if (terminal) {
+    // A terminal card already has an authoritative board outcome. Refresh it
+    // from the durable detail record; asking a worker here would reintroduce
+    // provider-text parsing and could overwrite the final outcome with stale
+    // model prose.
+    const refreshed = await _bdHydrate(id);
+    showToast(refreshed
+      ? 'Refreshed final terminal summary from the board'
+      : 'Could not refresh final terminal summary');
+    return;
+  }
   // Ask the owning session to report status onto the board (AMUX-2174). The
   // session's model authors the answer; amux only routes + records.
   try {
@@ -6321,10 +6335,17 @@ async function doSend(name, text) {
 
 async function doKeys(name, keys) {
   showSendingIndicator();
-  await apiCall(API + '/api/sessions/' + name + '/keys', {
+  const r = await apiCall(API + '/api/sessions/' + name + '/keys', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({keys})
   });
+  if (!r) return { accepted: false, effect: 'not_sent', message: 'key request was not confirmed' };
+  const d = await r.json().catch(() => ({}));
+  return {
+    accepted: d.accepted !== undefined ? !!d.accepted : d.ok === true,
+    effect: d.effect || (d.ok ? 'unverified' : 'not_sent'),
+    message: d.message || ''
+  };
 }
 
 function autoGrow(el) {
@@ -9014,7 +9035,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.825';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.826';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -11943,8 +11964,9 @@ async function peekQuickSend(text) {
 }
 async function peekQuickKeys(keys) {
   if (!peekSession) return;
-  await doKeys(peekSession, keys);
+  const result = await doKeys(peekSession, keys);
   _refreshPeekSoon();
+  return result;
 }
 async function _submitSuggestion(name, isPeek, fallbackKeys) {
   showSendingIndicator();
@@ -11954,13 +11976,33 @@ async function _submitSuggestion(name, isPeek, fallbackKeys) {
       body: JSON.stringify({text: ''})
     });
     const d = await r.json().catch(() => ({}));
-    if (d.message === 'no suggestion found') {
-      if (fallbackKeys) { if (isPeek) peekQuickKeys(fallbackKeys); else doKeys(name, fallbackKeys); }
-      else showToast('No suggestion to submit');
+    if (d.submission === 'no_effect' || d.message === 'no suggestion found') {
+      if (fallbackKeys) {
+        const keyResult = isPeek
+          ? await peekQuickKeys(fallbackKeys)
+          : await doKeys(name, fallbackKeys);
+        if (keyResult && keyResult.accepted) {
+          showToast(`No suggestion found — pressed ${fallbackKeys}; effect ${keyResult.effect}. If nothing changes, restart the worker.`);
+          amuxTrack('suggestion_fallback', {
+            session: name, key: fallbackKeys, verdict: keyResult.effect, ver: APP_VER
+          });
+        } else {
+          const why = keyResult && keyResult.message ? ': ' + keyResult.message : '';
+          showToast(`No suggestion found — ${fallbackKeys} was not confirmed${why}`);
+          amuxTrack('suggestion_fallback', {
+            session: name, key: fallbackKeys, verdict: 'not_sent', ver: APP_VER
+          });
+        }
+      } else showToast('No suggestion to submit');
     } else if (d.ok) {
       showToast('Sent suggestion');
+    } else {
+      showToast('Suggestion control failed: ' + (d.message || d.error || `HTTP ${r.status}`));
     }
-  } catch(e) {}
+  } catch(e) {
+    showToast('Suggestion control failed: ' + (e.message || String(e)));
+    amuxTrack('suggestion_fallback', { session: name, verdict: 'request_failed', ver: APP_VER });
+  }
   if (isPeek) _refreshPeekSoon();
   else if (_gridPanes && _gridPanes[name]) setTimeout(() => _updateGridPane(name), 500);
 }
@@ -27274,9 +27316,9 @@ function _bdRenderMeta(item) {
 async function _bdHydrate(id) {
   try {
     const r = await apiCall(API + '/api/board/' + id);
-    if (!r || !r.ok) return;
+    if (!r || !r.ok) return false;
     const full = await r.json();
-    if (!full || full.id !== id || boardDetailId !== id) return;  // modal moved on
+    if (!full || full.id !== id || boardDetailId !== id) return false;  // modal moved on
     const idx = boardItems.findIndex(i => i.id === id);
     const cached = idx >= 0 ? { ...boardItems[idx] } : {};
     if (idx >= 0) boardItems[idx] = Object.assign({}, boardItems[idx], full);
@@ -27284,7 +27326,7 @@ async function _bdHydrate(id) {
     _bdRenderHistory(merged);
     if (typeof _bdRenderStatusBanner === 'function') _bdRenderStatusBanner(merged);
     _bdRenderMeta(merged);
-    if (_boardDrafts[id]) { _bdHydrated = true; return; }  // user's draft wins
+    if (_boardDrafts[id]) { _bdHydrated = true; return true; }  // user's draft wins
     const title = document.getElementById('bd-title');
     if (title && title.value === (cached.title || '')) {
       title.value = full.title || '';
@@ -27322,7 +27364,8 @@ async function _bdHydrate(id) {
       _tagState['bd'] = [...(full.tags || [])]; _beTagRenderChips('bd'); _beTagInputUpdate('bd');
     }
     _bdHydrated = true;
-  } catch (e) { /* leave unhydrated; the save guard covers it */ }
+    return true;
+  } catch (e) { /* leave unhydrated; the save guard covers it */ return false; }
 }
 
 async function openBoardDetail(id) {
