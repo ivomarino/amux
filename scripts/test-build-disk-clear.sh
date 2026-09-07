@@ -295,7 +295,9 @@ else
   out9=$(HOME="$h" AMUX_RS_BUILD_LOG="$h/build.log" AMUX_BUILD_MIN_FREE_GB=0 \
     AMUX_BUILD_SACRIFICE_CACHE_BELOW_GB=0 AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB=-1 \
     AMUX_RS_DISK_CLEAR_ONLY=1 bash "$SCRIPT" >/dev/null 2>&1; cat "$h/build.log" 2>/dev/null)
-  kill "$DECOY" 2>/dev/null; wait "$DECOY" 2>/dev/null
+  # A successfully killed decoy makes `wait` report its signal status. That is
+  # expected cleanup, not a harness failure under `set -e`.
+  kill "$DECOY" 2>/dev/null; wait "$DECOY" 2>/dev/null || true
   # PROVE THE PROBE RAN before believing its negative (ethos rule 4). This cell
   # asserted only the ABSENCE of "DEFERRED", and a script that died before
   # reaching the decision produces exactly that log. It did: the first cut of
