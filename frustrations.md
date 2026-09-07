@@ -3589,3 +3589,15 @@ CARD: ATE-84
 SYMPTOM: ATE-75 reached Done with a 12:05 validation note still shown as Latest status; Refresh asked the worker and did not surface the current terminal outcome.
 COST: Reviewers could not tell whether the completed work had actually deployed or passed live acceptance, and the visible worker-action summary omitted the final evidence.
 FIX: The save_patched durable write choke point now atomically records a provider-independent final summary in last_result and a STATUS (board) history line, including outcome, recorded actions, tests/deployment/live evidence, and linked assets. Terminal Refresh rehydrates the authoritative board detail instead of requesting provider text. Legacy terminal rows are repaired on their next durable board write, and terminal_summary_recorded is logged for sweeps.
+
+
+## Message jumps mixed zoomed screen coordinates with unzoomed scroll offsets
+AREA: browser
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux
+CARD: AMUX-4192
+SYMPTOM: Multi-worker live checks found 80% jumps hundreds or thousands of pixels from the selected message. At 100%, the fixed 12px landing put the first line beneath the terminal's floating controls. Search also matched serialized HTML, so entities and ANSI-split phrases could not be found, and a working worker's refresh could replace the selected search result.
+COST: The preceding live check at one normal zoom did not cover these cases; Ethan requested cross-worker verification again. The baseline reproduced unreadable landings on amux-frustrations and mixpeek-general.
+FIX: Convert rendered geometry to layout coordinates, reserve the actual floating-control inset, reveal nested horizontal table matches, and publish zoom/inset/scroll-error/visibility in navigation beacons. Search rendered text across inline spans as one result. Pin selected search/message nodes while newer output is buffered. Regression cases cover long/wrapped text, symbols, Unicode paths, ANSI spans, wide tables, start/end wrapping and real refreshes across desktop, 375px and WebKit.

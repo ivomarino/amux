@@ -1,0 +1,132 @@
+import { test, expect } from './fixtures';
+
+test.beforeEach(async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem('amux_walkthrough_done', '1'));
+  await page.goto('/');
+  await page.waitForFunction(() => typeof (window as any)._peekHtml === 'function');
+  await page.evaluate(() => {
+    eval("peekSession='scroll-worker'; _peekMsgRowsFor=peekSession; _peekMsgRows=[]; _peekMsgNavKind='all'; _peekMsgIndex=-1; _peekHistoryHTML=''; _peekEarlier={chunks:[],loadedKb:0,done:true,hidden:true,loading:false};");
+    document.getElementById('peek-overlay')!.classList.add('active');
+    (window as any)._stopPeekPoll();
+  });
+});
+
+async function render(page: import('@playwright/test').Page, raw: string) {
+  await page.evaluate(raw => {
+    eval('lastPeekHTML=_peekHtml(' + JSON.stringify(raw) + '); _lastLiveHTML=lastPeekHTML;');
+    (window as any).applyPeekSearch(false, false);
+    document.getElementById('peek-body')!.scrollTop = 0;
+  }, raw);
+}
+
+async function readable(page: import('@playwright/test').Page, selector: string) {
+  const location = await page.locator(selector).first().evaluate(el => {
+    const body = document.getElementById('peek-body')!;
+    const target = el.getBoundingClientRect(), bounds = body.getBoundingClientRect();
+    // The prompt's decorative left border can extend outside the padding;
+    // measure its actual text when deciding whether the words are readable.
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    let node: Node | null;
+    do { node = walker.nextNode(); } while (node && !node.textContent?.trim());
+    const range = document.createRange();
+    if (node) range.selectNodeContents(node);
+    const glyph = node ? range.getClientRects()[0] : target;
+
+    const controls = [...document.querySelectorAll('.peek-copy-btn,.peek-agent-nav')]
+      .filter(e => e.getClientRects().length).map(e => e.getBoundingClientRect().bottom);
+    return { top: target.top, bottom: bounds.bottom, safe: Math.max(bounds.top, ...controls),
+      left: glyph.left, bodyLeft: bounds.left, bodyRight: bounds.right,
+      horizontal: glyph.left >= bounds.left - 1 && glyph.left < bounds.right,
+      pageTop: document.scrollingElement!.scrollTop };
+  });
+  expect(location.top).toBeGreaterThanOrEqual(location.safe);
+  expect(location.top).toBeLessThan(location.bottom);
+  expect(location.horizontal, JSON.stringify(location)).toBe(true);
+  expect(location.pageTop).toBe(0);
+}
+
+for (const zoom of [1, 0.8, 1.25]) {
+  test(`message order and readable landings at ${zoom * 100}% zoom`, async ({ page }) => {
+    const beacons: any[] = [];
+    await page.route('**/api/client-debug', async route => {
+      beacons.push(route.request().postDataJSON());
+      await route.fulfill({ json: { ok: true } });
+    });
+    await page.evaluate(zoom => { document.body.style.zoom = String(zoom); }, zoom);
+    const labels = ['first α 🧭 & <tag>', '[amux-origin:producer] supplied /tmp/report.txt', '[Scheduled] verify the result', 'last short message'];
+    const raw = 'before\n'.repeat(50) + '› ' + labels[0] + '\n  ' + 'A wrapped paragraph. '.repeat(900)
+      + '\nAssistant reply\n' + 'between\n'.repeat(30) + '❯ ' + labels[1]
+      + '\nAssistant reply\n' + 'between\n'.repeat(30) + '❯ ' + labels[2]
+      + '\nAssistant reply\n' + 'between\n'.repeat(30) + '› ' + labels[3];
+    await render(page, raw);
+    for (const index of [0, 1, 2, 3, 0]) {
+      await page.getByRole('button', { name: 'Next message', exact: true }).click();
+      await expect(page.locator('.peek-msg-current')).toContainText(labels[index]);
+      await readable(page, '.peek-msg-current');
+    }
+    await page.getByRole('button', { name: 'Previous message', exact: true }).click();
+    await expect(page.locator('.peek-msg-current')).toContainText(labels[3]);
+    await readable(page, '.peek-msg-current');
+    await expect.poll(() => beacons.filter(b => b.kind === 'peek-message-nav' && b.verdict === 'landed').length).toBe(6);
+    for (const b of beacons.filter(b => b.kind === 'peek-message-nav')) {
+      expect(b.measured).toBe(true);
+      expect(b.target_visible).toBe(true);
+      expect(Math.abs(b.scroll_error_px)).toBeLessThan(2);
+      expect(b.zoom).toBeCloseTo(zoom, 2);
+      expect(b.desired_inset).toBeGreaterThanOrEqual(39.95);
+    }
+  });
+}
+
+for (const sample of [
+  { text: 'red & blue <tag>', query: 'red & blue <tag>' },
+  { text: 'multi\x1b[31mcolor\x1b[0m phrase', query: 'multicolor phrase' },
+  { text: '/tmp/report-α.md has 🧭 notes', query: '/tmp/report-α.md' },
+]) {
+  test(`Find navigates rendered text: ${sample.query}`, async ({ page }) => {
+    await render(page, 'before\n'.repeat(45) + sample.text + '\n' + 'between\n'.repeat(50) + sample.text + '\n' + 'after\n'.repeat(50));
+    await page.getByRole('button', { name: 'Find in terminal', exact: true }).click();
+    await page.getByRole('searchbox', { name: 'Find in terminal', exact: true }).fill(sample.query);
+    await expect(page.locator('#peek-msg-count')).toHaveText('1/2');
+    await readable(page, '.peek-highlight.current');
+    expect(await page.locator('.peek-highlight.current').allTextContents()).not.toHaveLength(0);
+    expect((await page.locator('.peek-highlight.current').allTextContents()).join('')).toBe(sample.query);
+    await page.getByRole('button', { name: 'Next message', exact: true }).click();
+    await expect(page.locator('#peek-msg-count')).toHaveText('2/2');
+    await readable(page, '.peek-highlight.current');
+    await page.locator('#peek-search').press('Enter');
+    await expect(page.locator('#peek-msg-count')).toHaveText('1/2');
+    await page.locator('#peek-search').press('Shift+Enter');
+    await expect(page.locator('#peek-msg-count')).toHaveText('2/2');
+  });
+}
+
+test('Find reveals text inside a wide terminal table', async ({ page }) => {
+  await render(page, 'before\n'.repeat(40) + '│ ' + 'wide column '.repeat(100) + 'far-token │\n' + 'after\n'.repeat(40));
+  await page.getByRole('button', { name: 'Find in terminal', exact: true }).click();
+  await page.getByRole('searchbox', { name: 'Find in terminal', exact: true }).fill('far-token');
+  await expect(page.locator('#peek-msg-count')).toHaveText('1/1');
+  await readable(page, '.peek-highlight.current');
+  expect(await page.locator('.peek-box').evaluate(el => el.scrollLeft)).toBeGreaterThan(0);
+});
+
+for (const mode of ['message', 'search']) {
+  test(`a working worker refresh keeps the selected ${mode} and its position`, async ({ page }) => {
+    const raw = 'before\n'.repeat(45) + '› selected original text\nAssistant\n' + 'after\n'.repeat(50);
+    await render(page, raw);
+    if (mode === 'search') {
+      await page.getByRole('button', { name: 'Find in terminal', exact: true }).click();
+      await page.getByRole('searchbox', { name: 'Find in terminal', exact: true }).fill('selected original text');
+    } else await page.getByRole('button', { name: 'Next message', exact: true }).click();
+    const selector = mode === 'search' ? '.peek-highlight.current' : '.peek-msg-current';
+    const target = await page.locator(selector).elementHandle();
+    const top = await page.locator('#peek-body').evaluate(el => el.scrollTop);
+    await page.route('**/api/sessions/scroll-worker/peek?*', route => route.fulfill({ json: {
+      output: 'new output\n'.repeat(100) + raw + '\nlatest output', history: '',
+    } }));
+    await page.evaluate(() => (window as any).refreshPeek());
+    expect(await target!.evaluate(el => el.isConnected)).toBe(true);
+    expect(await page.locator('#peek-body').evaluate(el => el.scrollTop)).toBe(top);
+    await readable(page, selector);
+  });
+}

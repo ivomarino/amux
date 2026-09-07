@@ -55,7 +55,8 @@ test('header arrows land at the start of a long message and hold through refresh
   });
   expect(landing.height).toBeGreaterThan(400);
   expect(landing.offset).toBeGreaterThanOrEqual(0);
-  expect(landing.offset).toBeLessThan(18);
+  expect(landing.offset).toBeGreaterThanOrEqual(39);
+  expect(landing.offset).toBeLessThan(42);
   expect(landing.top).toBeGreaterThan(100);
   expect(landing.locked).toBe(true);
   await page.evaluate(() => (window as any)._peekReclassifyPrompts());

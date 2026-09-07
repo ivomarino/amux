@@ -9035,7 +9035,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.826';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.827';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -10791,7 +10791,7 @@ async function refreshPeek(liveOnly, bypassTrim) {
       histChanged = true;
     }
     const atBottom = _isScrolledToBottom(body);
-    if (atBottom) _peekScrollLocked = false;
+    if (atBottom && !body.querySelector('.peek-msg-current, .peek-highlight.current')) _peekScrollLocked = false;
     const newHTML = _peekHtml(output);
     if (peekSelecting || (window.getSelection()?.toString().length > 0)) return;
     if (_sendingSnapshot && newHTML !== _sendingSnapshot) clearSendingIndicator();
@@ -10804,8 +10804,10 @@ async function refreshPeek(liveOnly, bypassTrim) {
     const hasSearch = peekSearchQuery.trim().length > 0;
     // When user has scrolled up, skip DOM update to avoid fidgeting the view.
     // Buffer in lastPeekHTML and flush when they resume.
-    if (hasSearch) {
-      // Output changed while a search is active: re-highlight matches in the new
+    if (hasSearch && (!_peekScrollLocked || _peekPendingFindScroll)) {
+      // A selected search result stays pinned while output is buffered, just
+      // like message navigation. Only an unlocked search or pending Locate
+      // should replace its nodes. Re-highlight matches in the new
       // DOM but DON'T scroll to the current match — preserve wherever the user
       // scrolled. Auto-scroll only happens on explicit search actions (typing /
       // next / prev). Restoring scrollTop keeps position across the innerHTML swap.
@@ -10880,23 +10882,44 @@ function applyPeekSearch(keepIndex, doScroll) {
     if (countEl) countEl.textContent = '';
     return;
   }
-  // Highlight all matches in text nodes only (not inside tags)
+  // Search the rendered text, not serialized HTML. Entities and ANSI/link
+  // spans must not turn one visible phrase into missing or duplicate matches.
+  body.innerHTML = lastPeekHTML;
+  const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+  const nodes = [];
+  let text = '', node;
+  while ((node = walker.nextNode())) {
+    nodes.push({node, start:text.length, end:text.length + node.data.length});
+    text += node.data;
+  }
   const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const re = new RegExp('(' + escaped + ')', 'gi');
-  const parts = lastPeekHTML.split(/(<[^>]+>)/);
-  let idx = 0;
-  body.innerHTML = parts.map(p => {
-    if (p.startsWith('<')) return p;
-    return p.replace(re, (match) => `<span class="peek-highlight" data-idx="${idx++}">${esc(match)}</span>`);
-  }).join('');
-  _peekMatches = Array.from(body.querySelectorAll('.peek-highlight'));
+  const ranges = [...text.matchAll(new RegExp(escaped, 'gi'))].map(m => ({start:m.index,end:m.index + m[0].length}));
+  _peekMatches = [];
+  let firstRange = 0;
+  for (const entry of nodes) {
+    while (firstRange < ranges.length && ranges[firstRange].end <= entry.start) firstRange++;
+    if (firstRange >= ranges.length || ranges[firstRange].start >= entry.end) continue;
+    const fragment = document.createDocumentFragment();
+    let offset = 0;
+    for (let i = firstRange; i < ranges.length && ranges[i].start < entry.end; i++) {
+      const start = Math.max(0, ranges[i].start - entry.start), end = Math.min(entry.node.length, ranges[i].end - entry.start);
+      fragment.append(document.createTextNode(entry.node.data.slice(offset, start)));
+      const mark = document.createElement('span');
+      mark.className = 'peek-highlight'; mark.dataset.idx = String(i);
+      mark.textContent = entry.node.data.slice(start, end); fragment.append(mark);
+      if (!_peekMatches[i]) _peekMatches[i] = mark;
+      offset = end;
+    }
+    fragment.append(document.createTextNode(entry.node.data.slice(offset)));
+    entry.node.replaceWith(fragment);
+  }
   _peekReclassifyPrompts();
   if (!keepIndex || peekSearchIndex >= _peekMatches.length) peekSearchIndex = 0;
   _peekScrollTo(peekSearchIndex, doScroll);
   if (countEl) countEl.textContent = _peekMatches.length > 0 ? (peekSearchIndex + 1) + '/' + _peekMatches.length : 'no matches';
 }
 function _peekScrollTo(i, doScroll, instant) {
-  _peekMatches.forEach((m, j) => m.classList.toggle('current', j === i));
+  document.querySelectorAll('#peek-body .peek-highlight').forEach(m => m.classList.toggle('current', Number(m.dataset.idx) === i));
   const cur = _peekMatches[i];
   // instant: the one-shot Locate jump — a smooth animation would be frozen
   // mid-flight by the next poll tick's savedTop restore.
@@ -10991,7 +11014,7 @@ function _peekMsgNavIsExplicit(e) {
 function _peekMsgPrompts() {
   const body = document.getElementById('peek-body');
   if (!body) return [];
-  if (peekSearchQuery.trim()) return Array.from(body.querySelectorAll('.peek-highlight'));
+  if (peekSearchQuery.trim()) return _peekMatches.filter(el => el.isConnected);
   return Array.from(body.querySelectorAll('.peek-prompt')).filter(el =>
     _peekMsgNavKind === 'all' || el.dataset.msgKind === _peekMsgNavKind);
 }
@@ -11044,24 +11067,61 @@ function _peekToolbarCheck() {
   });
 }
 window.addEventListener('resize', _peekToolbarCheck);
-function _peekJumpTo(el) {
+// getBoundingClientRect uses rendered pixels; scrollTop uses unzoomed layout
+// pixels. Use computed border-box height (not rounded offsetHeight) to convert.
+function _peekScrollScale(el) {
+  const style = getComputedStyle(el);
+  const extra = style.boxSizing === 'border-box' ? 0 : ['paddingTop','paddingBottom','borderTopWidth','borderBottomWidth']
+    .reduce((sum, key) => sum + (parseFloat(style[key]) || 0), 0);
+  return el.getBoundingClientRect().height / (parseFloat(style.height) + extra) || 1;
+}
+function _peekJumpGeometry(el) {
   const body = document.getElementById('peek-body');
-  // Lock before changing scrollTop: a polling tick must not replace the target
-  // while a smooth animation is still in flight. Scroll only this container.
+  const bounds = body.getBoundingClientRect(), rect = el.getBoundingClientRect();
+  const scale = _peekScrollScale(body);
+  const viewportTop = bounds.top + body.clientTop * scale;
+  // Padding protects the first line at rest; explicit jumps must also respect
+  // the controls that float above the scrolling output.
+  let inset = Math.max(12, parseFloat(getComputedStyle(body).paddingTop) || 0);
+  for (const control of document.querySelectorAll('#peek-overlay .peek-copy-btn, #peek-overlay .peek-agent-nav')) {
+    if (!control.getClientRects().length) continue;
+    const r = control.getBoundingClientRect();
+    if (r.bottom > viewportTop && r.top < bounds.bottom) inset = Math.max(inset, (r.bottom - viewportTop) / scale + 6);
+  }
+  const offset = (rect.top - viewportTop) / scale;
+  const max = Math.max(0, body.scrollHeight - body.clientHeight);
+  const wanted = Math.max(0, Math.min(max, body.scrollTop + offset - inset));
+  return {body, bounds, rect, scale, inset, offset, wanted, max,
+    visible: rect.top >= viewportTop + inset * scale - 1 && rect.top < bounds.bottom
+      && rect.right > bounds.left && rect.left < bounds.right};
+}
+function _peekJumpTo(el) {
+  const g = _peekJumpGeometry(el);
   _peekScrollLocked = true;
-  const top = el.getBoundingClientRect().top - body.getBoundingClientRect().top + body.scrollTop - 12;
-  body.scrollTo({ top: Math.max(0, top), behavior: 'instant' });
+  // A search match inside a wide terminal table also needs its own horizontal
+  // scroller moved. Never scroll the page or an unrelated overlay.
+  for (let box = el.parentElement; box && box !== g.body; box = box.parentElement) {
+    if (box.scrollWidth <= box.clientWidth) continue;
+    const r = box.getBoundingClientRect(), match = el.getBoundingClientRect(), scale = _peekScrollScale(box);
+    if (match.left < r.left || match.right > r.right) box.scrollLeft += (match.left - r.left) / scale - 8;
+  }
+  g.body.scrollTo({top:g.wanted, behavior:'instant'});
 }
 function _peekNavBeacon(verdict, prompts, target) {
   const body = document.getElementById('peek-body');
-  const bounds = body.getBoundingClientRect();
-  const rect = target && target.getBoundingClientRect();
+  const geometry = target && _peekJumpGeometry(target);
+  const searching = !!peekSearchQuery.trim();
   try {
     fetch(API + '/api/client-debug', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ kind: 'peek-message-nav', verdict, session: peekSession, ver: APP_VER,
-        measured: true, n_considered: prompts.length, filter: _peekMsgNavKind,
-        index: _peekMsgIndex, target_kind: target?.dataset.msgKind || null,
-        target_visible: !!rect && rect.top >= bounds.top - 1 && rect.top < bounds.bottom,
+        measured: true, n_considered: prompts.length, filter: searching ? 'matches' : _peekMsgNavKind,
+        mode: searching ? 'search' : 'messages',
+        index: searching ? peekSearchIndex : _peekMsgIndex, target_kind: target?.closest('.peek-prompt')?.dataset.msgKind || null,
+        target_visible: !!geometry && geometry.visible,
+        target_offset: geometry ? Math.round(geometry.offset * 100) / 100 : null,
+        desired_inset: geometry ? Math.round(geometry.inset * 100) / 100 : null,
+        scroll_error_px: geometry ? Math.round((geometry.wanted - body.scrollTop) * 100) / 100 : null,
+        zoom: geometry ? Math.round(geometry.scale * 1000) / 1000 : null,
         scroll_top: Math.round(body.scrollTop),
         unclassified: body.querySelectorAll('.peek-prompt-unknown').length }) }).catch(() => {});
   } catch (e) {}
@@ -11096,7 +11156,8 @@ async function _peekMsgMove(direction, event) {
   const selected = prompts.findIndex(p => p.classList.contains(peekSearchQuery.trim() ? 'current' : 'peek-msg-current'));
   if (selected >= 0) _peekMsgIndex = (selected + direction + prompts.length) % prompts.length;
   else {
-    const top = document.getElementById('peek-body').getBoundingClientRect().top + 13;
+    const g = _peekJumpGeometry(prompts[0]);
+    const top = g.bounds.top + g.inset * g.scale + 1;
     const visible = prompts.findIndex(p => p.getBoundingClientRect().top >= top);
     _peekMsgIndex = direction > 0 ? (visible < 0 ? 0 : visible)
       : (visible <= 0 ? prompts.length - 1 : visible - 1);
@@ -11110,9 +11171,8 @@ async function _peekMsgMove(direction, event) {
   }
   _peekJumpTo(target);
   _peekMsgCount(prompts);
-  const rect = target.getBoundingClientRect();
-  const bounds = document.getElementById('peek-body').getBoundingClientRect();
-  _peekNavBeacon(rect.top >= bounds.top - 1 && rect.top < bounds.bottom ? 'landed' : 'target-not-visible', prompts, target);
+  const landed = _peekJumpGeometry(target);
+  _peekNavBeacon(landed.visible && Math.abs(landed.wanted - landed.body.scrollTop) < 2 ? 'landed' : 'target-not-visible', prompts, target);
 }
 function peekMsgNext(event) { _peekMsgMove(1, event); }
 function peekMsgPrev(event) { _peekMsgMove(-1, event); }
