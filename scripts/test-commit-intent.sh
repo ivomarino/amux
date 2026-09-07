@@ -99,3 +99,5 @@ if [ "$FAILED" -eq 0 ]; then
 fi
 echo "FAIL ($FAILED of $CELLS outcome cells)"
 exit 1
+
+# AF-565: live check that the intent manifest round-trips
