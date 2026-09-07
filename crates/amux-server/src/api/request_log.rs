@@ -103,6 +103,13 @@ pub struct LogRow {
 /// definition rather than the test restating the order — the two drifting is
 /// exactly how the log came to disagree with the handlers in the first place.
 pub(crate) fn caller_from_headers(h: &axum::http::HeaderMap) -> String {
+    // An invited human is authenticated by the member cookie. Ordinary
+    // X-Amux-Worker / X-Amux-Session values remain client-controlled, so the
+    // internal member actor must win or multiplayer request history is
+    // trivially spoofable.
+    if let Some(actor) = super::org::local_member_actor(h) {
+        return actor.to_string();
+    }
     for k in ["x-amux-worker", "x-amux-session"] {
         if let Some(v) = h.get(k).and_then(|v| v.to_str().ok()) {
             let v = v.trim();

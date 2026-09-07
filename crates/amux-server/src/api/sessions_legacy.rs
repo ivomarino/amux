@@ -10,7 +10,7 @@
 use super::AppState;
 use crate::backend::tmux::pane_target;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
@@ -2495,6 +2495,7 @@ pub(crate) fn worker_model_env(
 
 pub async fn create_session_legacy(
     State(_state): State<AppState>,
+    headers: HeaderMap,
     body: Option<Json<serde_json::Value>>,
 ) -> Response {
     let body = body.map(|Json(v)| v).unwrap_or(serde_json::Value::Null);
@@ -2575,9 +2576,14 @@ pub async fn create_session_legacy(
         &default_model,
     );
     let mut pairs: Vec<(&str, String)> = vec![("CC_DIR", dir.clone())];
-    let creator = s("creator");
+    // An invited human's author comes from the verified member cookie. The
+    // request body and ordinary worker/session headers are caller-controlled,
+    // so neither may decide who appears as the worker's creator.
+    let creator = super::org::local_member_actor(&headers)
+        .map(str::to_string)
+        .unwrap_or_else(|| s("creator"));
     if !creator.is_empty() {
-        pairs.push(("CC_CREATOR", creator));
+        pairs.push(("CC_CREATOR", creator.clone()));
     }
     if provider != "claude" {
         pairs.push(("CC_PROVIDER", provider.clone()));
@@ -2643,6 +2649,7 @@ pub async fn create_session_legacy(
             "name": name,
             "dir": dir,
             "provider": provider,
+            "creator": creator,
             "running": false,
             "archived": false,
             // Echo what was actually stored so a dropped or defaulted field is

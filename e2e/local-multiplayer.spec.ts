@@ -33,6 +33,7 @@ test('local invitee joins, shares work, uses worker APIs, appears in logs, and c
   browser,
   request,
 }) => {
+  test.setTimeout(60_000);
   await owner.goto('/');
   await settle(owner);
   const ownerToken = await owner.evaluate(() => (window as any)._AMUX_AUTH_TOKEN as string);
@@ -118,32 +119,56 @@ test('local invitee joins, shares work, uses worker APIs, appears in logs, and c
     const workerAccess = await guest.evaluate(async (workerName) => {
       const create = await fetch('/api/sessions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          // Ordinary attribution headers are caller-controlled. The server
+          // must still persist the authenticated member as the author.
+          'X-Amux-Worker': 'spoofed-worker-author',
+        },
         body: JSON.stringify({
           name: workerName,
           dir: '/tmp',
           provider: 'codex',
-          creator: 'guest@example.com',
+          creator: 'spoofed-owner',
           tags: ['e2e-multiplayer'],
         }),
       });
+      const createBody = await create.json();
       const fleet = await fetch('/api/sessions');
       const rows = await fleet.json();
+      const fleetRow = rows.find((row: any) => row.name === workerName);
       const info = await fetch(`/api/sessions/${encodeURIComponent(workerName)}/info`);
+      const infoBody = await info.json();
+      const stoppedSend = await fetch(`/api/sessions/${encodeURIComponent(workerName)}/send`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Amux-Session': 'another-spoofed-worker',
+        },
+        body: JSON.stringify({ text: 'member worker-use probe', record_history: true }),
+      });
       return {
         createStatus: create.status,
+        createBody,
         fleetStatus: fleet.status,
-        listed: rows.some((row: any) => row.name === workerName),
+        listed: Boolean(fleetRow),
+        fleetCreator: fleetRow?.creator,
         infoStatus: info.status,
-        infoBody: await info.json(),
+        infoBody,
+        sendStatus: stoppedSend.status,
+        sendBody: await stoppedSend.json(),
       };
     }, memberWorker);
     expect(workerAccess).toMatchObject({
       createStatus: 201,
+      createBody: { creator: 'member:guest@example.com' },
       fleetStatus: 200,
       listed: true,
+      fleetCreator: 'member:guest@example.com',
       infoStatus: 200,
       infoBody: { name: memberWorker },
+      sendStatus: 200,
+      sendBody: { ok: true, authored_by: 'member:guest@example.com' },
     });
     createdWorkers.push(memberWorker);
     for (const [name, tags] of [
@@ -194,19 +219,44 @@ test('local invitee joins, shares work, uses worker APIs, appears in logs, and c
     const created = await guest.evaluate(async (cardTitle) => {
       const response = await fetch('/api/board', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Amux-Worker': 'spoofed-card-author',
+        },
         body: JSON.stringify({
           title: cardTitle,
           type: 'chore',
           status: 'todo',
-          creator: 'guest@example.com',
+          creator: 'spoofed-owner',
         }),
       });
       return { status: response.status, body: await response.json() };
     }, title);
     expect(created.status).toBe(201);
+    expect(created.body.creator).toBe('member:guest@example.com');
     const cardId = created.body.id as string;
     createdCards.push(cardId);
+    const authoredEdit = await guest.evaluate(async (id) => {
+      const response = await fetch(`/api/board/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Amux-Session': 'spoofed-edit-author',
+        },
+        body: JSON.stringify({ desc_append: 'member-authored note' }),
+      });
+      return { status: response.status, body: await response.json() };
+    }, cardId);
+    expect(authoredEdit.status).toBe(200);
+    expect(authoredEdit.body.log).toContain('member:guest@example.com: desc +20 chars');
+    const ownerCard = await request.get(`/api/board/${encodeURIComponent(cardId)}`, {
+      headers: ownerHeaders,
+    });
+    expect(ownerCard.status()).toBe(200);
+    expect(await ownerCard.json()).toMatchObject({
+      creator: 'member:guest@example.com',
+      log: expect.stringContaining('member:guest@example.com: desc +20 chars'),
+    });
     await owner.evaluate(() => {
       document.getElementById('settings-menu')?.classList.remove('open');
       (window as any).switchView('board');

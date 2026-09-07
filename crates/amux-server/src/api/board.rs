@@ -1878,7 +1878,9 @@ fn hhmm() -> String {
 /// fixes every already-installed CLI copy at once, and closes both effects
 /// together, whereas patching curl lines fixes only the machines that upgrade.
 fn actor_from_headers(headers: &HeaderMap) -> (Actor, String) {
-    match Some(crate::api::groups::hdr_worker(headers))
+    match super::org::local_member_actor(headers)
+        .map(str::to_string)
+        .or_else(|| Some(crate::api::groups::hdr_worker(headers)))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
     {
@@ -3888,13 +3890,13 @@ pub async fn create_item(
     // present, the card is for the sender's own lane. An EXPLICIT value —
     // including explicit "" / null for a deliberately unassigned card — is
     // always respected.
-    let (_, hdr_name) = actor_from_headers(&headers);
-    let hdr_session = if hdr_name == "api-anonymous"
+    let (_, actor_name) = actor_from_headers(&headers);
+    let hdr_session = if actor_name == "api-anonymous"
         || super::org::is_verified_local_member(&headers)
     {
         String::new()
     } else {
-        hdr_name.clone()
+        actor_name.clone()
     };
     let session = if map.contains_key("session") {
         body_str(&map, "session").unwrap_or_default().trim().to_string()
@@ -4018,11 +4020,17 @@ pub async fn create_item(
     // Creator attribution (AMUX-1812): the body value is a self-reported
     // CLAIM; the verified header wins, and a disagreement is recorded.
     let claimed = body_str(&map, "creator").unwrap_or_default().trim().to_string();
-    let creator = match (&hdr_session.is_empty(), claimed.is_empty()) {
-        (false, false) if hdr_session != claimed => format!("{hdr_session} (claimed {claimed})"),
-        (false, _) => hdr_session.clone(),
-        (true, false) => claimed,
-        (true, true) => String::new(),
+    let verified_creator = (actor_name != "api-anonymous").then_some(actor_name.as_str());
+    let creator = match (verified_creator, claimed.is_empty()) {
+        // A local member's author is derived from the verified invite cookie.
+        // Old dashboard clients still send a device-name `creator`; retaining
+        // that self-reported value would make the same person appear under a
+        // different author on every device and would allow deliberate spoofing.
+        (Some(author), _) if super::org::is_verified_local_member(&headers) => author.to_string(),
+        (Some(author), false) if author != claimed => format!("{author} (claimed {claimed})"),
+        (Some(author), _) => author.to_string(),
+        (None, false) => claimed,
+        (None, true) => String::new(),
     };
 
     let owner_type = match body_str(&map, "owner_type").as_deref() {

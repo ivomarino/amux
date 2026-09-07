@@ -3733,3 +3733,6 @@ cookie-authenticated request, filter fleet and board reads, refuse cross-scope
 worker/card access, keep org administration owner-only, and make rescoping take
 effect on the existing cookie. The browser E2E now transitions one live member
 global → group → worker and proves both permitted work and cross-scope 403s.
+Member-authored cards, edits, worker creation, sends, and request-log rows derive
+their author from that verified cookie, so client-supplied creator or worker
+headers cannot rewrite multiplayer history.

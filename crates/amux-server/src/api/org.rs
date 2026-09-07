@@ -42,6 +42,7 @@ const MEMBER_COOKIE: &str = "amux_member";
 const VERIFIED_MEMBER_HEADER: &str = "x-amux-local-member-verified";
 const MEMBER_SCOPE_LEVEL_HEADER: &str = "x-amux-local-member-scope-level";
 const MEMBER_SCOPE_NAME_HEADER: &str = "x-amux-local-member-scope-name";
+const MEMBER_ACTOR_HEADER: &str = "x-amux-local-member-actor";
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -65,6 +66,20 @@ pub fn public_routes() -> Router<AppState> {
 /// this cannot be asserted by a Tailscale/LAN client itself.
 pub(crate) fn is_verified_local_member(headers: &HeaderMap) -> bool {
     headers.get(VERIFIED_MEMBER_HEADER).and_then(|v| v.to_str().ok()) == Some("1")
+}
+
+/// Server-verified author for an invited human. The marker and value are both
+/// removed from inbound requests below, so a member cannot impersonate a
+/// worker (or another member) by supplying the ordinary attribution headers.
+pub(crate) fn local_member_actor(headers: &HeaderMap) -> Option<&str> {
+    if !is_verified_local_member(headers) {
+        return None;
+    }
+    headers
+        .get(MEMBER_ACTOR_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 /// The resource boundary granted to a local/Tailscale member.
@@ -347,6 +362,9 @@ pub async fn local_member_identity(
     req.headers_mut().remove(VERIFIED_MEMBER_HEADER);
     req.headers_mut().remove(MEMBER_SCOPE_LEVEL_HEADER);
     req.headers_mut().remove(MEMBER_SCOPE_NAME_HEADER);
+    req.headers_mut().remove(MEMBER_ACTOR_HEADER);
+    req.headers_mut().remove("x-amux-user-id");
+    req.headers_mut().remove("x-amux-user-email");
     let Some(token) = member_cookie(req.headers()).map(str::to_string) else {
         return next.run(req).await;
     };
@@ -407,6 +425,9 @@ pub async fn local_member_identity(
     }
     req.headers_mut().insert("x-amux-user-id", id);
     req.headers_mut().insert("x-amux-user-email", email);
+    if let Ok(actor) = HeaderValue::from_str(&format!("member:{}", member.email)) {
+        req.headers_mut().insert(MEMBER_ACTOR_HEADER, actor);
+    }
     if !req.headers().contains_key("x-amux-worker") && !req.headers().contains_key("x-amux-session") {
         if let Ok(actor) = HeaderValue::from_str(&format!("member:{}", member.email)) {
             req.headers_mut().insert("x-amux-session", actor);
@@ -1408,6 +1429,47 @@ mod tests {
         assert_eq!(identity["is_cloud"], false);
         assert_eq!(identity["access_scope"], json!({"level": "global", "name": ""}));
 
+        // Authorship is derived from the verified invite cookie, not from a
+        // caller-controlled creator field or ordinary worker/session header.
+        // The same author must survive into both the card and its edit history.
+        let (card_status, _, card_body) = raw_send(
+            &app,
+            "POST",
+            "/api/board",
+            r#"{"title":"member-authored","type":"chore","status":"backlog","creator":"spoofed-owner"}"#,
+            &[
+                ("cookie", cookie),
+                ("content-type", "application/json"),
+                ("x-amux-worker", "spoofed-worker"),
+                ("x-amux-user-email", "spoofed@example.com"),
+            ],
+        )
+        .await;
+        assert_eq!(card_status, StatusCode::CREATED, "{card_body}");
+        let card: Value = serde_json::from_str(&card_body).unwrap();
+        assert_eq!(card["creator"], "member:guest@example.com");
+        let card_id = card["id"].as_str().unwrap();
+        let (patch_status, _, patch_body) = raw_send(
+            &app,
+            "PATCH",
+            &format!("/api/board/{card_id}"),
+            r#"{"desc_append":"member note"}"#,
+            &[
+                ("cookie", cookie),
+                ("content-type", "application/json"),
+                ("x-amux-session", "another-spoofed-worker"),
+            ],
+        )
+        .await;
+        assert_eq!(patch_status, StatusCode::OK, "{patch_body}");
+        let patched: Value = serde_json::from_str(&patch_body).unwrap();
+        assert!(
+            patched["log"]
+                .as_str()
+                .is_some_and(|log| log.contains("member:guest@example.com: desc +11 chars")),
+            "{patch_body}"
+        );
+
         // The member shell cannot inherit the owner's bearer: real browser API
         // calls must continue to exercise the cookie boundary.
         let (shell_status, _, shell) = raw_send(&app, "GET", "/", "", &[("cookie", cookie)]).await;
@@ -1429,6 +1491,25 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(actor, "member:guest@example.com");
+        let mut board_actor = String::new();
+        for _ in 0..50 {
+            board_actor = rusqlite::Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT amux_session FROM _amux_request_log \
+                     WHERE path='/api/board' AND method='POST' ORDER BY ts DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap()
+                .unwrap_or_default();
+            if !board_actor.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(board_actor, "member:guest@example.com");
 
         let member_id: String = rusqlite::Connection::open(&db).unwrap().query_row(
             "SELECT id FROM org_members WHERE email='guest@example.com'", [], |row| row.get(0)).unwrap();
