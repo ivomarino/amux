@@ -2061,6 +2061,67 @@ pub fn repeat_offers_are_visible(
     }))]
 }
 
+/// A card claiming to be live work, hidden from everything that could act (AF-544).
+///
+/// `amux board archive` promises to "hide a card from every view AND every
+/// autonomy loop", which is right for a TERMINAL card. Applied to a `todo` or
+/// `doing` card it produces a state with no honest reading: the status says the
+/// work is live, and nothing — no view, no drain, no nudge, no human — will ever
+/// surface it again. There is no signal anywhere that it happened.
+///
+/// THE MECHANISM, reported by studio-plg and verified in source:
+/// `session_verbs::archive_session_issues` is
+/// `UPDATE issues SET archived=?1 WHERE session=?3 AND deleted IS NULL AND
+/// archived!=?1` — no status filter. Archiving a SESSION takes its todo, doing,
+/// review, needsyou, backlog and blocked cards with it. `board::clear_done`
+/// scopes correctly to `status='done'` and is not the cause; they checked and
+/// ruled it out.
+///
+/// MEASURED 2026-09-06: 823 fleet-wide — 314 backlog, 273 todo, 107 needsyou,
+/// 48 review, 43 doing, 38 blocked. studio-plg found the review slice; the whole
+/// population is seventeen times it. One of theirs, SP-457, said "routing to the
+/// server/backend lane" in its own description on 2026-08-01 and dispatched to
+/// nobody for five weeks.
+///
+/// WHY THIS REPORTS RATHER THAN UN-ARCHIVING, and it is not reflex: the obvious
+/// fix — make archive skip non-terminal statuses — leaves `todo` cards owned by
+/// a lane that no longer exists, which `board_drive` cannot dispatch to. That is
+/// exactly the stranded-card defect `todo_is_reachable_by_dispatch` reports one
+/// card over. The naive fix trades this defect for that one, so the shape of the
+/// remedy is a real decision and it is not this check's to make.
+pub fn archived_cards_are_terminal(
+    by_status: &[(String, i64)],
+    worst_lane: Option<(String, i64)>,
+) -> Vec<InvariantResult> {
+    const ID: &str = "board.archived_cards_are_terminal";
+    let total: i64 = by_status.iter().map(|(_, n)| *n).sum();
+    if total == 0 {
+        return vec![InvariantResult::pass(ID)
+            .evidence(json!({"archived_non_terminal": 0, "by_status": []}))];
+    }
+    let breakdown: Vec<String> =
+        by_status.iter().map(|(st, n)| format!("{n} {st}")).collect();
+    let who = worst_lane
+        .as_ref()
+        .map(|(l, n)| format!(" Worst lane: {l} ({n}).", l = l, n = n))
+        .unwrap_or_default();
+    vec![InvariantResult::fail(
+        ID,
+        "an archived card is terminal — nothing archived still claims to be live work"
+            .to_string(),
+        format!(
+            "{total} archived card(s) are in a NON-TERMINAL status ({}), so their status              says the work is live while no view, no drain, no nudge and no human will              ever surface them.{who} Archiving a SESSION does this:              archive_session_issues has no status filter. Do NOT bulk-unarchive — a todo              card owned by an archived lane is undispatchable (see              board.todo_is_reachable_by_dispatch); the shape of the remedy is a decision.",
+            breakdown.join(", "),
+        ),
+    )
+    .evidence(json!({
+        "archived_non_terminal": total,
+        "by_status": by_status.iter().map(|(s, n)| json!({"status": s, "count": n}))
+            .collect::<Vec<_>>(),
+        "worst_lane": worst_lane.map(|(l, n)| json!({"lane": l, "count": n})),
+    }))]
+}
+
 /// Every open card's type is IN THE VOCABULARY (AMUX-3552).
 ///
 /// An unknown type is not inert: `core_item_type` maps anything it does not
@@ -6135,5 +6196,51 @@ mod repeat_offer_tests {
         // ...and the threshold, or a later reader cannot tell whether the zero
         // means "nothing cycled" or "the bar was set impossibly high".
         assert!(d.contains("threshold"), "{d}");
+    }
+}
+
+#[cfg(test)]
+mod archived_terminal_tests {
+    use super::*;
+
+    fn st(s: &str, n: i64) -> (String, i64) { (s.to_string(), n) }
+
+    /// AF-544. The breakdown by status is the finding: 273 `todo` and 43 `doing`
+    /// are a different problem from 314 `backlog`, and a bare total hides that.
+    #[test]
+    fn it_breaks_the_count_down_by_status_and_names_the_worst_lane() {
+        let bad = archived_cards_are_terminal(
+            &[st("backlog", 314), st("todo", 273), st("doing", 43)],
+            Some(("amux".to_string(), 147)),
+        );
+        assert_eq!(bad[0].status, Status::Fail);
+        let d = format!("{:?}", bad[0]);
+        assert!(d.contains("630 archived"), "the total must be the sum, not a guess: {d}");
+        assert!(d.contains("273 todo"), "a bare total hides which status is affected: {d}");
+        assert!(d.contains("amux (147)"), "the worst lane must be named to be actionable: {d}");
+    }
+
+    /// It must REFUSE the obvious remedy in the message, because bulk-unarchiving
+    /// hands `todo` cards to lanes that no longer exist — the stranded-card
+    /// defect one check over. A finding that invites the wrong fix is worse than
+    /// none.
+    #[test]
+    fn it_warns_against_the_bulk_unarchive_that_would_strand_the_cards() {
+        let bad = archived_cards_are_terminal(&[st("todo", 5)], None);
+        let d = format!("{:?}", bad[0]);
+        assert!(d.contains("Do NOT bulk-unarchive"), "{d}");
+        assert!(d.contains("todo_is_reachable_by_dispatch"), "name the defect it would create: {d}");
+        assert!(d.contains("archive_session_issues"), "name the cause, or nobody can fix it: {d}");
+    }
+
+    /// THE CONTROL: a clean board must PASS. Without it the check is satisfiable
+    /// by always failing, and the whole family of these would read as broken.
+    #[test]
+    fn a_board_with_nothing_archived_mid_flight_passes() {
+        let ok = archived_cards_are_terminal(&[], None);
+        assert_eq!(ok[0].status, Status::Pass);
+        // A missing worst-lane must not crash or fabricate one.
+        let d = format!("{:?}", ok[0]);
+        assert!(d.contains("archived_non_terminal"), "the pass still publishes its field: {d}");
     }
 }

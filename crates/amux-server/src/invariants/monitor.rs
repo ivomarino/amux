@@ -369,6 +369,7 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     out.extend(autofix_dispatchable_check(state));
     out.extend(todo_reachable_check(state));
     out.extend(repeat_offer_check(state));
+    out.extend(archived_terminal_check(state));
     out.extend(card_type_vocabulary_check(state));
     out.extend(board_list_read_check(state));
 
@@ -1745,6 +1746,50 @@ const REPEAT_OFFER_WINDOW_S: i64 = 7 * 86_400;
 /// 867 pairs claimed once, 104 twice, 39 three times, 9 at four, tail to 9x. The
 /// distribution knees between 3 and 4.
 const REPEAT_OFFER_THRESHOLD: i64 = 4;
+
+/// AF-544, reported by studio-plg. The statuses a card can hold and still be
+/// claiming live work; anything else is terminal and archiving it is correct.
+const NON_TERMINAL_STATUSES: &[&str] =
+    &["todo", "doing", "review", "backlog", "needsyou", "blocked"];
+
+fn archived_terminal_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "board.archived_cards_are_terminal";
+    let Ok(conn) = state.store.read() else {
+        return vec![InvariantResult::unknown(ID, "store unreadable")];
+    };
+    // The list is built from the const rather than inlined, so adding a status
+    // there cannot leave this check quietly measuring the old set.
+    let placeholders = NON_TERMINAL_STATUSES.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let params: Vec<&dyn rusqlite::ToSql> =
+        NON_TERMINAL_STATUSES.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+    let by_status: Result<Vec<(String, i64)>, _> = conn
+        .prepare(&format!(
+            "SELECT status, COUNT(*) FROM issues WHERE deleted IS NULL              AND COALESCE(archived,0)=1 AND status IN ({placeholders})              GROUP BY status ORDER BY 2 DESC"
+        ))
+        .and_then(|mut st| {
+            st.query_map(params.as_slice(), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map(|it| it.flatten().collect())
+        });
+    let Ok(by_status) = by_status else {
+        return vec![InvariantResult::unknown(ID, "archived-status query failed")];
+    };
+    let params2: Vec<&dyn rusqlite::ToSql> =
+        NON_TERMINAL_STATUSES.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let worst = conn
+        .prepare(&format!(
+            "SELECT COALESCE(session,'<unassigned>'), COUNT(*) FROM issues              WHERE deleted IS NULL AND COALESCE(archived,0)=1              AND status IN ({placeholders}) GROUP BY 1 ORDER BY 2 DESC LIMIT 1"
+        ))
+        .and_then(|mut st| {
+            st.query_row(params2.as_slice(), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+        })
+        .ok();
+    checks::archived_cards_are_terminal(&by_status, worst)
+}
 
 fn repeat_offer_check(state: &AppState) -> Vec<InvariantResult> {
     const ID: &str = "board.repeat_offers_are_visible";
