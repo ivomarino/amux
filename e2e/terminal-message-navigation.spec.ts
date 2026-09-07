@@ -151,6 +151,12 @@ test('a toolbar layout regression announces itself to client diagnostics', async
     beacons.push(route.request().postDataJSON());
     await route.fulfill({ json: { ok: true } });
   });
+  await page.evaluate(async () => {
+    document.body.style.zoom = '0.8';
+    (window as any)._peekToolbarCheck();
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  });
+  expect(beacons.filter(b => b.kind === 'peek-toolbar-layout')).toHaveLength(0);
   await page.locator('#peek-msg-nav').evaluate(el => { (el as HTMLElement).style.flexDirection = 'column'; });
   await page.evaluate(() => (window as any)._peekToolbarCheck());
   await expect.poll(() => beacons.filter(b => b.kind === 'peek-toolbar-layout').length).toBe(1);

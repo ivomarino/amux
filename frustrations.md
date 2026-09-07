@@ -3544,3 +3544,14 @@ CARD: AMUX-4188
 SYMPTOM: Ethan circled the Human 0 tower, tab grid and directory link/edit icons on his phone. The navigation group measured 76px tall with 24px arrow targets; its counter secretly cycled seven message types.
 COST: A second user report after the earlier scrolling fix; 30px of avoidable header height and small ambiguous tap targets remained on the primary phone surface.
 FIX: One horizontal 44px-control toolbar with an explicit message-type select and on-demand Find. Search and message navigation share arrows/counters, including keyboard changes. Tabs is labeled; directory changes and copy links use named worker-menu entries. peek-toolbar-layout emits unusable-controls with measured/population/overflow/target sizes if this layout regresses. Browser checks cover desktop, 375px mobile and iOS WebKit; a negative control restores column stacking to prove the geometry check fails.
+
+## Cached worker links opened before message state existed and never loaded scoped history
+AREA: browser
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux
+CARD: AMUX-4188
+SYMPTOM: Live #peek=amux displayed Cannot access _pmSel before initialization. _peekMsgRows remained null: the initial cached-message render threw before _peekMessagesLoad reached its fetch.
+COST: Live toolbar verification was blocked; direct worker links could keep Human at zero because the scoped history request never started.
+FIX: Initial deep-link routing and screen restoration now run together after DOM readiness and full bundle initialization. Cached worker/history fixtures prove a real scoped request and human classification. Global action/script failures now emit client-action-error beacons as well as the existing toast. Live layout signals also exposed a zoom-coordinate false positive; geometry validation now compares layout sizes to layout thresholds and records rendered height separately.

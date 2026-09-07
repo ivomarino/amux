@@ -9014,7 +9014,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.823';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.824';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -9038,6 +9038,9 @@ _loadModelCatalog().then(() => { if (!_initialLoad) render(); }).catch(() => {})
       const text = String(msg || 'unknown error').slice(0, 140);
       if (typeof showToast === 'function') showToast('\u26a0 ' + kind + ': ' + text);
       console.error('amux ' + kind + ':', msg);
+      fetch(API + '/api/client-debug', {method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({kind:'client-action-error',verdict:kind,message:text,
+          measured:true,n_considered:1,ver:APP_VER})}).catch(() => {});
     } catch (e) {}
   }
   window.addEventListener('unhandledrejection', function (ev) {
@@ -10989,14 +10992,16 @@ function _peekToolbarCheck() {
     if (!toolbar || !toolbar.getClientRects().length) return;
     const controls = [...toolbar.querySelectorAll('button,select')];
     const rect = toolbar.getBoundingClientRect();
-    const small = controls.filter(el => { const r = el.getBoundingClientRect(); return r.width < 43 || r.height < 43; });
+    // Layout sizes are independent of the user's deliberate UI zoom. Comparing
+    // scaled screen rectangles to CSS sizes falsely flagged every 80% control.
+    const small = controls.filter(el => el.offsetWidth < 43 || el.offsetHeight < 43);
     const overflow = rect.right > document.documentElement.clientWidth + 1 || toolbar.scrollWidth > toolbar.clientWidth + 1;
-    const fault = overflow || small.length || rect.height > 48;
-    const key = fault ? [innerWidth, Math.round(rect.height), overflow, small.length].join(':') : '';
+    const fault = overflow || small.length || toolbar.offsetHeight > 48;
+    const key = fault ? [innerWidth, toolbar.offsetHeight, overflow, small.length].join(':') : '';
     if (key && key !== _peekToolbarFault) {
       try { fetch(API + '/api/client-debug', {method:'POST', headers:{'Content-Type':'application/json'},
         body:JSON.stringify({kind:'peek-toolbar-layout',verdict:'unusable-controls',session:peekSession,
-          measured:true,n_considered:controls.length,viewport:innerWidth,height:rect.height,
+          measured:true,n_considered:controls.length,viewport:innerWidth,height:toolbar.offsetHeight,rendered_height:rect.height,
           overflow,small_targets:small.length,ver:APP_VER})}).catch(() => {}); } catch(e) {}
     }
     _peekToolbarFault = key;
@@ -32029,8 +32034,8 @@ async function _handleDeeplink(hash) {
     }
   } catch(e) {}
 }
-// On page load
-_handleDeeplink(location.hash);
+// Initial routing is scheduled with restoration below, after both the DOM and
+// the complete bundle (including late message-selection state) are initialized.
 // Restore the screen you were on — INCLUDING after iOS evicts a backgrounded
 // PWA (which wipes sessionStorage but keeps localStorage): the active tab and
 // any open session peek. Bounded to 24h so a days-later open still lands on a
@@ -32106,8 +32111,12 @@ function _restoreScreen() {
     }, 200);
   }
 }
-if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', _restoreScreen);
-else _restoreScreen();
+function _restoreAppScreen() {
+  _handleDeeplink(location.hash);
+  _restoreScreen();
+}
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', _restoreAppScreen, {once:true});
+else queueMicrotask(_restoreAppScreen);
 // On hash change (e.g. paste URL into address bar while app already open — no page reload)
 window.addEventListener('hashchange', () => _handleDeeplink(location.hash));
 
