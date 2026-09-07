@@ -922,17 +922,21 @@ test('settings_team_section', async ({ page, request }, testInfo) => {
   await openSettings(page);
   await expect(page.locator('#settings-org-name')).toHaveValue('E2E Workspace');
 
-  // "+ Invite" first offers optional email binding, then creates a real
-  // invite and shows the shareable link modal.
+  // "+ Invite" binds email and access scope before it creates the real link.
   await page.locator('#settings-team-section button', { hasText: '+ Invite' }).click();
-  const emailPrompt = page.locator('#modal-prompt-input');
+  const emailPrompt = page.locator('#team-invite-email');
   await expect(emailPrompt).toBeVisible();
   await emailPrompt.fill('invitee@example.com');
+  await expect(page.locator('#team-scope-level option')).toHaveText([
+    'Global — every worker and card',
+    'Group — workers tagged in one group',
+    'Worker — one worker only',
+  ]);
   const [invRes] = await Promise.all([
     page.waitForResponse(
       (r) => r.url().endsWith('/api/org/invites') && r.request().method() === 'POST',
     ),
-    page.locator('#modal-btns button', { hasText: 'OK' }).click(),
+    page.locator('#team-scope-submit').click(),
   ]);
   expect(invRes.status()).toBe(201); // create_invite answers 201 CREATED
   const linkInput = page.locator('#invite-link-input');
@@ -941,9 +945,7 @@ test('settings_team_section', async ({ page, request }, testInfo) => {
   expect(inviteUrl).toContain('/invite/');
   // Scope Done to the invite modal — the (hidden) filters modal also carries a
   // "Done" button, and an unscoped role query trips strict mode on it.
-  await linkInput
-    .locator('xpath=ancestor::div[contains(@style,"fixed")]//button[normalize-space()="Done"]')
-    .click();
+  await page.locator('#invite-done-button').click();
   await expect(linkInput).not.toBeAttached();
 
   // The invite is real server-side.

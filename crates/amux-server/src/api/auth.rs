@@ -64,10 +64,29 @@ pub async fn require_bearer(
     let Some(expected) = &state.auth_token else {
         return next.run(req).await;
     };
+    // An explicit owner credential wins even if this browser also carries an
+    // old member cookie. Owners use that combination when testing an invite in
+    // the same browser; treating them as the invitee would lock them out of the
+    // very membership controls needed to repair it.
+    if provided_owner_token(req.headers(), req.uri())
+        .is_some_and(|t| constant_time_eq(t.as_bytes(), expected.as_bytes()))
+    {
+        return next.run(req).await;
+    }
     // Local invitees authenticate through the revocable member cookie. Only
     // org::local_member_identity can insert this marker: it strips any inbound
     // copy before validating the cookie against org_invites -> org_members.
+    // Authorization is evaluated on every request against the member row, so
+    // rescoping or revoking a user takes effect without reminting their cookie.
     if super::org::is_verified_local_member(req.headers()) {
+        if let Some(response) = super::org::authorize_local_member_request(
+            &state,
+            req.method(),
+            req.uri(),
+            req.headers(),
+        ) {
+            return response;
+        }
         return next.run(req).await;
     }
     // Localhost always bypasses auth (Python parity: local sessions, CLI

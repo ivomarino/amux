@@ -3714,3 +3714,22 @@ SYMPTOM: A concurrent reader was named owner of three ops research files after t
 COST: The reader had to disown files it never edited; publication required an ownership check and this repair.
 FIX: Keep mtime observations in a separate, counted advisory. They cannot name an owner or replace recorded edits; preserve recorded-writer and blind-cotenant protection. Regression: concurrent_reader_observations_cannot_claim_the_ops_research_files.
 VERIFIED: dd416c753b24 is running (build eee97f2b86189c02). The same five staged paths changed from three observed-only foreign blocks to zero foreign owners, with three advisory paths/four observer records retained; the MOS-33 log records that denominator. Final source passes 70 guard tests, six real hook-main controls, existing protection checks, clippy and cargo check.
+
+## A local invite proved identity but granted the owner’s entire API surface
+AREA: auth
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: Codex local Tailscale multiplayer
+CARD: ATE-79
+SYMPTOM: Every accepted local/Tailscale invite became a verified member, but the
+ member row carried no resource boundary and auth returned immediately after the
+ cookie check. An invite intended for one worker could read and mutate the whole
+ fleet, board, settings, and membership API.
+COST: Local multiplayer could not be shared safely with an external collaborator;
+ the only authorization choices were full owner-equivalent data access or no access.
+FIX: Persist global/group/worker scope on invites and members, resolve it on every
+cookie-authenticated request, filter fleet and board reads, refuse cross-scope
+worker/card access, keep org administration owner-only, and make rescoping take
+effect on the existing cookie. The browser E2E now transitions one live member
+global → group → worker and proves both permitted work and cross-scope 403s.

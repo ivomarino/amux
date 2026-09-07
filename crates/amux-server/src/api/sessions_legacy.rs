@@ -2269,6 +2269,7 @@ pub async fn list_sessions_legacy(
     match built.unwrap_or_else(|e| Err(anyhow::anyhow!("sessions build panicked: {e}"))) {
         Ok(json) => {
             let body = filter_isolated_for_peer(&json, &headers);
+            let body = filter_for_local_member(&body, &headers);
             // CONTENT-hash ETag (AMUX-3504), not a store-rev one: this payload
             // is part store, part scrape (pane previews, token counts), so a
             // rev ETag would serve stale 304s when scrape state moved. The
@@ -2313,6 +2314,9 @@ pub async fn list_sessions_legacy(
 /// the owner's dashboard is a browser and sends neither. Same owner-vs-peer
 /// split the send guard uses (empty origin = owner).
 fn caller_is_peer(headers: &axum::http::HeaderMap) -> bool {
+    if crate::api::org::is_verified_local_member(headers) {
+        return false;
+    }
     ["x-amux-worker", "x-amux-session"].iter().any(|k| {
         headers
             .get(*k)
@@ -2320,6 +2324,27 @@ fn caller_is_peer(headers: &axum::http::HeaderMap) -> bool {
             .map(|v| !v.trim().is_empty())
             .unwrap_or(false)
     })
+}
+
+/// A human invited at worker/group scope sees only the fleet slice they were
+/// granted. Filtering happens before the content ETag is computed, so a scope
+/// change cannot reuse a validator for a broader response.
+fn filter_for_local_member(json: &str, headers: &axum::http::HeaderMap) -> String {
+    let Some(scope) = crate::api::org::local_member_scope(headers) else {
+        return json.to_string();
+    };
+    if scope.is_global() {
+        return json.to_string();
+    }
+    let Ok(mut rows) = serde_json::from_str::<Vec<serde_json::Value>>(json) else {
+        return json.to_string();
+    };
+    rows.retain(|row| {
+        row.get("name")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|worker| scope.allows_worker(worker))
+    });
+    serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into())
 }
 
 /// ISOLATED (AMUX-3232): strip isolated (raw-agent) workers from the fleet list

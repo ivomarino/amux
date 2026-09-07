@@ -1675,6 +1675,18 @@ fn err(status: StatusCode, body: Value) -> Response {
     (status, Json(body)).into_response()
 }
 
+fn scoped_board_forbidden(scope: &super::org::MemberScope, resource: &str) -> Response {
+    err(
+        StatusCode::FORBIDDEN,
+        json!({
+            "error": "outside local member access scope",
+            "scope_level": scope.level(),
+            "scope_name": scope.name(),
+            "resource": resource,
+        }),
+    )
+}
+
 use super::internal;
 
 fn not_found(id: &str) -> Response {
@@ -2959,6 +2971,7 @@ pub struct ExportParams {
 
 pub async fn export_board(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(p): Query<ExportParams>,
 ) -> Response {
     let conn = match state.store.read() {
@@ -2970,11 +2983,22 @@ pub async fn export_board(
         .as_deref()
         .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
         .unwrap_or_default();
-    let workers: Vec<String> = p
+    let mut workers: Vec<String> = p
         .worker
         .as_deref()
         .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
         .unwrap_or_default();
+    if let Some(scope) = super::org::local_member_scope(&headers).filter(|scope| !scope.is_global()) {
+        if workers.iter().any(|worker| !scope.allows_worker(worker)) {
+            return scoped_board_forbidden(&scope, "board export");
+        }
+        if workers.is_empty() {
+            workers = super::org::scoped_worker_names(&scope);
+            if workers.is_empty() {
+                workers.push("__amux_no_permitted_worker__".into());
+            }
+        }
+    }
     // Default ActiveOnly: an export is a working document, and silently
     // including archived cards would overstate the board. `archived=all`
     // opts in, and the header below always says which was used.
@@ -3129,7 +3153,18 @@ pub async fn list_board(
     }
     // ETag based on global_rev — saves 3.5MB on unchanged polls.
     let rev = state.store.current_rev().map(|r| r.0).unwrap_or(0);
-    let etag_val = format!("\"board-{}\"", rev);
+    let member_scope = super::org::local_member_scope(&headers);
+    let scope_etag = member_scope
+        .as_ref()
+        .map(|scope| {
+            use sha2::Digest as _;
+            let digest = sha2::Sha256::digest(
+                format!("{}\0{}", scope.level(), scope.name()).as_bytes(),
+            );
+            format!("-{}", &hex::encode(digest)[..12])
+        })
+        .unwrap_or_default();
+    let etag_val = format!("\"board-{}{scope_etag}\"", rev);
     if let Some(inm) = headers.get("if-none-match").and_then(|v| v.to_str().ok()) {
         if inm == etag_val || inm == format!("W/{etag_val}") {
             let mut h = HeaderMap::new();
@@ -3165,7 +3200,20 @@ pub async fn list_board(
             .collect()
     };
     let status_f = split(&p.status);
-    let session_f = split(&p.session);
+    let mut session_f = split(&p.session);
+    if let Some(scope) = member_scope.as_ref().filter(|scope| !scope.is_global()) {
+        if session_f.iter().any(|worker| !scope.allows_worker(worker)) {
+            return scoped_board_forbidden(scope, "board list");
+        }
+        if session_f.is_empty() {
+            session_f = super::org::scoped_worker_names(scope);
+            if session_f.is_empty() {
+                // An empty SQL filter means "all sessions", so use an
+                // impossible sentinel when a group currently has no workers.
+                session_f.push("__amux_no_permitted_worker__".into());
+            }
+        }
+    }
     // `archived` grammar (amux-server.py:68758 + 14025, ported on AMUX-2586 fix #5):
     //   "1"/"true"/"yes"          -> archived-only
     //   any OTHER non-empty value -> non-archived only ("0", "false", "all", "2", ...)
@@ -3841,7 +3889,9 @@ pub async fn create_item(
     // including explicit "" / null for a deliberately unassigned card — is
     // always respected.
     let (_, hdr_name) = actor_from_headers(&headers);
-    let hdr_session = if hdr_name == "api-anonymous" {
+    let hdr_session = if hdr_name == "api-anonymous"
+        || super::org::is_verified_local_member(&headers)
+    {
         String::new()
     } else {
         hdr_name.clone()
@@ -3851,6 +3901,11 @@ pub async fn create_item(
     } else {
         hdr_session.chars().take(64).collect()
     };
+    if let Some(scope) = super::org::local_member_scope(&headers).filter(|scope| !scope.is_global()) {
+        if session.is_empty() || !scope.allows_worker(&session) {
+            return scoped_board_forbidden(&scope, if session.is_empty() { "unassigned card" } else { &session });
+        }
+    }
 
     let status_in = body_str(&map, "status").unwrap_or_else(|| "todo".into());
     // THE SAME PREDICATE ON THE CREATE DOOR (AMUX-3929). The transition gate
@@ -4644,9 +4699,14 @@ mod task_asset_resolution_tests {
     }
 }
 
-pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+pub async fn get_item(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
     let store = state.store.clone();
     let key = id.clone();
+    let member_scope = super::org::local_member_scope(&headers).filter(|scope| !scope.is_global());
     let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = store.read()?;
         let Some(row) = bs::get_issue(&conn, &key)? else {
@@ -4663,6 +4723,14 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
         let children = child_ids
             .iter()
             .filter_map(|child| bs::get_issue(&conn, child).ok().flatten())
+            .filter(|child| {
+                member_scope.as_ref().is_none_or(|scope| {
+                    child
+                        .session
+                        .as_deref()
+                        .is_some_and(|worker| scope.allows_worker(worker))
+                })
+            })
             .map(|child| {
                 json!({
                     "id": child.id,
@@ -4682,7 +4750,14 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
         // A child inherits the source message of its epic for display, while
         // cmd_history.card_id itself remains attached to the root epic. That
         // keeps the Messages chip stable from prompt through completion.
-        let message_root = row.epic.as_deref().unwrap_or(&row.id);
+        // A child normally inherits its epic's prompt. For a scoped member,
+        // crossing that parent boundary could reveal a prompt on a card they
+        // cannot open, so only use the directly-authorized card as the root.
+        let message_root = if member_scope.is_some() {
+            &row.id
+        } else {
+            row.epic.as_deref().unwrap_or(&row.id)
+        };
         let mut messages = Vec::new();
         let mut msg_stmt = conn.prepare(
             "SELECT id,text,type,session,ts,origin,card_id FROM cmd_history \
@@ -6270,6 +6345,17 @@ pub async fn patch_item(
             json!({ "error": "body must be a JSON object" }),
         );
     };
+    if let Some(scope) = super::org::local_member_scope(&headers).filter(|scope| !scope.is_global()) {
+        if map.contains_key("session") {
+            let target = body_str(&map, "session").unwrap_or_default();
+            if target.is_empty() || !scope.allows_worker(&target) {
+                return scoped_board_forbidden(
+                    &scope,
+                    if target.is_empty() { "unassigned card" } else { &target },
+                );
+            }
+        }
+    }
     // AF-413: computed HERE, before `map` moves into the write closure, because
     // the refusal that needs it is built inside that closure and answered after
     // it. Cheap (a key scan) and unconditional: a value only read on the refusal

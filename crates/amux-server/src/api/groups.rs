@@ -275,12 +275,36 @@ async fn list_groups(State(state): State<AppState>, method: Method, headers: Hea
     }
     let home = amux_home();
     let rows = scan_session_tags(&home);
-    let scope = caller_scope(&home, &headers);
+    let member_scope = super::org::local_member_scope(&headers);
+    let scope = match member_scope.as_ref() {
+        Some(super::org::MemberScope::Global) | None => caller_scope(&home, &headers),
+        Some(super::org::MemberScope::Worker(worker)) => {
+            let mut worker_headers = HeaderMap::new();
+            if let Ok(value) = worker.parse() {
+                worker_headers.insert("x-amux-worker", value);
+            }
+            caller_scope(&home, &worker_headers)
+        }
+        Some(super::org::MemberScope::Group(group)) => {
+            (true, [group.clone()].into_iter().collect(), String::new())
+        }
+    };
     let cfgs = match state.store.read() {
         Ok(conn) => load_group_configs(&conn),
         Err(_) => BTreeMap::new(),
     };
-    j(200, build_group_list(&rows, &scope, &cfgs))
+    let mut body = build_group_list(&rows, &scope, &cfgs);
+    if let Some(super::org::MemberScope::Group(group)) = member_scope {
+        if let Some(groups) = body.get_mut("groups").and_then(Value::as_array_mut) {
+            groups.retain(|row| {
+                row.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&group))
+            });
+            body["total"] = json!(groups.len());
+        }
+    }
+    j(200, body)
 }
 
 // ---------------------------------------------------------------------------
