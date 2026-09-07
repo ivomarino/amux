@@ -2153,9 +2153,9 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <button class="search-clear" onclick="event.stopPropagation();clearPeekSearch()">&#x2715;</button>
       </div>
       <div class="peek-msg-nav" id="peek-msg-nav" title="Navigate messages (click counter to change kind)">
-        <button class="peek-nav-btn" onclick="peekMsgPrev()" title="Previous message" aria-label="Previous message">&#x2191;</button>
+        <button class="peek-nav-btn" onpointerdown="_peekMsgNavArm(event)" onclick="peekMsgPrev(event)" title="Previous message" aria-label="Previous message">&#x2191;</button>
         <button class="peek-msg-count" id="peek-msg-count" onclick="_peekMsgNavCycle()" aria-label="Choose message kind" title="Choose message kind">Human 0</button>
-        <button class="peek-nav-btn" onclick="peekMsgNext()" title="Next message" aria-label="Next message">&#x2193;</button>
+        <button class="peek-nav-btn" onpointerdown="_peekMsgNavArm(event)" onclick="peekMsgNext(event)" title="Next message" aria-label="Next message">&#x2193;</button>
       </div>
       <div class="peek-more-wrap">
         <button class="btn" onclick="togglePeekMoreMenu()" id="peek-worker-menu-btn" title="Worker actions">&#x22EE;</button>

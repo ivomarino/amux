@@ -89,7 +89,62 @@ test('search navigation shares real matches and reports an empty filter', async 
     eval('peekSearchQuery = ""; _peekMsgNavKind = "human";');
     document.getElementById('peek-body')!.innerHTML = '';
   });
-  await page.getByRole('button', { name: 'Next message', exact: true }).evaluate((el: HTMLElement) => el.click());
+  await page.route('**/api/sessions/nav-probe/log?*', route => route.fulfill({ status: 404, json: { error: 'missing' } }));
+  await page.getByRole('button', { name: 'Next message', exact: true }).click();
   await expect.poll(() => beacons.filter(b => b.verdict === 'no-targets').length).toBe(1);
   await expect(page.locator('#peek-msg-count')).toHaveText('Human 0');
+  await expect(page.locator('#toast')).toContainText('This worker has no saved earlier output.');
+});
+
+test('a scroll gesture ending over a message arrow is inert', async ({ page }) => {
+  const beacons: any[] = [];
+  await page.route('**/api/client-debug', async route => {
+    beacons.push(route.request().postDataJSON());
+    await route.fulfill({ json: { ok: true } });
+  });
+  await page.evaluate(() => {
+    const body = document.getElementById('peek-body')!;
+    body.innerHTML = '<div style="height:4000px">plain output without prompts</div>';
+    body.scrollTop = 0;
+    document.getElementById('toast')!.classList.remove('visible');
+  });
+  const next = page.getByRole('button', { name: 'Next message', exact: true });
+  const box = await next.boundingBox();
+  expect(box).not.toBeNull();
+  await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
+  await page.mouse.down();
+  await page.evaluate(() => {
+    const body = document.getElementById('peek-body')!;
+    body.scrollTop = 500;
+    body.dispatchEvent(new Event('scroll'));
+  });
+  await page.mouse.up();
+
+  await expect.poll(() => beacons.filter(b => b.verdict === 'suppressed-scroll-gesture').length).toBe(1);
+  await expect(page.locator('#toast')).not.toHaveClass(/visible/);
+  expect(await page.locator('#peek-body').evaluate(el => el.scrollTop)).toBe(500);
+});
+
+test('an explicit empty navigation loads earlier output and lands on its message', async ({ page }) => {
+  const beacons: any[] = [];
+  await page.route('**/api/client-debug', async route => {
+    beacons.push(route.request().postDataJSON());
+    await route.fulfill({ json: { ok: true } });
+  });
+  await page.route('**/api/sessions/nav-probe/log?*', route => route.fulfill({
+    status: 200,
+    headers: { 'Content-Type': 'text/plain', 'X-Log-Remaining': '0' },
+    body: '› older human request\nassistant response\n',
+  }));
+  await page.evaluate(() => {
+    eval('peekSearchQuery = ""; _peekMsgNavKind = "all"; _peekEarlier = { chunks: [], loadedKb: 0, done: false, hidden: false, loading: false }; _peekHistoryHTML = ""; _lastLiveHTML = ""; lastPeekHTML = "";');
+    document.getElementById('peek-body')!.innerHTML = '';
+    document.getElementById('toast')!.classList.remove('visible');
+  });
+  await page.getByRole('button', { name: 'Next message', exact: true }).click();
+
+  await expect(page.locator('.peek-msg-current')).toContainText('older human request');
+  await expect.poll(() => beacons.filter(b => b.verdict === 'loaded-earlier').length).toBe(1);
+  await expect.poll(() => beacons.filter(b => b.verdict === 'landed').length).toBe(1);
+  await expect(page.locator('#toast')).not.toHaveClass(/visible/);
 });

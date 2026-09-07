@@ -8998,7 +8998,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.820';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.821';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -10609,18 +10609,22 @@ function _peekEarlierHTML() {
     : '';
   return bar + blocks;
 }
-async function _peekLoadEarlier() {
+async function _peekLoadEarlier(options) {
+  const quiet = !!(options && options.quiet);
   const name = peekSession;
-  if (!name || _peekEarlier.loading || _peekEarlier.done) return;
+  if (!name || _peekEarlier.loading) return 'busy';
+  if (_peekEarlier.done) return 'beginning';
   _peekEarlier.loading = true;
+  let verdict = 'error';
   try {
     const r = await fetch(API + '/api/sessions/' + encodeURIComponent(name) +
       '/log?plain=1&tail_kb=' + _PEEK_LOG_CHUNK_KB + '&before_kb=' + _peekEarlier.loadedKb,
       { headers: _authHeaders() });
     if (peekSession !== name) return;
     if (!r.ok) {
-      showToast('No saved log for this worker');
+      if (!quiet) showToast('No saved log for this worker');
       if (r.status === 404) _peekEarlier.hidden = true;
+      verdict = 'missing';
     } else {
       const text = await r.text();
       const remaining = parseInt(r.headers.get('X-Log-Remaining') || '0', 10);
@@ -10643,6 +10647,7 @@ async function _peekLoadEarlier() {
       _peekEarlier.chunks.unshift('<span class="pe-chunk">' + _peekHtml(text) + '</span>');
       _peekEarlier.loadedKb += _PEEK_LOG_CHUNK_KB;
       _peekEarlier.done = remaining <= 0;
+      verdict = text.trim() ? 'loaded' : (_peekEarlier.done ? 'beginning' : 'empty');
     }
     // Paint immediately (refreshPeek skips DOM writes while scrolled up) and
     // anchor at the bottom of the just-loaded chunk so reading continues
@@ -10652,8 +10657,12 @@ async function _peekLoadEarlier() {
     const body = document.getElementById('peek-body');
     const first = body && body.querySelector('.pe-chunk');
     if (first) body.scrollTop = Math.max(0, first.offsetTop + first.offsetHeight - 80);
-  } catch (e) { showToast('Could not load log'); }
+  } catch (e) {
+    if (!quiet) showToast('Could not load log');
+    verdict = 'error';
+  }
   finally { _peekEarlier.loading = false; }
+  return verdict;
 }
 
 // ── Fitted border rules ──
@@ -10885,6 +10894,31 @@ function _closePeekMore() {
 // ── Peek message navigation ──
 let _peekMsgIndex = -1;
 let _peekMsgNavKind = 'human';
+let _peekMsgNavGesture = null;
+function _peekMsgNavArm(e) {
+  const body = document.getElementById('peek-body');
+  _peekMsgNavGesture = {
+    pointerId: e.pointerId,
+    x: e.clientX,
+    y: e.clientY,
+    scrollTop: body ? body.scrollTop : 0,
+    at: performance.now(),
+  };
+}
+function _peekMsgNavIsExplicit(e) {
+  // Keyboard activation produces a trusted click with detail=0 and no pointer
+  // gesture. Programmatic .click() is intentionally not user intent.
+  if (!e || !e.isTrusted) return false;
+  if (e.detail === 0) return true;
+  const body = document.getElementById('peek-body');
+  const armed = _peekMsgNavGesture;
+  _peekMsgNavGesture = null;
+  if (!armed || performance.now() - armed.at > 1500) return false;
+  if (e.pointerId != null && armed.pointerId != null && e.pointerId !== armed.pointerId) return false;
+  const moved = Math.hypot((e.clientX || 0) - armed.x, (e.clientY || 0) - armed.y);
+  const scrolled = !!body && Math.abs(body.scrollTop - armed.scrollTop) > 1;
+  return moved <= 8 && !scrolled;
+}
 function _peekMsgPrompts() {
   const body = document.getElementById('peek-body');
   if (!body) return [];
@@ -10927,14 +10961,32 @@ function _peekNavBeacon(verdict, prompts, target) {
         unclassified: body.querySelectorAll('.peek-prompt-unknown').length }) }).catch(() => {});
   } catch (e) {}
 }
-function _peekMsgMove(direction) {
-  _peekReclassifyPrompts();
-  const prompts = _peekMsgPrompts();
-  if (!prompts.length) {
-    _peekMsgCount(prompts);
-    _peekNavBeacon('no-targets', prompts, null);
-    showToast('No matching messages in loaded output. Choose another message kind or load earlier output.');
+async function _peekMsgMove(direction, event) {
+  if (!_peekMsgNavIsExplicit(event)) {
+    const prompts = _peekMsgPrompts();
+    _peekNavBeacon('suppressed-scroll-gesture', prompts, null);
     return;
+  }
+  _peekReclassifyPrompts();
+  let prompts = _peekMsgPrompts();
+  if (!prompts.length) {
+    const earlier = await _peekLoadEarlier({quiet: true});
+    _peekReclassifyPrompts();
+    prompts = _peekMsgPrompts();
+    if (prompts.length) {
+      _peekNavBeacon('loaded-earlier', prompts, null);
+    } else {
+      _peekMsgCount(prompts);
+      _peekNavBeacon('no-targets', prompts, null);
+      const label = _peekMsgNavKind === 'all' ? 'messages'
+        : ((_MSG_KIND[_peekMsgNavKind] || _MSG_KIND.unknown).label.toLowerCase() + ' messages');
+      const why = earlier === 'beginning' ? 'Reached the beginning of the saved output.'
+        : earlier === 'loaded' || earlier === 'empty' ? 'Loaded an earlier output page.'
+        : earlier === 'missing' ? 'This worker has no saved earlier output.'
+        : 'Earlier output could not be loaded.';
+      showToast('No matching ' + label + '. ' + why);
+      return;
+    }
   }
   const selected = prompts.findIndex(p => p.classList.contains('peek-msg-current'));
   if (selected >= 0) _peekMsgIndex = (selected + direction + prompts.length) % prompts.length;
@@ -10957,8 +11009,8 @@ function _peekMsgMove(direction) {
   const bounds = document.getElementById('peek-body').getBoundingClientRect();
   _peekNavBeacon(rect.top >= bounds.top - 1 && rect.top < bounds.bottom ? 'landed' : 'target-not-visible', prompts, target);
 }
-function peekMsgNext() { _peekMsgMove(1); }
-function peekMsgPrev() { _peekMsgMove(-1); }
+function peekMsgNext(event) { _peekMsgMove(1, event); }
+function peekMsgPrev(event) { _peekMsgMove(-1, event); }
 function _peekMsgNavCycle() {
   const kinds = ['human', 'session', 'schedule', 'amux', 'unstamped', 'unknown', 'all'];
   _peekMsgNavKind = kinds[(kinds.indexOf(_peekMsgNavKind) + 1) % kinds.length];

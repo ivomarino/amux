@@ -3511,3 +3511,14 @@ CARD: ATE-45
 SYMPTOM: social-activities showed WORKING + AGENTS twelve hours after its Sonnet turn returned to the prompt. The durable lifecycle set still contained agent add9b6f920fb9ef31 because SubagentStart arrived, the agent immediately failed on HTTP 429, and no SubagentStop hook followed. Its provider-owned parent transcript already contained a newer structured task notification with status=failed, but status derivation never reconciled that terminal fact.
 COST: An idle lane looked actively occupied, its board state contradicted the visible prompt, and the stale child survived reports and server restarts with no age-based bound.
 FIX: Reconcile only provider-owned structured terminal task notifications newer than the stored per-agent start edge, through the same durable ordering/tombstone path as a real stop. Run it immediately at an idle report and from the periodic sweep for already-leaked rows; malformed, missing, stale, quoted, and still-live evidence fails open for the model. Emit subagent_lifecycle WARN verdict terminal_transcript_reconciled with the session, agent id, provider status, event timestamp, and resulting count.
+
+## Scrolling a worker terminal fired empty message-navigation toasts
+AREA: browser
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux-testing-e2e
+CARD: AMUX-4178
+SYMPTOM: Safari repeatedly displayed “No matching messages in loaded output” while the user was scrolling a worker terminal, even though they had not asked to navigate. Live client-debug beacons recorded repeated no-targets arrow activations during the scroll interaction.
+COST: Ordinary reading produced alarming, irrelevant feedback and made the new message arrows feel unreliable; when a real explicit navigation found no loaded match, it also left the user to locate and press Load earlier manually.
+FIX: Arm message navigation on pointer-down and accept only a trusted keyboard activation or a non-moving pointer gesture with no intervening terminal scroll. Suppressed gestures emit peek-message-nav verdict=suppressed-scroll-gesture and never toast or move. A genuine empty navigation now pages the saved worker log once, reclassifies it, lands on a newly found message, or explains the exact terminal result.
