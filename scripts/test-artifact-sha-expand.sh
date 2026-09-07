@@ -9,7 +9,7 @@
 # rendered as a token with nothing to open, 301 of those bare commit shas. The
 # dashboard renderer was never the defect: it already links a URL and opens a
 # path. The REF was not a thing you could open.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 CLI="${AMUX_CLI:-$(pwd)/amux}"
 PASS=0; FAIL=0

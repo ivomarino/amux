@@ -13,7 +13,7 @@
 # SHIPPED script through its dry-run seam rather than restating the logic.
 #
 # Exit 0 = all pass, 1 = a failure. Wired into .github/workflows/checks.yml.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 SCRIPT="$(pwd)/scripts/rust-auto-build.sh"
 PASS=0; FAIL=0

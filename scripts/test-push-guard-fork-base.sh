@@ -28,7 +28,7 @@
 #   PUSH_GUARD_HOOK=/tmp/pre-guard bash scripts/test-push-guard-fork-base.sh
 #
 # Exit 0 = all pass, 1 = a failure.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 GUARD="${PUSH_GUARD_HOOK:-$(pwd)/scripts/git-hooks/append-only-push-guard}"
 PASS=0; FAIL=0

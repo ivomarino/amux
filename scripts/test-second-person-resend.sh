@@ -13,7 +13,7 @@
 # the ledger for a missing dependency.
 #
 # Exit 0 = pass, 1 = failure.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PASS=0; FAIL=0

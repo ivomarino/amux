@@ -17,7 +17,7 @@
 # not move.
 #
 # Runs the SHIPPED hook, not a retyped copy.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 HOOK="${COMMIT_STAMP_HOOK:-$(pwd)/scripts/git-hooks/prepare-commit-msg}"
 PASS=0; FAIL=0

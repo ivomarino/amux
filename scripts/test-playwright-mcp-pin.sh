@@ -11,7 +11,7 @@
 # Reads the SHIPPED script. No network, no npx, no browser: this cell must give
 # the same answer on a laptop and on a CI runner, which is the property three
 # separate tests failed to have today (AMUX-3962, AMUX-3969, AMUX-3974).
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 W="${PLAYWRIGHT_MCP_WRAPPER:-$(pwd)/scripts/amux-playwright-mcp.sh}"
 PASS=0; FAIL=0

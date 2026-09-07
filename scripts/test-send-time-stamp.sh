@@ -20,7 +20,7 @@
 # It drives the SHIPPED functions extracted from app.js, never a retyped copy:
 # a copy passes forever while the real one rots, which is the failure this file
 # exists to prevent (ethos rule 7).
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 APP=crates/amux-dashboard/static/app.js
 PASS=0; FAIL=0

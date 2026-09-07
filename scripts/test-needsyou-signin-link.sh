@@ -8,7 +8,7 @@
 # NO server log could catch a regression — this test is the guard, same as
 # test-register-merge.sh. It runs the REAL shipped verb against a MOCK curl that
 # captures the PATCH bodies, so it needs no live server and mutates no board.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 AMUX_BIN="${AMUX_BIN:-./amux}"
 PASS=0; FAIL=0

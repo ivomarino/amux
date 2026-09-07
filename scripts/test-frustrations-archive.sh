@@ -39,7 +39,7 @@
 # that silently stops working is exactly what happened last time.
 #
 # Exit 0 = all pass, 1 = a failure.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 # Overridable so a MUTANT runs through the same cells (ethos rule 7).
 ARCHIVE_TOOL="${FRUSTRATIONS_ARCHIVE:-$(pwd)/scripts/frustrations-archive.py}"

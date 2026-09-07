@@ -13,7 +13,7 @@
 #      unreachable, and would look completely correct in a diff.
 #
 # Exit 0 = all pass, 1 = a failure. Wired into .github/workflows/checks.yml.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 SERVE=e2e/serve-head.sh
 PASS=0; FAIL=0

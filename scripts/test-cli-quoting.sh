@@ -18,7 +18,7 @@
 # CC_HOME holding one fake worker: a test that delivers messages to the live
 # fleet on every run is its own incident, and the CLI refuses an unknown worker
 # before it ever POSTs.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 AMUX_BIN="${AMUX_BIN:-./amux}"   # override to run against a broken fixture
 PASS=0; FAIL=0

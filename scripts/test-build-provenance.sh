@@ -17,7 +17,7 @@
 # The on-main cases are the load-bearing ones: a builder that shouted on every
 # build would be ignored within a day, and the whole value is that the line only
 # appears when something is actually off.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 BUILDER="$(pwd)/scripts/rust-auto-build.sh"
 PASS=0; FAIL=0

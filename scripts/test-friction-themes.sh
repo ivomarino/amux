@@ -23,7 +23,7 @@
 # Cells run the SHIPPED script against a synthetic store via AMUX_DB /
 # MIXPEEK_REPO, rather than restating its logic: simulating what you believe
 # the code does cannot catch it doing something else (ethos rule 7).
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 SCAN="${FRICTION_THEMES:-$(pwd)/scripts/friction_themes.py}"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT

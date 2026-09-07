@@ -17,7 +17,7 @@
 # says which of the three situations it measured. The cells below pin all three
 # plus the anti-vacuity control, because a banner nobody can fail is a banner
 # nobody should believe.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 SRC_REPO="$(pwd)"
 PASS=0; FAIL=0

@@ -21,7 +21,7 @@
 # cannot catch it doing something else.
 #
 # Exit 0 = all pass, 1 = a failure. Wired into .github/workflows/checks.yml.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 # PUSH_GUARD_HOOK lets a caller point these cells at a DIFFERENT copy of the
 # guard — specifically an older one, to confirm a new cell actually fails

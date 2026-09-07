@@ -18,7 +18,7 @@
 #
 # `cargo` is stubbed via PATH so no real suite runs; the wrapper's own git calls
 # run against a throwaway repo, never this checkout.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 WRAP="$(pwd)/scripts/test-contended.sh"
 PASS=0; FAIL=0

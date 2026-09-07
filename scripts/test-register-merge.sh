@@ -8,7 +8,7 @@
 # re-register preserves the keys it does not manage while updating the ones it
 # does. CLI-side .env write => no server log could catch a regression; this test
 # is the guard.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 AMUX_BIN="${AMUX_BIN:-./amux}"
 PASS=0; FAIL=0

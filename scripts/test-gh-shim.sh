@@ -11,7 +11,7 @@
 # shim that always injected would pass 1-4 and silently replace a CI token.
 #
 # Exit 0 = pass, 1 = failure.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 SHIM="$(pwd)/scripts/gh-shim/gh"
 [ -x "$SHIM" ] || { echo "FAIL: $SHIM missing or not executable"; exit 1; }
