@@ -1326,6 +1326,42 @@ mod report_hook_wiring_tests {
     /// The settings.json shapes verbatim: the one running now (correct), and the
     /// AMUX-2936 fork it replaced. Both must be SELECTED — the fork especially,
     /// since filtering it out is what would leave a check that cannot fail.
+    /// AF-555. `non_terminal_statuses()` replaced a hand-written literal with a
+    /// derivation over `TaskStatus::ALL`. A refactor that silently CHANGES the
+    /// set would alter what `board.archived_cards_are_terminal` measures while
+    /// staying green, so the old literal is pinned here as the control.
+    ///
+    /// Compared as SETS and by COUNT: a set comparison alone cannot see a
+    /// duplicate, and a count alone cannot see a substitution.
+    #[test]
+    fn the_derived_live_status_set_still_equals_the_literal_it_replaced() {
+        use std::collections::BTreeSet;
+        // The exact literal from AF-544, before the derivation.
+        const WAS: [&str; 6] = ["todo", "doing", "review", "backlog", "needsyou", "blocked"];
+        let now = non_terminal_statuses();
+        assert_eq!(
+            now.iter().copied().collect::<BTreeSet<_>>(),
+            WAS.iter().copied().collect::<BTreeSet<_>>(),
+            "the derivation must measure the same statuses the literal did"
+        );
+        assert_eq!(now.len(), WAS.len(), "and hold no duplicates");
+        // And it must be DERIVED, not a second literal: every entry has to
+        // round-trip through the enum that now owns the fact.
+        for st in &now {
+            let parsed = crate::db::board_store::parse_status(st)
+                .unwrap_or_else(|| panic!("{st} must parse"));
+            assert!(parsed.claims_live_work(), "{st} must claim live work");
+        }
+        for st in amux_core::board::TaskStatus::ALL {
+            if st.claims_live_work() {
+                assert!(
+                    now.contains(&crate::db::board_store::db_status_spelling(st)),
+                    "a status added to the enum must join this set automatically: {st:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_extractor_selects_both_the_wired_and_the_forked_shape() {
         let wired = serde_json::json!({"hooks": {
@@ -1770,8 +1806,20 @@ const REPEAT_OFFER_THRESHOLD: i64 = 4;
 
 /// AF-544, reported by studio-plg. The statuses a card can hold and still be
 /// claiming live work; anything else is terminal and archiving it is correct.
-const NON_TERMINAL_STATUSES: &[&str] =
-    &["todo", "doing", "review", "backlog", "needsyou", "blocked"];
+///
+/// DERIVED from `TaskStatus::claims_live_work`, not written out (AF-555). This
+/// was a hand-maintained literal, and it was the ONLY place the fact lived —
+/// so every other consumer re-derived it, including one in another repo and
+/// another language that got it wrong and silently suppressed a page. A status
+/// added to the enum now joins this list automatically, and cannot be added to
+/// one and forgotten in the other.
+fn non_terminal_statuses() -> Vec<&'static str> {
+    amux_core::board::TaskStatus::ALL
+        .iter()
+        .filter(|s| s.claims_live_work())
+        .map(|s| crate::db::board_store::db_status_spelling(*s))
+        .collect()
+}
 
 fn archived_terminal_check(state: &AppState) -> Vec<InvariantResult> {
     const ID: &str = "board.archived_cards_are_terminal";
@@ -1780,9 +1828,10 @@ fn archived_terminal_check(state: &AppState) -> Vec<InvariantResult> {
     };
     // The list is built from the const rather than inlined, so adding a status
     // there cannot leave this check quietly measuring the old set.
-    let placeholders = NON_TERMINAL_STATUSES.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let live_statuses = non_terminal_statuses();
+    let placeholders = live_statuses.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let params: Vec<&dyn rusqlite::ToSql> =
-        NON_TERMINAL_STATUSES.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        live_statuses.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
 
     let by_status: Result<Vec<(String, i64)>, _> = conn
         .prepare(&format!(
@@ -1798,7 +1847,7 @@ fn archived_terminal_check(state: &AppState) -> Vec<InvariantResult> {
         return vec![InvariantResult::unknown(ID, "archived-status query failed")];
     };
     let params2: Vec<&dyn rusqlite::ToSql> =
-        NON_TERMINAL_STATUSES.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        live_statuses.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
     let worst = conn
         .prepare(&format!(
             "SELECT COALESCE(session,'<unassigned>'), COUNT(*) FROM issues              WHERE deleted IS NULL AND COALESCE(archived,0)=1              AND status IN ({placeholders}) GROUP BY 1 ORDER BY 2 DESC LIMIT 1"

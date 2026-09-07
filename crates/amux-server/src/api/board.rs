@@ -1913,6 +1913,58 @@ fn actor_from_headers(headers: &HeaderMap) -> (Actor, String) {
 /// Resolved through `session_is_isolated`, the same predicate the fleet filter
 /// and the send guard consult, so a card cannot claim a reachability the send
 /// path disagrees with.
+/// Publish whether this card still claims live work, BESIDE the fields a
+/// consumer would otherwise derive it from (AF-555).
+///
+/// A row ships 48 fields including `status` and `archived` and, until this,
+/// nothing that answered the question every consumer actually asks. So every
+/// consumer derived it, and a derivation nobody publishes is a derivation that
+/// diverges. gtm-engine's `is_active_card` read status and never `archived`,
+/// so an archived card in a dispatchable status suppressed a hand-raiser
+/// breach page while reaching nobody — board_drive excludes archived from
+/// dispatch and every closing verb refuses it, so the alarm went quiet because
+/// of a card that can be neither worked nor closed. 785 cards are archived
+/// while holding a non-terminal status, so the ambiguity is not rare.
+///
+/// `live_reason` is here because a bare boolean cannot say WHY, and "false"
+/// with no reason is the shape a consumer misreads next. It names which of the
+/// four rules fired.
+///
+/// Rides through slim on purpose: it is NOT in `SLIM_OMITS`, because a
+/// liveness verdict that disappears from the list payload is worse than one
+/// that was never there — `row.get("live")` returning None reads as an answer.
+fn designate_live_state(obj: &mut serde_json::Map<String, Value>, row: &IssueRow) {
+    let (live, reason) = live_state(row);
+    obj.insert("live".into(), json!(live));
+    obj.insert("live_reason".into(), json!(reason));
+}
+
+/// The four rules, in order. Exported for tests and for any in-process caller
+/// that would otherwise write a fifth copy of this.
+pub(crate) fn live_state(row: &IssueRow) -> (bool, &'static str) {
+    // NO `deleted` ARM: `IssueRow` carries no such field, because a deleted row
+    // is filtered before it ever reaches serialization. Checked rather than
+    // assumed — writing one would have compiled against a field that is not
+    // there, which is how you get a rule that reads as covered and never runs.
+    let Some(st) = crate::db::board_store::parse_status(&row.status) else {
+        // An unparseable status is NOT reported as dead. A card whose status we
+        // cannot read is a card we cannot speak for, and answering "not live"
+        // would be a measurement that never ran wearing the clothes of one that
+        // did (ethos rule 4).
+        return (true, "status_unparseable");
+    };
+    if !st.claims_live_work() {
+        return (false, "status_claims_no_work");
+    }
+    if row.archived != 0 && !st.survives_archive() {
+        return (false, "archived");
+    }
+    if row.archived != 0 {
+        return (true, "archived_but_ask_still_owed");
+    }
+    (true, "live")
+}
+
 fn designate_owner_reach(obj: &mut serde_json::Map<String, Value>, row: &IssueRow) {
     if !row.session.as_deref().is_some_and(crate::api::session_verbs::session_is_isolated) {
         // Absent rather than `false`: this is a rare property and a key on every
@@ -1935,6 +1987,10 @@ fn detail_body(row: &IssueRow) -> Value {
     // insertion covers both shipped paths (AMUX-3713).
     if let Some(obj) = v.as_object_mut() {
         designate_owner_reach(obj, row);
+        // Same reasoning, same place: the single-card GET must carry the
+        // liveness verdict too, or a consumer that fetches one card gets a
+        // different contract from one that lists.
+        designate_live_state(obj, row);
     }
     v
 }
@@ -2311,6 +2367,11 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
     if slim {
         designate_owner_reach(obj, row);
     }
+    // BOTH paths, unlike designate_owner_reach above: the full branch gets its
+    // owner-reach fields inside detail_body, but liveness is inserted here so
+    // the list and the single-card GET cannot drift (detail_body carries its
+    // own call for the single-card route).
+    designate_live_state(obj, row);
     // (see designate_owner_reach for why this exists)
     if slim {
         // AF-346: `desc` may be a bounded PREFIX here. The two derivations
@@ -10403,6 +10464,71 @@ mod slim_tests {
     /// removed the fields without replacing what the SPA derives FROM them.
     /// A payload diet that drops a rendered value is a regression wearing a
     /// performance win, and it fails silently — the card just looks empty.
+    /// AF-555. A row shipped 48 fields including `status` and `archived` and
+    /// nothing that answered the question every consumer asks, so every
+    /// consumer derived it — and gtm-engine's derivation, in another repo and
+    /// another language, read status and never `archived`, silently
+    /// suppressing a hand-raiser breach page.
+    #[test]
+    fn a_row_publishes_whether_it_is_live_so_no_consumer_has_to_derive_it() {
+        let live = IssueRow { id: "T-1".into(), status: "todo".into(), ..Default::default() };
+        assert_eq!(live_state(&live), (true, "live"));
+
+        // The exact shape that suppressed the page: archived, but in a status
+        // that dispatch would otherwise treat as workable.
+        let ghost = IssueRow {
+            id: "T-2".into(),
+            status: "todo".into(),
+            archived: 1,
+            ..Default::default()
+        };
+        assert_eq!(live_state(&ghost), (false, "archived"));
+
+        // gtm-engine's carve-out: a needs:you ask is still owed after archiving,
+        // and a blanket rule would re-mint a breach over a live human ask.
+        let ask = IssueRow {
+            id: "T-3".into(),
+            status: "needsyou".into(),
+            archived: 1,
+            ..Default::default()
+        };
+        assert_eq!(live_state(&ask), (true, "archived_but_ask_still_owed"));
+
+        let done = IssueRow { id: "T-4".into(), status: "verified".into(), ..Default::default() };
+        assert_eq!(live_state(&done), (false, "status_claims_no_work"));
+
+        // A status we cannot parse is NOT reported dead: a measurement that did
+        // not run must not wear the clothes of one that did.
+        let weird = IssueRow { id: "T-5".into(), status: "banana".into(), ..Default::default() };
+        assert_eq!(live_state(&weird), (true, "status_unparseable"));
+    }
+
+    /// The verdict must survive slimming. A liveness field that disappears from
+    /// the list payload is worse than one that never existed: `row.get("live")`
+    /// returning None reads as an answer, which is the exact failure `desc`
+    /// caused (AF-161) and that `slim` names its drops to prevent.
+    #[test]
+    fn the_live_verdict_rides_through_slim_and_is_on_both_serializers() {
+        let row = IssueRow {
+            id: "T-6".into(),
+            status: "todo".into(),
+            archived: 1,
+            ..Default::default()
+        };
+        for (label, v) in [
+            ("full list", list_body(&row, false, false)),
+            ("slim list", list_body(&row, true, false)),
+            ("single-card GET", detail_body(&row)),
+        ] {
+            assert_eq!(v["live"], serde_json::json!(false), "{label} must carry live");
+            assert_eq!(v["live_reason"], serde_json::json!("archived"), "{label} reason");
+        }
+        assert!(
+            !SLIM_OMITS.contains(&"live") && !SLIM_OMITS.contains(&"live_reason"),
+            "adding either to SLIM_OMITS reintroduces the absent-key-reads-as-answer bug"
+        );
+    }
+
     #[test]
     fn slim_drops_the_prose_but_keeps_the_two_things_the_list_renders() {
         let row = IssueRow {

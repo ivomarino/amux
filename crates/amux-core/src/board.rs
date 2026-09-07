@@ -104,6 +104,53 @@ impl TaskStatus {
             TaskStatus::Verified | TaskStatus::Discarded | TaskStatus::Quarantined
         )
     }
+
+    /// Does a card in this status still CLAIM LIVE WORK?
+    ///
+    /// DELIBERATELY NOT `!is_terminal()`, and the difference is the whole
+    /// reason this exists. `is_terminal` answers "is the lifecycle finished",
+    /// where `done` is NOT terminal because it still awaits verification. This
+    /// answers "is this card asserting there is work outstanding", where `done`
+    /// IS finished — the work happened. Two legitimate questions that disagree
+    /// on `done` and `armed`, sharing the word "terminal", which is how a
+    /// reader picks the wrong one.
+    ///
+    /// AF-555. Before this, the set lived as a private const in
+    /// `invariants/monitor.rs` (AF-544) and every other consumer re-derived it.
+    /// gtm-engine re-derived it in their own repo, in Python, and got it wrong
+    /// in the one way that mattered: their `is_active_card` read status and
+    /// never `archived`, so an archived card in a dispatchable status silently
+    /// SUPPRESSED a hand-raiser breach page while reaching nobody. Latent, 461
+    /// cards fleet-wide qualify. A predicate that every consumer must
+    /// reimplement is a predicate that will be wrong somewhere.
+    pub fn claims_live_work(&self) -> bool {
+        matches!(
+            self,
+            TaskStatus::Backlog
+                | TaskStatus::Todo
+                | TaskStatus::Doing
+                | TaskStatus::Review
+                | TaskStatus::NeedsYou
+                | TaskStatus::Blocked
+        )
+    }
+
+    /// Does a needs:you ask survive being archived?
+    ///
+    /// YES, and this is the carve-out a blanket "archived means dead" rule
+    /// gets wrong in exactly the case that matters most. amux keeps a needs:you
+    /// ask in front of the human by design even on an archived card, and the
+    /// ask really is still owed — the archived nudge says so in as many words
+    /// (AF-552: "This card is ARCHIVED, which does NOT clear the ask").
+    ///
+    /// gtm-engine found this while fixing their suppressed-page bug: treating
+    /// every archived card as dead would have re-minted a breach over a live
+    /// human ask. Named as its own predicate rather than left as a condition
+    /// inside one caller, so the next consumer inherits the carve-out instead
+    /// of rediscovering it.
+    pub fn survives_archive(&self) -> bool {
+        matches!(self, TaskStatus::NeedsYou)
+    }
 }
 
 /// What kind of work a card is. Gates DERIVE from type (ethos rule 3): when a
