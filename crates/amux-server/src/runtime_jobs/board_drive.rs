@@ -4790,11 +4790,31 @@ fn needsyou_renag_text(
     // fires once per window until the HUMAN answers or the ask is cleared as
     // overtaken — loud nagging over quiet suppression, per the decision.
     let days = (asked_age / 86400.0) as i64;
+    // AF-552, reported by gtm-engine with two live instances (GE-537, GE-583).
+    //
+    // This branch used to stop after "does NOT clear the ask", and the shared
+    // tail below then prescribed "clear needs:you and move the card" — which
+    // the board REFUSES on an archived card with `archived_task_immutable`
+    // ("task is archived; restore it first"). The disclosure and the
+    // instruction contradicted each other in adjacent sentences: the nudge
+    // KNEW the card was archived, said so, and prescribed the one action that
+    // state forbids.
+    //
+    // `amux board unarchive <ID>` has existed since AMUX-2492 and this text
+    // never named it, so every lane rediscovered it or gave up. gtm-engine got
+    // there by PATCHing {"archived":0} by hand — off the sanctioned path, for a
+    // verb that was already sitting in the CLI. Ethos rule 1: a capability that
+    // exists but does not reach the model is a capability nobody has.
     let arch = if archived != 0 {
-        "This card is ARCHIVED, which does NOT clear the ask — needs:you stays visible to the \
-         human by design.\n\n"
+        format!(
+            "This card is ARCHIVED, which does NOT clear the ask — needs:you stays visible \
+             to the human by design.\n\nAND ARCHIVED IS IMMUTABLE: every closing verb \
+             refuses it with `archived_task_immutable` (\"task is archived; restore it \
+             first\"). So the move below is TWO steps here, not one:\n\n    amux board \
+             unarchive {card}\n\nthen clear needs:you and move it as normal.\n\n"
+        )
     } else {
-        ""
+        String::new()
     };
     // The old text promised "Re-state it on the card (silences this for Nd)".
     // That was false, measured on AF-111 (AF-465): re-statement is meant to
@@ -9202,6 +9222,39 @@ mod tests {
     /// time a lane tried it (AF-111). Now: MIN(added_at) is the monotonic ask
     /// clock, the cooldown is the only silence, and a re-stated but still-open ask
     /// past the window IS re-nagged.
+    /// AF-552, reported by gtm-engine with two live instances (GE-537, GE-583).
+    /// The nudge disclosed "This card is ARCHIVED" and then prescribed "clear
+    /// needs:you and move the card" — which the board refuses on an archived
+    /// card with `archived_task_immutable`. Adjacent sentences, contradicting.
+    /// `amux board unarchive` had existed since AMUX-2492 and this text never
+    /// named it, so gtm-engine cleared theirs by hand-PATCHing {"archived":0}.
+    #[test]
+    fn an_archived_needs_you_nudge_names_the_unarchive_step_it_requires() {
+        let conn = board_db();
+        add_card(&conn, "D-2", "lane", "doing", "asked Ethan", "SCOPE: x");
+        tag(&conn, "D-2", "needs:you", now_f64() - 10.0 * 86400.0);
+
+        let arch = needsyou_renag_text(&conn, "lane", "D-2", "t", 10.0 * 86400.0, 1, now_f64())
+            .expect("an archived needs:you card is still re-nagged");
+        assert!(arch.contains("ARCHIVED"), "it must still disclose the state: {arch}");
+        assert!(
+            arch.contains("amux board unarchive D-2"),
+            "prescribing the move without the step that unblocks it is the defect: {arch}"
+        );
+        assert!(
+            arch.contains("archived_task_immutable"),
+            "name the refusal the lane will otherwise hit, so the recipe is checkable: {arch}"
+        );
+
+        // And the NON-archived nudge must not grow the instruction — a card that
+        // is not archived needs no unarchive step, and a recipe that appears
+        // when it does not apply is the same class of wrong.
+        let plain = needsyou_renag_text(&conn, "lane", "D-2", "t", 10.0 * 86400.0, 0, now_f64())
+            .expect("a live needs:you card is re-nagged too");
+        assert!(!plain.contains("unarchive"), "not applicable here: {plain}");
+        assert!(!plain.contains("ARCHIVED"), "not applicable here: {plain}");
+    }
+
     #[test]
     fn re_stating_a_needs_you_card_no_longer_silences_the_renag() {
         let conn = board_db();
