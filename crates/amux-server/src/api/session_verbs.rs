@@ -24158,6 +24158,11 @@ mod composer_state_tests {
     /// preview `gpt-5.6-solxhigh~/Dev/amux`.
     const LIVE_CODEX_IDLE_WITH_BRANCH: &str = "\u{1b}[1m\u{203a}\u{1b}[0m \u{1b}[2mAsk Codex to do anything\u{1b}[0m\n\n  \u{1b}[38;2;246;226;183mgpt-5.6-sol xhigh\u{1b}[2m\u{1b}[39m \u{b7} \u{1b}[0m\u{1b}[38;2;171;223;167m~/Dev/amux\u{1b}[2m\u{1b}[39m \u{b7} Main [default]\u{1b}[0m\n";
 
+    /// Cross-provider/model control captured from mixpeek-ops-server on
+    /// 2026-09-07. Footer classification is structural: an Astra identity and
+    /// a different worktree must not require another model-name allowlist.
+    const LIVE_CODEX_ASTRA_IDLE_WITH_BRANCH: &str = "\u{1b}[1m\u{203a}\u{1b}[0m \u{1b}[2mAsk Codex to do anything\u{1b}[0m\n\n  \u{1b}[38;2;246;226;183mgpt-6-astra xhigh\u{1b}[2m\u{1b}[39m \u{b7} \u{1b}[0m\u{1b}[38;2;171;223;167m~/Dev/mixpeek/operations\u{1b}[2m\u{1b}[39m \u{b7} Main [default]\u{1b}[0m\n";
+
     /// `backend`, captured 2026-08-09 while it was being reported as "holding
     /// unsubmitted text for hours". The composer is EMPTY; `continue with the
     /// queue` is Claude Code's dim suggestion. Three people pressed Enter,
@@ -24330,7 +24335,11 @@ mod composer_state_tests {
 
     #[test]
     fn a_codex_model_footer_is_chrome_not_unsubmitted_text() {
-        for frame in [LIVE_CODEX_IDLE, LIVE_CODEX_IDLE_WITH_BRANCH] {
+        for frame in [
+            LIVE_CODEX_IDLE,
+            LIVE_CODEX_IDLE_WITH_BRANCH,
+            LIVE_CODEX_ASTRA_IDLE_WITH_BRANCH,
+        ] {
             assert_eq!(
                 composer_state(frame),
                 ComposerState::Placeholder("AskCodextodoanything".into())
