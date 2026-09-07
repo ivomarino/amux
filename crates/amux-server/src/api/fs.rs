@@ -565,7 +565,10 @@ async fn mkdir(req: Request) -> Response {
 ///
 /// Resolution failure returns false: refusing to open is recoverable (the path
 /// is in the response), opening a Finder window on someone else's desktop is not.
-fn browser_is_on_this_machine(peer: Option<std::net::IpAddr>, host_header: Option<&str>) -> bool {
+pub(crate) fn browser_is_on_this_machine(
+    peer: Option<std::net::IpAddr>,
+    host_header: Option<&str>,
+) -> bool {
     browser_is_on_this_machine_with(peer, host_header, |h| {
         std::net::ToSocketAddrs::to_socket_addrs(&(h, 0u16))
             .map(|it| it.map(|a| a.ip()).collect())

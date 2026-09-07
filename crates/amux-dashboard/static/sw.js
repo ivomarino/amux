@@ -1,4 +1,4 @@
-const CACHE = 'amux-v0.9.826';
+const CACHE = 'amux-v0.9.827';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -73,6 +73,17 @@ self.addEventListener('fetch', e => {
   // Main HTML (SPA): network-first, always cache as canonical '/' key
   // Hash fragments (#path=...) are client-side only — SW sees bare '/' regardless
   if (url.pathname === '/') {
+    // A remote owner reaches the public shell with `?_token=...`, which the
+    // server exchanges for an HttpOnly owner-session cookie and redirects to
+    // a clean URL. Never answer that one-time exchange from the canonical `/`
+    // cache: doing so drops the query before the server sees it and leaves the
+    // correct owner credential looking exactly like an unauthenticated peer.
+    // `fetch(e.request)` follows the server redirect on the network, applying
+    // Set-Cookie before the clean owner shell is returned.
+    if (url.searchParams.has('_token')) {
+      e.respondWith(fetch(e.request));
+      return;
+    }
     const canonical = new Request('/', { headers: { 'Accept': 'text/html' } });
     // STALE-WHILE-REVALIDATE, not network-first. The shell is ~1.6MB of inline
     // HTML/CSS/JS; network-first meant every single load blocked on that full

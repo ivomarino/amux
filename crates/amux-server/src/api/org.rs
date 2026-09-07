@@ -27,7 +27,7 @@ use crate::db::{PendingEvent, WriteOutcome};
 use crate::integrations::email::base64url_nopad;
 use amux_core::revision::{EntityType, MutationKind};
 use axum::extract::{Form, Path, Request, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -75,6 +75,14 @@ fn member_cookie(headers: &HeaderMap) -> Option<&str> {
             (name == MEMBER_COOKIE && !value.is_empty()).then_some(value)
         })
     })
+}
+
+/// A cookie with this name remains significant even after its backing member
+/// is deleted. Static shell serving uses the distinction between "no member
+/// session" and "a revoked member session" so a reload cannot silently turn
+/// a revoked invitee into the owner.
+pub(crate) fn has_local_member_cookie(headers: &HeaderMap) -> bool {
+    member_cookie(headers).is_some()
 }
 
 /// Resolve a local invitee before auth and before the request logger.
@@ -159,25 +167,41 @@ fn token_urlsafe(nbytes: usize) -> String {
     base64url_nopad(&bytes)
 }
 
-/// Python: `scheme = "https" if X-Forwarded-Proto == "https" else "http"`,
-/// host from the Host header. The fallback host is this server's OWN port
-/// (`config::canonical_port()`), not Python's 8822 literal — an invite link is
-/// mailed to a person and outlives the process, so minting it against the
-/// retired address hands out a URL with an expiry date on it.
-fn base_url(headers: &HeaderMap) -> String {
+/// Public origin for a link another browser must be able to open.
+///
+/// HTTP/2 carries the authority and scheme as pseudo-headers; axum exposes
+/// them on the URI, not in `HeaderMap`. Browsers negotiate h2 on the Tailscale
+/// TLS listener, so reading only `Host` used to mint
+/// `http://localhost:8824/invite/...` from the real tailnet dashboard.
+/// HTTP/1.1 still supplies `Host`, while a reverse proxy remains authoritative
+/// through `X-Forwarded-Proto`. With no protocol signal, HTTPS is the honest
+/// default because the production Rust listener is TLS-only.
+fn base_url(headers: &HeaderMap, uri: &Uri) -> String {
     let fallback = format!("localhost:{}", crate::config::canonical_port());
-    let host = headers
+    let authority = headers
         .get("host")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or(&fallback);
-    let scheme = if headers
+        .map(str::to_string)
+        .or_else(|| uri.authority().map(|a| a.to_string()));
+    let host = match authority {
+        Some(authority) => authority,
+        None => {
+            tracing::warn!(
+                target: "amux::local_invite",
+                verdict = "origin_fallback",
+                fallback = %fallback,
+                "invite request carried no HTTP authority; using the canonical localhost origin"
+            );
+            fallback
+        }
+    };
+    let forwarded = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
-        == Some("https")
-    {
-        "https"
-    } else {
-        "http"
+        .map(str::to_ascii_lowercase);
+    let scheme = match forwarded.as_deref().or_else(|| uri.scheme_str()) {
+        Some("http") => "http",
+        _ => "https",
     };
     format!("{scheme}://{host}")
 }
@@ -511,8 +535,12 @@ pub async fn delete_member(State(state): State<AppState>, Path(id): Path<String>
 
 // ---- GET /api/org/invites -------------------------------------------------
 
-pub async fn list_invites(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let base = base_url(&headers);
+pub async fn list_invites(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    let base = base_url(&headers, &uri);
     let store = state.store.clone();
     let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Value>> {
         let conn = store.read()?;
@@ -543,6 +571,7 @@ pub async fn list_invites(State(state): State<AppState>, headers: HeaderMap) -> 
 pub async fn create_invite(
     State(state): State<AppState>,
     headers: HeaderMap,
+    uri: Uri,
     Json(body): Json<Value>,
 ) -> Response {
     // Python: `body.get("email", "").strip().lower() or None`.
@@ -578,7 +607,7 @@ pub async fn create_invite(
             tracing::info!(target: "amux::local_invite", verdict = "created",
                 bound_email = email.as_deref().unwrap_or("open"), expires_at = expires,
                 "local invite created");
-            let url = format!("{}/invite/{token}", base_url(&headers));
+            let url = format!("{}/invite/{token}", base_url(&headers, &uri));
             (
                 StatusCode::CREATED,
                 Json(json!({ "token": token, "url": url, "expires_at": expires })),
@@ -805,12 +834,31 @@ mod tests {
             json!("https://cloud.amux.io/invite/livetokenlivetokenlivetoken00001")
         );
 
+        // A real browser reaches the TLS listener over HTTP/2. In that
+        // protocol there is no Host header: :authority and :scheme are
+        // surfaced on the request URI. This is the actual Tailscale shape,
+        // and the invite must remain usable from another node instead of
+        // silently falling back to http://localhost.
+        let (st, h2) = send(
+            &app,
+            "GET",
+            "https://desktop.tail5ce8f5.ts.net:8824/api/org/invites",
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{h2}");
+        assert_eq!(
+            h2[0]["url"],
+            json!("https://desktop.tail5ce8f5.ts.net:8824/invite/livetokenlivetokenlivetoken00001")
+        );
+
         // Default host/scheme when the headers are absent.
         let (_, inv2) = send(&app, "GET", "/api/org/invites", None, &[]).await;
         let url = inv2[0]["url"].as_str().unwrap();
         // Derived, not literal: the fallback follows this server's own port,
         // so hardcoding one here would pin the test to a deployment.
-        let want = format!("http://localhost:{}/invite/", crate::config::canonical_port());
+        let want = format!("https://localhost:{}/invite/", crate::config::canonical_port());
         assert!(url.starts_with(&want), "{url} should start with {want}");
     }
 
@@ -948,6 +996,18 @@ mod tests {
         assert_eq!(deleted, StatusCode::OK, "{body}");
         let (revoked, _, _) = raw_send(&app, "GET", "/api/org/members", "", &[("cookie", cookie)]).await;
         assert_eq!(revoked, StatusCode::UNAUTHORIZED);
+        // Revocation must survive a page reload. The stale HttpOnly cookie is
+        // still stored by the browser after its member row is deleted; the
+        // public shell must not treat the now-unverified request as an owner
+        // and bootstrap the owner's bearer into JavaScript.
+        let (shell_status, _, revoked_shell) =
+            raw_send(&app, "GET", "/", "", &[("cookie", cookie)]).await;
+        assert_eq!(shell_status, StatusCode::OK);
+        assert!(revoked_shell.contains("window._AMUX_AUTH_TOKEN=\"\""), "{revoked_shell}");
+        assert!(
+            !revoked_shell.contains("window._AMUX_AUTH_TOKEN=\"owner-token\""),
+            "{revoked_shell}"
+        );
         let (replay, _, _) = raw_send(&app, "GET", &format!("/invite/{token}"), "", &[]).await;
         assert_eq!(replay, StatusCode::GONE);
     }
