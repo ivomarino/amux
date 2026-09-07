@@ -440,26 +440,118 @@ pub(crate) fn scoped_setting_in(home: &std::path::Path, lane: &str, key: &str) -
     EnvFile::load(&home.join("amux.env")).get(key).and_then(nonempty)
 }
 
-/// Resolve `CC_SEND_ALLOW` while preserving an explicit empty value.
+/// The effective cross-group sender policy and the explanation shown beside it.
 ///
-/// The general scoped resolver deliberately treats empty as absent because
-/// most switches spell an override as `0`. Cross-worker reach predates that
-/// convention: its persisted opt-out is an empty allow-list. Once the product
-/// default became open, collapsing empty into absent made OFF reload as ON —
-/// exactly the resetting toggle the user observed. Same layer order as the
-/// launched shell and [`scoped_setting_in`], but presence and value stay two
-/// separate facts.
-pub(crate) fn cross_group_allow_setting_in(
+/// `CC_SEND_ALLOW` is an allow-list, not an ordinary scalar setting. Nonempty
+/// values therefore compose additively across global/group/worker layers; a
+/// lower nonempty list must not silently narrow an explicit global `*` grant.
+/// An explicit empty value is the one deny/reset operation. A still-more-
+/// specific nonempty value can reopen that lane, preserving ordinary scope
+/// precedence while making the deny visible instead of implied by omission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CrossGroupAllowResolution {
+    pub(crate) value: String,
+    pub(crate) source: String,
+    pub(crate) reason: String,
+    pub(crate) configured: bool,
+    pub(crate) explicit_deny: bool,
+    pub(crate) worker_defined: bool,
+}
+
+pub(crate) fn cross_group_allow_resolution_in(
     home: &std::path::Path,
     lane: &str,
-) -> Option<String> {
-    for path in scope_env_layers(home, lane).into_iter().rev() {
+) -> CrossGroupAllowResolution {
+    let worker_path = home.join("sessions").join(format!("{lane}.env"));
+    let mut values = std::collections::BTreeSet::<String>::new();
+    let mut sources = Vec::<String>::new();
+    let mut configured = false;
+    let mut explicit_deny = false;
+    let mut worker_defined = false;
+
+    for path in scope_env_layers(home, lane) {
         let cfg = EnvFile::load(&path);
-        if let Some(v) = cfg.get("CC_SEND_ALLOW") {
-            return Some(v.trim().trim_matches('"').to_string());
+        let Some(raw) = cfg.get("CC_SEND_ALLOW") else {
+            continue;
+        };
+        let source = if path == home.join("amux.env") {
+            "global".to_string()
+        } else if path == worker_path {
+            worker_defined = true;
+            "worker".to_string()
+        } else {
+            format!(
+                "group:{}",
+                path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown")
+            )
+        };
+        let layer: std::collections::BTreeSet<String> = raw
+            .trim()
+            .trim_matches('"')
+            .split(',')
+            .map(|token| token.trim().trim_matches('"').to_lowercase())
+            .filter(|token| !token.is_empty())
+            .collect();
+        configured = true;
+        if layer.is_empty() {
+            values.clear();
+            sources.clear();
+            sources.push(source);
+            explicit_deny = true;
+            continue;
         }
+        if explicit_deny {
+            values.clear();
+            sources.clear();
+        }
+        values.extend(layer);
+        if !sources.contains(&source) {
+            sources.push(source);
+        }
+        explicit_deny = false;
     }
-    None
+
+    if !configured {
+        return CrossGroupAllowResolution {
+            value: "*".into(),
+            source: "default".into(),
+            reason: "Open product default: no global, group, or worker CC_SEND_ALLOW is configured.".into(),
+            configured: false,
+            explicit_deny: false,
+            worker_defined: false,
+        };
+    }
+    let source = sources.join(" + ");
+    if explicit_deny {
+        return CrossGroupAllowResolution {
+            value: String::new(),
+            reason: format!("Explicit {source} deny: CC_SEND_ALLOW is empty."),
+            source,
+            configured,
+            explicit_deny: true,
+            worker_defined,
+        };
+    }
+    let value = if values.contains("*") {
+        "*".to_string()
+    } else {
+        values.into_iter().collect::<Vec<_>>().join(",")
+    };
+    let reason = if value == "*" {
+        format!(
+            "Allowed for every group by {source}; nonempty lower-level allow-lists are additive and cannot narrow an explicit * grant."
+        )
+    } else {
+        format!("Allowed groups composed from {source}: {value}.")
+    };
+    CrossGroupAllowResolution {
+        value,
+        source,
+        reason,
+        configured,
+        explicit_deny: false,
+        worker_defined,
+    }
 }
 
 fn provider_of(cfg: &EnvFile) -> String {
@@ -13690,16 +13782,17 @@ pub(crate) fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static
     if !og.is_disjoint(&tg) {
         return Ok("same-group");
     }
-    // RESOLVED WORKER > GROUP > GLOBAL, not read from the worker file alone
-    // (AMUX-4015). Both switches below are POLICY — a standing order about who
+    // RESOLVED FROM GLOBAL + GROUP + WORKER, not read from the worker file alone
+    // (AMUX-4015 / AMUX-4018). Both switches below are POLICY — a standing order about who
     // may talk to whom — and AMUX-2930 already established that policy read
     // through `parse_env` is the ethos-rule-1 shape: `/api/scope` advertises
     // `env` at all three levels and the Configurations tab writes all three, so a
     // group-level or global `CC_SEND_ALLOW` saved cleanly and changed nothing,
     // because this gate only ever consulted `sessions/<worker>.env`.
     //
-    // Using the same resolver `continuation_required` uses means a setting means
-    // the same thing to this gate as it does inside the lane's own shell.
+    // Unlike scalar env values, nonempty sender allow-lists compose. Empty is
+    // the explicit deny/reset at that layer. The effective source/reason is
+    // returned to the worker UI by the same resolver this gate uses.
     let home = crate::config::amux_home();
     let truthy = |v: Option<String>| {
         matches!(
@@ -13727,8 +13820,9 @@ pub(crate) fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static
     // explicit empty worker/group/global value remains the opt-out. Keeping
     // the policy in this one resolver means direct sends, board requests and
     // reviewer routing cannot acquire three different defaults.
-    let allow: Vec<String> = cross_group_allow_setting_in(&home, origin)
-        .unwrap_or_else(|| "*".into())
+    let resolution = cross_group_allow_resolution_in(&home, origin);
+    let allow: Vec<String> = resolution
+        .value
         .split(',')
         .map(|t| t.trim().trim_matches('"').to_lowercase())
         .filter(|t| !t.is_empty())
@@ -13739,16 +13833,26 @@ pub(crate) fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static
     let fmt = |g: &std::collections::BTreeSet<String>| {
         if g.is_empty() { "(untagged)".to_string() } else { g.iter().cloned().collect::<Vec<_>>().join(",") }
     };
+    tracing::warn!(
+        origin,
+        target,
+        policy_source = %resolution.source,
+        policy_value = %resolution.value,
+        explicit_deny = resolution.explicit_deny,
+        verdict = "cross_group_policy_refused",
+        "cross-group send refused by the resolved sender policy"
+    );
     Err(format!(
         "cross-group send refused: {origin} [{}] -> {target} [{}]. This worker has \
-         an explicit cross-group opt-out. To allow it STANDING (no per-message \
+         no standing allowance for the target. Effective policy: {} To allow it STANDING (no per-message \
          approval): clear that override so it inherits the open fleet default, \
          or set CC_SEND_ALLOW on {origin} \
          (comma-separated groups, or *), or CC_RECEIVE_ANY=1 on {target} if it is a \
          fleet-wide routing target. BOTH RESOLVE worker > group > global, so the \
          Configurations tab can set them for this one worker, for its whole group, or \
-         fleet-wide, and a worker-level value overrides a group or global one \
-         (AMUX-4015). For a ONE-OFF instead, this refusal mints a grant the owner \
+         fleet-wide. Nonempty allow-lists compose; an explicit empty more-specific \
+         value is the visible deny/reset (AMUX-4015 / AMUX-4018). For a ONE-OFF \
+         instead, this refusal mints a grant the owner \
          approves from the dashboard. A human send is never \
          restricted — this applies only to sends carrying a worker origin. For a \
          cross-group HANDOFF with a NEW finding, create the card in YOUR OWN lane and \
@@ -13760,7 +13864,7 @@ pub(crate) fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static
          <CARD> --stdin` notifies the owner at their next turn, and `amux board ask \
          <CARD>` requests a status update from them (AVE-36: a bare desc PATCH records \
          without notifying).",
-        fmt(&og), fmt(&tg)
+        fmt(&og), fmt(&tg), resolution.reason
     ))
 }
 
@@ -13793,7 +13897,7 @@ async fn get_cross_group_config() -> Response {
         // they had closed a door that is not there.
         "gate_enforcing": enforcing,
         "note": if enforcing {
-            "the gate is active; this default grants every worker a standing allowance"
+            "The gate is active. An explicit global grant composes with nonempty group/worker allow-lists; only an explicit empty lower-level value denies that scope."
         } else {
             "AMUX_GROUP_SEND_ENFORCE is off, so ALL cross-group sends pass regardless of this setting"
         },
@@ -17928,11 +18032,25 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
         // enforce rather than what was just typed — a group or global layer can
         // still grant this lane even when its own value is now empty, and
         // reporting "off" there would be a lie the next send disproves.
-        let effective = cross_group_allow_setting_in(&crate::config::amux_home(), name)
-            .unwrap_or_else(|| "*".into());
-        let effective = effective.trim().trim_matches('"').to_string();
+        let resolution = cross_group_allow_resolution_in(&crate::config::amux_home(), name);
+        let effective = resolution.value.clone();
+        let source = resolution.source.clone();
+        let reason = resolution.reason.clone();
+        let explicit_deny = resolution.explicit_deny;
+        let message = if effective.is_empty() {
+            format!("cross-group sends refused for this worker: {reason}")
+        } else if effective == "*" {
+            format!("this worker may send to any group: {reason}")
+        } else {
+            format!("this worker may send to {effective}: {reason}")
+        };
         tracing::info!(
-            session = %name, send_allow = %value, effective = %effective,
+            session = %name,
+            send_allow = %value,
+            effective = %effective,
+            policy_source = %source,
+            explicit_deny,
+            verdict = "cross_group_policy_persisted",
             "config: cross-group standing allowance set (CC_SEND_ALLOW)"
         );
         return j200(json!({
@@ -17940,17 +18058,12 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
             "spans_groups": !effective.is_empty(),
             "send_allow": value,
             "effective": effective,
+            "source": source,
+            "reason": reason,
+            "explicit_deny": explicit_deny,
             // Applies to the NEXT send, not at spawn: the gate resolves this on
             // every send rather than caching it at launch, so no restart.
-            "message": if effective.is_empty() {
-                "cross-group sends refused again for this worker".to_string()
-            } else if value.is_empty() {
-                format!("worker value cleared, but a group or global layer still grants: {effective}")
-            } else if effective == "*" {
-                "this worker may now send to any group, no approval needed".to_string()
-            } else {
-                format!("this worker may now send to: {effective}")
-            },
+            "message": message,
         }));
     }
 
@@ -18646,6 +18759,105 @@ mod tests {
             cross_group_send_ok("roamer", "target").expect("worker layer must grant"),
             "sender-allowlist"
         );
+    }
+
+    /// AMUX-4018: an explicit global grant is a standing allowance, not a
+    /// default that an old nonempty worker list may silently replace. Empty is
+    /// the sole deny/reset value and must remain visible in the resolution.
+    #[test]
+    fn cross_group_allow_lists_compose_while_empty_lower_layers_explicitly_deny() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        let groups = dir.path().join("env");
+        std::fs::create_dir_all(&sessions).expect("mkdir sessions");
+        std::fs::create_dir_all(&groups).expect("mkdir groups");
+        let worker = sessions.join("roamer.env");
+
+        std::fs::write(&worker, "CC_TAGS=customers\n").expect("write worker");
+        std::fs::write(sessions.join("target.env"), "CC_TAGS=amux\n").expect("write target");
+        let missing = cross_group_allow_resolution_in(dir.path(), "roamer");
+        assert_eq!(missing.value, "*", "a fresh fleet remains open");
+        assert_eq!(missing.source, "default");
+        assert!(!missing.configured);
+
+        // Legacy worker-only allow-lists still narrow the implicit default.
+        std::fs::write(&worker, "CC_TAGS=customers\nCC_SEND_ALLOW=ops\n").expect("write worker");
+        let legacy = cross_group_allow_resolution_in(dir.path(), "roamer");
+        assert_eq!(legacy.value, "ops");
+        assert_eq!(legacy.source, "worker");
+
+        // The live failure: explicit global `*` plus a nonempty worker list.
+        std::fs::write(dir.path().join("amux.env"), "CC_SEND_ALLOW=*\n").expect("write global");
+        let global = cross_group_allow_resolution_in(dir.path(), "roamer");
+        assert_eq!(global.value, "*", "worker allow-list must not narrow global grant");
+        assert_eq!(global.source, "global + worker");
+        assert!(global.reason.contains("additive"), "{}", global.reason);
+        assert!(global.worker_defined);
+        assert_eq!(
+            cross_group_send_ok("roamer", "target").expect("explicit global grant must reach gate"),
+            "sender-allowlist"
+        );
+
+        std::fs::write(groups.join("customers.env"), "CC_SEND_ALLOW=\n").expect("write group deny");
+        let group_deny = cross_group_allow_resolution_in(dir.path(), "roamer");
+        assert_eq!(
+            group_deny.value, "ops",
+            "a still-more-specific worker allow may reopen a group deny"
+        );
+        assert_eq!(group_deny.source, "worker");
+
+        std::fs::write(&worker, "CC_TAGS=customers\nCC_SEND_ALLOW=\n").expect("write worker deny");
+        let worker_deny = cross_group_allow_resolution_in(dir.path(), "roamer");
+        assert_eq!(worker_deny.value, "");
+        assert_eq!(worker_deny.source, "worker");
+        assert!(worker_deny.explicit_deny);
+        assert!(worker_deny.reason.contains("Explicit worker deny"));
+        assert!(cross_group_send_ok("roamer", "target").is_err());
+    }
+
+    #[tokio::test]
+    async fn fleet_cross_group_toggle_round_trips_the_persisted_global_layer() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        let decode = |response: Response| async move {
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json")
+        };
+
+        let saved = decode(
+            put_cross_group_config(
+                HeaderMap::new(),
+                Some(Json(json!({"allow": "*"}))),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(saved["enabled"], json!(true), "{saved}");
+        assert_eq!(
+            EnvFile::load(&dir.path().join("amux.env")).get("CC_SEND_ALLOW"),
+            Some("*"),
+            "the owner toggle must persist rather than merely echo"
+        );
+        let read = decode(get_cross_group_config().await).await;
+        assert_eq!(read["default_allow"], json!("*"), "{read}");
+        assert_eq!(read["enabled"], json!(true), "{read}");
+        assert!(read["note"].as_str().unwrap_or("").contains("explicit empty lower-level"));
+
+        let denied = decode(
+            put_cross_group_config(
+                HeaderMap::new(),
+                Some(Json(json!({"allow": ""}))),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(denied["enabled"], json!(false), "{denied}");
+        let reread = decode(get_cross_group_config().await).await;
+        assert_eq!(reread["default_allow"], json!(""), "{reread}");
+        assert_eq!(reread["enabled"], json!(false), "{reread}");
     }
 
     /// An ISOLATED target stays unreachable no matter how the SENDER is

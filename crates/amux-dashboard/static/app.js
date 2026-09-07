@@ -305,9 +305,9 @@ async function toggleAutofix(checked) {
 // dropping the server-resolved --model (passing `flags` at create would replace
 // it). Default OFF: skipping permission prompts is opt-in, per worker or globally.
 let _yoloDefault = false;
-// FLEET-WIDE cross-group default (AMUX-4018). Writes the GLOBAL env layer, which
-// `cross_group_send_ok` resolves at worker > group > global — so a per-worker
-// setting still wins and this is genuinely a default rather than an override.
+// FLEET-WIDE cross-group default (AMUX-4018). Writes the GLOBAL env layer.
+// Nonempty global/group/worker allow-lists compose; only a visible explicit
+// empty lower-level value denies. The worker row shows that effective source.
 //
 // No X-Amux-Session header: the server refuses this write from a worker origin,
 // because a session that could set it would be granting itself and every peer a
@@ -355,8 +355,10 @@ async function toggleCrossGroupDefault(checked) {
     }
     if (cb) cb.checked = !!saved.enabled;
     showToast(d.message || (checked ? 'Cross-group messaging on' : 'Cross-group messaging off'));
-    if (note && saved.gate_enforcing === false) {
-      note.textContent = 'Note: AMUX_GROUP_SEND_ENFORCE is off, so all cross-group sends pass regardless of this switch.';
+    if (note) {
+      note.textContent = saved.gate_enforcing === false
+        ? 'Note: AMUX_GROUP_SEND_ENFORCE is off, so all cross-group sends pass regardless of this switch.'
+        : (saved.note || 'An explicit empty group or worker setting can deny this for that scope.');
     }
   } catch (e) {
     rollback();
@@ -372,9 +374,11 @@ async function toggleCrossGroupDefault(checked) {
     // SAY IT OUT LOUD when the gate is not enforcing at all. Otherwise an
     // operator reads an OFF switch as a closed door that is not there.
     const note = document.getElementById('crossgroup-default-note');
-    if (note && d.gate_enforcing === false) {
-      note.textContent = 'AMUX_GROUP_SEND_ENFORCE is off, so ALL cross-group sends pass regardless of this switch.';
-      note.style.color = '#b8860b';
+    if (note) {
+      note.textContent = d.gate_enforcing === false
+        ? 'AMUX_GROUP_SEND_ENFORCE is off, so ALL cross-group sends pass regardless of this switch.'
+        : (d.note || 'An explicit empty group or worker setting can deny this for that scope.');
+      if (d.gate_enforcing === false) note.style.color = '#b8860b';
     }
   } catch (e) {}
 })();
@@ -5865,10 +5869,11 @@ async function togglePin(session) {
 // a ticked box it cannot untick here, and saying "(inherited)" is the difference
 // between a confusing control and an honest one.
 function _spansLabel(s) {
-  if (!s.spans_groups) return '';
+  const source = s.spans_groups_source || (s.spans_groups_own ? 'worker' : 'inherited');
+  if (!s.spans_groups) return ': refused (' + esc(source) + ' deny)';
   const v = s.spans_groups_value || '';
   const scope = v === '*' ? 'all' : v;
-  return s.spans_groups_own ? ': ' + esc(scope) : ': ' + esc(scope) + ' (inherited)';
+  return ': ' + esc(scope) + ' (' + esc(source) + ')';
 }
 
 // AUTO-DRAIN BACKLOG (AMUX-4055). Ethan: "the configuration needs to be a
@@ -5903,13 +5908,9 @@ async function toggleSpansGroups(session) {
   closeAllMenus();
   const s = sessions.find(x => x.name === session);
   const was = s ? !!s.spans_groups : false;
-  // Turning OFF only clears this worker's own value. If a group or global layer
-  // granted it, the server says so in its reply rather than reporting success
-  // for a change the next send would disprove.
-  if (was && s && !s.spans_groups_own) {
-    showToast('Granted by a group or global layer — turn it off in Configurations');
-    return;
-  }
+  // OFF writes the explicit empty worker deny. That is deliberately different
+  // from omission: it is the visible lower-level override that can narrow an
+  // inherited global/group grant. ON writes the worker's explicit `*` grant.
   const next = !was;
   if (s) { s.spans_groups = next; lastSessionsJSON = ''; render(); }
   const r = await apiCall(API + '/api/sessions/' + session + '/config', {
@@ -5917,7 +5918,19 @@ async function toggleSpansGroups(session) {
     body: JSON.stringify({ spans_groups: next })
   });
   if (!r && s) { s.spans_groups = was; lastSessionsJSON = ''; render(); }
-  else if (r) { showToast(r.message || (next ? 'Spans groups on' : 'Spans groups off')); }
+  else if (r) {
+    if (s) {
+      s.spans_groups = !!r.spans_groups;
+      s.spans_groups_value = r.effective || '';
+      s.spans_groups_source = r.source || 'worker';
+      s.spans_groups_reason = r.reason || '';
+      s.spans_groups_explicit_deny = !!r.explicit_deny;
+      s.spans_groups_own = true;
+      lastSessionsJSON = '';
+      render();
+    }
+    showToast(r.message || (next ? 'Spans groups on' : 'Spans groups off'));
+  }
   await fetchSessions();
 }
 
@@ -7019,7 +7032,7 @@ function _workerPrimaryConfigurationsHTML(name) {
   const permissions = [
     _workerConfigurationRow('yolo', 'Model tool approval bypass (YOLO)', s.yolo ? 'Enabled' : 'Disabled', 'Uses the selected provider’s native tool-permission flag.', sw(!!s.yolo, 'toggleYolo', 'Toggle model tool approval bypass')),
     _workerConfigurationRow('isolated', 'Isolated raw agent', s.isolated ? 'Enabled' : 'Disabled', 'No amux harness, hooks, MCP config, or peer discovery; restart to apply.', sw(!!s.isolated, 'toggleIsolated', 'Toggle isolated mode')),
-    _workerConfigurationRow('cross_group', 'Cross-group messaging', s.spans_groups_value || 'Refused', s.spans_groups_own ? 'Worker override.' : (s.spans_groups ? 'Inherited from a group/global layer.' : 'No standing allowance.'), edit('send_allow', s.spans_groups_own ? (s.spans_groups_value || '') : '')),
+    _workerConfigurationRow('cross_group', 'Cross-group messaging', s.spans_groups_value || 'Refused', s.spans_groups_reason || (s.spans_groups ? 'Standing allowance is active.' : 'No standing allowance.'), edit('send_allow', s.spans_groups_own ? (s.spans_groups_value || '') : '')),
     _workerConfigurationRow('external_email', 'Send external email without approval', s.external_email_allowed ? 'Allowed' : 'Approval required', s.external_email_allowed_own ? 'Worker override; applies immediately.' : 'Inherited/default; disabled by default.', _workerEmailPermissionControls(name, s)),
   ];
   const advanced = [
@@ -8998,7 +9011,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.821';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.822';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.

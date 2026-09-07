@@ -2744,6 +2744,10 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
         {
             status = "waiting".to_string();
         }
+        let cross_group = crate::api::session_verbs::cross_group_allow_resolution_in(
+            &crate::config::amux_home(),
+            &name,
+        );
         out.push(json!({
             "archived": archived,
             // Why a `waiting` lane is waiting, and proof a lane is genuinely
@@ -2894,21 +2898,19 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             // SPANS GROUPS (AMUX-4015 / AMUX-4016): may this worker send across
             // group boundaries with no per-message approval.
             //
-            // RESOLVED worker > group > global, because that is what the gate
-            // actually enforces. Reading the worker file alone would render the
-            // toggle OFF for a lane that a group or global layer already grants,
-            // which is a checkbox contradicting the behaviour it describes.
+            // Nonempty global/group/worker allow-lists compose; an explicit
+            // empty lower layer is the visible deny/reset. The gate and both
+            // worker config routes use this exact resolution object too.
             //
             // `_own` says whether the WORKER's own file sets it, so the UI can
             // tell "this worker" from "inherited" and can refuse to offer a
             // local switch-off for something it did not set locally.
-            "spans_groups": crate::api::session_verbs::cross_group_allow_setting_in(
-                &crate::config::amux_home(), &name,
-            ).map(|v| !v.trim().trim_matches('"').is_empty()).unwrap_or(true),
-            "spans_groups_value": crate::api::session_verbs::cross_group_allow_setting_in(
-                &crate::config::amux_home(), &name,
-            ).map(|v| v.trim().trim_matches('"').to_string()).unwrap_or_else(|| "*".into()),
-            "spans_groups_own": env.contains_key("CC_SEND_ALLOW"),
+            "spans_groups": !cross_group.value.is_empty(),
+            "spans_groups_value": cross_group.value,
+            "spans_groups_source": cross_group.source,
+            "spans_groups_reason": cross_group.reason,
+            "spans_groups_explicit_deny": cross_group.explicit_deny,
+            "spans_groups_own": cross_group.worker_defined,
             "steering_queue": [],
             "managed_by": "python",
         }));

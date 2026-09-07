@@ -1675,6 +1675,64 @@ mod tests {
         body["rev"].as_u64().unwrap()
     }
 
+    /// AMUX-4018: the modern id route and legacy name route are two spellings
+    /// of the same persisted worker policy. Both must return the effective
+    /// composed source/reason, not just echo the value they wrote.
+    #[tokio::test]
+    async fn both_worker_config_routes_persist_and_explain_cross_group_policy() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(home.path().join("amux.env"), "CC_SEND_ALLOW=*\n").unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (app, _db) = app();
+        let id = create(&app, "policy-worker").await;
+        std::fs::write(
+            home.path().join("sessions/policy-worker.env"),
+            "CC_TAGS=customers\n",
+        )
+        .unwrap();
+
+        let (status, _, denied) = send(
+            &app,
+            "PATCH",
+            &format!("/api/workers/{id}/config"),
+            Some(json!({"spans_groups": false})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{denied}");
+        assert_eq!(denied["spans_groups"], json!(false), "{denied}");
+        assert_eq!(denied["source"], json!("worker"), "{denied}");
+        assert_eq!(denied["explicit_deny"], json!(true), "{denied}");
+
+        std::fs::write(
+            home.path().join("sessions/legacy-policy-worker.env"),
+            "CC_TAGS=customers\n",
+        )
+        .unwrap();
+        let (status, _, allowed) = send(
+            &app,
+            "PATCH",
+            "/api/sessions/legacy-policy-worker/config",
+            Some(json!({"send_allow": "ops"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{allowed}");
+        assert_eq!(allowed["spans_groups"], json!(true), "{allowed}");
+        assert_eq!(allowed["effective"], json!("*"), "{allowed}");
+        assert_eq!(allowed["source"], json!("global + worker"), "{allowed}");
+        assert!(
+            allowed["reason"].as_str().unwrap_or("").contains("additive"),
+            "{allowed}"
+        );
+        assert_eq!(
+            crate::config::parse_env_file(&home.path().join("sessions/legacy-policy-worker.env"))
+                .get("CC_SEND_ALLOW")
+                .map(String::as_str),
+            Some("ops"),
+            "legacy route must persist into the same worker env file"
+        );
+    }
+
     // ---- RR-0034 test list ----------------------------------------------
 
     /// The UI contract for the shared catalog: the route is really mounted,

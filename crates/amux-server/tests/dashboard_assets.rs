@@ -389,6 +389,17 @@ fn cross_group_default_can_initialize_before_the_main_api_constant() {
         !early_boot.contains("fetch(API + '/api/config/cross-group'"),
         "referencing API before its declaration throws in the temporal dead zone and silently leaves the toggle off"
     );
+    for needle in [
+        "saved.note || 'An explicit empty group or worker setting can deny this for that scope.'",
+        "s.spans_groups_source",
+        "s.spans_groups_reason",
+        "refused (' + esc(source) + ' deny)",
+    ] {
+        assert!(
+            app.contains(needle),
+            "cross-group UI must expose the effective source/reason instead of contradicting enforcement: `{needle}`"
+        );
+    }
 }
 
 #[test]
