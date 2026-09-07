@@ -75,6 +75,45 @@ def main():
     # Mention, not invocation — the same class the heredoc pins above cover.
     A("add -A mentioned in a commit message", 'git commit -m "never git add -A here" -- f.txt', False)
 
+    # MC-1712 — `\b` AFTER A LITERAL WORD IS SATISFIED BY A HYPHEN, so the
+    # matcher reads `commit-tree` as `commit`. Reported by mixpeek-cicd, who hit
+    # it on the exact pattern CLAUDE.md recommends for this checkout: build a
+    # tree against a temp GIT_INDEX_FILE, then commit-tree, so you never cp into
+    # a worktree other lanes are using. They were told "bare `git commit` would
+    # sweep 47 file(s) of index-vs-HEAD DRIFT" about a command that reads
+    # neither the index nor the worktree and structurally cannot sweep anything.
+    #
+    # The documented escape did not fit either: AMUX_ALLOW_SWEEP_COMMIT=47
+    # asserts an intent to commit 47 files, which was false, so taking it would
+    # have put a wrong claim in the audit trail. They hand-built the commit
+    # object with `git hash-object -t commit -w --stdin` instead.
+    #
+    # Swept the sibling verbs rather than only the reported one: `add` and
+    # `fetch` have real hyphenated forms too.
+    # THE REPRODUCIBLE ONE, and it is not the rule the report named. `--all`
+    # makes it reach the `-a/--all` matcher, which refuses with "commits EVERY
+    # modified tracked file" about a command that reads the object database and
+    # never touches the index. Measured on the unfixed guard: rc=2.
+    # THE PRIMARY CELL: launch-videos' exact command. QUOTING is the variable
+    # that makes it reachable — the scrubber blanks quoted strings, so the tree
+    # operand disappears and _commit_has_pathspec stops exempting it, and the
+    # sweep verdict fires. Measured against HEAD's guard: rc=2 "would sweep",
+    # and rc=0 after. The UNQUOTED spelling never blocked, which is why the
+    # first report was not reproducible from what it recorded.
+    A("quoted commit-tree is not commit", 'git commit-tree "$tree" -p "$BASE" -F msg', False)
+    A("commit-graph --all is not commit --all", "git commit-graph write --all", False)
+    A("commit-tree --all is not commit --all", "git commit-tree $T -p $P --all", False)
+    # The plain forms did NOT block even before the fix, because
+    # _commit_has_pathspec reads their tree/subcommand operand as a pathspec and
+    # exempts them. Pinned so a later change to that helper cannot turn the
+    # accidental exemption into a refusal without saying so.
+    A("commit-tree plain", "git commit-tree $T -p $P", False)
+    A("commit-graph plain", "git commit-graph write --reachable", False)
+    A("fetch-pack is not fetch", "git fetch-pack --all origin", False)
+    A("add--interactive is not add", "git add--interactive --patch", False)
+    # ...and the real verbs must STILL block, or the fix is a hole rather than a fix.
+    A("plain commit -a still blocks", "git commit -a -m x", True)
+
     # quoted mentions (existing behavior, regression pins)
     A("quoted commit-msg mention", 'git commit -m "never git reset --hard again" -- f.txt', False)
     A("echo quoted amend mention", 'echo "recipe: git commit --amend needs a pin"', False)

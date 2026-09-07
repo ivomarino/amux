@@ -116,7 +116,7 @@ DANGER = [
     # in the one shared tree, sweeping up other sessions' unstaged edits into your
     # commit (wrong-attribution incidents). Bare `git commit` (no -a) is NOT blocked
     # here — too frequent to gate fleet-wide — but the fix is the same: name paths.
-    (r'\bgit\s+' + GIT_GLOBALS + r'commit\b[^\n;&|]*?(?:\s--all\b|\s-[a-zA-Z]*a[a-zA-Z]*(?=[\s;&|]|$))',
+    (r'\bgit\s+' + GIT_GLOBALS + r'commit(?![-\w])[^\n;&|]*?(?:\s--all\b|\s-[a-zA-Z]*a[a-zA-Z]*(?=[\s;&|]|$))',
      'git commit -a/--all — commits EVERY modified tracked file in this SHARED tree, '
      'sweeping up other sessions\' edits; commit only your paths: `git commit -m "msg" -- <your files>`'),
     # THE SHARED INDEX, staged half (AF-316). `git commit -a` is blocked above;
@@ -136,7 +136,7 @@ DANGER = [
     # TWO RULES, because one regex could not keep `-A -- <path>` legal.
     # `git add -A -- src/foo.rs` is SCOPED and must pass: the flag is bounded by
     # the pathspec. Only the unbounded forms are the hazard.
-    (r'\bgit\s+' + GIT_GLOBALS + r'add\b(?![^;&|\n]*\s--\s+\S)[^\n;&|]*?'
+    (r'\bgit\s+' + GIT_GLOBALS + r'add(?![-\w])(?![^;&|\n]*\s--\s+\S)[^\n;&|]*?'
      r'(?:\s-A\b|\s--all\b|\s--no-ignore-removal\b)',
      'git add -A/--all — stages EVERY modified file in this SHARED checkout, '
      'including other sessions\' in-flight edits, and leaves them staged for the '
@@ -146,7 +146,7 @@ DANGER = [
     # command as `git add .` and would otherwise read as "scoped" to the rule
     # above — the obvious next thing to type after being refused once.
     # `git add ./src/foo.rs` is a real path and is NOT matched.
-    (r'\bgit\s+' + GIT_GLOBALS + r'add\b[^\n;&|]*?\s(?:--\s+)?\.(?=[\s;&|]|$)',
+    (r'\bgit\s+' + GIT_GLOBALS + r'add(?![-\w])[^\n;&|]*?\s(?:--\s+)?\.(?=[\s;&|]|$)',
      'git add . — stages EVERY modified file under this directory in a SHARED '
      'checkout, including other sessions\' in-flight edits. Name your own paths: '
      '`git add <your files>` (AF-316)'),
@@ -184,7 +184,7 @@ DANGER = [
     #   * `--unshallow` and `--deepen` stay allowed — they are the remedy, and
     #     "deepen" does not contain "depth" so there is no overlap.
     #   * `[^;&|\n]*?` keeps the match inside one command, like the tuples above.
-    (r'\bgit\s+' + GIT_GLOBALS + r'(?:fetch|pull)\b[^;&|\n]*?\s(?:--depth[=\s]|--shallow-since\b|--shallow-exclude\b)',
+    (r'\bgit\s+' + GIT_GLOBALS + r'(?:fetch|pull)(?![-\w])[^;&|\n]*?\s(?:--depth[=\s]|--shallow-since\b|--shallow-exclude\b)',
      "git fetch/pull --depth (or --shallow-since/--shallow-exclude) — truncates history in "
      "this SHARED checkout, and every `merge-base --is-ancestor` past the cut then returns a "
      "bare exit 1 with no error, which is indistinguishable from a real 'not an ancestor'",
@@ -623,7 +623,7 @@ def _commit_has_pathspec(scrubbed):
     which is precisely what a drift-sweep is not. Two spellings count — an
     explicit `--` separator, and trailing bare operands after the flags.
     """
-    m = re.search(r'\bgit\s+' + GIT_GLOBALS + r'commit\b([^\n;&|]*)', scrubbed)
+    m = re.search(r'\bgit\s+' + GIT_GLOBALS + r'commit(?![-\w])([^\n;&|]*)', scrubbed)
     if not m:
         return False
     rest = m.group(1)
@@ -676,9 +676,9 @@ def _sweep_commit_verdict(cmd, scrubbed, run_dir):
     and this never fires. That is correct: the failure needs a lagging HEAD.
 
     Returns None to allow, or a block-reason string."""
-    if not re.search(r'\bgit\s+' + GIT_GLOBALS + r'commit\b', scrubbed):
+    if not re.search(r'\bgit\s+' + GIT_GLOBALS + r'commit(?![-\w])', scrubbed):
         return None
-    if re.search(r'\bgit\s+' + GIT_GLOBALS + r'commit\b[^\n;&|]*--amend\b', scrubbed):
+    if re.search(r'\bgit\s+' + GIT_GLOBALS + r'commit(?![-\w])[^\n;&|]*--amend\b', scrubbed):
         return None   # amend has its own verdict, with its own pin
     if _commit_has_pathspec(scrubbed):
         return None
@@ -763,7 +763,7 @@ def _amend_verdict(cmd, scrubbed, run_dir):
     compare-and-amend to build it from. Do not restore the "kills the race"
     wording.
     Returns None to allow, or a block-reason string."""
-    if not re.search(r'\bgit\s+' + GIT_GLOBALS + r'commit\b[^\n;&|]*--amend\b', scrubbed):
+    if not re.search(r'\bgit\s+' + GIT_GLOBALS + r'commit(?![-\w])[^\n;&|]*--amend\b', scrubbed):
         return None
     import subprocess
     def _git(*args):
