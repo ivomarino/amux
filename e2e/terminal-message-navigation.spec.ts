@@ -18,7 +18,7 @@ test('separate Codex/Claude blocks, multiline origin matching, and late scoped h
   const result = await page.evaluate(() => {
     const w = window as any;
     const body = document.getElementById('peek-body')!;
-    const raw = '\x1b[34m› Review the first paragraph and verify the implementation\n  with a second line.\n\n  Keep this paragraph together.\n❯ [amux-origin:backend] inspect the build\n› standalone request\nAssistant reply\n❯ \n❯ 1. Yes';
+    const raw = '\x1b[34m› Review the first paragraph and verify the implementation\n  with a second line.\n\n  Keep this paragraph together.\n❯ [amux-origin:backend] inspect the build\n› standalone request\nAssistant reply\n❯ \n❯ 1. Yes\n› Ask Codex to do anything\n\n  gpt-6-astra xhigh · ~/Dev/amux';
     body.innerHTML = w._peekHtml(raw);
     const before = [...body.querySelectorAll('.peek-prompt')].map(el => (el as HTMLElement).dataset.msgKind);
     eval("_peekMsgRows = [{session:'nav-probe',type:'direct',text:'Review the first paragraph and verify the implementation with a second line. Keep this paragraph together.'}, {session:'other-worker',type:'direct',text:'standalone request'}]");
@@ -69,6 +69,11 @@ test('header arrows land at the start of a long message and hold through refresh
 });
 
 test('search navigation shares real matches and reports an empty filter', async ({ page }) => {
+  const positions = await page.locator('#peek-search-wrap').evaluate(el => {
+    const input = el.querySelector('input')!.getBoundingClientRect();
+    return [...el.querySelectorAll('.peek-nav-btn')].map(button => ({left: button.getBoundingClientRect().left - input.left, width: input.width}));
+  });
+  for (const position of positions) expect(position.left).toBeGreaterThan(position.width - 65);
   const beacons: any[] = [];
   await page.route('**/api/client-debug', async route => {
     beacons.push(route.request().postDataJSON());

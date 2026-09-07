@@ -1940,8 +1940,8 @@
   .peek-find-wrap .search-input { padding-right: 120px; min-width: 120px; }
   .peek-find-count { position: absolute; right: 60px; font-size: 0.65rem; color: var(--dim); white-space: nowrap; pointer-events: none; }
   .peek-nav-btn { width: 22px; height: 22px; border: none; background: transparent; color: var(--dim); cursor: pointer; font-size: 0.75rem; display: flex; align-items: center; justify-content: center; position: absolute; }
-  .peek-nav-btn:first-of-type { right: 36px; }
-  .peek-nav-btn:last-of-type { right: 16px; }
+  .peek-find-wrap .peek-nav-btn[onclick="peekSearchPrev()"] { right: 36px; }
+  .peek-find-wrap .peek-nav-btn[onclick="peekSearchNext()"] { right: 16px; }
   .peek-nav-btn:hover { color: var(--text); }
   .peek-find-wrap .search-clear { position: absolute; right: 2px; }
   .peek-find-wrap.has-value .search-clear { display: flex; }

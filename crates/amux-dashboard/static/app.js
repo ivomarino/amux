@@ -8998,7 +8998,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.819';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.820';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -10384,6 +10384,7 @@ function highlightPrompts(html) {
     let end = i + 1;
     while (end < lines.length) {
       if (/^[ \t]{0,2}[❯›](?:[ \t]+|$)/.test(plain[end])) break;
+      if (/^\s*(?:gpt-[\w.-]+|o[1-9][\w.-]*)\s.*(?:·|context left)/i.test(plain[end])) break;
       if (/^[ \t]{2,}\S/.test(plain[end]) && !/^\s*[│┃⏵]/.test(plain[end])) { end++; continue; }
       // Paragraph breaks belong to a message only when followed by another
       // indented paragraph, not by assistant output or terminal chrome.
