@@ -3550,3 +3550,14 @@ CARD: AMUX-4179
 SYMPTOM: The first live graph check read 57,937,366 bytes for 13,381 tasks because structural validation and full descriptions/evidence shared one export response.
 COST: Every routine CLI check transferred and parsed 58 MB; the loopback export alone took 0.576 seconds.
 FIX: Add /api/graph/board/verify using the same structural verifier as the periodic monitor; CLI summaries/checks use it, while --json retains the reproducible full audit export. Invalid checks emit task_graph_invalid with projection=validation; unmeasured reads emit task_graph_unmeasured. Regression compares both projections and proves a 2 MB task body cannot inflate the preflight response.
+
+## A provider-failed subagent stayed live forever after its stop hook vanished
+AREA: status
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: social-activities showed WORKING + AGENTS twelve hours after its Sonnet turn returned to the prompt. The durable lifecycle set still contained agent add9b6f920fb9ef31 because SubagentStart arrived, the agent immediately failed on HTTP 429, and no SubagentStop hook followed. Its provider-owned parent transcript already contained a newer structured task notification with status=failed, but status derivation never reconciled that terminal fact.
+COST: An idle lane looked actively occupied, its board state contradicted the visible prompt, and the stale child survived reports and server restarts with no age-based bound.
+FIX: Reconcile only provider-owned structured terminal task notifications newer than the stored per-agent start edge, through the same durable ordering/tombstone path as a real stop. Run it immediately at an idle report and from the periodic sweep for already-leaked rows; malformed, missing, stale, quoted, and still-live evidence fails open for the model. Emit subagent_lifecycle WARN verdict terminal_transcript_reconciled with the session, agent id, provider status, event timestamp, and resulting count.

@@ -11468,6 +11468,10 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
     // lane's background agents are live, or a lane reads `active` on the
     // fleet list and `stuck` here in the same breath.
     let sub_activity = crate::api::sessions_legacy::scan_subagent_activity();
+    // Only lanes with an explicitly positive durable lifecycle set pay for a
+    // transcript read. This periodic arm heals an already-leaked edge even if
+    // the worker never emits another hook after a provider-side failure.
+    let lifecycle_reconcile = stored_live_subagent_lanes(state);
     for e in entries.flatten() {
         let path = e.path();
         if path.extension().and_then(|x| x.to_str()) != Some("env") {
@@ -11486,6 +11490,9 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
         }
         if !is_running(name).await {
             continue;
+        }
+        if lifecycle_reconcile.contains(name) {
+            let _ = reconcile_terminal_subagents(state, name).await;
         }
         let pane = tmux_capture(name, 30).await;
 
@@ -15778,6 +15785,194 @@ fn apply_subagent_event(
     }
 }
 
+/// A provider-owned terminal notification that can close one missing
+/// SubagentStop edge. The notification timestamp is compared with the stored
+/// start edge before it is applied, so an old completion can never cancel a
+/// later resume of the same agent id.
+#[derive(Clone, Debug, PartialEq)]
+struct TranscriptTerminalAgent {
+    agent_id: String,
+    status: String,
+    event_ts: f64,
+}
+
+/// Extract terminal agent edges only from Claude's structured queue records.
+///
+/// Deliberately do not scan arbitrary content for words such as "finished" or
+/// `<task-notification>`: prompts routinely quote both while debugging hooks.
+/// `type=queue-operation` + `operation=enqueue` is provider-owned framing, and
+/// the exact XML envelope inside it is the durable terminal boundary written
+/// when an agent completes, fails, or is cancelled.
+fn transcript_terminal_agents(
+    records: &[Value],
+    live_edges: &serde_json::Map<String, Value>,
+) -> Vec<TranscriptTerminalAgent> {
+    let notification = cached_re!(
+        r"(?s)^<task-notification>\s*.*?<task-id>\s*([^<\r\n]{1,128})\s*</task-id>.*?<status>\s*(completed|failed|cancelled|canceled|stopped)\s*</status>.*?</task-notification>\s*$"
+    );
+    let mut latest: BTreeMap<String, TranscriptTerminalAgent> = BTreeMap::new();
+    for record in records {
+        if record["type"].as_str() != Some("queue-operation")
+            || record["operation"].as_str() != Some("enqueue")
+        {
+            continue;
+        }
+        let Some(content) = record["content"].as_str() else { continue };
+        let Some(caps) = notification.captures(content.trim()) else { continue };
+        let agent_id = caps.get(1).map(|m| m.as_str().trim()).unwrap_or_default();
+        let status = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
+        let Some(start_ts) = live_edges
+            .get(agent_id)
+            .filter(|edge| edge["state"].as_str() == Some("live"))
+            .and_then(|edge| edge["ts"].as_f64())
+        else {
+            continue;
+        };
+        let Some(event_ts) = record["timestamp"]
+            .as_str()
+            .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+            .map(|stamp| stamp.timestamp_millis() as f64 / 1000.0)
+        else {
+            continue;
+        };
+        if event_ts < start_ts {
+            continue;
+        }
+        let terminal = TranscriptTerminalAgent {
+            agent_id: agent_id.to_string(),
+            status: status.to_string(),
+            event_ts,
+        };
+        let replace = latest
+            .get(agent_id)
+            .is_none_or(|previous| terminal.event_ts > previous.event_ts);
+        if replace {
+            latest.insert(agent_id.to_string(), terminal);
+        }
+    }
+    latest.into_values().collect()
+}
+
+fn lifecycle_transcript_path(name: &str, lifecycle_session: &str) -> Option<PathBuf> {
+    if !cached_re!(r"^[0-9a-fA-F-]{36}$").is_match(lifecycle_session) {
+        return None;
+    }
+    let wd = work_dir_of(&parse_env(name));
+    let path = claude_home()
+        .join("projects")
+        .join(project_name(&wd))
+        .join(format!("{lifecycle_session}.jsonl"));
+    path.exists().then_some(path)
+}
+
+fn stored_live_subagent_lanes(state: &AppState) -> std::collections::HashSet<String> {
+    state
+        .store
+        .read()
+        .ok()
+        .and_then(|conn| {
+            conn.query_row("SELECT value FROM prefs WHERE key='session_reports'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .ok()
+        })
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|reports| reports.as_object().cloned())
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, report)| {
+            (report["subagents"]["count"].as_i64().unwrap_or(0) > 0).then_some(name)
+        })
+        .collect()
+}
+
+/// Heal a lifecycle start whose matching stop was lost because the provider
+/// failed before emitting SubagentStop or the hook process disappeared.
+///
+/// This is evidence-based, never age-based: unreadable/missing/malformed
+/// transcripts leave the model marked active. Applying the synthetic terminal
+/// edge still goes through the same per-agent ordering and tombstones as a real
+/// hook, so a concurrent newer start wins and duplicate sweeps are idempotent.
+async fn reconcile_terminal_subagents(state: &AppState, name: &str) -> usize {
+    let stored = state
+        .store
+        .read()
+        .ok()
+        .and_then(|conn| {
+            conn.query_row("SELECT value FROM prefs WHERE key='session_reports'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .ok()
+        })
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .map(|reports| reports[name]["subagents"].clone())
+        .unwrap_or(Value::Null);
+    if stored["count"].as_i64().unwrap_or(0) <= 0 {
+        return 0;
+    }
+    let Some(session_id) = stored["session_id"].as_str().filter(|id| !id.is_empty()) else {
+        return 0;
+    };
+    let Some(path) = lifecycle_transcript_path(name, session_id) else { return 0 };
+    let Some(edges) = stored["agent_edges"].as_object() else { return 0 };
+    // Bounded like the existing transcript readers. If the terminal record is
+    // outside this tail we preserve ACTIVE; absence is not evidence of done.
+    let records = iter_jsonl_tail(&path, 32_000_000);
+    let terminal = transcript_terminal_agents(&records, edges);
+    let mut reconciled = 0usize;
+    for edge in terminal {
+        let event_id = format!(
+            "transcript-terminal:{session_id}:{}:{}:{}",
+            edge.agent_id,
+            (edge.event_ts * 1000.0).round() as i64,
+            edge.status
+        );
+        let response = subagent_event_post(
+            state,
+            name,
+            "done",
+            &json!({
+                "agent_id": edge.agent_id,
+                "event_id": event_id,
+                "event_ts": edge.event_ts,
+                "session_id": session_id,
+            }),
+        )
+        .await;
+        let status_code = response.status();
+        let payload = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .unwrap_or(Value::Null);
+        let verdict = payload["verdict"].as_str().unwrap_or("write_failed");
+        if status_code == StatusCode::OK && verdict == "applied" {
+            reconciled += 1;
+            tracing::warn!(
+                target: "subagent_lifecycle",
+                session = name,
+                agent_id = %edge.agent_id,
+                provider_status = %edge.status,
+                event_ts = edge.event_ts,
+                count = payload["count"].as_i64().unwrap_or(-1),
+                verdict = "terminal_transcript_reconciled",
+                "provider terminal notification healed a missing subagent stop edge"
+            );
+        } else if status_code != StatusCode::OK {
+            tracing::warn!(
+                target: "subagent_lifecycle",
+                session = name,
+                agent_id = %edge.agent_id,
+                provider_status = %edge.status,
+                http_status = %status_code,
+                verdict,
+                "provider terminal notification could not reconcile a subagent edge"
+            );
+        }
+    }
+    reconciled
+}
+
 /// AMUX-3048/ATE-45: durably apply an ordered, idempotent lifecycle event.
 async fn subagent_event_post(state: &AppState, name: &str, ev: &str, body: &Value) -> Response {
     if !matches!(ev, "start" | "stop" | "done" | "reset") {
@@ -16018,6 +16213,13 @@ pub(crate) async fn report_post(state: &AppState, name: &str, headers: &HeaderMa
             StatusCode::BAD_REQUEST,
             json!({"error": format!("state must be one of active|idle|waiting|error (got '{st_raw}')")}),
         );
+    }
+    // A normal Stop report is the prompt terminal edge. Reconcile a provider
+    // task-notification before preserving `subagents` below so a child that
+    // failed without firing SubagentStop cannot hold the lane active until the
+    // periodic sweep. Unknown or still-live children remain untouched.
+    if st == "idle" {
+        let _ = reconcile_terminal_subagents(state, name).await;
     }
     let src: String = {
         let s = body_str(body, "source");
@@ -22847,6 +23049,106 @@ mod steer_boundary_tests {
             stored["primis"]["subagents"]["seen_events"].as_array().unwrap().len()
                 <= SUBAGENT_EVENT_HISTORY_LIMIT,
             "server-side delivery dedupe must remain bounded"
+        );
+    }
+
+    #[test]
+    fn structured_terminal_notifications_heal_only_the_matching_newer_agent_edges() {
+        fn edge(ts: f64) -> Value {
+            json!({"state":"live","ts":ts})
+        }
+        fn notification(id: &str, status: &str, stamp: &str) -> Value {
+            json!({
+                "type":"queue-operation",
+                "operation":"enqueue",
+                "timestamp":stamp,
+                "content":format!(
+                    "<task-notification>\n<task-id>{id}</task-id>\n<status>{status}</status>\n</task-notification>"
+                )
+            })
+        }
+
+        let mut live = serde_json::Map::new();
+        live.insert("failed-agent".into(), edge(100.0));
+        live.insert("still-live".into(), edge(100.0));
+        live.insert("resumed-agent".into(), edge(300.0));
+        let records = vec![
+            notification("failed-agent", "failed", "1970-01-01T00:02:00Z"),
+            // Duplicate provider delivery is idempotent: the latest terminal
+            // record for one id produces one synthetic edge.
+            notification("failed-agent", "failed", "1970-01-01T00:02:01Z"),
+            // This completion predates the stored resume edge and must not
+            // cancel the newer run of the same id.
+            notification("resumed-agent", "completed", "1970-01-01T00:03:20Z"),
+            // A live/non-terminal provider status is not evidence of done.
+            notification("still-live", "running", "1970-01-01T00:06:40Z"),
+            // Quoted provider-looking prose in a human prompt is inert even
+            // when it contains a complete terminal envelope.
+            json!({
+                "type":"user",
+                "timestamp":"1970-01-01T00:06:40Z",
+                "content":"<task-notification><task-id>still-live</task-id><status>failed</status></task-notification>"
+            }),
+            // Malformed provider rows fail open for the model.
+            json!({
+                "type":"queue-operation", "operation":"enqueue",
+                "timestamp":"not-a-time",
+                "content":"<task-notification><task-id>still-live</task-id><status>failed</status>"
+            }),
+        ];
+
+        let got = transcript_terminal_agents(&records, &live);
+        assert_eq!(got.len(), 1, "only one live edge has newer terminal proof: {got:?}");
+        assert_eq!(got[0].agent_id, "failed-agent");
+        assert_eq!(got[0].status, "failed");
+        assert_eq!(got[0].event_ts, 121.0, "the duplicate folds to its newest timestamp");
+
+        let previous = json!({
+            "count":1,
+            "live_ids":["failed-agent"],
+            "anonymous":0,
+            "seen_events":[],
+            "agent_edges":{"failed-agent":edge(100.0)},
+            "session_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        });
+        let healed = apply_subagent_event(
+            &previous,
+            "done",
+            &got[0].agent_id,
+            "transcript-terminal:test",
+            got[0].event_ts,
+            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            500.0,
+        );
+        assert_eq!(healed.verdict, "applied");
+        assert_eq!(healed.count, 0, "the final proven terminal edge returns the lane to idle");
+        assert!(healed.live_ids.is_empty());
+    }
+
+    #[test]
+    fn terminal_notification_statuses_are_provider_structural_not_model_named() {
+        let mut live = serde_json::Map::new();
+        for id in ["one", "two", "three", "four"] {
+            live.insert(id.into(), json!({"state":"live","ts":1.0}));
+        }
+        let records: Vec<Value> = [
+            ("one", "completed"),
+            ("two", "cancelled"),
+            ("three", "canceled"),
+            ("four", "stopped"),
+        ]
+        .into_iter()
+        .map(|(id, status)| json!({
+            "type":"queue-operation", "operation":"enqueue",
+            "timestamp":"1970-01-01T00:00:02Z",
+            "content":format!("<task-notification><task-id>{id}</task-id><status>{status}</status></task-notification>")
+        }))
+        .collect();
+        let got = transcript_terminal_agents(&records, &live);
+        assert_eq!(
+            got.iter().map(|edge| edge.agent_id.as_str()).collect::<Vec<_>>(),
+            ["four", "one", "three", "two"],
+            "classification uses provider-owned lifecycle structure, never a model allowlist"
         );
     }
 
