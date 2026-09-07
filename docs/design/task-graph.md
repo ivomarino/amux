@@ -77,6 +77,35 @@ workflow columns, gates, ownership, waits and WIP still determine runtime
 readiness through the existing ready frontier and claim API. Completing a
 prerequisite and satisfying a verification gate remain distinct actions.
 
+## Verified dependency handoff
+
+`amux board request <producer> <title> --for <original-task>` creates a real
+dependency and arms a durable return callback by default. The original task
+releases its doing slot and stays queued while the prerequisite is unresolved.
+Code, ops, blocker and tripwire dependencies require Verified; types whose
+workflow ends at Done resolve there. Missing, deleted and discarded prerequisites
+are not successful delivery. If the result is no longer required, explicitly
+remove or replace the relationship rather than claiming it was verified.
+
+Claims, the ready frontier, backlog promotion and completion callbacks use the
+same resolution predicate. A callback names the producer, prerequisite, original
+task, recorded outcome, next action and any remaining blockers. When the return
+task is unique, the Messages row links to that original task. Both cards retain
+the indicator in their histories. The dependency edge remains after resolution
+as provenance, and no longer blocks execution.
+
+The callback uses the existing persistent steering outbox and stable
+`task-callback-<dependency-id>` delivery key. Restart recovery cannot duplicate
+the indicator. Delivery occurs at the receiving worker's next available turn
+boundary; it cannot interrupt an in-flight tool. A reopened dependency with an
+undispatched callback is held for verification again. Discard sends a failure
+indicator, with remaining blockers explicitly named. Isolated workers keep their
+existing delivery restriction, which is recorded as a visible refusal.
+
+Sweep signals: `dependency_waiting_for_verification`,
+`dependency_callback_linked`, `dependency_callback_not_resolved`,
+`dependency_callback_graph_unmeasured`, and `dependency_resolution_unmeasured`.
+
 Dependency writes check reachability back to the edited task inside the writer
 transaction. An unrelated old cycle cannot mask a newly introduced cycle or
 block an unrelated valid edit. Parent writes independently reject cyclic

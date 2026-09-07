@@ -1818,7 +1818,9 @@ impl IssueRow {
             "callback": self.callback_session.as_ref().map(|session| serde_json::json!({
                 "session": session,
                 "prompt": self.callback_prompt,
-                "trigger": "terminal",
+                "trigger": "dependency_resolution",
+                "resolution_status": if amux_core::board::verified_is_meaningful(core_item_type(&self.item_type)) { "verified" } else { "done" },
+                "dependency_resolved": dependency_is_resolved(&self.status, &self.item_type),
                 "state": self.callback_state,
                 "message_id": self.callback_message_id,
                 "fired_at": self.callback_fired_at,
@@ -2760,6 +2762,25 @@ pub fn is_terminal_status(s: &str) -> bool {
     TERMINAL_STATUSES.contains(&s)
 }
 
+/// A completed dependency must satisfy its type's real completion boundary.
+/// Code/ops/blockers need verification; docs and chores finish at done. Missing
+/// and discarded tasks are not proof that a required dependency was resolved.
+/// Readiness, promotion and completion callbacks share this predicate.
+pub fn dependency_is_resolved(status: &str, item_type: &str) -> bool {
+    matches!(parse_status(status), Some(TaskStatus::Verified))
+        || (matches!(parse_status(status), Some(TaskStatus::Done))
+            && !amux_core::board::verified_is_meaningful(core_item_type(item_type)))
+}
+
+pub fn dependency_resolved(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
+    let state = conn.query_row(
+        "SELECT status, type FROM issues WHERE id=?1 AND deleted IS NULL",
+        [id],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default())),
+    ).optional()?;
+    Ok(state.is_some_and(|(status, item_type)| dependency_is_resolved(&status, &item_type)))
+}
+
 /// Keep the durable terminal outcome compact enough for the board list/detail
 /// payload while leaving the complete evidence and append-only log untouched.
 /// This is deliberately mechanical: the board records what was written, it
@@ -2951,15 +2972,19 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
         ));
         terminal_summary_assets = asset_count;
     }
-    if previous_status
-        .as_deref()
-        .is_some_and(|s| !is_terminal_status(s))
-        && is_terminal_status(&row.status)
-        && row.callback_session.as_deref().is_some_and(|s| !s.trim().is_empty())
+    if row.callback_session.as_deref().is_some_and(|s| !s.trim().is_empty())
         && row.callback_state.as_deref() == Some("armed")
     {
-        row.callback_state = Some("pending".into());
-        row.callback_error = None;
+        if dependency_is_resolved(&row.status, &row.item_type) || row.status == "discarded" {
+            // Done -> verified is an edge between two closed statuses. Checking
+            // only non-terminal -> terminal silently lost this completion.
+            row.callback_state = Some("pending".into());
+            row.callback_error = None;
+        } else if row.status == "done" && previous_status.as_deref() != Some("done") {
+            tracing::info!(task_id = %row.id, item_type = %row.item_type,
+                marker = "dependency_waiting_for_verification", measured = true, n_considered = 1,
+                "completion callback held until the dependency is verified");
+        }
     }
     let changed = conn.execute(
         "UPDATE issues SET title = ?1, \"desc\" = ?2, status = ?3, session = ?4, due = ?5, \
@@ -3755,45 +3780,27 @@ mod tests {
             "a card with no dependencies must never be blocked"
         );
 
-        // Close the blocker -> the dependent becomes ready in the same tick.
+        // Done is implementation completion, not verified dependency success.
         blocker.status = "done".into();
         blocker.updated = 2000;
         save_patched(&conn, &mut blocker).expect("close blocker");
-        assert!(
-            crate::runtime_jobs::board_drive::deps_blocking(&conn, &dependent).is_empty(),
-            "closing the blocker must free the dependent immediately"
-        );
+        assert_eq!(crate::runtime_jobs::board_drive::deps_blocking(&conn, &dependent), vec![blocker.id.clone()]);
+        blocker.status = "verified".into();
+        save_patched(&conn, &mut blocker).expect("verify blocker");
+        assert!(crate::runtime_jobs::board_drive::deps_blocking(&conn, &dependent).is_empty());
 
-        // A DEPENDENCY THAT RESOLVES TO NOTHING MUST NOT BLOCK, and this arm
-        // was NOT covered until a mutant said so. `None => true` survived the
-        // control above, because a card with an EMPTY depends_on never enters
-        // the filter at all -- so "a card with no dependencies is unblocked"
-        // is true whatever the None arm does. Two different things were both
-        // called "no dependency".
-        //
-        // The behaviour is the function's own documented rule: an id that
-        // resolves to nothing cannot be worked, and treating it as a blocker
-        // parks the holder forever.
+        // A missing or discarded required artifact is not successful delivery.
+        // The owner can explicitly remove a no-longer-required relationship.
         dependent.depends_on = vec!["AMUX-DOES-NOT-EXIST".into()];
-        save_patched(&conn, &mut dependent).expect("save phantom dep");
-        assert!(
-            crate::runtime_jobs::board_drive::deps_blocking(&conn, &dependent).is_empty(),
-            "a dependency on a card that does not exist must not park the holder forever"
-        );
-
-        // A DISCARDED blocker frees it too. Discard is a judgement, not a pause,
-        // and treating it as still-blocking parks the dependent forever.
-        let mut b2 = create_issue(&conn, &new_card("todo"), 1000).expect("b2");
-        dependent.depends_on = vec![b2.id.clone()];
-        save_patched(&conn, &mut dependent).expect("save deps 2");
-        assert!(!crate::runtime_jobs::board_drive::deps_blocking(&conn, &dependent).is_empty());
-        b2.status = "discarded".into();
-        b2.updated = 3000;
-        save_patched(&conn, &mut b2).expect("discard b2");
-        assert!(
-            crate::runtime_jobs::board_drive::deps_blocking(&conn, &dependent).is_empty(),
-            "a discarded blocker is resolved, not pending"
-        );
+        save_patched(&conn, &mut dependent).unwrap();
+        assert_eq!(crate::runtime_jobs::board_drive::deps_blocking(&conn, &dependent), dependent.depends_on);
+        blocker.status = "discarded".into();
+        save_patched(&conn, &mut blocker).unwrap();
+        dependent.depends_on = vec![blocker.id.clone()];
+        assert_eq!(crate::runtime_jobs::board_drive::deps_blocking(&conn, &dependent), dependent.depends_on);
+        dependent.depends_on.clear();
+        save_patched(&conn, &mut dependent).unwrap();
+        assert!(crate::runtime_jobs::board_drive::deps_blocking(&conn, &dependent).is_empty());
     }
 
     /// AMUX-3947. entered_state_at records the TRANSITION, and an ordinary edit
@@ -4094,6 +4101,7 @@ mod tests {
     fn terminal_transition_arms_one_durable_peer_callback() {
         let conn = create_db();
         let mut new = new_card("todo");
+        new.item_type = "chore".into();
         new.requested_by = Some("requester".into());
         new.callback_session = Some("requester".into());
         new.callback_prompt = Some("Start the dependent release card.".into());
