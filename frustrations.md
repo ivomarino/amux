@@ -3533,3 +3533,14 @@ CARD: AMUX-4018
 SYMPTOM: Global Settings showed “Workers may message across groups” ON and the global env persisted CC_SEND_ALLOW=*, but amux-frustrations → amux-testing-e2e still entered per-message approval because the resolver returned the sender worker’s nonempty legacy allow-list and ignored the explicit global grant.
 COST: The visible fleet policy contradicted enforcement, ordinary peer handoffs stalled, and neither the refusal nor worker UI identified which layer actually decided the result.
 FIX: Resolve CC_SEND_ALLOW as a layered allow-list: nonempty explicit global/group/worker values compose additively, while an explicit empty more-specific value is the visible deny/reset. Enforcement, both worker config routes, the worker list, and the UI share the resulting value/source/reason. Emit cross_group_policy_refused and cross_group_policy_persisted verdicts with the effective source.
+
+## An empty composer control was recorded as a confirmed message and failed silently
+AREA: browser
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux-testing-e2e
+CARD: ATE-75
+SYMPTOM: After an interrupted turn, the dashboard accepted `continue`, then recorded a second message.sent event with chars=0 even though the empty suggestion probe found nothing. Its fallback Enter returned no visible effect verdict, and the worker had to be stopped and resumed before the composer/control state was trustworthy again.
+COST: The live acceptance turn was interrupted, a no-op entered the durable audit trail as a confirmed send, and recovery required a worker stop/start.
+FIX: Classify a missing suggestion as submission=no_effect, omit it from send history/last_send, and emit a session.control_noop event plus composer-control WARN. Raw key responses now name effect=unverified, and the dashboard awaits the fallback and displays that verdict or an explicit failure.
