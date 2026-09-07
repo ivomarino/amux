@@ -27,7 +27,7 @@
 #
 # Runs against a throwaway listener on a random port. Nothing here can touch the
 # real board.
-set -uo pipefail
+set -eeuo pipefail
 cd "$(dirname "$0")/.."
 AMUX_BIN="${AMUX_BIN:-./amux}"
 PASS=0; FAIL=0
@@ -72,9 +72,11 @@ PORT=$(cat "$PORTF")
 
 run_su() {  # run_su <args...>  -> sets RC, leaves POST bodies in $CAP
   : > "$CAP"
-  timeout 20 env AMUX_API="http://127.0.0.1:$PORT" AMUX_SESSION=su-flag-test \
-    bash "$AMUX_BIN" board status-update "$@" >/dev/null 2>&1
-  RC=$?
+  # RC IS THE ASSERTION for several cells (a refused flag must exit non-zero),
+  # so the status is captured through `if` rather than lost to `set -e`.
+  # `|| true` would set RC=0 and silently pass every refusal cell (AF-562).
+  if timeout 20 env AMUX_API="http://127.0.0.1:$PORT" AMUX_SESSION=su-flag-test \
+      bash "$AMUX_BIN" board status-update "$@" >/dev/null 2>&1; then RC=0; else RC=$?; fi
 }
 posted_text() {
   python3 -c "

@@ -20,7 +20,12 @@
 # LIVE board and filed three junk cards while reporting green.
 #
 # Exit 0 = all pass, 1 = a failure. Wired into .github/workflows/checks.yml.
-set -uo pipefail
+set -euo
+
+# AF-562: the captures below run a CLI that is EXPECTED to fail (dead server,
+# refused gate). `if ...; then rc=0; else rc=$?; fi` keeps the status readable
+# under `set -e`. `|| true` appears only where nothing reads the status, and
+# says so at the site. pipefail
 cd "$(dirname "$0")/.."
 CLI="$(pwd)/amux"
 PASS=0; FAIL=0
@@ -54,7 +59,7 @@ PY
 }
 
 # --- (a) transition only, server unreachable -------------------------------
-out=$(AMUX_API="$DEAD" AMUX_URL="$DEAD" bash "$CLI" board done TEST-1 --checked x 2>&1); rc=$?
+if out=$(AMUX_API="$DEAD" AMUX_URL="$DEAD" bash "$CLI" board done TEST-1 --checked x 2>&1); then rc=0; else rc=$?; fi
 case "$out" in *"cannot reach the board"*) ok ;; *) bad "(a) an unreachable server must be named, not silent" "$out";; esac
 case "$out" in *"NOT applied"*) ok ;; *) bad "(a) it must say the transition did not happen" "$out";; esac
 [ "$rc" -ne 0 ] && ok || bad "(a) must exit non-zero" "rc=$rc"
@@ -62,7 +67,7 @@ case "$out" in *"NOT applied"*) ok ;; *) bad "(a) it must say the transition did
 # --- (b) with an outcome, server unreachable -------------------------------
 #     The incident's own shape. The old code printed a warning scoped to the
 #     OUTCOME and died, so the reader concluded the status had moved.
-out=$(AMUX_API="$DEAD" AMUX_URL="$DEAD" bash "$CLI" board done TEST-1 --checked x --outcome-stdin < "$TMP/oc.md" 2>&1); rc=$?
+if out=$(AMUX_API="$DEAD" AMUX_URL="$DEAD" bash "$CLI" board done TEST-1 --checked x --outcome-stdin < "$TMP/oc.md" 2>&1); then rc=0; else rc=$?; fi
 case "$out" in *"NOTHING was applied"*) ok ;; *) bad "(b) must state that NEITHER write landed" "$out";; esac
 case "$out" in
   *"outcome NOT recorded — server sent no JSON"*)
@@ -75,12 +80,13 @@ esac
 #     Without this, a CLI that always reported "cannot reach the board" passes
 #     every case above while being completely broken.
 if stub '{"id":"TEST-1","status":"done","ok":true}'; then
-  out=$(AMUX_API="http://127.0.0.1:8897" AMUX_URL="http://127.0.0.1:8897" \
-        bash "$CLI" board done TEST-1 --checked x 2>&1); rc=$?
+  if out=$(AMUX_API="http://127.0.0.1:8897" AMUX_URL="http://127.0.0.1:8897" \
+        bash "$CLI" board done TEST-1 --checked x 2>&1); then rc=0; else rc=$?; fi
   case "$out" in *"TEST-1"*) ok ;; *) bad "(c) a reachable server must still transition" "$out";; esac
   case "$out" in *"cannot reach"*) bad "(c) must not claim transport failure when reachable" "$out";; *) ok ;; esac
   [ "$rc" -eq 0 ] && ok || bad "(c) must exit 0 on success" "rc=$rc"
-  kill "$STUB_PID" 2>/dev/null; wait "$STUB_PID" 2>/dev/null; STUB_PID=""
+  # `wait` on a process we just killed returns non-zero BY DESIGN.
+  kill "$STUB_PID" 2>/dev/null || true; wait "$STUB_PID" 2>/dev/null || true; STUB_PID=""
 else
   bad "(c) stub server never came up" "harness"
 fi
@@ -91,11 +97,13 @@ fi
 #     the first — and a fix that shouted transport-failure at every error would
 #     satisfy (a) and (b) while destroying that distinction.
 if stub '{"ok":false,"error":"gate not acknowledged","item":"TEST-1","kind":"gate_blocked"}'; then
+  # status ignored on purpose: both assertions below read $out's TEXT, not $?.
   out=$(AMUX_API="http://127.0.0.1:8897" AMUX_URL="http://127.0.0.1:8897" \
-        bash "$CLI" board done TEST-1 2>&1)
+        bash "$CLI" board done TEST-1 2>&1) || true
   case "$out" in *"cannot reach"*) bad "(d) a refused gate must NOT read as a transport failure" "$out";; *) ok ;; esac
   case "$out" in *"gate not acknowledged"*) ok ;; *) bad "(d) the refusal reason must survive" "$out";; esac
-  kill "$STUB_PID" 2>/dev/null; wait "$STUB_PID" 2>/dev/null; STUB_PID=""
+  # `wait` on a process we just killed returns non-zero BY DESIGN.
+  kill "$STUB_PID" 2>/dev/null || true; wait "$STUB_PID" 2>/dev/null || true; STUB_PID=""
 else
   bad "(d) stub server never came up" "harness"
 fi
