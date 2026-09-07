@@ -3544,3 +3544,59 @@ CARD: ATE-75
 SYMPTOM: After an interrupted turn, the dashboard accepted `continue`, then recorded a second message.sent event with chars=0 even though the empty suggestion probe found nothing. Its fallback Enter returned no visible effect verdict, and the worker had to be stopped and resumed before the composer/control state was trustworthy again.
 COST: The live acceptance turn was interrupted, a no-op entered the durable audit trail as a confirmed send, and recovery required a worker stop/start.
 FIX: Classify a missing suggestion as submission=no_effect, omit it from send history/last_send, and emit a session.control_noop event plus composer-control WARN. Raw key responses now name effect=unverified, and the dashboard awaits the fallback and displays that verdict or an explicit failure.
+
+## Local multiplayer passed localhost while its Tailscale invite links were unusable
+AREA: tests
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: Codex local Tailscale multiplayer
+CARD: ATE-79
+SYMPTOM: The checked-in local multiplayer Playwright test passed in three browser
+ projects, but it ran only on localhost. A real browser negotiated HTTP/2 on the
+ Tailscale TLS listener, where authority and scheme live on the request URI rather
+ than the HTTP/1.1 Host header, and Team generated an http://localhost invite link
+ that no second tailnet node could open.
+COST: The original green E2E result gave the wrong release verdict and about 45
+ minutes went to repeating the flow at the real Tailscale origin before the protocol
+ difference became visible.
+FIX: ATE-79 reads authority and scheme from either HTTP version, pins the HTTP/2
+ request shape in the route test, and logs `origin_fallback` when neither source is
+ present.
+
+## Local multiplayer called a member revoked before testing a reload
+AREA: tests
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: Codex local Tailscale multiplayer
+CARD: ATE-79
+SYMPTOM: The revocation E2E asserted that the already-open member page received 401
+ after deletion and stopped. The HttpOnly cookie remained in the browser; reloading
+ made its DB lookup fail, classified the request as an ordinary public shell, and
+ injected the owner bearer into JavaScript. The member was therefore promoted to
+ owner by the first recovery action a user would try.
+COST: A revocable-invite feature carried a privilege-escalation path despite a green
+ browser test, and the missing lifecycle edge added about an hour of independent
+ cookie, reload, mutation, and request-log checks.
+FIX: ATE-79 distinguishes absent, verified, and revoked member cookies before owner
+ bootstrap, adds the reload assertion to all three Playwright projects, and emits
+ `revoked_member_bootstrap_withheld` when the blocked transition is attempted.
+
+## The PWA cache discarded a valid remote-owner bootstrap credential
+AREA: auth
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: Codex local Tailscale multiplayer
+CARD: ATE-79
+SYMPTOM: A remote owner opened the dashboard with the correct `?_token`, but the
+ service worker canonicalized every root navigation to cached `/` before the server
+ could see the query. The UI loaded, reported Polling, and every Team mutation failed
+ unauthorized, while direct HTTP with the same credential succeeded.
+COST: Two fresh browser origins and two server rebuilds were needed to separate a
+ server-auth failure from a cached-shell failure; without the browser check the new
+ secure remote-owner boundary would have shipped with no usable recovery path.
+FIX: ATE-79 exchanges the one-time URL bearer for a derived HttpOnly owner-session
+ cookie, removes it from the address bar, bypasses the canonical shell cache for the
+ exchange request, and pins the app/service-worker version seam.

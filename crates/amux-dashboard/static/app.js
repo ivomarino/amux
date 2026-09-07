@@ -9018,7 +9018,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.823';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.824';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.

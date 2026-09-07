@@ -180,6 +180,15 @@ test('local invitee joins, shares work, appears in logs, and can be revoked', as
     expect(revoked.status()).toBe(200);
     const afterRevoke = await guest.evaluate(async () => (await fetch('/api/org/members')).status);
     expect(afterRevoke).toBe(401);
+
+    // The cookie is HttpOnly and survives member deletion. A full reload must
+    // remain revoked; it must never fall through to the public owner shell and
+    // receive the owner's bearer just because the member lookup now fails.
+    await guest.reload();
+    await guest.waitForFunction(() => '_AMUX_AUTH_TOKEN' in window);
+    expect(await guest.evaluate(() => (window as any)._AMUX_AUTH_TOKEN)).toBe('');
+    const afterReload = await guest.evaluate(async () => (await fetch('/api/org/members')).status);
+    expect(afterReload).toBe(401);
   } finally {
     await guestContext.close();
   }

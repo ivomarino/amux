@@ -31,7 +31,7 @@
 
 use super::AppState;
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{Method, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use std::net::SocketAddr;
@@ -95,17 +95,7 @@ pub async fn require_bearer(
     if req.method() == Method::GET && !path.starts_with("/api/") && !path.starts_with("/proxy/") {
         return next.run(req).await;
     }
-    let provided = req
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .or_else(|| {
-            req.uri()
-                .query()
-                .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("_token=")))
-        });
-    match provided {
+    match provided_owner_token(req.headers(), req.uri()) {
         Some(t) if constant_time_eq(t.as_bytes(), expected.as_bytes()) => next.run(req).await,
         // Python's exact 401: JSON body, not bare text (the SPA and CLI both
         // parse the body; a text/plain 401 reads as a broken server).
@@ -118,9 +108,48 @@ pub async fn require_bearer(
     }
 }
 
+/// Whether this request explicitly presented the configured owner bearer.
+///
+/// Static shell serving is intentionally outside [`require_bearer`] so an
+/// invited member can load it using only their HttpOnly member cookie. It must
+/// still be able to distinguish an explicitly-authenticated remote owner from
+/// an anonymous tailnet peer without duplicating the credential parser.
+pub(crate) fn has_owner_token(state: &AppState, headers: &HeaderMap, uri: &Uri) -> bool {
+    state.auth_token.as_deref().is_some_and(|expected| {
+        provided_owner_token(headers, uri)
+            .is_some_and(|provided| constant_time_eq(provided.as_bytes(), expected.as_bytes()))
+    })
+}
+
+/// Query-only variant used by the public shell to exchange a one-time URL
+/// credential for an HttpOnly owner session before a service worker can cache
+/// the credential-bearing URL or reload it without the query string.
+pub(crate) fn has_owner_query_token(state: &AppState, uri: &Uri) -> bool {
+    let provided = uri
+        .query()
+        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("_token=")));
+    match (state.auth_token.as_deref(), provided) {
+        (Some(expected), Some(provided)) => {
+            constant_time_eq(provided.as_bytes(), expected.as_bytes())
+        }
+        _ => false,
+    }
+}
+
+fn provided_owner_token<'a>(headers: &'a HeaderMap, uri: &'a Uri) -> Option<&'a str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .or_else(|| {
+            uri.query()
+                .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("_token=")))
+        })
+}
+
 /// Constant-time comparison — a token check that leaks length-prefix timing
 /// is a token check that can be brute-forced from the LAN.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
