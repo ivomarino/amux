@@ -3641,10 +3641,11 @@ FIX: The scroll listener now preserves the navigation lock for selected messages
 ## Concurrent Bash observations are treated as file ownership
 AREA: attribution
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-09-07
 SESSION: mixpeek-ops-server
 CARD: MOS-33
 SYMPTOM: A concurrent reader was named owner of three ops research files after their mtimes changed during its Bash command. The production classifier reproduces a foreign block with provenance observed while its explanation asserts a transcript write. A later observation can also replace an existing recorded writer.
 COST: The reader had to disown files it never edited; publication required an ownership check and this repair.
 FIX: Keep mtime observations in a separate, counted advisory. They cannot name an owner or replace recorded edits; preserve recorded-writer and blind-cotenant protection. Regression: concurrent_reader_observations_cannot_claim_the_ops_research_files.
+VERIFIED: dd416c753b24 is running (build eee97f2b86189c02). The same five staged paths changed from three observed-only foreign blocks to zero foreign owners, with three advisory paths/four observer records retained; the MOS-33 log records that denominator. Final source passes 70 guard tests, six real hook-main controls, existing protection checks, clippy and cargo check.
