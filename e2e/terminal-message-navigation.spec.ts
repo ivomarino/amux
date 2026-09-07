@@ -114,7 +114,8 @@ test('toolbar has one horizontal row, explicit filters and reachable named actio
     overflow: el.scrollWidth > el.clientWidth + 1,
     controls: [...el.querySelectorAll('button,select')].map(c => {
       const r = c.getBoundingClientRect();
-      return { width: r.width, height: r.height, visible: c.contains(document.elementFromPoint(r.x + r.width/2, r.y + r.height/2)) };
+      // WebKit may return 43.999996 for a 44px control. Keep subpixel precision.
+      return { width: Number(r.width.toFixed(3)), height: Number(r.height.toFixed(3)), visible: c.contains(document.elementFromPoint(r.x + r.width/2, r.y + r.height/2)) };
     }),
   }));
   expect(geometry.height).toBeLessThanOrEqual(48);
@@ -133,6 +134,25 @@ test('toolbar has one horizontal row, explicit filters and reachable named actio
   await expect(page.locator('#peek-more-dropdown [data-worker-action="directory"]')).toHaveText('📁Change directory');
   await expect(page.locator('#peek-more-dropdown [data-worker-action="copy-directory-link"]')).toHaveText('🔗Copy directory link');
   await expect(page.locator('.peek-dir-bar .card-dir-edit')).toHaveCount(0);
+  // An action stops event propagation. Its outside-click listener must still
+  // be retired, or the next opening click immediately dismisses the menu.
+  const workerMenu = page.locator('#peek-overlay').getByRole('button', { name: 'Worker actions', exact: true });
+  await page.locator('#peek-more-dropdown [data-worker-action="copy-directory-link"]').click();
+  await expect(page.locator('#peek-more-dropdown')).not.toBeVisible();
+  await workerMenu.click();
+  await expect(workerMenu).toHaveAttribute('aria-expanded', 'true');
+  await expect(page.locator('#peek-more-dropdown')).toBeVisible();
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await page.locator('#peek-more-dropdown [data-worker-action="directory"]').click();
+    await expect(page.locator('#edit-title')).toHaveText('Change directory');
+    await expect(page.locator('#edit-input')).toHaveValue('/tmp/toolbar-probe');
+    await page.locator('#edit-overlay').getByRole('button', { name: 'Cancel', exact: true }).click();
+    await workerMenu.click();
+    await expect(workerMenu).toHaveAttribute('aria-expanded', 'true');
+    await expect(page.locator('#peek-more-dropdown')).toBeVisible();
+  }
+
   await page.locator('#peek-overlay').getByRole('button', { name: 'Worker actions', exact: true }).click();
   const tabs = page.getByRole('button', { name: 'Customize worker tabs' });
   await expect(tabs).toContainText('Tabs');
@@ -217,4 +237,23 @@ test('an explicit empty navigation loads earlier output and lands on its message
   await expect.poll(() => beacons.filter(b => b.verdict === 'loaded-earlier').length).toBe(1);
   await expect.poll(() => beacons.filter(b => b.verdict === 'landed').length).toBe(1);
   await expect(page.locator('#toast')).not.toHaveClass(/visible/);
+});
+
+
+test('a worker menu that loses its opening announces the failure', async ({ page }) => {
+  const beacons: any[] = [];
+  await page.route('**/api/client-debug', async route => {
+    beacons.push(route.request().postDataJSON());
+    await route.fulfill({ json: { ok: true } });
+  });
+  await page.evaluate(() => {
+    eval("sessions.push({name:'nav-probe',dir:'/tmp/toolbar-probe',running:true});");
+    (window as any).togglePeekMoreMenu();
+    // Positive diagnostic control: lose the opening before the first paint.
+    (window as any)._closePeekMore();
+  });
+  await expect.poll(() => beacons.filter(b => b.kind === 'worker-action-menu').length).toBe(1);
+  const signal = beacons.find(b => b.kind === 'worker-action-menu');
+  expect(signal).toMatchObject({ verdict: 'open-lost', measured: true, session: 'nav-probe' });
+  expect(signal.n_considered).toBeGreaterThan(20);
 });

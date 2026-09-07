@@ -9014,7 +9014,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.824';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.825';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -10905,20 +10905,35 @@ function peekSearchPrev() {
 }
 
 // ── Peek more-menu ──
+let _peekMoreDismissTimer = 0;
 function togglePeekMoreMenu() {
   const dd = document.getElementById('peek-more-dropdown');
   if (!dd) return;
   const s = (sessions || []).find(row => row.name === peekSession);
   if (s) _renderPeekWorkerActions(s);
   const opening = !dd.classList.contains('open');
-  dd.classList.toggle('open');
-  document.getElementById('peek-worker-menu-btn')?.setAttribute('aria-expanded', String(opening));
-  if (opening) {
-    if (s) requestAnimationFrame(() => _reportWorkerActionParity(s));
-    setTimeout(() => document.addEventListener('click', _closePeekMore, {once: true}), 0);
-  }
+  if (!opening) { _closePeekMore(); return; }
+  dd.classList.add('open');
+  document.getElementById('peek-worker-menu-btn')?.setAttribute('aria-expanded', 'true');
+  requestAnimationFrame(() => {
+    if (s) _reportWorkerActionParity(s);
+    if (!dd.classList.contains('open')) {
+      fetch(API + '/api/client-debug', {method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({kind:'worker-action-menu',verdict:'open-lost',session:peekSession,
+          measured:true,n_considered:dd.querySelectorAll('[role="menuitem"]').length,ver:APP_VER})}).catch(() => {});
+    }
+  });
+  _peekMoreDismissTimer = setTimeout(() => {
+    _peekMoreDismissTimer = 0;
+    document.addEventListener('click', _closePeekMore, {once: true});
+  }, 0);
 }
 function _closePeekMore() {
+  // Menu actions stop propagation, so the document's one-shot listener never
+  // fires for them. Retire it here or it consumes the next opening click.
+  clearTimeout(_peekMoreDismissTimer);
+  _peekMoreDismissTimer = 0;
+  document.removeEventListener('click', _closePeekMore);
   const dd = document.getElementById('peek-more-dropdown');
   if (dd) dd.classList.remove('open');
   document.getElementById('peek-worker-menu-btn')?.setAttribute('aria-expanded', 'false');
