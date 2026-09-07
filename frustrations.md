@@ -3539,3 +3539,14 @@ FIX: The edit record is built from Bash commands that MENTION a path, and a ment
   from Read exactly. AF-179 records the mirror of this on the co-edit side, where the guard
   itself prints "OBSERVED claim, not a recorded write" — the victim column has the same
   defect and no such caveat, so the weaker signal carries the stronger words.
+
+## Routine graph checks downloaded the complete 58 MB audit snapshot
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux
+CARD: AMUX-4179
+SYMPTOM: The first live graph check read 57,937,366 bytes for 13,381 tasks because structural validation and full descriptions/evidence shared one export response.
+COST: Every routine CLI check transferred and parsed 58 MB; the loopback export alone took 0.576 seconds.
+FIX: Add /api/graph/board/verify using the same structural verifier as the periodic monitor; CLI summaries/checks use it, while --json retains the reproducible full audit export. Invalid checks emit task_graph_invalid with projection=validation; unmeasured reads emit task_graph_unmeasured. Regression compares both projections and proves a 2 MB task body cannot inflate the preflight response.

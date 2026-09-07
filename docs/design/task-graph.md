@@ -14,7 +14,11 @@ amux board graph --check         # exit 0 valid; 1 invalid; 2 unavailable
 amux board graph --json > task-graph.json
 ```
 
-The API is `GET /api/graph/board`. It also appears in `/api/debug/routes` and
+The full export API is `GET /api/graph/board`. Routine CLI summaries and checks
+use `GET /api/graph/board/verify`, which reads only structural fields and omits
+task prose and artifact payloads. Both use the same verifier. The full export
+was 58 MB on the live board; repeatedly downloading it just to validate a plan
+would make the graph expensive to use. Both routes appear in `/api/debug/routes` and
 `/api/board/contract`. The response covers **all non-deleted tasks**, including
 archived and terminal tasks: filtering these out would invent dangling edges.
 An invalid graph still returns its findings and surviving components. A failed

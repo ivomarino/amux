@@ -197,11 +197,31 @@ async fn parent_cycles_are_refused_inside_the_write_transaction() {
 async fn a_failed_graph_probe_never_reports_an_empty_success() {
     let (app, store, _dir) = app();
     seed(&store, "ALTER TABLE issues RENAME TO broken_issues");
-    let (status, result) = request(&app, "GET", "/api/graph/board", Value::Null).await;
-    assert_eq!(status, 500);
-    assert_eq!(result["measured"], false);
-    assert_eq!(result["n_considered"], 0);
-    assert!(result["why_unmeasured"].is_string());
+    for path in ["/api/graph/board", "/api/graph/board/verify"] {
+        let (status, result) = request(&app, "GET", path, Value::Null).await;
+        assert_eq!(status, 500);
+        assert_eq!(result["measured"], false);
+        assert_eq!(result["n_considered"], 0);
+        assert!(result["why_unmeasured"].is_string());
+    }
+}
+
+#[tokio::test]
+async fn preflight_matches_export_without_loading_task_contents() {
+    let (app, store, _dir) = app();
+    seed(&store, "INSERT INTO issues(id,title,status,created,updated,depends_on,desc) VALUES \
+        ('G-1','large evidence','todo',1,1,'[]',hex(zeroblob(1000000)))");
+    let (_, full) = request(&app, "GET", "/api/graph/board", Value::Null).await;
+    let (status, thin) = request(&app, "GET", "/api/graph/board/verify", Value::Null).await;
+    assert_eq!(status, 200, "{thin}");
+    assert_eq!(thin["measured"], true);
+    assert_eq!(thin["n_considered"], 1);
+    assert_eq!(thin["verification"], full["verification"]);
+    assert_eq!(thin["revision"], full["revision"]);
+    assert!(thin.get("nodes").is_none());
+    assert!(thin.get("edges").is_none());
+    assert!(thin.to_string().len() < 2000);
+    assert!(full.to_string().len() > 2_000_000);
 }
 
 #[tokio::test]
@@ -237,19 +257,24 @@ async fn map_mutations_cannot_create_a_second_board_graph() {
 #[tokio::test]
 async fn graph_cli_check_distinguishes_valid_invalid_and_unmeasured() {
     let (app, store, _dir) = app();
-    let (_, good) = request(&app, "GET", "/api/graph/board", Value::Null).await;
+    let mut fixtures = Vec::new();
+    for path in ["/api/graph/board", "/api/graph/board/verify"] {
+        let (_, good) = request(&app, "GET", path, Value::Null).await;
+        fixtures.push((path, good, 0));
+    }
     seed(
         &store,
         "INSERT INTO issues(id,title,status,created,updated,depends_on) VALUES \
         ('G-1','cycle','todo',1,1,'[\"G-1\"]')",
     );
-    let (_, bad) = request(&app, "GET", "/api/graph/board", Value::Null).await;
+    for path in ["/api/graph/board", "/api/graph/board/verify"] {
+        let (_, bad) = request(&app, "GET", path, Value::Null).await;
+        fixtures.push((path, bad, 1));
+        fixtures.push((path, json!({"measured":false,"n_considered":0}), 2));
+        fixtures.push((path, json!({"schema_version":99,"measured":true}), 2));
+    }
     let cli = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../amux");
-    for (fixture, expected) in [
-        (good, 0),
-        (bad, 1),
-        (json!({"measured":false,"n_considered":0}), 2),
-    ] {
+    for (path, fixture, expected) in fixtures {
         // Execute the actual fleet CLI against a loopback response fixture.
         // Sourcing it would exit at the CLI's read-whole-file safety boundary,
         // never reaching a mocked command; an empty stdout must not pass.
@@ -259,7 +284,7 @@ async fn graph_cli_check_distinguishes_valid_invalid_and_unmeasured() {
         let fixture_app = axum::Router::new()
             .route("/health", axum::routing::get(|| async { "ok" }))
             .route(
-                "/api/graph/board",
+                path,
                 axum::routing::get(move || {
                     let body = payload.clone();
                     async move { axum::Json(body) }
@@ -271,9 +296,12 @@ async fn graph_cli_check_distinguishes_valid_invalid_and_unmeasured() {
         let cli = cli.clone();
         let scratch = tempfile::tempdir().unwrap();
         let out = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("bash")
-                .arg(cli)
-                .args(["board", "graph", "--json", "--check"])
+            let mut command = std::process::Command::new("bash");
+            command.arg(cli).args(["board", "graph", "--check"]);
+            if path == "/api/graph/board" {
+                command.arg("--json");
+            }
+            command
                 .env("AMUX_API", &url)
                 .env("AMUX_URL", &url)
                 .env("CC_HOME", scratch.path())
@@ -289,12 +317,20 @@ async fn graph_cli_check_distinguishes_valid_invalid_and_unmeasured() {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        if expected != 2 {
+        if expected != 2 && path == "/api/graph/board" {
             let exported: Value = serde_json::from_slice(&out.stdout).unwrap();
             assert_eq!(
                 exported, fixture,
                 "--json must preserve the versioned snapshot"
             );
+        } else if expected != 2 {
+            let summary = String::from_utf8(out.stdout).unwrap();
+            assert!(summary.starts_with(if expected == 0 {
+                "Task graph: valid"
+            } else {
+                "Task graph: INVALID"
+            }), "{summary}");
+            assert!(summary.contains("tasks | revision"), "{summary}");
         }
     }
 }

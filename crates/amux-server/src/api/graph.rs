@@ -41,6 +41,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/fleet", get(fleet_graph))
         .route("/board", get(board_graph))
+        .route("/board/verify", get(verify_board_graph))
         .route("/{id}", get(get_graph))
         .route("/{id}/import-vault", post(import_vault))
         .route("/{id}/nodes/{nid}", patch(patch_node))
@@ -79,6 +80,37 @@ async fn board_graph(State(state): State<AppState>) -> Response {
 
 fn now_secs() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+// Routine preflights must not download every task's description and evidence.
+// Measured on 13,381 live tasks: the audit snapshot was 58 MB. This shares the
+// periodic verifier and keeps the full snapshot available for explicit export.
+async fn verify_board_graph(State(state): State<AppState>) -> Response {
+    let store = state.store.clone();
+    let read = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        let conn = store.read()?;
+        let tx = conn.unchecked_transaction()?;
+        let revision: u64 = tx.query_row("SELECT rev FROM _amux_rev WHERE id=1", [], |r| r.get(0))?;
+        let (n, verification) = crate::db::task_graph_store::verify_graph(&tx)?;
+        tx.commit()?;
+        if !verification.valid {
+            tracing::warn!(target: "amux::board", verdict = "task_graph_invalid", projection = "validation",
+                measured = true, n_considered = n, findings = verification.findings.len(), revision,
+                "board graph preflight found structural problems");
+        }
+        Ok(json!({"schema_version":1,"projection":"validation","revision":revision,
+            "measured":true,"n_considered":n,"verification":verification}))
+    }).await;
+    match read {
+        Ok(Ok(value)) => Json(value).into_response(),
+        result => {
+            let why = match result { Ok(Err(e)) => e.to_string(), Err(e) => e.to_string(), _ => unreachable!() };
+            tracing::warn!(target: "amux::board", verdict = "task_graph_unmeasured", %why,
+                "board graph preflight could not be measured");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"measured":false,"n_considered":0,
+                "why_unmeasured":why,"error":"board graph preflight unavailable"}))).into_response()
+        }
+    }
 }
 
 fn board_graph_read_only() -> Response {

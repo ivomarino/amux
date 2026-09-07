@@ -2387,20 +2387,23 @@ This is structural build order. Workflow readiness: GET /api/board/ready."; retu
         esac
         shift
       done
-      graph_result=$(_curl -fsk "$AMUX_API/api/graph/board") || {
-        echo "amux board graph: graph measurement unavailable from $AMUX_API/api/graph/board" >&2
+      local graph_path="/api/graph/board/verify"
+      [[ "$graph_json" == 1 ]] && graph_path="/api/graph/board"
+      graph_result=$(_curl -fsk "$AMUX_API$graph_path") || {
+        echo "amux board graph: graph measurement unavailable from $AMUX_API$graph_path" >&2
         return 2
       }
       printf '%s' "$graph_result" | python3 -c '
 import json,sys
-d=json.load(sys.stdin)
-if d.get("measured") is not True or not isinstance(d.get("n_considered"),int) or "verification" not in d:
+try: d=json.load(sys.stdin)
+except ValueError:
+    print("amux board graph: response is not JSON",file=sys.stderr); sys.exit(2)
+if not isinstance(d,dict) or d.get("schema_version")!=1 or d.get("measured") is not True or not isinstance(d.get("n_considered"),int) or "verification" not in d:
     print("amux board graph: unmeasured or incompatible response",file=sys.stderr); sys.exit(2)
 v=d["verification"]
 if sys.argv[1]=="1": print(json.dumps(d,indent=2))
 else:
-    print("Task graph: %s | %s tasks | %s nodes | %s edges" % ("valid" if v["valid"] else "INVALID", d["n_considered"],len(d["nodes"]),len(d["edges"])))
-    print("Revision %s | sha256 %s" % (d["revision"],d["sha256"]))
+    print("Task graph: %s | %s tasks | revision %s" % ("valid" if v["valid"] else "INVALID", d["n_considered"],d["revision"]))
     print("Dependency layers: %s | unbuildable: %s" % (len(v["dependencies"]["layers"]),len(v["dependencies"]["unbuildable"])))
     for f in v["findings"]: print("  %s (%s): %s" % (f["code"],f["field"],", ".join(f["task_ids"])))
 sys.exit(1 if sys.argv[2]=="1" and not v["valid"] else 0)
