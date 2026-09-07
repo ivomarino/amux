@@ -10,7 +10,7 @@
 # The retry path only runs when the server is unreachable on the first try, so
 # there is no way to exercise it end to end without taking the server down. This
 # drives the block's own bytes with the environment the shell hands it.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 
 CELLS=0
@@ -79,8 +79,15 @@ fi
 # 3. A MISSING operand must CRASH, not print an empty field. The old
 #    `.get('_R','')` default is what turned a dead variable into a formatting
 #    nit nobody looked at for as long as it existed.
-out2=$(env -u _R _R_WAITED=2 RESP="$RESP" TGT="somelane" python3 -c "$PY" 2>&1)
-rc2=$?
+# THIS COMMAND IS SUPPOSED TO FAIL — its non-zero status IS the assertion.
+# Under `set -e` a bare `out2=$(...)` would abort the suite here, so the status
+# is captured through `if`, which set -e does not treat as an error. NOT `|| true`:
+# that would discard the very value the next three lines test (AF-562).
+if out2=$(env -u _R _R_WAITED=2 RESP="$RESP" TGT="somelane" python3 -c "$PY" 2>&1); then
+  rc2=0
+else
+  rc2=$?
+fi
 CELLS=$((CELLS + 1))
 if [ "$rc2" -eq 0 ]; then
   echo "  FAIL  a missing _R printed instead of crashing: $out2"
