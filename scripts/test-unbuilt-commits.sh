@@ -14,7 +14,7 @@
 #
 # Runs against a fixture repo and a fake log; touches no real builder state.
 # Exit 0 = pass, 1 = failure.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 SCRIPT="$(pwd)/scripts/unbuilt-commits.sh"
 [ -x "$SCRIPT" ] || { echo "FAIL: $SCRIPT missing"; exit 1; }
@@ -48,7 +48,9 @@ cat > "$D/log" <<EOF
 == 2026-08-27 06:00:00 SKIP $C2 — build already running (pid 1)
 EOF
 
-out=$(AMUX_RS_BUILD_LOG="$D/log" "$SCRIPT" base..HEAD 2>&1); rc=$?
+# EXPECTED to refuse; its status IS the assertion below. `if` is the set -e-safe
+# capture, and NOT `|| true`, which would discard the value the next line reads.
+if out=$(AMUX_RS_BUILD_LOG="$D/log" "$SCRIPT" base..HEAD 2>&1); then rc=0; else rc=$?; fi
 
 # 1 — the built one is not listed, and the count is right
 if [ "$rc" = 1 ] && echo "$out" | grep -q "NEVER built:        2"; then
@@ -65,7 +67,7 @@ else
 fi
 
 # 3 — CONTROL: no log means REFUSE, never "everything is unbuilt"
-out3=$(AMUX_RS_BUILD_LOG="$D/nope" "$SCRIPT" base..HEAD 2>&1); rc3=$?
+if out3=$(AMUX_RS_BUILD_LOG="$D/nope" "$SCRIPT" base..HEAD 2>&1); then rc3=0; else rc3=$?; fi
 if [ "$rc3" = 2 ] && ! echo "$out3" | grep -q "NEVER built"; then
   ok "3: control — an absent log refuses (exit 2) instead of reporting a count"
 else
@@ -77,7 +79,7 @@ cat > "$D/log2" <<EOF
 == building $C2 (trigger: $C2, previous stamp: x)
 == building $C3 (trigger: $C3, previous stamp: x)
 EOF
-out4=$(AMUX_RS_BUILD_LOG="$D/log2" "$SCRIPT" "$C1..HEAD" 2>&1); rc4=$?  # C2,C3 only
+if out4=$(AMUX_RS_BUILD_LOG="$D/log2" "$SCRIPT" "$C1..HEAD" 2>&1); then rc4=0; else rc4=$?; fi  # C2,C3 only
 if [ "$rc4" = 0 ] && echo "$out4" | grep -q "every commit in this range"; then
   ok "4: an all-built range exits 0 and says so"
 else
@@ -88,7 +90,7 @@ fi
 #     counting it inflates the answer — measured on the live repo as 83-of-235
 #     against a true 0-of-152 once the filter landed.
 echo doc > README.md; git add README.md; git commit -qm "docs only"
-out5=$(AMUX_RS_BUILD_LOG="$D/log2" "$SCRIPT" "$C2..HEAD" 2>&1); rc5=$?
+if out5=$(AMUX_RS_BUILD_LOG="$D/log2" "$SCRIPT" "$C2..HEAD" 2>&1); then rc5=0; else rc5=$?; fi
 if [ "$rc5" = 0 ] && ! echo "$out5" | grep -q "docs only"; then
   ok "5: a docs-only commit is excluded, not reported as never built"
 else
@@ -103,7 +105,11 @@ fi
 cat > "$D/log3" <<EOF
 == 2099-01-01 00:00:00 building $C3 (trigger: $C3, previous stamp: x)
 EOF
-out6=$(AMUX_RS_BUILD_LOG="$D/log3" "$SCRIPT" base..HEAD 2>&1)
+# STATUS DELIBERATELY IGNORED: the two assertions below read $out6's TEXT
+# ("COVERAGE GAP", "UP TO DATE"), never the exit code, so `|| true` discards
+# nothing. That is what makes it safe here and unsafe at the four sites above,
+# where the status IS the assertion (AF-562).
+out6=$(AMUX_RS_BUILD_LOG="$D/log3" "$SCRIPT" base..HEAD 2>&1) || true
 if echo "$out6" | grep -q "COVERAGE GAP" && echo "$out6" | grep -q "UPPER BOUND"; then
   ok "6: a log starting after the range prints a coverage gap and calls the count a bound"
 else
@@ -144,7 +150,7 @@ fi
 cat > "$D/log4" <<EOF
 == 2026-08-27 07:00:00 SKIP $C3 — build already running (pid 1)
 EOF
-out9=$(AMUX_RS_BUILD_LOG="$D/log4" "$SCRIPT" base..HEAD 2>&1); rc9=$?
+if out9=$(AMUX_RS_BUILD_LOG="$D/log4" "$SCRIPT" base..HEAD 2>&1); then rc9=0; else rc9=$?; fi
 if [ "$rc9" = 2 ] && ! echo "$out9" | grep -q "NEVER built"; then
   ok "9: a log with no 'building' line refuses (exit 2) rather than reporting 100%"
 else
