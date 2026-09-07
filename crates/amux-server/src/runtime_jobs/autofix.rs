@@ -233,6 +233,24 @@ const LONG_BY_DESIGN: &[(&str, f64)] = &[
     // exactly what a design-bounded quota wait looks like from outside.
     // 30s matches /api/email/inbox's own reasoning (2x worst measured).
     ("/api/gmail/inbox", 30_000.0),
+    // GET /api/gmail/accounts (AMUX-112, third filing on the same residual —
+    // AMUX-84/90 before it). A DIFFERENT route from /api/gmail/inbox above (a
+    // health-probe rollup, not a message list) but the SAME shape once
+    // AMUX-84 fixed its own N+1: `accounts()`'s per-account `account_health`
+    // calls run through `buffered(8)` — with only 3 connected accounts today
+    // that is effectively full concurrency, so total latency is bounded by
+    // whichever ONE account's probe is slowest, not by the account count.
+    // `probe_health`'s own comment already measured this: "24.3s across 3
+    // connected accounts" — a real, accepted worst case baked into the code
+    // BEFORE this entry existed, not a guess made here. That number comes
+    // from the same `ReqwestTransport` this whole gmail integration shares
+    // (integrations/email.rs, `.timeout(Duration::from_secs(30))`), and
+    // `probe_health` can chain up to two such calls (a profile GET, then a
+    // token-refresh POST on a 401) — so a single wedged call still hits the
+    // SAME 30s per-call bound the sibling entries above already reason from.
+    // 30s, not 2x 24.3s: matches the transport's own timeout directly, the
+    // same choice /api/gmail/inbox made for the identical reason.
+    ("/api/gmail/accounts", 30_000.0),
     // GET /api/email/search (AMUX-3690). THE ARGUMENT IS NOT "it is also slow",
     // it is that this route and the one above are the SAME CODE: both call
     // `email::inbox_messages`, so both inherit its 8-wide concurrency, its
@@ -256,6 +274,27 @@ const LONG_BY_DESIGN: &[(&str, f64)] = &[
     // a budget in advance. The next route to call `inbox_messages` will file too,
     // for a duration that was designed in before it existed.
     ("/api/email/search", 30_000.0),
+    // GET /api/gmail/thread/{id} (AMUX-114). `get_thread` (integrations/
+    // email.rs) fetches the thread through the same `self.api(...)` quota-
+    // backed call every other entry in this table reasons from, so it gets
+    // the same 30s budget for the same reason: a single wedged call to
+    // Google hits that transport's own 30s timeout, and a bound derived
+    // from that (not padded) still means "something hung" when crossed.
+    //
+    // NOT fixed here, named because it is real and this route is the one
+    // place it lives: after the thread GET, `get_thread` clears UNREAD on
+    // every unread message SEQUENTIALLY (`for uid in unread_ids { ...
+    // self.api(...).await }`), not with the bounded concurrency AMUX-66/84
+    // already gave the sibling N+1 shapes on /gmail/inbox and
+    // /gmail/accounts. Both real occurrences this card investigated were
+    // ~30001ms — consistent with ONE call hitting the transport timeout,
+    // not several stacking toward 60s+ — so the flat 30s bound holds for
+    // what has actually been observed. A thread with many unread messages
+    // could still legitimately exceed it without any single call hanging;
+    // that would show as a design-duration false positive here, not a
+    // wedge, and is the tell that this loop needs the same buffered() fix
+    // its siblings already got.
+    ("/api/gmail/thread/{id}", 30_000.0),
     // POST /api/alert/owner (AMUX-3522, third filing on one mechanism): while
     // the Messages Automation permission stays missing (MI-4933), the
     // iMessage breaker re-probes once per 15-min cooldown and that probe IS
@@ -12347,6 +12386,108 @@ mod tests {
         let (f2, _) = detect_latency(&st.store.read().unwrap(), now + 1.0);
         assert!(
             f2.iter().any(|x| x.signature.contains("/api/gmail/inbox")),
+            "past the 30s budget this is a hang, not a design duration, and must still file: {f2:?}"
+        );
+    }
+
+    /// AMUX-112: /api/gmail/accounts is a health-probe rollup (a DIFFERENT
+    /// function, `accounts()`, from `list_messages` above) but shares the
+    /// same transport (`ReqwestTransport`, 30s timeout) and the same
+    /// bounded-concurrency shape AMUX-84 gave it — with today's 3 connected
+    /// accounts under `buffered(8)`, total latency is bounded by the single
+    /// slowest account's probe, and `probe_health`'s own comment already
+    /// measured that worst case at 24.3s.
+    #[tokio::test]
+    async fn gmail_accounts_is_judged_against_its_own_measured_worst_case() {
+        let (st, _d) = state();
+        let now = unix_now();
+        log_row(
+            &st,
+            Row {
+                ts: now - 300.0,
+                method: "GET",
+                path: "/api/gmail/accounts",
+                family: "/api/gmail",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 24_300.0, // probe_health's own documented worst measured
+            },
+        );
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        assert!(
+            !f.iter().any(|x| x.signature.contains("/api/gmail/accounts")),
+            "inside its 30s design budget, a health-probe rollup must not file: {f:?}"
+        );
+
+        log_row(
+            &st,
+            Row {
+                ts: now - 100.0,
+                method: "GET",
+                path: "/api/gmail/accounts",
+                family: "/api/gmail",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 45_000.0,
+            },
+        );
+        let (f2, _) = detect_latency(&st.store.read().unwrap(), now + 1.0);
+        assert!(
+            f2.iter().any(|x| x.signature.contains("/api/gmail/accounts")),
+            "past the 30s budget this is a hang, not a design duration, and must still file: {f2:?}"
+        );
+    }
+
+    /// AMUX-114: /api/gmail/thread/{id} is a wildcard-parameter route --
+    /// pins that a REAL thread id in the logged path (not the literal
+    /// `{id}` template) still resolves to the LONG_BY_DESIGN entry, via the
+    /// same route-table normalization every other target in this table
+    /// relies on implicitly.
+    #[tokio::test]
+    async fn gmail_thread_is_judged_against_its_own_transport_timeout() {
+        let (st, _d) = state();
+        let now = unix_now();
+        log_row(
+            &st,
+            Row {
+                ts: now - 300.0,
+                method: "GET",
+                path: "/api/gmail/thread/1a065ea83437499a", // a real id, not the template
+                family: "/api/gmail",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 20_020.0, // AMUX-114's own worst measured, single-call
+            },
+        );
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        assert!(
+            !f.iter().any(|x| x.signature.contains("/api/gmail/thread")),
+            "inside its 30s design budget, a quota-bound thread fetch must not file: {f:?}"
+        );
+
+        log_row(
+            &st,
+            Row {
+                ts: now - 100.0,
+                method: "GET",
+                path: "/api/gmail/thread/1a060bfebc7ab94a",
+                family: "/api/gmail",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 45_000.0,
+            },
+        );
+        let (f2, _) = detect_latency(&st.store.read().unwrap(), now + 1.0);
+        assert!(
+            f2.iter().any(|x| x.signature.contains("/api/gmail/thread")),
             "past the 30s budget this is a hang, not a design duration, and must still file: {f2:?}"
         );
     }

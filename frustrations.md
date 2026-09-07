@@ -3306,3 +3306,126 @@ FIX: ecbf4daf derives the Settings rows from the full built-in provider registry
  quota APIs from unlimited local inference. 6bdf9999 also resolves Codex through the
  same login-shell path as a real worker, rather than launchd's stale-but-executable
  shim. `amux::usage_probe` logs whenever a probe succeeds or cannot report its quota.
+
+## append-only push guard offered two causes, and the real one was a third
+AREA: gates
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-06
+SESSION: amux-frustrations
+CARD: AF-528
+SYMPTOM: Pushing a maintainer conflict-resolution to a CONTRIBUTOR'S FORK branch (PR
+  #188), the pre-push guard refused: "frustrations.md as pushed is MISSING 4 line(s)
+  the remote's current copy has", then insisted I decide between RETIREMENT and STALE
+  REPUBLISH before acting, warning that the wrong choice is destructive. Neither was
+  true. main had UPDATED the ATE-17 entry IN PLACE (STATUS: open -> fixed, FIX
+  paragraph rewritten; origin/main:frustrations.md:2342-2365) and the fork branch
+  carried the older copy, so merging main FORWARD replaced their stale text with
+  main's newer text. The archive cross-check cannot help: the lines did not MOVE to
+  frustrations-archive.md, they were rewritten where they stood.
+COST: ~10 minutes ruling out both offered causes against a refusal that says picking
+  wrong is destructive. The direction was the OPPOSITE of the accusation -- I was
+  publishing NEWER content and it read as a revert.
+FIX: Two cheap discriminators the guard already has the inputs for. (1) If the missing
+  lines are ADJACENT to CHANGED lines in the same entry block, that is an in-place
+  rewrite, not a deletion -- name it as a third cause. (2) Report whether the push
+  target is `origin` or a fork branch: merging main forward into a fork can only ever
+  ADD to origin's history, so the stale-republish reading does not apply there at all.
+  A line-set difference cannot see an EDIT any more than it can see a MOVE, which is
+  the failure mode this file's own contract already names one layer up.
+
+## Isolated workers hid confirmed owner work from the shared board
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-06
+SESSION: amux
+CARD: AMUX-4159
+SYMPTOM: The live `amux` worker has `CC_ISOLATED=1`. Its first task prompt in this
+session was recorded in `cmd_history` row 44634 as `delivery=direct`,
+`submit_verdict=confirmed`, but `card_id=NULL`; there was no capture verdict in the
+server log. Direct prompt capture deliberately excluded every isolated worker, and
+the capture health invariant deliberately excluded the same population, so mechanism
+and monitor agreed on invisible work.
+COST: The user had to point at the Workers board to establish that the task ledger
+was still incomplete, and the first linked implementation request had no card or
+task-local evidence even though the worker had received and was executing it.
+FIX: 6bce0158 removes isolation from owner-prompt capture while preserving its
+harness, peer-discovery, and automation boundaries. Capture logs now include
+`owner_isolated`, the health invariant evaluates isolated-owner prompts, and an exact
+regression fixture proves the confirmed live prompt shape mints and links a card.
+
+## Decomposition accepted child cards that did not say how to execute or verify them
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-06
+SESSION: amux
+CARD: AMUX-4161
+SYMPTOM: The capture decomposition endpoint required a title, priority, dependency
+ indexes, and next action, but accepted an empty description and no acceptance
+ criteria. All 24 live decomposition children predate the corrected contract and
+ lack acceptance criteria, yet no health invariant reported that incomplete
+ population.
+COST: A worker could receive a syntactically valid child without enough durable
+ detail to determine scope or falsify completion; terminal evidence then depended
+ on conversational context outside the board.
+FIX: The endpoint now rejects vague descriptions and missing, malformed, or duplicate
+ acceptance criteria atomically, and the board health sweep reports every incomplete
+ live decomposition row with `measured`, `n_considered`, and per-card gap names.
+
+## Manual claim bypassed a decomposed task's dependency graph
+AREA: board
+SEVERITY: corrupts
+STATUS: fixed
+DATE: 2026-09-06
+SESSION: amux
+CARD: AMUX-4161
+SYMPTOM: Board-drive held dependency-backed children in backlog, but the public claim
+ endpoint could force a backlog child directly to doing without consulting those
+ dependencies. The chaos journey reproduced the bypass by claiming plan step two
+ while step one was still open.
+COST: Two workers could execute an ordered plan out of sequence, consuming work whose
+ prerequisite had not produced its result while the board still displayed a valid
+ dependency edge.
+FIX: The claim primitive now checks dependencies in the same SQLite writer transaction
+ as its status compare-and-swap. A refusal returns `dependency_blocked` with the exact
+ blockers and writes both a WARN verdict and a durable `claim.dependency_blocked`
+ session event.
+
+## A different decomposition retry was reported as idempotent
+AREA: board
+SEVERITY: corrupts
+STATUS: fixed
+DATE: 2026-09-06
+SESSION: amux
+CARD: AMUX-4161
+SYMPTOM: Once an epic had children, every later decomposition request returned
+ `idempotent: true` without comparing the submitted plan to the committed one. A
+ retried or racing caller could therefore believe its changed plan won even though
+ the board retained a different child set.
+COST: The API acknowledged work it did not store and gave the caller no discriminator
+ for recovering after a lost response or concurrent decomposition.
+FIX: Decomposition now persists a normalized plan SHA-256 on the root epic. Exact
+retries return measured idempotent success; divergent retries return a measured 409
+with both hashes and emit a greppable `plan_conflict` WARN verdict.
+
+## The todo ceiling stranded a dependency successor after its predecessor closed
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-06
+SESSION: amux
+CARD: AMUX-4161
+SYMPTOM: Live dogfooding closed AMUX-4162, but AMUX-4163 remained in backlog across
+ multiple measured board-drive ticks even though its only dependency was done. The
+ selector found it correctly; the shared transition engine then refused backlog to
+ todo because this lane already had 122 unrelated todo cards against its 20-card
+ queue ceiling, and the refusal was discarded without a log line.
+COST: An accepted ordered plan could stop permanently between steps for a condition
+ unrelated to that plan, while `/api/debug/board-drive` reported `promoted: 0` with
+ no card or refusal reason to investigate.
+FIX: Dependency-cleared promotions now carry a narrow todo-ceiling exemption while
+ retaining transition, archive, and gate checks; revisit and ordinary queue additions
+ remain capped. Any selected promotion still refused by the transition engine now
+ emits a measured `promotion_refused` WARN naming the card and exact refusal.

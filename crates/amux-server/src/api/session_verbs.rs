@@ -4105,19 +4105,23 @@ pub(crate) async fn cmd_hist_record_full(
     // consequence (CLAUDE.md: hang the consequence off the write that happened).
     // Gated on ctype=="user": inter-session ("session") and scheduler ("schedule")
     // messages are not the recipient's task and must not spam the board.
-    // ISOLATED (AMUX-3232): a raw agent leaves no board trace; its prompts are
-    // not auto-captured as ledger cards. It has no session/URL to run `amux
-    // board`, so a card minted here would name work nobody can drive, and the
-    // accountability sweep is likewise told to skip it.
+    // ISOLATED DOES NOT MEAN INVISIBLE WORK (AMUX-4159). Isolation controls
+    // what amux injects into a worker and whether peers/automation can reach it;
+    // it does not change the fact that an owner's delivered prompt is work in
+    // the shared ledger. The `amux` lane itself supplied the specimen: its
+    // CC_ISOLATED=1 prompt was delivered and recorded as confirmed while
+    // card_id stayed NULL. The board already renders isolated owners explicitly,
+    // so keep the card visible and let that label describe its reachability.
     // AND NOT FOR A PROMPT THE LANE NEVER RECEIVED (AMUX-3903). A ledger card
     // asserts "this lane was given this task", and a stuck send means it was
     // not: the text is sitting in the composer. Minting one would hand the
     // accountability sweep a lane to chase over work nobody delivered. The
     // message ROW still goes in, because the delivery attempt is the fact worth
     // keeping; the card is a consequence that did not happen.
-    if is_user && landed && !skip_board && !session_is_isolated(&cap_session) {
+    if is_user && landed && !skip_board {
         let row_id = msg_row_id.load(std::sync::atomic::Ordering::SeqCst);
         if row_id > 0 {
+            let cap_isolated = session_is_isolated(&cap_session);
             let minted: std::sync::Arc<std::sync::Mutex<Option<String>>> =
                 std::sync::Arc::new(std::sync::Mutex::new(None));
             let minted_w = minted.clone();
@@ -4150,10 +4154,12 @@ pub(crate) async fn cmd_hist_record_full(
                 Ok(_) => {
                     if let Some(cid) = minted.lock().unwrap().take() {
                         tracing::info!(session = %sess_log, card_id = %cid,
+                            owner_isolated = cap_isolated,
                             "ledger: auto-captured board card from delivered prompt");
                     }
                 }
                 Err(e) => tracing::warn!(session = %sess_log, error = %e,
+                    owner_isolated = cap_isolated,
                     "ledger auto-capture FAILED; prompt recorded without a board card"),
             }
         }
@@ -13521,8 +13527,10 @@ pub(crate) fn env_flag_on(v: Option<&str>) -> bool {
 /// persists across reload and applies at the next spawn with no new store to
 /// keep in step (deliberately not a second spelling in a SQLite column). This
 /// function is the single source of truth every isolation decision consults:
-/// spawn-env suppression, `--mcp-config`, board auto-capture, the peer fleet
-/// list, the fleet roster, the peer-send guard, and the status/rate-limit sweep.
+/// spawn-env suppression, `--mcp-config`, the peer fleet list, the fleet roster,
+/// the peer-send guard, and the status/rate-limit sweep. Owner prompt capture is
+/// deliberately not an isolation decision: the shared board records human work
+/// even when the worker receiving it has no injected harness (AMUX-4159).
 ///
 /// AND WHAT GETS TYPED INTO ITS PANE, which that list did not cover for two
 /// months (Ethan, 2026-08-26: "we have an isolated worker but it still has amux
@@ -19832,6 +19840,280 @@ mod tests {
         );
     }
 
+    /// AMUX-4161. One hermetic chaos journey through the shipped seams:
+    /// delivered owner message -> capture card -> concurrent decomposition
+    /// retry -> dependency-gated execution -> terminal children -> terminal
+    /// root epic. The assertions inspect every board item's durable detail,
+    /// not just the HTTP statuses that moved it.
+    #[tokio::test]
+    async fn message_decomposition_chaos_reaches_terminal_states_with_complete_cards() {
+        let (st, _dir) = state();
+        let lane = "chaos-lane";
+        cmd_hist_record_full(
+            &st,
+            lane,
+            "Build the message pipeline, exercise dependency failures, and validate every task detail",
+            "user",
+            "",
+            false,
+            DeliveryMeta::direct(),
+        )
+        .await;
+        let root: String = st
+            .store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT card_id FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1",
+                [lane],
+                |r| r.get(0),
+            )
+            .expect("the delivered message must have a linked capture card");
+        let app = crate::api::router(st.clone());
+        let plan = json!({"tasks":[
+            {
+                "title":"Implement the captured behavior",
+                "description":"Implement the independently testable message behavior.",
+                "type":"code","priority":0,"depends_on":[],
+                "next_action":"Implement the focused message behavior",
+                "acceptance_criteria":[
+                    "The focused message regression test passes",
+                    "The produced implementation artifact is recorded"
+                ]
+            },
+            {
+                "title":"Exercise dependency and retry faults",
+                "description":"Inject dependency and idempotency failures through the real API.",
+                "type":"investigation","priority":1,"depends_on":[1],
+                "next_action":"Run the dependency chaos matrix",
+                "acceptance_criteria":[
+                    "An early dependent claim returns dependency_blocked",
+                    "A duplicate plan creates exactly one child set"
+                ]
+            },
+            {
+                "title":"Validate terminal board detail",
+                "description":"Inspect every child and the completed root epic.",
+                "type":"doc","priority":2,"depends_on":[2],
+                "next_action":"Record the terminal validation results",
+                "acceptance_criteria":[
+                    "Every child records evidence and a close timestamp",
+                    "The root epic records every terminal child status"
+                ]
+            }
+        ]});
+        let path = format!("/api/board/{root}/decompose");
+        let worker_headers = [("X-Amux-Worker", lane)];
+
+        // Two clients lose sight of each other and submit the identical plan
+        // together. SQLite serialization plus the durable plan hash must yield
+        // one creation and one measured idempotent retry, never six children.
+        let a = call_with(
+            &app,
+            "POST",
+            &path,
+            Some(plan.clone()),
+            &worker_headers,
+        );
+        let b = call_with(
+            &app,
+            "POST",
+            &path,
+            Some(plan.clone()),
+            &worker_headers,
+        );
+        let ((sa, va), (sb, vb)) = tokio::join!(a, b);
+        let mut statuses = [sa, sb];
+        statuses.sort();
+        assert_eq!(statuses, [StatusCode::OK, StatusCode::CREATED], "{va} / {vb}");
+        let (created, retried) = if sa == StatusCode::CREATED { (&va, &vb) } else { (&vb, &va) };
+        assert_eq!(retried["idempotent"], json!(true), "{retried}");
+        assert_eq!(retried["idempotency_measured"], json!(true), "{retried}");
+        assert_eq!(created["plan_sha256"], retried["plan_sha256"]);
+        let children = created["tasks"].as_array().unwrap().clone();
+        assert_eq!(children.len(), 3);
+        let child_count: i64 = st
+            .store
+            .read()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM issues WHERE epic=?1", [&root], |r| r.get(0))
+            .unwrap();
+        assert_eq!(child_count, 3, "a concurrent retry must not duplicate the plan");
+
+        for (idx, child) in children.iter().enumerate() {
+            assert!(!child["title"].as_str().unwrap_or_default().trim().is_empty());
+            assert!(child["desc"].as_str().unwrap_or_default().split_whitespace().count() >= 3);
+            assert_eq!(child["session"], json!(lane));
+            assert_eq!(child["creator"], json!(lane));
+            assert_eq!(child["source"], json!("decomposition"));
+            assert_eq!(child["epic"], json!(root));
+            assert_eq!(child["tags"], json!([format!("p{idx}")]));
+            assert!(child["next_action"].as_str().unwrap_or_default().split_whitespace().count() >= 3);
+            assert!(child["acceptance_criteria"].as_array().is_some_and(|v| !v.is_empty()));
+        }
+
+        let ids = children
+            .iter()
+            .map(|c| c["id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(children[1]["depends_on"], json!([ids[0].clone()]));
+        assert_eq!(children[2]["depends_on"], json!([ids[1].clone()]));
+
+        // Fault: try to leapfrog the plan.
+        let (blocked_status, blocked) = call_with(
+            &app,
+            "POST",
+            &format!("/api/board/{}/claim", ids[1]),
+            Some(json!({})),
+            &[("X-Amux-Session", lane)],
+        )
+        .await;
+        assert_eq!(blocked_status, StatusCode::CONFLICT, "{blocked}");
+        assert_eq!(blocked["code"], json!("dependency_blocked"));
+        assert_eq!(blocked["blocking"], json!([ids[0].clone()]));
+        assert_eq!(blocked["measured"], json!(true));
+
+        for (idx, id) in ids.iter().enumerate() {
+            if idx > 0 {
+                if idx == 1 {
+                    // Chaos: this lane already has a full ordinary dispatch
+                    // queue. A dependency successor is committed work that
+                    // replaces the predecessor we just closed; it must not sit
+                    // in backlog until unrelated todos drain below the cap.
+                    st.store
+                        .write(move |conn| {
+                            for filler in 0..crate::db::board_store::TODO_WIP_LIMIT_DEFAULT {
+                                conn.execute(
+                                    "INSERT INTO issues \
+                                     (id,title,desc,status,session,creator,owner_type,type,created,updated) \
+                                     VALUES (?1,?1,'Independent queued work','todo',?2,?2,'agent','code',1,1)",
+                                    rusqlite::params![format!("QUEUE-{filler}"), lane],
+                                )?;
+                            }
+                            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                        })
+                        .unwrap();
+                }
+                let (promoted, held) = crate::runtime_jobs::board_drive::promote_ready_backlog(&st).await;
+                assert_eq!((promoted, held), (1, 0), "step {idx} did not become runnable");
+            }
+            let (claim_status, claim) = call_with(
+                &app,
+                "POST",
+                &format!("/api/board/{id}/claim"),
+                Some(json!({})),
+                &[("X-Amux-Session", lane)],
+            )
+            .await;
+            assert_eq!(claim_status, StatusCode::OK, "step {idx}: {claim}");
+            assert_eq!(claim["status"], json!("doing"));
+
+            let terminal = json!({
+                "status":"done",
+                "gate_ack":true,
+                "evidence":"crates/amux-server/tests/board_api.rs",
+                "last_result":format!("Chaos step {} reached its expected terminal state.", idx + 1)
+            });
+            if idx == 2 {
+                // Two finishers race on the last step. Exactly one transition
+                // applies; the replay is an honest 200 no-op with rev intact.
+                let terminal_path = format!("/api/board/{id}");
+                let terminal_headers = [("X-Amux-Session", lane)];
+                let x = call_with(
+                    &app,
+                    "PATCH",
+                    &terminal_path,
+                    Some(terminal.clone()),
+                    &terminal_headers,
+                );
+                let y = call_with(
+                    &app,
+                    "PATCH",
+                    &terminal_path,
+                    Some(terminal),
+                    &terminal_headers,
+                );
+                let ((sx, vx), (sy, vy)) = tokio::join!(x, y);
+                assert_eq!((sx, sy), (StatusCode::OK, StatusCode::OK), "{vx} / {vy}");
+                let applied = [vx["applied"].as_bool(), vy["applied"].as_bool()];
+                assert_eq!(applied.iter().filter(|v| **v == Some(true)).count(), 1, "{applied:?}");
+                assert_eq!(applied.iter().filter(|v| **v == Some(false)).count(), 1, "{applied:?}");
+            } else {
+                let (done_status, done) = call_with(
+                    &app,
+                    "PATCH",
+                    &format!("/api/board/{id}"),
+                    Some(terminal),
+                    &[("X-Amux-Session", lane)],
+                )
+                .await;
+                assert_eq!(done_status, StatusCode::OK, "step {idx}: {done}");
+                assert_eq!(done["status"], json!("done"));
+                assert_eq!(done["applied"], json!(true));
+            }
+        }
+
+        assert_eq!(crate::runtime_jobs::board_drive::complete_finished_epics(&st).await, 1);
+        let (root_status, root_detail) = call(&app, "GET", &format!("/api/board/{root}"), None).await;
+        assert_eq!(root_status, StatusCode::OK);
+        assert_eq!(root_detail["status"], json!("done"));
+        assert!(root_detail["evidence"].as_str().unwrap_or_default().contains(&ids[0]));
+        assert!(root_detail["evidence"].as_str().unwrap_or_default().contains(&ids[2]));
+        assert!(root_detail["last_result"].as_str().unwrap_or_default().contains("Completed child plan"));
+        assert_eq!(root_detail["messages"][0]["card_id"], json!(root));
+
+        for id in &ids {
+            let (_, child) = call(&app, "GET", &format!("/api/board/{id}"), None).await;
+            assert_eq!(child["status"], json!("done"));
+            assert!(child["closed_at"].as_i64().is_some());
+            assert!(child["evidence"].as_str().is_some_and(|v| v.contains("board_api.rs")));
+            assert!(child["last_result"].as_str().is_some_and(|v| v.contains("terminal state")));
+            assert_eq!(child["messages"][0]["card_id"], json!(root));
+        }
+    }
+
+    /// AMUX-4159: `CC_ISOLATED` strips the agent-side harness; it must not strip
+    /// the owner's work from the shared ledger. This is the exact prompt shape
+    /// that was delivered to the live isolated `amux` lane with
+    /// submit_verdict=confirmed while card_id remained NULL.
+    #[tokio::test]
+    async fn an_isolated_workers_owner_prompt_still_reaches_the_board() {
+        let (st, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("raw.env"), "CC_ISOLATED=1\n").unwrap();
+        assert!(session_is_isolated("raw"), "fixture must exercise the isolated path");
+
+        cmd_hist_record_full(
+            &st,
+            "raw",
+            "[09:23 AM] implement something like this\n\nhttps://x.com/undefinedki/status/2095942506433089832?s=46",
+            "user",
+            "",
+            false,
+            DeliveryMeta {
+                delivery: Some(Delivery::Direct),
+                queued_at_ms: None,
+                submit_verdict: Some("confirmed"),
+            },
+        )
+        .await;
+
+        let (card_id, verdict): (Option<String>, Option<String>) = st
+            .store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT card_id, submit_verdict FROM cmd_history WHERE session='raw' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(card_id.is_some(), "an isolated owner must still see delivered work on the board");
+        assert_eq!(verdict.as_deref(), Some("confirmed"));
+    }
+
     // AMUX-3330: a pure status query is answered inline and produces no
     // deliverable, so it must NOT mint a board work card (the old capture minted
     // type=code/doing, which a question can never take through the gate and which
@@ -20309,7 +20591,20 @@ mod tests {
         path: &str,
         body: Option<Value>,
     ) -> (StatusCode, Value) {
+        call_with(app, method, path, body, &[]).await
+    }
+
+    async fn call_with(
+        app: &Router,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, Value) {
         let mut req = Request::builder().method(method).uri(path);
+        for (key, value) in headers {
+            req = req.header(*key, *value);
+        }
         let body = match body {
             Some(v) => {
                 req = req.header("content-type", "application/json");

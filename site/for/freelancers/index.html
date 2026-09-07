@@ -45,7 +45,7 @@
     "description": "Freelance developers use amux to run parallel AI coding agents across client projects, manage client relationships in a built-in CRM, and deliver completed features overnight — all from one dashboard or their phone.",
     "url": "https://amux.io/for/freelancers/",
     "datePublished": "2026-07-08",
-    "dateModified": "2026-07-08",
+    "dateModified": "2026-09-06",
     "author": {"@type": "Organization", "name": "amux", "url": "https://amux.io"},
     "publisher": {"@type": "Organization", "name": "amux", "url": "https://amux.io", "logo": {"@type": "ImageObject", "url": "https://amux.io/icon.png"}},
     "image": "https://amux.io/og-image.png",
@@ -119,7 +119,12 @@
     <div class="breadcrumb"><a href="/">amux</a> <span class="sep">›</span> <a href="/for/">For Developers</a> <span class="sep">›</span> <span>Freelancers</span></div>
 
     <h1>amux for Freelancers</h1>
-    <p class="subtitle">Run an AI engineering team from one dashboard. Bill hours while agents do the coding, manage every client relationship in one place, and deliver completed features overnight. <em>Updated July 2026.</em></p>
+    <p class="subtitle">Run an AI engineering team from one dashboard. Bill hours while agents do the coding, manage every client relationship in one place, and deliver completed features overnight. <em>Updated September 2026.</em></p>
+
+    <div style="background:var(--green,#2e7d32);color:#000;border-radius:8px;padding:0.85rem 1.25rem;margin:1.25rem 0;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.75rem">
+      <span style="font-weight:600">Open-source AI agent fleet for freelancers — zero subscription fee, runs on your laptop, 387+ stars.</span>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" style="background:#000;color:#fff;padding:0.45rem 1rem;border-radius:6px;font-weight:600;text-decoration:none;white-space:nowrap;font-size:0.9rem" onclick="posthog&&posthog.capture('exp080_freelancers_topofpage_cta_click')">View amux on GitHub ★</a>
+    </div>
 
     <p>amux is an open-source control plane that gives freelance developers a parallel AI engineering team — without hiring. It launches, monitors, and self-heals simultaneous Claude Code, Codex, or Gemini CLI sessions across your client projects, with a built-in kanban board, notes, CRM, Gmail API integration, browser automation, and a scheduler. One Rust binary, zero external dependencies, runs on your MacBook, and is controllable from your iPhone at a client meeting.</p>
 
@@ -298,14 +303,25 @@ curl -sk -X POST -H 'Content-Type: application/json' \
       </table>
     </div>
 
+    <h2>What's new in September 2026</h2>
+    <p>Recent amux updates that directly benefit freelancers:</p>
+    <ul>
+      <li><strong>Auto-drain (AMUX-4055):</strong> Sessions self-assign their next backlog task when they finish. No manual dispatch. Queue a week of client work on the board, enable drain on each session, and agents work through it automatically. <code>amux board drain on &lt;session&gt;</code></li>
+      <li><strong>Privacy-safe activity trail:</strong> The browser controller now keeps a local activity log of what each session did. Useful for client billing — you can show exactly what the agent did and when, without exposing sensitive data.</li>
+      <li><strong>Provider usage windows:</strong> Settings now shows the current usage window and spend for every AI provider (Anthropic, OpenAI, Google). No more checking three dashboards to understand what you're burning across client work.</li>
+      <li><strong>Resume after usage reset:</strong> Sessions that hit a usage cap now automatically resume when the window resets. Agents don't stall overnight just because Claude Max hit its limit at 11pm.</li>
+      <li><strong>Board block that actually works:</strong> <code>amux board block CARD-ID</code> now reliably keeps a card out of the drain queue. Use this to freeze in-flight client work you don't want agents touching until you review it.</li>
+    </ul>
+
     <h2>Getting started: freelancer setup in 15 minutes</h2>
     <p>If you're new to amux, here is the fastest path from zero to agents running on real client work:</p>
 
     <ol>
       <li>
         <strong>Install amux (2 minutes).</strong>
-        <pre style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:1rem;overflow-x:auto;font-size:0.85rem;margin-top:0.5rem;"><code>git clone https://github.com/mixpeek/amux &amp;&amp; cd amux &amp;&amp; ./install.sh</code></pre>
-        Requires Python 3.9+ and Claude Code CLI (or Codex CLI). That's it — no external services, no Docker.
+        <pre style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:1rem;overflow-x:auto;font-size:0.85rem;margin-top:0.5rem;"><code>brew install mixpeek/amux/amux
+# or: git clone https://github.com/mixpeek/amux &amp;&amp; cd amux &amp;&amp; ./install.sh</code></pre>
+        Single Rust binary, zero external dependencies. No Python, no Docker.
       </li>
       <li>
         <strong>Register your first client project (2 minutes).</strong>

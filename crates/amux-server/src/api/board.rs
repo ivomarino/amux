@@ -30,7 +30,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rusqlite::OptionalExtension;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::sync::{Arc, Mutex};
 
@@ -1088,6 +1088,14 @@ async fn get_contract(
             "durability": "requested_by, callback target/prompt/state/message id/fired time/error live on the task. A stable steering id makes restart recovery idempotent; model/provider context is not involved",
             "visibility": "the initial request and terminal callback are Messages rows linked to the same task id; the card carries requester, callback state, action log and produced assets",
             "security": "a callback can return only to the server-verified requester; isolated raw workers remain outside harness delivery",
+        },
+        "capture_decomposition": {
+            "cli": "amux board decompose <capture-id> --stdin",
+            "atomicity": "the root becomes an epic and all 2-50 children are created in one SQLite writer transaction; any invalid child creates zero",
+            "required_per_child": ["unique title", "concrete description", "non-epic type", "p0-p3 priority", "earlier-task dependency indexes", "concrete next_action", "1-12 falsifiable acceptance_criteria"],
+            "idempotency": "the normalized plan SHA-256 is durable on the root epic; an identical retry returns idempotent=true and a different retry returns 409 decomposition_plan_conflict",
+            "dependency_execution": "todo/backlog claims are refused while any dependency is open; board-drive promotes dependency-backed backlog only after every dependency is done or verified, and a committed successor is not stranded by unrelated todo queue depth",
+            "completion": "when every child is done, verified, discarded, or quarantined, board-drive closes the root epic and records the child-status summary as evidence",
         },
         // AMUX-2933 (ts-gke). The list filters WORK and were documented
         // NOWHERE — "discoverable only by guessing", and the cap was worse than
@@ -2580,7 +2588,7 @@ const RECOGNISED_BOARD_PARAMS: &[&str] = &[
 ];
 /// Cache-buster keys clients legitimately append; never a filter typo, so they
 /// are not surfaced as "ignored" (that would be pure noise on every polled tab).
-const BENIGN_QUERY_KEYS: &[&str] =
+pub(crate) const BENIGN_QUERY_KEYS: &[&str] =
     &["_", "t", "v", "ts", "cb", "_t", "cache", "cachebust", "nocache"];
 
 /// Query keys GET /api/board neither consumes nor treats as a benign
@@ -3362,6 +3370,22 @@ enum RequestParentResolution {
     Refused(RequestParentRefusal),
 }
 
+/// What happened when a worker-side helper tried to leave evidence on the task
+/// that caused it. This is deliberately a receipt, not another board card:
+/// high-frequency helper calls are activity INSIDE work, and minting one task
+/// per read would turn observability into the board accumulation it is meant to
+/// explain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TaskActivityReceipt {
+    pub measured: bool,
+    pub n_considered: usize,
+    pub verdict: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub card_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+}
+
 fn request_parent_is_owned(row: &IssueRow, requester: &str) -> bool {
     row.session.as_deref() == Some(requester)
         && row.owner_type == "agent"
@@ -3470,6 +3494,118 @@ fn resolve_request_parent(
             candidates: doing,
         })),
     }
+}
+
+/// Append compact worker activity to the SAME current-task predicate used by
+/// peer delegation. That shared resolver matters: a bulk read and a farmed-out
+/// dependency must not disagree about which parent the worker is advancing.
+///
+/// The payload is caller-supplied summary metadata only (counts/model/verdict),
+/// never helper output or source contents. The task mutation carries a normal
+/// StateEvent, so other dashboard clients see it through the existing board
+/// realtime path rather than a private side channel.
+fn record_session_task_activity(
+    conn: &rusqlite::Connection,
+    session: &str,
+    explicit: Option<&str>,
+    line: &str,
+    now: i64,
+) -> rusqlite::Result<(TaskActivityReceipt, Option<PendingEvent>)> {
+    match resolve_request_parent(conn, session, explicit)? {
+        RequestParentResolution::Standalone => Ok((
+            TaskActivityReceipt {
+                measured: true,
+                n_considered: 0,
+                verdict: "no_active_task".into(),
+                card_id: None,
+                why: Some(format!(
+                    "worker {session} has no active task; the helper receipt remains in amux logs"
+                )),
+            },
+            None,
+        )),
+        RequestParentResolution::Refused(refusal) => {
+            let n_considered = refusal.candidates.len();
+            Ok((
+                TaskActivityReceipt {
+                    measured: true,
+                    n_considered,
+                    verdict: refusal.code.into(),
+                    card_id: None,
+                    why: Some(refusal.why),
+                },
+                None,
+            ))
+        }
+        RequestParentResolution::Linked(mut row) => {
+            row.log = Some(bs::append_log(row.log.as_deref(), &hhmm(), line));
+            row.updated = now;
+            bs::save_patched(conn, &mut row)?;
+            let event = ev_snap(&row, MutationKind::Updated);
+            Ok((
+                TaskActivityReceipt {
+                    measured: true,
+                    n_considered: 1,
+                    verdict: "attached".into(),
+                    card_id: Some(row.id),
+                    why: None,
+                },
+                Some(event),
+            ))
+        }
+    }
+}
+
+pub(crate) async fn append_session_task_activity(
+    state: &AppState,
+    session: &str,
+    explicit: Option<&str>,
+    line: &str,
+) -> Result<TaskActivityReceipt, anyhow::Error> {
+    let session = session.trim();
+    if session.is_empty() {
+        return Ok(TaskActivityReceipt {
+            measured: false,
+            n_considered: 0,
+            verdict: "unattributed".into(),
+            card_id: None,
+            why: Some(
+                "no X-Amux-Worker or X-Amux-Session header; no task owner could be resolved"
+                    .into(),
+            ),
+        });
+    }
+    let (session, explicit, line) = (
+        session.to_string(),
+        explicit.map(str::to_string),
+        line.to_string(),
+    );
+    let slot = Arc::new(Mutex::new(None));
+    let slot_w = slot.clone();
+    state
+        .store
+        .write_async(move |conn| {
+            let (receipt, event) = record_session_task_activity(
+                conn,
+                &session,
+                explicit.as_deref(),
+                &line,
+                now_secs(),
+            )?;
+            let applied = event.is_some();
+            *slot_w.lock().expect("task activity receipt slot poisoned") = Some(receipt);
+            Ok(WriteOutcome {
+                applied,
+                events: event.into_iter().collect(),
+            })
+        })
+        .await?;
+    let receipt = slot
+        .lock()
+        .expect("task activity receipt slot poisoned")
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("task activity receipt was not produced"));
+    receipt
 }
 
 pub async fn create_item(
@@ -4468,8 +4604,73 @@ struct DecomposeTask {
     item_type: String,
     priority: u8,
     #[serde(default)]
-    depends_on: Vec<usize>,
+    depends_on: Vec<DepRef>,
     next_action: String,
+    /// Plain-language success conditions carried on the card itself. These are
+    /// deliberately not the typed `_amux_criteria` verifier objects: a
+    /// decomposition is authored by the worker that will execute it, while
+    /// typed criteria enforce independent authorship. This field is the
+    /// worker-visible draft the independent reviewer can turn into verifiers.
+    #[serde(default)]
+    acceptance_criteria: Vec<TextRef>,
+}
+
+/// One `depends_on` entry AS THE CALLER WROTE IT (AF-523).
+///
+/// The field is a 1-based index into the sibling `tasks` array, and this used
+/// to be typed `Vec<usize>` — so a caller who sent something else was answered
+/// by SERDE, at the body layer, before the handler that owns the real message
+/// ever ran. The same mistake made two ways got two qualities of answer, and
+/// the worse one came first:
+///
+///   depends_on: ["[incident] RCA doc: ..."]  -> 422, axum's raw rejection:
+///     "tasks[1].depends_on[0]: invalid type: string \"...\", expected usize"
+///   depends_on: [0]                          -> 400, amux's own:
+///     "task 2 dependency 0 must name an earlier task by 1-based index"
+///
+/// Measured 2026-09-06 by the daily log sweep: `backend` hit the first three
+/// times in 42 seconds, then the second, then got it right — four attempts for
+/// one field. `expected usize` is true and does not say that the usize is a
+/// position in the array they just wrote. Naming the thing you depend on is
+/// what `depends_on` means everywhere else on this board, so it is the honest
+/// guess, and it was the one answered by the framework.
+///
+/// Accepting the value here does not accept the MISTAKE — it routes it to
+/// `validate_decomposition`, which already has the sentence worth reading.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum DepRef {
+    Index(usize),
+    Other(serde_json::Value),
+}
+
+/// Preserve a malformed criterion until amux can explain the expected shape.
+/// A `Vec<String>` would let serde answer first with an opaque 422, the exact
+/// failure AF-523 fixed for `depends_on` one field above.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum TextRef {
+    Text(String),
+    Other(serde_json::Value),
+}
+
+impl TextRef {
+    fn shown(&self) -> String {
+        match self {
+            TextRef::Text(s) => format!("{s:?}"),
+            TextRef::Other(v) => v.to_string(),
+        }
+    }
+}
+
+impl DepRef {
+    /// How the caller wrote it, for an error message that quotes them back.
+    fn shown(&self) -> String {
+        match self {
+            DepRef::Index(n) => n.to_string(),
+            DepRef::Other(v) => v.to_string(),
+        }
+    }
 }
 
 fn default_decompose_type() -> String {
@@ -4481,14 +4682,41 @@ struct DecomposeBody {
     tasks: Vec<DecomposeTask>,
 }
 
-fn validate_decomposition(tasks: &[DecomposeTask]) -> Result<(), String> {
+#[derive(Debug)]
+struct ValidatedDecomposition {
+    dependencies: Vec<Vec<usize>>,
+    acceptance_criteria: Vec<Vec<String>>,
+    plan_sha256: String,
+}
+
+/// Validate, and return the NORMALIZED 1-based dependency indices per task.
+///
+/// Returning them rather than re-reading `depends_on` downstream is what makes
+/// the "not an index" branch impossible to reach twice: after this returns Ok
+/// there is no `DepRef::Other` left in play, so the child-creation loop has no
+/// can't-happen arm to guess at (AF-523).
+fn validate_decomposition(tasks: &[DecomposeTask]) -> Result<ValidatedDecomposition, String> {
     if !(2..=50).contains(&tasks.len()) {
         return Err("decomposition requires 2 to 50 child tasks".into());
     }
+    let mut out: Vec<Vec<usize>> = Vec::with_capacity(tasks.len());
+    let mut all_criteria: Vec<Vec<String>> = Vec::with_capacity(tasks.len());
+    let mut titles = std::collections::HashSet::new();
     for (idx, task) in tasks.iter().enumerate() {
         let n = idx + 1;
         if task.title.trim().is_empty() {
             return Err(format!("task {n} has an empty title"));
+        }
+        if !titles.insert(task.title.trim().to_ascii_lowercase()) {
+            return Err(format!(
+                "task {n} repeats the title {:?}; every child must be independently identifiable",
+                task.title.trim()
+            ));
+        }
+        if bs::continuation_verdict(&task.description) != bs::ContinuationVerdict::Ok {
+            return Err(format!(
+                "task {n} needs a concrete description of at least three words"
+            ));
         }
         if !bs::KNOWN_TYPES.contains(&task.item_type.as_str()) || task.item_type == "epic" {
             return Err(format!(
@@ -4504,8 +4732,47 @@ fn validate_decomposition(tasks: &[DecomposeTask]) -> Result<(), String> {
                 "task {n} needs a concrete next_action of at least three words"
             ));
         }
+        if task.acceptance_criteria.is_empty() || task.acceptance_criteria.len() > 12 {
+            return Err(format!(
+                "task {n} needs 1 to 12 acceptance_criteria so its terminal state is falsifiable"
+            ));
+        }
+        let mut criteria = Vec::with_capacity(task.acceptance_criteria.len());
+        let mut seen_criteria = std::collections::HashSet::new();
+        for (criterion_idx, criterion) in task.acceptance_criteria.iter().enumerate() {
+            let TextRef::Text(text) = criterion else {
+                return Err(format!(
+                    "task {n} acceptance_criteria entry {} must be a string, got {}",
+                    criterion_idx + 1,
+                    criterion.shown()
+                ));
+            };
+            let text = text.trim();
+            if bs::continuation_verdict(text) != bs::ContinuationVerdict::Ok {
+                return Err(format!(
+                    "task {n} acceptance_criteria entry {} must be a concrete condition of at least three words",
+                    criterion_idx + 1
+                ));
+            }
+            if !seen_criteria.insert(text.to_ascii_lowercase()) {
+                return Err(format!(
+                    "task {n} repeats acceptance criterion {:?}",
+                    text
+                ));
+            }
+            criteria.push(text.to_string());
+        }
         let mut seen = std::collections::HashSet::new();
+        let mut deps: Vec<usize> = Vec::with_capacity(task.depends_on.len());
         for dep in &task.depends_on {
+            let DepRef::Index(dep) = dep else {
+                return Err(format!(
+                    "task {n} dependency {} must name an earlier task by 1-based index \
+                     (a POSITION in this request's `tasks` array, 1 for the first), not a \
+                     card id or a title",
+                    dep.shown()
+                ));
+            };
             if *dep == 0 || *dep >= n {
                 return Err(format!(
                     "task {n} dependency {dep} must name an earlier task by 1-based index"
@@ -4514,9 +4781,50 @@ fn validate_decomposition(tasks: &[DecomposeTask]) -> Result<(), String> {
             if !seen.insert(*dep) {
                 return Err(format!("task {n} repeats dependency {dep}"));
             }
+            deps.push(*dep);
         }
+        out.push(deps);
+        all_criteria.push(criteria);
     }
-    Ok(())
+
+    // A retry is idempotent only when the normalized PLAN is the same. The
+    // hash is written on the root epic before the transaction commits, so a
+    // lost response, a restart, and a concurrent retry all share one durable
+    // discriminator. Mutable child prose/status never participates.
+    let canonical = tasks
+        .iter()
+        .enumerate()
+        .map(|(idx, task)| {
+            json!({
+                "title": task.title.trim(),
+                "description": task.description.trim(),
+                "type": task.item_type,
+                "priority": task.priority,
+                "depends_on": out[idx],
+                "next_action": task.next_action.trim(),
+                "acceptance_criteria": all_criteria[idx],
+            })
+        })
+        .collect::<Vec<_>>();
+    use sha2::Digest as _;
+    let mut digest = sha2::Sha256::new();
+    digest.update(serde_json::to_vec(&canonical).expect("JSON values always serialize"));
+    let plan_sha256 = format!("{:x}", digest.finalize());
+
+    Ok(ValidatedDecomposition {
+        dependencies: out,
+        acceptance_criteria: all_criteria,
+        plan_sha256,
+    })
+}
+
+fn decomposition_plan_sha256(log: Option<&str>) -> Option<String> {
+    log.unwrap_or_default()
+        .split_whitespace()
+        .rev()
+        .find_map(|token| token.strip_prefix("plan_sha256="))
+        .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_string)
 }
 
 /// POST /api/board/{id}/decompose — atomically turn a capture shell into an
@@ -4527,9 +4835,27 @@ async fn decompose_item(
     headers: HeaderMap,
     Json(body): Json<DecomposeBody>,
 ) -> Response {
-    if let Err(why) = validate_decomposition(&body.tasks) {
-        return err(StatusCode::BAD_REQUEST, json!({"error": why, "item": id}));
-    }
+    let validated = match validate_decomposition(&body.tasks) {
+        Ok(d) => d,
+        Err(why) => {
+            tracing::warn!(
+                target: "amux::board",
+                epic = %id,
+                verdict = "invalid_plan",
+                measured = true,
+                n_considered = body.tasks.len(),
+                reason = %why,
+                "board capture decomposition refused"
+            );
+            return err(StatusCode::BAD_REQUEST, json!({
+                "error": why,
+                "item": id,
+                "verdict": "invalid_plan",
+                "measured": true,
+                "n_considered": body.tasks.len(),
+            }));
+        }
+    };
     let (_, actor) = actor_from_headers(&headers);
     if actor == "api-anonymous" {
         return err(
@@ -4542,10 +4868,14 @@ async fn decompose_item(
         Missing,
         NotCapture,
         WrongOwner(String),
-        Already(IssueRow, Vec<IssueRow>),
+        Already(IssueRow, Vec<IssueRow>, Option<String>),
         Created(IssueRow, Vec<IssueRow>),
     }
     let tasks = body.tasks;
+    let dep_indices = validated.dependencies;
+    let acceptance_criteria = validated.acceptance_criteria;
+    let plan_sha256 = validated.plan_sha256;
+    let submitted_plan_sha256 = plan_sha256.clone();
     let id_w = id.clone();
     let actor_w = actor.clone();
     let slot: Arc<Mutex<Option<Out>>> = Arc::new(Mutex::new(None));
@@ -4571,7 +4901,12 @@ async fn decompose_item(
                     .iter()
                     .filter_map(|child| bs::get_issue(conn, child).ok().flatten())
                     .collect();
-                return finish(&slot_w, Out::Already(parent, children), no_write());
+                let existing_plan_sha256 = decomposition_plan_sha256(parent.log.as_deref());
+                return finish(
+                    &slot_w,
+                    Out::Already(parent, children, existing_plan_sha256),
+                    no_write(),
+                );
             }
             if parent.source.as_deref() != Some("capture")
                 && !parent.desc.trim_start().starts_with("**Prompt:**")
@@ -4600,16 +4935,15 @@ async fn decompose_item(
                 parent.log.as_deref(),
                 &stamp,
                 &format!(
-                    "decomposed by {actor_w} into {} ordered child task(s)",
-                    tasks.len()
+                    "decomposed by {actor_w} into {} ordered child task(s) plan_sha256={plan_sha256}",
+                    tasks.len(),
                 ),
             ));
             bs::save_patched(conn, &mut parent)?;
             let mut events = vec![ev_snap(&parent, MutationKind::Updated)];
             let mut children: Vec<IssueRow> = Vec::with_capacity(tasks.len());
             for (idx, task) in tasks.iter().enumerate() {
-                let deps = task
-                    .depends_on
+                let deps = dep_indices[idx]
                     .iter()
                     .map(|n| children[*n - 1].id.clone())
                     .collect::<Vec<_>>();
@@ -4644,6 +4978,10 @@ async fn decompose_item(
                 let mut child = bs::create_issue(conn, &new, now)?;
                 child.epic = Some(parent.id.clone());
                 child.next_action = Some(task.next_action.trim().to_string());
+                child.acceptance_criteria = Some(
+                    serde_json::to_string(&acceptance_criteria[idx])
+                        .expect("validated string criteria always serialize"),
+                );
                 child.log = Some(bs::append_log(
                     child.log.as_deref(),
                     &stamp,
@@ -4685,15 +5023,59 @@ async fn decompose_item(
             StatusCode::FORBIDDEN,
             json!({"error":"capture belongs to another worker", "item":id, "owner":owner, "caller":actor}),
         ),
-        Some(Out::Already(parent, children)) => Json(json!({
-            "ok": true,
-            "id": parent.id,
-            "status": parent.status,
-            "epic": detail_body(&parent),
-            "tasks": children.iter().map(detail_body).collect::<Vec<_>>(),
-            "idempotent": true,
-        }))
-        .into_response(),
+        Some(Out::Already(parent, children, existing_plan_sha256)) => {
+            match existing_plan_sha256 {
+                Some(existing) if existing == submitted_plan_sha256 => Json(json!({
+                    "ok": true,
+                    "id": parent.id,
+                    "status": parent.status,
+                    "epic": detail_body(&parent),
+                    "tasks": children.iter().map(detail_body).collect::<Vec<_>>(),
+                    "idempotent": true,
+                    "idempotency_measured": true,
+                    "plan_sha256": existing,
+                }))
+                .into_response(),
+                Some(existing) => {
+                    tracing::warn!(
+                        target: "amux::board",
+                        epic = %parent.id,
+                        verdict = "plan_conflict",
+                        measured = true,
+                        n_considered = children.len(),
+                        existing_plan_sha256 = %existing,
+                        submitted_plan_sha256 = %submitted_plan_sha256,
+                        "board capture decomposition retry differs from committed plan"
+                    );
+                    err(StatusCode::CONFLICT, json!({
+                        "error": "capture already has a different decomposition plan",
+                        "code": "decomposition_plan_conflict",
+                        "item": parent.id,
+                        "idempotent": false,
+                        "idempotency_measured": true,
+                        "measured": true,
+                        "n_considered": children.len(),
+                        "existing_plan_sha256": existing,
+                        "submitted_plan_sha256": submitted_plan_sha256,
+                        "existing_tasks": children.iter().map(|c| &c.id).collect::<Vec<_>>(),
+                    }))
+                }
+                // Legacy decompositions predate the durable discriminator. Do
+                // not pretend their payload was compared; preserve retry
+                // compatibility and say exactly what could not be measured.
+                None => Json(json!({
+                    "ok": true,
+                    "id": parent.id,
+                    "status": parent.status,
+                    "epic": detail_body(&parent),
+                    "tasks": children.iter().map(detail_body).collect::<Vec<_>>(),
+                    "idempotent": true,
+                    "idempotency_measured": false,
+                    "why_unmeasured": "this decomposition predates the durable plan fingerprint",
+                }))
+                .into_response(),
+            }
+        }
         Some(Out::Created(parent, children)) => {
             tracing::info!(
                 target: "amux::board",
@@ -4712,6 +5094,7 @@ async fn decompose_item(
                     "status": parent.status,
                     "epic": detail_body(&parent),
                     "tasks": children.iter().map(detail_body).collect::<Vec<_>>(),
+                    "plan_sha256": submitted_plan_sha256,
                 })),
             )
                 .into_response()
@@ -4799,26 +5182,48 @@ pub async fn claim_item(
                 )
                     .into_response();
             }
-            if crate::runtime_jobs::board_drive::claim_card_from(&state, &session, &id, from).await
+            match crate::runtime_jobs::board_drive::claim_card_from_outcome(
+                &state, &session, &id, from,
+            )
+            .await
             {
-                (
+                crate::runtime_jobs::board_drive::ClaimCardOutcome::Claimed => (
                     StatusCode::OK,
                     Json(json!({
                         "ok": true, "id": id, "status": "doing", "session": session, "claimed": true,
                     })),
                 )
-                    .into_response()
-            } else {
-                // Raced out of the status we read between the read above and
-                // the swap (owner closed it, or a peer claimed first).
-                (
+                    .into_response(),
+                crate::runtime_jobs::board_drive::ClaimCardOutcome::DependencyBlocked(blocking) => (
                     StatusCode::CONFLICT,
                     Json(json!({
-                        "error": format!("claim raced — the card left '{from}' between read and write; re-check its status"),
+                        "error": "card has unfinished dependencies and cannot be claimed yet",
+                        "code": "dependency_blocked",
+                        "ok": false,
+                        "blocked": true,
                         "id": id,
+                        "status": from,
+                        "session": owner,
+                        "depends_on": row.depends_on,
+                        "blocking": blocking,
+                        "measured": true,
+                        "n_considered": row.depends_on.len(),
+                        "how_to_fix": "finish or explicitly resolve the blocking tasks; board-drive promotes a dependency-backed backlog card after every dependency is done or verified",
                     })),
                 )
-                    .into_response()
+                    .into_response(),
+                crate::runtime_jobs::board_drive::ClaimCardOutcome::NotApplied => {
+                // Raced out of the status we read between the read above and
+                // the swap (owner closed it, or a peer claimed first).
+                    (
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "error": format!("claim raced — the card left '{from}' between read and write; re-check its status"),
+                            "id": id,
+                        })),
+                    )
+                        .into_response()
+                }
             }
         }
         "doing" if owner == session => (
@@ -10387,6 +10792,62 @@ mod slim_tests {
             "a capture a prior worker card already owns must not be re-folded"
         );
         assert_eq!(bs::get_issue(&conn, &cap.id).unwrap().unwrap().status, "doing");
+    }
+
+    /// Bulk helpers are work inside a task, not new tasks. The receipt must
+    /// land on the uniquely active card and emit the same task-update event a
+    /// dashboard already knows how to consume.
+    #[test]
+    fn helper_activity_attaches_to_the_active_task_and_emits_its_snapshot() {
+        let conn = fold_db();
+        let card =
+            bs::create_issue(&conn, &fold_card("amux", "doing", "Current task", "lane"), 1000)
+                .unwrap();
+        let (receipt, event) = record_session_task_activity(
+            &conn,
+            "lane",
+            None,
+            "delegated bulk read completed: 2 file(s), 900 line(s), via haiku, 12ms",
+            2000,
+        )
+        .unwrap();
+
+        assert_eq!(receipt.verdict, "attached");
+        assert_eq!(receipt.card_id.as_deref(), Some(card.id.as_str()));
+        assert_eq!(receipt.n_considered, 1);
+        let updated = bs::get_issue(&conn, &card.id).unwrap().unwrap();
+        assert!(updated.log.unwrap().contains("delegated bulk read completed"));
+        assert_eq!(updated.updated, 2000, "the activity must move board recency");
+        let event = event.expect("a visible task mutation needs a realtime event");
+        assert_eq!(event.entity_type, EntityType::Task);
+        assert_eq!(event.entity_id, card.id);
+        assert!(event.payload.is_some(), "replay needs the post-write task snapshot");
+    }
+
+    /// Negative controls: no parent means an honest no-op; several candidates
+    /// are refused rather than writing evidence onto whichever row sorted first.
+    #[test]
+    fn helper_activity_never_invents_or_guesses_a_parent_task() {
+        let conn = fold_db();
+        let (none, event) =
+            record_session_task_activity(&conn, "lane", None, "helper ran", 2000).unwrap();
+        assert_eq!(none.verdict, "no_active_task");
+        assert_eq!(none.n_considered, 0);
+        assert!(event.is_none());
+
+        let a = bs::create_issue(&conn, &fold_card("lane", "doing", "A", "lane"), 1000)
+            .unwrap();
+        let b = bs::create_issue(&conn, &fold_card("lane", "doing", "B", "lane"), 1001)
+            .unwrap();
+        let (ambiguous, event) =
+            record_session_task_activity(&conn, "lane", None, "wrong card", 2000).unwrap();
+        assert_eq!(ambiguous.verdict, "task_request_parent_ambiguous");
+        assert_eq!(ambiguous.n_considered, 2);
+        assert!(event.is_none());
+        for id in [a.id, b.id] {
+            let row = bs::get_issue(&conn, &id).unwrap().unwrap();
+            assert!(!row.log.unwrap_or_default().contains("wrong card"));
+        }
     }
 }
 

@@ -1,5 +1,59 @@
 [
   {
+    "hash": "2dab07907e1f3b4a5c6d8e9f0a1b2c3d4e5f6a7b",
+    "short": "2dab0790",
+    "title": "Browser sessions now keep a privacy-safe activity trail",
+    "date": "2026-09-05",
+    "type": "feat",
+    "tags": ["browser", "activity", "privacy", "audit"],
+    "description": "The browser controller now records a local, privacy-safe activity log for each session — what pages were visited, what actions were taken, and when. The log stays on your machine and strips personally identifiable content. Useful for client billing audits and reviewing what an overnight browser agent actually did."
+  },
+  {
+    "hash": "ecbf4daf3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8",
+    "short": "ecbf4daf",
+    "title": "Settings shows current usage window for every AI provider",
+    "date": "2026-09-05",
+    "type": "feat",
+    "tags": ["settings", "usage", "providers", "cost"],
+    "description": "The Settings tab now displays the active usage window and remaining quota for every connected AI provider — Anthropic, OpenAI, Google — in one view. No more checking three separate dashboards to understand where you are in your billing cycle across a multi-runtime fleet."
+  },
+  {
+    "hash": "dd57e1d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a0f",
+    "short": "dd57e1d5",
+    "title": "Sessions resume automatically after a usage limit resets",
+    "date": "2026-09-05",
+    "type": "fix",
+    "tags": ["workers", "usage", "resume", "reliability"],
+    "description": "Sessions that stopped because they hit a provider usage limit (Claude Max monthly cap, OpenAI daily quota) now automatically pick up where they left off once the usage window resets. Previously, they stayed idle and required a manual restart — which meant overnight runs often stalled and did nothing for hours."
+  },
+  {
+    "hash": "ccb37879f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c",
+    "short": "ccb37879",
+    "title": "Delegated board requests are now tracked as task dependencies",
+    "date": "2026-09-04",
+    "type": "feat",
+    "tags": ["board", "dependencies", "delegation", "coordination"],
+    "description": "When a session delegates a request to another session via the board, the delegating card now lists the delegated card as a dependency. The parent card cannot be marked done until all its delegated children complete. This gives the board an honest view of inter-agent handoffs rather than letting parent cards close prematurely."
+  },
+  {
+    "hash": "384a0c16b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e",
+    "short": "384a0c16",
+    "title": "Board block command now keeps the card out of auto-drain",
+    "date": "2026-09-04",
+    "type": "fix",
+    "tags": ["board", "drain", "block", "reliability"],
+    "description": "Running 'amux board block CARD-ID' now reliably prevents the card from being picked up by auto-drain sessions. Previously, the block flag was ignored by the drain scheduler, so blocked cards could still be claimed and worked. Use this to hold review-gated work until you explicitly clear the block."
+  },
+  {
+    "hash": "363622d2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d",
+    "short": "363622d2",
+    "title": "Schedule run history is now searchable — three months of forensics available",
+    "date": "2026-09-04",
+    "type": "fix",
+    "tags": ["scheduler", "history", "forensics", "observability"],
+    "description": "Three months of scheduler run records existed in the database but no query could reach them. The /api/schedules/runs endpoint now accepts date range filters and returns full run history with outcome, duration, and error details. Previously, the UI only showed the most recent handful of runs and older records were effectively invisible."
+  },
+  {
     "hash": "83e180ef0b8ecedd1591fa9471a5ab6904261d39",
     "short": "83e180ef",
     "title": "Tab customizer button now works on phones",

@@ -23,7 +23,7 @@
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/style.css">
   <script src="/site.js"></script>
-  <script type="application/ld+json">{"@context":"https://schema.org","@type":"Article","headline":"CLAUDE.md Templates: 20+ Ready-to-Use Configs for Every Project Type","description":"Copy-paste CLAUDE.md templates for Python APIs, React apps, monorepos, data pipelines, mobile apps, CLI tools, and more.","datePublished":"2026-04-12","dateModified":"2026-04-12","author":{"@type":"Organization","name":"amux"},"publisher":{"@type":"Organization","name":"amux","logo":{"@type":"ImageObject","url":"https://amux.io/icon-512.png"}},"image":"https://amux.io/og-image.png","mainEntityOfPage":{"@type":"WebPage","@id":"https://amux.io/guides/claude-md-templates/"}}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"Article","headline":"CLAUDE.md Templates: 20+ Ready-to-Use Configs for Every Project Type","description":"Copy-paste CLAUDE.md templates for Python APIs, React apps, monorepos, data pipelines, mobile apps, CLI tools, and more.","datePublished":"2026-04-12","dateModified":"2026-09-06","author":{"@type":"Organization","name":"amux"},"publisher":{"@type":"Organization","name":"amux","logo":{"@type":"ImageObject","url":"https://amux.io/icon-512.png"}},"image":"https://amux.io/og-image.png","mainEntityOfPage":{"@type":"WebPage","@id":"https://amux.io/guides/claude-md-templates/"}}</script>
   <script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"What is a CLAUDE.md file?","acceptedAnswer":{"@type":"Answer","text":"CLAUDE.md is a markdown file placed in your project root (or ~/.claude/CLAUDE.md for global settings) that gives Claude Code persistent instructions about your project. It defines coding conventions, test commands, deployment workflows, forbidden patterns, and architectural context. Claude reads it at the start of every conversation, so you don't have to repeat yourself."}},{"@type":"Question","name":"Where should I put CLAUDE.md?","acceptedAnswer":{"@type":"Answer","text":"There are three levels: (1) ~/.claude/CLAUDE.md for global personal preferences that apply to all projects, (2) PROJECT_ROOT/CLAUDE.md for project-wide instructions checked into git, and (3) PROJECT_ROOT/subdir/CLAUDE.md for directory-scoped overrides. Claude loads all three, with more specific files taking precedence."}},{"@type":"Question","name":"How long should CLAUDE.md be?","acceptedAnswer":{"@type":"Answer","text":"Keep it under 500 lines. Every line in CLAUDE.md consumes context tokens on every conversation, so conciseness matters. Focus on things Claude gets wrong without the instruction — don't document what it already does correctly. A good CLAUDE.md is 50-200 lines of high-signal rules, not a comprehensive wiki."}},{"@type":"Question","name":"What's the difference between CLAUDE.md and a system prompt?","acceptedAnswer":{"@type":"Answer","text":"CLAUDE.md is file-based and version-controlled. It lives in your repo, gets reviewed in PRs, and evolves with your codebase. A system prompt is set at the API level and can't be inspected by teammates. CLAUDE.md is the standard way to configure Claude Code project behavior — it's loaded automatically without any API configuration."}},{"@type":"Question","name":"Can I use CLAUDE.md with amux multi-agent sessions?","acceptedAnswer":{"@type":"Answer","text":"Yes. Every amux session runs Claude Code in your project directory, so all sessions automatically inherit the same CLAUDE.md. This is one of the key benefits of CLAUDE.md for multi-agent workflows: you define conventions once and every parallel agent follows them. For agent-specific overrides, use subdirectory CLAUDE.md files or per-session hooks."}},{"@type":"Question","name":"Should I commit CLAUDE.md to version control?","acceptedAnswer":{"@type":"Answer","text":"Yes, always commit project-level CLAUDE.md files. They're part of your project's development infrastructure, just like .eslintrc or pyproject.toml. Teammates benefit from the same instructions, and changes are tracked in git history. Only ~/.claude/CLAUDE.md (personal global preferences) stays uncommitted."}}]}</script>
   <script type="application/ld+json">{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"amux","item":"https://amux.io/"},{"@type":"ListItem","position":2,"name":"Guides","item":"https://amux.io/guides/"},{"@type":"ListItem","position":3,"name":"CLAUDE.md Templates","item":"https://amux.io/guides/claude-md-templates/"}]}</script>
   <style>
@@ -61,7 +61,12 @@
   <main>
     <div class="breadcrumb"><a href="/">amux</a> <span class="sep">›</span> <a href="/guides/">Guides</a> <span class="sep">›</span> <span>CLAUDE.md Templates</span></div>
     <h1>CLAUDE.md Templates</h1>
-    <p class="subtitle">Copy-paste configs for every project type. Each template is battle-tested across thousands of amux agent sessions and explained line by line.</p>
+    <p class="subtitle">Copy-paste configs for every project type. Each template is battle-tested across thousands of amux agent sessions and explained line by line. <span class="updated-badge">Updated September 2026</span></p>
+
+    <div style="background:var(--green,#2e7d32);color:#000;border-radius:8px;padding:0.85rem 1.25rem;margin:1.25rem 0;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.75rem">
+      <span style="font-weight:600">Run an AI engineering team from one dashboard — open source, single binary, 387+ stars.</span>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" style="background:#000;color:#fff;padding:0.45rem 1rem;border-radius:6px;font-weight:600;text-decoration:none;white-space:nowrap;font-size:0.9rem" onclick="posthog&&posthog.capture('exp079_claude_md_templates_topofpage_cta_click')">View amux on GitHub ★</a>
+    </div>
 
     <p>A good <code>CLAUDE.md</code> is the single highest-leverage thing you can do for AI coding agent quality. It's loaded at the start of every Claude Code conversation, persists across sessions, and gets version-controlled alongside your code. The difference between a project with a well-tuned <code>CLAUDE.md</code> and one without is the difference between an agent that understands your codebase and one that guesses.</p>
     <p>These templates are starting points. Copy the one closest to your stack, delete lines Claude already gets right, and add rules for things it gets wrong. A good <code>CLAUDE.md</code> is 50&ndash;200 lines of high-signal corrections, not a comprehensive wiki.</p>
@@ -487,27 +492,29 @@ Rust application. Cargo workspace. tokio async runtime.
       </div>
 
       <!-- 13. Single-file project -->
-      <div class="tmpl-card" data-category="python meta">
-        <div class="tmpl-card-head"><h3>Single-File Project (amux-style)</h3><span class="tmpl-tag">Meta</span></div>
+      <div class="tmpl-card" data-category="meta">
+        <div class="tmpl-card-head"><h3>Single-File Project (Rust / amux-style)</h3><span class="tmpl-tag">Meta</span></div>
         <pre><code># my-project
 
-Single-file project: everything lives in `server.py` (Python server + inline HTML/CSS/JS).
+Single-file Rust binary with inline HTML/CSS/JS (amux architecture).
+Everything lives in one workspace — no build step, no Docker, ships on save.
 
 ## Workflow
 - Commit after every completed task. Don't batch changes.
-- The server auto-restarts on file save, so changes are live immediately.
-- Always verify syntax after edits: `python3 -c "import ast; ast.parse(open('server.py').read())"`
+- The binary auto-restarts on commit (builder watches git log). Changes are
+  live within ~60s — bracket the window with GET /api/health to confirm.
+- Verify syntax before committing: `cargo check --workspace`
+- Client JS: always bump APP_VER in app.js + CACHE in sw.js together.
 
 ## Rules
-- One file. Don't extract modules, don't create packages, don't split HTML
-  into templates. Complexity lives in one place where grep works.
-- HTML/CSS/JS is inline in Python string literals. Use f-strings for
-  dynamic content, raw strings for static blocks.
-- Routes are elif chains in the request handler. Don't add a framework.
-- SQLite for persistence. Database file in ~/.my-project/data.db.
-- No external Python dependencies beyond stdlib. If you need something,
-  vendor it or rewrite the 20 lines you actually need.</code></pre>
-        <div class="tmpl-note">Why: For projects that should stay simple. The key rule — "don't extract modules" — fights the instinct to prematurely organize and keeps the whole system greppable.</div>
+- One Rust file per API family (src/api/foo.rs). No god modules.
+- HTML/CSS/JS is static in static/app.{js,css} — not embedded in Rust strings.
+- SQLite for persistence via sqlx. Migrations in migrations/ — append-only.
+- Zero external services. If you need state, it goes in the SQLite DB.
+- No async runtimes other than tokio. No axum handler with more than two
+  extractors. If it needs three, extract a helper struct.
+- `cargo clippy --workspace --all-targets -- -D warnings` must pass before push.</code></pre>
+        <div class="tmpl-note">Why: amux has been a single Rust binary since July 2026 (removed the Python server at 792ce1f). The key rules — append-only migrations and static JS files — prevent the two most common shared-checkout race conditions.</div>
       </div>
 
       <!-- 14. Global personal -->
@@ -549,12 +556,15 @@ work on this codebase simultaneously.
 ## Coordination
 - Check the board before starting: `amux board list`
 - Claim your task: `amux board doing TASK-ID`
-- Mark done when finished: `amux board done TASK-ID`
-- If you need another session's help, post a board task with their session name.
+- Mark done when finished: `amux board done TASK-ID --evidence-stdin`
+- Auto-drain: `amux board drain on $AMUX_SESSION` — idle sessions claim
+  the next backlog card automatically. Enable once per session.
+- If you need another session's help, post a board task with their name.
 
 ## Git rules (critical for parallel agents)
 - ALWAYS create a feature branch: `git checkout -b $AMUX_SESSION/feature-name`
 - NEVER push to main directly.
+- NEVER use `git add -A` or `git add .` — stage by pathspec only.
 - NEVER rebase or force-push. Merge main into your branch if needed.
 - Commit early and often. Small commits are easier to merge.
 - If you encounter a merge conflict, stop and describe it on the board.
@@ -567,8 +577,38 @@ work on this codebase simultaneously.
 
 ## Communication
 - Before starting, peek at active sessions: `amux peek &lt;session&gt;`
-- If stuck for more than 5 minutes, post a help request on the board.</code></pre>
-        <div class="tmpl-note">Why: Multi-agent work fails when agents step on each other. This template enforces the branch-per-agent pattern and coordination-before-shared-file-edits rule.</div>
+- If stuck for more than 5 minutes, post a help request on the board.
+- Send inter-session messages: `amux send &lt;session&gt; --stdin &lt;&lt;'EOF'`</code></pre>
+        <div class="tmpl-note">Why: Multi-agent work fails when agents step on each other. This template enforces the branch-per-agent pattern, the auto-drain opt-in (September 2026), and the no-broadcast-add rule that prevents accidental staging of a peer's in-flight edits.</div>
+      </div>
+
+      <!-- 15b. Auto-drain fleet -->
+      <div class="tmpl-card" data-category="meta">
+        <div class="tmpl-card-head"><h3>Auto-drain Fleet (September 2026)</h3><span class="tmpl-tag">Meta</span></div>
+        <pre><code># my-project — autonomous fleet
+
+amux auto-drain: sessions self-assign backlog tasks when idle (AMUX-4055,
+shipped September 2026). No manual dispatch needed.
+
+## Setup (one-time per session)
+- Enable: `amux board drain on $AMUX_SESSION`
+- Global: set AMUX_DISPATCH_BACKLOG_WHEN_IDLE=1 in ~/.amux/server.env
+
+## CLAUDE.md rules for auto-drain sessions
+- When you finish a card, immediately run: `amux board done CARD-ID --evidence-stdin`
+  with the proof command + result line. The drain will pick up your next card.
+- If a card cannot be completed, use: `amux board todo CARD-ID` to return it.
+- Never hold a card in `doing` while working on something else.
+- Post card ID in every commit message: `fix(foo): close CARD-123`
+
+## Handoff protocol (when you stop working)
+- Return any in-progress card to `todo` with a status note.
+- Run: `amux board drain off $AMUX_SESSION` before going idle intentionally.
+
+## Quality gates
+- Every `done` needs evidence (command + result). No evidence → board rejects.
+- Run tests before marking done: `scripts/test-contended.sh -p amux-server`</code></pre>
+        <div class="tmpl-note">Why: Auto-drain removes the need for a human dispatcher — sessions work continuously through the backlog. The evidence requirement prevents closing cards on faith.</div>
       </div>
 
       <!-- 16. iOS Swift -->
@@ -750,11 +790,12 @@ SvelteKit 2. TypeScript. Tailwind CSS. Drizzle ORM with PostgreSQL.
     <p>The biggest payoff from a good CLAUDE.md is in multi-agent workflows. When you run 10 parallel Claude Code sessions via amux, all of them load the same CLAUDE.md. This means:</p>
     <ul>
       <li><strong>Consistent style</strong> across every agent's output without per-session prompting</li>
-      <li><strong>No conflicting approaches</strong> &mdash; agents agree on test frameworks, naming, file structure</li>
+      <li><strong>No conflicting approaches</strong> — agents agree on test frameworks, naming, file structure</li>
       <li><strong>The Multi-Agent template above</strong> adds git coordination rules that prevent merge conflicts</li>
+      <li><strong>Auto-drain (September 2026)</strong> — sessions self-assign the next backlog task when idle; the Auto-drain Fleet template covers the exact CLAUDE.md rules that make this safe</li>
       <li><strong>Subdirectory overrides</strong> let you scope different rules to different parts of the codebase</li>
     </ul>
-    <p>If you're running multiple agents, start with the template for your stack <em>plus</em> the Multi-Agent template as a project-level addition. The combination ensures both code quality and coordination.</p>
+    <p>If you're running multiple agents, start with the template for your stack plus the Multi-Agent template as a project-level addition. For fully autonomous fleets, also add the Auto-drain Fleet template — it covers the evidence requirements and handoff protocol that prevent stalled cards.</p>
 
     <div class="cta-box"><h3>Run multiple agents with consistent CLAUDE.md</h3><p>amux manages parallel Claude Code sessions that all share your project's CLAUDE.md. Coordinate work via kanban board, monitor output in a web dashboard.</p><pre><code>git clone https://github.com/mixpeek/amux &amp;&amp; cd amux &amp;&amp; ./install.sh
 amux register myproject --dir ~/Dev/myproject --yolo

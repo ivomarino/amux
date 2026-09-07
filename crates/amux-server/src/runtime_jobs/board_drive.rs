@@ -1611,6 +1611,7 @@ fn drainable_backlog_ids(conn: &Connection, session: &str, now: f64) -> Vec<Stri
            AND NOT EXISTS (SELECT 1 FROM session_events e WHERE e.type='task.claimed' \
                            AND e.ts > ?2 AND e.data LIKE '%\"' || i.id || '\"%') \
            AND NOT (COALESCE(i.source_ref,'') <> '' AND COALESCE(i.last_verified_at,0) > ?3) \
+           AND COALESCE(i.blocked_on,'') = '' \
          ORDER BY COALESCE(i.created,0) ASC, i.id ASC",
         )
         .and_then(|mut st| {
@@ -1652,6 +1653,24 @@ fn drainable_backlog_count(conn: &Connection, session: &str, now: f64) -> usize 
 /// `last_verified_at` is a card whose owner said "not yet, and here is the
 /// condition"; draining it would override that, which is the MG-1388 mistake
 /// this module already carries a scar from.
+///
+/// Cards with `blocked_on` SET are excluded too (AF-516). `amux board block
+/// <ID> --on <cause>` sets that field and deliberately does NOT change status,
+/// "so its lifecycle position survives" — its own help says the card is
+/// "Excluded from `amux board ready` until unblocked". It was: `ready` honours
+/// the field and this predicate never read it, so a lane that blocked a backlog
+/// card correctly still had it claimed and moved to `doing` with `blocked_on`
+/// untouched. Reported by backend on BACKE-3548, 2026-09-05.
+///
+/// Two mechanisms disagreeing about the same field, which is the only kind of
+/// bug where both sides look right in isolation.
+///
+/// SAFE TO EXCLUDE because it is rare BY CONSTRUCTION: `--on` is required and
+/// must name a cause, so nothing defaults it. Measured 2026-09-06: 25 of 438
+/// backlog cards, 5%. The comparison that matters is against the fields that
+/// CANNOT serve this purpose — `source_ref` is on 93% of backlog cards and a
+/// future `due` on 65%, because both are auto-populated, so excluding on either
+/// would silence ~65% of the drain (AF-514).
 fn oldest_drainable_backlog(conn: &Connection, session: &str, now: f64) -> Option<String> {
     drainable_backlog_ids(conn, session, now).into_iter().next()
 }
@@ -2066,7 +2085,7 @@ fn backlog_dep_promotions(conn: &Connection) -> (Vec<(String, Vec<String>)>, usi
 /// dispatchable, and writes a greppable INFO line naming the card and the deps
 /// that cleared it (two-fixes: the next promotion — or a wrongful one — is
 /// self-announcing).
-async fn promote_ready_backlog(state: &AppState) -> (usize, usize) {
+pub(crate) async fn promote_ready_backlog(state: &AppState) -> (usize, usize) {
     let (candidates, held_on_trigger) = match state.store.read() {
         Ok(conn) => backlog_dep_promotions(&conn),
         Err(_) => return (0, 0),
@@ -2132,7 +2151,7 @@ fn epic_completion_candidates(conn: &Connection) -> Vec<(String, Vec<(String, St
 /// the id stored on the original message, so completing it is what makes the
 /// message's task chip report the state of the whole command rather than the
 /// state of whichever leaf happened to be created first.
-async fn complete_finished_epics(state: &AppState) -> usize {
+pub(crate) async fn complete_finished_epics(state: &AppState) -> usize {
     let candidates = match state.store.read() {
         Ok(conn) => epic_completion_candidates(&conn),
         Err(_) => return 0,
@@ -2301,6 +2320,11 @@ async fn promote_card(state: &AppState, card: &str, arm: PromoteArm) -> bool {
                 expected_from: Some("backlog".into()),
                 log_line: Some(arm.log_line().to_string()),
                 skip_continuation: true,
+                // A dependency successor is the next step of already-accepted
+                // work. The prior child just left WIP, so an unrelated deep
+                // todo queue must not strand this plan forever. Revisit-driven
+                // promotions remain ordinary queue additions and keep the cap.
+                skip_todo_wip: arm == PromoteArm::DepsCleared,
                 ..Default::default()
             };
             match crate::db::advance::advance(conn, &card_w, "todo", "board_drive", &opts)? {
@@ -2308,10 +2332,34 @@ async fn promote_card(state: &AppState, card: &str, arm: PromoteArm) -> bool {
                     applied: true,
                     events: outcome.events,
                 }),
-                Err(_) => Ok(crate::db::WriteOutcome { applied: false, events: vec![] }),
+                Err(refusal) => {
+                    tracing::warn!(
+                        target: "amux::board_drive",
+                        card = %card_w,
+                        ?arm,
+                        ?refusal,
+                        measured = true,
+                        n_considered = 1,
+                        verdict = "promotion_refused",
+                        "selected backlog promotion was refused by the transition engine"
+                    );
+                    Ok(crate::db::WriteOutcome { applied: false, events: vec![] })
+                }
             }
         })
         .await;
+    if let Err(error) = &reply {
+        tracing::warn!(
+            target: "amux::board_drive",
+            %card,
+            ?arm,
+            %error,
+            measured = false,
+            n_considered = 0,
+            verdict = "promotion_store_error",
+            "selected backlog promotion could not run its writer transaction"
+        );
+    }
     matches!(reply, Ok(r) if r.applied)
 }
 
@@ -3143,7 +3191,11 @@ fn stale_backlog_candidates(
 fn backlog_candidates(conn: &Connection, session: &str, now: i64) -> Vec<(String, String, i64)> {
     // DRAINABLE only — mirror the exclusions in the idle_drain gate so the cards
     // the nudge lists are exactly the ones it claims are un-worked: no dormant
-    // types (tripwire/watch) and no card parked on a LIVE source_ref trigger.
+    // types (tripwire/watch), no card parked on a LIVE source_ref trigger, and
+    // no card with `blocked_on` set (AF-516 — added to BOTH predicates in the
+    // same commit, because a nudge listing a card the drain will not take is the
+    // same disagreement one surface along, and this comment's promise to mirror
+    // is the only thing keeping them together).
     // "Live" means re-verified within SOURCE_REF_STALE_S — a trigger nobody has
     // re-checked in 24h+ is treated as if it were never set, so `--trigger`
     // cannot be used to permanently exit the drain nudge on a card the owner
@@ -3157,6 +3209,7 @@ fn backlog_candidates(conn: &Connection, session: &str, now: i64) -> Vec<(String
          AND COALESCE(archived,0)=0 AND owner_type='agent' \
          AND type NOT IN ('tripwire','watch','epic') \
          AND (COALESCE(source_ref,'')='' OR COALESCE(last_verified_at,0) < ?2) \
+         AND COALESCE(blocked_on,'')='' \
          ORDER BY created ASC LIMIT 8",
     )
     .and_then(|mut st| {
@@ -4221,7 +4274,8 @@ pub fn select_advance_with(
              One task? `amux board retitle {card_id} \"<title>\" --desc-stdin`\n\
              Several? Produce the ordered JSON plan and run \
              `amux board decompose {card_id} --stdin`. That single write preserves this \
-             message link and requires each child's dependencies, p0-p3 priority, and next action."
+             message link and requires each child's description, dependencies, p0-p3 priority, \
+             next action, and falsifiable acceptance criteria."
         );
         return Advance::Nudge {
             target: session.to_string(),
@@ -5766,6 +5820,13 @@ pub async fn claim_card(state: &AppState, session: &str, card: &str) -> bool {
     claim_card_from(state, session, card, "todo").await
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClaimCardOutcome {
+    Claimed,
+    DependencyBlocked(Vec<String>),
+    NotApplied,
+}
+
 /// `claim_card` with the expected PRIOR status as a parameter. Auto-pickup and
 /// every drive-loop path stay on `claim_card` ("todo"): a card parked
 /// todo->backlog mid-race must DEFEAT a racing pickup, so widening that CAS to
@@ -5779,6 +5840,22 @@ pub async fn claim_card_from(
     card: &str,
     from: &'static str,
 ) -> bool {
+    matches!(
+        claim_card_from_outcome(state, session, card, from).await,
+        ClaimCardOutcome::Claimed
+    )
+}
+
+/// The detailed claim primitive used by the HTTP door. Dependency checking
+/// lives INSIDE the same writer transaction as the status CAS: a preflight in
+/// the handler would leave a window where an open prerequisite could appear
+/// after the read and before the forced claim.
+pub(crate) async fn claim_card_from_outcome(
+    state: &AppState,
+    session: &str,
+    card: &str,
+    from: &'static str,
+) -> ClaimCardOutcome {
     let card_s = card.to_string();
     // Assign the claimer as part of the swap. For auto-pickup this is a no-op
     // (the card is already `i.session=lane`), but it makes a MANUAL claim
@@ -5800,6 +5877,8 @@ pub async fn claim_card_from(
     // raw-tmux-fallback and corrected.
     let cross_owner = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
     let cross_owner_w = cross_owner.clone();
+    let dependency_blockers = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let dependency_blockers_w = dependency_blockers.clone();
     let reply = state
         .store
         .write_async(move |conn| {
@@ -5807,14 +5886,20 @@ pub async fn claim_card_from(
             // log must be able to answer "which lane claimed this, and did it
             // already own it", because that is the exact question AF-79 could
             // NOT answer (AMUX-3776).
-            let prior_owner: String = conn
-                .query_row(
-                    "SELECT COALESCE(session,'') FROM issues WHERE id=?1 AND status=?2",
-                    rusqlite::params![card_s, from],
-                    |r| r.get(0),
-                )
-                .optional()?
-                .unwrap_or_default();
+            let Some(row) = bs::get_issue(conn, &card_s)? else {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            };
+            if row.status != from {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            }
+            let blockers = deps_blocking(conn, &row);
+            if !blockers.is_empty() {
+                if let Ok(mut g) = dependency_blockers_w.lock() {
+                    *g = blockers;
+                }
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            }
+            let prior_owner = row.session.unwrap_or_default();
 
             let reassigned = !prior_owner.is_empty() && prior_owner != session_s;
             let entry = if reassigned {
@@ -5850,6 +5935,39 @@ pub async fn claim_card_from(
             }
         })
         .await;
+    let blockers = dependency_blockers.lock().ok().map(|g| g.clone()).unwrap_or_default();
+    if !blockers.is_empty() {
+        let n_considered = blockers.len();
+        tracing::warn!(
+            target: "amux::board_drive",
+            %session,
+            %card,
+            %from,
+            blocking = %blockers.join(","),
+            measured = true,
+            n_considered,
+            verdict = "dependency_blocked",
+            "claim refused — prerequisite tasks are still open"
+        );
+        crate::api::session_verbs::emit_event(
+            state,
+            session,
+            "claim.dependency_blocked",
+            Some(json!({
+                "issue": card,
+                "claimer": session,
+                "from": from,
+                "blocking": blockers.clone(),
+                "measured": true,
+                "n_considered": n_considered,
+                "verdict": "dependency_blocked",
+            })),
+            None,
+            "board-drive",
+        )
+        .await;
+        return ClaimCardOutcome::DependencyBlocked(blockers);
+    }
     let claimed = matches!(reply, Ok(r) if r.applied);
     if !claimed {
         tracing::info!(
@@ -5858,7 +5976,7 @@ pub async fn claim_card_from(
             "claim NOT applied — card left the expected status between select and claim \
              (raced to a terminal/doing state, or store unreadable); prompt NOT dispatched"
         );
-        return false;
+        return ClaimCardOutcome::NotApplied;
     }
     // THE VIOLATION GETS ITS OWN TYPE, and it is emitted BEFORE `task.claimed`
     // so the ledger reads in causal order: the guard fired, then the claim
@@ -5890,7 +6008,7 @@ pub async fn claim_card_from(
         "board-drive",
     )
     .await;
-    true
+    ClaimCardOutcome::Claimed
 }
 
 /// Background driver.
@@ -7355,6 +7473,53 @@ mod tests {
     /// case — board-drive dispatches `todo`, so that queue never moves on its own.
     /// The discriminator is the drain INPUTS: backlog candidates exist AND
     /// eligible_todo_count is 0. A lane with a todo is dispatched, not drained.
+    /// AF-516 — a card BLOCKED with a named cause must not be drained.
+    ///
+    /// `amux board block <ID> --on <cause>` sets `blocked_on` and deliberately
+    /// leaves status alone ("so its lifecycle position survives"), and its own
+    /// help promises the card is "Excluded from `amux board ready` until
+    /// unblocked". `ready` honoured that field; the drain predicates did not, so
+    /// backend's BACKE-3548 was claimed and moved to `doing` with `blocked_on`
+    /// still set. Two mechanisms disagreeing about the same field.
+    ///
+    /// Its own test, not appended to the drain-candidate test: fixtures added
+    /// mid-body leak into that test's later assertions, which is how the first
+    /// version of this cell broke an unrelated one.
+    #[test]
+    fn a_card_blocked_on_a_named_cause_is_not_drainable() {
+        let conn = board_db();
+        let now = now_f64();
+        conn.execute(
+            "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type,blocked_on) \
+             VALUES ('BL-1','waiting on a peer reply','x','backlog','blk',?1,?1,'agent','code','mvs-infra: partition eviction')",
+            rusqlite::params![now as i64],
+        )
+        .unwrap();
+        let listed: Vec<String> =
+            backlog_candidates(&conn, "blk", now as i64).into_iter().map(|c| c.0).collect();
+        assert!(listed.is_empty(), "the drain NUDGE offered a blocked card: {listed:?}");
+        assert!(
+            drainable_backlog_ids(&conn, "blk", now).is_empty(),
+            "the DRAIN itself offered a blocked card"
+        );
+
+        // THE CONTROL, and it is what keeps the clause from being a ban on
+        // draining: an EMPTY blocked_on is the overwhelmingly common state — 413
+        // of 438 backlog cards when measured — and must stay drainable. Without
+        // it, excluding on `blocked_on IS NOT NULL` rather than `= ''` would
+        // silence the entire drain and still pass the assertions above.
+        conn.execute(
+            "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type,blocked_on) \
+             VALUES ('BL-2','ordinary parked work','x','backlog','blk',?1,?1,'agent','code','')",
+            rusqlite::params![now as i64],
+        )
+        .unwrap();
+        let listed: Vec<String> =
+            backlog_candidates(&conn, "blk", now as i64).into_iter().map(|c| c.0).collect();
+        assert_eq!(listed, vec!["BL-2".to_string()], "an unblocked card must still drain");
+        assert_eq!(drainable_backlog_ids(&conn, "blk", now), vec!["BL-2".to_string()]);
+    }
+
     #[test]
     fn a_lane_with_only_backlog_is_a_drain_candidate_a_lane_with_a_todo_is_not() {
         let conn = board_db();
@@ -7406,6 +7571,7 @@ mod tests {
             parked.is_empty(),
             "a tripwire and a FRESHLY-verified source_ref-triggered card are correctly parked, not drainable: {parked:?}"
         );
+
 
         // SOURCE_REF_STALE_S: a trigger nobody has re-checked in 24h+ is NOT a
         // live park — it must return as a drain candidate exactly like an

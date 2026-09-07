@@ -53,7 +53,7 @@ def ssh(script, timeout=90):
     """Run a python3 script on the cloud host via stdin. Returns stdout or ''."""
     try:
         r = subprocess.run(
-            ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=8",
+            ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=15",
              "-i", SSH_KEY, "root@%s" % HOST, "python3 -"],
             input=script, capture_output=True, text=True, timeout=timeout)
         return r.stdout.strip()
@@ -176,7 +176,13 @@ def fix_logs(emergency=False):
     # is the hand reclaim that pulled the host back from 0KB, now automatic.
     min_size = "0" if emergency else str(20 * 1024 * 1024)
     journal_keep = "30M" if emergency else "100M"
-    apt_line = ("subprocess.run(['apt-get','clean'],capture_output=True,timeout=30)"
+    # Emergency also clears REGENERABLE non-customer caches — apt, snap downloads, and
+    # the npm cache. On 2026-09-06 /root/.npm (~430M) + snap cache were what actually
+    # recovered prod (logs gave only 8-21M; the gateway needs sustained headroom to
+    # SERVE, not just start), so the emergency reclaim must include them (AC-414).
+    apt_line = ("subprocess.run(['apt-get','clean'],capture_output=True,timeout=30); "
+                "subprocess.run(['bash','-c','rm -rf /var/lib/snapd/cache/* 2>/dev/null'],timeout=30); "
+                "subprocess.run(['bash','-c','npm cache clean --force 2>/dev/null || rm -rf /root/.npm/_cacache 2>/dev/null'],timeout=90)"
                 if emergency else "pass")
     script = r'''
 import subprocess, glob, os
@@ -549,11 +555,34 @@ def main():
                 _fb = _disk.get("free_gb", 0)
                 # At the cliff (<~300MB free) drop the 20MB log floor and clear the
                 # journal + apt cache too, or the guard reclaims 0 (AC-414 2026-09-05).
-                fix_logs(emergency=_fb < 0.3)
+                fix_logs(emergency=_fb < 0.5)
                 _disk = check_disk(); result["disk"] = _disk
                 trace("disk_preventive", "after truncate: %.1f%% used, %.1fGB free (was %.1fGB)"
                       % (_disk.get("pct", 0), _disk.get("free_gb", 0), _fb), _disk.get("pct", 100) < 95)
-            result["healthy"] = _disk.get("pct", 100) < 98
+            # AC-414 (2026-09-06 outage): a full disk crash-loops the gateway (exit
+            # 120 — it cannot write startup files), and the loop itself eats any space
+            # freed, so reclaiming WHILE it loops never breaks it. If the gateway is
+            # down, stop the loop, reclaim with it stopped, then restart — the exact
+            # hand recovery from today's 502, now automatic in the 30-min guard so a
+            # disk-induced outage self-heals instead of waiting for a human.
+            if not no_fix:
+                # Trigger on a real PROD PROBE, not systemctl is-active: a crash-looping
+                # unit flashes 'active' between restarts and raced the is-active check
+                # (AC-414 2026-09-06). 502/000 = down.
+                _st = probe_cloud()
+                if _st not in (200, 301, 302, 401, 403):
+                    ssh("import subprocess; subprocess.run(['systemctl','stop','amux-gateway'])", timeout=30)
+                    fix_logs(emergency=True)
+                    ok = restart_gateway()
+                    _st2 = probe_cloud()
+                    trace("gateway_recover", "prod was %d -> stop+reclaim+restart ok=%s, reprobe %d"
+                          % (_st, ok, _st2), _st2 in (200, 301, 302, 401, 403))
+                    result["gateway_recovered"] = _st2 in (200, 301, 302, 401, 403)
+            # Verdict on ABSOLUTE free space, not pct: this is a 49G disk, so 98% used
+            # is still ~1GB free — plenty for the gateway to serve — yet `pct < 98`
+            # cried CRITICAL every cycle at healthy headroom (AC-414). The gateway
+            # crash-loops near 0 and serves fine at ~1GB, so 500MB is the honest floor.
+            result["healthy"] = _disk.get("free_gb", 0) >= 0.5
         ssh("import json; open('/var/log/cloud-autofix.jsonl','a').write(%r+chr(10))"
             % json.dumps({"ts": int(time.time()), "disk_only": True, "trace": TRACE}), timeout=20)
         if as_json:
@@ -662,7 +691,7 @@ def main():
             if _disk.get("pct", 0) >= 95 and not no_fix:
                 _free_before = _disk.get("free_gb", 0)
                 # At the cliff (<~300MB free), emergency mode: all logs + journal + apt.
-                _truncated_this_tick = fix_logs(emergency=_free_before < 0.3)
+                _truncated_this_tick = fix_logs(emergency=_free_before < 0.5)
                 _disk = check_disk()
                 result["disk"] = _disk
                 trace("disk_preventive", "after truncate: %.1f%% used, %.1fGB free (was %.1fGB)"

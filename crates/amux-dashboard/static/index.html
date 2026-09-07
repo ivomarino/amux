@@ -1548,8 +1548,9 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <button class="bw-btn bw-itab active" data-itab="console" onclick="_bwInspTab('console')" style="padding:3px 8px;">Console <span id="bw-ic-console" style="opacity:0.6;"></span></button>
         <button class="bw-btn bw-itab" data-itab="network" onclick="_bwInspTab('network')" style="padding:3px 8px;">Network <span id="bw-ic-network" style="opacity:0.6;"></span></button>
         <button class="bw-btn bw-itab" data-itab="errors" onclick="_bwInspTab('errors')" style="padding:3px 8px;">Errors <span id="bw-ic-errors" style="opacity:0.6;"></span></button>
+        <button class="bw-btn bw-itab" data-itab="trail" onclick="_bwInspTab('trail')" style="padding:3px 8px;" title="Durable redacted browser actions for this worker">Trail <span id="bw-ic-trail" style="opacity:0.6;"></span></button>
         <span style="flex:1;"></span>
-        <button class="bw-btn" style="padding:2px 6px;" onclick="_bwLoadInspect()" title="Refresh">&#x21bb;</button>
+        <button class="bw-btn" style="padding:2px 6px;" onclick="_bwRefreshInspect()" title="Refresh">&#x21bb;</button>
         <button class="bw-btn" style="padding:2px 6px;" onclick="_bwClearInspect()" title="Clear buffers">&#128465;</button>
       </div>
       <div id="bw-inspect-list" style="flex:1;overflow:auto;font-family:monospace;font-size:0.72rem;line-height:1.4;"></div>

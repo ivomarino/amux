@@ -34,16 +34,71 @@ struct Claims<'a> {
     exp: i64,
 }
 
+/// A lookup into the ambient (process) environment. Injected rather than called
+/// directly so that [`sa_config_in`]'s suppression of it is testable without a
+/// `std::env::set_var`, which would be order-dependent across a threaded test
+/// binary — the exact flake class AF-529 is about.
+type AmbientEnv<'a> = &'a dyn Fn(&str) -> Option<String>;
+type OwnedAmbientEnv = Box<dyn Fn(&str) -> Option<String>>;
+
 /// `(key_file_path, impersonation_subject)` if both are configured, else None.
 /// server.env is read fresh so a just-added key needs no restart.
+///
+/// Reads the REAL amux home. Any caller that was handed a home must use
+/// [`sa_config_in`] instead — see its docstring for what goes wrong otherwise.
 pub fn sa_config() -> Option<(String, String)> {
-    let file_env = crate::config::parse_env_file(&crate::config::amux_home().join("server.env"));
+    sa_config_in(&crate::config::amux_home())
+}
+
+/// The same resolution, under an EXPLICIT amux home.
+///
+/// Two things used to leak here and they are independent (AF-529). `sa_config`
+/// read `amux_home()` unconditionally, so a caller operating under a different
+/// home — a test's tempdir, a second install — silently got the real box's
+/// config; and the process-env fallback then answered even when that home's own
+/// server.env said nothing.
+///
+/// The ambient fallback is consulted ONLY when `home` IS the real amux home,
+/// because that is the one case where the process env was seeded from this same
+/// server.env at startup ("loaded at startup as setdefault"). Under any other
+/// home the ambient env belongs to a DIFFERENT installation, and answering from
+/// it means the handler's behaviour is decided by the machine it runs on rather
+/// than by the home it was handed.
+///
+/// Measured cost of not doing this: `connectors::mint_connector_token` gates the
+/// needs_auth branch on `sa_usable()`. On a CI runner nothing is set, the branch
+/// fires, and the response carries a `connect` action. On any amux box
+/// GOOGLE_SA_KEY_FILE is exported and the file exists, so the branch does NOT
+/// fire and the response has no `connect` — the same commit, green in CI and red
+/// locally, with neither result saying which environment it was measuring.
+pub fn sa_config_in(home: &std::path::Path) -> Option<(String, String)> {
+    let file_env = crate::config::parse_env_file(&home.join("server.env"));
+    let ambient: Option<OwnedAmbientEnv> =
+        if home == crate::config::amux_home() {
+            Some(Box::new(|k: &str| std::env::var(k).ok()))
+        } else {
+            None
+        };
+    resolve_sa(&file_env, ambient.as_deref())
+}
+
+/// The resolution itself, with the ambient lookup INJECTED rather than read.
+///
+/// Split out so the suppression above is testable without touching the process
+/// env: a test hands in an ambient closure that always answers, and asserts it
+/// is ignored when it should be. `std::env::set_var` would make the same
+/// assertion order-dependent across a threaded test binary, which is the class
+/// of flake this whole card is about.
+fn resolve_sa(
+    file_env: &std::collections::BTreeMap<String, String>,
+    ambient: Option<AmbientEnv<'_>>,
+) -> Option<(String, String)> {
     let get = |k: &str| {
         file_env
             .get(k)
             .cloned()
             .filter(|v| !v.trim().is_empty())
-            .or_else(|| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
+            .or_else(|| ambient.and_then(|f| f(k)).filter(|v| !v.trim().is_empty()))
     };
     Some((get("GOOGLE_SA_KEY_FILE")?, get("GOOGLE_SA_SUBJECT")?))
 }
@@ -56,7 +111,13 @@ pub fn sa_config() -> Option<(String, String)> {
 /// on "can we mint" must use THIS, not `sa_config().is_some()`, or they report a
 /// key that no longer exists as connected (ethos rule 4).
 pub fn sa_usable() -> bool {
-    sa_config()
+    sa_usable_in(&crate::config::amux_home())
+}
+
+/// [`sa_usable`] under an explicit home. Same home-scoping rule as
+/// [`sa_config_in`]; every caller holding a `ConnectorsCtx` must use this one.
+pub fn sa_usable_in(home: &std::path::Path) -> bool {
+    sa_config_in(home)
         .map(|(path, _)| std::path::Path::new(&path).exists())
         .unwrap_or(false)
 }
@@ -150,6 +211,86 @@ pub async fn mint_token_as(scope: &str, subject: &str) -> Result<MintedToken, St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
+    fn env_of(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// AF-529. The ambient (process-env) lookup is a PARAMETER, so this asserts
+    /// the suppression itself rather than asserting what some machine happens to
+    /// export. Hand in an ambient that always answers: consulted when supplied,
+    /// ignored when not. Delete the `ambient.and_then(..)` arm and the first half
+    /// fails; make it unconditional and the second half fails.
+    #[test]
+    fn the_ambient_env_is_consulted_only_when_it_is_handed_in() {
+        let always = |_: &str| Some("from-ambient".to_string());
+        let empty = env_of(&[]);
+
+        let with = resolve_sa(&empty, Some(&always));
+        assert_eq!(
+            with,
+            Some(("from-ambient".into(), "from-ambient".into())),
+            "an ambient lookup that was handed in must be used when the file says nothing"
+        );
+
+        let without = resolve_sa(&empty, None);
+        assert_eq!(
+            without, None,
+            "with no ambient handed in, an empty server.env must resolve to None — \
+             this is the arm that kept a handler's behaviour tied to the box it ran on"
+        );
+    }
+
+    /// The file always wins over the ambient, in both directions, so scoping the
+    /// ambient cannot be mistaken for scoping the whole resolution.
+    #[test]
+    fn the_files_value_wins_over_the_ambient_one() {
+        let always = |_: &str| Some("from-ambient".to_string());
+        let file = env_of(&[
+            ("GOOGLE_SA_KEY_FILE", "/from/file.json"),
+            ("GOOGLE_SA_SUBJECT", "file@example.com"),
+        ]);
+        assert_eq!(
+            resolve_sa(&file, Some(&always)),
+            Some(("/from/file.json".into(), "file@example.com".into()))
+        );
+        // A blank in the file is not a value; it falls through, same as before.
+        let blank = env_of(&[("GOOGLE_SA_KEY_FILE", "   "), ("GOOGLE_SA_SUBJECT", "s@e.com")]);
+        assert_eq!(
+            resolve_sa(&blank, Some(&always)),
+            Some(("from-ambient".into(), "s@e.com".into()))
+        );
+    }
+
+    /// AF-529, the end-to-end half: `sa_config_in` reads the home it is HANDED,
+    /// not `amux_home()`. Both arms run on every machine — the first proves it
+    /// reads the temp home at all (so the second cannot pass by reading nothing),
+    /// the second proves an unconfigured temp home answers None even on a box
+    /// with GOOGLE_SA_KEY_FILE exported, which is exactly where this was red.
+    #[test]
+    fn sa_config_in_reads_the_home_it_was_handed_and_no_other() {
+        let configured = tempfile::tempdir().unwrap();
+        std::fs::write(
+            configured.path().join("server.env"),
+            "GOOGLE_SA_KEY_FILE=/tmp/af529-key.json\nGOOGLE_SA_SUBJECT=svc@example.com\n",
+        )
+        .unwrap();
+        assert_eq!(
+            sa_config_in(configured.path()),
+            Some(("/tmp/af529-key.json".into(), "svc@example.com".into())),
+            "must read the server.env of the home it was given"
+        );
+
+        let bare = tempfile::tempdir().unwrap();
+        assert_eq!(
+            sa_config_in(bare.path()),
+            None,
+            "a home with no server.env must resolve to None regardless of what \
+             this machine exports — GOOGLE_SA_* in the ambient env belongs to a \
+             different installation than the one this caller named"
+        );
+    }
 
     /// AMUX-3383: a configured-but-missing SA key file must read as NOT usable.
     /// `sa_config().is_some()` only means the config is set; the file behind

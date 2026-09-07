@@ -119,7 +119,7 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/email", "email send/read (gmail api)"),
     ("/api/cal-events", "calendar events CRUD"),
     ("/api/gcal", "Google Calendar accounts + read/create events, live (no local mirror) — api/gcal.rs, distinct from /api/cal-events"),
-    ("/api/browser", "full browser family: launch/profiles + CDP driver verbs (screenshot/state/action/inspect/navigate/search) against the server-machine Chrome; /agent answers 501 — the session's model drives the native verbs (api/browser.rs, AMUX-2598)"),
+    ("/api/browser", "full browser family: launch/profiles + CDP driver verbs (screenshot/state/action/inspect/navigate/search) against the server-machine Chrome, with durable redacted history in session_events; /agent answers 501 — the session's model drives the native verbs (api/browser.rs, AMUX-2598)"),
     ("/api/files", "modern files API (raw-body upload, rooted)"),
     ("/api/file", "file VIEWER: payload + raw range streaming + vtt + prepare/transcode with durable media jobs (api/file_viewer.rs)"),
     ("/api/library", "ebook library index — calibre metadata.db / opf scan (api/file_viewer.rs)"),

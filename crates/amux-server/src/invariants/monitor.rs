@@ -326,6 +326,25 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
             wt.as_deref(),
             runtime,
         ));
+
+        // The helper-model read router is the third consumer of the same
+        // installed-script rule. Keeping it here means an uncommitted runtime
+        // edit cannot silently change fleet-wide context routing.
+        const BAKED_LARGE_READ_GUARD: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/hooks/large-read-guard.py"
+        ));
+        let runtime = std::fs::read_to_string(amux_home.join("hooks/large-read-guard.py"))
+            .map_err(|e| e.to_string());
+        let head = read_head(checks::LARGE_READ_GUARD.committed_path);
+        let wt = read_worktree(checks::LARGE_READ_GUARD.committed_path);
+        out.extend(checks::installed_script_matches_committed(
+            &checks::LARGE_READ_GUARD,
+            BAKED_LARGE_READ_GUARD,
+            head.as_deref(),
+            wt.as_deref(),
+            runtime,
+        ));
     }
 
     tm.mark(&out, "6. shared-checkout git guard");
@@ -334,6 +353,7 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // file it compares was correct the whole time and settings.json simply
     // pointed elsewhere. This is the leg that fails on the actual incident.
     out.extend(report_hooks_check());
+    out.extend(large_read_hooks_check());
 
     tm.mark(&out, "6b. and is anything WIRED to that script? The sha ch");
     // -- 6c. are session reports ATTRIBUTED? (AF-67). The largest signal in the
@@ -372,6 +392,12 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     out.extend(capture_pipeline_check(state));
 
     tm.mark(&out, "7. capture pipeline");
+    // -- 7b. did decomposition produce cards a stranger can execute and close?
+    // The endpoint validates the write; this independent read catches any
+    // second producer, legacy partial row, or later destructive edit.
+    out.extend(decomposition_detail_check(state));
+
+    tm.mark(&out, "7b. decomposition detail");
     // -- 8. provider launch agrees with its adapter (RR-0043 / AMUX-3153): does
     // the server launch each provider with the same binary its adapter — and its
     // capability report — describes? The launcher and the adapter are two
@@ -435,6 +461,55 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
 
     tm.finish();
     out
+}
+
+fn decomposition_detail_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "board.decomposed_tasks_have_comprehensive_details";
+    let Ok(conn) = state.store.read() else {
+        return vec![InvariantResult::unknown(ID, "store unreadable")];
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT i.id,i.title,i.desc,i.status,i.session,i.creator,COALESCE(i.type,'code'),i.epic, \
+                i.depends_on,i.next_action,i.acceptance_criteria, \
+                (SELECT GROUP_CONCAT(t.tag) FROM issue_tags t WHERE t.issue_id=i.id), \
+                i.evidence,i.closed_at \
+         FROM issues i WHERE i.source='decomposition' AND i.deleted IS NULL \
+              AND COALESCE(i.archived,0)=0 ORDER BY i.created,i.id",
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => return vec![InvariantResult::unknown(ID, format!("query prepare failed: {e}"))],
+    };
+    let rows = match stmt
+        .query_map([], |r| {
+            let tags_raw: Option<String> = r.get(11)?;
+            Ok(checks::DecompositionDetailRow {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                desc: r.get(2)?,
+                status: r.get(3)?,
+                session: r.get(4)?,
+                creator: r.get(5)?,
+                item_type: r.get(6)?,
+                epic: r.get(7)?,
+                depends_on: r.get(8)?,
+                next_action: r.get(9)?,
+                acceptance_criteria: r.get(10)?,
+                tags: tags_raw
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter(|tag| !tag.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                evidence: r.get(12)?,
+                closed_at: r.get(13)?,
+            })
+        })
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+    {
+        Ok(rows) => rows,
+        Err(e) => return vec![InvariantResult::unknown(ID, format!("query failed: {e}"))],
+    };
+    checks::decomposed_tasks_have_comprehensive_details(&rows)
 }
 
 /// AMUX-3203. Reads the SAME config keys and `push_subscriptions` table
@@ -659,13 +734,6 @@ fn capture_pipeline_check(state: &AppState) -> Vec<InvariantResult> {
         max_ts: i64,
     }
     let mut map: std::collections::HashMap<String, Acc> = std::collections::HashMap::new();
-    // ISOLATED LANES MUST STILL REPORT (AMUX-3824, second pass). Skipping them
-    // outright was my first fix and it was wrong in the way this file keeps
-    // teaching: a skipped entity emits NO result, so `latest_per_invariant`
-    // holds its last one forever — `self` stayed RED after the fix deployed,
-    // because the check simply stopped speaking about it. Absence is not health
-    // (ethos rule 4). An isolated lane is a PASS with a reason, not a silence.
-    let mut isolated_seen: std::collections::BTreeSet<String> = Default::default();
     for (session, text, carded, ts) in rows {
         if session.is_empty()
             || amux_core::board::title_from_prompt(&text).is_none()
@@ -673,25 +741,10 @@ fn capture_pipeline_check(state: &AppState) -> Vec<InvariantResult> {
         {
             continue;
         }
-        // AN ISOLATED LANE IS NOT CARDED BY DESIGN (AMUX-3232, AMUX-3824).
-        //
-        // The mint's gate is `is_user && !skip_board && !session_is_isolated(..)`,
-        // and this loop replicated only the first. So a raw agent — which has no
-        // session or URL to run `amux board`, and whose prompts are deliberately
-        // left off the board because a card there would name work nobody can
-        // drive — read as a lane whose board leg had been "silently dropped".
-        //
-        // Measured: `self` (CC_ISOLATED=1, Ethan's personal notes lane) failed
-        // this check 67 times from 2026-08-15 to 2026-08-28 while behaving
-        // exactly as specified. A permanently-red check on deliberate behaviour
-        // is the AF-132 shape, and it trains people to skim the invariants page.
-        //
-        // Calls the MINT'S OWN predicate rather than re-reading CC_ISOLATED here,
-        // so the exclusion cannot drift from the rule it mirrors (ethos rule 1).
-        if crate::api::session_verbs::session_is_isolated(&session) {
-            isolated_seen.insert(session);
-            continue;
-        }
+        // AMUX-4159: isolated means no injected harness/peer automation, not
+        // invisible human work. These rows now follow the same invariant as
+        // every other owner-delivered task so another capture regression is a
+        // failing `/api/health/invariants` result instead of a policy-shaped gap.
         let e = map.entry(session).or_insert(Acc {
             cardable: 0,
             carded: 0,
@@ -717,15 +770,7 @@ fn capture_pipeline_check(state: &AppState) -> Vec<InvariantResult> {
             span_s: (a.max_ts - a.min_ts) / 1000,
         })
         .collect();
-    let mut out = checks::user_prompts_produce_cards(&stats, min_cardable);
-    // An isolated lane PASSES, explicitly and by name, so its entity keeps
-    // reporting. Appended rather than folded into `stats` because it is a
-    // different claim: not "this lane carded its prompts" but "this lane is not
-    // supposed to card them" (AMUX-3232), and the two should not be one row.
-    for session in isolated_seen {
-        out.push(InvariantResult::pass(ID).entity(&session));
-    }
-    out
+    checks::user_prompts_produce_cards(&stats, min_cardable)
 }
 
 /// The derived card status against the physical pane, per lane (AMUX-2646).
@@ -1200,6 +1245,43 @@ fn report_hooks_check() -> Vec<InvariantResult> {
         tracing::debug!(target: "invariants", "{ID}: {why}");
     }
     checks::report_hooks_wired(parsed)
+}
+
+fn large_read_hooks_check() -> Vec<InvariantResult> {
+    const ID: &str = "hooks.large_read_guard_wired";
+    let path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".claude/settings.json");
+    let parsed = std::fs::read_to_string(&path)
+        .map_err(|e| format!("{} unreadable: {e}", path.display()))
+        .and_then(|text| {
+            serde_json::from_str::<serde_json::Value>(&text)
+                .map_err(|e| format!("{} is not valid JSON: {e}", path.display()))
+        })
+        .map(|value| extract_large_read_hooks(&value));
+    if let Err(ref why) = parsed {
+        tracing::debug!(target: "invariants", "{ID}: {why}");
+    }
+    checks::large_read_hooks_wired(parsed)
+}
+
+fn extract_large_read_hooks(v: &serde_json::Value) -> Vec<checks::ReportHookEntry> {
+    let mut entries = Vec::new();
+    for (event, groups) in v["hooks"].as_object().into_iter().flatten() {
+        for group in groups.as_array().into_iter().flatten() {
+            for hook in group["hooks"].as_array().into_iter().flatten() {
+                let command = hook["command"].as_str().unwrap_or_default().to_string();
+                if !command.contains("large-read-guard.py") {
+                    continue;
+                }
+                entries.push(checks::ReportHookEntry {
+                    event: event.clone(),
+                    command,
+                    matcher: group["matcher"].as_str().map(String::from),
+                });
+            }
+        }
+    }
+    entries
 }
 
 /// PURE so it can be driven by the incident's own settings.json shape.
@@ -2247,6 +2329,45 @@ mod tests {
             "a migrated, empty board is readable: {}",
             r.observed
         );
+    }
+
+    /// The decomposition check owns a query across `issues` and `issue_tags`.
+    /// Exercise that query, not only the pure row checker: tags are a relation,
+    /// and selecting an imaginary `issues.tags` column made the first live
+    /// probe return Unknown while every pure test stayed green.
+    #[test]
+    fn decomposition_detail_check_reads_the_real_tag_relation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(&dir.path().join("t.db")).unwrap();
+        store
+            .write(|conn| {
+                conn.execute(
+                    "INSERT INTO issues \
+                     (id,title,desc,status,session,creator,owner_type,type,epic,next_action, \
+                      acceptance_criteria,source,created,updated) \
+                     VALUES ('D-1','Execute the child','Execute this complete child.','todo', \
+                             'lane','lane','agent','code','E-1','Run the focused check', \
+                             '[\"The focused check passes\"]','decomposition',1,1)",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO issue_tags (issue_id,tag,added_at) VALUES ('D-1','p0',1)",
+                    [],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+        let state = AppState {
+            store: std::sync::Arc::new(store),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let rows = super::decomposition_detail_check(&state);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, crate::invariants::Status::Pass, "{rows:?}");
+        assert_eq!(rows[0].evidence["n_considered"], serde_json::json!(1));
     }
 
     use super::*;
