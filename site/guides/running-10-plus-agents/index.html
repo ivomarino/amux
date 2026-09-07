@@ -42,7 +42,7 @@
     "description": "How to run 10–50 parallel Claude Code, Codex, or Gemini CLI agents with amux. Fleet organization, task distribution, phone monitoring, and overnight self-healing operation.",
     "url": "https://amux.io/guides/running-10-plus-agents/",
     "datePublished": "2026-02-26",
-    "dateModified": "2026-07-05",
+    "dateModified": "2026-09-07",
     "author": {"@type": "Organization", "name": "amux", "url": "https://amux.io/"},
     "publisher": {"@type": "Organization", "name": "amux", "url": "https://amux.io/"},
     "image": "https://amux.io/og-image.png",
@@ -59,7 +59,7 @@
     "totalTime": "PT30M",
     "supply": [
       {"@type": "HowToSupply", "name": "Server with 8GB+ RAM"},
-      {"@type": "HowToSupply", "name": "Python 3.10+ and tmux"},
+      {"@type": "HowToSupply", "name": "amux (Homebrew: brew install mixpeek/amux/amux)"},
       {"@type": "HowToSupply", "name": "Claude Code (or Codex / Gemini CLI)"},
       {"@type": "HowToSupply", "name": "amux (open source, MIT)"}
     ],
@@ -178,7 +178,13 @@
     <div class="breadcrumb"><a href="/">amux</a> <span class="sep">›</span> <a href="/guides/">Guides</a> <span class="sep">›</span> <span>Running 10+ Agents in Parallel</span></div>
 
     <h1>Running 10+ AI Coding Agents in Parallel</h1>
-    <p class="subtitle">Updated July 2026 — how to scale from one Claude Code session to a full parallel AI engineering team</p>
+    <p class="subtitle"><span class="updated-badge">Updated September 2026</span> — how to scale from one Claude Code session to a full parallel AI engineering team</p>
+
+    <!-- EXP-081: top-of-page CTA — running-10-plus-agents, September 2026 refresh, started 2026-09-07 -->
+    <div style="background:var(--green,#2e7d32);color:#000;border-radius:8px;padding:0.85rem 1.25rem;margin:1.25rem 0;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.75rem">
+      <span style="font-weight:600">Run your AI engineering team from one dashboard — open source, single binary, 394+ stars.</span>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" style="background:#000;color:#fff;padding:0.45rem 1rem;border-radius:6px;font-weight:600;text-decoration:none;white-space:nowrap;font-size:0.9rem" onclick="posthog&&posthog.capture('exp081_running_10_plus_topofpage_cta_click')">View amux on GitHub ★</a>
+    </div>
 
     <p>You can run 10, 20, even 50 parallel Claude Code, Codex, or Gemini CLI agents from a single amux dashboard — and manage the whole fleet from your phone. The practical output: tasks that would take one agent a week ship in a day, overnight, while you sleep. This guide covers everything from machine requirements to fleet organization, atomic task distribution, git conflict prevention, and self-healing overnight operation.</p>
 
@@ -322,6 +328,14 @@ Session: docs-agent      → docs/**</code></pre>
 
     <p>With this pattern, you can add 20 tasks to the board and launch 20 agents — each will independently pull and lock exactly one task. The board shows you in real time who has what.</p>
 
+    <h3>Auto-drain: sessions self-assign tasks when idle (September 2026)</h3>
+    <p>Manual task claiming worked, but it required each agent to actively poll the board. <strong>Auto-drain</strong> (shipped AMUX-4055, September 2026) flips the model: enable it once and idle agents automatically pick up their next task without any CLAUDE.md boilerplate:</p>
+    <pre><code>amux board drain on $AMUX_SESSION   # enable per session
+# or globally for the whole fleet:
+AMUX_DISPATCH_BACKLOG_WHEN_IDLE=1   # in ~/.amux/server.env</code></pre>
+    <p>When a session finishes a task and marks it <code>done</code>, the dispatcher immediately checks for the next <code>todo</code> card tagged to that session and delivers it. The fleet stays busy without polling loops or wake-up messages. To pause a session intentionally: <code>amux board drain off $AMUX_SESSION</code>.</p>
+    <p><strong>Evidence requirement:</strong> auto-drain gates each <code>done</code> transition — agents must pass <code>--evidence-stdin</code> with a literal command and its result line. No evidence means the board rejects the transition and the card stays in <code>doing</code>. Build this into your CLAUDE.md from the start.</p>
+
     <h2>Preventing git conflicts</h2>
     <p>Agents writing to the same files is the most common failure mode when scaling past 5 agents. Three approaches:</p>
 
@@ -402,7 +416,7 @@ amux register payments --dir ../project-feature-payments --yolo</code></pre>
 
     <h2>Step-by-step: scaling from 1 to 10+ agents</h2>
     <ol>
-      <li><strong>Install amux:</strong> <code>git clone https://github.com/mixpeek/amux && cd amux && ./install.sh</code></li>
+      <li><strong>Install amux:</strong> <code>brew install mixpeek/amux/amux</code> (or <code>curl -fsSL https://amux.io/install.sh | sh</code>)</li>
       <li><strong>Register your project:</strong> <code>amux register myproject --dir ~/Dev/myproject --yolo</code></li>
       <li><strong>Decompose your work:</strong> break the sprint into independent tasks, add them to the board: <code>amux board add "Implement OAuth refresh flow"</code></li>
       <li><strong>Set up worktrees:</strong> one git worktree per agent, each on its own branch</li>
@@ -415,7 +429,7 @@ amux register payments --dir ../project-feature-payments --yolo</code></pre>
     <div class="cta-box">
       <h3>Run your AI engineering team with amux</h3>
       <p>Open-source control plane for parallel Claude Code, Codex, and Gemini CLI agents. Single Rust binary, zero external dependencies, MIT licensed.</p>
-      <pre><code>git clone https://github.com/mixpeek/amux && cd amux && ./install.sh
+      <pre><code>brew install mixpeek/amux/amux
 amux register myproject --dir ~/Dev/myproject --yolo
 amux start myproject
 amux serve  # → https://localhost:8824</code></pre>

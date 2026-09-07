@@ -39,7 +39,7 @@
     "author":{"@type":"Organization","name":"amux","url":"https://amux.io"},
     "publisher":{"@type":"Organization","name":"amux","url":"https://amux.io","logo":{"@type":"ImageObject","url":"https://amux.io/icon.png"}},
     "datePublished":"2026-05-09",
-    "dateModified":"2026-05-09",
+    "dateModified":"2026-09-07",
     "mainEntityOfPage":"https://amux.io/blog/claude-code-vs-cursor-vs-windsurf/"
   }</script>
   <script type="application/ld+json">{
@@ -138,8 +138,14 @@
   <main>
     <div class="breadcrumb"><a href="/">amux</a> <span class="sep">&rsaquo;</span> <a href="/blog/">Blog</a> <span class="sep">&rsaquo;</span> <span>Claude Code vs Cursor vs Windsurf</span></div>
 
-    <h1>Claude Code vs Cursor vs Windsurf (2026)</h1>
+    <h1>Claude Code vs Cursor vs Windsurf (2026) <span class="updated-badge" style="font-family:var(--font-mono);font-size:11px;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;padding:2px 7px;border-radius:3px;background:oklch(0.80 0.18 145 / .15);color:var(--green);vertical-align:middle;">Updated Sep 2026</span></h1>
     <p class="subtitle">Three tools dominate AI-assisted coding in 2026: <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> by <a href="https://anthropic.com/" target="_blank" rel="noopener">Anthropic</a>, <a href="https://www.cursor.com/" target="_blank" rel="noopener">Cursor</a> by <a href="https://www.cursor.com/" target="_blank" rel="noopener">Anysphere</a>, and <a href="https://windsurf.com/" target="_blank" rel="noopener">Windsurf</a> by <a href="https://cognition.ai/" target="_blank" rel="noopener">Cognition AI</a>. Each takes a fundamentally different approach to the same problem. This guide compares them honestly so you can pick the right one &mdash; or use all three together.</p>
+
+    <!-- EXP-082: top-of-page CTA — compare blog, September 2026 refresh, started 2026-09-07 -->
+    <div style="background:var(--green,#2e7d32);color:#000;border-radius:8px;padding:0.85rem 1.25rem;margin:1.25rem 0;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.75rem">
+      <span style="font-weight:600">Run 50 Claude Code agents while you code in Cursor or Windsurf. Open source, single Rust binary, 394+ stars.</span>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" style="background:#000;color:#fff;padding:0.45rem 1rem;border-radius:6px;font-weight:600;text-decoration:none;white-space:nowrap;font-size:0.9rem" onclick="posthog&&posthog.capture('exp082_compare_blog_topofpage_cta_click')">View amux on GitHub ★</a>
+    </div>
 
     <!-- ───────── TL;DR ───────── -->
     <div class="tldr">
@@ -646,7 +652,7 @@
     </div>
 
     <pre><code><span class="dim"># Install amux and run 5 Claude Code agents on your project</span>
-git clone https://github.com/mixpeek/amux && cd amux && ./install.sh
+brew install mixpeek/amux/amux
 amux register myproject --dir ~/Dev/myproject --yolo
 amux scale myproject --count 5
 amux serve  <span class="dim"># → https://localhost:8824</span></code></pre>
@@ -680,7 +686,7 @@ amux serve  <span class="dim"># → https://localhost:8824</span></code></pre>
       <details style="background:var(--surface);border:1px solid var(--border);border-radius:8px;margin-bottom:0.8rem;">
         <summary style="padding:1rem 1.2rem;cursor:pointer;font-weight:600;font-size:0.92rem;">Which AI coding tool has the best code quality?</summary>
         <div style="padding:0 1.2rem 1rem;font-size:0.88rem;color:var(--dim);line-height:1.7;">
-          <p>As of May 2026, <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> with <a href="https://docs.anthropic.com/en/docs/about-claude/models" target="_blank" rel="noopener">Opus 4.7</a> leads <a href="https://www.swebench.com/" target="_blank" rel="noopener">SWE-bench Verified</a> at 82%. <a href="https://www.cursor.com/" target="_blank" rel="noopener">Cursor</a>&rsquo;s Composer 2 model scores 73.7% on SWE-bench Multilingual. <a href="https://windsurf.com/" target="_blank" rel="noopener">Windsurf</a>&rsquo;s <a href="https://cognition.ai/blog/swe-1-6" target="_blank" rel="noopener">SWE-1.6</a> improves 10%+ over SWE-1.5 on SWE-Bench Pro. However, both <a href="https://www.cursor.com/" target="_blank" rel="noopener">Cursor</a> and <a href="https://windsurf.com/" target="_blank" rel="noopener">Windsurf</a> also support Claude Opus 4.7 as an optional model, so you can get top-tier quality from any tool.</p>
+          <p>As of September 2026, <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> with <a href="https://docs.anthropic.com/en/docs/about-claude/models" target="_blank" rel="noopener">Opus 4.7</a> leads <a href="https://www.swebench.com/" target="_blank" rel="noopener">SWE-bench Verified</a> at 82%. <a href="https://www.cursor.com/" target="_blank" rel="noopener">Cursor</a>&rsquo;s Composer 2 model scores 73.7% on SWE-bench Multilingual. <a href="https://windsurf.com/" target="_blank" rel="noopener">Windsurf</a>&rsquo;s <a href="https://cognition.ai/blog/swe-1-6" target="_blank" rel="noopener">SWE-1.6</a> improves 10%+ over SWE-1.5 on SWE-Bench Pro. However, both <a href="https://www.cursor.com/" target="_blank" rel="noopener">Cursor</a> and <a href="https://windsurf.com/" target="_blank" rel="noopener">Windsurf</a> also support Claude Opus 4.7 as an optional model, so you can get top-tier quality from any tool.</p>
         </div>
       </details>
 
@@ -716,7 +722,7 @@ amux serve  <span class="dim"># → https://localhost:8824</span></code></pre>
     <!-- ───────── CTA ───────── -->
     <div style="background:var(--accent-dim);border:1px solid var(--amber);border-radius:8px;padding:1.4rem 1.6rem;margin:3rem 0 2rem;text-align:center;">
       <p style="font-size:1rem;font-weight:600;margin:0 0 0.5rem;">Run 50 Claude Code agents while you use Cursor.</p>
-      <p style="font-size:0.88rem;color:var(--dim);margin:0 0 1rem;">amux orchestrates the fleet. Open source, single file, installs in one command.</p>
+      <p style="font-size:0.88rem;color:var(--dim);margin:0 0 1rem;">amux orchestrates the fleet. Open source, single Rust binary, installs in one command.</p>
       <a href="/guides/getting-started/" style="display:inline-block;background:var(--amber);color:var(--bg);padding:0.6rem 1.4rem;border-radius:6px;text-decoration:none;font-weight:600;font-size:0.88rem;">Get Started</a>
       <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" style="display:inline-block;background:var(--surface);color:var(--text);padding:0.6rem 1.4rem;border-radius:6px;text-decoration:none;font-weight:600;font-size:0.88rem;margin-left:0.6rem;border:1px solid var(--border);">View on GitHub</a>
     </div>

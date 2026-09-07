@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Claude Code vs Codex vs Gemini CLI: Running a Multi-Runtime AI Agent Fleet — amux</title>
+  <meta name="description" content="How to run Claude Code, OpenAI Codex, and Gemini CLI agents together in one fleet. Strengths of each runtime, when to mix them, and how amux orchestrates all three from one dashboard.">
+  <link rel="canonical" href="https://amux.io/guides/multi-runtime-ai-coding-agents/">
+  <link rel="stylesheet" href="/style.css">
+
+  <script type="application/ld+json">
+  {"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"amux","item":"https://amux.io/"},{"@type":"ListItem","position":2,"name":"Guides","item":"https://amux.io/guides/"},{"@type":"ListItem","position":3,"name":"Multi-Runtime AI Coding Agents","item":"https://amux.io/guides/multi-runtime-ai-coding-agents/"}]}
+  </script>
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "Article",
+    "headline": "Claude Code vs Codex vs Gemini CLI: Running a Multi-Runtime AI Agent Fleet",
+    "description": "How to run Claude Code, OpenAI Codex, and Gemini CLI agents together in one fleet. Strengths of each runtime, when to mix them, and how amux orchestrates all three from one dashboard.",
+    "url": "https://amux.io/guides/multi-runtime-ai-coding-agents/",
+    "datePublished": "2026-09-07",
+    "dateModified": "2026-09-07",
+    "author": {"@type": "Organization", "name": "amux", "url": "https://amux.io/"},
+    "publisher": {"@type": "Organization", "name": "amux", "url": "https://amux.io/"},
+    "image": "https://amux.io/og-image.png",
+    "keywords": ["Claude Code Codex Gemini CLI", "multi-runtime AI agents", "Claude Code vs Codex", "AI coding agent orchestration 2026", "run multiple AI coding runtimes"]
+  }
+  </script>
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "mainEntity": [
+      {
+        "@type": "Question",
+        "name": "What is the difference between Claude Code, Codex, and Gemini CLI?",
+        "acceptedAnswer": {"@type": "Answer", "text": "Claude Code is Anthropic's terminal-based agent, strongest at complex refactoring and system-level reasoning. OpenAI Codex CLI is MIT-licensed, fast, and excels at Python and data work. Gemini CLI targets long-context tasks and has a generous free tier. All three run as terminal agents that can write, edit, and test code autonomously."}
+      },
+      {
+        "@type": "Question",
+        "name": "Can I run Claude Code and Codex agents in the same project?",
+        "acceptedAnswer": {"@type": "Answer", "text": "Yes. With amux, each agent is an independent session regardless of which runtime it uses. You can assign Claude Code sessions to architecture and refactoring tasks, Codex sessions to Python scripts and data pipelines, and Gemini CLI sessions to documentation and long-context analysis — all monitored from one dashboard."}
+      },
+      {
+        "@type": "Question",
+        "name": "Which AI coding runtime is best for running overnight unattended?",
+        "acceptedAnswer": {"@type": "Answer", "text": "Claude Code has the most mature self-healing story when paired with amux — context compaction, crash recovery, and replay are well-tested overnight. Codex and Gemini CLI work well for bounded tasks (a script, a test suite, a document) where the task is likely to complete within one session."}
+      },
+      {
+        "@type": "Question",
+        "name": "Does amux support Gemini CLI agents?",
+        "acceptedAnswer": {"@type": "Answer", "text": "Yes. amux registers any terminal process as a session. Start a Gemini CLI agent in a tmux window, register it with amux, and it appears on the dashboard alongside Claude Code and Codex sessions with the same peek, steer, and self-healing capabilities."}
+      },
+      {
+        "@type": "Question",
+        "name": "How does cost compare between Claude Code, Codex, and Gemini CLI?",
+        "acceptedAnswer": {"@type": "Answer", "text": "Codex CLI is MIT-licensed and free to self-host; API costs depend on your OpenAI tier. Gemini CLI has a free tier (1,500 requests/day on the standard model). Claude Code uses Anthropic API pricing — Sonnet is the recommended daily-driver for cost-quality balance. In a mixed fleet, use cheaper runtimes for high-volume mechanical tasks and Claude Code for complex reasoning."}
+      },
+      {
+        "@type": "Question",
+        "name": "What does amux add to a multi-runtime agent fleet?",
+        "acceptedAnswer": {"@type": "Answer", "text": "amux provides a single control plane: one dashboard that shows all runtimes simultaneously, a shared kanban board where any agent pulls tasks regardless of runtime, phone monitoring via iOS app or PWA, self-healing watchdog for all sessions, and shared CRM, email, and browser automation tools that any agent can call."}
+      }
+    ]
+  }
+  </script>
+</head>
+<body>
+  <header>
+    <nav>
+      <a href="/" class="logo">amux</a>
+      <ul>
+        <li><a href="/guides/">Guides</a></li>
+        <li><a href="/compare/">Compare</a></li>
+        <li><a href="/for/">Use cases</a></li>
+        <li><a href="https://github.com/mixpeek/amux">GitHub</a></li>
+      </ul>
+    </nav>
+  </header>
+
+  <main>
+    <div class="breadcrumb"><a href="/">amux</a> <span class="sep">›</span> <a href="/guides/">Guides</a> <span class="sep">›</span> <span>Multi-Runtime AI Coding Agents</span></div>
+
+    <h1>Claude Code vs Codex vs Gemini CLI: Running a Multi-Runtime AI Agent Fleet</h1>
+    <p class="subtitle"><span class="updated-badge">September 2026</span> — orchestrating Claude Code, OpenAI Codex, and Gemini CLI agents from one dashboard</p>
+
+    <!-- EXP-081 rides on running-10-plus-agents; this page gets no separate experiment yet -->
+    <div style="background:var(--green,#2e7d32);color:#000;border-radius:8px;padding:0.85rem 1.25rem;margin:1.25rem 0;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.75rem">
+      <span style="font-weight:600">amux runs Claude Code, Codex, and Gemini CLI agents from one dashboard — open source, 394+ stars.</span>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" style="background:#000;color:#fff;padding:0.45rem 1rem;border-radius:6px;font-weight:600;text-decoration:none;white-space:nowrap;font-size:0.9rem" onclick="posthog&&posthog.capture('multi_runtime_guide_github_cta_click')">View amux on GitHub ★</a>
+    </div>
+
+    <p>You don't have to pick one AI coding runtime. Claude Code, OpenAI Codex CLI, and Gemini CLI each have different strengths — and a mature agent workflow uses all three in parallel, each assigned to the tasks it handles best. amux is the control plane that makes this work: one dashboard, one kanban board, one phone view, regardless of which runtime each agent uses.</p>
+
+    <div style="background:var(--surface-2);border-left:3px solid var(--accent,#c75b2e);padding:1rem 1.25rem;border-radius:0 6px 6px 0;margin:1.5rem 0">
+      <strong>Quick answer:</strong> Use Claude Code for complex reasoning and refactoring, Codex for Python scripts and data pipelines, Gemini CLI for long-context tasks and free-tier work. Run all three in amux — they share the same kanban board, you monitor all from your phone, and the self-healing watchdog covers all sessions equally.
+    </div>
+
+    <h2>How Claude Code, Codex, and Gemini CLI differ</h2>
+
+    <table style="width:100%;border-collapse:collapse;margin:1.25rem 0;font-size:0.9rem">
+      <thead>
+        <tr style="border-bottom:2px solid var(--border,#333)">
+          <th style="text-align:left;padding:0.6rem 0.75rem">Runtime</th>
+          <th style="text-align:left;padding:0.6rem 0.75rem">Model</th>
+          <th style="text-align:left;padding:0.6rem 0.75rem">Strongest at</th>
+          <th style="text-align:left;padding:0.6rem 0.75rem">Cost model</th>
+          <th style="text-align:left;padding:0.6rem 0.75rem">Context limit</th>
+          <th style="text-align:left;padding:0.6rem 0.75rem">License</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr style="border-bottom:1px solid var(--border,#333)">
+          <td style="padding:0.6rem 0.75rem"><strong>Claude Code</strong></td>
+          <td style="padding:0.6rem 0.75rem">Claude Sonnet / Opus / Haiku</td>
+          <td style="padding:0.6rem 0.75rem">System reasoning, large refactors, multi-file architecture</td>
+          <td style="padding:0.6rem 0.75rem">Anthropic API (usage-based)</td>
+          <td style="padding:0.6rem 0.75rem">200K tokens</td>
+          <td style="padding:0.6rem 0.75rem">Proprietary</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border,#333)">
+          <td style="padding:0.6rem 0.75rem"><strong>OpenAI Codex CLI</strong></td>
+          <td style="padding:0.6rem 0.75rem">GPT-4.1 / o3 / o4-mini</td>
+          <td style="padding:0.6rem 0.75rem">Python, data pipelines, bounded scripting tasks</td>
+          <td style="padding:0.6rem 0.75rem">OpenAI API (usage-based); CLI itself is free</td>
+          <td style="padding:0.6rem 0.75rem">128K tokens</td>
+          <td style="padding:0.6rem 0.75rem">MIT (CLI)</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border,#333)">
+          <td style="padding:0.6rem 0.75rem"><strong>Gemini CLI</strong></td>
+          <td style="padding:0.6rem 0.75rem">Gemini 2.0 Flash / Pro</td>
+          <td style="padding:0.6rem 0.75rem">Long-context analysis, documentation, codebase Q&amp;A</td>
+          <td style="padding:0.6rem 0.75rem">Free tier (1,500 req/day); Workspace for heavy use</td>
+          <td style="padding:0.6rem 0.75rem">1M tokens</td>
+          <td style="padding:0.6rem 0.75rem">Apache 2.0</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>When to run multiple runtimes in the same fleet</h2>
+    <p>Mixed fleets make sense when different tasks have different runtime requirements:</p>
+    <ul>
+      <li><strong>Cost tiering:</strong> put Claude Opus on the highest-complexity implementation tasks; use Codex on the high-volume mechanical work (migrations, test generation, linting fixes). You get Opus-quality output where it matters and Codex-speed output where it doesn't.</li>
+      <li><strong>Context size:</strong> Gemini's 1M-token context handles the "understand this whole codebase" prompt that would overflow a Claude session. Use Gemini for the analysis pass, Claude Code for the implementation.</li>
+      <li><strong>Free tier cadence:</strong> Gemini's 1,500 requests/day free tier covers low-priority tasks like documentation refreshes and README updates at zero API cost. Save your Anthropic credits for work that needs Claude's reasoning.</li>
+      <li><strong>Specialization by language:</strong> Codex trained heavily on Python-heavy GitHub data and performs especially well on data science, scripting, and ML tasks. Claude Code excels at system-level work (Rust, Go, multi-service architectures).</li>
+    </ul>
+
+    <h2>How amux orchestrates Claude Code, Codex, and Gemini CLI together</h2>
+    <p>amux treats every runtime as a session. It doesn't care which binary is running inside the tmux window — it reads terminal output, delivers steering messages, and tracks board state for all of them identically.</p>
+
+    <h3>Register sessions by runtime</h3>
+    <pre><code># Claude Code session
+amux register auth-agent --dir ~/Dev/myproject --yolo
+amux start auth-agent              # launches Claude Code
+
+# Codex session (same project, different task)
+amux register data-pipeline --dir ~/Dev/myproject --yolo --runtime codex
+amux start data-pipeline           # launches Codex CLI
+
+# Gemini CLI session (long-context analysis)
+amux register codebase-qa --dir ~/Dev/myproject --yolo --runtime gemini
+amux start codebase-qa             # launches Gemini CLI</code></pre>
+
+    <p>All three sessions appear on the same dashboard. The board shows which session owns which task, regardless of runtime.</p>
+
+    <h3>Shared kanban board across runtimes</h3>
+    <p>The amux kanban board is runtime-agnostic. Tasks are plain text with a status field. Any session — Claude Code, Codex, or Gemini — can claim, work, and close a task. Your CLAUDE.md (or equivalent per-runtime config) tells each agent how to interact with the board API.</p>
+
+    <pre><code># For Codex and Gemini sessions, add to their system prompt:
+# Board API: GET $AMUX_URL/api/board → claim tasks via POST /api/board/TASK_ID/claim
+# When done: PATCH /api/board/TASK_ID {"status":"done","desc":"Result: ..."}
+
+# Auto-drain (September 2026): sessions self-assign their next task when idle
+amux board drain on auth-agent      # Claude Code agent auto-drains
+amux board drain on data-pipeline   # Codex agent auto-drains</code></pre>
+
+    <h3>Phone monitoring across all runtimes</h3>
+    <p>The amux iOS app and PWA show all sessions in one list, regardless of runtime. Peek output, send a steering message, restart a crashed session — all from your phone, all runtimes unified.</p>
+
+    <h2>Recommended fleet composition by project size</h2>
+
+    <table style="width:100%;border-collapse:collapse;margin:1.25rem 0;font-size:0.9rem">
+      <thead>
+        <tr style="border-bottom:2px solid var(--border,#333)">
+          <th style="text-align:left;padding:0.6rem 0.75rem">Project size</th>
+          <th style="text-align:left;padding:0.6rem 0.75rem">Suggested mix</th>
+          <th style="text-align:left;padding:0.6rem 0.75rem">Why</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr style="border-bottom:1px solid var(--border,#333)">
+          <td style="padding:0.6rem 0.75rem">Solo developer (1–3 agents)</td>
+          <td style="padding:0.6rem 0.75rem">2x Claude Code + 1x Gemini CLI</td>
+          <td style="padding:0.6rem 0.75rem">Claude Code for impl, Gemini for doc/analysis at free tier</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border,#333)">
+          <td style="padding:0.6rem 0.75rem">Small team (4–10 agents)</td>
+          <td style="padding:0.6rem 0.75rem">5x Claude Code + 3x Codex + 2x Gemini CLI</td>
+          <td style="padding:0.6rem 0.75rem">Codex covers Python/data work, Gemini covers analysis, Claude for architecture</td>
+        </tr>
+        <tr>
+          <td style="padding:0.6rem 0.75rem">Large fleet (10–50 agents)</td>
+          <td style="padding:0.6rem 0.75rem">Claude Opus (2–3) + Claude Sonnet (10+) + Codex (10+) + Gemini (5+)</td>
+          <td style="padding:0.6rem 0.75rem">Opus for complex decisions, Sonnet for standard impl, Codex/Gemini for high-volume mechanical tasks</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>Practical patterns for mixed fleets</h2>
+
+    <h3>Analysis-implementation split</h3>
+    <p>Use a Gemini CLI session to analyze your codebase (full 1M-token context), produce a structured task list, and push it to the amux board. Claude Code sessions then pick up implementation tasks from the board atomically. You get the best of both: Gemini's scale for understanding, Claude's precision for building.</p>
+
+    <pre><code># Gemini session: analyze and queue tasks
+amux send codebase-qa "Read the full codebase in packages/api/, identify the 10 highest-priority tech-debt items, and add each as a board task: amux board add 'Fix: [item]'"
+
+# Claude Code sessions: pick up and implement those tasks automatically
+amux board drain on auth-agent
+amux board drain on payments-agent</code></pre>
+
+    <h3>Cost-optimized test generation</h3>
+    <p>Test generation is high-volume but mechanical. Assign Codex sessions to generate tests in parallel — Codex is fast and handles the pattern-matching work well. Reserve Claude Code sessions for the business logic that needs deeper reasoning.</p>
+
+    <h3>Language-specialized routing</h3>
+    <p>Route tasks by file extension in your CLAUDE.md: Claude Code for <code>*.rs</code>, <code>*.go</code>, <code>*.ts</code> architecture work; Codex for <code>*.py</code>, <code>*.ipynb</code>, <code>*.sql</code>; Gemini for <code>*.md</code>, <code>*.txt</code>, documentation refreshes.</p>
+
+    <h2>Switching runtimes mid-sprint</h2>
+    <p>You don't have to commit to a fleet composition at the start of a sprint. amux lets you add and remove sessions at any time. If a Claude Code session is blocked on an API rate limit, spin up a Codex session and route the next task there. The board state stays consistent — whoever claims the task owns it until done.</p>
+
+    <h2>Self-healing across runtimes</h2>
+    <p>amux's watchdog works the same for all runtimes: if a Codex or Gemini session crashes, it restarts and replays the last message exactly as it does for Claude Code. The only difference is context compaction — <code>/compact</code> is a Claude Code-specific command. For Codex and Gemini sessions that overflow context, the watchdog restarts with a fresh context (losing conversation history but keeping the board state and task description).</p>
+
+    <h2>Getting started with a multi-runtime fleet</h2>
+    <ol>
+      <li><strong>Install amux:</strong> <code>brew install mixpeek/amux/amux</code></li>
+      <li><strong>Install each runtime</strong> you plan to use: <a href="https://github.com/anthropics/claude-code" target="_blank" rel="noopener">Claude Code</a>, <a href="https://github.com/openai/codex" target="_blank" rel="noopener">Codex CLI</a>, <a href="https://github.com/google-gemini/gemini-cli" target="_blank" rel="noopener">Gemini CLI</a></li>
+      <li><strong>Register sessions by runtime:</strong> <code>amux register &lt;name&gt; --runtime &lt;claude|codex|gemini&gt;</code></li>
+      <li><strong>Write a shared CLAUDE.md</strong> with the board API calls and task-claiming workflow — reference <a href="/guides/claude-md-templates/">CLAUDE.md templates</a></li>
+      <li><strong>Enable auto-drain</strong> so idle sessions self-assign: <code>amux board drain on &lt;session&gt;</code></li>
+      <li><strong>Monitor from your phone</strong> — all runtimes in one dashboard view</li>
+    </ol>
+
+    <div class="cta-box">
+      <h3>Run Claude Code, Codex, and Gemini CLI from one dashboard</h3>
+      <p>amux is the open-source control plane for multi-runtime AI agent teams. Single Rust binary, zero external dependencies, MIT licensed.</p>
+      <div style="display:flex;gap:0.75rem;flex-wrap:wrap;margin-top:0.5rem">
+        <a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub</a>
+        <a class="btn" href="/guides/running-10-plus-agents/">Running 10+ agents</a>
+        <a class="btn" href="/guides/claude-md-templates/">CLAUDE.md templates</a>
+      </div>
+    </div>
+
+    <h2>Frequently asked questions</h2>
+
+    <h3>What is the difference between Claude Code, Codex, and Gemini CLI?</h3>
+    <p>Claude Code is Anthropic's terminal-based agent, strongest at complex refactoring and system-level reasoning. OpenAI Codex CLI is MIT-licensed, fast, and excels at Python and data work. Gemini CLI targets long-context tasks (1M-token window) and has a generous free tier. All three run as terminal agents that can write, edit, and test code autonomously.</p>
+
+    <h3>Can I run Claude Code and Codex agents in the same project?</h3>
+    <p>Yes. With amux, each agent is an independent session. You can assign Claude Code sessions to architecture and refactoring tasks, Codex sessions to Python scripts and data pipelines, and Gemini CLI sessions to documentation and long-context analysis — all monitored from one dashboard.</p>
+
+    <h3>Which AI coding runtime is best for running overnight unattended?</h3>
+    <p>Claude Code has the most mature self-healing story when paired with amux. Context compaction (<code>/compact</code>), crash recovery, and last-message replay are well-tested for overnight runs. Codex and Gemini CLI work well for bounded tasks where the session is likely to complete within a few hours.</p>
+
+    <h3>How does cost compare between the three runtimes?</h3>
+    <p>Codex CLI is MIT-licensed (free); you pay for OpenAI API usage. Gemini CLI has a free tier (1,500 requests/day on Gemini 2.0 Flash). Claude Code bills through Anthropic API pricing — Sonnet is the recommended daily driver for cost-quality balance. In a mixed fleet, route high-volume mechanical work to Codex or Gemini and reserve Claude for tasks requiring deep reasoning.</p>
+
+    <h3>Does amux support Gemini CLI agents?</h3>
+    <p>Yes. amux registers any terminal process. Start Gemini CLI in a tmux window, register it, and it appears on the dashboard alongside Claude Code and Codex sessions with the same peek, steer, and self-healing capabilities.</p>
+
+    <h2>Related guides</h2>
+    <ul>
+      <li><a href="/guides/running-10-plus-agents/">Running 10+ AI coding agents in parallel</a></li>
+      <li><a href="/guides/claude-md-templates/">CLAUDE.md templates for agent fleets</a></li>
+      <li><a href="/guides/agentic-engineering/">Agentic engineering — building an AI engineering team</a></li>
+      <li><a href="/compare/amux-vs-langchain/">amux vs LangChain</a></li>
+      <li><a href="/blog/claude-code-vs-cursor-vs-windsurf/">Claude Code vs Cursor vs Windsurf (2026)</a></li>
+    </ul>
+  </main>
+
+  <footer>
+    <p><a href="/">amux</a> — open-source control plane for AI agent teams. <a href="https://github.com/mixpeek/amux">GitHub</a> · <a href="/guides/">Guides</a> · <a href="/compare/">Compare</a></p>
+  </footer>
+  <script src="/site.js"></script>
+</body>
+</html>

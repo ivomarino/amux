@@ -4,13 +4,13 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="theme-color" content="#1e2330">
-  <title>amux for Python Developers — amux</title>
-    <link rel="icon" href="/icon.svg" type="image/svg+xml">
-  <meta name="description" content="Run parallel Claude Code agents for Python: one per package, one per test module, one per migration. amux for Python developers.">
-  <meta name="keywords" content="python AI coding agent, claude code python, parallel python development">
+  <title>amux for Python Developers — Run Parallel AI Agents on Your Python Codebase</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <meta name="description" content="Run parallel Claude Code agents across your Python monorepo: one per package, per test module, per migration. amux orchestrates them from a browser or phone. Open source, single Rust binary.">
+  <meta name="keywords" content="python AI coding agent, claude code python, parallel python development, python monorepo agents, pytest agent automation, django migration agents, pydantic upgrade automation, amux python">
   <link rel="canonical" href="https://amux.io/for/python-developers/">
-  <meta property="og:title" content="amux for Python Developers — amux">
-  <meta property="og:description" content="Run parallel Claude Code agents for Python: one per package, one per test module, one per migration. amux for Python developers.">
+  <meta property="og:title" content="amux for Python Developers — Parallel AI Agents for Python Projects">
+  <meta property="og:description" content="Run parallel Claude Code agents across your Python monorepo: one per package, per test module, per migration. amux orchestrates them from a browser or phone.">
   <meta property="og:url" content="https://amux.io/for/python-developers/">
   <meta property="og:image" content="https://amux.io/og-image.png">
   <meta property="og:type" content="article">
@@ -21,9 +21,33 @@
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/style.css">
   <script src="/site.js"></script>
+
   <script type="application/ld+json">{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"amux","item":"https://amux.io/"},{"@type":"ListItem","position":2,"name":"For","item":"https://amux.io/for/"},{"@type":"ListItem","position":3,"name":"amux for Python Developers","item":"https://amux.io/for/python-developers/"}]}</script>
-  <script type="application/ld+json">{"@context":"https://schema.org","@type":"WebPage","name":"amux for Python Developers","description":"Run parallel Claude Code agents for Python: one per package, one per test module, one per migration. amux for Python developers.","url":"https://amux.io/for/python-developers/","audience":{"@type":"Audience","audienceType":"amux for Python Developers"}}</script>
-  </head>
+
+  <script type="application/ld+json">{
+    "@context":"https://schema.org",
+    "@type":"Article",
+    "headline":"amux for Python Developers — Run Parallel AI Agents on Your Python Codebase",
+    "description":"Run parallel Claude Code agents across your Python monorepo: one per package, per test module, per migration. amux orchestrates them from a browser or phone.",
+    "author":{"@type":"Organization","name":"amux","url":"https://amux.io"},
+    "publisher":{"@type":"Organization","name":"amux","url":"https://amux.io","logo":{"@type":"ImageObject","url":"https://amux.io/icon.png"}},
+    "datePublished":"2026-02-15",
+    "dateModified":"2026-09-07",
+    "mainEntityOfPage":"https://amux.io/for/python-developers/"
+  }</script>
+
+  <script type="application/ld+json">{
+    "@context":"https://schema.org",
+    "@type":"FAQPage",
+    "mainEntity":[
+      {"@type":"Question","name":"How do I use Claude Code with a Python monorepo?","acceptedAnswer":{"@type":"Answer","text":"Register each package as a separate amux session pointing to your monorepo root. amux workers share the same directory, so agents can read each other's changes. Assign one agent per package via the shared kanban board. Use CLAUDE.md files in each package directory to give agents package-specific context."}},
+      {"@type":"Question","name":"Can I run pytest across multiple agents with amux?","acceptedAnswer":{"@type":"Answer","text":"Yes. Launch one Claude Code agent per test module or test file. Each agent runs its own pytest loop, fixing failures it encounters. amux shows all agents on a shared dashboard so you can see which tests are passing across the fleet."}},
+      {"@type":"Question","name":"How does amux help with Python dependency upgrades?","acceptedAnswer":{"@type":"Answer","text":"When a major dependency like Django, SQLAlchemy, or Pydantic releases a breaking version, spawn one agent per affected module via amux. Add a board card for each migration task, let agents claim them atomically, and monitor progress from the web dashboard or iOS app."}},
+      {"@type":"Question","name":"Does amux work with Python virtual environments?","acceptedAnswer":{"@type":"Answer","text":"Yes. Set the venv path in your CLAUDE.md so every agent activates the same environment. Alternatively, use one agent per venv and coordinate via the shared board. amux does not manage Python environments itself — it orchestrates Claude Code agents that run inside whatever environment you configure."}},
+      {"@type":"Question","name":"How do I install amux for Python development?","acceptedAnswer":{"@type":"Answer","text":"Install with Homebrew: brew install mixpeek/amux/amux. Then register your project and start agents. No Python required — amux is a single Rust binary."}}
+    ]
+  }</script>
+</head>
 <body>
   <header class="site-header">
     <a class="logo" href="/">amux</a>
@@ -39,42 +63,137 @@
   </header>
   <main>
     <div class="breadcrumb"><a href="/">amux</a> <span class="sep">›</span> <a href="/for/">For</a> <span class="sep">›</span> <span>amux for Python Developers</span></div>
-    <h1>amux for Python Developers</h1>
-<p class="subtitle">Python's ecosystem is vast. amux lets you work on multiple packages, modules, and migrations simultaneously.</p>
-<h2>Why Python + amux Works</h2>
-<p>Python projects often sprawl: multiple packages in a monorepo, dozens of test modules, long migration chains, data pipelines with many stages. The natural way to speed this up is parallelism — and amux gives you that at the agent level.</p>
-<ul>
-<li><strong>One agent per package:</strong> Migrating a monorepo from Python 3.9 to 3.12? Assign one agent per package. They run simultaneously and the work is done in hours instead of days.</li>
-<li><strong>One agent per test module:</strong> Run 10 agents writing unit tests across 10 test files. Cover an entire module in a single afternoon.</li>
-<li><strong>Dependency upgrade agents:</strong> When a major dependency (Django, SQLAlchemy, Pydantic) releases a breaking version, use agents to handle the migration per-module, coordinated via the board.</li>
-<li><strong>Type annotation blitzes:</strong> Adding <code>mypy</code> or <code>pyright</code> to a large untyped codebase? One agent per file or module, all running in parallel.</li>
-</ul>
-<h2>Python-Specific Workflows</h2>
-<pre><code># Register separate agents for different parts of your Python project
+
+    <h1>amux for Python Developers <span style="font-family:var(--font-mono);font-size:11px;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;padding:2px 7px;border-radius:3px;background:oklch(0.80 0.18 145 / .15);color:var(--green);vertical-align:middle;">Updated Sep 2026</span></h1>
+    <p class="subtitle">Python's ecosystem is vast: monorepos, dozens of test modules, long migration chains, ML pipelines. amux lets you work all of them simultaneously — one <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> agent per package, per test file, per migration. Monitor them all from your browser or phone.</p>
+
+    <!-- EXP-083: top-of-page CTA — python-developers, September 2026 refresh, started 2026-09-07 -->
+    <div style="background:var(--green,#2e7d32);color:#000;border-radius:8px;padding:0.85rem 1.25rem;margin:1.25rem 0;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.75rem">
+      <span style="font-weight:600">Open-source AI agent fleet for Python teams. Single Rust binary, 394+ stars on GitHub.</span>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" style="background:#000;color:#fff;padding:0.45rem 1rem;border-radius:6px;font-weight:600;text-decoration:none;white-space:nowrap;font-size:0.9rem" onclick="posthog&&posthog.capture('exp083_python_devs_topofpage_cta_click')">View amux on GitHub ★</a>
+    </div>
+
+    <h2>Why Python + amux Works</h2>
+    <p>Python projects sprawl naturally: multiple packages in a monorepo, test suites measured in thousands of files, migration chains that take days to untangle. The answer to scale is parallelism — and amux brings that to the agent level. Instead of one <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> agent doing one thing, you run ten agents doing ten things at once, each aware of what the others are doing via a shared kanban board.</p>
+
+    <ul>
+      <li><strong>One agent per package:</strong> Migrating a monorepo from Python 3.9 to 3.12? Assign one agent per package. They run simultaneously — work that would take days finishes in hours.</li>
+      <li><strong>One agent per test module:</strong> Run 10 agents writing unit tests across 10 test files. Cover an entire module in a single afternoon.</li>
+      <li><strong>Dependency upgrade agents:</strong> When a major dependency (Django, SQLAlchemy, Pydantic v2) releases a breaking version, use agents to handle the migration per-module, coordinated via the board.</li>
+      <li><strong>Type annotation blitzes:</strong> Adding <code>mypy</code> or <code>pyright</code> to a large untyped codebase? One agent per file or module, all running in parallel.</li>
+    </ul>
+
+    <h2>Python-Specific Workflows</h2>
+    <pre><code><span class="dim"># Install amux (single Rust binary)</span>
+brew install mixpeek/amux/amux
+
+<span class="dim"># Register separate agents for different parts of your Python project</span>
 amux register auth-agent --dir ~/myproject --yolo
-amux register api-agent --dir ~/myproject --yolo
+amux register api-agent  --dir ~/myproject --yolo
 amux register tests-agent --dir ~/myproject --yolo
 
-# Start them all
+<span class="dim"># Start them all</span>
 amux start auth-agent api-agent tests-agent
 
-# Assign tasks via the board
-curl -sk -X POST https://localhost:8824/api/board \
-  -d '{"title":"Migrate auth/ to Pydantic v2","session":"auth-agent"}'</code></pre>
-<h2>Data Science and ML</h2>
-<p>Python is the lingua franca of ML. Use amux to run parallel agents for:</p>
-<ul>
-<li>Generating model training scripts across multiple architectures</li>
-<li>Writing data validation and cleaning pipelines</li>
-<li>Implementing paper reproductions in parallel</li>
-<li>Generating experiment notebooks and evaluation harnesses</li>
-</ul>
-<h2>Async by Nature</h2>
-<p>Python developers are already familiar with async thinking (asyncio, Celery, multiprocessing). amux applies the same pattern to AI agents: fire off tasks, check back when they're done, aggregate results.</p>
-<div class="cta-box"><h3>Get started with amux</h3><p>Run dozens of Claude Code agents in parallel. Python 3 + tmux. Open source.</p><pre><code>git clone https://github.com/mixpeek/amux &amp;&amp; cd amux &amp;&amp; ./install.sh
+<span class="dim"># Assign tasks via the board</span>
+amux board add "Migrate auth/ to Pydantic v2" --session auth-agent
+amux board add "Write pytest fixtures for api/" --session api-agent
+amux board add "Type-annotate tests/ with pyright" --session tests-agent
+
+<span class="dim"># Monitor from the web dashboard or iOS app</span>
+amux serve  <span class="dim"># → https://localhost:8824</span></code></pre>
+
+    <h2>CLAUDE.md for Python Projects</h2>
+    <p>Every <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> agent reads a <code>CLAUDE.md</code> file from your project root. For Python projects, this is where you declare your conventions once so every agent follows them. See the <a href="/guides/claude-md-templates/" style="color:var(--dim);">CLAUDE.md templates guide</a> for full examples.</p>
+    <pre><code><span class="dim"># CLAUDE.md (place at your project root)</span>
+# Python conventions
+- Always activate the venv at `.venv/` before running commands
+- Use `uv` for dependency management (not pip)
+- Run `pytest -x --tb=short` to confirm a fix before marking a task done
+- Type hints required on all new functions (pyright strict)
+- Import style: absolute imports only, no relative imports across packages
+
+# Agent coordination
+- Check the board before starting any task: `amux board ls`
+- Mark your task `doing` before touching files
+- Mark `done` only after tests pass</code></pre>
+
+    <p>Agents in different tmux panes share the same <code>CLAUDE.md</code>, so you get consistent conventions across the whole fleet without repeating yourself.</p>
+
+    <h2>Auto-Drain: Agents That Pick Up Their Own Tasks</h2>
+    <p>Once you have agents running, you can load the board with tasks and let agents claim them automatically. Enable auto-drain per session:</p>
+    <pre><code><span class="dim"># Each agent claims the next todo card when idle</span>
+amux board drain on auth-agent
+amux board drain on api-agent
+amux board drain on tests-agent</code></pre>
+    <p>Now you can add 50 migration tasks to the board and walk away. Agents claim cards atomically — no two agents touch the same task. See the <a href="/guides/running-10-plus-agents/" style="color:var(--dim);">running 10+ agents guide</a> for the full pattern.</p>
+
+    <h2>Data Science and ML</h2>
+    <p>Python is the lingua franca of ML. amux handles the parallelism that makes ML work faster:</p>
+    <ul>
+      <li>Generate model training scripts across multiple architectures simultaneously</li>
+      <li>Write data validation and cleaning pipelines for each data source in parallel</li>
+      <li>Implement paper reproductions with one agent per paper</li>
+      <li>Generate experiment notebooks and evaluation harnesses across a model grid</li>
+    </ul>
+
+    <h2>Async by Nature</h2>
+    <p>Python developers already think in async terms: asyncio, Celery, multiprocessing. amux applies the same pattern at the agent level. Fire off tasks, check back when they're done, aggregate results from the board. The mental model is familiar — the execution is new.</p>
+
+    <div class="cta-box">
+      <h3>Get started with amux</h3>
+      <p>Open-source control plane for AI agent teams. Single Rust binary, installs in one command.</p>
+      <pre><code>brew install mixpeek/amux/amux
 amux register myproject --dir ~/Dev/myproject --yolo
 amux start myproject
-amux serve  # → https://localhost:8824</code></pre><a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub</a></div>
+amux serve  # → https://localhost:8824</code></pre>
+      <a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub ★</a>
+    </div>
+
+    <div class="related-guides" style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.2rem 1.6rem;margin:2rem 0;">
+      <strong style="font-size:0.82rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted);">Related</strong>
+      <ul style="margin:0.6rem 0 0;padding-left:1.2rem;font-size:0.88rem;line-height:2;">
+        <li><a href="/guides/running-10-plus-agents/" style="color:var(--dim);text-decoration:none;">Running 10+ Parallel Claude Code Agents</a></li>
+        <li><a href="/guides/claude-md-templates/" style="color:var(--dim);text-decoration:none;">CLAUDE.md Templates for Your Stack</a></li>
+        <li><a href="/guides/multi-runtime-ai-coding-agents/" style="color:var(--dim);text-decoration:none;">Multi-Runtime AI Agent Fleets (Claude Code, Codex, Gemini)</a></li>
+        <li><a href="/blog/claude-code-vs-cursor-vs-windsurf/" style="color:var(--dim);text-decoration:none;">Claude Code vs Cursor vs Windsurf</a></li>
+      </ul>
+    </div>
+
+    <h2 id="faq">FAQ</h2>
+    <div style="margin:1.5rem 0;">
+      <details style="background:var(--surface);border:1px solid var(--border);border-radius:8px;margin-bottom:0.8rem;">
+        <summary style="padding:1rem 1.2rem;cursor:pointer;font-weight:600;font-size:0.92rem;">How do I use Claude Code with a Python monorepo?</summary>
+        <div style="padding:0 1.2rem 1rem;font-size:0.88rem;color:var(--dim);line-height:1.7;">
+          <p>Register each package as a separate amux session pointing to your monorepo root. Agents share the same directory so they can read each other's changes. Assign one agent per package via the shared kanban board. Use <code>CLAUDE.md</code> files in each package directory to give agents package-specific context on top of the root-level conventions.</p>
+        </div>
+      </details>
+      <details style="background:var(--surface);border:1px solid var(--border);border-radius:8px;margin-bottom:0.8rem;">
+        <summary style="padding:1rem 1.2rem;cursor:pointer;font-weight:600;font-size:0.92rem;">Can I run pytest across multiple agents with amux?</summary>
+        <div style="padding:0 1.2rem 1rem;font-size:0.88rem;color:var(--dim);line-height:1.7;">
+          <p>Yes. Launch one Claude Code agent per test module or test file. Each agent runs its own <code>pytest</code> loop, fixing failures it encounters. amux shows all agents on a shared dashboard so you can see which tests are passing across the whole fleet at once.</p>
+        </div>
+      </details>
+      <details style="background:var(--surface);border:1px solid var(--border);border-radius:8px;margin-bottom:0.8rem;">
+        <summary style="padding:1rem 1.2rem;cursor:pointer;font-weight:600;font-size:0.92rem;">How does amux help with Python dependency upgrades?</summary>
+        <div style="padding:0 1.2rem 1rem;font-size:0.88rem;color:var(--dim);line-height:1.7;">
+          <p>When a major dependency like Django, SQLAlchemy, or Pydantic releases a breaking version, spawn one agent per affected module via amux. Add a board card for each migration task, let agents claim them atomically, and monitor progress from the web dashboard or iOS app. No two agents will claim the same card.</p>
+        </div>
+      </details>
+      <details style="background:var(--surface);border:1px solid var(--border);border-radius:8px;margin-bottom:0.8rem;">
+        <summary style="padding:1rem 1.2rem;cursor:pointer;font-weight:600;font-size:0.92rem;">Does amux work with Python virtual environments?</summary>
+        <div style="padding:0 1.2rem 1rem;font-size:0.88rem;color:var(--dim);line-height:1.7;">
+          <p>Yes. Set the venv path in your <code>CLAUDE.md</code> so every agent activates the same environment. amux doesn't manage Python environments — it orchestrates Claude Code agents that run inside whatever environment you configure. A typical <code>CLAUDE.md</code> line: <code>Always activate .venv/ before running any command.</code></p>
+        </div>
+      </details>
+      <details style="background:var(--surface);border:1px solid var(--border);border-radius:8px;margin-bottom:0.8rem;">
+        <summary style="padding:1rem 1.2rem;cursor:pointer;font-weight:600;font-size:0.92rem;">How do I install amux for Python development?</summary>
+        <div style="padding:0 1.2rem 1rem;font-size:0.88rem;color:var(--dim);line-height:1.7;">
+          <p>Install with Homebrew: <code>brew install mixpeek/amux/amux</code>. No Python required — amux is a single Rust binary. Register your project directory, start agents, and open the dashboard at <code>https://localhost:8824</code>.</p>
+        </div>
+      </details>
+    </div>
+
   </main>
   <footer class="sub-footer">
     <div class="footer-inner">
@@ -122,6 +241,6 @@ amux serve  # → https://localhost:8824</code></pre><a class="btn btn-primary" 
     </div>
   </footer>
 
-<script>fetch('https://api.github.com/repos/mixpeek/amux').then(function(r){return r.json()}).then(function(d){var el=document.getElementById('gh-stars');if(el&&d.stargazers_count) el.textContent='\u2605 '+d.stargazers_count}).catch(function(){})</script>
+  <script>fetch('https://api.github.com/repos/mixpeek/amux').then(function(r){return r.json()}).then(function(d){var el=document.getElementById('gh-stars');if(el&&d.stargazers_count) el.textContent='★ '+d.stargazers_count}).catch(function(){})</script>
 </body>
 </html>

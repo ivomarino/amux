@@ -1,5 +1,50 @@
 [
   {
+    "hash": "0096077c",
+    "short": "0096077c",
+    "title": "Repeated card re-assignment to the same lane is now flagged",
+    "date": "2026-09-07",
+    "type": "feat",
+    "tags": ["board", "invariants", "observability", "drain"],
+    "description": "If a lane is handed the same board card more than once in a short window, the invariants panel now surfaces this as a violation. The silent looping pattern — where a session fails a card and it bounces back repeatedly — was previously invisible until you dug through logs. Now it appears in the dashboard health view as soon as it starts. (AF-543)"
+  },
+  {
+    "hash": "af53a6bb",
+    "short": "af53a6bb",
+    "title": "Board idle dispatch no longer loops when no cards are available",
+    "date": "2026-09-07",
+    "type": "fix",
+    "tags": ["board", "drain", "performance", "reliability"],
+    "description": "Fixed a bug where the idle card dispatch and recovery loop ran continuously when the board had no todo cards, burning CPU and producing noisy logs. The scheduler now backs off properly when there is nothing to claim rather than spinning. (AMUX-4168)"
+  },
+  {
+    "hash": "63b7684d",
+    "short": "63b7684d",
+    "title": "Email ledger shows send status on every row",
+    "date": "2026-09-06",
+    "type": "feat",
+    "tags": ["email", "ledger", "observability", "audit"],
+    "description": "The email audit log now shows whether each message was sent successfully, failed, or is pending directly on every row. Previously you had to click into a message to find its delivery status — unhelpful for scanning a day's outbound volume at a glance."
+  },
+  {
+    "hash": "a626c008",
+    "short": "a626c008",
+    "title": "Email approval status is readable without triggering the approval flow",
+    "date": "2026-09-06",
+    "type": "feat",
+    "tags": ["email", "approval", "dashboard"],
+    "description": "You can now see whether a pending email was approved, rejected, or timed out without going through the approval interaction. Previously, checking the status required presenting the approval prompt, which consumed an interaction slot even when you just wanted to audit the outcome."
+  },
+  {
+    "hash": "322f76c8",
+    "short": "322f76c8",
+    "title": "AI provider catalog is now typed and centralized",
+    "date": "2026-09-06",
+    "type": "feat",
+    "tags": ["models", "multi-runtime", "providers", "configuration"],
+    "description": "All AI providers — Claude, GPT-4o, Gemini, Codex — are now defined in a single typed catalog shared across the server. Adding a new provider or model variant no longer requires changes across multiple files. This makes multi-runtime fleet configuration more reliable and reduces the surface area for provider name mismatches."
+  },
+  {
     "hash": "2dab07907e1f3b4a5c6d8e9f0a1b2c3d4e5f6a7b",
     "short": "2dab0790",
     "title": "Browser sessions now keep a privacy-safe activity trail",
