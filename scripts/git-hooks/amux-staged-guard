@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# guard-features: AMUX-2946 AF-342 AF-414
+# guard-features: AMUX-2946 AF-342 AF-414 MOS-33
 # (Drift token for install-hooks.sh — see append-only-push-guard's header for
 #  the mechanism. A vendored copy lacking a canonical token reads STALE.)
 # ============================================================================
@@ -50,7 +50,7 @@ import json, os, ssl, subprocess, sys, time, urllib.error, urllib.request
 # `^`-anchored, because an unanchored match now finds the comment line first
 # (checked: it returned empty, which would have made `grep -L` match nothing and
 # report a clean fleet).
-GUARD_VERSION = 13
+GUARD_VERSION = 15
 
 
 def amux_base_url():
@@ -794,6 +794,18 @@ def main():
         w("amux staged-guard: DISABLED on the server (AMUX_STAGED_GUARD=0) — "
           "cross-session sweep protection is OFF.\n")
 
+    # MOS-33: a changing mtime identifies activity during a command window,
+    # not the writer. Keep the uncertainty visible without assigning the
+    # observing session ownership or sending the committer to it for consent.
+    # Older servers omit this additive field and retain their normal output.
+    _observations = d.get("observations") or []
+    if _observations:
+        w("amux staged-guard: MTIME OBSERVATIONS — ownership unverified for %d "
+          "staged path(s); a moving mtime does not identify the writer:\n"
+          % len(_observations))
+        for _observation in _observations:
+            w("  %s\n" % _observation.get("path", "?"))
+
     # SHARED paths are not blocked — both sessions edited them, so the committer
     # has a legitimate claim and blocking would deadlock the file. But say it out
     # loud (AMUX-2332): in a single-file project this is the NORMAL case on the
@@ -816,6 +828,13 @@ def main():
         # right now. That is the FACT — someone has uncommitted work in a file
         # you are about to commit whole.
         _level = "WARNING" if f.get("has_unstaged_changes") else "NOTE"
+        # An own-shell fallback permits the workflow without identifying its
+        # writer. A dirty file adds no authorship evidence, and there is no
+        # peer whose recorded write the legacy provenance prose can describe.
+        if not f.get("peer") and f.get("mine_provenance") == "observed":
+            w("amux staged-guard: %s — %s has uncommitted changes; ownership is "
+              "unverified (mtime observation only).\n" % (_level, f.get("path")))
+            continue
         # AF-391: DOWNGRADE, never suppress, when the attribution is mtime-derived
         # AND nothing is in dispute. Two conditions, both required.
         #
@@ -909,13 +928,13 @@ def main():
         # line on every row is a line nobody reads. Absent on old servers, which
         # is why it is a .get with a default rather than an index.
         _mp, _tp = f.get("mine_provenance"), f.get("their_provenance")
-        if _mp and _tp and _mp != _tp:
-            if _mp == "observed":
+        if f.get("peer") and _mp and _tp and _mp != _tp:
+            if _mp == "observed" and _tp in ("transcript", "firsthand"):
                 w("  Provenance: THEIR claim is a recorded write; YOURS is an mtime your "
                   "own Bash command saw move, which on a shared checkout includes writes "
                   "you did not make. Before concluding they are a phantom co-editor, check "
                   "whether the phantom is yours (AMUX-3662).\n")
-            else:
+            elif _tp == "observed" and _mp in ("transcript", "firsthand"):
                 w("  Provenance: YOUR claim is a recorded write; THEIRS is an mtime their "
                   "Bash command saw move — possibly your own write, seen from their "
                   "window (AMUX-3662).\n")
@@ -1090,13 +1109,15 @@ def main():
                           verdict_id=_m.get("verdict_id"), elapsed=_el)
             _clear_marker(sess, top)
         return 0
-    w("\namux staged-guard: COMMIT BLOCKED — staged files were edited by "
-      "OTHER amux sessions sharing this checkout:\n\n")
+    w("\namux staged-guard: COMMIT BLOCKED — staged paths need ownership review:\n\n")
     for f in foreign:
         mins = int((f.get("age_secs") or 0) / 60)
         _w = f.get("why")
-        w("  %s   (edited by session '%s' %dm ago)%s\n"
-          % (f.get("path"), f.get("owner"), mins,
+        _owner = (f.get("owner") or "").strip()
+        _claim = ("edited by session '%s' %dm ago" % (_owner, mins)
+                  if _owner else "ownership is unverified; no recorded writer identified")
+        w("  %s   (%s)%s\n"
+          % (f.get("path"), _claim,
              ("\n      %s" % _w) if _w else ""))
     # AF-365, technique found by `amux` on 2026-08-31 and it belongs FIRST because
     # it is the only remedy here that touches nothing the peer owns.
@@ -1116,11 +1137,11 @@ def main():
     # wired nothing. `git add -p`, which this hook recommends two screens down for
     # the partial-stage case, is the wrong tool for it: the problem is not which of
     # YOUR hunks to take, it is that THEIRS are already staged.
-    w("\nCOMMIT ONLY YOUR OWN PATHS — leaves their staged entries untouched:\n"
+    w("\nCOMMIT ONLY YOUR OWN PATHS — leaves other staged entries untouched:\n"
       "  git commit <your paths> -m ...   # a pathspec commit ignores the index for\n"
       "                                   # everything it does not name\n")
-    w("\nOr unstage theirs — but note this EDITS THE SHARED INDEX, which is their\n"
-      "state, not yours:   git restore --staged "
+    w("\nOr unstage theirs, if any — but this EDITS THE SHARED INDEX and may\n"
+      "change a peer's staged state:   git restore --staged "
       + " ".join(f.get("path", "") for f in foreign) + "\n")
     # AF-26. Two separate defects, both about an honest exit.
     #
@@ -1133,8 +1154,8 @@ def main():
     #    cross-session commit is intentional". Clearing a FALSE positive therefore
     #    required asserting the commit was cross-session when it was not — ethos
     #    rule 3. The honest case now has an honest name.
-    w("\nVERIFY BEFORE OVERRIDING — this verdict comes from edit records in a time\n"
-      "window, NOT from the staged diff, so check whether their work is actually in it:\n")
+    w("\nVERIFY BEFORE OVERRIDING — this verdict uses edit records and cotenant\n"
+      "visibility, not the staged diff. Check whether each staged change is yours:\n")
     for f in foreign:
         w("  git diff --cached -- %s        # is any of this theirs?\n" % f.get("path", ""))
     w("\nThen take the exit that is TRUE:\n"

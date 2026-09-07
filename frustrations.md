@@ -3637,3 +3637,14 @@ CARD: AMUX-4192
 SYMPTOM: The deployed multi-worker sweep lost the selected message on amux-testing-e2e when a jump hit the bottom. The async scroll listener unlocked live updates even though refreshPeek itself preserved selected targets.
 COST: One live navigation failure survived synchronous refresh tests; a working worker replaced the selected message after a geometrically correct jump.
 FIX: The scroll listener now preserves the navigation lock for selected messages and search results at the finite scroll boundary. Regression tests wait for actual scroll events before refreshing and cover both trailing-output and end-of-output targets. Existing navigation beacons expose missing targets and scroll errors.
+
+## Concurrent Bash observations are treated as file ownership
+AREA: attribution
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-07
+SESSION: mixpeek-ops-server
+CARD: MOS-33
+SYMPTOM: A concurrent reader was named owner of three ops research files after their mtimes changed during its Bash command. The production classifier reproduces a foreign block with provenance observed while its explanation asserts a transcript write. A later observation can also replace an existing recorded writer.
+COST: The reader had to disown files it never edited; publication required an ownership check and this repair.
+FIX: Keep mtime observations in a separate, counted advisory. They cannot name an owner or replace recorded edits; preserve recorded-writer and blind-cotenant protection. Regression: concurrent_reader_observations_cannot_claim_the_ops_research_files.
