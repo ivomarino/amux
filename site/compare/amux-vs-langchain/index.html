@@ -4,13 +4,13 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="theme-color" content="#1e2330">
-  <title>amux vs LangChain (2026): Runtime Fleet vs Agent Framework — What's the Difference?</title>
+  <title>amux vs LangChain (2026): Runtime Fleet vs Agent Framework</title>
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
-  <meta name="description" content="amux vs LangChain compared: amux is a runtime control plane for running Claude Code agents on your own machine. LangChain is a Python SDK for building agent logic. They serve different layers — here's when to use each, and when to use both.">
+  <meta name="description" content="amux vs LangChain compared: amux is a runtime control plane for running Claude Code agents on your own machine. LangChain is a Python SDK for building agent logic. They serve different layers. Here's when to use each, and when to use both.">
   <meta name="keywords" content="amux vs LangChain, LangChain alternative, Claude Code vs LangChain, LangChain agent runner, amux LangChain, AI agent framework 2026, LangChain vs amux comparison">
   <link rel="canonical" href="https://amux.io/compare/amux-vs-langchain/">
   <meta property="og:title" content="amux vs LangChain (2026): Runtime Fleet vs Agent Framework">
-  <meta property="og:description" content="amux is a runtime control plane for running Claude Code agents. LangChain is a Python SDK for building agent logic. They answer different questions — here's the full breakdown.">
+  <meta property="og:description" content="amux is a runtime control plane for running Claude Code agents. LangChain is a Python SDK for building agent logic. They answer different questions. Here's the full breakdown.">
   <meta property="og:url" content="https://amux.io/compare/amux-vs-langchain/">
   <meta property="og:image" content="https://amux.io/og-image.png">
   <meta property="og:type" content="article">
@@ -59,7 +59,7 @@
         "name": "What is the difference between amux and LangChain?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "amux is a runtime control plane — it manages, monitors, and heals Claude Code (or Codex/Gemini CLI) processes running on your machine or server. LangChain is a Python SDK for composing LLM calls, tools, and agent logic into chains and graphs. amux doesn't define agent logic; LangChain doesn't manage live processes. They sit at different layers of the stack."
+          "text": "amux is a runtime control plane: it manages, monitors, and heals Claude Code (or Codex/Gemini CLI) processes running on your machine or server. LangChain is a Python SDK for composing LLM calls, tools, and agent logic into chains and graphs. amux doesn't define agent logic; LangChain doesn't manage live processes. They sit at different layers of the stack."
         }
       },
       {
@@ -67,7 +67,7 @@
         "name": "Can I use amux and LangChain together?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "Yes — and they don't conflict. LangChain defines what an agent does (the logic, tool calls, chain of reasoning). amux handles where agents run and what happens to them over time (self-healing, board coordination, phone monitoring, overnight operation). A common pattern: LangChain-built custom agents running as amux-managed sessions alongside Claude Code sessions, all visible in one dashboard."
+          "text": "Yes, and they don't conflict. LangChain defines what an agent does (the logic, tool calls, chain of reasoning). amux handles where agents run and what happens to them over time (self-healing, board coordination, phone monitoring, overnight operation). A common pattern: LangChain-built custom agents running as amux-managed sessions alongside Claude Code sessions, all visible in one dashboard."
         }
       },
       {
@@ -75,7 +75,7 @@
         "name": "Is LangChain a replacement for Claude Code?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "No. LangChain is an SDK for building agents in Python — you write the logic. Claude Code is a CLI that wraps an Anthropic model with built-in coding capabilities: file reading, code editing, shell commands, browser use. Claude Code is a finished agent; LangChain is a toolkit for building your own."
+          "text": "No. LangChain is an SDK for building agents in Python: you write the logic. Claude Code is a CLI that wraps an Anthropic model with built-in coding capabilities: file reading, code editing, shell commands, browser use. Claude Code is a finished agent; LangChain is a toolkit for building your own."
         }
       },
       {
@@ -91,7 +91,7 @@
         "name": "Does amux work with LangChain agents?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "amux manages tmux sessions running any CLI process — including Python scripts that drive LangChain agents. If your LangChain agent runs from the terminal, it can run as an amux session. You get the same dashboard visibility, peek output, steering queue, and self-healing watchdog as any other amux session."
+          "text": "amux manages tmux sessions running any CLI process, including Python scripts that drive LangChain agents. If your LangChain agent runs from the terminal, it can run as an amux session. You get the same dashboard visibility, peek output, steering queue, and self-healing watchdog as any other amux session."
         }
       },
       {
@@ -99,7 +99,7 @@
         "name": "What does amux offer that LangGraph doesn't?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "LangGraph (LangChain's graph-based agent framework) defines agent topology — states, edges, conditional routing. amux handles the operational layer: process lifecycle, multi-session coordination, phone monitoring, a kanban board for task distribution, and built-in self-healing. LangGraph answers 'what does the agent do?'; amux answers 'how do I run a fleet of agents reliably at 2am?'"
+          "text": "LangGraph (LangChain's graph-based agent framework) defines agent topology (states, edges, conditional routing). amux handles the operational layer: process lifecycle, multi-session coordination, phone monitoring, a kanban board for task distribution, and built-in self-healing. LangGraph answers 'what does the agent do?'; amux answers 'how do I run a fleet of agents reliably at 2am?'"
         }
       }
     ]
@@ -123,10 +123,10 @@
     <div class="breadcrumb"><a href="/">amux</a> <span class="sep">›</span> <a href="/compare/">Compare</a> <span class="sep">›</span> <span>amux vs LangChain</span></div>
 
     <h1>amux vs LangChain</h1>
-    <p class="subtitle">Runtime fleet management vs Python agent framework — they answer different questions. Here's when to use each, and when to use both. Updated September 2026.</p>
+    <p class="subtitle">Runtime fleet management vs Python agent framework: they answer different questions. Here's when to use each, and when to use both. Updated September 2026.</p>
 
     <div style="background:var(--surface-2);border-left:3px solid var(--accent,#c75b2e);padding:1rem 1.25rem;border-radius:0 6px 6px 0;margin:1.5rem 0">
-      <strong>Quick answer:</strong> amux manages live agent processes on your machine — self-healing, board coordination, phone monitoring, overnight operation. LangChain is a Python SDK for composing agent logic: tool calls, chains, retrievers. They sit at different layers and many teams use both.
+      <strong>Quick answer:</strong> amux manages live agent processes on your machine: self-healing, board coordination, phone monitoring, overnight operation. LangChain is a Python SDK for composing agent logic: tool calls, chains, retrievers. They sit at different layers and many teams use both.
     </div>
 
     <h2>What each tool actually is</h2>
@@ -145,8 +145,8 @@
       <tbody>
         <tr style="border-bottom:1px solid var(--border,#333)">
           <td style="padding:0.6rem 0.75rem"><strong>Primary role</strong></td>
-          <td style="padding:0.6rem 0.75rem">Runtime fleet manager — runs, heals, and coordinates live agent processes</td>
-          <td style="padding:0.6rem 0.75rem">Agent framework SDK — defines logic, chains, tool calls, and state graphs in code</td>
+          <td style="padding:0.6rem 0.75rem">Runtime fleet manager: runs, heals, and coordinates live agent processes</td>
+          <td style="padding:0.6rem 0.75rem">Agent framework SDK: defines logic, chains, tool calls, and state graphs in code</td>
         </tr>
         <tr style="border-bottom:1px solid var(--border,#333)">
           <td style="padding:0.6rem 0.75rem"><strong>Language</strong></td>
@@ -166,7 +166,7 @@
         <tr style="border-bottom:1px solid var(--border,#333)">
           <td style="padding:0.6rem 0.75rem"><strong>Multi-agent coordination</strong></td>
           <td style="padding:0.6rem 0.75rem">Built-in kanban board with atomic claiming, inter-session messaging, group routing</td>
-          <td style="padding:0.6rem 0.75rem">Multi-agent via LangGraph — edges and state transitions; no built-in board or messaging</td>
+          <td style="padding:0.6rem 0.75rem">Multi-agent via LangGraph: edges and state transitions; no built-in board or messaging</td>
         </tr>
         <tr style="border-bottom:1px solid var(--border,#333)">
           <td style="padding:0.6rem 0.75rem"><strong>Monitoring</strong></td>
@@ -176,7 +176,7 @@
         <tr style="border-bottom:1px solid var(--border,#333)">
           <td style="padding:0.6rem 0.75rem"><strong>Self-healing</strong></td>
           <td style="padding:0.6rem 0.75rem">Auto-compacts context overflows, auto-restarts crashes, replays last message</td>
-          <td style="padding:0.6rem 0.75rem">No built-in process supervision — you handle retries in your agent code</td>
+          <td style="padding:0.6rem 0.75rem">No built-in process supervision; you handle retries in your agent code</td>
         </tr>
         <tr style="border-bottom:1px solid var(--border,#333)">
           <td style="padding:0.6rem 0.75rem"><strong>Setup time</strong></td>
@@ -185,7 +185,7 @@
         </tr>
         <tr style="border-bottom:1px solid var(--border,#333)">
           <td style="padding:0.6rem 0.75rem"><strong>Phone access</strong></td>
-          <td style="padding:0.6rem 0.75rem">iOS app + PWA — full fleet control from your phone</td>
+          <td style="padding:0.6rem 0.75rem">iOS app + PWA: full fleet control from your phone</td>
           <td style="padding:0.6rem 0.75rem">LangSmith has a web UI; no dedicated mobile app for agent control</td>
         </tr>
         <tr style="border-bottom:1px solid var(--border,#333)">
@@ -195,29 +195,29 @@
         </tr>
         <tr style="border-bottom:1px solid var(--border,#333)">
           <td style="padding:0.6rem 0.75rem"><strong>Best for</strong></td>
-          <td style="padding:0.6rem 0.75rem">Running a fleet of coding agents reliably — overnight, unattended, at scale</td>
+          <td style="padding:0.6rem 0.75rem">Running a fleet of coding agents reliably (overnight, unattended, at scale)</td>
           <td style="padding:0.6rem 0.75rem">Building custom AI workflows, RAG pipelines, and specialized agent logic</td>
         </tr>
       </tbody>
     </table>
 
     <h2>Where LangChain fits: building agent logic</h2>
-    <p>LangChain shines when you need to define what an agent does — step by step. Common patterns:</p>
+    <p>LangChain shines when you need to define what an agent does, step by step. Common patterns:</p>
     <ul>
       <li><strong>RAG pipelines:</strong> retrieve documents, pass them to an LLM, parse structured output. LangChain's retriever + chain + output parser pattern is mature and well-documented.</li>
       <li><strong>Custom tool sequences:</strong> if your agent needs to call specific APIs in a defined order, LangChain's tool definition + agent executor pattern is explicit and testable.</li>
-      <li><strong>LangGraph state machines:</strong> complex multi-step workflows with conditional routing — "if the code review found bugs, run fix; otherwise run deploy."</li>
+      <li><strong>LangGraph state machines:</strong> complex multi-step workflows with conditional routing: "if the code review found bugs, run fix; otherwise run deploy."</li>
       <li><strong>Evaluation harnesses:</strong> LangSmith provides traces and evaluations for every LLM call, useful for debugging and improving custom agent behavior.</li>
     </ul>
-    <p>The trade-off: you write the agent logic. Every tool, every prompt template, every retry. For general coding tasks, Claude Code already handles all of that — you just describe what you want in natural language.</p>
+    <p>The trade-off: you write the agent logic. Every tool, every prompt template, every retry. For general coding tasks, Claude Code already handles all of that. You just describe what you want in natural language.</p>
 
     <h2>Where amux fits: running agents reliably</h2>
-    <p>amux is the right layer when your goal is to run agents — not build them. It answers operational questions:</p>
+    <p>amux is the right layer when your goal is to run agents, not build them. It answers operational questions:</p>
     <ul>
       <li><strong>How do I run 20 agents at once?</strong> amux manages parallel tmux sessions, each with its own context, task, and output stream.</li>
       <li><strong>What happens when an agent crashes at 3am?</strong> amux's watchdog auto-restarts and replays the last message. The agent picks up where it left off.</li>
-      <li><strong>How do 20 agents avoid working on the same task?</strong> The kanban board uses atomic claiming — once an agent claims a card, it's locked.</li>
-      <li><strong>How do I check on agents from my phone?</strong> The iOS app and PWA give you the full dashboard — peek output, send instructions, move tasks.</li>
+      <li><strong>How do 20 agents avoid working on the same task?</strong> The kanban board uses atomic claiming: once an agent claims a card, it's locked.</li>
+      <li><strong>How do I check on agents from my phone?</strong> The iOS app and PWA give you the full dashboard: peek output, send instructions, move tasks.</li>
       <li><strong>How do agents hand off work to each other?</strong> Inter-session messaging, group routing, and the board's dependency tracking handle cross-agent coordination without custom code.</li>
     </ul>
 
@@ -226,13 +226,13 @@
     <ol>
       <li>LangChain-built custom agents handle specialized logic (document processing, RAG, API workflows)</li>
       <li>Claude Code sessions handle general software development tasks</li>
-      <li>All sessions — LangChain and Claude Code — run as amux sessions in the same fleet</li>
+      <li>All sessions (LangChain and Claude Code) run as amux sessions in the same fleet</li>
       <li>All are visible in the amux dashboard, coordinate via the same kanban board, and benefit from the same self-healing watchdog</li>
     </ol>
     <p>The amux control plane doesn't care what's running in a tmux session. If your LangChain script runs from the terminal, it can run as an amux session.</p>
 
     <h2>amux vs LangGraph specifically</h2>
-    <p>LangGraph (the graph-based multi-agent framework from LangChain) and amux both enable multi-agent workflows — but at different levels:</p>
+    <p>LangGraph (the graph-based multi-agent framework from LangChain) and amux both enable multi-agent workflows, but at different levels:</p>
     <table style="width:100%;border-collapse:collapse;margin:1.25rem 0;font-size:0.9rem">
       <thead>
         <tr style="border-bottom:2px solid var(--border,#333)">
@@ -244,7 +244,7 @@
       <tbody>
         <tr style="border-bottom:1px solid var(--border,#333)">
           <td style="padding:0.6rem 0.75rem">How does the agent decide what to do next?</td>
-          <td style="padding:0.6rem 0.75rem">The model decides — no graph</td>
+          <td style="padding:0.6rem 0.75rem">The model decides (no graph)</td>
           <td style="padding:0.6rem 0.75rem">Defined as a state graph with edges and conditions</td>
         </tr>
         <tr style="border-bottom:1px solid var(--border,#333)">
@@ -259,15 +259,15 @@
         </tr>
         <tr style="border-bottom:1px solid var(--border,#333)">
           <td style="padding:0.6rem 0.75rem">How do I monitor from my phone?</td>
-          <td style="padding:0.6rem 0.75rem">iOS app / PWA — live fleet view, peek output</td>
+          <td style="padding:0.6rem 0.75rem">iOS app / PWA: live fleet view, peek output</td>
           <td style="padding:0.6rem 0.75rem">LangSmith web (no native mobile app)</td>
         </tr>
       </tbody>
     </table>
 
     <h2>Which one should you start with?</h2>
-    <p>If your goal is to <strong>write software faster using AI</strong> — run parallel Claude Code agents, automate code review, ship features overnight — start with amux. Setup is 5 minutes, no agent logic to write, and Claude Code handles general software tasks out of the box.</p>
-    <p>If your goal is to <strong>build a custom AI workflow</strong> — a document processor, a RAG system, a specialized tool-calling agent — start with LangChain. You define the logic, and the framework provides the plumbing.</p>
+    <p>If your goal is to <strong>write software faster using AI</strong> (run parallel Claude Code agents, automate code review, ship features overnight), start with amux. Setup is 5 minutes, no agent logic to write, and Claude Code handles general software tasks out of the box.</p>
+    <p>If your goal is to <strong>build a custom AI workflow</strong> (a document processor, a RAG system, a specialized tool-calling agent), start with LangChain. You define the logic, and the framework provides the plumbing.</p>
     <p>Many teams end up using both: LangChain for the custom parts, amux as the runtime layer that keeps everything running reliably.</p>
 
     <h2>Related comparisons</h2>
@@ -282,23 +282,23 @@
     <h2>Frequently asked questions</h2>
     <details style="border:1px solid var(--border);border-radius:6px;padding:0.75rem 1rem;margin:0.5rem 0">
       <summary style="cursor:pointer;font-weight:600">What is the difference between amux and LangChain?</summary>
-      <p style="margin-top:0.75rem">amux is a runtime control plane — it manages, monitors, and heals Claude Code processes running on your machine. LangChain is a Python SDK for composing LLM calls, tools, and agent logic. amux doesn't define agent logic; LangChain doesn't manage live processes. They sit at different layers of the stack.</p>
+      <p style="margin-top:0.75rem">amux is a runtime control plane: it manages, monitors, and heals Claude Code processes running on your machine. LangChain is a Python SDK for composing LLM calls, tools, and agent logic. amux doesn't define agent logic; LangChain doesn't manage live processes. They sit at different layers of the stack.</p>
     </details>
     <details style="border:1px solid var(--border);border-radius:6px;padding:0.75rem 1rem;margin:0.5rem 0">
       <summary style="cursor:pointer;font-weight:600">Can I use amux and LangChain together?</summary>
-      <p style="margin-top:0.75rem">Yes. LangChain defines what your agent does; amux handles where it runs and what happens to it. If your LangChain script runs from the terminal, it can be an amux session — with the same dashboard visibility, self-healing watchdog, and phone monitoring as any other session.</p>
+      <p style="margin-top:0.75rem">Yes. LangChain defines what your agent does; amux handles where it runs and what happens to it. If your LangChain script runs from the terminal, it can be an amux session, with the same dashboard visibility, self-healing watchdog, and phone monitoring as any other session.</p>
     </details>
     <details style="border:1px solid var(--border);border-radius:6px;padding:0.75rem 1rem;margin:0.5rem 0">
       <summary style="cursor:pointer;font-weight:600">Is LangChain better than Claude Code for coding tasks?</summary>
-      <p style="margin-top:0.75rem">They solve different problems. Claude Code is a finished coding agent — it reads files, edits code, runs tests, and iterates based on your instructions. LangChain is a toolkit for building your own agents; you define every tool call and prompt. For general software development, Claude Code with amux is much faster to set up and requires no agent framework code.</p>
+      <p style="margin-top:0.75rem">They solve different problems. Claude Code is a finished coding agent: it reads files, edits code, runs tests, and iterates based on your instructions. LangChain is a toolkit for building your own agents; you define every tool call and prompt. For general software development, Claude Code with amux is much faster to set up and requires no agent framework code.</p>
     </details>
     <details style="border:1px solid var(--border);border-radius:6px;padding:0.75rem 1rem;margin:0.5rem 0">
       <summary style="cursor:pointer;font-weight:600">Does amux support Python agents, not just Claude Code?</summary>
-      <p style="margin-top:0.75rem">Yes. amux manages tmux sessions — any terminal process. Python scripts, Node.js servers, custom agent CLIs all run as amux sessions. You get the same dashboard, peek output, steering queue, and self-healing as Claude Code sessions.</p>
+      <p style="margin-top:0.75rem">Yes. amux manages tmux sessions (any terminal process). Python scripts, Node.js servers, custom agent CLIs all run as amux sessions. You get the same dashboard, peek output, steering queue, and self-healing as Claude Code sessions.</p>
     </details>
     <details style="border:1px solid var(--border);border-radius:6px;padding:0.75rem 1rem;margin:0.5rem 0">
       <summary style="cursor:pointer;font-weight:600">What does amux cost vs LangSmith?</summary>
-      <p style="margin-top:0.75rem">amux is free and open source (MIT + Commons Clause). LangSmith, LangChain's observability and evaluation platform, has a free tier for individual developers and paid tiers for teams. The amux dashboard runs locally — no SaaS subscription, no data sent to external services.</p>
+      <p style="margin-top:0.75rem">amux is free and open source (MIT + Commons Clause). LangSmith, LangChain's observability and evaluation platform, has a free tier for individual developers and paid tiers for teams. The amux dashboard runs locally: no SaaS subscription, no data sent to external services.</p>
     </details>
 
     <div class="cta-box">

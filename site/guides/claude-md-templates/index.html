@@ -491,13 +491,14 @@ Rust application. Cargo workspace. tokio async runtime.
         <div class="tmpl-note">Why: The zero-I/O core crate pattern is the key to testable Rust — it means your business logic compiles and tests in milliseconds without standing up a server.</div>
       </div>
 
-      <!-- 13. Single-file project -->
+      <!-- 13. Cargo workspace project -->
       <div class="tmpl-card" data-category="meta">
-        <div class="tmpl-card-head"><h3>Single-File Project (Rust / amux-style)</h3><span class="tmpl-tag">Meta</span></div>
+        <div class="tmpl-card-head"><h3>Cargo Workspace (Rust / amux-style)</h3><span class="tmpl-tag">Meta</span></div>
         <pre><code># my-project
 
-Single-file Rust binary with inline HTML/CSS/JS (amux architecture).
-Everything lives in one workspace — no build step, no Docker, ships on save.
+Four-crate Cargo workspace: amux-core, amux-server, amux-cli, amux-dashboard.
+Static assets (app.js, app.css, index.html, sw.js) live in crates/amux-dashboard/static/.
+Server ships on commit via the auto-builder (live within ~60s).
 
 ## Workflow
 - Commit after every completed task. Don't batch changes.
@@ -508,7 +509,7 @@ Everything lives in one workspace — no build step, no Docker, ships on save.
 
 ## Rules
 - One Rust file per API family (src/api/foo.rs). No god modules.
-- HTML/CSS/JS is static in static/app.{js,css} — not embedded in Rust strings.
+- HTML/CSS/JS is static in static/app.{js,css} (not embedded in Rust strings).
 - SQLite for persistence via sqlx. Migrations in migrations/ — append-only.
 - Zero external services. If you need state, it goes in the SQLite DB.
 - No async runtimes other than tokio. No axum handler with more than two
