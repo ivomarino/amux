@@ -28,7 +28,7 @@
 # Follows scripts/test-cli-quoting.sh / test-amux-url.sh: an isolated CC_HOME plus a
 # stub tmux on PATH, so a run can neither reach a real worker nor touch the real tmux
 # server. No network, no fleet state, deterministic.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.." || exit 1
 AMUX_BIN="${AMUX_BIN:-./amux}"   # override to run against a fixture
 PASS=0; FAIL=0
@@ -92,7 +92,10 @@ run_launch() {
 }
 
 # ── 1. current CLI: the inject resolves AMUX_API; launch reaches "started" ─────
-run_launch "$AMUX_BIN"; RC=$?; OUT=$(cat "$WORK/out")
+# The launch's exit status IS the assertion in both cells below (case 1 must
+# succeed, case 2 must fail on the broken CLI). `if` keeps the status readable
+# under `set -e`; `|| true` would erase the thing being tested (AF-562).
+if run_launch "$AMUX_BIN"; then RC=0; else RC=$?; fi; OUT=$(cat "$WORK/out")
 if [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q "started" \
    && ! printf '%s' "$OUT" | grep -q "unbound variable"; then
   ok "current CLI reaches the launch inject with AMUX_API unset (no unbound var)"
@@ -121,7 +124,7 @@ else
   bad "could not build the broken fixture; has the specimen line drifted?" \
       "expected exactly 1 cmd_start occurrence in $AMUX_BIN and 0 in the copy; got $n_orig and $n_brk"
 fi
-run_launch "$BROKEN"; RC=$?; OUT=$(cat "$WORK/out")
+if run_launch "$BROKEN"; then RC=0; else RC=$?; fi; OUT=$(cat "$WORK/out")
 if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q "unbound variable"; then
   ok "broken copy fails at runtime with an unbound-variable error (rc=$RC)"
 else

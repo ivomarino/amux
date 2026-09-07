@@ -24,7 +24,7 @@
 # a worktree. So B rebuilds the pre-fix behaviour (the hardcoded path) and asserts
 # it FAILS on the same fixture. Confirmed before wiring in: with B's mutation
 # applied to the shipped script, A fails and B passes.
-set -uo pipefail
+set -euo pipefail
 
 SRC_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 TMP="$(mktemp -d)"
@@ -127,7 +127,11 @@ if ! grep -q 'HOOKS="\$ROOT/.git/hooks"' "$wt/scripts/install-hooks-prefix.sh"; 
   # mutation LANDED before reading its result.
   bad "B: the mutation did not apply — B proves nothing, fix the sed"
 else
-  bout="$(cd "$wt" && bash scripts/install-hooks-prefix.sh 2>&1)"; brc=$?
+  # THE FAILURE IS THE ASSERTION: this is the PRE-FIX path run from a worktree,
+  # and case A is only discriminating if it exits non-zero. Captured through `if`
+  # so `set -e` does not abort before $brc is read — `|| true` would destroy the
+  # very status the next line tests (AF-562).
+  if bout="$(cd "$wt" && bash scripts/install-hooks-prefix.sh 2>&1)"; then brc=0; else brc=$?; fi
   if [ "$brc" -eq 0 ]; then
     bad "B: the pre-fix path SUCCEEDED from a worktree — case A is not discriminating"
   elif printf '%s' "$bout" | grep -q 'Not a directory'; then
