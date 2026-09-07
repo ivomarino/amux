@@ -4177,9 +4177,52 @@ mod negative_controls {
             "only {} of {n_entries} entries yielded a SYMPTOM fingerprint",
             prints.len()
         );
+        // CHARS, not BYTES. `frustration_entry_fingerprints` truncates with
+        // `.chars().take(120)`, so a fingerprint is bounded at 120 CHARACTERS
+        // and `len()` measures UTF-8 bytes — the assertion could not be
+        // satisfied by the code that produces it (AF-551).
+        //
+        // It took a real entry to expose: amux-testing-e2e logged the Codex
+        // footer bug, whose SYMPTOM has to contain the middle dot the
+        // recognizer mis-parsed (`model · path · Main [default]`). Two bytes
+        // for one char, 120 chars, 122 bytes, red. You cannot report a
+        // character-rendering bug without writing the character, so this was a
+        // gate with no truthful path through it (ethos rule 3) — and it
+        // punished the most precise possible bug report.
+        let over: Vec<&str> = prints
+            .iter()
+            .filter(|(_, f)| f.chars().count() > 120 || f.contains("  "))
+            .map(|(t, _)| t.as_str())
+            .collect();
         assert!(
-            prints.iter().all(|(_, f)| f.len() <= 120 && !f.contains("  ")),
-            "fingerprints must be normalised and bounded"
+            over.is_empty(),
+            "{} fingerprint(s) not normalised or over 120 chars: {over:?}",
+            over.len()
+        );
+    }
+
+    /// AF-551. The bound is on CHARACTERS and the old assertion measured
+    /// BYTES, so any non-ASCII symptom failed a check its own producer could
+    /// not pass. A frustration about a character-rendering bug must contain the
+    /// character; this pins that it can.
+    #[test]
+    fn a_non_ascii_symptom_still_fits_the_fingerprint_bound() {
+        // 120 middle dots: the maximum the truncator emits, at 2 bytes each.
+        let dots = "\u{b7} ".repeat(200);
+        let md = format!("---\n\n## a title\nSYMPTOM: {dots}\n");
+        let prints = frustration_entry_fingerprints(&md);
+        assert_eq!(prints.len(), 1, "the entry must yield a fingerprint");
+        let f = &prints[0].1;
+        assert!(
+            f.chars().count() <= 120,
+            "the producer bounds CHARS: {} chars",
+            f.chars().count()
+        );
+        assert!(
+            f.len() > 120,
+            "and this specimen must exceed 120 BYTES, or it cannot catch the \
+             regression: {} bytes",
+            f.len()
         );
     }
 
