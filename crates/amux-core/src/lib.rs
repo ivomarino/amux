@@ -47,6 +47,7 @@ pub mod scope;
 pub mod search;
 pub mod session;
 pub mod stall;
+pub mod task_graph;
 pub mod turn;
 pub mod verification;
 pub mod workflow;

@@ -40,13 +40,52 @@ use std::sync::{Arc, Mutex};
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/fleet", get(fleet_graph))
+        .route("/board", get(board_graph))
         .route("/{id}", get(get_graph))
         .route("/{id}/import-vault", post(import_vault))
         .route("/{id}/nodes/{nid}", patch(patch_node))
 }
 
+// The board graph is a read-only projection. Mutations continue through the
+// attributed, revision-checked board APIs rather than the map editor.
+async fn board_graph(State(state): State<AppState>) -> Response {
+    let store = state.store.clone();
+    let read = tokio::task::spawn_blocking(move || {
+        let conn = store.read()?;
+        crate::db::task_graph_store::snapshot(&conn)
+    }).await;
+    match read {
+        Ok(Ok(snapshot)) => {
+            if !snapshot.verification.valid {
+                tracing::warn!(target: "amux::board", verdict = "task_graph_invalid",
+                    measured = true, n_considered = snapshot.n_considered,
+                    findings = snapshot.verification.findings.len(),
+                    revision = snapshot.revision, sha256 = snapshot.sha256,
+                    "board graph verification failed; GET /api/graph/board identifies the broken relations");
+            }
+            Json(snapshot).into_response()
+        }
+        result => {
+            let why = match result {
+                Ok(Err(e)) => e.to_string(), Err(e) => e.to_string(), _ => unreachable!(),
+            };
+            tracing::warn!(target: "amux::board", verdict = "task_graph_unmeasured", %why,
+                "board graph snapshot could not be read");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"measured":false,"n_considered":0,
+                "why_unmeasured":why,"error":"board graph unavailable"}))).into_response()
+        }
+    }
+}
+
 fn now_secs() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+fn board_graph_read_only() -> Response {
+    tracing::warn!(target: "amux::board", verdict = "task_graph_projection_write_rejected",
+        "task graph writes must use the attributed board APIs");
+    (StatusCode::CONFLICT, Json(json!({"error":"the board graph is a read-only projection",
+        "code":"task_graph_read_only", "remedy":"Use /api/board task, decomposition and artifact mutations"}))).into_response()
 }
 
 // ---- GET /api/graph/{id} ----------------------------------------------------
@@ -268,6 +307,7 @@ async fn import_vault(
     AxPath(gid): AxPath<String>,
     body: Option<Json<Value>>,
 ) -> Response {
+    if gid == "board" { return board_graph_read_only(); }
     let body = body.map(|Json(v)| v).unwrap_or(Value::Null);
     let vault_path = body.get("path").and_then(Value::as_str).unwrap_or("").trim();
     if vault_path.is_empty() {
@@ -441,6 +481,7 @@ async fn patch_node(
     AxPath((gid, nid)): AxPath<(String, String)>,
     body: Option<Json<Value>>,
 ) -> Response {
+    if gid == "board" { return board_graph_read_only(); }
     let body = body.map(|Json(v)| v).unwrap_or(Value::Null);
     // Whitelisted fields, python parity. Values pass through as their JSON
     // types (x/y numbers, pinned 0/1, strings for the rest).

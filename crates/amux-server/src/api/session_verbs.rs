@@ -18474,12 +18474,19 @@ mod tests {
     /// remedy, because it reads as an answer.
     #[test]
     fn the_cross_group_refusal_names_the_verb_that_works_without_an_existing_card() {
+        // A refusal test must establish the explicit opt-out. The fleet has
+        // been open by default since September 3; reading the real workers'
+        // configuration made a correct default fail every complete suite.
+        let dir = tempfile::tempdir().expect("isolated refusal fixture");
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("gtm-media-assets.env"), "CC_TAGS=media\nCC_SEND_ALLOW=\"\"\n").unwrap();
+        std::fs::write(sessions.join("amux-frustrations.env"), "CC_TAGS=engineering\nCC_RECEIVE_ANY=0\n").unwrap();
         let msg = cross_group_send_ok("gtm-media-assets", "amux-frustrations")
             .err()
             .unwrap_or_else(|| {
-                // If the fleet default is open on this box the send is allowed and
-                // there is no refusal to inspect. Say so rather than pass silently.
-                panic!("expected a refusal to inspect; the gate is open between these lanes")
+                panic!("explicit opt-out fixture failed to refuse: isolated AMUX_HOME with distinct groups")
             });
         assert!(
             msg.contains("board assign"),

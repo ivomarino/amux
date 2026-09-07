@@ -1095,6 +1095,7 @@ async fn get_contract(
             "required_per_child": ["unique title", "concrete description", "non-epic type", "p0-p3 priority", "earlier-task dependency indexes", "concrete next_action", "1-12 falsifiable acceptance_criteria"],
             "idempotency": "the normalized plan SHA-256 is durable on the root epic; an identical retry returns idempotent=true and a different retry returns 409 decomposition_plan_conflict",
             "dependency_execution": "todo/backlog claims are refused while any dependency is open; board-drive promotes dependency-backed backlog only after every dependency is done or verified, and a committed successor is not stranded by unrelated todo queue depth",
+            "graph": "GET /api/graph/board or amux board graph --check: versioned snapshot of tasks, workers, artifacts and recorded messages, typed provenance, cycle/missing-reference verification, and deterministic prerequisite-first layers. Structural order is not a workflow readiness or artifact-existence claim. Mutate through board/decompose/artifacts APIs; periodic board.graph_integrity detects legacy corruption.",
             "completion": "when every child is done, verified, discarded, or quarantined, board-drive closes the root epic and records the child-status summary as evidence",
         },
         // AMUX-2933 (ts-gke). The list filters WORK and were documented
@@ -6461,6 +6462,15 @@ pub async fn patch_item(
             set_opt("decision_rationale", &mut next.decision_rationale, &mut changed);
             set_opt("decision_supersedes", &mut next.decision_supersedes, &mut changed);
             set_opt("waiting_on", &mut next.waiting_on, &mut changed);
+            if next.epic != row.epic {
+                if let Some(parent) = next.epic.as_deref() {
+                    if let Some(cycle) = bs::epic_cycle(conn, &row.id, parent)? {
+                        return finish(&slot_w, PatchOut::Refused(StatusCode::BAD_REQUEST,
+                            json!({"error":format!("circular epic: {}",cycle.join(" -> ")),
+                                "code":"lineage_cycle", "cycle":cycle})), no_write());
+                    }
+                }
+            }
             if let Some(spec) = map.get("callback") {
                 if caller_lane.is_empty() {
                     return finish(

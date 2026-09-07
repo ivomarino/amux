@@ -24,14 +24,14 @@
 //!   does not model (`creator`, `created`, `notified`, `gcal_event_id`,
 //!   `deleted`).
 
-use amux_core::board::{self, Gate, GateCriterion, ItemType, Task, TaskStatus};
+use amux_core::board::{ Gate, GateCriterion, ItemType, Task, TaskStatus};
 use amux_core::events::Actor;
 use amux_core::ids::{GateId, TaskId};
 use amux_core::verification::VerifierKind;
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use rusqlite::{params, Connection, OptionalExtension, Row};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
@@ -2983,89 +2983,43 @@ pub fn clear_needs_you_tags(conn: &Connection, id: &str) -> rusqlite::Result<usi
 
 /// Would giving `self_id` the dependency set `new_deps` create a cycle?
 /// Returns the cycle as SEMANTIC ids for the error message, or `None` when
-/// acyclic. Uses core's [`board::detect_cycle`] over the whole board's
-/// `DependsOn` edges (self's existing edges are replaced by `new_deps`,
-/// matching PATCH replace semantics).
+/// acyclic. Walks only from the proposed dependencies back to self. Stopping at
+/// self makes its old outgoing edges irrelevant (PATCH replacement semantics).
 pub fn depends_on_cycle(
     conn: &Connection,
     self_id: &str,
     new_deps: &[String],
 ) -> rusqlite::Result<Option<Vec<String>>> {
-    let mut names: HashMap<TaskId, String> = HashMap::new();
-    let intern = |sem: &str, names: &mut HashMap<TaskId, String>| -> TaskId {
-        let t = internal_id(sem);
-        names.entry(t.clone()).or_insert_with(|| sem.to_string());
-        t
-    };
-    let mut edges: Vec<(TaskId, TaskId)> = Vec::new();
-    let mut stmt = conn.prepare(
-        "SELECT id, depends_on FROM issues \
-         WHERE deleted IS NULL AND depends_on IS NOT NULL AND depends_on != ''",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-    })?;
-    for row in rows {
-        let (id, dep_json) = row?;
-        if id == self_id {
-            continue; // replaced by new_deps below
-        }
-        if let Ok(deps) = serde_json::from_str::<Vec<serde_json::Value>>(&dep_json) {
-            for d in deps.iter().filter_map(|v| v.as_str()) {
-                let from = intern(&id, &mut names);
-                let to = intern(d, &mut names);
-                edges.push((from, to));
-            }
-        }
+    let result = dependency_path(conn, new_deps, self_id)?.map(|path| {
+        let mut cycle = vec![self_id.to_string()];
+        cycle.extend(path);
+        cycle
+    });
+    if let Some(cycle) = &result {
+        tracing::warn!(target: "amux::board", verdict = "dependency_cycle_rejected",
+            task_id = self_id, cycle = %cycle.join(" -> "),
+            "board graph rejected a cycle in the edited task's dependency closure");
     }
-    for d in new_deps {
-        let from = intern(self_id, &mut names);
-        let to = intern(d, &mut names);
-        edges.push((from, to));
+    Ok(result)
+}
+
+/// The parent relation is its own DAG: mixing it with depends_on would turn
+/// normal parent-waits-for-child execution into a false cycle.
+pub fn epic_cycle(conn: &Connection, self_id: &str, parent: &str) -> rusqlite::Result<Option<Vec<String>>> {
+    let mut graph = amux_core::task_graph::Adjacency::new();
+    let mut stmt = conn.prepare("SELECT id,epic FROM issues WHERE deleted IS NULL AND epic IS NOT NULL AND epic != ''")?;
+    for row in stmt.query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))? {
+        let (id,parent) = row?;
+        graph.entry(id).or_default().insert(parent);
     }
-    // REFUSE ONLY A CYCLE THIS CALLER IS PART OF (AC-335).
-    //
-    // The graph above is EVERY depends_on edge on the board, and detect_cycle
-    // returns the first cycle it finds anywhere in it. So one stale cycle
-    // between two unrelated cards made every subsequent depends_on write fail —
-    // with an error naming two ids the caller had never touched, which reads as
-    // "your edit is circular" when it is not.
-    //
-    // Live specimen: GE-473 <-> MHC-256, two cards owned by other lanes and BOTH
-    // already closed (done and verified). Setting AC-331 -> AC-330, which shares
-    // no node with either, was refused as "circular depends_on: GE-473 ->
-    // MHC-256". Board-wide, for everyone, until someone broke a cycle between two
-    // finished cards nobody was looking at.
-    //
-    // The check is sound because new edges all originate at `self_id`: adding
-    // them can only create cycles that pass THROUGH self_id. A cycle without
-    // self_id therefore pre-existed this request and is not this caller's to fix.
-    //
-    // Pre-existing cycles are still real board damage, so they are logged rather
-    // than swallowed — the caller is unblocked, and the problem stays visible to
-    // whoever owns those cards.
-    let self_tid = internal_id(self_id);
-    Ok(board::detect_cycle(&edges).and_then(|cycle| {
-        let named: Vec<String> = cycle
-            .iter()
-            .map(|t| {
-                names
-                    .get(t)
-                    .cloned()
-                    .unwrap_or_else(|| t.as_str().to_string())
-            })
-            .collect();
-        if cycle.contains(&self_tid) {
-            Some(named)
-        } else {
-            tracing::warn!(
-                cycle = %named.join(" -> "),
-                self_id = %self_id,
-                "pre-existing depends_on cycle elsewhere on the board — not blocking this write (AC-335)"
-            );
-            None
-        }
-    }))
+    let result = amux_core::task_graph::path_to(&graph, &[parent.into()], self_id).map(|path| {
+        let mut cycle = vec![self_id.into()]; cycle.extend(path); cycle
+    });
+    if let Some(cycle) = &result {
+        tracing::warn!(target: "amux::board", verdict = "lineage_cycle_rejected", task_id = self_id,
+            cycle = %cycle.join(" -> "), "board graph rejected cyclic parent lineage");
+    }
+    Ok(result)
 }
 
 /// Find an existing dependency path from any of `starts` to `target`.
@@ -3086,40 +3040,20 @@ pub fn dependency_path(
     starts: &[String],
     target: &str,
 ) -> rusqlite::Result<Option<Vec<String>>> {
-    let mut queue: VecDeque<Vec<String>> = starts
-        .iter()
-        .map(|start| vec![start.clone()])
-        .collect();
-    let mut seen = HashSet::new();
-
-    while let Some(path) = queue.pop_front() {
-        let Some(node) = path.last() else { continue };
-        if node == target {
-            return Ok(Some(path));
-        }
-        if !seen.insert(node.clone()) {
-            continue;
-        }
-        let dep_json: Option<String> = conn
-            .query_row(
-                "SELECT depends_on FROM issues WHERE id=?1 AND deleted IS NULL",
-                params![node],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let deps = dep_json
-            .as_deref()
-            .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
-            .unwrap_or_default();
-        for dep in deps {
-            if !seen.contains(&dep) {
-                let mut next = path.clone();
-                next.push(dep);
-                queue.push_back(next);
+    let mut graph = amux_core::task_graph::Adjacency::new();
+    let mut stmt = conn.prepare("SELECT id, depends_on FROM issues WHERE deleted IS NULL")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?;
+    for row in rows {
+        let (id, raw) = row?;
+        if let Some(raw) = raw.filter(|v| !v.is_empty()) {
+            match serde_json::from_str::<Vec<String>>(&raw) {
+                Ok(deps) => { graph.insert(id, deps.into_iter().collect()); }
+                Err(error) => tracing::warn!(target: "amux::board", verdict = "dependency_graph_malformed",
+                    task_id = id, %error, "cannot traverse malformed task dependencies; graph verification reports this row"),
             }
         }
     }
-    Ok(None)
+    Ok(amux_core::task_graph::path_to(&graph, starts, target))
 }
 
 #[cfg(test)]

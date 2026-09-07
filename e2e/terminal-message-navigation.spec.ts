@@ -1,9 +1,8 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 
 // Exercise the shipped renderer and actual header buttons, including ANSI spans
 // that used to cross block boundaries and Codex's different prompt glyph.
 test.beforeEach(async ({ page }) => {
-  await page.route('**/api/sessions/nav-probe/peek?*', route => route.fulfill({ json: { output: '' } }));
   await page.goto('/');
   await page.waitForFunction(() => typeof (window as any).highlightPrompts === 'function');
   await page.evaluate(() => {

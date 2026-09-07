@@ -3475,6 +3475,28 @@ SYMPTOM: Live amux terminal contained three Codex prompt lines but zero navigabl
 COST: User could not navigate the conversation; reproduced a zero-target click on the live worker.
 FIX: Recognize both prompt glyphs, balance ANSI and message blocks, classify from scoped history, land at message starts, and emit peek-message-nav beacons with landed/no-targets/target-not-visible verdicts. Desktop, mobile and WebKit: 9 passed; removing Codex detection fails the regression.
 
+## A stale dependency cycle can hide a new task cycle
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux
+CARD: AMUX-4179
+SYMPTOM: depends_on_cycle inspected only the first cycle anywhere on the board and ignored it if it did not contain the edited task. A second newly introduced cycle could therefore escape the write guard. Parent lineage had no cycle guard, and no periodic graph integrity check exposed malformed or dangling relationships.
+COST: Plans could become structurally unbuildable without a reliable rejection or graph-wide diagnosis.
+FIX: Edited-task reachability checks with real cycle witnesses, independent parent DAG validation, and a typed snapshot over existing primitives. board.graph_integrity runs periodically; dependency_cycle_rejected, lineage_cycle_rejected and task_graph_invalid identify failures. Removing the dependency guard makes the persisted-corruption API regression accept a cycle and fail.
+
+## A refusal test read the live fleet's open sending policy
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux
+CARD: AMUX-4179
+SYMPTOM: The complete server suite failed in the_cross_group_refusal_names_the_verb_that_works_without_an_existing_card because it expected a refusal while reading real worker configuration. Cross-group sending has been open by default since September 3.
+COST: One false failure interrupted a 2,012-test library run before integration targets could execute.
+FIX: Isolated AMUX_HOME with explicit opt-out and distinct groups, following the neighboring policy tests. The failure now names its explicit fixture if the gate unexpectedly opens; the focused test passes.
+
 ## Codex's worktree suffix revived the false unsubmitted-text badge
 AREA: status
 SEVERITY: slows

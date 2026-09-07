@@ -372,6 +372,7 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     out.extend(archived_terminal_check(state));
     out.extend(card_type_vocabulary_check(state));
     out.extend(board_list_read_check(state));
+    out.extend(task_graph_check(state));
 
     tm.mark(&out, "6d. are auto-filed cards DISPATCHABLE?");
     // -- 6f. does the frustrations LEDGER agree with the board? (AF-191).
@@ -1505,6 +1506,26 @@ fn result_log_bounded_check(state: &AppState) -> Vec<InvariantResult> {
 /// predicate that can pass while the API is down, which is precisely the failure
 /// being closed. It is the one board check that must never be "optimised" into
 /// its own SQL.
+fn task_graph_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "board.graph_integrity";
+    let result = state.store.read().and_then(|conn| crate::db::task_graph_store::verify_graph(&conn));
+    match result {
+        Ok((n, verification)) => {
+            let evidence = json!({"measured":true,"n_considered":n,"findings":verification.findings,
+                "dependency_cycles":verification.dependencies.cycles,
+                "unbuildable_count":verification.dependencies.unbuildable.len(),
+                "lineage_cycles":verification.lineage.cycles});
+            let row = if verification.valid { InvariantResult::pass(ID) } else {
+                InvariantResult::fail(ID, "resolvable, acyclic task dependencies and parent lineage",
+                    format!("{} graph findings; GET /api/graph/board", verification.findings.len()))
+            };
+            vec![row.evidence(evidence)]
+        }
+        Err(error) => vec![InvariantResult::unknown(ID, error.to_string())
+            .evidence(json!({"measured":false,"n_considered":0,"why_unmeasured":error.to_string()}))],
+    }
+}
+
 fn board_list_read_check(state: &AppState) -> Vec<InvariantResult> {
     const ID: &str = "board.list_read_succeeds";
     let Ok(conn) = state.store.read() else {
@@ -2435,6 +2456,32 @@ pub async fn run(state: AppState) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn graph_invariant_distinguishes_corruption_from_an_unmeasured_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::db::Store::open(&dir.path().join("graph.db")).unwrap());
+        let state = crate::api::AppState { store:store.clone(), started:std::time::Instant::now(),
+            build_hash:"test".into(),auth_token:None,reconciled:std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)) };
+        let result = super::task_graph_check(&state);
+        assert_eq!(result[0].status,crate::invariants::Status::Pass);
+        assert_eq!(result[0].evidence["measured"],true);
+        store.write(|conn| {
+            conn.execute_batch("INSERT INTO issues(id,title,status,created,updated,depends_on) VALUES \
+                ('G-1','cycle','todo',1,1,'[\"G-1\"]')")?;
+            Ok(crate::db::WriteOutcome {applied:true,events:vec![]})
+        }).unwrap();
+        let result = super::task_graph_check(&state);
+        assert_eq!(result[0].status,crate::invariants::Status::Fail);
+        assert_eq!(result[0].evidence["n_considered"],1);
+        store.write(|conn| {
+            conn.execute_batch("ALTER TABLE issues RENAME TO broken_issues")?;
+            Ok(crate::db::WriteOutcome {applied:true,events:vec![]})
+        }).unwrap();
+        let result = super::task_graph_check(&state);
+        assert_eq!(result[0].status,crate::invariants::Status::Unknown);
+        assert_eq!(result[0].evidence["measured"],false);
+    }
+
     // ── AF-317 fallout: the board's own readability had no invariant ────────
     //
     // 2026-08-30, ~20 minutes, every session: GET /api/board answered

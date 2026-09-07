@@ -17,6 +17,7 @@
 pub mod advance;
 pub mod artifact_store;
 pub mod board_store;
+pub mod task_graph_store;
 pub mod commands;
 pub mod memories;
 pub mod migrate;

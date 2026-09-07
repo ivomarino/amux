@@ -2371,6 +2371,42 @@ cmd_board() {
   local subcmd="${1:-help}"; shift 2>/dev/null || true
 
   case "$subcmd" in
+    graph)
+      # A projection of the board, not another store or planner. --check is a
+      # CI gate; --json preserves the whole versioned snapshot for replay.
+      local graph_json=0 graph_check=0 graph_result
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --json) graph_json=1 ;;
+          --check) graph_check=1 ;;
+          --help|-h) echo "Usage: amux board graph [--json] [--check]
+Typed task/worker/artifact/message graph, provenance, dependency layers and integrity findings.
+--check exits 1 for an invalid graph; unavailable measurements exit 2.
+This is structural build order. Workflow readiness: GET /api/board/ready."; return 0 ;;
+          *) die "amux board graph: unknown option '$1'" ;;
+        esac
+        shift
+      done
+      graph_result=$(_curl -fsk "$AMUX_API/api/graph/board") || {
+        echo "amux board graph: graph measurement unavailable from $AMUX_API/api/graph/board" >&2
+        return 2
+      }
+      printf '%s' "$graph_result" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+if d.get("measured") is not True or not isinstance(d.get("n_considered"),int) or "verification" not in d:
+    print("amux board graph: unmeasured or incompatible response",file=sys.stderr); sys.exit(2)
+v=d["verification"]
+if sys.argv[1]=="1": print(json.dumps(d,indent=2))
+else:
+    print("Task graph: %s | %s tasks | %s nodes | %s edges" % ("valid" if v["valid"] else "INVALID", d["n_considered"],len(d["nodes"]),len(d["edges"])))
+    print("Revision %s | sha256 %s" % (d["revision"],d["sha256"]))
+    print("Dependency layers: %s | unbuildable: %s" % (len(v["dependencies"]["layers"]),len(v["dependencies"]["unbuildable"])))
+    for f in v["findings"]: print("  %s (%s): %s" % (f["code"],f["field"],", ".join(f["task_ids"])))
+sys.exit(1 if sys.argv[2]=="1" and not v["valid"] else 0)
+' "$graph_json" "$graph_check"
+      return $?
+      ;;
     needsyou|needs-you)
       # Mark a card as blocked-on-human and RECORD THE ASK (AMUX-2167/2171):
       # additive tag (no clobber) + the question into the History, so Focus
@@ -3694,6 +3730,8 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
                                    a block with no named cause is unfalsifiable.
                                    Excluded from 'ready' until unblocked.
   amux board unblock <ID>          Clear the block; status untouched.
+  amux board graph [--json]       Typed graph, provenance and dependency build layers.
+    --check                      Exit nonzero when the measured graph is invalid.
   amux board next <ID> <text>      Continuation: what the next actor should DO.
                                    --stdin/--file preferred (a next action often
                                    quotes a command, and an inline arg is shell-
