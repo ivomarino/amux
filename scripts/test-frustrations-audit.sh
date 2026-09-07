@@ -27,7 +27,7 @@
 # script into it — the shipped decision path, not a paraphrase.
 #
 # Exit 0 = all pass, 1 = a failure. Wired into .github/workflows/checks.yml.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 # Overridable so a MUTANT can be run through the same cells (ethos rule 7: a
 # check that cannot fail on the case it was written for is theatre).
@@ -64,7 +64,13 @@ run_on() { # $1 = case dir name
   mkdir -p "$d/scripts"
   cp "$AUDIT" "$d/scripts/frustrations_audit.py"
   cat > "$d/frustrations.md"
-  ( cd "$d" && python3 scripts/frustrations_audit.py >"$d/out.txt" 2>&1; echo $? )
+  # THE AUDIT IS EXPECTED TO EXIT NON-ZERO in most cases here — its status is
+  # this function's RETURN VALUE, echoed for check_rc to compare. Under `set -e`
+  # the bare invocation kills the subshell before the echo, so the status is
+  # taken through `if`. `|| true` would echo 0 for every case and pass every
+  # cell (AF-562).
+  ( cd "$d" && { if python3 scripts/frustrations_audit.py >"$d/out.txt" 2>&1; \
+                 then _rc=0; else _rc=$?; fi; echo "$_rc"; } )
 }
 
 check_rc() { # label expected actual casedir
@@ -187,7 +193,9 @@ dl="$TMP/delta"; mkdir -p "$dl/scripts"; cp "$AUDIT" "$dl/scripts/frustrations_a
 BASE=$( cd "$dl" && git rev-parse HEAD )
 { echo "# h"; echo; echo "---"; echo; mk_entry widgets open one; mk_entry widgets open two; } > "$dl/frustrations.md"
 
-( cd "$dl" && python3 scripts/frustrations_audit.py --since "$BASE" >out.txt 2>&1 )
+# STATUS IGNORED HERE, unlike run_on: the assertion below greps out.txt for the
+# delta line. `|| true` discards nothing that is read (AF-562).
+( cd "$dl" && python3 scripts/frustrations_audit.py --since "$BASE" >out.txt 2>&1 ) || true
 # Matched on CONTENT, not on padding: the first version of this cell counted
 # spaces against a %-16s field, got it one short, and failed on a correct
 # implementation. An assertion coupled to column width breaks on any format tweak.
@@ -198,7 +206,9 @@ else
 fi
 
 # (dl2) THE CONTROL. An unreadable rev must REFUSE, not compute against nothing.
-( cd "$dl" && python3 scripts/frustrations_audit.py --since deadbeefdeadbeef >out2.txt 2>&1 )
+# THE CONTROL: an unreadable rev MUST refuse, so this is expected to fail and the
+# assertion reads out2.txt. Tolerated for `set -e`, not for the assertion.
+( cd "$dl" && python3 scripts/frustrations_audit.py --since deadbeefdeadbeef >out2.txt 2>&1 ) || true
 if grep -qF "cannot read frustrations.md" "$dl/out2.txt" && ! grep -qF "0 ->  2" "$dl/out2.txt"; then
   PASS=$((PASS+1)); echo "  ok   — (dl2) an unreadable rev REFUSES instead of showing all-growth"
 else

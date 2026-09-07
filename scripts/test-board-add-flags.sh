@@ -17,7 +17,13 @@
 # reach curl, it fails loudly instead of quietly mutating a real board.
 #
 # Exit 0 = all pass, 1 = a failure. Wired into .github/workflows/checks.yml.
-set -uo pipefail
+set -euo
+
+# AF-562: every capture below is `if ...; then rc=0; else rc=$?; fi`, and NONE is
+# `|| true`. All of them feed check_rc, so the EXIT STATUS is the assertion —
+# tolerating it would pass every refusal cell silently. I tried `|| true` on the
+# first one, believing its assertion read only $out; cell (a) also reads $rc and
+# went from pass to fail. The before/after cell count is what caught it. pipefail
 cd "$(dirname "$0")/.."
 AMUX_BIN="${AMUX_BIN:-./amux}"
 PASS=0; FAIL=0
@@ -59,7 +65,7 @@ check_lacks() { # label needle haystack
 # (a) The exact specimen from the incident. Not a convenient one: this is the
 #     literal invocation that filed AEAB-10 with an empty body and wrong type.
 # ---------------------------------------------------------------------------
-out=$(run "cloud.amux.io is DOWN (502)" --type blocker --desc-file "$TMP/nope.md"); rc=$?
+if out=$(run "cloud.amux.io is DOWN (502)" --type blocker --desc-file "$TMP/nope.md"); then rc=0; else rc=$?; fi
 # --type IS accepted now, so the refusal must come from the unreadable --desc-file,
 # NOT from the flag being unknown. Asserting which failure it is matters: a parser
 # that refused *every* flag would also be wrong.
@@ -70,7 +76,7 @@ check_lacks "(a) did not create a card"       "→ todo" "$out"
 # ---------------------------------------------------------------------------
 # (b) A genuinely unknown flag must be REFUSED and must say so.
 # ---------------------------------------------------------------------------
-out=$(run "PROBE title" --totally-bogus-flag xyz); rc=$?
+if out=$(run "PROBE title" --totally-bogus-flag xyz); then rc=0; else rc=$?; fi
 check_rc   "(b) unknown flag refused"          1 "$rc"
 check_has  "(b) names the offending flag"      "--totally-bogus-flag" "$out"
 check_has  "(b) says it is unknown"            "unknown option" "$out"
@@ -81,7 +87,7 @@ check_lacks "(b) did not create a card"        "→ todo" "$out"
 # (c) --help prints help and files NOTHING. This is the case that polluted the
 #     board, so it is asserted on both halves: help text present, no card.
 # ---------------------------------------------------------------------------
-out=$(run --help); rc=$?
+if out=$(run --help); then rc=0; else rc=$?; fi
 check_rc   "(c) --help exits 0"                0 "$rc"
 check_has  "(c) --help prints usage"           "Usage: amux board add" "$out"
 check_has  "(c) --help documents --type"       "--type" "$out"
@@ -96,7 +102,7 @@ check_lacks "(c) --help created no card"       "→ todo" "$out"
 #     It has already earned that: it is the case that detected the AMUX_URL/AMUX_API
 #     isolation bug described above, which was writing to a live board.
 # ---------------------------------------------------------------------------
-out=$(run "an ordinary title with no flags"); rc=$?
+if out=$(run "an ordinary title with no flags"); then rc=0; else rc=$?; fi
 check_lacks "(d) plain title not treated as a bad flag" "unknown option" "$out"
 check_lacks "(d) plain title did not print usage"       "Usage: amux board add" "$out"
 # curl exit 7 = "failed to connect". Only reachable AFTER parsing succeeded and a
@@ -109,7 +115,7 @@ check_rc   "(d) plain title reached the network layer"  7 "$rc"
 #     code did `title="$*"`, so this case passed before AND after — it is here to
 #     prove the rewrite to a while-loop did not regress the ordinary path.
 # ---------------------------------------------------------------------------
-out=$(run three separate words); rc=$?
+if out=$(run three separate words); then rc=0; else rc=$?; fi
 check_lacks "(e) multi-word title accepted" "unknown option" "$out"
 check_lacks "(e) multi-word title no usage" "Usage: amux board add" "$out"
 
@@ -119,23 +125,23 @@ check_lacks "(e) multi-word title no usage" "Usage: amux board add" "$out"
 #     error message advertises has to actually work.
 # ---------------------------------------------------------------------------
 printf -- '--this is really the title--\n' > "$TMP/title.txt"
-out=$(run --file "$TMP/title.txt"); rc=$?
+if out=$(run --file "$TMP/title.txt"); then rc=0; else rc=$?; fi
 check_lacks "(f) --file title not refused as a flag" "unknown option" "$out"
 check_lacks "(f) --file title did not print usage"   "Usage: amux board add" "$out"
 
 # ---------------------------------------------------------------------------
 # (g) Missing values are refused rather than swallowing the next token.
 # ---------------------------------------------------------------------------
-out=$(run "t" --type); rc=$?
+if out=$(run "t" --type); then rc=0; else rc=$?; fi
 check_rc   "(g) --type with no value refused" 1 "$rc"
-out=$(run "t" --desc); rc=$?
+if out=$(run "t" --desc); then rc=0; else rc=$?; fi
 check_rc   "(g) --desc with no value refused" 1 "$rc"
 
 # ---------------------------------------------------------------------------
 # (h) retitle had the identical catch-all twenty lines away; fixed in the same
 #     change, so it is covered here rather than left as a known hole.
 # ---------------------------------------------------------------------------
-out=$(HOME="$TMP" "$AMUX_BIN" board retitle AEAB-1 "a title" --totally-bogus-flag 2>&1); rc=$?
+if out=$(HOME="$TMP" "$AMUX_BIN" board retitle AEAB-1 "a title" --totally-bogus-flag 2>&1); then rc=0; else rc=$?; fi
 check_rc  "(h) retitle refuses an unknown flag"      1 "$rc"
 check_has "(h) retitle names the offending flag"     "--totally-bogus-flag" "$out"
 
