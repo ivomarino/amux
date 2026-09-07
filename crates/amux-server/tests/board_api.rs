@@ -4127,6 +4127,140 @@ async fn worker_outputs_auto_register_every_provider_artifact_and_survive_done()
     }
 }
 
+/// ATE-84: terminal summaries are written beside the status mutation, from
+/// structured board fields and the artifact registry. Provider output shapes
+/// are inputs to capture, never formats the terminal-summary code parses.
+#[tokio::test]
+async fn terminal_transition_records_summary_and_preserves_provenance_for_provider_shapes() {
+    let (app, store, _dir) = app_with_store();
+    let cases = [
+        ("claude", "claude-output.md"),
+        ("codex", "codex-output.png"),
+        ("gemini", "https://example.test/gemini-output"),
+        ("opencode", "53a868f"),
+    ];
+
+    for (provider, artifact_ref) in cases {
+        let lane = format!("summary-{provider}");
+        let made = create(
+            &app,
+            json!({
+                "title": format!("{provider} terminal summary"),
+                "status": "doing",
+                "type": "chore",
+                "session": lane,
+                "source_ref": "message:ATE-75",
+                "epic": "ATE-75",
+                "depends_on": ["AMUX-4018"],
+            }),
+        )
+        .await;
+        let id = made["id"].as_str().unwrap().to_string();
+        let linked_id = id.clone();
+        let linked_lane = lane.clone();
+        store
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO cmd_history(text,type,session,ts,origin,card_id) \
+                     VALUES('captured ATE-75 prompt','user',?1,1000,'browser','ATE-75')",
+                    rusqlite::params![linked_lane],
+                )?;
+                conn.execute(
+                    "UPDATE issues SET source_ref='message:ATE-75', epic='ATE-75', \
+                     depends_on='[\"AMUX-4018\"]' WHERE id=?1",
+                    rusqlite::params![linked_id],
+                )?;
+                Ok(amux_server::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+
+        let (st, _, update) = send_with(
+            &app,
+            "POST",
+            &format!("/api/board/{id}/status-update"),
+            Some(json!({
+                "text": format!("Produced {artifact_ref}; provider={provider}; ready for review.")
+            })),
+            &[("X-Amux-Worker", lane.as_str())],
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{provider} capture failed: {update}");
+
+        let evidence = format!(
+            "tests: ran `cargo test -p amux-server`; deployment: https://example.test/{provider}; live acceptance: passed"
+        );
+        let (st, _, done) = send_with(
+            &app,
+            "PATCH",
+            &format!("/api/board/{id}"),
+            Some(json!({"status":"done", "evidence":evidence, "gate_ack":true})),
+            &[("X-Amux-Worker", lane.as_str())],
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{provider} terminal transition failed: {done}");
+
+        let (st, _, detail) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+        assert_eq!(st, StatusCode::OK);
+        let summary = detail["last_result"].as_str().unwrap_or("");
+        assert!(summary.contains("Final outcome: done"), "{provider}: {summary}");
+        assert!(summary.contains("Actions:"), "{provider}: {summary}");
+        assert!(summary.contains("Tests/deployment/live evidence:"), "{provider}: {summary}");
+        assert!(summary.contains("Linked assets:"), "{provider}: {summary}");
+        assert!(summary.contains(artifact_ref), "{provider} asset missing: {summary}");
+        assert!(detail["log"].as_str().unwrap().contains("STATUS (board): Final outcome: done"));
+        assert_eq!(detail["source_ref"], json!("message:ATE-75"));
+        assert_eq!(detail["epic"], json!("ATE-75"));
+        assert_eq!(detail["depends_on"], json!(["AMUX-4018"]));
+        assert_eq!(detail["messages"][0]["card_id"], json!("ATE-75"));
+    }
+}
+
+/// A refused terminal transition must not manufacture a final summary. This
+/// is the unhappy half of the same four provider-shaped capture inputs.
+#[tokio::test]
+async fn refused_terminal_transition_does_not_record_summary_for_provider_shapes() {
+    let (app, _dir) = app();
+    let cases = [
+        ("claude", "claude-output.md"),
+        ("codex", "codex-output.png"),
+        ("gemini", "https://example.test/gemini-output"),
+        ("opencode", "53a868f"),
+    ];
+
+    for (provider, artifact_ref) in cases {
+        let lane = format!("refused-{provider}");
+        let made = create(
+            &app,
+            json!({"title": format!("{provider} refused summary"), "status":"doing", "session":lane}),
+        )
+        .await;
+        let id = made["id"].as_str().unwrap().to_string();
+        let (st, _, update) = send_with(
+            &app,
+            "POST",
+            &format!("/api/board/{id}/status-update"),
+            Some(json!({"text": format!("Produced {artifact_ref}; ready for review.")})),
+            &[("X-Amux-Worker", lane.as_str())],
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{provider} capture failed: {update}");
+
+        let (st, _, refused) = send_with(
+            &app,
+            "PATCH",
+            &format!("/api/board/{id}"),
+            Some(json!({"status":"done", "gate_ack":true})),
+            &[("X-Amux-Worker", lane.as_str())],
+        )
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT, "{provider} refusal was not enforced: {refused}");
+        let (_, _, detail) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+        assert_eq!(detail["status"], json!("doing"));
+        assert!(detail["last_result"].is_null(), "refused {provider}: {detail}");
+        assert!(!detail["log"].as_str().unwrap().contains("Final outcome:"), "refused {provider}: {detail}");
+    }
+}
+
 /// GCA-153: the provider-independent status endpoint must turn a worker's
 /// exact actionable card into current work. A stale source ref is provenance,
 /// not an eternal trigger block.

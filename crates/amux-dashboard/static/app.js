@@ -3999,6 +3999,20 @@ function _taskIdChip(s) {
     + 'style="cursor:pointer;font-size:0.7rem;font-weight:600;color:var(--accent);border:1px solid var(--accent);border-radius:6px;padding:0 6px;margin-left:4px;white-space:nowrap;">' + esc(id) + '</span>';
 }
 async function _askCardStatus(id, sess) {
+  const current = boardItems.find(i => i.id === id);
+  const terminal = /^(done|verified|discarded)$/i.test(String(
+    (current && current.status) || (id === boardDetailId && boardDetailStatus) || ''));
+  if (terminal) {
+    // A terminal card already has an authoritative board outcome. Refresh it
+    // from the durable detail record; asking a worker here would reintroduce
+    // provider-text parsing and could overwrite the final outcome with stale
+    // model prose.
+    const refreshed = await _bdHydrate(id);
+    showToast(refreshed
+      ? 'Refreshed final terminal summary from the board'
+      : 'Could not refresh final terminal summary');
+    return;
+  }
   // Ask the owning session to report status onto the board (AMUX-2174). The
   // session's model authors the answer; amux only routes + records.
   try {
@@ -9021,7 +9035,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.825';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.826';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -27302,9 +27316,9 @@ function _bdRenderMeta(item) {
 async function _bdHydrate(id) {
   try {
     const r = await apiCall(API + '/api/board/' + id);
-    if (!r || !r.ok) return;
+    if (!r || !r.ok) return false;
     const full = await r.json();
-    if (!full || full.id !== id || boardDetailId !== id) return;  // modal moved on
+    if (!full || full.id !== id || boardDetailId !== id) return false;  // modal moved on
     const idx = boardItems.findIndex(i => i.id === id);
     const cached = idx >= 0 ? { ...boardItems[idx] } : {};
     if (idx >= 0) boardItems[idx] = Object.assign({}, boardItems[idx], full);
@@ -27312,7 +27326,7 @@ async function _bdHydrate(id) {
     _bdRenderHistory(merged);
     if (typeof _bdRenderStatusBanner === 'function') _bdRenderStatusBanner(merged);
     _bdRenderMeta(merged);
-    if (_boardDrafts[id]) { _bdHydrated = true; return; }  // user's draft wins
+    if (_boardDrafts[id]) { _bdHydrated = true; return true; }  // user's draft wins
     const title = document.getElementById('bd-title');
     if (title && title.value === (cached.title || '')) {
       title.value = full.title || '';
@@ -27350,7 +27364,8 @@ async function _bdHydrate(id) {
       _tagState['bd'] = [...(full.tags || [])]; _beTagRenderChips('bd'); _beTagInputUpdate('bd');
     }
     _bdHydrated = true;
-  } catch (e) { /* leave unhydrated; the save guard covers it */ }
+    return true;
+  } catch (e) { /* leave unhydrated; the save guard covers it */ return false; }
 }
 
 async function openBoardDetail(id) {

@@ -6233,7 +6233,7 @@ pub async fn patch_item(
                 }
             }
 
-            let ignored: Vec<String> = map
+            let mut ignored: Vec<String> = map
                 .keys()
                 .filter(|k| {
                     !PATCH_WRITABLE.contains(&k.as_str()) && !PATCH_CONTROL.contains(&k.as_str())
@@ -6515,7 +6515,22 @@ pub async fn patch_item(
             set_opt("ask_unblocks", &mut next.ask_unblocks, &mut changed);
             set_opt("ask_actor", &mut next.ask_actor, &mut changed);
             set_opt("next_action", &mut next.next_action, &mut changed);
-            set_opt("last_result", &mut next.last_result, &mut changed);
+            // Once a terminal transition has recorded the authoritative
+            // board summary, a replaying provider payload must not replace it
+            // with stale prose and turn an idempotent retry into a second
+            // applied write. A new terminal entry still flows through the
+            // normal setter and save_patched replaces it atomically.
+            let terminal_summary_locked = bs::is_terminal_status(&row.status)
+                && bs::is_terminal_status(&next.status)
+                && row
+                    .last_result
+                    .as_deref()
+                    .is_some_and(|summary| summary.starts_with("Final outcome:"));
+            if terminal_summary_locked && map.contains_key("last_result") {
+                ignored.push("last_result".into());
+            } else {
+                set_opt("last_result", &mut next.last_result, &mut changed);
+            }
             set_opt("unresolved", &mut next.unresolved, &mut changed);
             set_opt("blocked_on", &mut next.blocked_on, &mut changed);
             set_opt("acceptance_criteria", &mut next.acceptance_criteria, &mut changed);
