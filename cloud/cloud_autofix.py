@@ -697,7 +697,13 @@ def main():
                 trace("disk_preventive", "after truncate: %.1f%% used, %.1fGB free (was %.1fGB)"
                       % (_disk.get("pct", 0), _disk.get("free_gb", 0), _free_before),
                       _disk.get("pct", 100) < 95)
-            hi = _disk.get("pct", 0) >= 90
+            # Escalate a board card only when the disk is GENUINELY at-risk (free <
+            # 0.4GB, past the stopgap), not merely >=90% used: on this 49G disk 99%
+            # used is ~0.5GB, which the host cron holds and the gateway serves fine,
+            # so a pct>=90 trigger filed a DUPLICATE disk card every daily run (AC-419
+            # dup of AC-414). AC-414 already carries the standing resize escalation;
+            # only re-escalate if the contained state breaks down.
+            hi = _disk.get("free_gb", 99) < 0.4
             if hi and not env_problem:
                 _tried = " (logs already truncated this tick — this is the net-negative disk, only a resize or deprovision fixes it)" \
                     if _truncated_this_tick else ""
