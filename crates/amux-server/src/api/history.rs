@@ -45,6 +45,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use regex::Regex;
 use serde_json::{json, Map, Value};
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -55,6 +56,84 @@ pub fn routes() -> Router<AppState> {
         // Look up ONE message by its id. `/import` is a literal POST above, so
         // this GET capture never swallows it.
         .route("/{id}", get(get_history_item))
+}
+
+/// Attach every non-deleted task in the message card's durable epic lineage.
+///
+/// `cmd_history.card_id` predates decomposition and can name only one task. A
+/// source prompt can later become an epic plus several child cards, though,
+/// and each child deliberately inherits that same source message. Returning
+/// only the old scalar made card -> message work while message -> card lost all
+/// but the original epic (TUBES-2474 / TUBES-2501). Keep the scalar for API
+/// compatibility and add the complete lineage as `linked_cards`.
+///
+/// This is one batched query for the whole history page, not one query per
+/// message. The CTE also resolves a scalar that already names a child back to
+/// its epic root, so both old and new writers produce the same answer.
+fn attach_linked_cards(
+    conn: &rusqlite::Connection,
+    rows: &mut [Value],
+) -> rusqlite::Result<()> {
+    let card_ids: BTreeSet<String> = rows
+        .iter()
+        .filter_map(|row| row.get("card_id").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(String::from)
+        .collect();
+    if card_ids.is_empty() {
+        for row in rows {
+            row["linked_cards"] = json!([]);
+        }
+        return Ok(());
+    }
+
+    let placeholders = card_ids.iter().map(|_| "(?)").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "WITH message_cards(card_id) AS (VALUES {placeholders}), \
+         roots(card_id, root_id) AS ( \
+           SELECT mc.card_id, COALESCE(NULLIF(source.epic,''), mc.card_id) \
+           FROM message_cards mc LEFT JOIN issues source ON source.id=mc.card_id \
+         ) \
+         SELECT roots.card_id, linked.id, linked.title, linked.status, \
+                COALESCE(linked.archived,0), linked.session, roots.root_id \
+         FROM roots JOIN issues linked \
+           ON linked.id=roots.root_id OR linked.epic=roots.root_id \
+         WHERE COALESCE(linked.deleted,0)=0 \
+         ORDER BY roots.card_id, CASE WHEN linked.id=roots.root_id THEN 0 ELSE 1 END, linked.id"
+    );
+    let values: Vec<rusqlite::types::Value> =
+        card_ids.iter().cloned().map(rusqlite::types::Value::Text).collect();
+    let refs: Vec<&dyn rusqlite::types::ToSql> =
+        values.iter().map(|v| v as &dyn rusqlite::types::ToSql).collect();
+    let mut linked_by_card: HashMap<String, Vec<Value>> = HashMap::new();
+    let mut stmt = conn.prepare(&sql)?;
+    let linked = stmt.query_map(refs.as_slice(), |r| {
+        let message_card: String = r.get(0)?;
+        let card = json!({
+            "id": r.get::<_, String>(1)?,
+            "title": r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            "status": r.get::<_, Option<String>>(3)?.unwrap_or_else(|| "todo".into()),
+            "archived": r.get::<_, i64>(4)? != 0,
+            "session": r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            "lineage_root": r.get::<_, String>(6)?,
+        });
+        Ok((message_card, card))
+    })?;
+    for result in linked {
+        let (message_card, card) = result?;
+        linked_by_card.entry(message_card).or_default().push(card);
+    }
+    for row in rows {
+        let cards = row
+            .get("card_id")
+            .and_then(Value::as_str)
+            .and_then(|id| linked_by_card.get(id))
+            .cloned()
+            .unwrap_or_default();
+        row["linked_cards"] = Value::Array(cards);
+    }
+    Ok(())
 }
 
 /// GET /api/history/{id} — look up ONE message by its id, accepting either a
@@ -118,6 +197,7 @@ async fn get_history_item(
                 d["delivered_at_actual"] = json!((t * 1000.0) as i64);
             }
         }
+        attach_linked_cards(&conn, &mut rows)?;
         Ok(rows.into_iter().next())
     })
     .await;
@@ -605,6 +685,7 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
                 }
             }
         }
+        attach_linked_cards(&conn, &mut rows)?;
         Ok(Value::Array(rows))
     })
     .await;
@@ -1038,15 +1119,32 @@ mod tests {
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO issues (id, title, desc, status, created, updated, archived) \
-                 VALUES ('AMUX-9', 'Fix parser', '', 'done', 1, 1, 1)",
+                "INSERT INTO issues (id, title, desc, status, created, updated, archived, epic) \
+                 VALUES ('AMUX-9', 'Fix parser', '', 'done', 1, 1, 0, NULL)",
                 [],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "INSERT INTO issues
+                   (id,title,desc,status,created,updated,archived,epic,deleted)
+                 VALUES
+                   ('AMUX-10','Live child','', 'doing',1,1,0,'AMUX-9',0),
+                   ('AMUX-11','Deleted child','', 'todo',1,1,0,'AMUX-9',1),
+                   ('AMUX-12','Archived child','', 'verified',1,1,1,'AMUX-9',0),
+                   ('AMUX-20','Empty epic root','', 'backlog',1,1,0,'',0);
+                 INSERT INTO cmd_history (text,type,session,ts,origin,card_id)
+                 VALUES ('standalone source','direct','mg',1,'orch','AMUX-20');",
             )
             .unwrap();
         }
         let (st, list) = send(&app, "GET", "/api/history", None).await;
         assert_eq!(st, StatusCode::OK, "{list}");
-        let row = &list.as_array().unwrap()[0];
+        let row = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["card_id"] == json!("AMUX-9"))
+            .unwrap();
         assert_eq!(row["id"], json!(1));
         assert_eq!(row["text"], json!("fix the parser"));
         assert_eq!(row["type"], json!("steering"));
@@ -1056,16 +1154,41 @@ mod tests {
         assert_eq!(row["card_id"], json!("AMUX-9"));
         assert_eq!(row["card_title"], json!("Fix parser"));
         assert_eq!(row["card_status"], json!("done"));
-        assert_eq!(row["card_archived"], json!(1));
+        assert_eq!(row["card_archived"], json!(0));
         assert!(row["card_deleted"].is_null());
         assert_eq!(row["kind"], json!("human"), "steering displays as human");
         assert_eq!(row["queued"], json!(true), "steering is the queued delivery detail");
+        let linked = row["linked_cards"].as_array().unwrap();
+        assert_eq!(
+            linked.iter().map(|c| c["id"].as_str().unwrap()).collect::<Vec<_>>(),
+            vec!["AMUX-9", "AMUX-10", "AMUX-12"],
+            "the root and both live children are returned; deleted=1 is excluded"
+        );
+        assert_eq!(linked[1]["archived"], json!(false), "deleted=0 is a live card");
+        assert_eq!(linked[2]["archived"], json!(true), "archived lineage stays navigable");
+        assert!(linked.iter().all(|c| c["id"] != json!("AMUX-11")));
+
+        let standalone = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["card_id"] == json!("AMUX-20"))
+            .unwrap();
+        assert_eq!(
+            standalone["linked_cards"],
+            json!([{
+                "id": "AMUX-20", "title": "Empty epic root", "status": "backlog",
+                "archived": false, "session": "", "lineage_root": "AMUX-20"
+            }]),
+            "both NULL and empty epic values resolve the source card as the lineage root"
+        );
 
         let (st, one) = send(&app, "GET", "/api/history/MSG-1", None).await;
         assert_eq!(st, StatusCode::OK, "{one}");
         assert_eq!(one["card_title"], json!("Fix parser"));
         assert_eq!(one["card_status"], json!("done"));
-        assert_eq!(one["card_archived"], json!(1));
+        assert_eq!(one["card_archived"], json!(0));
+        assert_eq!(one["linked_cards"], row["linked_cards"]);
     }
 
     #[tokio::test]

@@ -15,6 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 /// WorkerState -> the Python status vocabulary the SPA's badges render.
 fn python_status(state_json: &str) -> &'static str {
@@ -671,6 +672,67 @@ fn parse_list_sessions_line(l: &str) -> Option<(&str, Option<i64>, Option<i64>)>
 /// Signals the derivation reads, loaded once per request and shared with the
 /// board's `stale` computation (`active_python_sessions`) so the two can
 /// never disagree about who is working.
+/// Resolve Codex tool descendants from the same one-shot process snapshot used
+/// for shell-pane liveness. A plain idle Codex lane has
+/// `pane shell -> node wrapper -> native codex`; only a process BELOW the
+/// native provider is tool work. This avoids treating the provider process's
+/// mere existence as activity while keeping a long-running cargo/browser child
+/// authoritative when rollout writes are naturally quiet.
+fn sessions_with_codex_tool_children(
+    pane_roots: &[(String, String)],
+    ps_output: &str,
+) -> BTreeSet<String> {
+    let mut processes: BTreeMap<String, (String, String, String)> = BTreeMap::new();
+    for line in ps_output.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(pid) = fields.next() else { continue };
+        let Some(ppid) = fields.next() else { continue };
+        let state = fields.next().unwrap_or("").to_string();
+        let command = fields.next().unwrap_or("").to_string();
+        processes.insert(pid.to_string(), (ppid.to_string(), state, command));
+    }
+    let mut active = BTreeSet::new();
+    for (session, root) in pane_roots {
+        for (pid, (ppid, state, _)) in &processes {
+            // A persistent sleeping provider helper (for example an MCP
+            // process) is not current tool execution. Require a process the
+            // kernel observes running or in an active/uninterruptible I/O wait.
+            if !matches!(state.chars().next(), Some('R' | 'D' | 'U')) {
+                continue;
+            }
+            let mut cursor = ppid.as_str();
+            let mut below_codex = false;
+            let mut reached_root = false;
+            for _ in 0..32 {
+                if cursor == root {
+                    reached_root = true;
+                    break;
+                }
+                let Some((parent, _, command)) = processes.get(cursor) else { break };
+                if Path::new(command)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name == "codex")
+                {
+                    below_codex = true;
+                }
+                if parent == cursor {
+                    break;
+                }
+                cursor = parent;
+            }
+            if reached_root && below_codex {
+                // `pid` is below native codex because the codex process was an
+                // ancestor, not the candidate itself.
+                let _ = pid;
+                active.insert(session.clone());
+                break;
+            }
+        }
+    }
+    active
+}
+
 pub struct FleetSignals {
     /// tmux session name (`amux-<n>`) -> when its pane last PAINTED, i.e.
     /// `max(#{session_activity}, #{window_activity})`.
@@ -715,6 +777,12 @@ pub struct FleetSignals {
     /// the hook-equivalent signal for providers whose terminal UI can redraw
     /// without advancing tmux's activity timestamp.
     pub(crate) codex_turns: BTreeMap<String, crate::api::session_verbs::CodexTurnSignal>,
+    /// Codex/ollama worker names with a process below the provider process
+    /// (for example a running shell/test command). This is the positive
+    /// process-side control for a quiet structured rollout: a stale Working
+    /// footer cannot vote, but a live tool child can.
+    pub(crate) provider_child_activity: BTreeSet<String>,
+    pub(crate) provider_children_measured: bool,
     /// session name -> raw pane capture, for lanes that PAINTED recently.
     ///
     /// The only physical evidence in this struct: everything else is a claim
@@ -744,6 +812,21 @@ pub struct FleetSignals {
 
 impl FleetSignals {
     pub fn load(conn: &rusqlite::Connection) -> Self {
+        Self::load_scoped(conn, None)
+    }
+
+    /// Fresh send-time check of one worker, using the Workers derivation.
+    /// Only this worker's rollout and pane are read; a fleet tick loads once.
+    pub(crate) fn load_lane(conn: &rusqlite::Connection, name: &str) -> Self {
+        let mut signals = Self::load_scoped(conn, Some(name));
+        let pt = pane_target(&format!("amux-{name}"));
+        if let Some(raw) = capture_pane_bounded(&pt, name) {
+            signals.panes.insert(name.to_string(), raw);
+        }
+        signals
+    }
+
+    fn load_scoped(conn: &rusqlite::Connection, lane: Option<&str>) -> Self {
         let mut activity = BTreeMap::new();
         let mut created = BTreeMap::new();
         let mut running = BTreeSet::new();
@@ -770,12 +853,14 @@ impl FleetSignals {
         // 697s on 2026-08-28. `run_bounded_output` rather than `run_bounded`
         // because the WARN below needs `status` and `stderr`.
         let mut lsc = std::process::Command::new("tmux");
-        lsc.args([
-            "list-sessions",
-            "-F",
-            "#{session_name}:#{session_activity}:#{session_created}:#{window_activity}",
-        ])
-        .stdout(std::process::Stdio::piped())
+        let format = "#{session_name}:#{session_activity}:#{session_created}:#{window_activity}";
+        if let Some(name) = lane {
+            let st = crate::backend::tmux::session_target(&format!("amux-{name}"));
+            lsc.args(["display-message", "-p", "-t", &st, format]);
+        } else {
+            lsc.args(["list-sessions", "-F", format]);
+        }
+        lsc.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
         let tmux_out = run_bounded_output(lsc, probe_budget(), "list-sessions").ok_or(());
         match &tmux_out {
@@ -817,8 +902,13 @@ impl FleetSignals {
         // BOUNDED (AF-301) — was a bare `.output()`.
         let all_panes_dead = {
             let mut c = std::process::Command::new("tmux");
-            c.args(["list-panes", "-a", "-F", "#{session_name}:#{pane_dead}"])
-                .stdout(std::process::Stdio::piped())
+            if let Some(name) = lane {
+                let st = crate::backend::tmux::session_target(&format!("amux-{name}"));
+                c.args(["list-panes", "-t", &st, "-F", "#{session_name}:#{pane_dead}"]);
+            } else {
+                c.args(["list-panes", "-a", "-F", "#{session_name}:#{pane_dead}"]);
+            }
+            c.stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null());
             run_bounded(c, probe_budget(), "list-panes/dead")
                 .map(|out| sessions_with_all_panes_dead(&out))
@@ -838,7 +928,7 @@ impl FleetSignals {
                 let Some((n, a, c)) = parse_list_sessions_line(l) else {
                     continue;
                 };
-                if all_panes_dead.contains(n) {
+                if lane.is_some_and(|lane| n != format!("amux-{lane}")) || all_panes_dead.contains(n) {
                     continue;
                 }
                 running.insert(n.to_string());
@@ -856,11 +946,18 @@ impl FleetSignals {
         // and a stopped lane shows as `bash`. A session with several panes
         // counts as shell-only only if EVERY pane is a shell.
         let mut shell_only = BTreeSet::new();
+        let mut provider_child_activity = BTreeSet::new();
+        let mut provider_children_measured = false;
         // BOUNDED (AF-301) — was a bare `.output()`.
         let panes_probe = {
             let mut c = std::process::Command::new("tmux");
-            c.args(["list-panes", "-a", "-F", "#{session_name}:#{pane_pid}:#{pane_current_command}"])
-                .stdout(std::process::Stdio::piped())
+            if let Some(name) = lane {
+                let st = crate::backend::tmux::session_target(&format!("amux-{name}"));
+                c.args(["list-panes", "-t", &st, "-F", "#{session_name}:#{pane_pid}:#{pane_current_command}"]);
+            } else {
+                c.args(["list-panes", "-a", "-F", "#{session_name}:#{pane_pid}:#{pane_current_command}"]);
+            }
+            c.stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null());
             run_bounded(c, probe_budget(), "list-panes/pids")
         };
@@ -868,6 +965,7 @@ impl FleetSignals {
             const SHELLS: [&str; 8] = ["bash", "zsh", "sh", "fish", "dash", "ksh", "tcsh", "csh"];
             let mut any_live: BTreeSet<String> = BTreeSet::new();
             let mut seen: BTreeSet<String> = BTreeSet::new();
+            let mut pane_roots: Vec<(String, String)> = Vec::new();
             // Panes whose FOREGROUND command is a shell but which might still host
             // an agent as a CHILD: (session, pane_pid). Collected here and probed
             // below only for sessions not already proven live by another pane.
@@ -877,7 +975,9 @@ impl FleetSignals {
                 // so split from the RIGHT twice: cmd, then pid.
                 let Some((rest, cmd)) = l.rsplit_once(':') else { continue };
                 let Some((sess, pid)) = rest.rsplit_once(':') else { continue };
+                if !running.contains(sess) { continue; }
                 seen.insert(sess.to_string());
+                pane_roots.push((sess.to_string(), pid.trim().to_string()));
                 let cmd = cmd.trim().trim_start_matches('-');
                 if !SHELLS.contains(&cmd) {
                     any_live.insert(sess.to_string());
@@ -943,19 +1043,23 @@ impl FleetSignals {
                 std::collections::BTreeSet::new();
             let ps_probe = {
                 let mut c = std::process::Command::new("ps");
-                c.args(["-eo", "ppid="])
+                c.args(["-eo", "pid=,ppid=,state=,comm="])
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::null());
                 run_bounded(c, probe_budget(), "ps/ppid")
             };
             match &ps_probe {
                 Some(out) => {
+                    provider_children_measured = !out.trim().is_empty();
                     for line in out.lines() {
-                        let t = line.trim();
-                        if !t.is_empty() {
-                            ppids_with_children.insert(t.to_string());
+                        let mut fields = line.split_whitespace();
+                        let _pid = fields.next();
+                        if let Some(ppid) = fields.next() {
+                            ppids_with_children.insert(ppid.to_string());
                         }
                     }
+                    provider_child_activity =
+                        sessions_with_codex_tool_children(&pane_roots, out);
                 }
                 None => tracing::warn!(
                     target: "amux::sessions",
@@ -1063,10 +1167,38 @@ impl FleetSignals {
             transitions,
             started,
             codex_turns,
+            provider_child_activity,
+            provider_children_measured,
             panes: BTreeMap::new(),
             subagent_activity: scan_subagent_activity(),
             now: chrono::Utc::now().timestamp() as f64,
         }
+    }
+
+    /// A derived idle is usable only with positive evidence. The activity
+    /// fallback can label a silent/missing probe idle for display, never grant
+    /// permission to send into an unknown worker.
+    pub(crate) fn turn_boundary_status(&self, name: &str) -> Option<String> {
+        if !self.agent_running(&format!("amux-{name}")) {
+            return None;
+        }
+        let (status, ex) = self.derive_status_explain(name, true);
+        let structured = ex["report"]["applied"] == true
+            || ex["codex_rollout"]["from_this_life"] == true;
+        let pane_boundary = self.pane_of(name).map(crate::api::session_verbs::pane_is_at_boundary);
+        let measured = structured || pane_boundary.is_some();
+        if !structured && status == "idle" && pane_boundary != Some(true) {
+            return None;
+        }
+        if measured && ex["decided_by"] == "codex_stale_active_refused" {
+            let key = format!("structured-boundary:{name}");
+            if crate::log_dedupe::first_this_bucket(&key, crate::log_dedupe::hour_bucket(self.now)) {
+                tracing::warn!(target: "status_truth", session = name, measured = true, n_considered = 1,
+                    verdict = "boundary_stale_codex_footer_refused",
+                    "Workers and steering agree: stale Codex footer has no live heartbeat or child; boundary is idle");
+            }
+        }
+        measured.then_some(status)
     }
 
     /// Is there a WORKER in this tmux session, not merely a tmux session?
@@ -1778,6 +1910,12 @@ impl FleetSignals {
         if let Some(signal) = self.codex_turns.get(name) {
             let started = self.started.get(name).copied().unwrap_or(0.0);
             let from_this_life = started > 0.0 && signal.ts >= started;
+            let heartbeat_age = (self.now - signal.heartbeat_ts).max(0.0);
+            let heartbeat_window = env_secs("AMUX_CODEX_TURN_HEARTBEAT_S", 300.0);
+            let heartbeat_fresh = heartbeat_age <= heartbeat_window;
+            let tool_child_running = self.provider_child_activity.contains(name);
+            let active_is_live = signal.state != "active" || heartbeat_fresh || tool_child_running || self.subagents_working(name);
+            let applied = from_this_life && active_is_live;
             let pane_waiting = self.pane_of(name)
                 .map(crate::api::session_verbs::detect_claude_status)
                 .as_deref() == Some("waiting");
@@ -1786,10 +1924,15 @@ impl FleetSignals {
                 "boundary": signal.boundary,
                 "rollout_file": signal.rollout_file,
                 "age_s": (self.now - signal.ts).max(0.0),
+                "heartbeat_age_s": heartbeat_age,
+                "heartbeat_window_s": heartbeat_window,
+                "heartbeat_fresh": heartbeat_fresh,
+                "tool_child_running": tool_child_running,
+                "tool_children_measured": self.provider_children_measured,
                 "from_this_life": from_this_life,
-                "applied": from_this_life,
+                "applied": applied,
             }));
-            if from_this_life {
+            if applied {
                 if signal.state == "active" && pane_waiting {
                     status = "waiting".into();
                     decided = "codex_rollout_with_picker";
@@ -1797,7 +1940,26 @@ impl FleetSignals {
                     status = signal.state.clone();
                     decided = "codex_rollout";
                 }
+            } else if from_this_life && signal.state == "active" {
+                // A `task_started` edge can survive a provider crash or an
+                // interrupted generation indefinitely. Codex also keeps its
+                // Working timer/footer repainting, so pane mtime/churn are not
+                // independent evidence. With neither a bounded structured
+                // heartbeat nor a live tool descendant, force the fossil idle
+                // and name the rejected evidence in status-explain.
+                if self.provider_children_measured {
+                    status = "idle".into();
+                    decided = "codex_stale_active_refused";
+                } else {
+                    status = "active".into();
+                    decided = "codex_child_probe_unmeasured";
+                }
             }
+        }
+        // Main-turn completion does not complete its live tool/subagents.
+        if status == "idle" && (self.provider_child_activity.contains(name) || subagents_reported_live) {
+            status = "active".into();
+            decided = "structured_live_children";
         }
         // API-ERROR (5xx / Overloaded) is its own status (Ethan 2026-08-18).
         // Claude Code ENDS the turn on a 529 and returns to the prompt, so its
@@ -2210,6 +2372,16 @@ struct RuntimeBoardTruth {
 /// work. The board row is the release signal, so no second, lossy ownership
 /// state is needed here.
 type TaskMarker = (f64, Option<String>, bool, String);
+
+/// A cardless event must carry the semantic classification which licensed it.
+/// Transport intent (`[no-board]`) is not such a classification: a substantive
+/// turn remains work even when its sender asked not to mint a duplicate card.
+fn cardless_event_allowed(data: &serde_json::Value) -> bool {
+    matches!(
+        data["reason"].as_str(),
+        Some("informational-query") | Some("control-prompt")
+    )
+}
 
 struct RuntimeMarkerSelection<'a> {
     marker: Option<&'a TaskMarker>,
@@ -3312,6 +3484,7 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
         let mut doing: BTreeMap<String, (String, String, i64)> = BTreeMap::new();
         let mut doing_by_id: BTreeMap<String, (String, String, i64)> = BTreeMap::new();
         let mut doing_counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut blocked_doing_counts: BTreeMap<String, usize> = BTreeMap::new();
         for row in stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -3321,6 +3494,12 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
             ))
         })? {
             let (sess, id, title, updated) = row?;
+            let blocked = crate::db::board_store::get_issue(conn, &id)?
+                .is_some_and(|issue| !crate::runtime_jobs::board_drive::doing_is_unblocked(conn, &issue));
+            if blocked {
+                *blocked_doing_counts.entry(sess).or_default() += 1;
+                continue;
+            }
             *doing_counts.entry(sess.clone()).or_default() += 1;
             doing_by_id.insert(id.clone(), (sess.clone(), title.clone(), updated));
             doing.insert(sess, (id, title, updated));
@@ -3387,7 +3566,10 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
                     .map(str::trim)
                     .filter(|id| !id.is_empty())
                     .map(str::to_string);
-                let cardless = kind == "task.cardless";
+                let cardless = kind == "task.cardless" && cardless_event_allowed(&parsed);
+                if kind == "task.cardless" && !cardless {
+                    continue;
+                }
                 if card_id.is_some() || cardless {
                     task_markers
                         .entry(session)
@@ -3449,6 +3631,7 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
                 (board.map(|(id, _, _)| id.as_str()), board.is_some())
             };
             let doing_count = doing_counts.get(&name).copied().unwrap_or(0);
+            let blocked_doing_count = blocked_doing_counts.get(&name).copied().unwrap_or(0);
             let truth = reconcile_runtime_board(
                 running,
                 &runtime_status,
@@ -3507,6 +3690,7 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
                 "status": truth.verdict,
                 "n_considered": truth.n_considered,
                 "card_count": truth.n_considered,
+                "blocked_doing_count": blocked_doing_count,
                 "verdict": truth.verdict,
                 "violation": truth.violation,
                 "runtime_status": runtime_status,
@@ -3902,7 +4086,7 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     static PROBE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -4282,6 +4466,22 @@ mod tests {
         assert!(select_runtime_marker(&conflicting, 0.0, "lane", &doing).conflicting_live_claims);
     }
 
+    #[test]
+    fn transport_intent_cannot_classify_substantive_work_as_cardless() {
+        assert!(cardless_event_allowed(&json!({"reason": "informational-query"})));
+        assert!(cardless_event_allowed(&json!({"reason": "control-prompt"})));
+        for invalid in [
+            json!({}),
+            json!({"reason": "explicit-no-board"}),
+            json!({"reason": "substantive-work"}),
+        ] {
+            assert!(
+                !cardless_event_allowed(&invalid),
+                "Primis's substantive CARDLESS TURN shape must be rejected: {invalid}"
+            );
+        }
+    }
+
     /// ATE-92: one decision owns the runtime/board join. These cells are the
     /// whole contract: exact live attribution, explicit non-task exemption,
     /// missing/invalid attribution, idle suppression, and a vanished worker.
@@ -4424,7 +4624,7 @@ mod tests {
         assert_eq!(python_status(r#"{"state":"stopped"}"#), "");
     }
 
-    pub(super) fn signals() -> FleetSignals {
+    pub(crate) fn signals() -> FleetSignals {
         FleetSignals {
             activity: BTreeMap::new(),
             created: BTreeMap::new(),
@@ -4435,6 +4635,8 @@ mod tests {
             transitions: BTreeMap::new(),
             started: BTreeMap::new(),
             codex_turns: BTreeMap::new(),
+            provider_child_activity: BTreeSet::new(),
+            provider_children_measured: true,
             panes: BTreeMap::new(),
             now: 1_000_000.0,
         }
@@ -4990,6 +5192,7 @@ Claude usage limit reached. Your limit will reset at 3pm.
             crate::api::session_verbs::CodexTurnSignal {
                 state: "active".into(),
                 ts: s.now - 120.0,
+                heartbeat_ts: s.now - 2.0,
                 boundary: "task_started".into(),
                 rollout_file: Some("rollout-codex-lane.jsonl".into()),
             },
@@ -5015,6 +5218,107 @@ Claude usage limit reached. Your limit will reset at 3pm.
         assert_eq!(status, "idle", "pre-restart rollout evidence must be ignored: {ex}");
         assert_eq!(ex["codex_rollout"]["applied"], json!(false));
         assert_ne!(ex["decided_by"], json!("codex_rollout"));
+    }
+
+    /// Primis live acceptance, 2026-09-08: the parent Codex turn had stopped
+    /// producing provider events 56 minutes earlier and both named subagents
+    /// were historical, but Codex kept repainting `Working (11h 27m)`. Pane
+    /// mtime and churn therefore looked fresh forever. The worker is active
+    /// only with a bounded rollout heartbeat or a process below native Codex.
+    #[test]
+    fn stale_codex_parent_and_historical_children_cannot_hold_working() {
+        let lane = "primis";
+        let frame = "\
+• Interacted with `/root/video_media_hydration_fix`
+• Interacted with `/root/cache_invalidation_root`
+• Working (11h 27m • esc to interrupt)
+› Ask Codex to do anything
+  gpt-6-astra xhigh · ~/Dev/mixpeek/customers/primis";
+        let mut s = signals();
+        s.running.insert(format!("amux-{lane}"));
+        s.started.insert(lane.into(), s.now - 12.0 * 3600.0);
+        // The footer counter repaints every second even though no work event
+        // has landed for nearly an hour.
+        s.activity.insert(format!("amux-{lane}"), (s.now - 1.0) as i64);
+        s.panes.insert(lane.into(), frame.into());
+        s.reports = json!({lane: {
+            "state": "idle", "ts": s.now - 13.0 * 3600.0,
+            "subagents": {"count": 0, "live_ids": []}
+        }});
+        s.codex_turns.insert(
+            lane.into(),
+            crate::api::session_verbs::CodexTurnSignal {
+                state: "active".into(),
+                ts: s.now - 11.5 * 3600.0,
+                heartbeat_ts: s.now - 56.0 * 60.0,
+                boundary: "task_started".into(),
+                rollout_file: None,
+            },
+        );
+
+        let (status, ex) = s.derive_status_explain(lane, true);
+        assert_eq!(status, "idle", "stale provider chrome is not a current turn: {ex}");
+        assert_eq!(ex["decided_by"], json!("codex_stale_active_refused"), "{ex}");
+        assert_eq!(ex["codex_rollout"]["heartbeat_fresh"], json!(false), "{ex}");
+        assert_eq!(ex["codex_rollout"]["tool_child_running"], json!(false), "{ex}");
+        assert_eq!(ex["subagents_live"], json!(0), "{ex}");
+
+        s.provider_child_activity.insert(lane.into());
+        let (status, ex) = s.derive_status_explain(lane, true);
+        assert_eq!(status, "active", "a real tool descendant is positive live evidence: {ex}");
+        assert_eq!(ex["codex_rollout"]["tool_child_running"], json!(true), "{ex}");
+    }
+
+    #[test]
+    fn boundary_and_workers_share_structured_codex_truth_and_fail_closed() {
+        let mut s = signals();
+        let lane = "boundary";
+        s.running.insert(format!("amux-{lane}"));
+        s.activity.insert(format!("amux-{lane}"), s.now as i64);
+        s.started.insert(lane.into(), s.now - 7200.0);
+        s.reports = json!({lane: {"state":"idle", "ts":s.now - 7300.0, "subagents":{"count":0}}});
+        s.panes.insert(lane.into(), "• Working (1h • esc to interrupt)\n› Ask Codex to do anything\n  gpt-6-astra xhigh · /tmp".into());
+        s.codex_turns.insert(lane.into(), crate::api::session_verbs::CodexTurnSignal {
+            state: "active".into(), ts: s.now - 3600.0, heartbeat_ts: s.now - 3500.0, boundary: "task_started".into(),
+            rollout_file: None,
+        });
+        assert_eq!(s.turn_boundary_status(lane).as_deref(), Some("idle"));
+        assert_eq!(s.derive_status(lane, true), "idle");
+        s.provider_children_measured = false;
+        assert_eq!(s.turn_boundary_status(lane).as_deref(), Some("active"), "missing process probe must hold");
+        s.provider_children_measured = true;
+        s.codex_turns.get_mut(lane).unwrap().heartbeat_ts = s.now;
+        assert_eq!(s.turn_boundary_status(lane).as_deref(), Some("active"));
+        s.codex_turns.get_mut(lane).unwrap().heartbeat_ts = s.now - 3500.0;
+        s.provider_child_activity.insert(lane.into());
+        assert_eq!(s.turn_boundary_status(lane).as_deref(), Some("active"));
+        s.provider_child_activity.clear();
+        s.reports[lane]["subagents"]["count"] = json!(1);
+        assert_eq!(s.turn_boundary_status(lane).as_deref(), Some("active"));
+        s.reports[lane]["subagents"]["count"] = json!(0);
+        for edge in ["task_complete", "turn_aborted"] {
+            let signal = s.codex_turns.get_mut(lane).unwrap();
+            signal.state = "idle".into(); signal.boundary = edge.into();
+            assert_eq!(s.turn_boundary_status(lane).as_deref(), Some("idle"), "{edge}");
+        }
+        s.codex_turns.clear(); s.panes.clear(); s.reports = json!({});
+        assert!(s.turn_boundary_status(lane).is_none(), "no structured or pane evidence is not permission");
+        s.running.clear();
+        assert!(s.turn_boundary_status(lane).is_none());
+    }
+
+    #[test]
+    fn codex_tool_child_is_resolved_below_provider_not_from_provider_existence() {
+        let roots = vec![("primis".to_string(), "100".to_string())];
+        let idle = "100 1 S bash\n110 100 S node\n120 110 S /opt/codex\n";
+        assert!(sessions_with_codex_tool_children(&roots, idle).is_empty());
+        let sleeping_helper = format!("{idle}125 120 S mcp-server\n");
+        assert!(sessions_with_codex_tool_children(&roots, &sleeping_helper).is_empty());
+        let active = format!("{sleeping_helper}130 120 S cargo\n131 130 R rustc\n");
+        assert_eq!(
+            sessions_with_codex_tool_children(&roots, &active),
+            BTreeSet::from(["primis".to_string()])
+        );
     }
 
     #[test]
@@ -5050,6 +5354,7 @@ Claude usage limit reached. Your limit will reset at 3pm.
             crate::api::session_verbs::CodexTurnSignal {
                 state: "idle".into(),
                 ts: s.now - 1.0,
+                heartbeat_ts: s.now - 1.0,
                 boundary: "turn_aborted".into(),
                 rollout_file: None,
             },

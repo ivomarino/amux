@@ -83,3 +83,6 @@ amux-server.new
 # never got staged, so double-check `git show HEAD:.gitignore` after editing
 # this file, not just the working tree, before trusting it's committed.
 CLAUDE.local.md
+
+# Cargo lifetime leases stay outside target/ so reclaim cannot remove their inode.
+.*.reclaim.lock

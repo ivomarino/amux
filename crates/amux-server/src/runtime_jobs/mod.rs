@@ -163,7 +163,10 @@ pub(crate) fn per_job_disable_var(name: &str) -> String {
 ///   - a GLOBAL isolation switch (`AMUX_ISOLATED=1` / `AMUX_NO_FLEET=1`) - the
 ///     one knob a dev/test server sets ONCE to opt the whole process out;
 ///   - a PER-JOB `AMUX_<NAME>_SECS=0` opt-out, to silence one loop.
-fn isolation_reason_with<F: Fn(&str) -> Option<String>>(name: &str, get: F) -> Option<String> {
+pub(crate) fn isolation_reason_with<F: Fn(&str) -> Option<String>>(
+    name: &str,
+    get: F,
+) -> Option<String> {
     for var in ["AMUX_ISOLATED", "AMUX_NO_FLEET"] {
         if get(var).as_deref().map(str::trim) == Some("1") {
             return Some(format!("{var}=1"));

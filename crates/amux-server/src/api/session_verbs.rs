@@ -2641,8 +2641,9 @@ fn rollout_for_worker_start<'a>(
 /// transcript).
 pub(crate) fn codex_rollout_path(name: &str) -> Option<PathBuf> {
     let cfg = parse_env(name);
-    let wd = work_dir_of(&cfg);
     let meta = load_meta(name);
+    let runtime_cwd = meta_str(&meta, "cc_cwd");
+    let wd = if runtime_cwd.trim().is_empty() { work_dir_of(&cfg) } else { runtime_cwd };
     let sid = meta_str(&meta, "codex_session_id");
     let files = codex_rollout_files();
     if files.is_empty() {
@@ -2666,13 +2667,37 @@ pub(crate) fn codex_rollout_path(name: &str) -> Option<PathBuf> {
     //    Codex has given us a durable thread id, so use it and decline to guess
     //    outside the bounded startup window.
     let started = meta_i64(&meta, "last_started") as f64;
-    match rollout_for_worker_start(&files, &wd, started) {
+    let matched = match rollout_for_worker_start(&files, &wd, started) {
         Ok(path) => path.cloned(),
         Err(candidates) => {
             warn_codex_rollout_unresolved(name, "ambiguous_worker_rollout", &candidates, "");
             None
         }
+    };
+    // Adopt the deterministic fallback once. Without this receipt every
+    // subsequent poll repeats a best-effort cwd/time join, and a restart or a
+    // new same-directory worker can change which transcript/status stream the
+    // old worker appears to own. The rollout itself carries the durable UUID;
+    // persist it as soon as the two-coordinate fallback resolves it.
+    if sid.is_empty() {
+        if let Some((path, rollout_id)) = matched
+            .as_ref()
+            .and_then(|path| rollout_session_id(path).map(|id| (path, id)))
+        {
+            update_meta(name, &[("codex_session_id", json!(rollout_id))]);
+            tracing::warn!(
+                target: "status_truth",
+                session = name,
+                codex_session_id = %rollout_id,
+                rollout = %path.display(),
+                measured = true,
+                n_considered = 1,
+                verdict = "codex_rollout_identity_adopted",
+                "Codex rollout fallback resolved one worker generation and persisted its exact identity"
+            );
+        }
     }
+    matched
 }
 
 fn warn_codex_rollout_unresolved(name: &str, verdict: &str, candidates: &[&PathBuf], claim: &str) {
@@ -2685,6 +2710,21 @@ fn warn_codex_rollout_unresolved(name: &str, verdict: &str, candidates: &[&PathB
             codex_session_id = claim,
             "Codex rollout ownership unresolved; refusing a guessed status/transcript; record the worker's proven codex_session_id (AMUX-4220)");
     }
+}
+
+fn rollout_session_id(path: &Path) -> Option<String> {
+    let f = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(f);
+    let mut line = String::new();
+    use std::io::BufRead;
+    reader.read_line(&mut line).ok()?;
+    let value: Value = serde_json::from_str(line.trim()).ok()?;
+    value
+        .pointer("/payload/session_id")
+        .or_else(|| value.pointer("/payload/id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_string)
 }
 
 /// The latest structured Codex turn boundary recorded in a rollout file.
@@ -2700,6 +2740,11 @@ fn warn_codex_rollout_unresolved(name: &str, verdict: &str, candidates: &[&PathB
 pub(crate) struct CodexTurnSignal {
     pub state: String,
     pub ts: f64,
+    /// Newest turn-scoped provider event, not merely the opening boundary.
+    /// An active boundary without this heartbeat can survive a crashed/stuck
+    /// parent forever; bounded freshness distinguishes that fossil from a
+    /// model/tool turn which is still producing events.
+    pub heartbeat_ts: f64,
     pub boundary: String,
     pub rollout_file: Option<String>,
 }
@@ -2709,25 +2754,71 @@ fn codex_turn_signal_from_events(lines: &[Value]) -> Option<CodexTurnSignal> {
     for event in lines {
         let top = event.get("type").and_then(Value::as_str).unwrap_or("");
         let nested = event.pointer("/payload/type").and_then(Value::as_str).unwrap_or("");
-        let (state, boundary) = match (top, nested) {
-            ("turn.started", _) => ("active", "turn.started"),
-            ("event_msg", "task_started") => ("active", "task_started"),
-            ("turn.completed", _) => ("idle", "turn.completed"),
-            ("event_msg", "task_complete") => ("idle", "task_complete"),
-            ("turn.aborted", _) => ("idle", "turn.aborted"),
-            ("event_msg", "turn_aborted") => ("idle", "turn_aborted"),
-            _ => continue,
+        let boundary = match (top, nested) {
+            ("turn.started", _) => Some(("active", "turn.started")),
+            ("event_msg", "task_started") => Some(("active", "task_started")),
+            ("turn.completed", _) => Some(("idle", "turn.completed")),
+            ("event_msg", "task_complete") => Some(("idle", "task_complete")),
+            ("turn.aborted", _) => Some(("idle", "turn.aborted")),
+            ("event_msg", "turn_aborted") => Some(("idle", "turn_aborted")),
+            _ => None,
         };
-        let ts = event.get("timestamp")
+        let turn_id = event
+            .pointer("/payload/turn_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let is_turn_activity = top == "response_item"
+            || (top == "event_msg"
+                && matches!(nested, "item_started" | "item_completed" | "token_count"));
+        if boundary.is_none() && !is_turn_activity {
+            continue;
+        }
+        let Some(ts) = event
+            .get("timestamp")
             .and_then(Value::as_str)
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|t| t.timestamp_millis() as f64 / 1000.0)?;
-        latest = Some(CodexTurnSignal {
-            state: state.into(),
-            ts,
-            boundary: boundary.into(),
-            rollout_file: None,
-        });
+            .map(|t| t.timestamp_millis() as f64 / 1000.0)
+        else {
+            continue;
+        };
+        if let Some((state, boundary)) = boundary {
+            latest = Some(CodexTurnSignal {
+                state: state.into(),
+                ts,
+                heartbeat_ts: ts,
+                boundary: boundary.into(),
+                rollout_file: None,
+            });
+            continue;
+        }
+        // Long Codex turns can push task_started outside the bounded tail.
+        // Turn-scoped item/token events are provider-owned proof that the turn
+        // is alive now; they reconstruct an active edge without trusting the
+        // TUI's long-lived Working footer.
+        if is_turn_activity {
+            match latest.as_mut() {
+                Some(signal) if signal.state == "active" => signal.heartbeat_ts = ts,
+                Some(signal) if !turn_id.is_empty() && ts > signal.ts => {
+                    *signal = CodexTurnSignal {
+                        state: "active".into(),
+                        ts,
+                        heartbeat_ts: ts,
+                        boundary: "turn_activity".into(),
+                        rollout_file: None,
+                    };
+                }
+                None if !turn_id.is_empty() => {
+                    latest = Some(CodexTurnSignal {
+                        state: "active".into(),
+                        ts,
+                        heartbeat_ts: ts,
+                        boundary: "turn_activity".into(),
+                        rollout_file: None,
+                    });
+                }
+                _ => {}
+            }
+        }
     }
     latest
 }
@@ -3685,6 +3776,84 @@ pub(crate) async fn emit_event_store(store: &crate::db::SharedStore, session: &s
         .await;
 }
 
+/// Persist the refusal when transport intent tries to make substantive work
+/// cardless.
+///
+/// This lives at the message classification/write boundary, not in the
+/// sessions projection. The old read-path warning needed an unbounded
+/// process-global set keyed by every historical `(session, ts)` merely to keep
+/// each `/api/sessions` refresh from logging the same row again. That set grew
+/// forever and forgot everything on restart. The session event's unique `idem`
+/// is the receipt now: only the write which inserts it emits the WARN, and the
+/// evidence survives process generations.
+async fn record_rejected_cardless_receipt(
+    state: &AppState,
+    session: &str,
+    message_row_id: i64,
+) {
+    if message_row_id <= 0 {
+        tracing::warn!(
+            target: "amux::sessions",
+            %session,
+            measured = false,
+            n_considered = 0,
+            verdict = "cardless_rejection_receipt_missing_message",
+            "substantive no-board prompt could not persist its cardless-refusal receipt because its message row was unavailable"
+        );
+        return;
+    }
+    let session = session.to_string();
+    let session_for_write = session.clone();
+    let idem = format!("cardless-rejected:message:{message_row_id}");
+    let result = state
+        .store
+        .write_async(move |conn| {
+            ensure_fleet_tables(conn)?;
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO session_events (ts, session, type, data, idem, source) \
+                 VALUES (?1,?2,'task.cardless_rejected',?3,?4,'prompt-capture')",
+                rusqlite::params![
+                    now_f64(),
+                    session_for_write,
+                    json!({
+                        "message_id": format!("MSG-{message_row_id}"),
+                        "reason": "transport-intent-is-not-semantic-exemption",
+                        "requested_no_board": true,
+                        "measured": true,
+                        "n_considered": 1,
+                        "verdict": "substantive_cardless_marker_rejected",
+                    })
+                    .to_string(),
+                    idem,
+                ],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: inserted > 0, events: vec![] })
+        })
+        .await;
+    match result {
+        Ok(reply) if reply.applied => tracing::warn!(
+            target: "amux::sessions",
+            %session,
+            message_id = %format!("MSG-{message_row_id}"),
+            measured = true,
+            n_considered = 1,
+            verdict = "substantive_cardless_marker_rejected",
+            "runtime/board truth rejected transport-only cardless intent and persisted the audit receipt"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            target: "amux::sessions",
+            %session,
+            message_id = %format!("MSG-{message_row_id}"),
+            %error,
+            measured = false,
+            n_considered = 1,
+            verdict = "cardless_rejection_receipt_write_failed",
+            "runtime/board truth rejected transport-only cardless intent but could not persist the audit receipt"
+        ),
+    }
+}
+
 /// The secret-redaction pass Python applies before any chat text lands in a
 /// DB row (py:8676 _cmd_hist_record / py:8655 steer history — AMUX-2525).
 /// Same pattern family as the delivery/history redactor (py:21478). Terminal
@@ -3922,8 +4091,6 @@ pub(crate) fn redact_prompt_secrets(s: &str) -> String {
     out
 }
 
-type CapturedCardReceipt = (String, String);
-
 fn mint_capture_card(
     conn: &rusqlite::Connection,
     session_name: &str,
@@ -3944,7 +4111,7 @@ fn mint_capture_card(
     }
     let body = redacted.as_str();
     let Some(title) = amux_core::board::title_from_prompt(body) else {
-        return Ok(None); // steering / control / [no-board] — mint nothing
+        return Ok(None); // steering / control text — mint nothing
     };
     if session_name.trim().is_empty() {
         return Ok(None);
@@ -4103,6 +4270,66 @@ fn mint_capture_card(
     // notifier never re-announces a prompt the worker already received live.
     conn.execute("UPDATE issues SET notified = 1 WHERE id = ?1", rusqlite::params![row.id])?;
     Ok(Some(row))
+}
+
+#[derive(Debug, Clone)]
+struct CaptureAssociation {
+    row: crate::db::board_store::IssueRow,
+    created: bool,
+}
+
+/// Distinct semantic board ids named by a delivered owner prompt.
+fn prompt_card_refs(text: &str) -> Vec<String> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"\b[A-Z][A-Z0-9]+-\d+\b").expect("board card reference regex")
+    });
+    let mut seen = std::collections::HashSet::new();
+    re.find_iter(text)
+        .map(|found| found.as_str().to_string())
+        .filter(|id| seen.insert(id.clone()))
+        .collect()
+}
+
+/// Link substantive work to one explicitly named live owned card, or mint the
+/// ordinary capture card when no such identity exists.
+///
+/// This is the bridge between `[no-board]` and the no-silent-work invariant.
+/// The marker may ask the ledger not to create a duplicate, but it cannot make
+/// a substantive delivered turn cease to be work. A unique existing reference
+/// (Primis's PRIMI-187 specimen) is reused; zero or ambiguous live references
+/// fall back to a capture card the model can merge/decompose explicitly.
+fn associate_capture_card(
+    conn: &rusqlite::Connection,
+    session_name: &str,
+    body: &str,
+    now_ms: i64,
+) -> rusqlite::Result<Option<CaptureAssociation>> {
+    let mut live_owned = Vec::new();
+    for id in prompt_card_refs(body) {
+        let Some(row) = crate::db::board_store::get_issue(conn, &id)? else { continue };
+        if row.session.as_deref() == Some(session_name)
+            && row.owner_type == "agent"
+            && !crate::db::board_store::is_terminal_status(&row.status)
+        {
+            live_owned.push(row);
+        }
+    }
+    if live_owned.len() == 1 {
+        return Ok(Some(CaptureAssociation { row: live_owned.remove(0), created: false }));
+    }
+    if live_owned.len() > 1 {
+        tracing::warn!(
+            session = %session_name,
+            cards = ?live_owned.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            measured = true,
+            n_considered = live_owned.len(),
+            verdict = "substantive_prompt_card_reference_ambiguous",
+            "ledger: substantive prompt named multiple live owned cards; capturing an explicit reconciliation card"
+        );
+    }
+    Ok(mint_capture_card(conn, session_name, body, now_ms)?
+        .map(|row| CaptureAssociation { row, created: true }))
 }
 
 /// The most recent row for (session, text) that was actually DELIVERED, newer
@@ -4330,8 +4557,8 @@ pub(crate) async fn cmd_hist_record_full(
         .await;
     }
 
-    // NO SILENT WORK (AMUX-3071): mint a ledger card for a HUMAN prompt and link
-    // it to the message row. Separate write so a capture failure can never roll
+    // NO SILENT WORK (AMUX-3071): associate a HUMAN task prompt with a ledger
+    // card and link it to the message row. Separate write so a capture failure can never roll
     // back the message record — the message is the durable entity, the card its
     // consequence (CLAUDE.md: hang the consequence off the write that happened).
     // Gated on ctype=="user": inter-session ("session") and scheduler ("schedule")
@@ -4349,30 +4576,46 @@ pub(crate) async fn cmd_hist_record_full(
     // accountability sweep a lane to chase over work nobody delivered. The
     // message ROW still goes in, because the delivery attempt is the fact worth
     // keeping; the card is a consequence that did not happen.
-    if is_user && landed && !skip_board {
+    let substantive = amux_core::board::title_from_prompt(&cap_text).is_some()
+        && !amux_core::board::is_informational_query(&cap_text);
+    if is_user && landed && substantive {
         let row_id = msg_row_id.load(std::sync::atomic::Ordering::SeqCst);
         if row_id > 0 {
             let cap_isolated = session_is_isolated(&cap_session);
             let cap_text_for_capture = cap_text.clone();
-            let minted: std::sync::Arc<std::sync::Mutex<Option<CapturedCardReceipt>>> =
+            let associated: std::sync::Arc<std::sync::Mutex<Option<CaptureAssociation>>> =
                 std::sync::Arc::new(std::sync::Mutex::new(None));
-            let minted_w = minted.clone();
+            let associated_w = associated.clone();
             let sess_log = cap_session.clone();
             let res = state
                 .store
-                .write_async(move |conn| match mint_capture_card(conn, &cap_session, &cap_text_for_capture, now_ms)? {
-                    Some(row) => {
+                .write_async(move |conn| match associate_capture_card(
+                    conn,
+                    &cap_session,
+                    &cap_text_for_capture,
+                    now_ms,
+                )? {
+                    Some(association) => {
                         conn.execute(
                             "UPDATE cmd_history SET card_id = ?1 WHERE id = ?2",
-                            rusqlite::params![row.id, row_id],
+                            rusqlite::params![association.row.id, row_id],
                         )?;
-                        *minted_w.lock().unwrap() = Some((row.id.clone(), row.status.clone()));
-                        let ev = crate::db::PendingEvent {
-                            entity_type: amux_core::revision::EntityType::Task,
-                            entity_id: row.id.clone(),
-                            mutation: amux_core::revision::MutationKind::Created,
-                            payload: Some(row.snapshot()),
+                        let ev = if association.created {
+                            crate::db::PendingEvent {
+                                entity_type: amux_core::revision::EntityType::Task,
+                                entity_id: association.row.id.clone(),
+                                mutation: amux_core::revision::MutationKind::Created,
+                                payload: Some(association.row.snapshot()),
+                            }
+                        } else {
+                            crate::db::PendingEvent {
+                                entity_type: amux_core::revision::EntityType::Message,
+                                entity_id: format!("MSG-{row_id}"),
+                                mutation: amux_core::revision::MutationKind::Updated,
+                                payload: None,
+                            }
                         };
+                        *associated_w.lock().unwrap() = Some(association);
                         Ok(crate::db::WriteOutcome { applied: true, events: vec![ev] })
                     }
                     None => Ok(crate::db::WriteOutcome { applied: false, events: vec![] }),
@@ -4384,24 +4627,78 @@ pub(crate) async fn cmd_hist_record_full(
                 // arriving — plus the cmd_history.card_id NULL rate — is the
                 // detector. grep "ledger: auto-captured".
                 Ok(_) => {
-                    let captured_id = minted.lock().ok().and_then(|mut id| id.take());
-                    if let Some((cid, capture_status)) = captured_id {
-                        tracing::info!(session = %sess_log, card_id = %cid,
-                            owner_isolated = cap_isolated,
-                            "ledger: auto-captured board card from delivered prompt");
+                    let association = associated.lock().ok().and_then(|mut value| value.take());
+                    if let Some(association) = association {
+                        let created = association.created;
+                        let cid = association.row.id;
+                        let status = association.row.status;
+                        if created {
+                            tracing::info!(session = %sess_log, card_id = %cid,
+                                owner_isolated = cap_isolated,
+                                requested_no_board = skip_board,
+                                "ledger: auto-captured board card from delivered prompt");
+                        } else {
+                            tracing::info!(session = %sess_log, card_id = %cid, %status,
+                                owner_isolated = cap_isolated,
+                                requested_no_board = skip_board,
+                                measured = true, n_considered = 1,
+                                verdict = "substantive_prompt_linked_existing_card",
+                                "ledger: linked substantive delivered prompt to its unique live owned card");
+                        }
+                        let (event, reason, verdict, receipt) = match (created, status.as_str()) {
+                            (true, "doing") => (
+                                "task.claimed",
+                                "delivered-owner-prompt",
+                                "capture-claimed",
+                                format!("prompt-card:{row_id}"),
+                            ),
+                            (true, _) => (
+                                "task.captured",
+                                "delivered-owner-prompt-pending-active-claim",
+                                "capture-pending-active-claim",
+                                format!("prompt-card:{row_id}"),
+                            ),
+                            (false, "doing") => (
+                                "task.claimed",
+                                "delivered-owner-prompt-existing-card",
+                                "linked-doing-card",
+                                format!("prompt-card:{row_id}"),
+                            ),
+                            (false, _) => (
+                                "task.attribution_pending",
+                                "substantive-prompt-references-non-doing-card",
+                                "existing-card-must-be-claimed",
+                                format!("prompt-attribution:{row_id}"),
+                            ),
+                        };
                         emit_event(
                             state,
                             &sess_log,
-                            if capture_status == "doing" { "task.claimed" } else { "task.captured" },
+                            event,
                             Some(json!({
                                 "issue": cid,
-                                "status": capture_status,
-                                "reason": "delivered-owner-prompt",
+                                "status": status,
+                                "reason": reason,
+                                "measured": true,
+                                "n_considered": 1,
+                                "verdict": verdict,
                             })),
-                            None,
+                            Some(receipt),
                             "prompt-capture",
                         )
                         .await;
+                        if !created && status != "doing" {
+                            tracing::warn!(
+                                target: "amux::sessions",
+                                session = %sess_log,
+                                card_id = %cid,
+                                %status,
+                                measured = true,
+                                n_considered = 1,
+                                verdict = "existing_card_must_be_claimed",
+                                "substantive prompt linked to an existing non-Doing card; runtime WORKING withheld until it is claimed"
+                            );
+                        }
                     }
                 }
                 Err(e) => tracing::warn!(session = %sess_log, error = %e,
@@ -4411,9 +4708,7 @@ pub(crate) async fn cmd_hist_record_full(
         }
     }
     if is_user && landed {
-        let cardless_reason = if skip_board {
-            Some("explicit-no-board")
-        } else if amux_core::board::is_informational_query(&cap_text) {
+        let cardless_reason = if amux_core::board::is_informational_query(&cap_text) {
             Some("informational-query")
         } else if amux_core::board::title_from_prompt(&cap_text).is_none() {
             Some("control-prompt")
@@ -4425,7 +4720,7 @@ pub(crate) async fn cmd_hist_record_full(
                 state,
                 &truth_session,
                 "task.cardless",
-                Some(json!({"reason": reason})),
+                Some(json!({"reason": reason, "requested_no_board": skip_board})),
                 None,
                 "prompt-capture",
             )
@@ -4439,6 +4734,13 @@ pub(crate) async fn cmd_hist_record_full(
                 verdict = "cardless-allowed",
                 "runtime/board truth: delivered owner prompt is explicitly cardless"
             );
+        } else if substantive && skip_board {
+            record_rejected_cardless_receipt(
+                state,
+                &truth_session,
+                msg_row_id.load(std::sync::atomic::Ordering::SeqCst),
+            )
+            .await;
         }
     }
 }
@@ -4579,7 +4881,30 @@ pub(crate) async fn steer_enqueue_precond(
     sender: &str,
     precond: Option<(&str, i64)>,
 ) -> Result<String, &'static str> {
-    steer_enqueue_precond_with_id(store, name, text, guard, sender, precond, None).await
+    steer_enqueue_precond_with_id(store, name, text, guard, sender, precond, None)
+        .await
+        .map(|result| result.id)
+}
+
+/// Whether a stable steering id created a delivery commitment or found the
+/// commitment left by an earlier attempt.
+///
+/// The distinction closes the crash window for callers which must write their
+/// own causal receipt after enqueue. A plain `Ok(id)` cannot say whether this
+/// invocation queued the message, found it still queued, or found it already
+/// delivered; treating all three as a new send is how a durable idempotency
+/// primitive can still produce a repeated higher-level action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StableEnqueueDisposition {
+    New,
+    AlreadyQueued,
+    AlreadyDelivered,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StableEnqueueResult {
+    pub id: String,
+    pub disposition: StableEnqueueDisposition,
 }
 
 /// Board callbacks use a stable id so a crash between enqueue and marking the
@@ -4595,6 +4920,24 @@ pub(crate) async fn steer_enqueue_idempotent(
     sender: &str,
     message_id: &str,
 ) -> Result<String, &'static str> {
+    steer_enqueue_idempotent_report(state, name, text, guard, sender, message_id)
+        .await
+        .map(|result| result.id)
+}
+
+/// Stable enqueue plus the durable disposition needed by recovery producers.
+/// Existing callback callers keep the string-only wrapper above; board-drive
+/// consumes this richer result so a crash after enqueue but before its
+/// `task.resumed` receipt cannot turn the same committed delivery into another
+/// prompt on the next process tick.
+pub(crate) async fn steer_enqueue_idempotent_report(
+    state: &AppState,
+    name: &str,
+    text: &str,
+    guard: &str,
+    sender: &str,
+    message_id: &str,
+) -> Result<StableEnqueueResult, &'static str> {
     steer_enqueue_precond_with_id(
         &state.store,
         name,
@@ -4615,7 +4958,7 @@ async fn steer_enqueue_precond_with_id(
     sender: &str,
     precond: Option<(&str, i64)>,
     stable_id: Option<&str>,
-) -> Result<String, &'static str> {
+) -> Result<StableEnqueueResult, &'static str> {
     // ZERO AMUX HARNESS INTO AN ISOLATED LANE (Ethan, 2026-08-26: "isolated =
     // zero amux harness, just raw LLM pass through"), gated at the CHOKEPOINT
     // for the same reason AF-188 put the archived refusal here.
@@ -4707,10 +5050,25 @@ async fn steer_enqueue_precond_with_id(
     let stable_w = stable_id.map(str::to_string);
     let should_emit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let should_emit_w = should_emit.clone();
+    let disposition = std::sync::Arc::new(std::sync::Mutex::new(StableEnqueueDisposition::New));
+    let disposition_w = disposition.clone();
     let persisted = store
         .write_async(move |conn| {
             ensure_fleet_tables(conn)?;
             if let Some(ref fixed) = stable_w {
+                if fixed.starts_with("board-drive-resume:") {
+                    if !resume_id_is_current(conn, &session, fixed) {
+                        tracing::warn!(session, delivery_id = fixed, verdict = "swap_resume_superseded",
+                            "resume enqueue refused: the durable worker generation or active card changed");
+                        return Err(rusqlite::Error::InvalidQuery);
+                    }
+                    let removed = conn.execute("DELETE FROM steering_queue WHERE session=?1 AND id LIKE 'board-drive-resume:%' AND id<>?2",
+                        rusqlite::params![session, fixed])?;
+                    if removed > 0 {
+                        tracing::warn!(session, removed, delivery_id = fixed, verdict = "swap_resume_superseded",
+                            "older pending recovery belongs to a replaced worker generation; only current recovery remains queued");
+                    }
+                }
                 let delivered = conn
                     .query_row(
                         "SELECT 1 FROM steering_history WHERE id=?1 LIMIT 1",
@@ -4720,6 +5078,9 @@ async fn steer_enqueue_precond_with_id(
                     .unwrap_or(false);
                 if delivered {
                     should_emit_w.store(false, std::sync::atomic::Ordering::SeqCst);
+                    if let Ok(mut value) = disposition_w.lock() {
+                        *value = StableEnqueueDisposition::AlreadyDelivered;
+                    }
                     if let Ok(mut g) = effective_id_w.lock() {
                         *g = fixed.clone();
                     }
@@ -4733,6 +5094,10 @@ async fn steer_enqueue_precond_with_id(
                     )
                     .unwrap_or(false);
                 if queued {
+                    should_emit_w.store(false, std::sync::atomic::Ordering::SeqCst);
+                    if let Ok(mut value) = disposition_w.lock() {
+                        *value = StableEnqueueDisposition::AlreadyQueued;
+                    }
                     conn.execute(
                         "UPDATE steering_queue SET text=?1, session=?2, guard=?3, sender=?4 \
                          WHERE id=?5",
@@ -4763,7 +5128,7 @@ async fn steer_enqueue_precond_with_id(
             // been waiting since it was first queued. The newest TEXT wins
             // because that is the guard's purpose (one pending answer, current
             // content); the age is not part of the content.
-            let existing: Option<String> = if guard_s.is_empty() || non_coalescing(&guard_s) {
+            let existing: Option<String> = if stable_w.is_some() || guard_s.is_empty() || non_coalescing(&guard_s) {
                 None
             } else {
                 conn.query_row(
@@ -4782,10 +5147,12 @@ async fn steer_enqueue_precond_with_id(
                     *g = prior;
                 }
             } else {
-                conn.execute(
-                    "DELETE FROM steering_queue WHERE session=?1 AND text=?2",
-                    rusqlite::params![session, text_s],
-                )?;
+                if stable_w.is_none() {
+                    conn.execute(
+                        "DELETE FROM steering_queue WHERE session=?1 AND text=?2",
+                        rusqlite::params![session, text_s],
+                    )?;
+                }
                 conn.execute(
                     "INSERT OR REPLACE INTO steering_queue\
                      (id, session, text, queued_at, guard, sender, precond_card, precond_rev) \
@@ -4820,7 +5187,13 @@ async fn steer_enqueue_precond_with_id(
         .await;
     }
     // The row that exists, not the one we minted (AMUX-3557).
-    Ok(effective_id.lock().map(|g| g.clone()).unwrap_or(msg_id))
+    Ok(StableEnqueueResult {
+        id: effective_id.lock().map(|g| g.clone()).unwrap_or(msg_id),
+        disposition: disposition
+            .lock()
+            .map(|value| *value)
+            .unwrap_or(StableEnqueueDisposition::New),
+    })
 }
 
 /// py:25236 _send_dedup_seen — idempotency across client retries, persisted
@@ -5494,6 +5867,12 @@ pub(crate) fn send_failure_status(msg: &str) -> (StatusCode, Option<&'static str
         ),
         ("session at a selector", "a prompt is open in the pane — answer it, then retry"),
         ("session started generating", "retry at the next turn boundary, or POST with deliver_now"),
+        ("structured worker state", "retry when the worker's structured state confirms an idle boundary"),
+        ("started, but durable resume context", "repair the worker's durable task/directory context before resuming"),
+        ("saved resume context", "reconcile the worker identity and active card before restarting"),
+        ("active task directory", "restore the recorded task directory or explicitly change the worker directory"),
+        ("durable worker directory", "record an absolute directory for this worker before restarting"),
+        ("conflicting live task claims", "reconcile the worker's exact active claim before restarting"),
         ("session is blocked", "remove the lane from ~/.amux/blocked-sessions.txt"),
         ("session is archived", "POST /api/sessions/<name>/wake first"),
         ("terminal client attached", "a terminal client owns the size — detach it, or resize there"),
@@ -6661,8 +7040,18 @@ async fn send_text_inner(
             return (true, "no suggestion found".into());
         }
     }
+    let structured_status = if from_steering && !hook_confirmed_idle {
+        let status = boundary_signals(state, Some(name)).await
+            .and_then(|signals| signals.turn_boundary_status(name));
+        if status.is_none() || (!allow_mid_turn && status.as_deref() != Some("idle")) {
+            return (false, "structured worker state changed or is unmeasured — retry at next turn boundary".into());
+        }
+        status
+    } else { None };
     let (mut generating, mut waiting) = if hook_confirmed_idle {
         (false, false)
+    } else if let Some(status) = structured_status.as_deref() {
+        (status == "active", status == "waiting")
     } else {
         let status = detect_claude_status(&tmux_capture(name, 12).await);
         (status == "active", status == "waiting")
@@ -6801,7 +7190,12 @@ async fn send_text_inner(
         // (D1 exit). Re-scraping the pane here overrode the hook for sessions
         // idle with background agents ("esc to interrupt" on the bar from
         // agents, not from generation), freezing the steering queue for 2h+.
-        if !hook_confirmed_idle && pane_bar_says_generating(&tmux_capture(name, 12).await) {
+        let still_generating = if structured_status.is_some() {
+            !steer_lane_at_boundary(state, name).await
+        } else {
+            !hook_confirmed_idle && pane_bar_says_generating(&tmux_capture(name, 12).await)
+        };
+        if still_generating {
             generating = true;
             if from_steering && !allow_mid_turn {
                 return (false, "session started generating — retry at next turn boundary".into());
@@ -7448,8 +7842,20 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
     if cfg.get("CC_ARCHIVED") == Some("1") {
         return (false, "session is archived; wake it first".into());
     }
+    let pending_meta = load_meta(name);
+    let pending_context = match state.store.read().map_err(|e| e.to_string()).and_then(|conn| {
+        resume_launch_context(&conn, name, &pending_meta, cfg.get_or("CC_DIR", ""))
+    }) {
+        Ok(context) => context,
+        Err(error) => {
+            tracing::warn!(session = name, %error, verdict = "swap_context_invalid",
+                "worker start refused: durable task/directory is unresolved; configured checkout was not substituted");
+            return (false, error);
+        }
+    };
     let work_dir = {
-        let wd = cfg.get_or("CC_DIR", "").trim();
+        let wd = pending_context.as_ref().map(|c| c.cwd.as_str())
+            .unwrap_or_else(|| cfg.get_or("CC_DIR", "")).trim();
         let wd = if wd.is_empty() {
             std::env::var("HOME").unwrap_or_default()
         } else {
@@ -8103,29 +8509,57 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
     let _ = tmux(&["pipe-pane", "-t", &ptq, &pipe_cmd]).await;
     meta.remove("start_error");
     meta.insert("last_started".into(), json!(now_i64()));
+    // The launch directory is runtime identity, including when a saved active
+    // task overrides the worker's general configured checkout.
+    meta.insert("cc_cwd".into(), json!(work_dir));
     let count = meta.get("start_count").and_then(|v| v.as_i64()).unwrap_or(0);
     meta.insert("start_count".into(), json!(count + 1));
-    // Old `pending_log_reload` keys are consumed for migration, but the new
-    // worker never receives raw terminal replay. Durable board state is the
-    // cross-provider continuity contract.
-    let pending_resume = meta.remove("pending_structured_resume").is_some()
-        || meta.remove("pending_log_reload").is_some();
-    let pending_reason = meta
-        .remove("pending_structured_resume_reason")
-        .or_else(|| meta.remove("pending_log_reload_reason"))
-        .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_default();
-    save_meta(name, &meta);
-    if pending_resume {
-        let prompt = structured_resume_prompt(name, &pending_reason);
-        tracing::info!(
-            session = %name,
-            reason = %pending_reason,
-            "context hydration: structured board state queued; raw terminal replay suppressed"
-        );
-        let st2 = state.clone();
-        let n = name.to_string();
-        tokio::spawn(async move { send_after_ready(st2, n, prompt, 60, SendOrigin::Automation).await });
+    // Keep pending identity until the durable steering queue accepts it. The
+    // session.started row is the generation shared with board-drive; both
+    // producers use exactly the same generation/card delivery id.
+    let pending_resume = meta.contains_key("pending_structured_resume")
+        || meta.contains_key("pending_log_reload") || pending_context.is_some();
+    let context = pending_context.or_else(|| pending_resume.then(|| {
+        state.store.read().ok().and_then(|conn| {
+            resume_context_from_state(&conn, name, &meta_str(&meta, "cc_cwd"), &work_dir).ok()
+        })
+    }).flatten());
+    if pending_resume && context.is_none() {
+        tracing::warn!(session = name, verdict = "swap_resume_context_missing",
+            "worker started but structured resume context is unresolved; pending identity retained");
+        return (false, "started, but durable resume context is unresolved".into());
+    }
+    let reason = meta_str(&meta, "pending_structured_resume_reason");
+    let token = meta.get("pending_structured_resume_token").cloned()
+        .unwrap_or_else(|| json!(ulid::Ulid::new().to_string()));
+    if let Some(context) = &context {
+        meta.insert("pending_structured_resume".into(), json!(now_i64()));
+        meta.insert("pending_structured_resume_context".into(), json!(context));
+        meta.insert("pending_structured_resume_token".into(), token.clone());
+    }
+    if let Err(error) = save_resume_meta(name, &meta) {
+        tracing::warn!(session = name, %error, verdict = "swap_context_persist_failed",
+            "started worker retains recovery requirement; metadata commit failed");
+        return (false, "started, but durable resume context is unresolved".into());
+    }
+    let started_key = format!("session-started:{name}:{}", ulid::Ulid::new());
+    emit_event(state, name, "session.started", Some(json!({
+        "resumed": !meta_str(&meta, "cc_conversation_id").is_empty(),
+        "resume_context": context, "resume_token": token, "resume_reason": reason,
+    })), Some(started_key.clone()), "start_session").await;
+    let generation = state.store.read().ok().and_then(|conn| conn.query_row(
+        "SELECT id FROM session_events WHERE idem=?1", [&started_key], |row| row.get::<_, i64>(0),
+    ).ok());
+    let Some(generation) = generation else {
+        tracing::warn!(session = name, verdict = "swap_generation_uncommitted",
+            "session.started was not committed; resume remains pending and was not consumed");
+        return (false, "started, but durable resume context is unresolved".into());
+    };
+    if let Some(context) = context {
+        if let Err(error) = enqueue_generation_resume(state, &context, generation, &reason).await {
+            tracing::warn!(session = name, %error, generation, verdict = "swap_resume_enqueue_failed",
+                "worker started; recovery remains pending for the next board-drive retry");
+        }
     }
     // Standing instruction re-send (py:24833). Board digest briefing: gap.
     let instr = meta_str(&load_meta(name), "instructions").trim().to_string();
@@ -8134,15 +8568,6 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
         let n = name.to_string();
         tokio::spawn(async move { send_after_ready(st2, n, instr, 60, SendOrigin::Owner).await });
     }
-    emit_event(
-        state,
-        name,
-        "session.started",
-        Some(json!({"resumed": !meta_str(&load_meta(name), "cc_conversation_id").is_empty()})),
-        None,
-        "start_session",
-    )
-    .await;
     (true, "started".into())
 }
 
@@ -8182,16 +8607,148 @@ fn libc_geteuid() -> u32 {
     })
 }
 
-fn structured_resume_prompt(name: &str, reason: &str) -> String {
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StructuredResumeContext {
+    pub(crate) session: String,
+    pub(crate) card: Option<String>,
+    pub(crate) cwd: String,
+}
+
+fn resume_context_from_state(
+    conn: &rusqlite::Connection,
+    name: &str,
+    runtime_cwd: &str,
+    configured_cwd: &str,
+) -> Result<StructuredResumeContext, String> {
+    let card = crate::runtime_jobs::board_drive::exact_resume_card(conn, name)?;
+    let cwd = if runtime_cwd.trim().is_empty() { configured_cwd } else { runtime_cwd };
+    if !Path::new(cwd).is_absolute() || !Path::new(cwd).is_dir() {
+        return Err("durable worker directory is missing or not absolute".into());
+    }
+    Ok(StructuredResumeContext { session: name.into(), card, cwd: cwd.into() })
+}
+
+fn resume_launch_context(
+    conn: &rusqlite::Connection,
+    name: &str,
+    meta: &Map<String, Value>,
+    configured_cwd: &str,
+) -> Result<Option<StructuredResumeContext>, String> {
+    let exact = crate::runtime_jobs::board_drive::exact_resume_card(conn, name)?;
+    let context = if let Some(value) = meta.get("pending_structured_resume_context") {
+        let mut context: StructuredResumeContext = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+        if context.session != name {
+            return Err("saved resume context does not match the worker's exact active claim".into());
+        }
+        if context.card != exact {
+            let previous = context.card.clone();
+            let runtime_cwd = meta_str(meta, "cc_cwd");
+            // A completed task's worktree may already be gone. Once its claim
+            // is superseded, derive this worker's current context; never let
+            // the old snapshot resurrect the task or block a normal launch.
+            let cwd = if Path::new(&runtime_cwd).is_absolute() && Path::new(&runtime_cwd).is_dir() {
+                runtime_cwd.as_str()
+            } else { configured_cwd };
+            context = resume_context_from_state(conn, name, cwd, configured_cwd)?;
+            tracing::warn!(session = name, previous_card = ?previous, current_card = ?context.card,
+                cwd = %context.cwd, measured = true, n_considered = 1, verdict = "swap_context_superseded",
+                "saved recovery task no longer matches durable board truth; launch uses current claim or scoped queue");
+        }
+        Some(context)
+    } else if exact.is_some() {
+        Some(resume_context_from_state(conn, name, &meta_str(meta, "cc_cwd"), configured_cwd)?)
+    } else { None };
+    if context.as_ref().is_some_and(|context| !Path::new(&context.cwd).is_absolute() || !Path::new(&context.cwd).is_dir()) {
+        return Err("active task directory is missing or not absolute".into());
+    }
+    Ok(context)
+}
+
+pub(crate) fn generation_resume_prompt(conn: &rusqlite::Connection, session: &str, card: &str) -> Option<String> {
+    let raw: String = conn.query_row(
+        "SELECT data FROM session_events WHERE session=?1 AND type='session.started' ORDER BY ts DESC,id DESC LIMIT 1",
+        [session], |row| row.get(0),
+    ).ok()?;
+    let data: Value = serde_json::from_str(&raw).ok()?;
+    let context: StructuredResumeContext = serde_json::from_value(data["resume_context"].clone()).ok()?;
+    (context.session == session && context.card.as_deref() == Some(card))
+        .then(|| structured_resume_prompt(&context, data["resume_reason"].as_str().unwrap_or("restart")))
+}
+
+fn resume_id_is_current(conn: &rusqlite::Connection, session: &str, id: &str) -> bool {
+    if let Some(current) = crate::runtime_jobs::board_drive::current_resume_delivery_id(conn, session) {
+        return current == id;
+    }
+    if !matches!(crate::runtime_jobs::board_drive::exact_resume_card(conn, session), Ok(None)) {
+        return false;
+    }
+    let generation = conn.query_row(
+        "SELECT id FROM session_events WHERE session=?1 AND type='session.started' ORDER BY ts DESC,id DESC LIMIT 1",
+        [session], |row| row.get::<_, i64>(0),
+    ).ok();
+    generation.is_some_and(|generation| crate::runtime_jobs::board_drive::resume_delivery_id(session, None, generation) == id)
+}
+
+pub(crate) async fn enqueue_generation_resume(
+    state: &AppState, context: &StructuredResumeContext, generation: i64, reason: &str,
+) -> Result<StableEnqueueResult, &'static str> {
+    let id = crate::runtime_jobs::board_drive::resume_delivery_id(&context.session, context.card.as_deref(), generation);
+    let result = steer_enqueue_idempotent_report(state, &context.session,
+        &structured_resume_prompt(context, reason), BOARD_DRIVE_GUARD, "", &id).await?;
+    record_resume_accepted(state, &context.session, context.card.as_deref(), &id, "startup").await;
+    Ok(result)
+}
+
+pub(crate) async fn record_resume_accepted(
+    state: &AppState, session: &str, card: Option<&str>, id: &str, cause: &str,
+) {
+    emit_event(state, session, "task.resumed", Some(json!({
+        "issue": card, "delivery_id": id, "cause": cause,
+        "measured": true, "n_considered": 1, "verdict": "exact_live_claim_resumed",
+    })), Some(format!("task-resumed:{id}")), "board-drive").await;
+    // Matching the startup token prevents an older acceptance from consuming a
+    // newer swap's pending context. A crash here is safe: stable enqueue finds
+    // its committed queue/history row and retries this receipt without a send.
+    let token = state.store.read().ok().and_then(|conn| {
+        let generation = id.rsplit(':').next()?.parse::<i64>().ok()?;
+        let raw: String = conn.query_row("SELECT data FROM session_events WHERE id=?1 AND session=?2 AND type='session.started'",
+            rusqlite::params![generation, session], |row| row.get(0)).ok()?;
+        serde_json::from_str::<Value>(&raw).ok()?.get("resume_token").cloned()
+    });
+    let mut meta = load_meta(session);
+    if token.is_some() && meta.get("pending_structured_resume_token") == token.as_ref() {
+        for key in ["pending_structured_resume", "pending_structured_resume_context", "pending_structured_resume_reason",
+                    "pending_structured_resume_token", "pending_log_reload", "pending_log_reload_reason"] {
+            meta.remove(key);
+        }
+        if let Err(error) = save_resume_meta(session, &meta) {
+            tracing::warn!(session, %error, delivery_id = id, verdict = "swap_resume_receipt_pending",
+                "resume accepted durably; pending metadata cleanup will retry without redelivery");
+        }
+    }
+    tracing::info!(session, delivery_id = id, cause, verdict = "swap_resume_accepted",
+        "one generation/card recovery accepted by the durable delivery queue");
+}
+
+fn structured_resume_prompt(context: &StructuredResumeContext, reason: &str) -> String {
+    let name = &context.session;
     let reason_text = if reason.is_empty() { "session swap" } else { reason };
+    let task = match &context.card {
+        Some(card) => format!("{}{} — resume this still-owned task now. Resume exact active card {card}: run `amux board show {card}` first. \
+            This claim survives the provider/version restart. Preserve its task scope, next action, \
+            gates, worker actions and produced assets. Do not replace it with a higher-priority \
+            fleet card. If it has since become terminal, inspect this worker's scoped queue.", crate::runtime_jobs::board_drive::PICKUP_ANCHOR, card),
+        None => "No exact active claim was recorded. Inspect this worker's scoped queue before selecting actionable work.".into(),
+    };
     format!(
-        "Continue this worker after a {reason_text} using durable amux state, not terminal \
-         replay. Run `amux board ls --session {name}` and inspect every non-terminal card \
-         assigned to this worker with `amux board show <ID>`. Treat each card's source message, \
-         epic, dependencies, priority, next action, gates, worker actions, and produced assets \
-         as the source of truth. Resume the highest-priority actionable card and keep driving \
-         until no actionable non-terminal work remains. Consult a linked message only when the \
-         card says context is missing. Do not automatically load the worker terminal log."
+        "Continue worker {name} after a {reason_text} using durable amux state. First run \
+         `cd -- {} && pwd && git status --short`; work only in that exact directory. {task} \
+         The supported scoped list is `AMUX_SESSION={} amux board ls --mine`. Never choose \
+         from unfiltered fleet output. Inspect assigned non-terminal cards with \
+         `amux board show <ID>`; each card's source message, epic, dependencies, priority and \
+         recorded evidence are authoritative. Consult a linked message only when the card says \
+         context is missing. Do not automatically load the worker terminal log.",
+        sh_quote(&context.cwd), sh_quote(name),
     )
 }
 
@@ -8778,14 +9335,60 @@ pub async fn debug_logs(RawQuery(q): RawQuery) -> Response {
     ))
 }
 
-fn mark_pending_structured_resume(name: &str, reason: &str) {
-    update_meta(
-        name,
-        &[
-            ("pending_structured_resume", json!(now_i64())),
-            ("pending_structured_resume_reason", json!(reason)),
-        ],
-    );
+fn mark_pending_structured_resume(state: &AppState, name: &str, reason: &str) -> bool {
+    let meta = load_meta(name);
+    let cfg = parse_env(name);
+    let context = state.store.read().map_err(|e| e.to_string()).and_then(|conn| {
+        resume_context_from_state(&conn, name, &meta_str(&meta, "cc_cwd"), cfg.get_or("CC_DIR", ""))
+    });
+    let context = match context {
+        Ok(context) => context,
+        Err(error) => {
+            tracing::warn!(session = name, %error, reason, measured = false, n_considered = 1,
+                verdict = "swap_context_unresolved", "worker restart refused: durable identity could not be preserved");
+            return false;
+        }
+    };
+    let mut pending = meta;
+    pending.insert("pending_structured_resume".into(), json!(now_i64()));
+    pending.insert("pending_structured_resume_reason".into(), json!(reason));
+    pending.insert("pending_structured_resume_context".into(), json!(&context));
+    pending.insert("pending_structured_resume_token".into(), json!(ulid::Ulid::new().to_string()));
+    if let Err(error) = save_resume_meta(name, &pending) {
+        tracing::warn!(session = name, %error, verdict = "swap_context_persist_failed",
+            "worker restart refused before config mutation: resume context was not saved");
+        return false;
+    }
+    tracing::info!(session = name, card = ?context.card, cwd = %context.cwd,
+        reason, measured = true, n_considered = 1, verdict = "swap_context_persisted",
+        "worker restart preserved exact durable task and directory");
+    true
+}
+
+// The resume protocol must observe a failed write; save_meta's historical
+// best-effort contract is unsuitable for authorizing a destructive restart.
+fn save_resume_meta(name: &str, meta: &Map<String, Value>) -> std::io::Result<()> {
+    use std::io::Write;
+    std::fs::create_dir_all(sessions_dir())?;
+    let path = meta_path(name);
+    let temp = path.with_extension(format!("resume-{}", ulid::Ulid::new()));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+        file.write_all(Value::Object(meta.clone()).to_string().as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temp, &path)
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(temp); }
+    result
+}
+
+fn write_swap_config(
+    state: &AppState, name: &str, cfg: &EnvFile, running: bool, reason: &str,
+) -> Result<(), (StatusCode, &'static str)> {
+    if running && !mark_pending_structured_resume(state, name, reason) {
+        return Err((StatusCode::CONFLICT, "restart refused: durable task/directory context is unresolved"));
+    }
+    cfg.write(&env_path(name)).map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "could not write session env"))
 }
 
 /// A model/provider switch is the one moment the harness has direct evidence
@@ -10439,6 +11042,7 @@ pub(crate) fn provider_background_working(raw: &str) -> bool {
 /// Kept pure because both board-drive and queued steering depend on this exact
 /// override; the live Codex interruption must be a regression cell, not an
 /// integration assumption.
+#[cfg(test)]
 fn reported_idle_is_boundary(subagents_live: Option<i64>, raw: &str) -> bool {
     !subagents_live.is_some_and(|count| count > 0) && !provider_background_working(raw)
 }
@@ -10542,36 +11146,31 @@ pub(crate) fn status_decision_history(
     (out, since)
 }
 
+/// Load on a blocking thread: tmux/process/rollout probes must not block an
+/// async runtime worker. `None` means unmeasured, so callers hold delivery.
+pub(crate) async fn boundary_signals(
+    state: &AppState,
+    lane: Option<&str>,
+) -> Option<crate::api::sessions_legacy::FleetSignals> {
+    let store = state.store.clone();
+    let lane = lane.map(str::to_string);
+    tokio::task::spawn_blocking(move || {
+        let conn = store.read().ok()?;
+        Some(match lane.as_deref() {
+            Some(name) => crate::api::sessions_legacy::FleetSignals::load_lane(&conn, name),
+            None => {
+                let mut signals = crate::api::sessions_legacy::FleetSignals::load(&conn);
+                signals.capture_panes();
+                signals
+            }
+        })
+    }).await.ok().flatten()
+}
+
 pub(crate) async fn steer_lane_at_boundary(state: &AppState, name: &str) -> bool {
-    // 1. Self-report (hooks). "active" = mid-turn, "waiting" = at a selector.
-    //    ONLY while it is still authoritative — a report this gate would honour
-    //    but the status badge refuses is the AMUX-3756 deadlock.
-    if let Some(r) = lane_report(state, name) {
-        if r.applies {
-            if r.state != "idle" {
-                return false;
-            }
-            if r.subagents_live.is_some_and(|count| count > 0) {
-                return false;
-            }
-            let raw = tmux_capture(name, 12).await;
-            if !reported_idle_is_boundary(r.subagents_live, &raw) {
-                warn_background_override_once(name, &raw);
-                return false;
-            }
-            return true;
-        }
-    }
-    // 2. Hookless lane, or a report that no longer applies: the pane. Empty
-    //    capture means "cannot tell" — and for a herdr lane mid-turn the
-    //    capture is empty BY DESIGN (herdr refuses a history read while
-    //    working/blocked), so treating empty as idle would deliver into exactly
-    //    the state we are trying to avoid.
-    let raw = tmux_capture(name, 12).await;
-    if raw.trim().is_empty() {
-        return false;
-    }
-    pane_is_at_boundary(&raw)
+    boundary_signals(state, Some(name)).await
+        .and_then(|signals| signals.turn_boundary_status(name))
+        .as_deref() == Some("idle")
 }
 
 /// Is this pane at a turn boundary? Composed so the GATE and the SEND PATH read
@@ -10595,36 +11194,21 @@ pub(crate) fn pane_is_at_boundary(raw: &str) -> bool {
 /// The same two signals `steer_lane_at_boundary` reads, fed into
 /// [`steer_decide`] together with the message's age.
 pub(crate) async fn steer_delivery_for(state: &AppState, name: &str, age_s: f64) -> SteerDelivery {
-    // Same shared read and the same trust verdict as the gate above — this used
-    // to be a second, unjudged copy of the report read (AMUX-3756). A report
-    // that no longer applies is dropped to `None`, which routes to the pane
-    // exactly as a hookless lane does.
-    let report = lane_report(state, name).filter(|r| r.applies);
-    let reported: Option<String> = report.as_ref().map(|r| r.state.clone());
-    // Capture even for a trusted active report: max-age delivery is allowed for
-    // ordinary foreground work, but must remain disabled for provider-owned
-    // background work until its terminal row appears.
-    let raw = tmux_capture(name, 12).await;
-    let provider_background = provider_background_working(&raw);
-    let background_working = report
-        .as_ref()
-        .and_then(|r| r.subagents_live)
-        .is_some_and(|count| count > 0)
-        || provider_background;
-    if provider_background {
-        warn_background_override_once(name, &raw);
-    }
-    let pane_idle = if reported.is_some() {
-        None
-    } else {
-        if raw.trim().is_empty() { None } else { Some(pane_is_at_boundary(&raw)) }
+    let Some(signals) = boundary_signals(state, Some(name)).await else {
+        return SteerDelivery::Hold;
     };
+    let Some(status) = signals.turn_boundary_status(name) else {
+        return SteerDelivery::Hold;
+    };
+    let (_, explain) = signals.derive_status_explain(name, true);
+    let background_working = explain["subagents_working"] == true
+        || explain["provider_background_working"] == true
+        || signals.provider_child_activity.contains(name);
+    if background_working {
+        if let Some(raw) = signals.panes.get(name) { warn_background_override_once(name, raw); }
+    }
     steer_decide_with_background(
-        reported.as_deref(),
-        pane_idle,
-        age_s,
-        steer_max_age_s(),
-        background_working,
+        Some(&status), None, age_s, steer_max_age_s(), background_working,
     )
 }
 
@@ -10850,6 +11434,21 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         std::collections::HashMap::new();
     let mut delivered = 0usize;
     for (id, session, text, queued_at, guard, sender) in queued {
+        if id.starts_with("board-drive-resume:") {
+            let current = state.store.read().ok().map(|conn| resume_id_is_current(&conn, &session, &id));
+            if current != Some(true) {
+                if current == Some(false) {
+                    let stale_id = id.clone();
+                    let _ = state.store.write_async(move |conn| {
+                        conn.execute("DELETE FROM steering_queue WHERE id=?1", [&stale_id])?;
+                        Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                    }).await;
+                    tracing::warn!(session, delivery_id = id, verdict = "swap_resume_superseded",
+                        "queued recovery refused at delivery: worker generation or active card changed");
+                }
+                continue;
+            }
+        }
         if delivered_lanes.contains(&session) {
             continue; // this lane already got its one delivery this tick
         }
@@ -11231,9 +11830,9 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         {
             let (sess3, text3) = (session.clone(), text.clone());
             let now_ms = (now_f64() * 1000.0) as i64;
-            let minted: std::sync::Arc<std::sync::Mutex<Option<CapturedCardReceipt>>> =
+            let associated: std::sync::Arc<std::sync::Mutex<Option<CaptureAssociation>>> =
                 std::sync::Arc::new(std::sync::Mutex::new(None));
-            let minted_w = minted.clone();
+            let associated_w = associated.clone();
             let res = state
                 .store
                 .write_async(move |conn| {
@@ -11255,24 +11854,28 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                     if already > 0 {
                         return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
                     }
-                    match mint_capture_card(conn, &sess3, &text3, now_ms)? {
-                        Some(row) => {
+                    match associate_capture_card(conn, &sess3, &text3, now_ms)? {
+                        Some(association) => {
                             // Link the most recent uncarded cmd_history row for this
                             // prompt, if the enqueue recorded one without carding it.
                             conn.execute(
                                 "UPDATE cmd_history SET card_id = ?1 WHERE id = \
                                  (SELECT id FROM cmd_history WHERE session = ?2 AND text = ?3 \
                                   AND card_id IS NULL ORDER BY id DESC LIMIT 1)",
-                                rusqlite::params![row.id, sess3, text3],
+                                rusqlite::params![association.row.id, sess3, text3],
                             )?;
-                            *minted_w.lock().unwrap() = Some((row.id.clone(), row.status.clone()));
-                            let ev = crate::db::PendingEvent {
-                                entity_type: amux_core::revision::EntityType::Task,
-                                entity_id: row.id.clone(),
-                                mutation: amux_core::revision::MutationKind::Created,
-                                payload: Some(row.snapshot()),
+                            let events = if association.created {
+                                vec![crate::db::PendingEvent {
+                                    entity_type: amux_core::revision::EntityType::Task,
+                                    entity_id: association.row.id.clone(),
+                                    mutation: amux_core::revision::MutationKind::Created,
+                                    payload: Some(association.row.snapshot()),
+                                }]
+                            } else {
+                                vec![]
                             };
-                            Ok(crate::db::WriteOutcome { applied: true, events: vec![ev] })
+                            *associated_w.lock().unwrap() = Some(association);
+                            Ok(crate::db::WriteOutcome { applied: true, events })
                         }
                         None => Ok(crate::db::WriteOutcome { applied: false, events: vec![] }),
                     }
@@ -11283,20 +11886,55 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                 // announces its captures the same way the direct path does, so a
                 // future silent stop is a queryable absence, not an invisible one.
                 Ok(_) => {
-                    let captured_id = minted.lock().ok().and_then(|mut id| id.take());
-                    if let Some((cid, capture_status)) = captured_id {
-                        tracing::info!(session = %session, id = %id, card_id = %cid,
-                            "ledger: auto-captured board card from STEERING-delivered prompt (AMUX-3148)");
+                    let association = associated.lock().ok().and_then(|mut value| value.take());
+                    if let Some(association) = association {
+                        let created = association.created;
+                        let cid = association.row.id;
+                        let status = association.row.status;
+                        if created {
+                            tracing::info!(session = %session, id = %id, card_id = %cid,
+                                "ledger: auto-captured board card from STEERING-delivered prompt (AMUX-3148)");
+                        } else {
+                            tracing::info!(session = %session, id = %id, card_id = %cid, %status,
+                                measured = true, n_considered = 1,
+                                verdict = "substantive_prompt_linked_existing_card",
+                                "ledger: linked STEERING-delivered prompt to its unique live owned card");
+                        }
+                        let (event, reason, verdict) = match (created, status.as_str()) {
+                            (true, "doing") => (
+                                "task.claimed",
+                                "steering-delivered-owner-prompt",
+                                "capture-claimed",
+                            ),
+                            (true, _) => (
+                                "task.captured",
+                                "steering-delivered-owner-prompt-pending-active-claim",
+                                "capture-pending-active-claim",
+                            ),
+                            (false, "doing") => (
+                                "task.claimed",
+                                "steering-delivered-owner-prompt-existing-card",
+                                "linked-doing-card",
+                            ),
+                            (false, _) => (
+                                "task.attribution_pending",
+                                "steering-delivered-owner-prompt-existing-non-doing-card",
+                                "existing-card-must-be-claimed",
+                            ),
+                        };
                         emit_event(
                             state,
                             &session,
-                            if capture_status == "doing" { "task.claimed" } else { "task.captured" },
+                            event,
                             Some(json!({
                                 "issue": cid,
-                                "status": capture_status,
-                                "reason": "steering-delivered-owner-prompt",
+                                "status": status,
+                                "reason": reason,
+                                "measured": true,
+                                "n_considered": 1,
+                                "verdict": verdict,
                             })),
-                            None,
+                            Some(format!("prompt-card:{id}")),
                             "prompt-capture",
                         )
                         .await;
@@ -13234,6 +13872,11 @@ fn log_get(name: &str, subid: &str, qs: &[(String, String)]) -> Response {
         [
             ("content-type", "text/plain; charset=utf-8".to_string()),
             ("content-disposition", format!("attachment; filename=\"{name}.log\"")),
+            // The dashboard can have an older worker's log request in flight
+            // while a reconnect restores or opens a different worker.  Carry
+            // the resolved identity with the bytes so the client can refuse a
+            // cross-worker response rather than trusting its mutable UI state.
+            ("x-amux-session", name.to_string()),
             ("x-log-remaining", remaining.to_string()),
             ("x-log-rotated-bytes", rotated_bytes.to_string()),
             (
@@ -17913,7 +18556,7 @@ async fn restart_with_structured_resume(
     provider: &str,
     reason: &str,
 ) -> bool {
-    mark_pending_structured_resume(name, reason);
+    if !mark_pending_structured_resume(state, name, reason) { return false; }
     restart_for_swap(state, name, provider).await
 }
 
@@ -18036,6 +18679,15 @@ pub(crate) async fn config_patch(state: &AppState, name: &str, body: &Value) -> 
 }
 
 async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Response {
+    let changes_runtime = ["provider", "model", "effort", "toggle_yolo", "toggle_auto_continue"]
+        .iter().any(|key| body.get(*key).is_some());
+    let running = changes_runtime && is_running(name).await;
+    config_patch_with_liveness(state, name, body, running).await
+}
+
+// The observed liveness is an input so refusal tests exercise the whole config
+// branch, including its ordering, without restarting a real fleet worker.
+async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, running: bool) -> Response {
     if !body.is_object() {
         return jresp(StatusCode::BAD_REQUEST, json!({"error": "payload must be a JSON object"}));
     }
@@ -18087,12 +18739,9 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
         }
         cfg.set("CC_PROVIDER", &provider_val);
         cfg.set("CC_FLAGS", &flags);
-        let was_running = is_running(name).await;
-        if cfg.write(&f).is_err() {
-            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
-        }
-        if was_running {
-            mark_pending_structured_resume(name, "provider swap");
+        let was_running = running;
+        if let Err((status, error)) = write_swap_config(state, name, &cfg, was_running, "provider swap") {
+            return jresp(status, json!({"error": error}));
         }
         let restarted = if was_running { restart_for_swap(state, name, &old_provider).await } else { false };
         if restarted {
@@ -18159,15 +18808,15 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
         }
         cfg.set("CC_FLAGS", &flags);
         let current_provider = provider_of(&cfg);
-        let was_running = is_running(name).await;
+        let was_running = running;
         // Python also clears its in-memory credit-limit flag here (AF-14) —
         // process state this origin does not hold.
         // The env rewrite is the DURABLE half and happens either way: whatever
         // the live agent does, the next cold start must come up on the new
         // model. A restart resumes from structured board state, never from a
         // raw terminal transcript.
-        if cfg.write(&f).is_err() {
-            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+        if let Err((status, error)) = write_swap_config(state, name, &cfg, was_running, "model swap") {
+            return jresp(status, json!({"error": error}));
         }
         let rep = apply_live_config_change(
             state, name, &current_provider, was_running, &cmds, expressible, "model swap",
@@ -18217,9 +18866,9 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
         };
         cfg.set("CC_FLAGS", &flags);
         let current_provider = provider_of(&cfg);
-        let was_running = is_running(name).await;
-        if cfg.write(&f).is_err() {
-            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+        let was_running = running;
+        if let Err((status, error)) = write_swap_config(state, name, &cfg, was_running, "effort change") {
+            return jresp(status, json!({"error": error}));
         }
         // `/effort <level>` is hot on the same slash surface as `/model`
         // (verified 2026-08-09: "Set effort level to high (saved as your
@@ -18274,12 +18923,9 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
             enabled = true;
         }
         cfg.set("CC_FLAGS", &new_flags);
-        let was_running = is_running(name).await;
-        if cfg.write(&f).is_err() {
-            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
-        }
-        if was_running {
-            mark_pending_structured_resume(name, "YOLO mode change");
+        let was_running = running;
+        if let Err((status, error)) = write_swap_config(state, name, &cfg, was_running, "YOLO mode change") {
+            return jresp(status, json!({"error": error}));
         }
         let restarted = if was_running { restart_for_swap(state, name, &provider).await } else { false };
         let state_word = if enabled { "enabled" } else { "disabled" };
@@ -18292,6 +18938,11 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
     if let Some(dv) = body.get("dir") {
         let new_dir = dv.as_str().unwrap_or("").trim().to_string();
         let old_dir = cfg.get_or("CC_DIR", "").to_string();
+        // Explicit owner directory change supersedes the previous runtime cwd.
+        let mut meta = load_meta(name);
+        meta.remove("cc_cwd");
+        meta.remove("pending_structured_resume_context");
+        save_meta(name, &meta);
         cfg.set("CC_DIR", &new_dir);
         if cfg.write(&f).is_err() {
             return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
@@ -21048,8 +21699,9 @@ mod tests {
     // AMUX-3071: the send path lost Python's _autotask_from_command at the
     // 792ce1f cutover (2026-08-09), so 330 human prompts recorded card_id=NULL
     // and left no board trace. A real task prompt must now mint a `doing` card
-    // and stamp cmd_history.card_id; steering / [no-board] / inter-session must
-    // not. This test would have been RED for the whole regression window.
+    // and stamp cmd_history.card_id; informational/control and inter-session
+    // messages must not. `[no-board]` can prevent a duplicate only by reusing
+    // an exact live card; it cannot erase substantive work attribution.
     #[tokio::test]
     async fn a_human_prompt_auto_captures_and_links_a_ledger_card() {
         let (st, _dir) = state();
@@ -21121,19 +21773,129 @@ mod tests {
         drop(conn);
 
 
-        // 3. [no-board] (skip_board=true) mints nothing.
+        // 3. Primis's substantive CARDLESS TURN shape: `[no-board]` asks us
+        //    not to mint a duplicate, not to erase work attribution. Reuse the
+        //    unique live owned card named by the prompt and keep the runtime
+        //    pending until its non-Doing lifecycle is honestly claimed.
+        st.store
+            .write(|conn| {
+                conn.execute(
+                    "INSERT INTO issues \
+                     (id,title,desc,status,session,creator,created,updated,owner_type,type) \
+                     VALUES ('PRIMI-187','Hydrate callbacks','SCOPE: validate MVS', \
+                             'review','lane-nb','test',1,1,'agent','code')",
+                    [],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
         cmd_hist_record_full(
-            &st, "lane-nb", "Do a big refactor of the whole module right now",
+            &st,
+            "lane-nb",
+            "Reconcile this substantive callback hydration work to PRIMI-187 and finish validation",
             "user", "", true, DeliveryMeta::direct(),
         )
         .await;
-        assert!(
+        assert_eq!(
             q("SELECT card_id FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1", "lane-nb")
-                .is_none(),
-            "[no-board] mints no card"
+                .as_deref(),
+            Some("PRIMI-187"),
+            "substantive [no-board] work must link its unique existing card, not become cardless"
+        );
+        let primis_cards: i64 = st
+            .store
+            .read()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM issues WHERE session='lane-nb'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(primis_cards, 1, "the existing card must be reused; no duplicate capture card");
+        let invalid_cardless: i64 = st
+            .store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE session='lane-nb' AND type='task.cardless'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(invalid_cardless, 0, "transport intent cannot license substantive cardless work");
+        let primis_message_row: i64 = st
+            .store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM cmd_history WHERE session='lane-nb' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let rejection_receipts = |st: &AppState| -> i64 {
+            st.store
+                .read()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM session_events WHERE session='lane-nb' \
+                     AND type='task.cardless_rejected'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            rejection_receipts(&st),
+            1,
+            "the rejected transport-only exemption must leave one durable audit receipt"
+        );
+        record_rejected_cardless_receipt(&st, "lane-nb", primis_message_row).await;
+        assert_eq!(
+            rejection_receipts(&st),
+            1,
+            "the message-keyed receipt must remain idempotent across retries/restarts"
         );
 
-        // 4. Inter-session ("session") messages are not the recipient's task.
+        // 4. With no exact existing identity to reuse, substantive work still
+        //    receives a capture even when the transport carried [no-board].
+        cmd_hist_record_full(
+            &st,
+            "lane-nb-new",
+            "Implement durable queue attribution across every worker restart",
+            "user",
+            "",
+            true,
+            DeliveryMeta::direct(),
+        )
+        .await;
+        assert!(
+            q(
+                "SELECT card_id FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1",
+                "lane-nb-new",
+            )
+            .is_some(),
+            "substantive work with no reusable identity must be captured, never cardless"
+        );
+
+        // 5. A genuine informational/control turn remains cardless.
+        cmd_hist_record_full(
+            &st,
+            "lane-info",
+            "what is the current status?",
+            "user",
+            "",
+            true,
+            DeliveryMeta::direct(),
+        )
+        .await;
+        assert!(
+            q(
+                "SELECT card_id FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1",
+                "lane-info",
+            )
+            .is_none(),
+            "informational turns are the narrow cardless exception"
+        );
+
+        // 6. Inter-session ("session") messages are not the recipient's task.
         cmd_hist_record_full(
             &st, "lane-x", "Coordinate the rollout with the other lane and report back",
             "session", "peer-lane", false, DeliveryMeta::direct(),
@@ -22150,12 +22912,34 @@ CLAUDE-POSTFIX-COMPLETE
         assert_eq!(active.state, "active");
         assert_eq!(active.boundary, "task_started");
         assert!(active.ts > 1_700_000_000.0);
+        assert!(
+            active.heartbeat_ts > active.ts,
+            "a null-turn-id response_item advances an already-open turn"
+        );
+
+        let tail_without_opening_boundary = vec![
+            json!({"type": "session_meta", "payload": {"cwd": "/tmp"}}),
+            json!({
+                "timestamp": "2026-09-02T21:38:18Z",
+                "type": "event_msg",
+                "payload": {"type": "item_completed", "turn_id": "turn-live"}
+            }),
+        ];
+        let reconstructed = codex_turn_signal_from_events(&tail_without_opening_boundary).unwrap();
+        assert_eq!(reconstructed.state, "active");
+        assert_eq!(reconstructed.boundary, "turn_activity");
+        assert_eq!(reconstructed.heartbeat_ts, reconstructed.ts);
 
         let mut completed = events;
         completed.push(json!({
             "timestamp": "2026-09-02T21:40:00Z",
             "type": "event_msg",
             "payload": {"type": "task_complete"}
+        }));
+        completed.push(json!({
+            "timestamp": "2026-09-02T21:40:01Z",
+            "type": "event_msg",
+            "payload": {"type": "token_count", "turn_id": null}
         }));
         let completed = codex_turn_signal_from_events(&completed).unwrap();
         assert_eq!(completed.state, "idle");
@@ -22539,12 +23323,143 @@ CLAUDE-POSTFIX-COMPLETE
 
     #[test]
     fn provider_resume_uses_structured_state_not_terminal_replay() {
-        let prompt = structured_resume_prompt("lane-a", "provider swap");
-        assert!(prompt.contains("amux board ls --session lane-a"), "{prompt}");
+        let context = StructuredResumeContext { session: "lane-a".into(), card: Some("ATE-92".into()), cwd: "/tmp/exact-worktree".into() };
+        let prompt = structured_resume_prompt(&context, "provider swap");
+        assert!(prompt.contains("amux board ls --mine"), "{prompt}");
+        assert!(prompt.contains("AMUX_SESSION="), "{prompt}");
+        assert!(!prompt.contains("board ls --session"), "{prompt}");
+        assert!(prompt.contains("cd --") && prompt.contains("/tmp/exact-worktree") && prompt.contains("amux board show ATE-92"), "{prompt}");
         assert!(prompt.contains("amux board show <ID>"), "{prompt}");
         assert!(prompt.contains("source message") && prompt.contains("dependencies"), "{prompt}");
         assert!(!prompt.contains(".amux/logs"), "{prompt}");
         assert!(!prompt.contains("terminal history"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn refused_live_swap_preserves_env_meta_and_runtime_before_any_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        std::fs::create_dir_all(sessions_dir()).unwrap();
+        let name = "refused-swap";
+        std::fs::write(env_path(name), "CC_PROVIDER=claude\nCC_FLAGS=--model sonnet\nCC_DIR=relative-invalid\n").unwrap();
+        let original_meta = json!({"cc_cwd": "relative-invalid", "active_model_confirmed": "sonnet", "last_started": 123});
+        std::fs::write(meta_path(name), original_meta.to_string()).unwrap();
+        let (state, _store_dir) = state();
+        state.store.write(move |conn| {
+            conn.execute("INSERT INTO session_events(ts,session,type,data) VALUES (123,?1,'session.started','{}')", [name])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let env_before = std::fs::read(env_path(name)).unwrap();
+        let meta_before = std::fs::read(meta_path(name)).unwrap();
+        for (reason, patch) in [("provider swap", json!({"provider": "codex"})),
+                                 ("YOLO mode change", json!({"toggle_yolo": true})),
+                                 ("model swap", json!({"model": "sonnet"})),
+                                 ("effort change", json!({"effort": "high"}))] {
+            let refusal = config_patch_with_liveness(&state, name, &patch, true).await;
+            assert_eq!(refusal.status(), StatusCode::CONFLICT);
+            assert_eq!(std::fs::read(env_path(name)).unwrap(), env_before, "{reason}");
+            assert_eq!(std::fs::read(meta_path(name)).unwrap(), meta_before, "{reason}");
+            let events: i64 = state.store.read().unwrap().query_row("SELECT COUNT(*) FROM session_events", [], |r| r.get(0)).unwrap();
+            assert_eq!(events, 1, "a refused live swap cannot stop, start, or enqueue recovery");
+        }
+        // Positive control: a valid preflight persists the exact directory
+        // before the changed config can become durable.
+        let mut valid = original_meta.as_object().unwrap().clone();
+        valid.insert("cc_cwd".into(), json!(dir.path()));
+        save_resume_meta(name, &valid).unwrap();
+        let mut changed = parse_env(name);
+        changed.set("CC_PROVIDER", "codex");
+        write_swap_config(&state, name, &changed, true, "provider swap").unwrap();
+        assert_eq!(parse_env(name).get("CC_PROVIDER"), Some("codex"));
+        assert_eq!(load_meta(name)["pending_structured_resume_context"]["cwd"], json!(dir.path()));
+    }
+
+    #[test]
+    fn model_swap_resume_preserves_exact_claim_directory_and_scope_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("resume.db");
+        let store = crate::db::Store::open(&db).unwrap();
+        store.write(|conn| {
+            conn.execute_batch("INSERT INTO issues(id,title,desc,status,session,owner_type,type,created,updated)
+                VALUES ('ATE-92','Runtime truth','two root blockers','doing','lane-a','agent','code',strftime('%s','now'),strftime('%s','now')),
+                       ('FOREIGN-1','Unrelated fleet task','do not select','doing','other','agent','code',strftime('%s','now'),strftime('%s','now'));")?;
+            conn.execute("INSERT INTO session_events(ts,session,type,data) VALUES (?1,'lane-a','task.claimed',?2)",
+                rusqlite::params![crate::config::now_f64(), r#"{"issue":"ATE-92"}"#])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let worktree = dir.path().join("exact worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        let cwd = worktree.to_str().unwrap();
+        let context = resume_context_from_state(&store.read().unwrap(), "lane-a", cwd, "/tmp/shared-main").unwrap();
+        let receipt = dir.path().join("resume.json");
+        std::fs::write(&receipt, serde_json::to_vec(&context).unwrap()).unwrap();
+        drop(store);
+        let store = crate::db::Store::open(&db).unwrap();
+        let restored: StructuredResumeContext = serde_json::from_slice(&std::fs::read(receipt).unwrap()).unwrap();
+        for reason in ["model swap", "provider swap", "provider version restart"] {
+            let prompt = structured_resume_prompt(&restored, reason);
+            assert!(prompt.contains("amux board show ATE-92") && prompt.contains(cwd), "{prompt}");
+            assert!(!prompt.contains("/tmp/shared-main") && !prompt.contains("FOREIGN-1"), "{prompt}");
+            assert!(prompt.contains("amux board ls --mine") && !prompt.contains("board ls --session"), "{prompt}");
+        }
+        assert_eq!(crate::runtime_jobs::board_drive::exact_resume_card(&store.read().unwrap(), "lane-a").unwrap().as_deref(), Some("ATE-92"));
+        let conn = store.read().unwrap();
+        let scope: String = conn.query_row("SELECT desc FROM issues WHERE id='ATE-92'", [], |r| r.get(0)).unwrap();
+        assert_eq!(scope, "two root blockers");
+        let mut meta = Map::new();
+        meta.insert("pending_structured_resume_context".into(), json!(&restored));
+        let launched = resume_launch_context(&conn, "lane-a", &meta, "/tmp/shared-main").unwrap().unwrap();
+        assert_eq!(launched.cwd, cwd);
+        assert_eq!(launched.card.as_deref(), Some("ATE-92"));
+        meta["pending_structured_resume_context"]["session"] = json!("other");
+        assert!(resume_launch_context(&conn, "lane-a", &meta, "/tmp/shared-main").is_err());
+        meta.clear();
+        meta.insert("cc_cwd".into(), json!(cwd));
+        assert_eq!(resume_launch_context(&conn, "lane-a", &meta, "/tmp/shared-main").unwrap().unwrap().cwd, cwd,
+            "a provider-version restart without a pending swap also retains active runtime cwd");
+        std::fs::remove_dir(&worktree).unwrap();
+        assert!(resume_launch_context(&conn, "lane-a", &meta, "/tmp/shared-main").is_err(), "missing worktree must never fall back");
+        assert!(resume_context_from_state(&conn, "lane-a", "relative/missing", "/tmp/shared-main").is_err());
+    }
+
+    #[test]
+    fn terminal_after_hot_switch_and_changed_claim_replace_stale_launch_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(&dir.path().join("switch.db")).unwrap();
+        store.write(|conn| {
+            conn.execute_batch("INSERT INTO issues(id,title,status,session,owner_type,type,created,updated)
+                VALUES ('OLD-1','finished before restart','done','lane','agent','code',1,1),
+                       ('CURRENT-2','new work','todo','lane','agent','code',1,1);
+                INSERT INTO session_events(ts,session,type,data) VALUES (1,'lane','task.claimed','{\"issue\":\"OLD-1\"}');")?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let stale = StructuredResumeContext { session: "lane".into(), card: Some("OLD-1".into()),
+            cwd: dir.path().join("removed-old-worktree").to_string_lossy().into() };
+        let mut meta = Map::new();
+        meta.insert("pending_structured_resume_context".into(), json!(&stale));
+        meta.insert("pending_structured_resume".into(), json!(1));
+        meta.insert("cc_cwd".into(), json!(&stale.cwd));
+        let fallback = dir.path().to_str().unwrap();
+        let terminal = resume_launch_context(&store.read().unwrap(), "lane", &meta, fallback).unwrap().unwrap();
+        assert_eq!(terminal.card, None);
+        assert_eq!(terminal.cwd, fallback);
+        let prompt = structured_resume_prompt(&terminal, "version restart after hot switch");
+        assert!(!prompt.contains("OLD-1") && !prompt.contains("removed-old-worktree"));
+        assert!(prompt.contains("amux board ls --mine"));
+        store.write(|conn| {
+            conn.execute_batch("UPDATE issues SET status='doing' WHERE id='CURRENT-2';
+                INSERT INTO session_events(ts,session,type,data) VALUES (2,'lane','task.claimed','{\"issue\":\"CURRENT-2\"}');")?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let current_dir = dir.path().join("current-worktree");
+        std::fs::create_dir(&current_dir).unwrap();
+        meta.insert("cc_cwd".into(), json!(current_dir));
+        let changed = resume_launch_context(&store.read().unwrap(), "lane", &meta, fallback).unwrap().unwrap();
+        assert_eq!(changed.card.as_deref(), Some("CURRENT-2"));
+        assert_eq!(changed.cwd, current_dir.to_str().unwrap());
+        let prompt = structured_resume_prompt(&changed, "provider restart");
+        assert!(prompt.contains("amux board show CURRENT-2") && prompt.contains("current-worktree"));
+        assert!(!prompt.contains("OLD-1") && !prompt.contains("removed-old-worktree"));
     }
 
     /// The file/DB-backed verbs, exercised through the full router shape on a
@@ -22575,6 +23490,59 @@ CLAUDE-POSTFIX-COMPLETE
         );
         // And an explicit off is not yolo either.
         assert!(!yolo_enabled("--model opus", Some("0")));
+    }
+
+    #[test]
+    fn fresh_workers_default_to_full_board_drive_and_nonterminal_continuation() {
+        let dir = tempfile::tempdir().expect("isolated standing-order home");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("fresh.env"), "CC_ISOLATED=0\n").unwrap();
+
+        assert_eq!(
+            crate::runtime_jobs::isolation_reason_with("board-drive", |_| None),
+            None,
+            "the process-level board-drive master must default enabled"
+        );
+        for key in ["CC_STANDING_ORDERS", "CC_AUTO_PICKUP", "CC_AUTO_CONTINUE"] {
+            assert!(
+                standing_orders_on_in(dir.path(), "fresh", key),
+                "a non-isolated worker with no override must enroll in {key}"
+            );
+        }
+        assert!(
+            crate::runtime_jobs::board_drive::dispatch_backlog_when_idle_in(
+                dir.path(),
+                "fresh",
+                None,
+            ),
+            "a fresh non-isolated worker must promote eligible backlog by default"
+        );
+
+        std::fs::write(
+            sessions.join("fresh.env"),
+            "CC_ISOLATED=0\nCC_STANDING_ORDERS=0\nCC_AUTO_PICKUP=1\nCC_AUTO_CONTINUE=1\nAMUX_DISPATCH_BACKLOG_WHEN_IDLE=0\n",
+        )
+        .unwrap();
+        assert!(!standing_orders_on_in(dir.path(), "fresh", "CC_STANDING_ORDERS"));
+        assert!(!standing_orders_on_in(dir.path(), "fresh", "CC_AUTO_PICKUP"));
+        assert!(!standing_orders_on_in(dir.path(), "fresh", "CC_AUTO_CONTINUE"));
+        assert!(
+            !crate::runtime_jobs::board_drive::dispatch_backlog_when_idle_in(
+                dir.path(),
+                "fresh",
+                None,
+            ),
+            "an explicit backlog-promotion opt-out must stay off"
+        );
+        assert_eq!(
+            crate::runtime_jobs::isolation_reason_with("board-drive", |key| {
+                (key == "AMUX_BOARD_DRIVE_SECS").then(|| "0".to_string())
+            })
+            .as_deref(),
+            Some("AMUX_BOARD_DRIVE_SECS=0"),
+            "the explicit process-level board-drive opt-out remains available"
+        );
     }
 
     /// A rust-managed worker keeps the modern pointer for every verb EXCEPT
@@ -23778,11 +24746,11 @@ mod steer_boundary_tests {
             ("idle", true),
         ] {
             set_report(&state, "probe", reported).await;
-            assert_eq!(
-                steer_lane_at_boundary(&state, "probe").await,
-                want,
-                "reported state {reported:?} should give at_boundary={want}"
-            );
+            let mut signals = crate::api::sessions_legacy::tests::signals();
+            signals.running.insert("amux-probe".into());
+            signals.reports = json!({"probe": {"state": reported, "ts": signals.now}});
+            assert_eq!(signals.turn_boundary_status("probe").as_deref() == Some("idle"), want,
+                "reported state {reported:?} should give at_boundary={want}");
         }
 
         // AMUX-3756: AND ONLY WHILE THE REPORT IS STILL AUTHORITATIVE. A stuck
@@ -26511,6 +27479,69 @@ mod steer_coalescing_tests {
         steer_enqueue_store(&st, "lane", "same text", "board-progress", "peer").await.unwrap();
         steer_enqueue_store(&st, "lane", "same text", "board-progress", "peer").await.unwrap();
         assert_eq!(pending(&st, "lane").len(), 1, "an identical repeat must not stack");
+    }
+
+    /// ATE-92 chaos boundary: a stable producer needs to distinguish its first
+    /// durable commit from a retry after process death. The string-only API
+    /// cannot express that fact; the disposition lets board-drive restore a
+    /// missing receipt without sending the worker another prompt.
+    #[tokio::test]
+    async fn stable_enqueue_reports_new_queued_and_delivered_commitments() {
+        let (st, _d) = store().await;
+
+        let first = steer_enqueue_precond_with_id(
+            &st,
+            "lane",
+            "resume exact card",
+            "board-drive",
+            "",
+            None,
+            Some("resume-generation-7"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.id, "resume-generation-7");
+        assert_eq!(first.disposition, StableEnqueueDisposition::New);
+
+        let queued_retry = steer_enqueue_precond_with_id(
+            &st,
+            "lane",
+            "resume exact card",
+            "board-drive",
+            "",
+            None,
+            Some("resume-generation-7"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(queued_retry.disposition, StableEnqueueDisposition::AlreadyQueued);
+        assert_eq!(pending(&st, "lane").len(), 1, "retry must not stack a second row");
+
+        st.write_async(|conn| {
+            conn.execute(
+                "INSERT INTO steering_history (id,session,text,queued_at,delivered_at) \
+                 SELECT id,session,text,queued_at,?1 FROM steering_queue WHERE id=?2",
+                rusqlite::params![now_f64(), "resume-generation-7"],
+            )?;
+            conn.execute("DELETE FROM steering_queue WHERE id=?1", ["resume-generation-7"])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .await
+        .unwrap();
+
+        let delivered_retry = steer_enqueue_precond_with_id(
+            &st,
+            "lane",
+            "resume exact card",
+            "board-drive",
+            "",
+            None,
+            Some("resume-generation-7"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(delivered_retry.disposition, StableEnqueueDisposition::AlreadyDelivered);
+        assert!(pending(&st, "lane").is_empty(), "delivered retry must stay out of the queue");
     }
 
     /// CONTROL 3: the guard stays NON-EMPTY for board notes, so the isolation

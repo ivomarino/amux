@@ -64,6 +64,19 @@ if [ "${1:-}" = "test" ] && [ -z "${_TC_RECEIPT:-}" ]; then
   [ -x "$_receipt" ] || _receipt=""
 fi
 
+_target_guard="$(cd "$(dirname "$0")" && pwd)/cargo-target-guard.py"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.amux/rust-build-target}"
+_guard_cmd=(python3 "$_target_guard" run --target "$CARGO_TARGET_DIR")
+# Cargo's explicit --target-dir wins over the environment. Lease both roots.
+_next_target=0
+for _arg in "$@"; do
+  if [ "$_next_target" = 1 ]; then _guard_cmd+=(--target "$_arg"); _next_target=0; fi
+  case "$_arg" in
+    --target-dir) _next_target=1 ;;
+    --target-dir=*) _guard_cmd+=(--target "${_arg#--target-dir=}") ;;
+  esac
+done
+
 if [ -d /run/systemd/system ]; then
   if ! command -v systemd-run >/dev/null 2>&1; then
     echo "safe-cargo.sh: systemd-run not found on a systemd host — refusing to run cargo unisolated." \
@@ -75,11 +88,11 @@ if [ -d /run/systemd/system ]; then
        --setenv=CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.amux/rust-build-target}"
        --setenv=PATH="$PATH"
        --setenv=HOME="$HOME"
-       -- cargo "$@")
+       -- "${_guard_cmd[@]}" -- cargo "$@")
 else
   echo "safe-cargo.sh: no systemd on this host — running cargo directly." \
        "There is no pane scope for an OOM to cascade into here." >&2
-  CMD=(cargo "$@")
+  CMD=("${_guard_cmd[@]}" -- cargo "$@")
 fi
 
 if [ -z "$_receipt" ]; then

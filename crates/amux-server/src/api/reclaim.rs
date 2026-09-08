@@ -1880,7 +1880,7 @@ async fn create_quarantine(
         if let Some(parent) = dest.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        match std::fs::rename(&p, &dest) {
+        match crate::cargo_target_guard::rename(&p, &dest) {
             Ok(_) => {
                 total += sz;
                 moved.push((p.to_string_lossy().into_owned(), dest.to_string_lossy().into_owned(), sz));
@@ -2016,6 +2016,7 @@ async fn restore_quarantine(State(state): State<AppState>, Path(id): Path<String
     };
 
     let mut restored = 0usize;
+    let mut restored_paths = Vec::new();
     let mut failed = Vec::new();
     for (orig, staged) in &pairs {
         let op = PathBuf::from(orig);
@@ -2026,8 +2027,11 @@ async fn restore_quarantine(State(state): State<AppState>, Path(id): Path<String
         if let Some(parent) = op.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        match std::fs::rename(staged, &op) {
-            Ok(_) => restored += 1,
+        match crate::cargo_target_guard::rename(FsPath::new(staged), &op) {
+            Ok(_) => {
+                restored += 1;
+                restored_paths.push(orig.clone());
+            }
             Err(e) => failed.push(json!({"path": orig, "reason": e.to_string()})),
         }
     }
@@ -2037,10 +2041,13 @@ async fn restore_quarantine(State(state): State<AppState>, Path(id): Path<String
     let _ = state
         .store
         .write_async(move |c| {
-            c.execute(
-                "UPDATE reclaim_quarantine_items SET status='restored' WHERE batch_id=?1 AND status='staged'",
-                [&bid],
-            )?;
+            // A Cargo guard refusal must remain staged and retryable.
+            for original in &restored_paths {
+                c.execute(
+                    "UPDATE reclaim_quarantine_items SET status='restored' WHERE batch_id=?1 AND original_path=?2 AND status='staged'",
+                    rusqlite::params![bid, original],
+                )?;
+            }
             c.execute(
                 "UPDATE reclaim_quarantine SET status=?2 WHERE id=?1",
                 rusqlite::params![bid, if ok_all { "restored" } else { "failed" }],
@@ -2083,15 +2090,25 @@ async fn purge_quarantine(
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad batch id"}))).into_response();
     }
     let (free_before, _) = df_bytes(&home_dir()).unwrap_or((0, 0));
-    if let Err(e) = std::fs::remove_dir_all(&dir) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::error!(batch = %id, error = %e, "reclaim purge failed");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-                .into_response();
+    // Older versions could stage a live Cargo target. Keep the original paths
+    // in the guard even though the bytes are now under quarantine/.
+    let originals: Vec<String> = {
+        let conn = match state.store.read() {
+            Ok(c) => c,
+            Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
+        };
+        let result = (|| -> rusqlite::Result<Vec<String>> {
+            let mut stmt = conn.prepare("SELECT original_path FROM reclaim_quarantine_items WHERE batch_id=?1")?;
+            let rows = stmt.query_map([&id], |row| row.get(0))?;
+            rows.collect()
+        })();
+        match result {
+            Ok(paths) => paths,
+            Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
         }
+    };
+    if let Err(e) = crate::cargo_target_guard::purge(&dir, &originals) {
+        return (StatusCode::CONFLICT, Json(json!({"error": e, "verdict": "cargo_reclaim_deferred"}))).into_response();
     }
     let (free_after, _) = df_bytes(&home_dir()).unwrap_or((0, 0));
     let snaps = local_snapshots().len();

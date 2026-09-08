@@ -4082,3 +4082,98 @@ FIX: Search retains an editable type filter and finds matches only inside that
   proof: 12 passed across desktop, 375px Chromium and iPhone WebKit; screenshots
   reviewed. The browser proof used changed assets with an isolated pinned
   backend, so it required no fleet access or additional Rust compilation.
+
+---
+## Every idle sweep re-delivered the same surviving task claim
+AREA: scheduler
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-92
+SYMPTOM: `select_resume` treated a durable surviving `task.claimed` marker as
+  fresh delivery permission on every idle board-drive tick. The live log showed
+  48 ATE-93 resume prompts to amux-testing-e2e, 74 ATE-114 prompts to
+  handoff-producer-0907, and repeated deliveries on several other owners.
+COST: Active workers were repeatedly re-steered onto the card they already
+  owned, the highlighted runtime card looked unstable, and backlog progress was
+  drowned by duplicate recovery prompts across hours of otherwise idle ticks.
+FIX: Separate causal runtime truth from recovery authorization. A running worker
+  keeps its exact claimed card without delivery; one new worker generation gets
+  one stable-id recovery, and a crash between durable enqueue and receipt
+  recovers the receipt without sending again. The board-drive log now emits
+  `active_owner_not_resteered`, `exact_live_claim_resumed`, or
+  `resume_receipt_recovered_without_redelivery` with the card, delivery id,
+  measured population, and causal reason on every branch.
+
+---
+## Current recovery suppression also suppressed canonical advancement
+AREA: scheduler
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-92
+SYMPTOM: A surviving exact claim returned from drive_lane as Current before select_advance ran. An idle worker could keep its correct highlighted card indefinitely without a cooldown/backoff-gated continuation.
+COST: The live acceptance lane remained stalled after the duplicate-resume fix; implementation could not honestly pass the advancement gate.
+FIX: Suppress only recovery delivery and fall through to canonical advancement. The Current trace now records the advancement refusal reason, and task.resume_suppressed remains an idempotent receipt. Regression: current_claim_advances_once_then_obeys_cooldown_across_repeated_ticks.
+
+---
+## Workers rejected a stale Codex footer while board-drive still trusted it
+AREA: scheduler
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-92
+SYMPTOM: TubeScience and Primis were skipped as mid-turn by board-drive after Workers had refused their stale Codex activity using structured FleetSignals.
+COST: Eligible continuation remained blocked despite the visible runtime correction; another user intervention was required.
+FIX: Board-drive reads one FleetSignals snapshot per tick. General steering and send-time race checks probe only the target worker through the same derivation. An unavailable process probe holds instead of inventing no children. boundary_stale_codex_footer_refused announces the recovered class in amux logs.
+
+---
+## Model-swap resume lost the active worktree and requested an unscoped board list
+AREA: attribution
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-92
+SYMPTOM: The generated swap prompt requested `amux board ls --session amux-testing-e2e`, which this CLI silently ignored and returned unrelated fleet cards. The restarted worker began in the configured shared checkout instead of its active isolated task directory.
+COST: The owner interrupted recovery to prevent touching foreign drafts and had to repeat the exact worktree and active task scope.
+FIX: Persist exact claim, worker and runtime cwd before swapping; the launcher retains that directory or refuses an unresolved/missing context. Resume prompts name the exact card first and use `AMUX_SESSION=<worker> amux board ls --mine`. swap_context_persisted and swap_context_invalid make the identity decision visible. Regression reopens the durable DB and exercises the same launch selector for model/provider/version restarts.
+
+---
+## Disk pressure cleanup deleted the shared target during active Rust gates
+AREA: runtime
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-92
+SYMPTOM: The shared debug/deps directory vanished during ATE-92 cargo check/clippy/test runs as free space jumped from roughly 13 GiB to 26 GiB. The builder explicitly bypassed its peer check below the disk floor, and reclaim could quarantine Cargo artifacts without any process or lock check. disk_watch itself only reports.
+COST: Interrupted compilation, missing artifact errors, and a cold rebuild before acceptance could continue. Existing cleanup tests required destruction during a peer build.
+FIX: Remove the low-disk override. safe-cargo holds an inherited lifetime lease outside the target; builder and Cargo-only reclaim mutations share one guard that takes Cargo locks, checks cargo/rustc/direct test processes, and fails closed on unknown probes. Cargo lock files retain their inodes; active builds defer with cargo_reclaim_deferred and idle retries emit cargo_reclaim_result. Ordinary non-Cargo reclaim remains native Rust. Temporary fixture regressions prove active artifact survival and reclaim after exit without depending on unrelated host builds.
+
+---
+## Refused swaps changed config and startup recovery bypassed durable delivery
+AREA: runtime
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-92
+SYMPTOM: Provider/YOLO branches wrote CC_PROVIDER/CC_FLAGS before validating resume identity, so a 409 could leave changed configuration. Startup consumed its pending context before a detached send_after_ready task committed delivery, while board-drive independently enqueued recovery for the same session.started generation.
+COST: Refused swaps could alter the next launch; accepted swaps could lose or duplicate recovery across process failure. Both prevented honest model-swap acceptance.
+FIX: Validate and atomically persist exact resume context before config writes. Startup commits its generation and context before enqueue and shares board-drive's stable card/generation identity and accepted-delivery receipt. Pending tokens clear only after durable queue acceptance; queue/history records deduplicate concurrent producers and process restarts, superseded generations cannot enqueue, and enqueue failures retain context for retry. Diagnostics: swap_context_unresolved, swap_context_persist_failed, swap_resume_enqueue_failed, swap_resume_accepted, swap_resume_superseded. Regression tests exercise the actual config branch ordering and concurrent startup/board enqueue against reopened durable state.
+
+---
+## Pending hot-swap recovery outlived its active card
+AREA: runtime
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-92
+SYMPTOM: A hot config change could retain saved card X after X became terminal or a different exact claim replaced it. The launch validator accepted saved Some(X) against current None, and the old worktree could then prevent startup or reintroduce stale work.
+COST: Model-swap acceptance remained unsafe across task completion, despite passing the same-card restart regression.
+FIX: Compare saved and current claim identities including None. Superseded snapshots derive the current exact card or scoped queue and current runtime/configured cwd; a removed old worktree does not block that replacement. swap_context_superseded names the old/current identities. The explicit terminal_after_hot_switch_and_changed_claim_replace_stale_launch_context regression covers both transitions.
