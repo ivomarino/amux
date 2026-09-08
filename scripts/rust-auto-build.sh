@@ -79,7 +79,7 @@ server_api_base() {
 import json,sys
 try:
     d=json.load(open(sys.argv[1]))
-    print(d.get('url') or d.get('endpoint') or '')
+    print(d.get('canonical_url') or d.get('url') or d.get('endpoint') or '')
 except Exception:
     pass
 PY
@@ -88,20 +88,26 @@ PY
   printf '%s\n' "${api:-https://localhost:8824}"
 }
 
-live_server_commit() {
-  local url body
+# One measurement owns both the decision and its receipt. A later successful
+# curl must never be used to explain an earlier timeout (AMUX-4225).
+measure_live_identity() {
+  local url body rc=0
   url="${AMUX_RS_HEALTH_URL:-$(server_api_base)/api/health}"
-  body=$(curl -sk --max-time 4 "$url" 2>/dev/null) || return 1
-  printf '%s' "$body" | python3 -c '
-import json,sys
+  body=$(curl -sk --max-time 4 "$url" 2>/dev/null) || rc=$?
+  live=""
+  identity_reason="curl_exit=$rc"
+  if [ "$rc" != 0 ]; then return 1; fi
+  live=$(printf '%s' "$body" | python3 -c '
+import json,re,sys
 try:
-    commit=json.load(sys.stdin).get("commit", "")
-    if not isinstance(commit, str) or not commit:
-        raise ValueError("missing commit")
+    d=json.load(sys.stdin)
+    commit=d.get("commit_full") or d.get("commit", "")
+    if not isinstance(commit,str) or not re.fullmatch(r"[0-9a-f]{12,40}",commit):
+        raise ValueError("invalid commit")
     print(commit)
 except Exception:
     raise SystemExit(1)
-' 2>/dev/null
+' 2>/dev/null) || { identity_reason="invalid_commit"; return 1; }
 }
 
 activation_authorized() {
@@ -117,28 +123,12 @@ activation_authorized() {
   return 0
 }
 
-stamp_matches_live_image() {
-  local live
-  [ "$head" = "$last" ] || return 1
-  live=$(live_server_commit) || return 1
-  case "$built_sha" in
-    "$live"*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
 # Provenance and disk-only seams never install or restart anything. Keeping
 # them outside the authority gate lets their hermetic fixtures stay about the
 # operation they actually exercise.
 if [ "${AMUX_RS_BUILD_PROVENANCE_ONLY:-}" != "1" ] \
    && [ "${AMUX_RS_DISK_CLEAR_ONLY:-}" != "1" ] \
    && ! activation_authorized; then
-  exit 0
-fi
-
-if [ "${AMUX_RS_BUILD_PROVENANCE_ONLY:-}" != "1" ] \
-   && [ "${AMUX_RS_DISK_CLEAR_ONLY:-}" != "1" ] \
-   && stamp_matches_live_image; then
   exit 0
 fi
 
@@ -188,12 +178,33 @@ if [ "${AMUX_RS_BUILD_PROVENANCE_ONLY:-}" != "1" ] \
   if ! activation_authorized; then
     exit 0
   fi
-  if stamp_matches_live_image; then
-    exit 0
-  fi
   if [ "$head" = "$last" ]; then
-    live=$(live_server_commit 2>/dev/null || true)
-    echo "== !! ACTIVATION STAMP DRIFT $built_sha — stamp says this revision installed, but /api/health reports ${live:-unmeasured}; rebuilding the elected image" >> "$LOG"
+    if ! measure_live_identity; then
+      echo "== $(date '+%F %T') !! ACTIVATION IDENTITY UNMEASURED expected=$built_sha trigger=$head $identity_reason measured=false action=defer — unavailable health is not evidence of image drift" >> "$LOG"
+      exit 0
+    fi
+    case "$built_sha" in
+      "$live"*)
+        echo "== $(date '+%F %T') ACTIVATION IDENTITY MATCH expected=$built_sha live=$live measured=true action=skip" >> "$LOG"
+        exit 0 ;;
+      *)
+        # The elected bytes may already be installed while the old process is
+        # awaiting its next adoption tick. Recompiling them cannot help it.
+        if python3 - "$INSTALL" "${INSTALL}.identity.json" "$built_sha" <<'PYINSTALLED' 2>/dev/null
+import hashlib,json,sys
+try:
+    d=json.load(open(sys.argv[2]))
+    with open(sys.argv[1], 'rb') as f: digest=hashlib.sha256(f.read()).hexdigest()[:16]
+    raise SystemExit(0 if d.get('sha') == sys.argv[3] and d.get('build') == digest else 1)
+except (OSError,ValueError):
+    raise SystemExit(1)
+PYINSTALLED
+        then
+          echo "== $(date '+%F %T') !! ACTIVATION AWAITING ADOPTION expected=$built_sha live=$live installed_match=true measured=true action=skip_rebuild" >> "$LOG"
+          exit 0
+        fi
+        echo "== $(date '+%F %T') !! ACTIVATION STAMP DRIFT $built_sha live=$live measured=true action=rebuild — measured foreign image" >> "$LOG" ;;
+    esac
   fi
 fi
 
@@ -653,15 +664,36 @@ fi
              "Create the identity (see AMUX-3527) or set AMUX_CODESIGN_IDENTITY."
       fi
     fi
-    mv -f "$INSTALL_TMP" "$INSTALL"
+    PROV_JSON=$(python3 - "$INSTALL_TMP" "$PROV_JSON" "$head" <<'PYIDENTITY'
+import hashlib,json,sys
+with open(sys.argv[1], 'rb') as f:
+    build=hashlib.file_digest(f, 'sha256').hexdigest()[:16] if hasattr(hashlib, 'file_digest') else hashlib.sha256(f.read()).hexdigest()[:16]
+d=json.loads(sys.argv[2]); d.update(build=build, trigger=sys.argv[3])
+print(json.dumps(d))
+PYIDENTITY
+)
+    # Publish identity before the executable. Readers require its hash to
+    # match the candidate, so neither half of the rename pair can lie.
+    printf '%s\n' "$PROV_JSON" > "${INSTALL}.identity.json.new.$$"
+    mv -f "${INSTALL}.identity.json.new.$$" "${INSTALL}.identity.json"
+
+    if cmp -s "$INSTALL_TMP" "$INSTALL"; then
+      echo "== ACTIVATION IDENTICAL BINARY sha=$built_sha action=skip_install — keeping executable inode and mtime; no self-adoption"
+      rm -f "$INSTALL_TMP"
+      install_action=unchanged
+    else
+      mv -f "$INSTALL_TMP" "$INSTALL"
+      install_action=replaced
+    fi
     INSTALL_TMP=""
     echo "$head" > "$STAMP"
+    printf '%s\n' "$PROV_JSON" > "$PROV_FILE" 2>/dev/null || true
+    echo "== ACTIVATION INSTALLED identity=$PROV_JSON"
     # AEAB-50: only NOW is this true. Written after the atomic install so the
     # file means "what is installed" rather than "what was attempted". On the
     # failure branch below it is left alone, so it keeps naming the last good
     # build — which is exactly what that branch says is still running.
-    printf '%s\n' "$PROV_JSON" > "$PROV_FILE" 2>/dev/null || true
-    echo "== installed atomically; running server will self-adopt within 5s"
+    echo "== installation action=$install_action; running server will verify identity before adoption"
   else
     echo "== BUILD FAILED for $head — running server keeps the last good build"
     echo "-- diagnostics (every error, with context) ---------------------------"

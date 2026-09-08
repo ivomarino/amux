@@ -63,6 +63,7 @@ pub mod pane_size;
 /// derived from the spawn sites rather than declared alongside them.
 pub mod queue_disposition;
 pub mod registry;
+mod poll_watch;
 pub mod scheduler;
 pub mod storage;
 pub mod tailnet_watch;
@@ -258,7 +259,7 @@ where
                 }
             }
             registry::tick_start(&job_id);
-            f().await;
+            poll_watch::watch(&job_id, f()).await;
             registry::tick_end(&job_id);
         }
     });

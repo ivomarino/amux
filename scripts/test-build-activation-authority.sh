@@ -95,6 +95,13 @@ expect grep -q "$ELECTED" "$INSTALL"
 expect test "$(grep -c '^build ' "$TRACE")" = 1
 expect grep -q "ACTIVATION AUTHORITY REFUSED $STALE" "$LOG"
 
+# A delayed adoption needs no second build while the elected bytes remain installed.
+run_builder "$AUTH"
+expect test "$(grep -c '^build ' "$TRACE")" = 1
+expect grep -q 'ACTIVATION AWAITING ADOPTION' "$LOG"
+# Simulate the actual foreign overwrite; the old receipt must not hide it.
+printf '#!/bin/sh\necho foreign\n' > "$INSTALL"
+
 # The exact live incident: the elected stamp still names ELECTED, but the
 # process answering health is STALE. The elected builder must rebuild instead
 # of considering its local stamp proof that its binary is still live.
@@ -103,10 +110,42 @@ expect test "$(grep -c '^build ' "$TRACE")" = 2
 expect grep -q "ACTIVATION STAMP DRIFT $ELECTED" "$LOG"
 expect grep -q "$ELECTED" "$INSTALL"
 
+# AMUX-4225: full and abbreviated identities mean the same image. A failed
+# measurement is NOT a measured mismatch. In the incident the first two curls
+# timed out and a third matched, but only that third answer reached STAMP DRIFT.
+for identity in "$ELECTED" "${ELECTED:0:12}"; do
+  printf '{"commit":"%s","build":"fixture","pid":123}\n' "$identity" > "$HEALTH"
+  run_builder "$AUTH"
+  expect test "$(grep -c '^build ' "$TRACE")" = 2
+done
+mkdir -p "$FAKE_HOME/.cargo/bin"
+export CURL_TRACE="$TMP/curl.trace" HEALTH
+cat > "$FAKE_HOME/.cargo/bin/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$CURL_TRACE"
+n=$(wc -l < "$CURL_TRACE" | tr -d ' ')
+if [ "$n" -le 2 ]; then exit 28; fi
+cat "$HEALTH"
+EOF
+chmod +x "$FAKE_HOME/.cargo/bin/curl"
+run_builder "$AUTH"
+expect test "$(grep -c '^build ' "$TRACE")" = 2
+expect test "$(wc -l < "$CURL_TRACE" | tr -d ' ')" = 1
+expect grep -q 'ACTIVATION IDENTITY UNMEASURED.*curl_exit=28.*action=defer' "$LOG"
+rm -f "$FAKE_HOME/.cargo/bin/curl" "$CURL_TRACE"
+# Missing/invalid identities must not become prefix matches or rebuild orders.
+for identity in '' a unknown "${ELECTED:0:12}-dirty"; do
+  printf '{"commit":"%s"}\n' "$identity" > "$HEALTH"
+  run_builder "$AUTH"
+  expect test "$(grep -c '^build ' "$TRACE")" = 2
+done
+
 # Worker-attributed diagnostic runs must remain offline, while a real install
 # of that same commit must still fail closed without a measured overlap permit.
+printf 'worker source\n' >> "$AUTH/crates/input.rs"
+git -C "$AUTH" add crates/input.rs
 git -C "$AUTH" -c user.name=test -c user.email=test@example.com commit \
-  --allow-empty -qm $'worker revision\n\nAmux-Session: fixture-worker'
+  -qm $'worker revision\n\nAmux-Session: fixture-worker'
 WORKER=$(git -C "$AUTH" rev-parse HEAD)
 git -C "$AUTH" update-ref refs/remotes/origin/main "$WORKER"
 mkdir -p "$FAKE_HOME/.cargo/bin"

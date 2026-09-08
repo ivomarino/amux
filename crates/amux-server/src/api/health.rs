@@ -56,6 +56,7 @@ pub struct Health {
     /// compiles the working tree, so a bare sha would overclaim);
     /// "unknown" outside a git checkout (the cloud image).
     pub commit: &'static str,
+    pub commit_full: &'static str,
     pub uptime_s: u64,
     pub rev: Option<u64>,
     pub store: &'static str,
@@ -479,50 +480,53 @@ fn fd_health() -> Option<FdHealth> {
 }
 
 pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>) {
-    // A store that cannot answer the revision query is degraded — surface
-    // that instead of a green lie (ethos rule 7: a check must be able to
-    // fail).
-    let (rev, store, code) = match state.store.current_rev() {
-        Ok(rev) => (Some(rev.0), "ok", StatusCode::OK),
-        Err(_) => (None, "hung", StatusCode::SERVICE_UNAVAILABLE),
-    };
-    // AF-332: exercise the REAL board read. This is the one probe here that
-    // deserializes a row, because the outage it exists to catch was a row-
-    // mapping failure that `current_rev()` above answered "ok" straight
-    // through. Bounded to one row: /health is polled constantly and
-    // `list_issues` is unbounded.
-    let board = match state.store.read() {
-        Ok(conn) => match crate::db::board_store::probe_board_read(&conn) {
-            Ok(n) => BoardProbe { measured: true, ok: true, rows_mapped: n, error: None },
-            Err(e) => {
-                // The two-fix rule: the fix, plus a signal that makes the next
-                // occurrence self-announce. This WARN is what a log sweep
-                // greps; without it the field is only visible to whoever
-                // happens to curl /health during the window, which is exactly
-                // how the 20-minute outage went unnoticed.
-                tracing::warn!(
-                    target: "health",
-                    "[health/board-probe AF-332] the board row mapper FAILED: {e}. \
-                     GET /api/board is very likely 5xx for the whole fleet right now; \
-                     `store` cannot see this class because it only checks current_rev()."
-                );
-                BoardProbe {
-                    measured: true,
-                    ok: false,
-                    rows_mapped: 0,
-                    error: Some(e.to_string()),
-                }
+    // AMUX-4225: a pooled read can wait 30s and SQLite itself can wait 5s.
+    // Neither may occupy a Tokio worker, including the worker accepting TLS.
+    // One in-flight probe per store prevents timed-out requests from filling
+    // the blocking pool. The permit stays WITH the work after HTTP times out.
+    let started = std::time::Instant::now();
+    let phase = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let result = match state.store.health_probe.clone().try_acquire_owned() {
+        Ok(permit) => {
+            let store = state.store.clone();
+            let phase = phase.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                phase.store(1, std::sync::atomic::Ordering::Relaxed);
+                let conn = store.try_read().ok_or("read_pool_exhausted")?;
+                phase.store(2, std::sync::atomic::Ordering::Relaxed);
+                let rev: u64 = conn.query_row("SELECT rev FROM _amux_rev WHERE id = 1", [], |r| r.get(0))
+                    .map_err(|_| "revision_read_failed")?;
+                phase.store(3, std::sync::atomic::Ordering::Relaxed);
+                let board = match crate::db::board_store::probe_board_read(&conn) {
+                    Ok(n) => BoardProbe { measured: true, ok: true, rows_mapped: n, error: None },
+                    Err(e) => {
+                        tracing::warn!(target: "health", error = %e, verdict = "board_mapper_failed",
+                            "health board row mapper failed (AF-332)");
+                        BoardProbe { measured: true, ok: false, rows_mapped: 0, error: Some(e.to_string()) }
+                    }
+                };
+                Ok((rev, board))
+            });
+            match tokio::time::timeout(std::time::Duration::from_millis(250), task).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err("probe_task_failed"),
+                Err(_) => Err("probe_deadline_exceeded"),
             }
-        },
-        // Could not even take the connection. `measured:false` because the
-        // probe did not run, which is NOT the same claim as "the board is
-        // broken" and must not render as one.
-        Err(_) => BoardProbe {
-            measured: false,
-            ok: false,
-            rows_mapped: 0,
-            error: Some("store lock unavailable; probe did not run".into()),
-        },
+        }
+        Err(_) => Err("probe_already_in_flight"),
+    };
+    let (rev, store, code, board) = match result {
+        Ok((rev, board)) => (Some(rev), "ok", StatusCode::OK, board),
+        Err(reason) => {
+            tracing::warn!(target: "health", verdict = reason, measured = false,
+                phase = phase.load(std::sync::atomic::Ordering::Relaxed),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                commit = env!("AMUX_BUILD_COMMIT"), build = %state.build_hash,
+                pid = std::process::id(), "health store probe unavailable; returning identity without blocking the runtime");
+            (None, "hung", StatusCode::SERVICE_UNAVAILABLE,
+                BoardProbe { measured: false, ok: false, rows_mapped: 0, error: Some(reason.into()) })
+        }
     };
     let board_bad = board.measured && !board.ok;
     let fds = fd_health();
@@ -560,6 +564,7 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
             board,
             build: state.build_hash.clone(),
             commit: env!("AMUX_BUILD_COMMIT"),
+            commit_full: env!("AMUX_BUILD_COMMIT_FULL"),
             uptime_s: state.started.elapsed().as_secs(),
             rev,
             store,

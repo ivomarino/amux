@@ -98,6 +98,7 @@ pub mod orchestrator;
 pub mod provider;
 pub mod push;
 pub mod runtime_jobs;
+pub mod activation;
 pub mod tls;
 
 use std::sync::Arc;
@@ -110,11 +111,7 @@ use std::time::Instant;
 pub fn build_hash() -> String {
     (|| -> Option<String> {
         let exe = std::env::current_exe().ok()?;
-        let bytes = std::fs::read(exe).ok()?;
-        use sha2::Digest;
-        let mut h = sha2::Sha256::new();
-        h.update(&bytes);
-        Some(hex::encode(&h.finalize()[..8]))
+        activation::file_build_hash(&exe).ok()
     })()
     .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")))
 }
@@ -280,7 +277,10 @@ async fn async_main() {
         None => tracing_subscriber::fmt().with_env_filter(env_filter()).init(),
     }
 
-    tracing::info!(port = cfg.port, db = %cfg.db_path.display(), "starting amux-rust");
+    let running_build = build_hash();
+    tracing::info!(port = cfg.port, db = %cfg.db_path.display(), pid = std::process::id(),
+        commit = env!("AMUX_BUILD_COMMIT_FULL"), build = %running_build,
+        self_adopted = std::env::var("AMUX_SELF_ADOPTED").is_ok(), "starting amux-rust");
 
     // WAS THIS RESTART ANNOUNCED? (AF-176)
     //
@@ -388,7 +388,7 @@ async fn async_main() {
     let state = api::AppState {
         store: store.clone(),
         started: Instant::now(),
-        build_hash: build_hash(),
+        build_hash: running_build.clone(),
         auth_token,
         reconciled: reconciled.clone(),
     };
@@ -756,17 +756,36 @@ async fn async_main() {
              binary change (AEAB-52: a test harness pins its build on purpose)"
         );
     } else {
-        jobs::spawn_loop(jobs::ids::SELF_ADOPT, Some(secs(5)), async {
+        jobs::spawn_loop(jobs::ids::SELF_ADOPT, Some(secs(5)), async move {
             let Ok(exe) = std::env::current_exe() else { return };
             let Ok(meta) = std::fs::metadata(&exe) else { return };
-            let initial = meta.modified().ok();
+            let mut observed = meta.modified().ok();
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 interval.tick().await;
                 jobs::tick(jobs::ids::SELF_ADOPT);
                 let current = std::fs::metadata(&exe).ok().and_then(|m| m.modified().ok());
-                if current.is_some() && current != initial {
-                    tracing::info!(
+                if current.is_some() && current != observed {
+                    let path = exe.clone();
+                    let candidate = match tokio::task::spawn_blocking(move || activation::Candidate::read(&path)).await {
+                        Ok(Ok(candidate)) => candidate,
+                        error => {
+                            tracing::warn!(verdict = "adoption_identity_unmeasured", ?error,
+                                pid = std::process::id(), "self-adoption deferred: cannot verify installed image");
+                            continue;
+                        }
+                    };
+                    let running_commit = env!("AMUX_BUILD_COMMIT_FULL");
+                    if let Some(reason) = candidate.skip_reason(running_commit, &running_build) {
+                        tracing::warn!(verdict = reason, pid = std::process::id(),
+                            running_commit, running_build = %running_build,
+                            candidate_commit = ?candidate.commit, candidate_build = %candidate.build,
+                            "self-adoption skipped: installation did not advance the running revision");
+                        observed = current;
+                        continue;
+                    }
+                    tracing::info!(pid = std::process::id(), running_commit, running_build = %running_build,
+                        candidate_commit = ?candidate.commit, candidate_build = %candidate.build,
                         "binary changed on disk — exec'ing the new build in place (self-adoption, \
                          AMUX-3458: no exit means no launchd throttle window)"
                     );

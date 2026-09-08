@@ -31,5 +31,8 @@ fn main() {
     {
         sha.push_str("-dirty");
     }
+    let mut full = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    if sha.ends_with("-dirty") { full.push_str("-dirty"); }
+    println!("cargo:rustc-env=AMUX_BUILD_COMMIT_FULL={full}");
     println!("cargo:rustc-env=AMUX_BUILD_COMMIT={sha}");
 }

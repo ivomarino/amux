@@ -85,6 +85,7 @@ pub struct WriteReply {
 pub struct Store {
     write_tx: mpsc::Sender<WriteRequest>,
     read_pool: ReadPool,
+    pub(crate) health_probe: Arc<tokio::sync::Semaphore>,
     /// Broadcast of committed StateEvents for SSE fan-out.
     events_tx: tokio::sync::broadcast::Sender<StateEvent>,
 }
@@ -128,6 +129,7 @@ impl Store {
         Ok(Store {
             write_tx,
             read_pool,
+            health_probe: Arc::new(tokio::sync::Semaphore::new(1)),
             events_tx,
         })
     }
@@ -161,6 +163,11 @@ impl Store {
     /// Borrow a read-only connection from the pool.
     pub fn read(&self) -> anyhow::Result<r2d2::PooledConnection<SqliteConnectionManager>> {
         Ok(self.read_pool.get()?)
+    }
+
+    /// Health must report pool exhaustion without waiting behind fleet probes.
+    pub fn try_read(&self) -> Option<r2d2::PooledConnection<SqliteConnectionManager>> {
+        self.read_pool.try_get()
     }
 
     /// Current global revision.

@@ -4020,3 +4020,23 @@ FIX: Not mine to write. `amux` (isolated) has the fix already written and
   launchd authority runs committed bytes from `~/.amux/activation-source`.
   Deliberately left untouched, per the shared-checkout rule. `amux` is an isolated
   raw-agent worker: my send was refused, so only the owner can ask it to commit.
+
+---
+## A health timeout rebuilt the same revision and a later successful curl was logged as drift
+AREA: runtime
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux
+CARD: AMUX-4225
+SYMPTOM: Already-stamped a604412b rebuilt at 10:12:56 and self-adopted at
+  10:16:06 while health, sessions and handoff calls stalled. The drift line
+  printed the matching 12-character SHA, concealing earlier failed probes.
+COST: One confirmed redundant release build took 3m01s; another entered 18GB
+  cache cleanup. Missing measurement provenance sent diagnosis toward SHA
+  abbreviation, which the original comparator already accepted.
+FIX: One captured identity decision, unmeasured deferral, hash-checked install
+  receipts, same-revision adoption suppression, bounded off-runtime health
+  reads, and per-job slow-poll attribution. Native sample had no stacks; the
+  original unannounced stop remains unproven. RCA:
+  docs/incidents/2026-09-08-health-stalls-build-feedback.md.
