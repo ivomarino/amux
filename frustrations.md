@@ -4103,3 +4103,25 @@ FIX: Existing registered jobs use a separate process-owned maintenance runtime,
   regression blocks maintenance while real health and board requests must
   return; host CPU/IO contention and the original unannounced stop remain
   separate, explicitly unproven parts of the historical incident.
+
+---
+## A clean detached tree ran a dashboard test executable from another checkout
+AREA: gates
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux
+CARD: AMUX-4225
+SYMPTOM: A full gate on clean 21909b7e reported a missing cache prefix and a
+  card-syncing assertion absent from that tree. The executable in the shared
+  target directory embedded a different PR review checkout as its manifest
+  path. Clean source did not imply that the process executed its test binary.
+COST: A full validation run spent more than 15 minutes and reported stale-code
+  failures that could have prompted edits to already-correct source.
+FIX: For this proof, Cargo's RUSTC_WORKSPACE_WRAPPER namespaces workspace
+  artifacts while retaining the one shared CARGO_TARGET_DIR. The wrapper pins
+  the server from its hashed compiler output for the existing AMUX_RESTART_BIN
+  test seam and logs manifest/full-commit origins, refusing a source mismatch.
+  The private receipt and reproducible wrapper are in ~/.amux/logs/amux-4225/.
+  This corrects the verification setup; the default test-contended warning
+  alone remains insufficient proof of executable provenance.
