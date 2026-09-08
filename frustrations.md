@@ -4232,3 +4232,15 @@ CARD: AMUX-4237
 SYMPTOM: Ethan reported mixpeek-general positioned oddly and requested status ordering by default. The default was Recent activity, while the Status comparator was identical to it: working and waiting shared one priority and pins outranked status. Grouped rendering also discarded its sorted bucket when only one group remained.
 COST: A worker's position did not reliably communicate its displayed state; recent traffic and pins could split the expected status order.
 FIX: Default to Status and share the displayed status keys across ranking, grouping and frozen-order capture. Working, needs-input, API-error, rate-limited, idle and stopped remain distinct; pins and activity order within each state. A rendered-DOM worker-status-order beacon reports measured population and status-order-violation to the durable client-debug log. Browser regressions exercise mixpeek-general, status changes, single-group sorting, freeze, explicit preference preservation and a deliberately inverted DOM: 9 passed across desktop, mobile and iOS Safari.
+
+---
+## Publication gate mistook match patterns for failed sends
+AREA: tests
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux
+CARD: AMUX-4225
+SYMPTOM: The exact published 765e9ea2 suite reported two unclassified HTTP 500 outcomes containing only doing. Both were (false, "doing") match-arm inputs in the recovered prompt attribution path, not returned messages. Separately, the guard-default test inherited AMUX_TASK_GUARD=1 from host settings or another test's config load; the same executable passed alone with a clean environment.
+COST: Correct production behavior failed the publication gate, obscuring the distinction between a regression, ambient test state and an extractor error. The full run also reached an unrelated real-home filesystem probe that stayed blocked beyond its budget; its interruption and the integration-target continuation are recorded separately under ~/.amux/logs/amux-4225/.
+FIX: Exclude tuple literals followed by a match arrow while retaining actual failure returns and the existing positive controls. Emit gate_probe with measured population, excluded match patterns and unclassified count. The guard-default fixture explicitly clears its two effective values in its private server.env so live process settings cannot override the defaults under test. No runtime refusal policy or fleet state changes.
