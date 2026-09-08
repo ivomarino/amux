@@ -951,3 +951,59 @@ fn worker_board_opens_current_work_without_expanding_every_idle_lane() {
         "the old undefined-means-every-worker-open default returned"
     );
 }
+
+/// AF-390 fixed `#email-approvals-banner` swallowing clicks on the peek
+/// overlay's fixed-position controls (`.overlay { z-index: 100 }`): an
+/// in-flow global banner with `z-index: 200` painted over it once the banner
+/// grew tall enough (narrow viewport -> its text wraps -> its box reaches
+/// further down the screen). The fix set that ONE banner to `z-index: 90`
+/// and left a comment stating the rule for every future one: "NOTHING IN
+/// NORMAL FLOW MAY OUTRANK THESE TWO... If you add another global strip, put
+/// it under 100 too."
+///
+/// AMUX-126 (2026-09-07): three more global banners violated exactly that
+/// rule — `#no-apikey-banner`, `#org-banner`, `#org-invite-banner` all still
+/// carried `z-index: 200`, inherited from before AF-390 landed and never
+/// updated to match. CI caught the symptom (a real `locator.click` timeout on
+/// mobile/ios-safari in `terminal-message-navigation.spec.ts`, `#no-apikey-
+/// banner` named in the error as the element "intercepting pointer events")
+/// but nothing had checked the RULE itself — a comment stating an invariant
+/// is not a check that can fail (ethos rule 7). This scans every global
+/// banner div for its inline z-index and fails if a new one is ever added (or
+/// an old one edited) above the overlay's own 100.
+#[test]
+fn global_banners_never_outrank_the_peek_overlay() {
+    let html = asset("index.html");
+    // Every id in this list is a banner that renders in NORMAL DOCUMENT FLOW
+    // (not `position: fixed`) at the top of the page, in the same screen band
+    // as `.overlay` (z-index 100) and `#board-detail-overlay` (z-index 150) —
+    // exactly the AF-390 hazard. A banner added under a NEW id needs adding
+    // here too, or this test cannot see it.
+    let banner_ids =
+        ["no-apikey-banner", "org-banner", "org-invite-banner", "email-approvals-banner"];
+    for id in banner_ids {
+        let needle = format!("id=\"{id}\" style=\"");
+        let start = html.find(&needle).unwrap_or_else(|| panic!("banner #{id} not found in index.html — did it move or get renamed?"));
+        let tail = &html[start..];
+        let tag_end = tail.find('>').expect("unterminated div tag");
+        let style_attr = &tail[..tag_end];
+        let zi_key = "z-index:";
+        let zi_start = style_attr
+            .find(zi_key)
+            .unwrap_or_else(|| panic!("banner #{id} has no inline z-index at all — add one under 100, don't rely on the cascade default"))
+            + zi_key.len();
+        let zi_rest = &style_attr[zi_start..];
+        let zi_end = zi_rest.find(';').unwrap_or(zi_rest.len());
+        let z: i32 = zi_rest[..zi_end]
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("banner #{id}'s z-index isn't a plain integer: {e}"));
+        assert!(
+            z < 100,
+            "banner #{id} has z-index:{z} -- AF-390's rule is nothing in normal flow may outrank \
+             the peek overlay (z-index:100); a tall-wrapped banner at {z} will paint over and \
+             swallow clicks on the overlay's own controls exactly like AF-390 did. Use 90, matching \
+             #email-approvals-banner."
+        );
+    }
+}
