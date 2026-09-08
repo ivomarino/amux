@@ -9374,6 +9374,118 @@ fn compose_worker_block(name: &str, session_content: &str) -> String {
 /// `AMUX_HOME`), so a test that called `write_claude_memory` would overwrite the
 /// developer's own `~/.claude/.../MEMORY.md`. Everything this function reads is
 /// rooted at `AMUX_HOME`, so it is safe to exercise directly.
+/// Index lines an AGENT appended straight to MEMORY.md, which the compose would
+/// otherwise destroy (AF-578).
+///
+/// MEMORY.md is written by `fs::write` from the server's own sources, so it is a
+/// FULL REBUILD. Anything not in those sources dies on the next compose. That
+/// collides head-on with the memory instruction every session carries, which
+/// says to write a memory file and then "add a one-line pointer in MEMORY.md":
+/// an agent following its own instructions writes into the volatile half.
+///
+/// Measured 2026-09-07 on this box: 44 memory files on disk,
+/// ~/.claude/projects/-Users-ethan-Dev-amux/memory/MEMORY.md indexing 5 of them,
+/// and the server source `~/.amux/memory/amux-frustrations.md` carrying ~25
+/// pointers with NO overlap with those 5. Two indexes, not two views of one.
+/// Reported up from ts-gke (TG-3374) as a truncation problem; truncation is the
+/// SECOND loss.
+///
+/// THE FILES SURVIVE AND THE POINTERS DO NOT, which is why this reads as
+/// working: the write succeeds, the .md persists, and only discoverability is
+/// lost. 39 of 44 were already content with no index entry.
+///
+/// A DELETED MEMORY MUST STAY DELETED. The memory rules tell sessions to remove
+/// memories that turn out to be wrong, so a pointer whose target file is gone is
+/// NOT preserved: resurrecting it would make deletion impossible and quietly
+/// restore a fact somebody retracted.
+fn preserved_agent_pointers(mem_dir: &std::path::Path, composed: &str) -> String {
+    let existing = match std::fs::read_to_string(mem_dir.join("MEMORY.md")) {
+        Ok(t) => t,
+        Err(_) => return String::new(), // no prior file: nothing to preserve
+    };
+    let re = cached_re!(r"(?m)^- \[[^\]]+\]\(([A-Za-z0-9._-]+\.md)\)");
+    let mut kept: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in existing.lines() {
+        let Some(c) = re.captures(line) else { continue };
+        let target = c[1].to_string();
+        if target.eq_ignore_ascii_case("MEMORY.md") {
+            continue;
+        }
+        // Already carried by the sources: re-emitting would duplicate it, and a
+        // duplicate index line is the same defect one layer along.
+        if composed.contains(&format!("({target})")) {
+            continue;
+        }
+        if !seen.insert(target.clone()) {
+            continue; // idempotent: composing twice must not grow the file
+        }
+        if !mem_dir.join(&target).is_file() {
+            continue; // deleted memory: see the doc comment
+        }
+        kept.push(line.trim_end().to_string());
+    }
+    // SAY WHAT IS BEING DROPPED (ts-gke, and the two-fix rule). A destructive
+    // rebuild that cannot name what it removed is unobservable from outside,
+    // which is the same class as a guard that reads green while skipped. Two
+    // populations, counted separately because they mean opposite things:
+    //   - a pointer whose FILE is gone: dropped ON PURPOSE, so deletion works
+    //   - anything else a session wrote: dropped because this merge only
+    //     understands pointer lines
+    //
+    // THAT SECOND COUNT IS A REAL LIMIT OF THIS FIX, not a formality. Lane
+    // memory sources are not all pointer-shaped: ts-gke.md is `## Heading` plus
+    // prose with zero `- [Title](file.md)` lines, so for a lane in that style
+    // this preserves nothing and the warn is the only signal anyone gets.
+    // grep "memory: compose dropped".
+    let mut dropped_deleted = 0usize;
+    let mut unrecognised = 0usize;
+    let mut in_roster = false;
+    for line in existing.lines() {
+        let t = line.trim();
+        if t.starts_with("## Fleet — who else is running") {
+            in_roster = true;
+        }
+        if in_roster || t.is_empty() {
+            continue;
+        }
+        match re.captures(line) {
+            Some(c) => {
+                let target = &c[1];
+                if !mem_dir.join(target).is_file() {
+                    dropped_deleted += 1;
+                }
+            }
+            None => {
+                if !composed.contains(t) {
+                    unrecognised += 1;
+                }
+            }
+        }
+    }
+    if dropped_deleted > 0 || unrecognised > 0 {
+        tracing::warn!(
+            dir = %mem_dir.display(),
+            preserved = kept.len(),
+            dropped_deleted_target = dropped_deleted,
+            unrecognised_lines = unrecognised,
+            "memory: compose dropped session-written content it could not carry (AF-578); \
+             only `- [Title](file.md)` lines are preserved"
+        );
+    }
+    if kept.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n## Session-written pointers (preserved across compose — AF-578)\n\n\
+         These were appended to MEMORY.md by a session rather than written to \
+         ~/.amux/memory/<worker>.md. They are carried forward on every rebuild so \
+         following the memory instruction does not silently lose the entry. To make \
+         one durable in the server's own index instead, add it to that file.\n\n{}\n",
+        kept.join("\n")
+    )
+}
+
 fn compose_memory_doc(name: &str, global_content: &str, session_content: &str) -> String {
     let mut parts = Vec::new();
     // RULES FIRST (AF-297). Binding constraints buried under prose are
@@ -9450,7 +9562,13 @@ fn write_claude_memory(name: &str, work_dir: &str) {
     }
     // The roster rides on the SAME write, so it is refreshed whenever the
     // session's memory is — no separate job to fall behind the fleet.
-    let composed = composed + &fleet_roster();
+    // ORDER IS LOAD-BEARING: preserved pointers BEFORE the roster, so the roster
+    // stays last. Under a read ceiling the tail is what gets dropped, and the
+    // roster is auto-generated and re-derivable while a memory pointer is not
+    // (ts-gke's option 3, which their mixpeek file violates with 122 lines after
+    // the roster).
+    let preserved = preserved_agent_pointers(&claude_mem_dir, &composed);
+    let composed = composed + &preserved + &fleet_roster();
     let _ = std::fs::write(&claude_mem_file, &composed);
 }
 
@@ -18608,6 +18726,70 @@ fn getrandom_fill(buf: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
+
+    /// AF-578. MEMORY.md is rebuilt wholesale from the server's sources, so a
+    /// pointer a session appended there (which the memory instruction tells every
+    /// session to do) died on the next compose. Measured on this box before the
+    /// fix: 44 memory files, 5 indexed in MEMORY.md, and the server source
+    /// carrying ~25 with zero overlap.
+    ///
+    /// Cell 2 is the one that keeps this honest. Preserving everything would make
+    /// DELETION IMPOSSIBLE, and the memory rules tell sessions to remove memories
+    /// that turn out to be wrong. A pointer whose file is gone must stay gone.
+    #[test]
+    fn a_session_written_pointer_survives_compose_unless_its_memory_was_deleted() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let d = dir.path();
+        std::fs::write(d.join("kept.md"), "a real memory\n").unwrap();
+        std::fs::write(d.join("already.md"), "carried by the sources\n").unwrap();
+        // NOTE: no gone.md on disk — that memory was deleted.
+        std::fs::write(
+            d.join("MEMORY.md"),
+            // EVERY POINTER LINE STARTS AT COLUMN 0, as it does in a real
+            // MEMORY.md, because the regex is anchored with `^`. An earlier
+            // version of this fixture carried 13 leading spaces on lines 2-4
+            // and they matched NOTHING, so the gone/already/roster cells all
+            // passed vacuously. Mutation A (removing the file-existence check)
+            // stayed GREEN, which is what exposed it: three of five cells were
+            // asserting about candidates the regex had already skipped.
+            concat!(
+                "- [Kept](kept.md) — written by a session\n",
+                "- [Gone](gone.md) — deleted memory, must NOT come back\n",
+                "- [Already](already.md) — the sources have this one\n",
+                "\n## Fleet — who else is running (auto-generated, do not edit)\n",
+                "| worker | groups |\n|---|---|\n| peer | x |\n",
+            ),
+        )
+        .unwrap();
+
+        let composed = "# Shared Context\n- [Already](already.md) — from the server source\n";
+        let out = super::preserved_agent_pointers(d, composed);
+
+        assert!(out.contains("(kept.md)"), "a session-written pointer must survive: {out}");
+        assert!(
+            !out.contains("(gone.md)"),
+            "a pointer whose memory FILE was deleted must not be resurrected: {out}"
+        );
+        assert!(
+            !out.contains("(already.md)"),
+            "a pointer the sources already carry must not be duplicated: {out}"
+        );
+        // The roster's table rows are not pointer lines and must not be dragged in.
+        assert!(!out.contains("| worker |"), "the roster is not a pointer: {out}");
+
+        // IDEMPOTENT. The output is written back into MEMORY.md, so the next
+        // compose reads its own emission. Growing on every tick would turn this
+        // fix into the accumulation it prevents.
+        let round2 = {
+            std::fs::write(d.join("MEMORY.md"), format!("{composed}{out}")).unwrap();
+            super::preserved_agent_pointers(d, composed)
+        };
+        assert_eq!(
+            round2.matches("(kept.md)").count(),
+            1,
+            "composing twice must not duplicate the preserved pointer: {round2}"
+        );
+    }
 
     #[test]
     fn tmux_shell_setup_keeps_line_and_enter_in_one_command() {
