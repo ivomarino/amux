@@ -151,6 +151,34 @@ pub(crate) struct EnvFile {
     dirty: Vec<(String, Option<String>)>,
 }
 
+/// The refusal body for a failed session-env write, WITH THE CAUSE.
+///
+/// `EnvFile::write` returns `io::Result`, and every HTTP call site threw the
+/// error away (`cfg.write(&f).is_err()`), so a 500 said only "could not write
+/// session env". That names the operation and not one fact about why it
+/// failed: no path, no errno, nothing separating a full disk from a bad
+/// permission from a missing parent directory.
+///
+/// TUBES-2497, reported by `tubescience` 2026-09-08: one PATCH
+/// /api/sessions/tubescience/config answered exactly that on 2026-09-07
+/// 15:59:05 and never reproduced. A one-shot 5xx whose body carries no operand
+/// cannot be diagnosed afterwards, and `runtime_jobs::autofix` files a card per
+/// distinct 5xx signature, so the card inherits the same silence and a lane
+/// spends a turn on it.
+///
+/// The docstring on `env_tmp_path` above already quotes the SHAPE this used to
+/// have — `500 could not write session env: No such file or directory (os
+/// error 2)` — so this restores a form the file still documents rather than
+/// inventing one.
+///
+/// The path is included deliberately: these writes go to per-session env files
+/// and the failing one is the operand the reader needs. It is a local path
+/// under ~/.amux, not a credential, and the VALUES in that file are never
+/// touched here.
+fn env_write_error(path: &std::path::Path, e: &std::io::Error) -> String {
+    format!("could not write session env at {}: {e}", path.display())
+}
+
 fn env_write_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
@@ -8279,14 +8307,58 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
             } else {
                 provider_value(key)
             };
-            let refreshed = match value {
-                Some(value) => tmux(&["set-environment", "-t", &st, key, &value]).await,
+            let refreshed = match value.as_deref() {
+                Some(value) => tmux(&["set-environment", "-t", &st, key, value]).await,
                 None => tmux(&["set-environment", "-u", "-t", &st, key]).await,
             };
-            if !refreshed.map(|out| out.status.success()).unwrap_or(false) {
+            // WHICH failure, not just that one happened (AF-592). `tmux()` is
+            // `Option<Output>` and carries three distinct outcomes that the old
+            // `.map(|o| o.status.success()).unwrap_or(false)` collapsed into
+            // one sentence: the command never ran (spawn failure or the 5s
+            // OP_TIMEOUT), or it ran and refused with a reason on stderr.
+            //
+            // Measured 2026-09-08 11:49:19: one POST /api/sessions/
+            // amux-frustrations/send answered 500 "auto-wake failed: could not
+            // refresh ANTHROPIC_API_KEY for the existing tmux session" after
+            // 27.2s, and nothing distinguished a hung tmux from a refusal. The
+            // server log carried no line for it at all, so the only trace was
+            // the HTTP body, and the body named the operation and no cause.
+            let why = match &refreshed {
+                None => format!(
+                    "tmux did not answer within {}s (spawn failure or timeout)",
+                    OP_TIMEOUT.as_secs()
+                ),
+                Some(out) if !out.status.success() => {
+                    // The VALUE never appears here. `set-environment` takes it
+                    // as an argv element, so a tmux error that echoes its own
+                    // command line could carry a live API key onto stderr and
+                    // into an HTTP body. Scrub it rather than trusting tmux's
+                    // phrasing.
+                    let mut err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    if let Some(v) = value.as_deref() {
+                        if !v.is_empty() {
+                            err = err.replace(v, "<redacted>");
+                        }
+                    }
+                    let code = out.status.code().unwrap_or(-1);
+                    if err.is_empty() {
+                        format!("tmux exited {code}")
+                    } else {
+                        format!("tmux exited {code}: {err}")
+                    }
+                }
+                Some(_) => String::new(),
+            };
+            if !why.is_empty() {
+                tracing::warn!(
+                    target: "session",
+                    verdict = "tmux_env_refresh_failed",
+                    session = name, key, why = %why,
+                    "could not refresh a provider key for an existing tmux session"
+                );
                 return (
                     false,
-                    format!("could not refresh {key} for the existing tmux session"),
+                    format!("could not refresh {key} for the existing tmux session: {why}"),
                 );
             }
         }
@@ -16406,8 +16478,8 @@ pub(crate) fn commit_guard_patch_verb(name: &str, body: &Value) -> Response {
         None => cfg.remove("AMUX_COMMIT_GUARD_SESSION"),
         Some(b) => cfg.set("AMUX_COMMIT_GUARD_SESSION", if b { "1" } else { "0" }),
     }
-    if cfg.write(&f).is_err() {
-        return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+    if let Err(e) = cfg.write(&f) {
+        return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": env_write_error(&f, &e)}));
     }
     let enabled = override_v.unwrap_or(global);
     j200(json!({
@@ -19017,8 +19089,8 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
         meta.remove("pending_structured_resume_context");
         save_meta(name, &meta);
         cfg.set("CC_DIR", &new_dir);
-        if cfg.write(&f).is_err() {
-            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+        if let Err(e) = cfg.write(&f) {
+            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": env_write_error(&f, &e)}));
         }
         if new_dir != old_dir && is_running(name).await {
             let st2 = state.clone();
@@ -19061,8 +19133,8 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
     // Description (py:76667).
     if let Some(dv) = body.get("desc") {
         cfg.set("CC_DESC", dv.as_str().unwrap_or("").trim());
-        if cfg.write(&f).is_err() {
-            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+        if let Err(e) = cfg.write(&f) {
+            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": env_write_error(&f, &e)}));
         }
         // A description is AUTO-DISCOVERY DATA, not a private label: every other
         // worker's roster names this one. Refresh the fleet so the change is
@@ -19080,8 +19152,8 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
     if body.get("toggle_pin").map(py_truthy).unwrap_or(false) {
         let now_pinned = cfg.get("CC_PINNED") == Some("1");
         cfg.set("CC_PINNED", if now_pinned { "" } else { "1" });
-        if cfg.write(&f).is_err() {
-            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+        if let Err(e) = cfg.write(&f) {
+            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": env_write_error(&f, &e)}));
         }
         return j200(json!({"ok": true, "message": "pin toggled"}));
     }
@@ -19096,8 +19168,8 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
     if let Some(iv) = body.get("isolated") {
         let on = py_truthy(iv);
         cfg.set("CC_ISOLATED", if on { "1" } else { "" });
-        if cfg.write(&f).is_err() {
-            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+        if let Err(e) = cfg.write(&f) {
+            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": env_write_error(&f, &e)}));
         }
         // The roster peers read is fleet-wide data; toggling isolation adds or
         // removes this worker from it, so refresh like desc/tags do.
@@ -19162,10 +19234,10 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
         } else {
             cfg.set(key, if py_truthy(v) { "1" } else { "0" });
         }
-        if cfg.write(&f).is_err() {
+        if let Err(e) = cfg.write(&f) {
             return jresp(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                json!({"error": "could not write session env"}),
+                json!({"error": env_write_error(&f, &e)}),
             );
         }
         let effective = if key == crate::runtime_jobs::board_drive::DISPATCH_BACKLOG_KEY {
@@ -19199,10 +19271,10 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
         } else {
             cfg.set(key, if py_truthy(v) { "1" } else { "0" });
         }
-        if cfg.write(&f).is_err() {
+        if let Err(e) = cfg.write(&f) {
             return jresp(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                json!({"error": "could not write session env"}),
+                json!({"error": env_write_error(&f, &e)}),
             );
         }
         let effective = crate::api::email_approval::external_email_allowed(
@@ -19237,8 +19309,8 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
             String::new()
         };
         cfg.set("CC_SEND_ALLOW", &value);
-        if cfg.write(&f).is_err() {
-            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+        if let Err(e) = cfg.write(&f) {
+            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": env_write_error(&f, &e)}));
         }
         // Resolved AFTER the write, so the answer is what the gate will actually
         // enforce rather than what was just typed — a group or global layer can
@@ -19282,8 +19354,8 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
     // Branch (py:76679).
     if let Some(bv) = body.get("branch") {
         cfg.set("CC_BRANCH", bv.as_str().unwrap_or("").trim());
-        if cfg.write(&f).is_err() {
-            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+        if let Err(e) = cfg.write(&f) {
+            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": env_write_error(&f, &e)}));
         }
         return j200(json!({"ok": true, "message": "branch updated"}));
     }
@@ -19351,8 +19423,8 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
             }
         };
         cfg.set("CC_TAGS", &joined);
-        if cfg.write(&f).is_err() {
-            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+        if let Err(e) = cfg.write(&f) {
+            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": env_write_error(&f, &e)}));
         }
         // Echo what was stored: the caller sent an array and a bare "ok" is what
         // let the silent clear go unnoticed for as long as it did.
@@ -19366,8 +19438,8 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
             return jresp(StatusCode::BAD_REQUEST, json!({"error": "mcp must be 'chrome' or '' (empty)"}));
         }
         cfg.set("CC_MCP", &mcp_val);
-        if cfg.write(&f).is_err() {
-            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+        if let Err(e) = cfg.write(&f) {
+            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": env_write_error(&f, &e)}));
         }
         let msg = if mcp_val.is_empty() { "mcp disabled".to_string() } else { format!("mcp set to {mcp_val}") };
         return j200(json!({"ok": true, "message": format!("{msg} (restart session to apply)")}));
@@ -27805,6 +27877,50 @@ mod refusal_status_tests {
     /// This is the check that CAN fail: it is built from the shipped source,
     /// not from a paraphrase of it, so it also fails if someone reworders an
     /// existing literal out from under the classifier.
+    /// A session-env write 500 must name WHICH write and WHY (TUBES-2497).
+    ///
+    /// The reported instance was one PATCH /api/sessions/tubescience/config
+    /// answering `{"error":"could not write session env"}` on 2026-09-07
+    /// 15:59:05, never reproduced. A 5xx that names the operation and no fact
+    /// about the failure cannot be diagnosed after the fact, and the autofix
+    /// files a card per distinct 5xx signature, so the card inherits the same
+    /// silence.
+    #[test]
+    fn a_failed_session_env_write_names_the_path_and_the_cause() {
+        let e = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Permission denied");
+        let msg = env_write_error(std::path::Path::new("/tmp/amux/x.env"), &e);
+        assert!(msg.contains("/tmp/amux/x.env"), "the failing PATH is the operand: {msg}");
+        assert!(msg.contains("Permission denied"), "the CAUSE must survive: {msg}");
+        // Still recognisable as the same failure, so a reader (and the autofix
+        // grouping) does not see an unrelated new error class.
+        assert!(msg.starts_with("could not write session env"), "{msg}");
+
+        // A DIFFERENT cause must read differently. Without this, a helper that
+        // ignored `e` and appended a constant would pass everything above.
+        let other = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
+        let msg2 = env_write_error(std::path::Path::new("/tmp/amux/x.env"), &other);
+        assert_ne!(msg, msg2, "the message must vary with the error, not just mention one");
+        assert!(msg2.contains("No such file or directory"), "{msg2}");
+    }
+
+    /// And no HTTP site may go back to the bare sentence.
+    ///
+    /// The helper above is only worth having if every caller uses it. This
+    /// scans the shipped source rather than a paraphrase, so a NEW site added
+    /// later with the old copy-pasted body fails here (ethos rule 7).
+    #[test]
+    fn no_session_env_500_ships_without_its_cause() {
+        const SRC: &str = include_str!("session_verbs.rs");
+        // Built by concat! so this test's own needle is not a match.
+        let bare = concat!("json!({\"error\": \"could not write session ", "env\"})");
+        let hits = SRC.matches(bare).count();
+        assert_eq!(
+            hits, 0,
+            "{hits} HTTP site(s) still answer a failed session-env write with the bare \
+             sentence and no path or errno — use env_write_error(&path, &e)"
+        );
+    }
+
     #[test]
     fn every_send_failure_literal_is_classified() {
         const SRC: &str = include_str!("session_verbs.rs");
