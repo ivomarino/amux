@@ -1230,13 +1230,22 @@ pub fn effective_gate_trail(
     // Consult everything FIRST, decide after. Interleaving the two is what made
     // "consulted and empty" and "never asked" indistinguishable.
     let card = row.gate_criteria();
-    let worker = session.and_then(|s| scoped_gate(conn, s, target));
+    let worker_raw = session.and_then(|s| scoped_gate(conn, s, target));
+    let worker_additive = worker_raw.as_ref().map(|(_, a)| *a).unwrap_or(false);
+    let worker = worker_raw.map(|(c, _)| c);
     let mut group_merged: Vec<String> = Vec::new();
     let mut group_hits: Vec<String> = Vec::new();
+    let mut group_additive = false;
     if session.is_some() {
         for group in groups {
-            if let Some(list) = scoped_gate(conn, &format!("group:{group}"), target) {
+            if let Some((list, additive)) = scoped_gate(conn, &format!("group:{group}"), target) {
                 group_hits.push(group.clone());
+                // ANY contributing group asking to be additive makes the merged
+                // group tier additive. Union across groups is already this
+                // function's rule for criteria, and a mixed answer has no
+                // meaning: the merged list is one tier, so it either defers to
+                // the type or replaces it.
+                group_additive = group_additive || additive;
                 for c in list {
                     if !group_merged.contains(&c) {
                         group_merged.push(c);
@@ -1255,13 +1264,33 @@ pub fn effective_gate_trail(
     // override is empty and the two agree by definition.
     let type_default = default_gates_for(&row.item_type, target);
 
+    // AF-570: an ADDITIVE winning tier keeps the type default instead of
+    // replacing it. Type first, so the card's own definition of finished leads
+    // and the scope's process criteria follow. Deduped, because a scope is
+    // allowed to restate a criterion the type already has and nobody should be
+    // asked to acknowledge it twice.
+    let union_with_type = |scope_criteria: Vec<String>| -> Vec<String> {
+        let mut out = type_default.clone();
+        for c in scope_criteria {
+            if !out.contains(&c) {
+                out.push(c);
+            }
+        }
+        out
+    };
     let (criteria, source, winner) = if !card.is_empty() {
         (card.clone(), GateSource::Card, "card")
     } else if let Some(g) = worker.clone() {
+        let g = if worker_additive { union_with_type(g) } else { g };
         (g, GateSource::Worker(session.unwrap_or("").to_string()), "worker")
     } else if !group_merged.is_empty() {
+        let g = if group_additive {
+            union_with_type(group_merged.clone())
+        } else {
+            group_merged.clone()
+        };
         (
-            group_merged.clone(),
+            g,
             GateSource::Group(groups.iter().cloned().collect::<Vec<_>>().join(", ")),
             "group",
         )
@@ -1398,11 +1427,29 @@ impl GateSource {
 /// One scope's gate row from `session_gates` (scope key is a session name or
 /// `group:<name>`), or None when the row is absent, empty, or unreadable —
 /// every "cannot tell" inherits the next tier rather than opening the gate.
+/// The marker a scoped gate uses to declare itself ADDITIVE (AF-570).
+///
+/// A scoped gate normally REPLACES every tier below it, which is what makes the
+/// precedence readable. That is wrong for a gate whose criteria are about HOW a
+/// card was checked rather than WHAT it is: group:amux wants "a different worker
+/// reviewed it, and checked rather than believed" to apply to every card, while
+/// still letting each item TYPE say what being finished means for it. Under
+/// replacement those two cannot both be true, so setting the group gate to the
+/// peer criteria alone silently removes "Confirmed working in prod" from every
+/// `code` card (found by amux-cloud, reading effective_gate_trail, before this
+/// was built rather than after it shipped).
+pub const GATE_ADDITIVE_MARKER: &str = "@additive";
+
+/// An operator-authored gate for a scope, plus whether it is ADDITIVE.
+///
+/// OPT-IN, so this is a no-op for every gate that does not carry the marker: the
+/// fleet's other groups resolve through this same function and were not part of
+/// the decision to change amux's gate.
 fn scoped_gate(
     conn: &rusqlite::Connection,
     scope: &str,
     target: TaskStatus,
-) -> Option<Vec<String>> {
+) -> Option<(Vec<String>, bool)> {
     let id = status_to_db(target, "");
     let gate: Option<String> = conn
         .query_row(
@@ -1412,12 +1459,25 @@ fn scoped_gate(
         )
         .ok()?;
     let list: Vec<String> = serde_json::from_str(&gate?).ok()?;
+    let mut additive = false;
     let list: Vec<String> = list
         .into_iter()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        .filter(|s| {
+            if s.eq_ignore_ascii_case(GATE_ADDITIVE_MARKER) {
+                additive = true;
+                false // the marker is a directive, never a criterion to acknowledge
+            } else {
+                true
+            }
+        })
         .collect();
-    (!list.is_empty()).then_some(list)
+    // A gate of ONLY the marker holds no criteria, so it is not a rule and must
+    // not win its tier. Returning it would hand the winner an empty criteria
+    // list, which reads as "no gate" and opens the strictest transitions -- the
+    // same failure `configured_gate` documents one function down.
+    (!list.is_empty()).then_some((list, additive))
 }
 
 /// The operator-authored gate for a column, or None.
@@ -5175,6 +5235,108 @@ column=silent type:code=outranked(2)"
             &groups(&["ops"]),
         );
         assert_eq!(got, vec!["Group rule"]);
+    }
+
+    /// AF-570. An ADDITIVE scoped gate unions with the type default instead of
+    /// replacing it, and one WITHOUT the marker still replaces.
+    ///
+    /// Three cells, and the third is the one that matters. amux-cloud pointed out
+    /// that asserting only the two additive outcomes proves the OUTCOME and not
+    /// that the flag is READ: if the union were hardcoded, both additive cells
+    /// still pass, because that is what group:amux wants anyway, while every
+    /// gate in the fleet that never opted in silently flips to union. The
+    /// replace-when-unset cell is what guarantees no other group moved.
+    ///
+    /// Cell 2 is amux-cloud's "test the type you did NOT set out to change": the
+    /// case this feature exists for is `investigation`, so `code` is where a
+    /// mistake would hide. Setting the group gate to the peer criteria alone,
+    /// under the replacement semantics this replaces, silently drops
+    /// "Confirmed working in prod" from every code card.
+    #[test]
+    fn an_additive_scoped_gate_unions_with_the_type_default_and_a_plain_one_replaces() {
+        let peer = r#"["@additive","Peer-reviewed by a DIFFERENT worker","That peer verified it themselves"]"#;
+
+        // CELL 1: the type this was built for. It gains a truthful bar it can
+        // actually satisfy, plus the peer criteria.
+        let c = conn_with(None, None);
+        add_session_gates(&c);
+        scope_gate(&c, "group:amux", "verified", peer);
+        let inv = effective_gate_scoped(
+            &c,
+            &row_for("amux-frustrations", "investigation", None),
+            TaskStatus::Verified,
+            &groups(&["amux"]),
+        );
+        assert!(
+            inv.iter().any(|g| g == "Outcome confirmed to still hold"),
+            "an investigation must keep its own type bar: {inv:?}"
+        );
+        assert!(
+            inv.iter().any(|g| g.starts_with("Peer-reviewed")),
+            "and still carry the group peer criteria: {inv:?}"
+        );
+
+        // CELL 2: the type NOT being changed. This is where the regression hides.
+        let code = effective_gate_scoped(
+            &c,
+            &row_for("amux-frustrations", "code", None),
+            TaskStatus::Verified,
+            &groups(&["amux"]),
+        );
+        for want in [
+            "Deployed to prod",
+            "Confirmed working in prod",
+            "Zero regressions",
+        ] {
+            assert!(
+                code.iter().any(|g| g == want),
+                "code must NOT lose {want:?} to the group gate: {code:?}"
+            );
+        }
+        assert!(
+            code.iter().any(|g| g.starts_with("Peer-reviewed")),
+            "and code still answers to the group peer criteria: {code:?}"
+        );
+
+        // CELL 3: NO marker, so replacement is unchanged. Without this cell a
+        // hardcoded union passes cells 1 and 2 while moving every gate in the
+        // fleet that never opted in.
+        let c2 = conn_with(None, None);
+        add_session_gates(&c2);
+        scope_gate(&c2, "group:ops", "verified", r#"["Ops rule"]"#);
+        let plain = effective_gate_scoped(
+            &c2,
+            &row_for("backend", "code", None),
+            TaskStatus::Verified,
+            &groups(&["ops"]),
+        );
+        assert_eq!(
+            plain,
+            vec!["Ops rule"],
+            "a gate WITHOUT the marker must still REPLACE the type default: {plain:?}"
+        );
+
+        // CELL 4: the marker is a directive, never a criterion. Nobody should be
+        // asked to acknowledge "@additive", and a gate of only the marker holds
+        // no rule, so it must not win its tier with an empty list (which reads as
+        // no gate and opens the transition).
+        assert!(
+            !inv.iter().any(|g| g == GATE_ADDITIVE_MARKER),
+            "the marker must not surface as a criterion: {inv:?}"
+        );
+        let c3 = conn_with(None, None);
+        add_session_gates(&c3);
+        scope_gate(&c3, "group:amux", "verified", r#"["@additive"]"#);
+        let only_marker = effective_gate_scoped(
+            &c3,
+            &row_for("amux-frustrations", "code", None),
+            TaskStatus::Verified,
+            &groups(&["amux"]),
+        );
+        assert!(
+            only_marker.iter().any(|g| g == "Confirmed working in prod"),
+            "a marker-only gate holds no rule and must fall through, not open the gate: {only_marker:?}"
+        );
     }
 
     /// A worker in several groups answers to ALL of them: union, in sorted
