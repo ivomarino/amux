@@ -613,6 +613,7 @@ function _sessStatusKey(s) {
   if (!s.running) return 'stopped';
   if (s.status === 'rate_limited') return 'rate_limited';
   if (s.status === 'api_error') return 'api_error';
+  if (s.status === 'unattributed') return 'waiting';
   if (s.status === 'active') return 'working';
   if (s.status === 'waiting') return 'waiting';
   return 'idle';
@@ -3112,6 +3113,7 @@ function updatePeekStatus() {
   // already on screen. amux is mobile-first — when the phone and a nice-to-have
   // trade off, the phone wins.
   if (s.status === 'active')  badge = '<span class="status-badge active">working</span>' + _agentsChip(s);
+  else if (s.status === 'unattributed') badge = _runtimeBoardSplitBadge(s);
   else if (s.status === 'waiting') badge = '<span class="status-badge waiting"' + _waitingTitle(s) + '>' + _waitingLabel(s) + '</span>';
   else if (s.status === 'rate_limited') badge = '<span class="status-badge rate-limited">rate limited</span>';
   else if (s.status === 'api_error') badge = `<span class="status-badge rate-limited" title="API Error ${esc(s.api_error_code || '5xx')} — server-side and retryable. Send &quot;continue&quot;.">API ${esc(s.api_error_code || '5xx')}</span>`;
@@ -3276,6 +3278,17 @@ function _cardDoingItem(name) {
   return (boardItems || []).find(c =>
     !c.deleted && !c.archived && c.session === name && c.status === 'doing' && c.id === claimed
   ) || null;
+}
+
+// Presentation only: the server owns the reconciliation and publishes the
+// measured verdict. A client must never turn `unattributed` back into WORKING
+// by guessing from another doing card.
+function _runtimeBoardSplitBadge(s) {
+  if (!s || s.status !== 'unattributed') return '';
+  const truth = s.runtime_board || {};
+  const observed = truth.observed_card_id ? ' Observed ' + truth.observed_card_id + '.' : '';
+  return '<span class="status-badge rate-limited" title="Runtime activity has no exact live board-card attribution.'
+    + observed + ' Verdict: ' + esc(truth.verdict || 'unattributed') + '.">runtime/board split</span>';
 }
 
 // Turn the board-drive trace into the smallest useful operator explanation.
@@ -3708,6 +3721,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
               claiming work). The payload now only reports FUTURE limits, so when
               rate_limited_until is set it is the true state and it supersedes
               the status badge outright (AMUX-2566). */ ''}          ${s.rate_limited_until ? '' : `${s.status === 'rate_limited' ? '<span class="status-badge rate-limited" title="Hit a usage limit (on credits or waiting for reset)">rate limited</span>' : ''}${s.status === 'active' ? '<span class="status-badge active">working</span>' + _agentsChip(s) : ''}
+          ${s.status === 'unattributed' ? _runtimeBoardSplitBadge(s) : ''}
           ${s.status === 'waiting' ? `<span class="status-badge waiting"${_waitingTitle(s)}>${_waitingLabel(s)}</span>${_stalledFor(s)}` : ''}
           ${s.status === 'idle' ? '<span class="status-badge idle">idle</span>' : ''}`}
           ${s.rate_limited_until ? `<span class="status-badge rate-limited" title="${s.rate_limit_weekly ? 'Weekly limit' : 'Rate-limited'} — auto-resume at ${_fmtResetTime(s.rate_limited_until)}">${s.rate_limit_weekly ? 'Weekly limit until' : 'Rate-limited until'} ${_fmtResetTime(s.rate_limited_until)}</span>` : ''}
@@ -9044,7 +9058,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.830';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.831';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.

@@ -695,6 +695,9 @@ pub trait Fleet: Send + Sync {
     fn auto_pickup_enabled(&self, lane: &str) -> bool;
     /// `CC_TAGS`, lowercased — for explicit-mode status scoping (py:16096).
     fn tags(&self, lane: &str) -> Vec<String>;
+    /// Isolation is a selection veto, not merely a delivery refusal: claiming
+    /// first would strand work with a raw worker that must not be automated.
+    fn is_isolated(&self, _lane: &str) -> bool { false }
     async fn is_running(&self, lane: &str) -> bool;
     /// The turn-boundary gate. REUSED from the steering path, never
     /// reimplemented: a second copy of "is this lane mid-turn" is the
@@ -707,8 +710,19 @@ pub trait Fleet: Send + Sync {
     /// explicit =1 additionally implies YOLO (is_yolo_enabled); the default
     /// deliberately does not.
     fn auto_continue_enabled(&self, lane: &str) -> bool;
+    /// Start a stopped worker through the canonical provider-aware launcher.
+    /// Default refusal makes a new Fleet opt in explicitly to autonomous wake.
+    async fn start_for_dispatch(&self, lane: &str) -> Result<(), String> {
+        Err(format!("fleet cannot start worker '{lane}' for board dispatch"))
+    }
     /// Hand text to the lane. Durable queue + the existing delivery loop.
     async fn deliver(&self, lane: &str, text: &str);
+    /// Work delivery reports a queue refusal so its just-made board claim can
+    /// be compensated; legacy nudge delivery remains fire-and-forget.
+    async fn deliver_work(&self, lane: &str, text: &str) -> Result<(), String> {
+        self.deliver(lane, text).await;
+        Ok(())
+    }
 
     /// Deliver a message whose text ASSERTS SOMETHING ABOUT A CARD (AMUX-3659).
     ///
@@ -770,6 +784,9 @@ impl Fleet for LiveFleet {
             .filter(|t| !t.is_empty())
             .collect()
     }
+    fn is_isolated(&self, lane: &str) -> bool {
+        crate::api::session_verbs::session_is_isolated(lane)
+    }
     fn auto_continue_enabled(&self, lane: &str) -> bool {
         crate::api::session_verbs::standing_orders_on(lane, "CC_AUTO_CONTINUE")
     }
@@ -779,9 +796,14 @@ impl Fleet for LiveFleet {
     async fn at_boundary(&self, lane: &str) -> bool {
         crate::api::session_verbs::steer_lane_at_boundary(&self.state, lane).await
     }
+    async fn start_for_dispatch(&self, lane: &str) -> Result<(), String> {
+        crate::api::session_verbs::start_for_board_dispatch(&self.state, lane).await
+    }
     async fn deliver(&self, lane: &str, text: &str) {
-        let _ = crate::api::session_verbs::steer_enqueue(&self.state, lane, text, GUARD, "").await;
-        self.record_prompt(lane, text).await;
+        let _ = self.enqueue_work(lane, text).await;
+    }
+    async fn deliver_work(&self, lane: &str, text: &str) -> Result<(), String> {
+        self.enqueue_work(lane, text).await
     }
     async fn deliver_about(&self, lane: &str, text: &str, card: &str, rev: i64) {
         let _ = crate::api::session_verbs::steer_enqueue_precond(
@@ -794,6 +816,20 @@ impl Fleet for LiveFleet {
 }
 
 impl LiveFleet {
+    /// A durable queue insert is the work-delivery commitment. Check liveness
+    /// again after a wake so a vanished worker causes claim compensation rather
+    /// than a false `doing` card.
+    async fn enqueue_work(&self, lane: &str, text: &str) -> Result<(), String> {
+        if !crate::api::session_verbs::is_running(lane).await {
+            return Err("worker vanished before work delivery could be queued".into());
+        }
+        crate::api::session_verbs::steer_enqueue(&self.state, lane, text, GUARD, "")
+            .await
+            .map_err(str::to_string)?;
+        self.record_prompt(lane, text).await;
+        Ok(())
+    }
+
     /// A PICKUP IS A PROMPT, AND NOTHING RECORDED IT (AMUX-3547 -> AMUX-3544).
     ///
     /// `/api/usage/attribution` answers "where did the plan window go" by
@@ -1671,8 +1707,12 @@ fn backlog_drain_pickup(
         return None;
     }
     let card = oldest_drainable_backlog(conn, session, now)?;
+    // Build the worker prompt from the selected row now, but re-check the
+    // status under the claim transaction before anything is dispatched.
+    let row = bs::get_issue(conn, &card).ok().flatten()?;
     Some(Pickup::DrainBacklog {
         card,
+        prompt: pickup_prompt(conn, session, &row),
         backlog_left: drainable_backlog_count(conn, session, now),
         todo_refusals,
     })
@@ -2451,10 +2491,9 @@ pub enum Pickup {
     /// `blocked_card` is the todo that was waiting; `promoted` are the backlog
     /// ids that were promoted. The lane receives no nudge — it just gets work.
     PromoteDeps { blocked_card: String, promoted: Vec<String> },
-    /// A `backlog` card promoted to `todo` because the lane has no claimable
-    /// todo and opted in to draining its own backlog (AMUX-4055). A non-zero
-    /// `todo_refusals` makes the ATE-37 fallback visible in traces and logs.
-    DrainBacklog { card: String, backlog_left: usize, todo_refusals: usize },
+    /// A `backlog` card selected for direct `backlog -> doing` claim because
+    /// the lane has no claimable todo and opted in to automatic draining.
+    DrainBacklog { card: String, prompt: String, backlog_left: usize, todo_refusals: usize },
     /// An ABANDONED `doing` card, returned to `todo` so it stops holding the
     /// lane's WIP slot (AMUX-4042). `held_h` is how long it went untouched.
     ReclaimStale { card: String, held_h: f64, blocking: usize },
@@ -4914,13 +4953,54 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
         return LaneTrace::skip(lane, "opted-out", "CC_AUTO_PICKUP=0 in the session env")
             .with_counts(eligible, open);
     }
-    if !fleet.is_running(lane).await {
-        return LaneTrace::skip(lane, "not-running", "no live session").with_counts(eligible, open);
+    if fleet.is_isolated(lane) {
+        return LaneTrace::skip(lane, "isolated", "isolated workers never receive board automation")
+            .with_counts(eligible, open);
     }
+    // A stopped lane is woken only after the same selector has found a real
+    // claim. Re-select after start: the preflight authorizes a wake, not a
+    // stale card mutation.
+    let woke_for_dispatch = if !fleet.is_running(lane).await {
+        let preflight = match state.store.read() {
+            Ok(conn) => select_pickup(&conn, lane, now_f64()),
+            Err(_) => return LaneTrace::skip(lane, "store-unavailable", "could not preflight stopped worker")
+                .with_counts(eligible, open),
+        };
+        if !matches!(preflight, Pickup::Claim { .. } | Pickup::DrainBacklog { .. }) {
+            return LaneTrace::skip(
+                lane,
+                "not-running-no-dispatchable-work",
+                "stopped worker was not started: selector found no eligible todo/backlog claim",
+            )
+            .with_counts(eligible, open);
+        }
+        match fleet.start_for_dispatch(lane).await {
+            Ok(()) if fleet.is_running(lane).await => {
+                tracing::info!(target: "amux::board_drive", session = lane,
+                    measured = true, n_considered = 1, verdict = "eligible_work_woke_worker",
+                    "board_drive: started stopped worker after eligible work preflight");
+                true
+            }
+            Ok(()) => {
+                tracing::warn!(target: "amux::board_drive", session = lane,
+                    measured = true, n_considered = 1, verdict = "start_reported_not_running",
+                    "board_drive: start returned success but worker was absent; no card was claimed");
+                return LaneTrace::skip(lane, "start-not-running", "start returned success but no live worker remained")
+                    .with_counts(eligible, open);
+            }
+            Err(error) => {
+                tracing::warn!(target: "amux::board_drive", session = lane, %error,
+                    measured = true, n_considered = 1, verdict = "eligible_work_start_failed",
+                    "board_drive: eligible work did not claim because the worker failed to start");
+                return LaneTrace::skip(lane, "start-failed", format!("eligible work left untouched: {error}"))
+                    .with_counts(eligible, open);
+            }
+        }
+    } else { false };
     // THE TURN-BOUNDARY GATE, reused from the steering path. Fails CLOSED:
     // anything not positively known to be idle is left alone. A nudge that waits
     // one more tick costs nothing; a nudge delivered mid-turn is an interruption.
-    if !fleet.at_boundary(lane).await {
+    if !woke_for_dispatch && !fleet.at_boundary(lane).await {
         // NAME THE EVIDENCE, not just the verdict. `mid-turn` read identically
         // for a lane genuinely generating and for one held by a self-report
         // nothing would ever refresh — and the second kind sat here for up to
@@ -5037,9 +5117,19 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
             // (AMUX-2983). A refused claim is not an error, it is the race being
             // caught: skip, do not deliver finished work.
             if claim_card(state, lane, &card).await {
-                fleet.deliver(lane, &prompt).await;
-                LaneTrace::acted(lane, "assigned", &card, "claimed and prompt queued")
-                    .with_counts(eligible, open)
+                match fleet.deliver_work(lane, &prompt).await {
+                    Ok(()) => LaneTrace::acted(lane, "assigned", &card, "claimed and prompt queued")
+                        .with_counts(eligible, open),
+                    Err(error) => {
+                        let released = release_claim_after_dispatch_failure(state, lane, &card, "todo", &error).await;
+                        LaneTrace::skip(lane,
+                            if released { "delivery-failed-released" } else { "delivery-failed-release-raced" },
+                            format!("{card} was not dispatched: {error}; {}", if released {
+                                "claim was compensated back to todo"
+                            } else { "compensation yielded to a concurrent card change; inspect board-drive WARN" }))
+                            .with_counts(eligible, open)
+                    }
+                }
             } else {
                 LaneTrace::skip(
                     lane,
@@ -5112,81 +5202,38 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 .with_counts(eligible, open),
             }
         }
-        Pickup::DrainBacklog { card, backlog_left, todo_refusals } => {
-            // AMUX-4055. CAS on `expected_from: backlog`, so if the owner moved
-            // the card between select and write we lose the race and say so
-            // rather than promoting something they just re-parked.
-            let card_c = card.clone();
-            let line = format!(
-                "auto-drained: lane had no claimable todo and opted in to backlog dispatch \
-                 ({backlog_left} drainable card(s) remain; {todo_refusals} todo refusal(s))"
-            );
-            let result = state
-                .store
-                .write_async(move |conn| {
-                    let opts = crate::db::advance::AdvanceOpts {
-                        expected_from: Some("backlog".into()),
-                        skip_continuation: true,
-                        log_line: Some(line.clone()),
-                        ..Default::default()
-                    };
-                    let outcome =
-                        crate::db::advance::advance(conn, &card_c, "todo", "board_drive", &opts)?;
-                    Ok(crate::db::WriteOutcome {
-                        applied: outcome.is_ok(),
-                        events: outcome.map(|o| o.events).unwrap_or_default(),
-                    })
-                })
-                .await;
-            match result {
-                Ok(o) if o.applied => {
-                    if todo_refusals > 0 {
-                        // Two-fix signal: the recovered topology is searchable
-                        // without reconstructing the board at that instant.
-                        tracing::info!(
-                            session = lane,
-                            card,
-                            todo_refusals,
-                            backlog_left,
-                            "board_drive: auto-drain bypassed unclaimable todo"
-                        );
+        Pickup::DrainBacklog { card, prompt, backlog_left, todo_refusals } => {
+            // A direct CAS eliminates the old backlog -> todo -> next-tick gap.
+            match claim_card_from_outcome(state, lane, &card, "backlog").await {
+                ClaimCardOutcome::Claimed => match fleet.deliver_work(lane, &prompt).await {
+                    Ok(()) => {
+                        let remaining = backlog_left.saturating_sub(1);
+                        crate::api::session_verbs::emit_event(state, lane, "backlog.drained",
+                            Some(json!({"issue": card, "from": "backlog", "to": "doing", "started": true,
+                                "backlog_left": remaining, "todo_refusals": todo_refusals})), None, "board-drive").await;
+                        tracing::info!(target: "amux::board_drive", session = lane, card,
+                            measured = true, n_considered = backlog_left, verdict = "backlog_claim_started",
+                            "board_drive: auto-drained backlog directly into doing with a causal task claim");
+                        LaneTrace::acted(lane, "assigned", &card,
+                            format!("{card} backlog -> doing and prompt queued; {remaining} drainable left; bypassed {todo_refusals} unclaimable todo(s)"))
+                            .with_counts(eligible, open)
                     }
-                    crate::api::session_verbs::emit_event(
-                        state,
-                        lane,
-                        "backlog.drained",
-                        Some(json!({
-                            "issue": card,
-                            "backlog_left": backlog_left,
-                            "todo_refusals": todo_refusals,
-                        })),
-                        None,
-                        "board-drive",
-                    )
-                    .await;
-                    LaneTrace::acted(
-                        lane,
-                        "drain-backlog",
-                        &card,
-                        format!(
-                            "{card} backlog -> todo; {backlog_left} drainable left; \
-                             bypassed {todo_refusals} unclaimable todo(s)"
-                        ),
-                    )
-                    .with_counts(eligible, open)
-                }
-                Ok(_) => LaneTrace::skip(
-                    lane,
-                    "drain-raced",
-                    format!("{card} left backlog before the drain landed"),
-                )
-                .with_counts(eligible, open),
-                Err(e) => LaneTrace::skip(
-                    lane,
-                    "drain-err",
-                    format!("write failed draining {card}: {e}"),
-                )
-                .with_counts(eligible, open),
+                    Err(error) => {
+                        let released = release_claim_after_dispatch_failure(state, lane, &card, "backlog", &error).await;
+                        LaneTrace::skip(lane,
+                            if released { "delivery-failed-released" } else { "delivery-failed-release-raced" },
+                            format!("{card} backlog claim was not dispatched: {error}; {}", if released {
+                                "claim was compensated back to backlog"
+                            } else { "compensation yielded to a concurrent card change; inspect board-drive WARN" }))
+                            .with_counts(eligible, open)
+                    }
+                },
+                ClaimCardOutcome::DependencyBlocked(blocking) => LaneTrace::skip(lane, "drain-dependency-raced",
+                    format!("{card} gained unfinished prerequisite(s): {}", blocking.join(", ")))
+                    .with_counts(eligible, open),
+                ClaimCardOutcome::NotApplied => LaneTrace::skip(lane, "drain-raced",
+                    format!("{card} left backlog before the atomic claim landed"))
+                    .with_counts(eligible, open),
             }
         }
         Pickup::ReclaimStale { card, held_h, blocking } => {
@@ -5854,14 +5901,6 @@ pub(crate) async fn claim_card_from_outcome(
 
             let reassigned = !prior_owner.is_empty() && prior_owner != session_s;
             let entry = if reassigned {
-                tracing::warn!(
-                    target: "amux::board_drive", claimer = %session_s, prior = %prior_owner, card = %card_s,
-                    "claim REASSIGNED a card across owners; every caller is supposed to prevent this; \
-                     if you see this, a dispatch path let a lane claim another lane's card"
-                );
-                if let Ok(mut g) = cross_owner_w.lock() {
-                    *g = Some(prior_owner.clone());
-                }
                 format!("Auto-picked up from queue by {session_s} (reassigned from {prior_owner})")
             } else if from == "backlog" {
                 format!("Claimed from backlog by {session_s}")
@@ -5878,10 +5917,26 @@ pub(crate) async fn claim_card_from_outcome(
                 ..Default::default()
             };
             match crate::db::advance::advance(conn, &card_s, "doing", &session_s, &opts)? {
-                Ok(outcome) => Ok(crate::db::WriteOutcome {
-                    applied: true,
-                    events: outcome.events,
-                }),
+                Ok(outcome) => {
+                    // Attribution is part of the claim transaction. A restart
+                    // or writer failure can now leave neither a `doing` card
+                    // nor a causal marker, never only one of them.
+                    if reassigned {
+                        conn.execute(
+                            "INSERT INTO session_events (ts,session,type,data,source) VALUES (?,?,?,?,?)",
+                            rusqlite::params![now_f64(), &session_s, "claim.cross_owner",
+                                json!({"issue": &card_s, "claimer": &session_s,
+                                    "prior_owner": &prior_owner, "from": from}).to_string(), "board-drive"],
+                        )?;
+                        if let Ok(mut g) = cross_owner_w.lock() { *g = Some(prior_owner.clone()); }
+                    }
+                    conn.execute(
+                        "INSERT INTO session_events (ts,session,type,data,source) VALUES (?,?,?,?,?)",
+                        rusqlite::params![now_f64(), &session_s, "task.claimed",
+                            json!({"issue": &card_s, "status": "doing", "from": from}).to_string(), "board-drive"],
+                    )?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: outcome.events })
+                }
                 Err(_refusal) => Ok(crate::db::WriteOutcome { applied: false, events: vec![] }),
             }
         })
@@ -5919,7 +5974,15 @@ pub(crate) async fn claim_card_from_outcome(
         .await;
         return ClaimCardOutcome::DependencyBlocked(blockers);
     }
-    let claimed = matches!(reply, Ok(r) if r.applied);
+    let claimed = match reply {
+        Ok(r) => r.applied,
+        Err(error) => {
+            tracing::warn!(target: "amux::board_drive", %session, %card, %from, %error,
+                measured = false, n_considered = 0, verdict = "atomic_claim_write_failed",
+                "board_drive: atomic claim failed; neither doing state nor causal task claim committed");
+            false
+        }
+    };
     if !claimed {
         tracing::info!(
             target: "amux::board_drive", %session, %card,
@@ -5929,37 +5992,68 @@ pub(crate) async fn claim_card_from_outcome(
         );
         return ClaimCardOutcome::NotApplied;
     }
-    // THE VIOLATION GETS ITS OWN TYPE, and it is emitted BEFORE `task.claimed`
-    // so the ledger reads in causal order: the guard fired, then the claim
-    // landed. A distinct type rather than a field on `task.claimed`, because
-    // this is a different FACT — every caller is supposed to make it
-    // impossible, so one row is a bug report, not a variation on a claim
-    // (AMUX-3776).
     if let Some(prior) = cross_owner.lock().ok().and_then(|g| g.clone()) {
-        crate::api::session_verbs::emit_event(
-            state,
-            session,
-            "claim.cross_owner",
-            Some(json!({"issue": card, "claimer": session, "prior_owner": prior, "from": from})),
-            None,
-            "board-drive",
-        )
-        .await;
+        tracing::warn!(target: "amux::board_drive", claimer = %session, prior = %prior, card = %card,
+            measured = true, n_considered = 1, verdict = "cross_owner_claimed",
+            "claim reassigned a card across owners");
     }
-    crate::api::session_verbs::emit_event(
-        state,
-        session,
-        "task.claimed",
-        // `status` rides along so the progress-yields-cooldown check reads a
-        // claim the same way it reads a nudge: if the lane moves this card
-        // before the 15 minutes are up, that IS progress and it gets the next
-        // one immediately.
-        Some(json!({"issue": card, "status": "doing"})),
-        None,
-        "board-drive",
-    )
-    .await;
     ClaimCardOutcome::Claimed
+}
+
+/// Undo a claim after its work prompt was refused. The status CAS and release
+/// receipt share one writer transaction; a human reassignment wins the race
+/// rather than being overwritten by this compensation.
+async fn release_claim_after_dispatch_failure(
+    state: &AppState, session: &str, card: &str, from: &'static str, error: &str,
+) -> bool {
+    let (session, card, error) = (session.to_string(), card.to_string(), error.to_string());
+    let (session_w, card_w, error_w) = (session.clone(), card.clone(), error.clone());
+    let reply = state.store.write_async(move |conn| {
+        let Some(row) = bs::get_issue(conn, &card_w)? else {
+            return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+        };
+        if row.status != "doing" || row.session.as_deref() != Some(session_w.as_str()) {
+            return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+        }
+        let opts = crate::db::advance::AdvanceOpts {
+            expected_from: Some("doing".into()), force: true, skip_continuation: true,
+            skip_todo_wip: true,
+            log_line: Some(format!("auto-claim released: work prompt could not be queued ({error_w})")),
+            ..Default::default()
+        };
+        match crate::db::advance::advance(conn, &card_w, from, "board_drive", &opts)? {
+            Ok(outcome) => {
+                conn.execute(
+                    "INSERT INTO session_events (ts,session,type,data,source) VALUES (?,?,?,?,?)",
+                    rusqlite::params![now_f64(), &session_w, "task.released",
+                        json!({"issue": &card_w, "from": "doing", "to": from,
+                            "reason": "delivery_failed", "error": &error_w}).to_string(), "board-drive"],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: outcome.events })
+            }
+            Err(_) => Ok(crate::db::WriteOutcome { applied: false, events: vec![] }),
+        }
+    }).await;
+    match reply {
+        Ok(r) if r.applied => {
+            tracing::warn!(target: "amux::board_drive", %session, %card, %from, %error,
+                measured = true, n_considered = 1, verdict = "dispatch_failed_claim_released",
+                "board_drive: delivery refused; reverted the un-delivered claim");
+            true
+        }
+        Ok(_) => {
+            tracing::warn!(target: "amux::board_drive", %session, %card, %from, %error,
+                measured = true, n_considered = 1, verdict = "dispatch_compensation_raced",
+                "board_drive: delivery failed but compensation yielded to a concurrent card change");
+            false
+        }
+        Err(write_error) => {
+            tracing::error!(target: "amux::board_drive", %session, %card, %from, %error, %write_error,
+                measured = false, n_considered = 1, verdict = "dispatch_compensation_write_failed",
+                "board_drive: delivery failed and claim compensation could not be persisted");
+            false
+        }
+    }
 }
 
 /// Background driver.
@@ -7278,6 +7372,260 @@ mod tests {
         crate::db::migrate::test_memdb()
     }
 
+    struct BoundaryFleet {
+        delivered: std::sync::Mutex<Vec<(String, String)>>,
+        running: std::sync::atomic::AtomicBool,
+        boundary: std::sync::atomic::AtomicBool,
+        enabled: std::sync::atomic::AtomicBool,
+        isolated: std::sync::atomic::AtomicBool,
+        starts: std::sync::atomic::AtomicUsize,
+        start_error: std::sync::Mutex<Option<String>>,
+        delivery_error: std::sync::Mutex<Option<String>>,
+    }
+    impl Default for BoundaryFleet {
+        fn default() -> Self {
+            Self { delivered: std::sync::Mutex::new(vec![]),
+                running: std::sync::atomic::AtomicBool::new(true),
+                boundary: std::sync::atomic::AtomicBool::new(true),
+                enabled: std::sync::atomic::AtomicBool::new(true),
+                isolated: std::sync::atomic::AtomicBool::new(false),
+                starts: std::sync::atomic::AtomicUsize::new(0),
+                start_error: std::sync::Mutex::new(None), delivery_error: std::sync::Mutex::new(None) }
+        }
+    }
+    impl Fleet for BoundaryFleet {
+        fn lanes(&self) -> Vec<String> { vec!["lane".into()] }
+        fn auto_pickup_enabled(&self, _: &str) -> bool { self.enabled.load(std::sync::atomic::Ordering::SeqCst) }
+        fn tags(&self, _: &str) -> Vec<String> { vec![] }
+        fn is_isolated(&self, _: &str) -> bool { self.isolated.load(std::sync::atomic::Ordering::SeqCst) }
+        async fn is_running(&self, _: &str) -> bool { self.running.load(std::sync::atomic::Ordering::SeqCst) }
+        async fn at_boundary(&self, _: &str) -> bool { self.boundary.load(std::sync::atomic::Ordering::SeqCst) }
+        fn auto_continue_enabled(&self, _: &str) -> bool { true }
+        async fn start_for_dispatch(&self, _: &str) -> Result<(), String> {
+            self.starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(error) = self.start_error.lock().unwrap().clone() { return Err(error); }
+            self.running.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn deliver(&self, lane: &str, text: &str) {
+            self.delivered.lock().unwrap().push((lane.into(), text.into()));
+        }
+        async fn deliver_work(&self, lane: &str, text: &str) -> Result<(), String> {
+            if let Some(error) = self.delivery_error.lock().unwrap().clone() { return Err(error); }
+            self.deliver(lane, text).await;
+            Ok(())
+        }
+    }
+
+    fn drive_state() -> (tempfile::TempDir, AppState, std::sync::Arc<crate::db::Store>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::db::Store::open(&dir.path().join("drive.db")).unwrap());
+        let state = AppState { store: store.clone(), started: std::time::Instant::now(), build_hash: "test".into(),
+            auth_token: None, reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)) };
+        (dir, state, store)
+    }
+    fn drive_card(store: &std::sync::Arc<crate::db::Store>, id: &str, status: &str, owner: &str, kind: &str) {
+        let (id, status, owner, kind) = (id.to_string(), status.to_string(), owner.to_string(), kind.to_string());
+        let now = now_f64() as i64;
+        store.write(move |conn| {
+            conn.execute("INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type) \
+                          VALUES (?1,?1,'SCOPE: work\n- [ ] do it',?2,'lane',?3,?3,?4,?5)",
+                rusqlite::params![id, status, now, owner, kind])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+    }
+    fn drive_status(store: &std::sync::Arc<crate::db::Store>, id: &str) -> String {
+        store.read().unwrap().query_row("SELECT status FROM issues WHERE id=?1", [id], |r| r.get(0)).unwrap()
+    }
+    fn drive_events(store: &std::sync::Arc<crate::db::Store>, kind: &str) -> i64 {
+        store.read().unwrap().query_row("SELECT COUNT(*) FROM session_events WHERE type=?1", [kind], |r| r.get(0)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn atomic_claim_rolls_back_when_the_causal_marker_is_rejected() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "ATOMIC", "todo", "agent", "code");
+        store.write(|conn| {
+            conn.execute_batch("CREATE TRIGGER reject_marker BEFORE INSERT ON session_events \
+                WHEN NEW.type='task.claimed' BEGIN SELECT RAISE(ABORT, 'marker'); END;")?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        assert!(!claim_card(&state, "lane", "ATOMIC").await);
+        assert_eq!(drive_status(&store, "ATOMIC"), "todo");
+        assert_eq!(drive_events(&store, "task.claimed"), 0);
+    }
+
+    #[tokio::test]
+    // The standard mutex deliberately serializes process-global test settings
+    // for the complete asynchronous dispatch, so the environment cannot change
+    // between selection and delivery.
+    #[allow(clippy::await_holding_lock)]
+    async fn auto_drain_starts_only_the_eligible_backlog_card_with_an_atomic_claim() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        std::env::remove_var(DISPATCH_BACKLOG_KEY);
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "READY", "backlog", "agent", "code");
+        drive_card(&store, "HUMAN", "backlog", "human", "code");
+        drive_card(&store, "WATCH", "backlog", "agent", "watch");
+        let fleet = BoundaryFleet::default();
+        fleet.running.store(false, std::sync::atomic::Ordering::SeqCst);
+        let trace = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(trace.outcome, "assigned", "{trace:?}");
+        assert_eq!(trace.card.as_deref(), Some("READY"));
+        assert_eq!(drive_status(&store, "READY"), "doing");
+        assert_eq!(drive_status(&store, "HUMAN"), "backlog");
+        assert_eq!(drive_status(&store, "WATCH"), "backlog");
+        assert_eq!(drive_events(&store, "task.claimed"), 1);
+        assert_eq!(fleet.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let delivered = fleet.delivered.lock().unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert!(delivered[0].1.contains("READY"));
+    }
+
+    #[tokio::test]
+    async fn idle_worker_receives_next_card_without_restart() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "IDLE", "todo", "agent", "code");
+        let fleet = BoundaryFleet::default();
+        let trace = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(trace.outcome, "assigned");
+        assert_eq!(drive_status(&store, "IDLE"), "doing");
+        assert_eq!(fleet.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(fleet.delivered.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn start_failure_leaves_no_false_doing_or_working_marker() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "STARTFAIL", "todo", "agent", "code");
+        let fleet = BoundaryFleet::default();
+        fleet.running.store(false, std::sync::atomic::Ordering::SeqCst);
+        *fleet.start_error.lock().unwrap() = Some("provider rejected restart".into());
+        let trace = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(trace.reason, "start-failed");
+        assert_eq!(drive_status(&store, "STARTFAIL"), "todo");
+        assert_eq!(drive_events(&store, "task.claimed"), 0);
+    }
+
+    #[tokio::test]
+    async fn delivery_failure_and_vanished_worker_compensate_claims() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "REFUSED", "todo", "agent", "code");
+        let fleet = BoundaryFleet::default();
+        *fleet.delivery_error.lock().unwrap() = Some("worker vanished before queue insert".into());
+        let trace = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(trace.reason, "delivery-failed-released");
+        assert_eq!(drive_status(&store, "REFUSED"), "todo");
+        assert_eq!(drive_events(&store, "task.claimed"), 1);
+        assert_eq!(drive_events(&store, "task.released"), 1);
+        assert!(fleet.delivered.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    // See `auto_drain_starts_only_the_eligible_backlog_card_with_an_atomic_claim`.
+    #[allow(clippy::await_holding_lock)]
+    async fn backlog_delivery_failure_compensates_back_to_backlog() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        std::env::remove_var(DISPATCH_BACKLOG_KEY);
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "BACKLOG-REFUSED", "backlog", "agent", "code");
+        let fleet = BoundaryFleet::default();
+        *fleet.delivery_error.lock().unwrap() = Some("steering target is archived".into());
+        let trace = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(trace.reason, "delivery-failed-released");
+        assert_eq!(drive_status(&store, "BACKLOG-REFUSED"), "backlog");
+        assert_eq!(drive_events(&store, "task.claimed"), 1);
+        assert_eq!(drive_events(&store, "task.released"), 1);
+        assert_eq!(drive_events(&store, "backlog.drained"), 0);
+    }
+
+    #[tokio::test]
+    // See `auto_drain_starts_only_the_eligible_backlog_card_with_an_atomic_claim`.
+    #[allow(clippy::await_holding_lock)]
+    async fn blocked_todo_with_eligible_backlog_wakes_exact_backlog_card() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        std::env::remove_var(DISPATCH_BACKLOG_KEY);
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "DEP", "doing", "agent", "code");
+        drive_card(&store, "BLOCKED", "todo", "agent", "code");
+        drive_card(&store, "BACKLOG", "backlog", "agent", "code");
+        store.write(|conn| {
+            conn.execute("UPDATE issues SET session='other' WHERE id='DEP'", [])?;
+            conn.execute("UPDATE issues SET depends_on='[\"DEP\"]' WHERE id='BLOCKED'", [])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let fleet = BoundaryFleet::default();
+        fleet.running.store(false, std::sync::atomic::Ordering::SeqCst);
+        let trace = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(trace.card.as_deref(), Some("BACKLOG"));
+        assert_eq!(drive_status(&store, "BACKLOG"), "doing");
+        assert_eq!(drive_status(&store, "BLOCKED"), "todo");
+    }
+
+    #[tokio::test]
+    async fn stale_subagent_and_protected_work_never_wake_or_claim() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "STALE", "todo", "agent", "code");
+        let busy = BoundaryFleet::default();
+        busy.boundary.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(drive_lane(&state, &busy, "lane").await.reason, "mid-turn");
+        assert_eq!(drive_status(&store, "STALE"), "todo");
+
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "HUMAN", "todo", "human", "code");
+        drive_card(&store, "EPIC", "backlog", "agent", "epic");
+        drive_card(&store, "WATCH", "todo", "agent", "watch");
+        drive_card(&store, "TRIGGER", "backlog", "agent", "code");
+        drive_card(&store, "DEP", "doing", "agent", "code");
+        drive_card(&store, "BLOCKED", "todo", "agent", "code");
+        store.write(|conn| {
+            let now = now_f64() as i64;
+            conn.execute("UPDATE issues SET source_ref='watch', last_verified_at=?1 WHERE id='TRIGGER'", [now])?;
+            conn.execute("UPDATE issues SET session='other' WHERE id='DEP'", [])?;
+            conn.execute("UPDATE issues SET depends_on='[\"DEP\"]' WHERE id='BLOCKED'", [])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let stopped = BoundaryFleet::default();
+        stopped.running.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(drive_lane(&state, &stopped, "lane").await.reason, "not-running-no-dispatchable-work");
+        assert_eq!(stopped.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let isolated = BoundaryFleet::default();
+        isolated.running.store(false, std::sync::atomic::Ordering::SeqCst);
+        isolated.isolated.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(drive_lane(&state, &isolated, "lane").await.reason, "isolated");
+        let opted = BoundaryFleet::default();
+        opted.running.store(false, std::sync::atomic::Ordering::SeqCst);
+        opted.enabled.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(drive_lane(&state, &opted, "lane").await.reason, "opted-out");
+    }
+
+    #[tokio::test]
+    async fn concurrent_tick_claims_once_and_model_provider_restart_uses_start_seam() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "RACE", "todo", "agent", "code");
+        let one = BoundaryFleet::default();
+        let two = BoundaryFleet::default();
+        let (a, b) = tokio::join!(drive_lane(&state, &one, "lane"), drive_lane(&state, &two, "lane"));
+        assert_eq!([a.outcome, b.outcome].iter().filter(|v| **v == "assigned").count(), 1);
+        assert_eq!(drive_events(&store, "task.claimed"), 1);
+        assert_eq!(one.delivered.lock().unwrap().len() + two.delivered.lock().unwrap().len(), 1);
+
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "RESTART", "todo", "agent", "code");
+        let restart = BoundaryFleet::default();
+        restart.running.store(false, std::sync::atomic::Ordering::SeqCst);
+        restart.boundary.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(drive_lane(&state, &restart, "lane").await.card.as_deref(), Some("RESTART"));
+        assert_eq!(restart.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn add_card(conn: &Connection, id: &str, session: &str, status: &str, title: &str, desc: &str) {
         let now = now_f64() as i64;
@@ -8302,7 +8650,7 @@ mod tests {
         // needing a redundant opt-in key.
         std::env::remove_var(DISPATCH_BACKLOG_KEY);
         match select_pickup_with(&build(), "lane", now_f64(), false) {
-            Pickup::DrainBacklog { card, backlog_left, todo_refusals } => {
+            Pickup::DrainBacklog { card, backlog_left, todo_refusals, .. } => {
                 assert_eq!(card, "B-1", "oldest first, so a starved card is not starved further");
                 assert_eq!(backlog_left, 2, "the count reports what is drainable, before the move");
                 assert_eq!(todo_refusals, 0, "an empty todo queue has no refusals");
@@ -9019,7 +9367,7 @@ mod tests {
             .expect("backlog order");
 
         match select_pickup_with(&conn, "lane", now, false) {
-            Pickup::DrainBacklog { card, backlog_left, todo_refusals } => {
+            Pickup::DrainBacklog { card, backlog_left, todo_refusals, .. } => {
                 assert_eq!(card, "B-1");
                 assert_eq!(backlog_left, 1);
                 assert_eq!(todo_refusals, 1, "the trace must expose the blocked todo bypass");
