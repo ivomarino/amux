@@ -482,6 +482,14 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
         app.contains("const _liveNow = !!(_liveCard && _liveCard.id === item.id)"),
         "only the explicitly claimed card may say Working now"
     );
+    for needle in [
+        "function _runtimeBoardSplitBadge(s)",
+        "s.status !== 'unattributed'",
+        "runtime/board split",
+        "truth.verdict",
+    ] {
+        assert!(app.contains(needle), "unattributed runtime lost its server-verdict treatment `{needle}`");
+    }
     for rejected in ["no board task claimed", "board-unclaimed-mount", "_activeWithoutClaim"] {
         assert!(!app.contains(rejected), "runtime activity must not manufacture the board pseudo-state `{rejected}`");
         assert!(!index.contains(rejected), "the removed pseudo-state must not retain a dead mount `{rejected}`");

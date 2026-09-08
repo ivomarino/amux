@@ -4136,6 +4136,7 @@ pub(crate) async fn cmd_hist_record_full(
     };
     let msg_row_id_w = msg_row_id.clone();
     let cap_session = session.clone();
+    let truth_session = cap_session.clone();
     let cap_text = text.clone();
     let _ = state
         .store
@@ -4240,13 +4241,14 @@ pub(crate) async fn cmd_hist_record_full(
         let row_id = msg_row_id.load(std::sync::atomic::Ordering::SeqCst);
         if row_id > 0 {
             let cap_isolated = session_is_isolated(&cap_session);
+            let cap_text_for_capture = cap_text.clone();
             let minted: std::sync::Arc<std::sync::Mutex<Option<String>>> =
                 std::sync::Arc::new(std::sync::Mutex::new(None));
             let minted_w = minted.clone();
             let sess_log = cap_session.clone();
             let res = state
                 .store
-                .write_async(move |conn| match mint_capture_card(conn, &cap_session, &cap_text, now_ms)? {
+                .write_async(move |conn| match mint_capture_card(conn, &cap_session, &cap_text_for_capture, now_ms)? {
                     Some(row) => {
                         conn.execute(
                             "UPDATE cmd_history SET card_id = ?1 WHERE id = ?2",
@@ -4270,16 +4272,61 @@ pub(crate) async fn cmd_hist_record_full(
                 // arriving — plus the cmd_history.card_id NULL rate — is the
                 // detector. grep "ledger: auto-captured".
                 Ok(_) => {
-                    if let Some(cid) = minted.lock().unwrap().take() {
+                    let captured_id = minted.lock().ok().and_then(|mut id| id.take());
+                    if let Some(cid) = captured_id {
                         tracing::info!(session = %sess_log, card_id = %cid,
                             owner_isolated = cap_isolated,
                             "ledger: auto-captured board card from delivered prompt");
+                        emit_event(
+                            state,
+                            &sess_log,
+                            "task.claimed",
+                            Some(json!({
+                                "issue": cid,
+                                "status": "doing",
+                                "reason": "delivered-owner-prompt",
+                            })),
+                            None,
+                            "prompt-capture",
+                        )
+                        .await;
                     }
                 }
                 Err(e) => tracing::warn!(session = %sess_log, error = %e,
                     owner_isolated = cap_isolated,
                     "ledger auto-capture FAILED; prompt recorded without a board card"),
             }
+        }
+    }
+    if is_user && landed {
+        let cardless_reason = if skip_board {
+            Some("explicit-no-board")
+        } else if amux_core::board::is_informational_query(&cap_text) {
+            Some("informational-query")
+        } else if amux_core::board::title_from_prompt(&cap_text).is_none() {
+            Some("control-prompt")
+        } else {
+            None
+        };
+        if let Some(reason) = cardless_reason {
+            emit_event(
+                state,
+                &truth_session,
+                "task.cardless",
+                Some(json!({"reason": reason})),
+                None,
+                "prompt-capture",
+            )
+            .await;
+            tracing::info!(
+                target: "amux::sessions",
+                session = %truth_session,
+                reason,
+                measured = true,
+                n_considered = 1,
+                verdict = "cardless-allowed",
+                "runtime/board truth: delivered owner prompt is explicitly cardless"
+            );
         }
     }
 }
@@ -7987,6 +8034,26 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
     (true, "started".into())
 }
 
+/// Start the exact provider configured for a board-driven worker, and do not
+/// report a successful wake until the common liveness predicate can see it.
+///
+/// This remains a narrow wrapper around [`start_session`], so provider/model
+/// restart behavior—including Codex's self-update relaunch—stays in the one
+/// provider-aware launcher rather than a board-specific copy.
+pub(crate) async fn start_for_board_dispatch(state: &AppState, name: &str) -> Result<(), String> {
+    if session_is_isolated(name) {
+        return Err("isolated workers never receive board automation".into());
+    }
+    let (started, detail) = start_session(state, name, "", false).await;
+    if !started {
+        return Err(detail);
+    }
+    if !is_running(name).await {
+        return Err(format!("start reported '{detail}', but no live provider process remains"));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn libc_geteuid() -> u32 {
     // std has no geteuid without the libc crate; the UID check only matters
@@ -10944,14 +11011,57 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                 // announces its captures the same way the direct path does, so a
                 // future silent stop is a queryable absence, not an invisible one.
                 Ok(_) => {
-                    if let Some(cid) = minted.lock().unwrap().take() {
+                    let captured_id = minted.lock().ok().and_then(|mut id| id.take());
+                    if let Some(cid) = captured_id {
                         tracing::info!(session = %session, id = %id, card_id = %cid,
                             "ledger: auto-captured board card from STEERING-delivered prompt (AMUX-3148)");
+                        emit_event(
+                            state,
+                            &session,
+                            "task.claimed",
+                            Some(json!({
+                                "issue": cid,
+                                "status": "doing",
+                                "reason": "steering-delivered-owner-prompt",
+                            })),
+                            None,
+                            "prompt-capture",
+                        )
+                        .await;
                     }
                 }
                 Err(e) => tracing::warn!(session = %session, error = %e,
                     "ledger auto-capture FAILED on steering delivery; prompt delivered without a board card"),
             }
+        }
+        if guard.is_empty()
+            && sender.is_empty()
+            && (amux_core::board::title_from_prompt(&text).is_none()
+                || amux_core::board::is_informational_query(&text))
+        {
+            let reason = if amux_core::board::is_informational_query(&text) {
+                "informational-query"
+            } else {
+                "control-prompt"
+            };
+            emit_event(
+                state,
+                &session,
+                "task.cardless",
+                Some(json!({"reason": reason})),
+                None,
+                "prompt-capture",
+            )
+            .await;
+            tracing::info!(
+                target: "amux::sessions",
+                session = %session,
+                reason,
+                measured = true,
+                n_considered = 1,
+                verdict = "cardless-allowed",
+                "runtime/board truth: steering-delivered owner prompt is explicitly cardless"
+            );
         }
         // The metadata AMUX-2643's "direct vs queued" view needs, recorded on
         // EVERY delivery path: how it was queued, how long it waited, whether
