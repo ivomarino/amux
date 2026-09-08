@@ -877,7 +877,22 @@ pub fn pickup_junk_reason(title: &str, desc: &str, log: &str) -> String {
     // The marker on the CURRENT desc still brands (a card literally defined as the
     // capture marker is a shell); but read `desc`, NOT the blob, so the durable
     // LOG copy of a reshaped card does not (AMUX-3187, see above).
-    if desc.contains("capture: session prompt") && folds < 2 {
+    // ANCHORED (AF-569). This used to be `desc.contains(...)`, which brands a card
+    // that merely MENTIONS the marker. Specimen: AF-568, the card about duplicate
+    // capture cards, quoted the string inside backticks while explaining the bug
+    // and was nudged "captured chat prompt, not a unit of work" while it sat in
+    // `doing` with a shipped fix. A card cannot describe the capture mechanism
+    // without being classified as its output.
+    //
+    // The intent stated two paragraphs up is "a card literally defined as the
+    // capture marker", and starts_with is that intent. Every REAL capture is still
+    // caught by the anchored PROMPT check below, on `**Prompt:** `, which is the
+    // prefix session_verbs.rs actually mints.
+    //
+    // It also fired BEFORE the STRUCTURE VETO below, so a substring match
+    // short-circuited the 2+ ALLCAPS-heads evidence that exists to stop this. AF-568
+    // had three such heads.
+    if desc.trim_start().starts_with("capture: session prompt") && folds < 2 {
         return "captured chat prompt, not a unit of work".into();
     }
     // ANCHORED, and the word must END as a subject too (GCA-85 + creative-dna's
@@ -9757,6 +9772,42 @@ mod tests {
             pickup_junk_reason("A perfectly normal task", "Do the normal thing.", raw_log),
             "",
             "the capture-origin log marker alone must not brand a card"
+        );
+    }
+
+    /// AF-569. The brand must fire on a card DEFINED as the capture marker, and not
+    /// on one that merely QUOTES it. AF-568 was the specimen: the card about
+    /// duplicate capture cards explained the bug with the marker in backticks, and
+    /// the unanchored `desc.contains` nudged it "not a unit of work" while it sat in
+    /// `doing` with a shipped fix. A card could not describe the capture mechanism
+    /// without being classified as its output.
+    ///
+    /// Both cells are required. `starts_with` alone would also be satisfied by a
+    /// check that never fires, so the first assertion is the one that keeps the
+    /// second honest.
+    #[test]
+    fn the_capture_brand_fires_on_the_marker_as_definition_not_as_a_quotation() {
+        // STILL BRANDS: the desc IS the marker. This is the intent the code states.
+        assert!(
+            pickup_junk_reason("shell", "capture: session prompt", "")
+                .contains("captured chat prompt"),
+            "a card whose desc IS the capture marker must still be branded"
+        );
+
+        // THE BUG: the marker QUOTED inside a real write-up. AF-568's actual shape,
+        // trimmed. Three ALLCAPS heads, so the structure veto below would clear it
+        // too, which the substring check short-circuited by returning first.
+        let real_work = "MEASURED, 2026-09-07 (population: every card from that broadcast).\n\
+                         There are two capture paths and both write the same durable \
+                         `capture: session prompt` log marker, so nothing downstream can \
+                         tell them apart.\n\
+                         WHAT I CLAIMED: a second mint path.\n\
+                         WHY IT IS WRONG: the orchestrator stamps source='orchestrator'.\n\
+                         WHAT I DID NOT ESTABLISH: what re-delivered the prompt.";
+        assert_eq!(
+            pickup_junk_reason("One broadcast minted 105 capture cards", real_work, ""),
+            "",
+            "a card that QUOTES the capture marker while doing real work must not be branded"
         );
     }
 

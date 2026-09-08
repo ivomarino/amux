@@ -3751,3 +3751,15 @@ SYMPTOM: The 5:59 PM recovery broadcast produced 56 identical cmd_history rows (
 COST: 49 junk cards across 46 lanes, each needing a manual disposition by whoever owns it. gainz is parked on a permission prompt clearing GAINZ-52/53 with `curl -X DELETE`, which also destroys the audit trail `amux board discard` keeps. My own lane spent the recovery turn deciding what two identical `doing` cards meant before any work started.
 FIX: A 45s window is sized for a transport retry and is being asked to guard a path whose entire purpose is to WAIT for a turn boundary, which took 17 to 25 minutes for every duplicate here. Dedupe against `issues` instead, the table the mint itself writes, with no time box while the card is non-terminal: refuse the mint when the session already holds a non-terminal `source='capture'` card whose desc is byte-identical. Log the refusal with the surviving card id so a wrongly suppressed distinct prompt is findable rather than silent.
 NOTE: An earlier draft of this entry blamed a second mint path in orchestrator/runtime.rs. That was wrong and is recorded on AF-568. The orchestrator path stamps `source='orchestrator'`; all 104 sourced cards here read `capture`, which is what sent me back to the log.
+
+---
+## The junk classifier brands any card that MENTIONS the capture marker, so a card cannot describe the capture mechanism
+AREA: notices
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux-frustrations
+CARD: AF-569
+SYMPTOM: AF-568, the card ABOUT duplicate capture cards, was nudged "captured chat prompt, not a unit of work" while it sat in `doing` with a shipped fix and a 4000-char write-up. It is not a capture by any structural test: source='agent', creator='amux-frustrations', desc begins "MEASURED, 2026-09-07", no `capture: session prompt` marker in its log. The brand at board_drive.rs:880 was `desc.contains("capture: session prompt")`, and AF-568's desc contains that string once, inside backticks, in the sentence explaining the bug. Measured: contains=True, starts_with=False, folds=0.
+COST: A live card with a shipped fix was told it was not a unit of work and offered discard/retitle/decompose. Small in minutes, and it is the shape that matters: the classifier cannot tell a MENTION from a USE, so any card documenting the capture mechanism is misfiled as its output. It also fired BEFORE the STRUCTURE VETO at :907, which returns "not junk" on 2+ ALLCAPS section heads; AF-568 had three, so a substring match short-circuited the evidence that existed to prevent exactly this.
+FIX: 271167a3's follow-up. Anchor it to the intent the code already states three lines above ("a card literally defined as the capture marker"): `desc.trim_start().starts_with(...)`. Every real capture is still caught by the anchored PROMPT check below, on the `**Prompt:** ` prefix session_verbs.rs actually mints. Line 880's positive case had NO test before this, which is why changing it broke nothing: the existing tests around it cover the PROMPT check and the log-only case. Two new cells, mutation-checked in both directions.
