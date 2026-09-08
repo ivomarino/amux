@@ -586,6 +586,10 @@ async function _upgradeCheckout(billing) {
 }
 
 let sessions = [];
+// A stream update and a poll response are two snapshots of the same runtime
+// truth. A request begun before an SSE update must not finish later and put the
+// old task attribution back on screen.
+let _sessionsSnapshotEpoch = 0;
 let archivedExpanded = false;
 let gitInfo = {};  // {sessionName: {branch, repo, _conflict}}
 let _initialLoad = true;   // true until first data arrives from server
@@ -2922,6 +2926,7 @@ function _staleShellRecover() {
 
 let _sessEtag = null;
 async function fetchSessions() {
+  const snapshotEpoch = _sessionsSnapshotEpoch;
   try {
     // AMUX-3504: conditional fetch — the server hashes the (now byte-stable)
     // payload, so an unchanged fleet answers 304 with no body. That is the
@@ -2942,6 +2947,10 @@ async function fetchSessions() {
       console.warn('sessions fetch returned non-array (status ' + r.status + ') — keeping previous set');
       return;
     }
+    if (snapshotEpoch !== _sessionsSnapshotEpoch) {
+      console.info('sessions poll completed behind a newer stream snapshot; discarded');
+      return;
+    }
     consecutiveFailures = 0;
     _lastDataTime = Date.now();
     if (_initialLoad) { _initialLoad = false; }
@@ -2951,6 +2960,7 @@ async function fetchSessions() {
       _checkSessionTransitions(data);
       lastSessionsJSON = j;
       sessions = data;
+      _sessionsSnapshotEpoch++;
       // Quota-full store: drop the cache rather than let the throw break rendering
       try { localStorage.setItem('amux_sessions_cache', j); }
       catch (e2) { try { localStorage.removeItem('amux_sessions_cache'); } catch (e3) {} }
@@ -3100,6 +3110,7 @@ function updatePeekStatus() {
   if (!s) { el.innerHTML = ''; return; }
   _renderPeekWorkerActions(s);
   let badge = '';
+  const runtimeBoard = _runtimeBoardPresentation(s);
   // NAME · STATUS · MODEL, and nothing else (Ethan, 2026-08-11: "top we only
   // need the task name, status and model"). `_liveWorkLine` used to append the
   // worker's current progress line — "Perusing… (4m 11s · ↓ 5.4k tokens)" — up
@@ -3112,7 +3123,10 @@ function updatePeekStatus() {
   // the same output live, so this was a lossy 60-char summary of something
   // already on screen. amux is mobile-first — when the phone and a nice-to-have
   // trade off, the phone wins.
-  if (s.status === 'active')  badge = '<span class="status-badge active">working</span>' + _agentsChip(s);
+  if (s.status === 'active')  badge = runtimeBoard.syncing
+    ? _runtimeBoardSyncBadge()
+    : '<span class="status-badge active">working</span>' + _agentsChip(s)
+      + (runtimeBoard.cardless ? _runtimeBoardCardlessBadge() : '');
   else if (s.status === 'unattributed') badge = _runtimeBoardSplitBadge(s);
   else if (s.status === 'waiting') badge = '<span class="status-badge waiting"' + _waitingTitle(s) + '>' + _waitingLabel(s) + '</span>';
   else if (s.status === 'rate_limited') badge = '<span class="status-badge rate-limited">rate limited</span>';
@@ -3262,22 +3276,47 @@ function _cardBoardStatusCounts(name) {
   });
   return counts;
 }
-// The ONE board card a worker explicitly claims through `task_board_id`.
-//
-// Do not derive this from "worker active + card doing". A worker may have more
-// than one historical/captured card in doing (TubeScience had four), while one
-// terminal turn can execute only one parent task. The old newest-doing fallback
-// made all four cards say "Working now" and could also replace the task named by
-// the status hook with whichever card happened to be touched last. An active
-// worker can also be answering an informational message that correctly produced
-// no card. Runtime activity is not a board error state; guessing a task is wrong.
+// The server's measured runtime/board object is the ONE source for a worker's
+// active card. `boardItems` may arrive before or after it, so it may decorate a
+// board row but can never decide the worker's badge, task, or card link.
+function _runtimeBoardCardId(s) {
+  const truth = s && s.runtime_board;
+  if (!truth || truth.measured !== true || truth.status !== 'linked') return '';
+  return String(truth.card_id || '').trim();
+}
+
 function _cardDoingItem(name) {
   const session = (sessions || []).find(s => s.name === name);
-  const claimed = String(session && session.task_board_id || '').trim();
+  const claimed = _runtimeBoardCardId(session);
   if (!claimed) return null;
   return (boardItems || []).find(c =>
     !c.deleted && !c.archived && c.session === name && c.status === 'doing' && c.id === claimed
   ) || null;
+}
+
+// A card's runtime badge, text and link make one statement. The server owns
+// that statement; when an old cache/response lacks the measured object, or the
+// object reports a contradiction, rendering a neutral synchronization state is
+// more honest than rebuilding WORKING from a separate board snapshot.
+function _runtimeBoardPresentation(s) {
+  if (!s || s.status !== 'active') return { syncing: false, cardless: false, cardId: '' };
+  const truth = s.runtime_board;
+  if (!truth || truth.measured !== true) return { syncing: true, cardless: false, cardId: '' };
+  const status = String(truth.status || truth.verdict || '');
+  if (status === 'cardless-allowed') return { syncing: false, cardless: true, cardId: '' };
+  const cardId = String(truth.card_id || '').trim();
+  if (status !== 'linked' || !cardId || Number(truth.card_count) !== 1) {
+    return { syncing: true, cardless: false, cardId: '' };
+  }
+  return { syncing: false, cardless: false, cardId };
+}
+
+function _runtimeBoardSyncBadge() {
+  return '<span class="status-badge waiting" title="The server has not yet measured one exact live board card for this runtime; WORKING is withheld.">runtime/board syncing</span>';
+}
+
+function _runtimeBoardCardlessBadge() {
+  return '<span class="status-badge" style="margin-left:4px;" title="The server measured this as an explicit informational or control turn, not board work.">cardless turn</span>';
 }
 
 // Presentation only: the server owns the reconciliation and publishes the
@@ -3675,15 +3714,16 @@ function render() {
     const model = sessionConfiguredModel(s);
     const effort = provider === 'claude' ? flagValue(flags, '--effort') : '';
     const pLabel = providerLabel(provider);
-    const liveBoardTask = _cardDoingItem(s.name);
-    // A board transition and the next sessions poll are not atomic. Render the
-    // SSE-synced doing card immediately, then naturally converge on the server
-    // fields on the next poll. This also repairs old/stale task summaries while
-    // the board has a stronger, current fact.
-    const displayTaskName = liveBoardTask ? (liveBoardTask.title || liveBoardTask.id) : (s.task_name || '');
-    const displayTaskSource = liveBoardTask ? 'board' : s.task_source;
-    const displayTaskBoardId = liveBoardTask ? liveBoardTask.id : s.task_board_id;
-    const taskStale = liveBoardTask ? 0 : _taskStaleAge(s);
+    const runtimeBoard = _runtimeBoardPresentation(s);
+    // The measured object and the task text were serialized together by the
+    // server. Do not let a faster/slower board poll replace either side with a
+    // different snapshot; it is presentation-only evidence for the board view.
+    const displayTaskName = runtimeBoard.syncing
+      ? 'Synchronizing runtime/board truth…'
+      : (s.task_name || runtimeBoard.cardId || '');
+    const displayTaskSource = runtimeBoard.syncing ? 'sync' : (runtimeBoard.cardId ? 'board' : s.task_source);
+    const displayTaskBoardId = runtimeBoard.cardId;
+    const taskStale = runtimeBoard.cardId ? 0 : _taskStaleAge(s);
     const offCached = !!(_peekIndex && _peekIndex[s.name]);
     const taskDim = taskStale && displayTaskSource === 'board';   // stale board title shown as last resort
     // AF-148: a lane with no active card falls back to its static DESCRIPTION,
@@ -3701,7 +3741,7 @@ function render() {
     // Same discriminator the stale case already uses, applied to the case it
     // skipped. Not a mood, not a guess: the field was in the payload the whole
     // time and one consumer read it for one branch.
-    const taskIsDesc = displayTaskSource === 'desc' && !!displayTaskName;
+    const taskIsDesc = !runtimeBoard.cardless && displayTaskSource === 'desc' && !!displayTaskName;
     return `
     <div class="card ${isExp ? 'expanded' : ''}" data-session="${esc(s.name)}" onclick="event.stopPropagation();toggle('${s.name}')">
       <div class="card-header" onclick="headerTap('${s.name}', event)" onmousedown="tileMouseDown(event,'${s.name}')">
@@ -3720,7 +3760,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
               that hits the banner never fires Stop and the active latch keeps
               claiming work). The payload now only reports FUTURE limits, so when
               rate_limited_until is set it is the true state and it supersedes
-              the status badge outright (AMUX-2566). */ ''}          ${s.rate_limited_until ? '' : `${s.status === 'rate_limited' ? '<span class="status-badge rate-limited" title="Hit a usage limit (on credits or waiting for reset)">rate limited</span>' : ''}${s.status === 'active' ? '<span class="status-badge active">working</span>' + _agentsChip(s) : ''}
+              the status badge outright (AMUX-2566). */ ''}          ${s.rate_limited_until ? '' : `${s.status === 'rate_limited' ? '<span class="status-badge rate-limited" title="Hit a usage limit (on credits or waiting for reset)">rate limited</span>' : ''}${s.status === 'active' ? (runtimeBoard.syncing ? _runtimeBoardSyncBadge() : '<span class="status-badge active">working</span>' + _agentsChip(s) + (runtimeBoard.cardless ? _runtimeBoardCardlessBadge() : '')) : ''}
           ${s.status === 'unattributed' ? _runtimeBoardSplitBadge(s) : ''}
           ${s.status === 'waiting' ? `<span class="status-badge waiting"${_waitingTitle(s)}>${_waitingLabel(s)}</span>${_stalledFor(s)}` : ''}
           ${s.status === 'idle' ? '<span class="status-badge idle">idle</span>' : ''}`}
@@ -9058,7 +9098,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.831';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.832';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -21448,6 +21488,7 @@ function _fmtRelTime(ts) {
 // ═══════ BOARD ═══════
 let activeView = 'sessions';
 let boardItems = [];
+let _boardSnapshotEpoch = 0;
 // The exact set the last renderBoard() painted, after every filter. Export uses
 // it so "export" always means "what I am looking at". See renderBoard().
 let _boardLastVisible = [];
@@ -24355,6 +24396,7 @@ async function fetchBoard() {
   // Saved views sync via /api/prefs so a view made on the desktop is on the
   // phone. Fetched once, not on every board poll.
   if (!_boardViewsLoaded) { _boardViewsLoaded = true; await _boardViewsLoad(); }
+  const snapshotEpoch = _boardSnapshotEpoch;
   try {
     const boardHeaders = {};
     if (_boardEtag) boardHeaders['If-None-Match'] = _boardEtag;
@@ -24417,6 +24459,10 @@ async function fetchBoard() {
       console.warn('board fetch returned non-array (status ' + r.status + ') — keeping previous set');
       return;
     }
+    if (snapshotEpoch !== _boardSnapshotEpoch) {
+      console.info('board poll completed behind a newer stream snapshot; discarded');
+      return;
+    }
     const j = JSON.stringify(data);
     const itemsChanged = j !== lastBoardJSON;
     if (itemsChanged || statusesChanged) {
@@ -24445,6 +24491,7 @@ async function fetchBoard() {
       } else {
         boardItems = _mergeArchived(data);
       }
+      _boardSnapshotEpoch++;
       _cacheBoardJSON(j);
       renderBoard();
       _nudgeWorkersOnBoardChange();
@@ -29955,6 +30002,7 @@ function connectSSE() {
           // list. The class test now forbids any bare `workers =` assignment in
           // client code.
           sessions = msg.payload;
+          _sessionsSnapshotEpoch++;
           // Quota-full store: drop the cache rather than let the throw break SSE handling
           try { localStorage.setItem('amux_sessions_cache', j); }
           catch (e2) { try { localStorage.removeItem('amux_sessions_cache'); } catch (e3) {} }
@@ -29987,6 +30035,7 @@ function connectSSE() {
           // archived cards were lazily loaded, or an SSE push would wipe them
           // out from under an is:archived query.
           boardItems = _mergeArchived(msg.payload);
+          _boardSnapshotEpoch++;
           _cacheBoardJSON(j);
           // Mirror to IDB for full offline durability (iOS-safe)
           _idb.applyIssueDelta(msg.payload);

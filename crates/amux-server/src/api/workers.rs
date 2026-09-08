@@ -2177,6 +2177,164 @@ mod tests {
         assert_eq!(detail["id"].as_str().unwrap(), id);
     }
 
+    /// ATE-92 acceptance contract: the HTTP session projection, not only a
+    /// helper test, must carry one measured runtime/board verdict. A client
+    /// may never have to reconstruct its WORKING badge from a separate board
+    /// poll. A later control prompt cannot erase a still-live claimed card.
+    #[tokio::test]
+    async fn legacy_sessions_http_serializes_sticky_runtime_board_truth() {
+        crate::api::sessions_legacy::SUPPRESS_FLEET_FOR_TEST
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let (app, dir) = app();
+        let now = chrono::Utc::now().timestamp();
+        let marker_ts = now as f64 + 60.0;
+        let conn = rusqlite::Connection::open(dir.path().join("amux-test.db")).unwrap();
+        for (worker, session) in [
+            ("linked", "ses-linked"),
+            ("multiple", "ses-multiple"),
+            ("sticky", "ses-sticky"),
+            ("tubescience", "ses-tubescience"),
+            ("released", "ses-released"),
+            ("conflict", "ses-conflict"),
+        ] {
+            conn.execute(
+                "INSERT INTO _amux_workers (id, display_name, state, created_at, updated_at) \
+                 VALUES (?1, ?2, '{\"state\":\"active\"}', 'now', 'now')",
+                rusqlite::params![format!("wrk-{worker}"), worker],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO _amux_sessions (id, worker_id, backend, backend_ref, started_at) \
+                 VALUES (?1, ?2, 'tmux', ?3, 'now')",
+                rusqlite::params![session, format!("wrk-{worker}"), format!("amux-{worker}")],
+            )
+            .unwrap();
+        }
+        for (id, session) in [
+            ("LINKED-1", "linked"),
+            ("MULTI-1", "multiple"),
+            ("MULTI-2", "multiple"),
+            ("STICKY-1", "sticky"),
+            ("TUBES-2459", "tubescience"),
+            ("CONFLICT-1", "conflict"),
+            ("CONFLICT-2", "conflict"),
+        ] {
+            conn.execute(
+                "INSERT INTO issues (id, title, status, session, creator, created, updated) \
+                 VALUES (?1, ?2, 'doing', ?3, 'test', ?4, ?4)",
+                rusqlite::params![id, format!("title {id}"), session, now],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO issues (id, title, status, session, creator, created, updated) \
+             VALUES ('RELEASED-1', 'released title', 'done', 'released', 'test', ?1, ?1)",
+            rusqlite::params![now],
+        )
+        .unwrap();
+        for (session, card) in [
+            ("linked", "LINKED-1"),
+            ("multiple", "MULTI-1"),
+            ("sticky", "STICKY-1"),
+            ("tubescience", "TUBES-2459"),
+            ("released", "RELEASED-1"),
+            ("conflict", "CONFLICT-1"),
+            ("conflict", "CONFLICT-2"),
+        ] {
+            conn.execute(
+                "INSERT INTO session_events (ts, session, type, data, source) \
+                 VALUES (?1, ?2, 'task.claimed', ?3, 'test')",
+                rusqlite::params![marker_ts + if card.ends_with("2") { 1.0 } else { 0.0 }, session, json!({"issue": card}).to_string()],
+            )
+            .unwrap();
+        }
+        for session in ["sticky", "tubescience", "released"] {
+            conn.execute(
+                "INSERT INTO session_events (ts, session, type, data, source) \
+                 VALUES (?1, ?2, 'task.cardless', '{}', 'test')",
+                rusqlite::params![marker_ts + 2.0, session],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        crate::api::sessions_legacy::invalidate_sessions_cache();
+
+        let (status, _, payload) = send(&app, "GET", "/api/sessions", None).await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        let rows = payload.as_array().expect("legacy session array");
+        let linked = rows.iter().find(|row| row["name"] == "linked").expect("linked row");
+        assert_eq!(linked["runtime_board"]["measured"], json!(true), "{linked}");
+        assert_eq!(linked["runtime_board"]["status"], json!("linked"), "{linked}");
+        assert_eq!(linked["runtime_board"]["card_id"], json!("LINKED-1"), "{linked}");
+        assert_eq!(linked["runtime_board"]["card_count"], json!(1), "{linked}");
+        assert_eq!(linked["task_board_id"], json!("LINKED-1"), "{linked}");
+
+        // Aggregate Doing count is diagnostic, not a substitute for causal
+        // ownership: MULTI-1 remains exact even with unrelated MULTI-2 live.
+        let multiple = rows.iter().find(|row| row["name"] == "multiple").expect("multiple row");
+        assert_eq!(multiple["status"], json!("active"), "{multiple}");
+        assert_eq!(multiple["runtime_board"]["measured"], json!(true), "{multiple}");
+        assert_eq!(multiple["runtime_board"]["status"], json!("linked"), "{multiple}");
+        assert_eq!(multiple["runtime_board"]["card_count"], json!(2), "{multiple}");
+        assert_eq!(multiple["runtime_board"]["card_id"], json!("MULTI-1"), "{multiple}");
+        assert_eq!(multiple["task_board_id"], json!("MULTI-1"), "{multiple}");
+
+        let sticky = rows.iter().find(|row| row["name"] == "sticky").expect("sticky row");
+        assert_eq!(sticky["runtime_board"]["status"], json!("linked"), "{sticky}");
+        assert_eq!(sticky["runtime_board"]["card_id"], json!("STICKY-1"), "{sticky}");
+        assert_eq!(sticky["runtime_board"]["card_count"], json!(1), "{sticky}");
+        assert_eq!(sticky["runtime_board"]["cardless_suppressed_by_live_claim"], json!(true), "{sticky}");
+        assert_eq!(sticky["task_board_id"], json!("STICKY-1"), "{sticky}");
+
+        let tubescience = rows.iter().find(|row| row["name"] == "tubescience").expect("active TubeScience row");
+        assert_eq!(tubescience["status"], json!("active"), "{tubescience}");
+        assert_eq!(tubescience["runtime_board"]["status"], json!("linked"), "{tubescience}");
+        for value in [
+            &tubescience["runtime_board"]["card_id"],
+            &tubescience["task_board_id"],
+            &tubescience["runtime_board"]["observed_card_id"],
+        ] {
+            assert_eq!(value, &json!("TUBES-2459"), "{tubescience}");
+        }
+
+        let released = rows.iter().find(|row| row["name"] == "released").expect("released row");
+        assert_eq!(released["runtime_board"]["status"], json!("cardless-allowed"), "{released}");
+        assert_eq!(released["runtime_board"]["card_count"], json!(0), "{released}");
+        assert!(released["runtime_board"]["card_id"].is_null(), "{released}");
+        assert_eq!(released["runtime_board"]["cardless_suppressed_by_live_claim"], json!(false), "{released}");
+        assert!(released["task_board_id"].as_str().unwrap_or_default().is_empty(), "{released}");
+
+        let conflict = rows.iter().find(|row| row["name"] == "conflict").expect("conflict row");
+        assert_eq!(conflict["status"], json!("unattributed"), "{conflict}");
+        assert_eq!(conflict["runtime_board"]["status"], json!("active-conflicting-claims"), "{conflict}");
+        assert_eq!(conflict["runtime_board"]["card_count"], json!(2), "{conflict}");
+        assert!(conflict["runtime_board"]["card_id"].is_null(), "{conflict}");
+
+        let conn = rusqlite::Connection::open(dir.path().join("amux-test.db")).unwrap();
+        conn.execute(
+            "UPDATE _amux_workers SET state = '{\"state\":\"idle\"}' WHERE display_name = 'tubescience'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        crate::api::sessions_legacy::invalidate_sessions_cache();
+        let (status, _, idle_payload) = send(&app, "GET", "/api/sessions", None).await;
+        assert_eq!(status, StatusCode::OK, "{idle_payload}");
+        let idle_tubescience = idle_payload
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["name"] == "tubescience"))
+            .expect("idle TubeScience row");
+        assert_eq!(idle_tubescience["status"], json!("idle"), "{idle_tubescience}");
+        assert_eq!(idle_tubescience["runtime_board"]["status"], json!("runtime-not-active"), "{idle_tubescience}");
+        for value in [
+            &idle_tubescience["runtime_board"]["card_id"],
+            &idle_tubescience["task_board_id"],
+            &idle_tubescience["runtime_board"]["observed_card_id"],
+        ] {
+            assert_eq!(value, &json!("TUBES-2459"), "{idle_tubescience}");
+        }
+    }
+
     #[tokio::test]
     async fn conflicting_name_fields_are_400_and_legacy_name_is_accepted() {
         let (app, _dir) = app();

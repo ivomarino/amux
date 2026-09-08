@@ -445,15 +445,18 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
     let app = asset("app.js");
     let index = asset("index.html");
     let helper_start = app
-        .find("function _cardDoingItem(name)")
-        .expect("dashboard must derive the live doing card from SSE-synced board data");
+        .find("function _runtimeBoardCardId(s)")
+        .expect("dashboard must derive the live doing card from the server's measured runtime truth");
     let helper_tail = &app[helper_start..];
     let helper_end = helper_tail
         .find("function _nudgeWorkersOnBoardChange()")
         .expect("live-card helper must precede board-change invalidation");
     let helper = &helper_tail[..helper_end];
     for needle in [
-        "session.task_board_id",
+        "function _runtimeBoardCardId(s)",
+        "truth.measured !== true",
+        "truth.status !== 'linked'",
+        "truth.card_id",
         "c.id === claimed",
         "c.session === name",
         "c.status === 'doing'",
@@ -467,13 +470,18 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
         .expect("session-card renderer must exist");
     let render = &app[render_start..render_start + 16_000.min(app.len() - render_start)];
     for needle in [
-        "const liveBoardTask = _cardDoingItem(s.name)",
-        "liveBoardTask ? (liveBoardTask.title || liveBoardTask.id)",
-        "liveBoardTask ? liveBoardTask.id : s.task_board_id",
+        "const runtimeBoard = _runtimeBoardPresentation(s);",
+        "runtimeBoard.cardId",
+        "Synchronizing runtime/board truth…",
+        "runtimeBoard.syncing ? _runtimeBoardSyncBadge()",
         "_taskIdChip({task_board_id: displayTaskBoardId})",
     ] {
         assert!(render.contains(needle), "session card lost live board linkage `{needle}`");
     }
+    assert!(
+        !render.contains("_cardDoingItem(s.name)"),
+        "the worker card must not rebuild runtime truth from an independently refreshed boardItems snapshot"
+    );
     assert!(
         app.contains("board-card-live-label\"><span class=\"board-live-dot\"></span>Working now"),
         "a live board card needs an explicit visible label, not only a border or tooltip"
@@ -489,6 +497,17 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
         "truth.verdict",
     ] {
         assert!(app.contains(needle), "unattributed runtime lost its server-verdict treatment `{needle}`");
+    }
+    for needle in [
+        "let _sessionsSnapshotEpoch = 0",
+        "snapshotEpoch !== _sessionsSnapshotEpoch",
+        "let _boardSnapshotEpoch = 0",
+        "snapshotEpoch !== _boardSnapshotEpoch",
+        "function _runtimeBoardPresentation(s)",
+        "Number(truth.card_count) !== 1",
+        "_runtimeBoardSyncBadge()",
+    ] {
+        assert!(app.contains(needle), "a stale poll may again publish a false WORKING/no-card combination without `{needle}`");
     }
     for rejected in ["no board task claimed", "board-unclaimed-mount", "_activeWithoutClaim"] {
         assert!(!app.contains(rejected), "runtime activity must not manufacture the board pseudo-state `{rejected}`");
