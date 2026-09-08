@@ -12,7 +12,8 @@ remain intact. No worker restart or signal to protected tmux PIDs was used.
   contention, not the initiating cause of every subsequent stall.
 - 10:03:18: watchdog health timeout, recovery 10:03:57.
 - 10:09:40: unannounced server start, PID 91066. Watchdog did not record a
-  restart-threshold firing then. The initiating stop remains unproven.
+  restart-threshold firing then. Later correlated to an explicit external
+  launchctl reload to apply plist changes (see supervisor follow-up below).
 - 10:12:56: builder began rebuilding already-stamped `a604412b492330dc67e4138b0b77443840fa72b9`,
   logging matching health commit `a604412b4923` as STAMP DRIFT. Build took 3m01s.
 - 10:14:50 and 10:15:40: watchdog timed out; 10:16:06: same-revision self-exec;
@@ -149,8 +150,23 @@ the measured linked-status/card-id refusal that actually ships. Final results
 are recorded on AMUX-4225 after the clean committed checks finish.
 
 A bounded native unified-log read found launchd reporting `service inactive`
-and `removing service: com.amux.server-rs` at 10:09:37.847641/847642 EDT, just
-before PID 91066's 10:09:40 start. This narrows the unexplained boot to a
-supervisor service-removal event; the available records do not identify its
-caller. Receipts: `launchd-restart-evidence.json`, `launchd-restart-detail.json`
-and `launchd-restart-context.json` under the private incident directory.
+and `removing service: com.amux.server-rs` at 10:09:37.847641/847642 EDT. The
+surrounding five-second launchd window supplied the missing initiator chain:
+`launchctl[90728] <- bash[90719] <- Claude[43527]`, from an iTerm session.
+At 10:09:40.788513, launchctl[91064] successfully bootstrapped the service;
+10:09:40.799013 records the spawn of amux-server-rs[91066].
+
+The matching local command record at 10:09:31.734 explicitly ran `launchctl
+bootout` followed by `launchctl bootstrap` with the stated purpose of picking
+up all plist changes. Its 10:09:48 follow-up reported uptime 3s and the new
+65536 FD limit. This resolves that restart as an intentional external service
+reload, separate from the redundant build/adoption feedback. It appeared
+unannounced because that external reload did not carry the self-adoption
+marker. The earlier September 7 tmux initiating-stall uncertainty remains in
+its own original RCA; it is not reopened here.
+
+Receipts under the private incident directory: `launchd-restart-evidence.json`,
+`launchd-restart-detail.json`, `launchd-restart-context.json`, the concise
+`launchd-restart-summary.json`, `restart-command-summary.json` and
+`restart-purpose-summary.json`. No worker restart or protected tmux signal
+was needed to obtain this evidence.
