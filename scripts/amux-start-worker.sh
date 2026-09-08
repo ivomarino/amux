@@ -71,6 +71,29 @@ started=0
 failed=0
 failed_names=()
 
+# AMUX-120: "ok":true here only means the API accepted the launch request
+# and sent the keystrokes — it was being logged and counted as
+# "successful" even when the pane's shell never actually got a live claude
+# child (confirmed live 2026-09-04: a transient PATH/.bashrc problem at
+# boot left 5 of 7 lanes with a dead "claude: command not found" shell,
+# while this script's own log read "7 started, 0 failed" the whole time).
+# A status code has no operand (ethos rule 4) — verify the thing the log
+# claims, don't just trust the accept response. Poll the session's real
+# `running` state (the same is_running() probe the invariant trusts) with
+# a short retry window before counting a lane as started.
+verify_running() {
+    local name="$1" tries=0
+    while [ $tries -lt 5 ]; do
+        sleep 2
+        if /usr/bin/curl -sk --connect-timeout 3 --max-time 5 "https://localhost:8824/api/sessions/$name" 2>/dev/null \
+          | grep -q '"running":true'; then
+            return 0
+        fi
+        tries=$((tries + 1))
+    done
+    return 1
+}
+
 for f in "${lane_files[@]}"; do
     name=$(basename "$f" .env)
     echo "$(date): Calling amux API to start worker: $name..." >> "$LOG_FILE"
@@ -81,8 +104,14 @@ for f in "${lane_files[@]}"; do
     echo "$(date): [$name] curl exit=$CURL_RC response=$RESPONSE" >> "$LOG_FILE"
 
     if [ $CURL_RC -eq 0 ] && echo "$RESPONSE" | grep -q '"ok":true'; then
-        echo "$(date): [$name] worker startup successful" >> "$LOG_FILE"
-        started=$((started + 1))
+        if verify_running "$name"; then
+            echo "$(date): [$name] worker startup successful (verified running)" >> "$LOG_FILE"
+            started=$((started + 1))
+        else
+            echo "$(date): [$name] WARN worker startup ACCEPTED but pane never came up running (checked for ~10s) — likely a dead shell (bad PATH, missing binary, .bashrc error); treating as failed" >> "$LOG_FILE"
+            failed=$((failed + 1))
+            failed_names+=("$name")
+        fi
     else
         echo "$(date): [$name] worker startup FAILED" >> "$LOG_FILE"
         failed=$((failed + 1))

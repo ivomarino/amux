@@ -12,7 +12,9 @@
 # pipeline does NOT build it itself: baking the toolchain + a warm dependency
 # cache into every run is the exact slowness this pipeline exists to avoid.
 # Rebuild it manually whenever Cargo.lock changes enough that the cache goes
-# meaningfully stale.
+# meaningfully stale — scripts/rebuild-rust-base.sh does this across all
+# real build hosts at once (amux's own job as of 2026-09-05, see
+# docs/woodpecker-setup.md).
 #
 # Structural advantages over the ad-hoc `docker build` approach it replaces,
 # worth naming explicitly since they're not obvious from the YAML alone:
