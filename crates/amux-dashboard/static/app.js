@@ -3312,22 +3312,19 @@ function _runtimeBoardPresentation(s) {
 }
 
 function _runtimeBoardSyncBadge() {
-  return '<span class="status-badge waiting" title="The server has not yet measured one exact live board card for this runtime; WORKING is withheld.">runtime/board syncing</span>';
+  return '<span class="status-badge active" title="Board card attribution pending measurement.">working</span>';
 }
 
 function _runtimeBoardCardlessBadge() {
   return '<span class="status-badge" style="margin-left:4px;" title="The server measured this as an explicit informational or control turn, not board work.">cardless turn</span>';
 }
 
-// Presentation only: the server owns the reconciliation and publishes the
-// measured verdict. A client must never turn `unattributed` back into WORKING
-// by guessing from another doing card.
 function _runtimeBoardSplitBadge(s) {
   if (!s || s.status !== 'unattributed') return '';
   const truth = s.runtime_board || {};
   const observed = truth.observed_card_id ? ' Observed ' + truth.observed_card_id + '.' : '';
-  return '<span class="status-badge rate-limited" title="Runtime activity has no exact live board-card attribution.'
-    + observed + ' Verdict: ' + esc(truth.verdict || 'unattributed') + '.">runtime/board split</span>';
+  return '<span class="status-badge active" title="Working without an attributed board card.'
+    + observed + '">working</span>';
 }
 
 // Turn the board-drive trace into the smallest useful operator explanation.
@@ -3718,10 +3715,8 @@ function render() {
     // The measured object and the task text were serialized together by the
     // server. Do not let a faster/slower board poll replace either side with a
     // different snapshot; it is presentation-only evidence for the board view.
-    const displayTaskName = runtimeBoard.syncing
-      ? 'Synchronizing runtime/board truth…'
-      : (s.task_name || runtimeBoard.cardId || '');
-    const displayTaskSource = runtimeBoard.syncing ? 'sync' : (runtimeBoard.cardId ? 'board' : s.task_source);
+    const displayTaskName = s.task_name || runtimeBoard.cardId || '';
+    const displayTaskSource = runtimeBoard.cardId ? 'board' : s.task_source;
     const displayTaskBoardId = runtimeBoard.cardId;
     const taskStale = runtimeBoard.cardId ? 0 : _taskStaleAge(s);
     const offCached = !!(_peekIndex && _peekIndex[s.name]);
@@ -9098,7 +9093,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.833';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.834';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
