@@ -3978,3 +3978,45 @@ COST: Exact-SHA Rust CI ran for over four minutes and blocked ATE-93's terminal
 FIX: Compute the fixture timestamp once and use that same binary value for the
   report and strict round-trip assertion. The failure now self-announces the
   JSON/SQLite contract instead of conflating codegen rounding with persistence.
+
+---
+## The activation authority rebuilds on a probe that TIMED OUT, and the rebuild is what makes probes time out
+AREA: instruments
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-08
+SESSION: amux-frustrations
+CARD: AMUX-4225
+SYMPTOM: Both `--max-time` curls in `scripts/rust-auto-build.sh` (2 of 2) convert a
+  FAILED probe into an adoption verdict. `stamp_matches_live_image` does
+  `live=$(live_server_commit) || return 1` on a `--max-time 4` health call, and
+  `overlap_deploy_permitted` does `curl --max-time 8 ... || { OVERLAP GUARD
+  UNMEASURED; return 1; }`. Neither can say "I could not measure"; a timeout is
+  spent as a negative answer, and the correction is a full `--release` rebuild.
+  That rebuild (rustc measured at 596% CPU, plus a 1268-file worktree checkout and
+  a 14 GB target clear) is a large contributor to the load that makes the next
+  probe time out. Measured on this box at 10:38 EDT: load average 163.55 with
+  `available_parallelism` 28, `/api/health` p95 4731 ms over the trailing hour
+  against a 2 ms baseline, and TLS handshake timeouts on the watchdog.
+  The abbreviated-SHA theory is WRONG and worth recording as dead so nobody
+  re-derives it: `stamp_matches_live_image` compares with a PREFIX pattern
+  (`case "$built_sha" in "$live"*`), so 12-char `a604412b4923` against the 40-char
+  stamp matches correctly. The reason a604412b logged STAMP DRIFT while NAMING a
+  matching commit is that the deciding probe failed and line 195 then RE-PROBED
+  successfully to compose the message. The log line prints evidence against the
+  verdict it announces, from a different call than the one that decided.
+COST: 10 STAMP DRIFT verdicts and 3 OVERLAP GUARD refusals today, each costing a
+  redundant release build of an already-installed revision; watchdog /health
+  timeouts at 10:03, 10:14, 10:15, 10:26 and 10:28; `/api/sessions` returning zero
+  bytes after 20s at 10:34; TubeScience independently blocked registering handoffs
+  on a 20s localhost read timeout. Two lanes spent the morning diagnosing a loop
+  whose trigger is its own remedy.
+FIX: Not mine to write. `amux` (isolated) has the fix already written and
+  UNCOMMITTED in this shared checkout: `crates/amux-server/src/activation.rs`
+  (hash-checked install identity, `same_revision` skip), `runtime_jobs/poll_watch.rs`
+  (WARN naming a job that holds a runtime thread), and an `ACTIVATION AWAITING
+  ADOPTION` skip_rebuild path in the builder. Not live: `origin/main`'s builder has
+  0 occurrences of `ACTIVATION AWAITING ADOPTION`, the worktree has 1, and the
+  launchd authority runs committed bytes from `~/.amux/activation-source`.
+  Deliberately left untouched, per the shared-checkout rule. `amux` is an isolated
+  raw-agent worker: my send was refused, so only the owner can ask it to commit.
