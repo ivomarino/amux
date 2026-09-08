@@ -873,8 +873,77 @@ def main():
             "AF-507/control: a genuine 40-file commit with NO drift was blocked (rc=%s). "
             "The signal is drift, not size. stderr: %r" % (_rc, _err[:300]))
 
+    # ---- AF-577: `git config` from inside a LINKED WORKTREE writes SHARED ----
+    # A linked worktree has no config of its own unless
+    # extensions.worktreeConfig is enabled, so a bare `git config` there rewrites
+    # the file the main checkout and every sibling worktree read. Through this
+    # channel `core.bare true` killed every work-tree operation for every lane on
+    # the mixpeek checkout for ~30 minutes, and the identity half authored 9
+    # commits as `t <t@t.t>` (mixpeek-general, 132a2b8a).
+    #
+    # SHARED_ROOT IS DELIBERATELY A DIRECTORY THAT IS NOT THIS REPO. A linked
+    # worktree is never inside the checkout it belongs to (ours live in /tmp, per
+    # CLAUDE.md:185), so a check gated on AMUX_SHARED_CHECKOUTS could not fire on
+    # any real target. The first draft sat after that gate and returned 0 for all
+    # cells including `core.bare true`; passing an unrelated shared_root here is
+    # what stops it silently drifting back behind the gate.
+    _wt = tempfile.mkdtemp(prefix="guardwt-")
+    _wt_main = os.path.join(_wt, "main")
+    _wt_linked = os.path.join(_wt, "linked")
+    subprocess.run(["git", "init", "-q", "-b", "main", _wt_main], capture_output=True)
+    git(_wt_main, "config", "user.email", "a@b.c")
+    git(_wt_main, "config", "user.name", "ab")
+    subprocess.run(["git", "-C", _wt_main, "commit", "-q", "--allow-empty", "-m", "init"],
+                   capture_output=True)
+    subprocess.run(["git", "-C", _wt_main, "worktree", "add", "-q", _wt_linked, "-b", "side"],
+                   capture_output=True)
+    _elsewhere = os.path.join(_wt, "not-the-repo")
+    os.makedirs(_elsewhere, exist_ok=True)
+
+    _wtcases = [
+        ("git config user.email t@t.t", _wt_linked, True,
+         "the identity write that authored 9 commits as t@t.t"),
+        ("git config core.bare true", _wt_linked, True,
+         "the write that took a whole fleet down"),
+        ("git config --add remote.o.url u", _wt_linked, True, "--add is a write"),
+        ("git config --unset user.email", _wt_linked, True, "--unset writes the SHARED file"),
+        # The MAIN checkout owns its own config; refusing there would break every
+        # legitimate repo-level setting and is the obvious over-reach.
+        ("git config user.email t@t.t", _wt_main, False,
+         "the main checkout writing its own config is not this defect"),
+        ("git config --global user.email t@t.t", _wt_linked, False, "--global is an exit"),
+        ("git config --worktree core.bare true", _wt_linked, False, "--worktree is an exit"),
+        ("git config --file /tmp/x k v", _wt_linked, False, "--file is an exit"),
+        # READS. `git config user.email` and `git config user.email x` differ only
+        # in operand count and no flag separates them.
+        ("git config user.email", _wt_linked, False, "a bare key is a READ"),
+        ("git config --get user.email", _wt_linked, False, "--get is a READ"),
+        ("git config -l", _wt_linked, False, "-l is a READ"),
+        # Not a repo: the probe cannot run, so it must not produce a verdict.
+        ("git config user.email t@t.t", _elsewhere, False,
+         "no repo -> unmeasured -> must not block (AF-559)"),
+        ("echo hello", _wt_linked, False, "a non-git command is untouched"),
+    ]
+    _wtcfg = len(_wtcases)
+    for _c, _d, _want_block, _why in _wtcases:
+        _rc, _err = run_hook(_c, _d, _elsewhere)
+        _blocked = _rc == 2
+        if _blocked != _want_block:
+            failures.append(
+                "AF-577: %r in %s -> blocked=%s, want %s (%s). stderr: %r"
+                % (_c, "linked" if _d == _wt_linked else os.path.basename(_d),
+                   _blocked, _want_block, _why, _err[:200]))
+    # The refusal must NOT offer --local, which in a linked worktree IS the shared
+    # file. Recommending it would name the defect as its own cure.
+    _rc, _err = run_hook("git config core.bare true", _wt_linked, _elsewhere)
+    _wtcfg += 1
+    if "--local" not in _err or "NOT one of them" not in _err:
+        failures.append(
+            "AF-577: the refusal must explicitly rule OUT --local; got %r" % _err[:300])
+
     total = (len(cases) + len(trio) + len(quad) + len(matrix) + _bodies + 1
-             + len(redir_cases) + _mr101 + _subst + _lockcases + _amendlock + _sweep)
+             + len(redir_cases) + _mr101 + _subst + _lockcases + _amendlock + _sweep
+             + _wtcfg)
     if failures:
         print(f"FAIL {len(failures)}/{total}:")
         for f in failures:

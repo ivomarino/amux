@@ -1307,6 +1307,111 @@ def _discard_verdict(cmd, scrubbed, run_dir):
             "they may be yours, a peer's with no record, or both. " + tail)
 
 
+# ---------------------------------------------------------------- AF-577 ----
+# A LINKED WORKTREE SHARES .git/config WITH THE MAIN CHECKOUT.
+#
+# Any `git config` run inside one, without --worktree, rewrites the file every
+# other worktree and the main checkout read. No GIT_DIR, no inherited
+# environment, no hook involved, which is why a long hunt for an environment
+# channel came back empty (mixpeek-general 132a2b8a, after retracting their own
+# GIT_DIR hypothesis when mixpeek-cicd falsified it).
+#
+# Reproduced here, fresh repo, no GIT_DIR:
+#   BEFORE  main user.email=<real>  core.bare=false
+#   (cd linked && git config user.email t@t.t && git config core.bare true)
+#   AFTER   main user.email=t@t.t   core.bare=true
+#
+# COST WHEN IT LANDS: `core.bare=true` killed every work-tree operation for
+# every lane at once for ~30 minutes on the mixpeek checkout (MG-1648), and the
+# identity half authored 9 commits on their origin/main as `t <t@t.t>`.
+#
+# WHY --local IS NOT AN EXIT: in a linked worktree "local" IS the shared file.
+# That is the whole defect, so listing --local as an escape would recommend the
+# thing being refused.
+#
+# WHY THIS GUARD AND NOT extensions.worktreeConfig: enabling the extension makes
+# a private config POSSIBLE; it does not stop a bare `git config` from still
+# writing shared. The protection has to sit where the command is issued.
+_CONFIG_READ_FLAGS = (
+    "--get", "--get-all", "--get-regexp", "--get-urlmatch", "--get-color",
+    "--get-colorbool", "--list", "-l", "--default", "--type", "--name-only",
+)
+_CONFIG_WRITE_FLAGS = (
+    "--add", "--replace-all", "--unset", "--unset-all",
+    "--rename-section", "--remove-section", "--edit", "-e",
+)
+# Writes that do NOT touch the shared file. --local is deliberately absent.
+_CONFIG_SCOPE_EXITS = ("--global", "--system", "--worktree", "--file", "-f", "--blob")
+
+
+def _config_write_tokens(scrubbed):
+    """The `git config ...` argument list when this command WRITES, else None.
+
+    Read the OPERANDS, not just the flags: `git config user.email` is a read and
+    `git config user.email x` is a write, and no flag distinguishes them.
+    """
+    m = re.search(r'\bgit\s+' + GIT_GLOBALS + r'config(?![-\w])([^\n;&|]*)', scrubbed)
+    if not m:
+        return None
+    toks = m.group(1).split()
+    if any(t in _CONFIG_SCOPE_EXITS or t.startswith("--file=") or t.startswith("--blob=")
+           for t in toks):
+        return None                      # writes somewhere that is not shared
+    if any(t in _CONFIG_WRITE_FLAGS for t in toks):
+        return toks
+    if any(t in _CONFIG_READ_FLAGS or t.startswith("--type=") or t.startswith("--default=")
+           for t in toks):
+        return None                      # an explicit read
+    operands = [t for t in toks if not t.startswith("-")]
+    # <key> alone is a read; <key> <value> is a write. Zero operands is `git
+    # config` with nothing, which git treats as an error, so it changes nothing.
+    return toks if len(operands) >= 2 else None
+
+
+def _linked_worktree_main(run_dir):
+    """The MAIN checkout path when run_dir is a LINKED worktree, else None.
+
+    Decided by git, not by guessing at path shape: in a linked worktree
+    --git-dir points at <main>/.git/worktrees/<name> while --git-common-dir
+    points at <main>/.git, and in the main checkout the two are equal.
+
+    READS THE STATUS, not just the output. A non-zero git here means the probe
+    could not run (not a repo, git missing, core.bare already broken), and an
+    unrun probe must not produce a verdict about the directory (AF-559).
+    """
+    import subprocess  # imported locally, as everywhere else in this file
+    try:
+        r = subprocess.run(
+            ["git", "-C", run_dir, "rev-parse", "--git-dir", "--git-common-dir"],
+            capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    parts = [x.strip() for x in (r.stdout or "").splitlines() if x.strip()]
+    if len(parts) != 2:
+        return None
+    gitdir, common = (os.path.realpath(os.path.join(run_dir, p)) for p in parts)
+    if gitdir == common:
+        return None                      # the main checkout, or a bare repo
+    return os.path.dirname(common)
+
+
+def _worktree_config_verdict(cmd, scrubbed, run_dir):
+    toks = _config_write_tokens(scrubbed)
+    if not toks:
+        return None
+    main = _linked_worktree_main(run_dir)
+    if not main:
+        return None
+    setting = " ".join(toks[:3])
+    return (
+        "`git config " + setting + "` in a LINKED WORKTREE writes the config SHARED with "
+        + main + " and every other worktree of it, because a linked worktree has no config "
+        "of its own"
+    )
+
+
 def _has_cotenants(run_dir):
     """True if another live session shares this repo root. Fail-CLOSED to False
     (allow) on any error, matching the guard's standing fail-open contract: a
@@ -1589,6 +1694,46 @@ def main():
         # prefix with a trailing variable (`-C /shared/root/$X reset --hard`)
         # must stay guarded even when the session cwd is elsewhere.
         _scope_dirs.append(os.path.realpath(os.path.expanduser(_unexpanded_c)))
+    # RUNS BEFORE THE STATIC-SCOPE GATE, for the same reason the discard check
+    # above does, and more sharply: AMUX_SHARED_CHECKOUTS defaults to
+    # ~/Dev/mixpeek, and a LINKED WORKTREE IS NEVER INSIDE THE CHECKOUT IT
+    # BELONGS TO. Our own convention puts them in /tmp (CLAUDE.md:185 says
+    # `git worktree add --detach /tmp/push-check main`), so gating this on that
+    # list would make it structurally unable to fire on any real target.
+    #
+    # Caught by testing it: placed after the gate it returned 0 for every cell,
+    # including `git config core.bare true` from a linked worktree, which is the
+    # exact command that took the mixpeek fleet down. An inert guard that reads
+    # as installed is worse than no guard, because nobody looks again.
+    #
+    # It needs no list. It self-scopes on a FACT about the repo (is this cwd a
+    # linked worktree, decided by git rev-parse), not on a static membership
+    # roll that drifts by construction.
+    # AF-577: a `git config` WRITE from inside a linked worktree lands in the
+    # config shared with the main checkout and every sibling worktree. Checked
+    # before the sweep verdict because its blast radius is the whole repo for
+    # every lane at once (core.bare=true took the mixpeek fleet down for ~30
+    # minutes), where a sweep buries one tree.
+    wt_why = None
+    try:
+        wt_why = _worktree_config_verdict(cmd, scrubbed, run_dir)
+    except Exception:
+        wt_why = None  # fail-open, same posture as the rest of the guard
+    if wt_why:
+        if _consume_override(cmd):
+            sys.stderr.write(f"amux guard: ALLOWED once (owner-sanctioned): {wt_why}\n")
+        else:
+            sys.stderr.write(
+                f"BLOCKED by amux shared-checkout guard: {wt_why}.\n"
+                f"EXITS, and --local is NOT one of them (in a linked worktree \"local\" IS "
+                f"the shared file, which is the whole defect):\n"
+                f"  --global / --system   for anything about you rather than this repo\n"
+                f"  --worktree            needs `git config --global extensions.worktreeConfig "
+                f"true` first; without it a worktree has NO private config\n"
+                f"  run it from the MAIN checkout, if the setting really is repo-wide\n"
+                f"OWNER-AUTHORIZED one-off: write the exact command to ~/.amux/guard-allow-once "
+                f"and re-run (consumed once, audit-logged).\n")
+            return 2
     if not any(d == s or d.startswith(s + os.sep) for d in _scope_dirs for s in shared):
         if not _has_cotenants(run_dir):
             return 0
