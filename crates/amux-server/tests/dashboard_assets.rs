@@ -506,7 +506,13 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
         "s.status !== 'unattributed'",
         "active-conflicting-claims",
         ">card conflict</span>",
-        ">card syncing</span>",
+        // `>card syncing</span>` was pinned here by 03061448 and deliberately
+        // REMOVED from app.js by 9127257d ("remove false 'card syncing'
+        // badges from worker cards"), which named three distinct causes of
+        // the badge being wrong and left this needle behind. The test then
+        // demanded a treatment the dashboard had stopped rendering on
+        // purpose, so it reddened `rust` on main from 9127257d onward while
+        // describing the failure as lost functionality.
         "truth.verdict",
     ] {
         assert!(app.contains(needle), "unattributed runtime lost its server-verdict treatment `{needle}`");
@@ -527,7 +533,12 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
         "let _boardSnapshotEpoch = 0",
         "snapshotEpoch !== _boardSnapshotEpoch",
         "function _runtimeBoardPresentation(s)",
-        "Number(truth.card_count) !== 1",
+        // `Number(truth.card_count) !== 1` was the SECOND needle 9127257d
+        // stranded. That commit's own cause #1 is this exact check: "Active
+        // workers with card_count > 1 (e.g. gainz with 2 cards) were shown as
+        // 'card syncing' because the check required exactly 1. A linked worker
+        // with a known card_id is working, regardless of count." Pinning the
+        // removed predicate re-asserts the bug it was removed to fix.
         "_runtimeBoardSyncBadge()",
     ] {
         assert!(app.contains(needle), "a stale poll may again publish a false WORKING/no-card combination without `{needle}`");
