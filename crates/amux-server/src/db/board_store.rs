@@ -3002,12 +3002,31 @@ fn terminal_summary(
 ) -> rusqlite::Result<(String, usize)> {
     let (action_count, latest_action) = terminal_action_digest(row.log.as_deref());
     let evidence = compact_terminal_text(row.evidence.as_deref().unwrap_or("not recorded"), 1200);
+    // "not supplied" WAS VERY NEARLY A CONSTANT, and a constant cannot disagree
+    // with the run, so it read as a measurement to every reader.
+    //
+    // This clause reads `last_result`, which only `board next --result` writes.
+    // The verb a lane closing a card actually uses is `--outcome`, and that goes
+    // to `desc_append` and `evidence` (amux:2138, amux:2039). `last_result` is
+    // then overwritten by THIS function's own composed summary, which the filter
+    // below correctly rejects. So the clause announced "not supplied" almost
+    // every time, including directly above an evidence line carrying the very
+    // outcome it said was missing.
+    //
+    // Reported by mixpeek-frustrations 2026-09-08 on MS-1388: mixpeek-studio had
+    // done a full prod verification and recorded it, and the callback still led
+    // with "closed the request without resolving the dependency ... not supplied
+    // ... none recorded". They chased it to the board before they could tell it
+    // from a dropped request, for the second time that day.
+    //
+    // So the clause is now OMITTED when there is nothing to report, rather than
+    // asserting a negative the payload contradicts one field over. Saying
+    // nothing is the honest form of having nothing to say.
     let recorded_outcome = row
         .last_result
         .as_deref()
         .filter(|summary| !summary.starts_with("Final outcome:"))
-        .map(|summary| compact_terminal_text(summary, 600))
-        .unwrap_or_else(|| "not supplied".to_string());
+        .map(|summary| compact_terminal_text(summary, 600));
     let mut assets = Vec::new();
     let mut seen = HashSet::new();
     for artifact in crate::db::artifact_store::list_for_task(conn, &row.id)? {
@@ -3053,10 +3072,14 @@ fn terminal_summary(
             assets.len(),
         ));
     }
+    let outcome_clause = match recorded_outcome {
+        Some(text) => format!(" Recorded terminal outcome: {text}."),
+        None => String::new(),
+    };
     Ok((
         format!(
-            "Final outcome: {} (from {}). Recorded terminal outcome: {}. Actions: {} recorded; latest: {}. Tests/deployment/live evidence: {}. Linked assets: {}.",
-            row.status, from, recorded_outcome, action_count, latest_action, evidence, linked_assets
+            "Final outcome: {} (from {}).{} Actions: {} recorded; latest: {}. Tests/deployment/live evidence: {}. Linked assets: {}.",
+            row.status, from, outcome_clause, action_count, latest_action, evidence, linked_assets
         ),
         assets.len(),
     ))
@@ -5272,6 +5295,54 @@ column=silent type:code=outranked(2)"
     /// re-derive, and concluded the override was pinned per-card. Worker and
     /// Group are exactly the rungs that were never asserted.
     ///
+    /// The outcome clause must report, never assert a negative it cannot support.
+    ///
+    /// "Recorded terminal outcome: not supplied" was very nearly a CONSTANT.
+    /// It reads `last_result`, which only `board next --result` writes; a lane
+    /// closing a card uses `--outcome`, which goes to desc_append and evidence,
+    /// and `last_result` is then overwritten by terminal_summary's own output
+    /// and filtered out. So the clause announced "not supplied" almost every
+    /// time, including directly above an evidence line carrying that outcome.
+    ///
+    /// mixpeek-frustrations, MS-1388, 2026-09-08: mixpeek-studio had done a full
+    /// prod verification and recorded it; the callback still said not supplied.
+    #[test]
+    fn the_outcome_clause_is_omitted_rather_than_asserting_not_supplied() {
+        let mut conn = Connection::open_in_memory().expect("memdb");
+        crate::db::migrate::apply_all(&mut conn).expect("schema");
+        let add = |id: &str, last_result: Option<&str>| {
+            conn.execute(
+                "INSERT INTO issues (id, title, status, type, created, updated, last_result)
+                 VALUES (?1, ?2, 'discarded', 'doc', ?3, ?3, ?4)",
+                rusqlite::params![id, format!("t {id}"), 1_760_000_000.0_f64, last_result],
+            ).expect("insert");
+            get_issue(&conn, id).expect("read").expect("row")
+        };
+
+        // A card whose last_result is this function's OWN prior output, which is
+        // the overwhelmingly common real state.
+        let echoed = add("C-ECHO", Some("Final outcome: discarded (from doing). Actions: 1 recorded."));
+        let (text, _) = terminal_summary(&conn, &echoed, "doing").expect("summary");
+        assert!(!text.contains("not supplied"),
+            "must not assert an absence it cannot support: {text}");
+        assert!(!text.contains("Recorded terminal outcome"),
+            "the clause is omitted, not emptied: {text}");
+        assert!(text.starts_with("Final outcome: discarded (from doing)."), "{text}");
+
+        // A card with nothing recorded at all: same, no negative asserted.
+        let bare = add("C-BARE", None);
+        let (bare_text, _) = terminal_summary(&conn, &bare, "doing").expect("summary");
+        assert!(!bare_text.contains("not supplied"), "{bare_text}");
+
+        // THE CONTROL, and it is the one that matters: a REAL recorded outcome
+        // must still be reported. Without this, deleting the clause entirely
+        // would pass everything above.
+        let real = add("C-REAL", Some("Verified the CTA on studio.mixpeek.com; manifest chain checked."));
+        let (real_text, _) = terminal_summary(&conn, &real, "doing").expect("summary");
+        assert!(real_text.contains("Recorded terminal outcome:"), "{real_text}");
+        assert!(real_text.contains("Verified the CTA on studio.mixpeek.com"), "{real_text}");
+    }
+
     /// A fold must be readable as a fold, from the log alone.
     ///
     /// Reported 2026-09-08 by mixpeek-frustrations and, independently, by
