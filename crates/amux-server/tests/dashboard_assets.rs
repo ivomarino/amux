@@ -483,7 +483,7 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
     for needle in [
         "const runtimeBoard = _runtimeBoardPresentation(s);",
         "runtimeBoard.cardId",
-        "Synchronizing runtime/board truth…",
+        "const displayTaskName = s.task_name || runtimeBoard.cardId || '';",
         "runtimeBoard.syncing ? _runtimeBoardSyncBadge()",
         "_taskIdChip({task_board_id: displayTaskBoardId})",
     ] {
@@ -504,11 +504,23 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
     for needle in [
         "function _runtimeBoardSplitBadge(s)",
         "s.status !== 'unattributed'",
-        "runtime/board split",
+        "active-conflicting-claims",
+        ">card conflict</span>",
+        ">card syncing</span>",
         "truth.verdict",
     ] {
         assert!(app.contains(needle), "unattributed runtime lost its server-verdict treatment `{needle}`");
     }
+    assert!(
+        app.contains("verdict === 'active-conflicting-claims'")
+            && app.contains("status-badge rate-limited")
+            && app.contains("status-badge waiting"),
+        "only competing live claims should receive the red conflict treatment"
+    );
+    assert!(
+        !app.contains(">runtime/board split</span>"),
+        "a recoverable task-link lag must not be presented as a red runtime failure"
+    );
     for needle in [
         "let _sessionsSnapshotEpoch = 0",
         "snapshotEpoch !== _sessionsSnapshotEpoch",

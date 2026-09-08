@@ -3312,7 +3312,7 @@ function _runtimeBoardPresentation(s) {
 }
 
 function _runtimeBoardSyncBadge() {
-  return '<span class="status-badge active" title="Board card attribution pending measurement.">working</span>';
+  return '<span class="status-badge waiting" title="The worker is running; AMUX is still linking this runtime to one exact live task.">card syncing</span>';
 }
 
 function _runtimeBoardCardlessBadge() {
@@ -3322,9 +3322,17 @@ function _runtimeBoardCardlessBadge() {
 function _runtimeBoardSplitBadge(s) {
   if (!s || s.status !== 'unattributed') return '';
   const truth = s.runtime_board || {};
-  const observed = truth.observed_card_id ? ' Observed ' + truth.observed_card_id + '.' : '';
-  return '<span class="status-badge active" title="Working without an attributed board card.'
-    + observed + '">working</span>';
+  const verdict = String(truth.verdict || 'unattributed');
+  const observed = truth.observed_card_id ? ' Observed ' + esc(truth.observed_card_id) + '.' : '';
+  // Most unattributed turns are a stale/missing task link, not a stopped or
+  // failed worker. Keep that honest but quiet. Only two competing live claims
+  // need the red operator-attention treatment.
+  if (verdict === 'active-conflicting-claims') {
+    return '<span class="status-badge rate-limited" title="This running worker has more than one live task claim, so AMUX will not guess.'
+      + observed + ' Diagnostic: ' + esc(verdict) + '.">card conflict</span>';
+  }
+  return '<span class="status-badge waiting" title="The worker is running; its exact live task link is not available yet.'
+    + observed + ' Diagnostic: ' + esc(verdict) + '.">card syncing</span>';
 }
 
 // Turn the board-drive trace into the smallest useful operator explanation.
@@ -9093,7 +9101,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.834';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.835';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.

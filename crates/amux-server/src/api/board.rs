@@ -29,7 +29,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rusqlite::OptionalExtension;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
@@ -6757,6 +6757,90 @@ mod overlap_reconciliation_tests {
     }
 }
 
+/// Record the causal runtime marker for work the owning lane explicitly moved
+/// into `doing`. `amux board doing` and `amux board claim` are both documented
+/// ways to start work; only the latter used to write this marker, leaving the
+/// sessions API with a live Doing card and an unrelated older claim.
+///
+/// The state-entry timestamp makes this idempotent per Doing lifecycle. That
+/// matters because `/claim` on an already-owned Doing card is the sanctioned
+/// repair path, and repeated repairs must not inflate the repeat-offer ledger.
+fn ensure_owner_doing_claim(
+    conn: &Connection,
+    row: &IssueRow,
+    actor: &str,
+    source: &str,
+    from: &str,
+) -> rusqlite::Result<bool> {
+    if row.status != "doing" || row.session.as_deref() != Some(actor) {
+        return Ok(false);
+    }
+    let entered = row.entered_state_at.map(|at| at as f64).unwrap_or(0.0);
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_events \
+         WHERE session=?1 AND type='task.claimed' AND ts>=?2 \
+         AND json_extract(data,'$.issue')=?3)",
+        rusqlite::params![actor, entered, row.id],
+        |r| r.get(0),
+    )?;
+    if exists {
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT INTO session_events (ts,session,type,data,source) VALUES (?,?,?,?,?)",
+        rusqlite::params![
+            crate::config::now_f64(),
+            actor,
+            "task.claimed",
+            json!({"issue": row.id, "status": "doing", "from": from}).to_string(),
+            source,
+        ],
+    )?;
+    tracing::info!(
+        target: "amux::board",
+        marker = "owner_doing_claim_recorded",
+        task = %row.id,
+        worker = actor,
+        %source,
+        %from,
+        measured = true,
+        n_considered = 1,
+        "owner-started Doing work now has an exact runtime/board claim marker"
+    );
+    Ok(true)
+}
+
+async fn repair_owned_doing_claim(
+    state: &AppState,
+    session: &str,
+    card: &str,
+) -> anyhow::Result<bool> {
+    let repaired = Arc::new(Mutex::new(false));
+    let repaired_w = repaired.clone();
+    let session = session.to_string();
+    let card = card.to_string();
+    let write = state
+        .store
+        .write_async(move |conn| {
+            let Some(row) = bs::get_issue(conn, &card)? else {
+                return Ok(WriteOutcome { applied: false, events: vec![] });
+            };
+            let inserted = ensure_owner_doing_claim(
+                conn,
+                &row,
+                &session,
+                "board-claim-repair",
+                "doing",
+            )?;
+            *repaired_w.lock().expect("claim repair result slot poisoned") = inserted;
+            Ok(WriteOutcome { applied: inserted, events: vec![] })
+        })
+        .await?;
+    let inserted = *repaired.lock().expect("claim repair result slot poisoned");
+    debug_assert_eq!(write.applied, inserted);
+    Ok(inserted)
+}
+
 /// POST /api/board/{id}/claim — atomically take a `todo` or `backlog` card and
 /// start it. The CLI and auto-pickup share its compare-and-swap ->doing,
 /// assignment, and `task.claimed` event. Backlog remains claimable here while
@@ -6870,13 +6954,20 @@ pub async fn claim_item(
                 }
             }
         }
-        "doing" if owner == session => (
-            StatusCode::OK,
-            Json(json!({
-                "ok": true, "id": id, "status": "doing", "session": session, "already": true,
-            })),
-        )
-            .into_response(),
+        "doing" if owner == session => {
+            let attribution_repaired = match repair_owned_doing_claim(&state, &session, &id).await {
+                Ok(v) => v,
+                Err(e) => return internal(e),
+            };
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true, "id": id, "status": "doing", "session": session,
+                    "already": true, "attribution_repaired": attribution_repaired,
+                })),
+            )
+                .into_response()
+        }
         other => (
             StatusCode::CONFLICT,
             Json(json!({
@@ -10120,6 +10211,17 @@ pub async fn patch_item(
             }
             next.updated = now_secs();
             bs::save_patched(conn, &mut next)?;
+            if let Some((from, to)) = &status_event {
+                if to == "doing" {
+                    ensure_owner_doing_claim(
+                        conn,
+                        &next,
+                        &actor_name,
+                        "board-patch",
+                        from,
+                    )?;
+                }
+            }
             // AF-137 / AMUX-3464: retiring an auto-filed REPORT re-arms its
             // detector. The filing dedupe is a PERMANENT session_events idem
             // row ("a restart must not refile"), so a discarded report whose

@@ -2450,6 +2450,100 @@ async fn lifecycle_todo_doing_review_done_verified_via_state_machine() {
     assert!(v["error"].as_str().unwrap().contains("archive it instead"), "{v}");
 }
 
+#[tokio::test]
+async fn owner_doing_transition_records_claim_and_claim_repairs_a_missing_marker() {
+    let (app, store, _dir) = app_with_store();
+
+    let direct = create(
+        &app,
+        json!({
+            "title": "owner starts work directly",
+            "type": "chore",
+            "session": "direct-owner",
+        }),
+    )
+    .await;
+    let direct_id = direct["id"].as_str().unwrap();
+    let (st, _, direct_started) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{direct_id}"),
+        Some(json!({
+            "status": "doing",
+            "gate_ack": true,
+            "next_action": "exercise the direct-start attribution path",
+        })),
+        &[("X-Amux-Session", "direct-owner")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "owner start: {direct_started}");
+    let direct_markers: i64 = store
+        .read()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM session_events WHERE session='direct-owner' \
+             AND type='task.claimed' AND json_extract(data,'$.issue')=?1 \
+             AND source='board-patch'",
+            [direct_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(direct_markers, 1, "`board doing` must carry the same exact claim as `board claim`");
+
+    // A coordinator can move another lane's assigned card to Doing without
+    // claiming that runtime. The owning lane's idempotent `/claim` is the
+    // sanctioned repair and emits exactly one marker for this state entry.
+    let repair = create(
+        &app,
+        json!({
+            "title": "repair an older unmarked doing card",
+            "type": "chore",
+            "session": "repair-owner",
+        }),
+    )
+    .await;
+    let repair_id = repair["id"].as_str().unwrap();
+    let (st, _, moved) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{repair_id}"),
+        Some(json!({
+            "status": "doing",
+            "gate_ack": true,
+            "next_action": "exercise the repair path",
+        })),
+        &[("X-Amux-Session", "coordinator")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "coordinator move: {moved}");
+
+    for expected_repaired in [true, false] {
+        let (st, _, claimed) = send_with(
+            &app,
+            "POST",
+            &format!("/api/board/{repair_id}/claim"),
+            Some(json!({})),
+            &[("X-Amux-Session", "repair-owner")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "repair claim: {claimed}");
+        assert_eq!(claimed["already"], json!(true), "{claimed}");
+        assert_eq!(claimed["attribution_repaired"], json!(expected_repaired), "{claimed}");
+    }
+    let repair_markers: i64 = store
+        .read()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM session_events WHERE session='repair-owner' \
+             AND type='task.claimed' AND json_extract(data,'$.issue')=?1 \
+             AND source='board-claim-repair'",
+            [repair_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(repair_markers, 1, "repeated repair must not inflate task.claimed history");
+}
+
 // ---- PYTHON INTEROP: a live-shaped row survives the Rust API -------------
 
 #[tokio::test]
