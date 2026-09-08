@@ -188,7 +188,10 @@ fn establish_owner_session(state: &AppState) -> Response {
     let cookie = format!(
         "{OWNER_COOKIE}={value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000"
     );
-    let mut response = Redirect::to("/").into_response();
+    // Redirect to /?_fresh=1 so the service worker bypasses its stale cache
+    // on the redirected load too. Without this, the SW serves a cached HTML
+    // shell that predates the cookie, and the auth token is missing.
+    let mut response = Redirect::to("/?_fresh=1").into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&cookie).expect("hex owner-session cookie is a valid header"),
@@ -553,7 +556,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        assert_eq!(response.headers()[header::LOCATION], "/");
+        assert_eq!(response.headers()[header::LOCATION], "/?_fresh=1");
         let set_cookie = response.headers()[header::SET_COOKIE].to_str().unwrap();
         assert!(set_cookie.contains("HttpOnly") && set_cookie.contains("Secure"), "{set_cookie}");
         assert!(!set_cookie.contains("tok123"), "the raw bearer must not be copied into the cookie");

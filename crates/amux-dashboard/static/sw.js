@@ -1,4 +1,4 @@
-const CACHE = 'amux-v0.9.835';
+const CACHE = 'amux-v0.9.836';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -80,7 +80,7 @@ self.addEventListener('fetch', e => {
     // correct owner credential looking exactly like an unauthenticated peer.
     // `fetch(e.request)` follows the server redirect on the network, applying
     // Set-Cookie before the clean owner shell is returned.
-    if (url.searchParams.has('_token')) {
+    if (url.searchParams.has('_token') || url.searchParams.has('_fresh')) {
       e.respondWith(fetch(e.request));
       return;
     }
