@@ -283,14 +283,20 @@ else bad "(l) the override must SAY it overrode a peer, not clear silently" "$ou
 # "fix" this back to an exit-code test.)
 #
 # The shipped detector consumes the output too, so it is unaffected either way.
-# `|| true` because the STATUS IS IGNORED here: the decision below reads the
-# OUTPUT ($_real_builds being empty or not), never the exit code. On an IDLE
-# host both pgreps exit 1, `pipefail` propagates that through the substitution,
-# and `set -euo pipefail` then aborts the whole harness BEFORE it prints
-# anything. That is what turned CI red from 39ac1877 to 55920e07: it could not
-# reproduce on this box, where a builder keeps a cargo process alive so the
+# `|| true` on EACH pgrep, because the STATUS IS IGNORED here: the decision below
+# reads the OUTPUT ($_real_builds being empty or not), never the exit code. On an
+# IDLE host both pgreps exit 1, `pipefail` propagates that through the
+# substitution, and `set -euo pipefail` then aborts the whole harness BEFORE it
+# prints anything. That is what turned CI red from 39ac1877 to 55920e07: it could
+# not reproduce on this box, where a builder keeps a cargo process alive so the
 # pgrep matches and the status is 0. Green here, red on any idle runner.
-_real_builds="$( { pgrep -x rustc; pgrep -x cargo; } 2>/dev/null | tr -d '[:space:]')" || true
+#
+# MERGE NOTE: amux-frustrations and the 1133c2f2 author fixed this independently
+# within the hour, mine as `)" || true` on the assignment and theirs per-command.
+# Both work; theirs is kept because it leaves the assignment's own status
+# meaningful instead of blanketing it, and this comment is kept because it
+# carries the measured cause.
+_real_builds="$( { pgrep -x rustc || true; pgrep -x cargo || true; } 2>/dev/null | tr -d '[:space:]')"
 if [ -n "$_real_builds" ]; then
   echo "SKIP (m): a real cargo/rustc is running on this host, so the no-peer"
   echo "         precondition cannot be established. Not counted as a pass."
@@ -302,7 +308,7 @@ else
   out9=$(HOME="$h" AMUX_RS_BUILD_LOG="$h/build.log" AMUX_BUILD_MIN_FREE_GB=0 \
     AMUX_BUILD_SACRIFICE_CACHE_BELOW_GB=0 AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB=-1 \
     AMUX_RS_DISK_CLEAR_ONLY=1 bash "$SCRIPT" >/dev/null 2>&1; cat "$h/build.log" 2>/dev/null)
-  kill "$DECOY" 2>/dev/null; wait "$DECOY" 2>/dev/null
+  kill "$DECOY" 2>/dev/null; wait "$DECOY" 2>/dev/null || true
   # PROVE THE PROBE RAN before believing its negative (ethos rule 4). This cell
   # asserted only the ABSENCE of "DEFERRED", and a script that died before
   # reaching the decision produces exactly that log. It did: the first cut of

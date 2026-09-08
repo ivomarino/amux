@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# ATE-93 — a builder stamp is not activation authority. This runs the shipped
+# builder against two committed checkouts sharing one install/stamp/lock: an
+# elected origin/main and a stale local branch. It proves both halves of the
+# takeover incident:
+#
+#   1. a foreign checkout cannot install over the elected image; and
+#   2. if an old process did replace it, a matching local stamp does not make
+#      the elected builder exit early — /api/health forces re-adoption.
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+BUILDER="$ROOT/scripts/rust-auto-build.sh"
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+AUTH="$TMP/authority"
+FOREIGN="$TMP/foreign"
+FAKE_HOME="$TMP/home"
+INSTALL="$TMP/bin/amux-server-rs"
+STAMP="$TMP/stamp"
+LOCK="$TMP/lock"
+LOG="$TMP/build.log"
+HEALTH="$TMP/health.json"
+TRACE="$TMP/build.trace"
+PASS=0; FAIL=0
+export TRACE
+
+ok() { PASS=$((PASS + 1)); }
+bad() { FAIL=$((FAIL + 1)); echo "FAIL: $1"; }
+expect() { if "$@"; then ok; else bad "$*"; fi; }
+
+git init -q -b main "$AUTH"
+mkdir -p "$AUTH/crates" "$AUTH/scripts" "$FAKE_HOME/.amux/rust-build-target"
+printf '[workspace]\n' > "$AUTH/Cargo.toml"
+printf 'elected source\n' > "$AUTH/crates/input.rs"
+cat > "$AUTH/scripts/safe-cargo.sh" <<'EOF'
+#!/bin/sh
+set -eu
+sha=$(git rev-parse HEAD)
+printf 'build %s\n' "$sha" >> "$TRACE"
+mkdir -p "$CARGO_TARGET_DIR/release"
+printf '#!/bin/sh\necho %s\n' "$sha" > "$CARGO_TARGET_DIR/release/amux-server"
+chmod 0755 "$CARGO_TARGET_DIR/release/amux-server"
+EOF
+chmod +x "$AUTH/scripts/safe-cargo.sh"
+(
+  cd "$AUTH"
+  git add -A
+  git -c user.name=test -c user.email=test@example.com commit -qm elected
+)
+ELECTED=$(git -C "$AUTH" rev-parse HEAD)
+# The production default is origin/main. A synthetic repository has no remote,
+# so give it the exact remote-tracking ref rather than weakening the real gate.
+git -C "$AUTH" update-ref refs/remotes/origin/main "$ELECTED"
+git clone -q "$AUTH" "$FOREIGN"
+(
+  cd "$FOREIGN"
+  git checkout -qb stale/local
+  printf 'foreign source\n' > crates/stale.rs
+  git add -A
+  git -c user.name=test -c user.email=test@example.com commit -qm stale
+)
+STALE=$(git -C "$FOREIGN" rev-parse HEAD)
+printf '{"commit":"%s"}\n' "$STALE" > "$HEALTH"
+
+run_builder() {
+  HOME="$FAKE_HOME" \
+  AMUX_REPO="$1" \
+  AMUX_RS_INSTALL="$INSTALL" \
+  AMUX_RS_BUILD_STAMP="$STAMP" \
+  AMUX_RS_BUILD_LOCK="$LOCK" \
+  AMUX_RS_BUILD_LOG="$LOG" \
+  AMUX_RS_BUILD_PROVENANCE="$TMP/provenance.json" \
+  AMUX_RS_HEALTH_URL="file://$HEALTH" \
+  AMUX_BUILD_MIN_FREE_GB=0 \
+  AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB=999999 \
+    bash "$BUILDER" >/dev/null
+}
+
+# Establish a real elected install and its stamp while /health reports a
+# different image. No shortcut is possible on this first run because no stamp
+# exists yet.
+run_builder "$AUTH"
+expect test -x "$INSTALL"
+expect grep -q "$ELECTED" "$INSTALL"
+expect test "$(cat "$STAMP")" = "$ELECTED"
+expect test "$(grep -c '^build ' "$TRACE")" = 1
+
+# Chaos: a separately-running stale checkout uses the same normal activation
+# path and shared install locations. It must be refused before cargo/install;
+# keeping the return status zero makes the timer quiet but the builder log is
+# the durable sweep signal.
+run_builder "$FOREIGN"
+expect grep -q "$ELECTED" "$INSTALL"
+expect test "$(grep -c '^build ' "$TRACE")" = 1
+expect grep -q "ACTIVATION AUTHORITY REFUSED $STALE" "$LOG"
+
+# The exact live incident: the elected stamp still names ELECTED, but the
+# process answering health is STALE. The elected builder must rebuild instead
+# of considering its local stamp proof that its binary is still live.
+run_builder "$AUTH"
+expect test "$(grep -c '^build ' "$TRACE")" = 2
+expect grep -q "ACTIVATION STAMP DRIFT $ELECTED" "$LOG"
+expect grep -q "$ELECTED" "$INSTALL"
+
+echo "test-build-activation-authority: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]
