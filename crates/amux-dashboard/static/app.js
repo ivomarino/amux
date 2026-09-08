@@ -3324,18 +3324,17 @@ function _runtimeBoardSplitBadge(s) {
   const truth = s.runtime_board || {};
   const verdict = String(truth.verdict || 'unattributed');
   const observed = truth.observed_card_id ? ' Observed ' + esc(truth.observed_card_id) + '.' : '';
+  const isRunning = truth.runtime_status === 'active';
   if (verdict === 'active-conflicting-claims') {
     return '<span class="status-badge rate-limited" title="This running worker has more than one live task claim, so AMUX will not guess.'
       + observed + ' Diagnostic: ' + esc(verdict) + '.">card conflict</span>';
   }
-  if (verdict === 'active-without-card') {
-    return '<span class="status-badge" title="Running but no board card is assigned.' + observed + '">no card</span>';
+  if (isRunning) {
+    return '<span class="status-badge active" title="Running. Board link: ' + esc(verdict) + '.'
+      + observed + '">working</span>';
   }
-  if (verdict === 'active-card-invalid') {
-    return '<span class="status-badge" title="The linked card is stale or deleted.' + observed + '">stale card</span>';
-  }
-  return '<span class="status-badge waiting" title="The worker is running; its task link is being resolved.'
-    + observed + ' Diagnostic: ' + esc(verdict) + '.">working</span>';
+  return '<span class="status-badge waiting" title="' + esc(verdict) + '.'
+    + observed + '">working</span>';
 }
 
 // Turn the board-drive trace into the smallest useful operator explanation.
@@ -9102,7 +9101,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.838';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.839';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
