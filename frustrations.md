@@ -4040,3 +4040,24 @@ FIX: One captured identity decision, unmeasured deferral, hash-checked install
   reads, and per-job slow-poll attribution. Native sample had no stacks; the
   original unannounced stop remains unproven. RCA:
   docs/incidents/2026-09-08-health-stalls-build-feedback.md.
+
+---
+## Every owner follow-up created another Doing claim and replaced the runtime's current card
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux
+CARD: AMUX-4228
+SYMPTOM: During AMUX-4225 recovery, four delivered owner follow-ups each
+  minted Doing and task.claimed. Runtime correctly reported five conflicting
+  claims; asking to fix the conflict itself added another claim.
+COST: Repeated manual reconciliation. Moving the extra cards to Todo was
+  refused by the lane's existing WIP cap, so the requests were preserved in
+  triggered Backlog; no unrelated work was closed to manufacture room.
+FIX: Capture checks the active Doing population in the writer transaction.
+  Follow-ups remain durable, already-delivered cards in triggered Backlog and
+  emit task.captured, preserving the active task.claimed identity. Logs name
+  capture_pending_active_claim, the existing card and population. Focused
+  capture tests: 21 passed, including distinct prompt preservation, one active
+  claim, a pending delivery receipt, and retry deduplication.

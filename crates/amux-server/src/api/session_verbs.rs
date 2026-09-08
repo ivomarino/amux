@@ -3922,6 +3922,8 @@ pub(crate) fn redact_prompt_secrets(s: &str) -> String {
     out
 }
 
+type CapturedCardReceipt = (String, String);
+
 fn mint_capture_card(
     conn: &rusqlite::Connection,
     session_name: &str,
@@ -3976,10 +3978,10 @@ fn mint_capture_card(
     // The former time-only test swallowed every distinct command sent within 45s,
     // preventing the model from ever seeing or decomposing that work. Equality is
     // checked against the exact captured description; a distinct follow-up cards
-    // immediately, and a manual work card never blocks a capture. Captures mint
-    // `doing` (never re-dispatched), so an extra card cannot re-run work — the
-    // AMUX-2613 double-run the old dedup was conflated with stays fixed by the
-    // `doing` mint, not by this skip.
+    // immediately, and a manual work card never blocks a capture. The first
+    // capture claims Doing; follow-ups use triggered Backlog until the worker
+    // explicitly switches. Neither state redispatches already-delivered work
+    // (AMUX-2613); capture and execution attribution remain separate.
     let window_s: i64 = std::env::var("AMUX_CAPTURE_DEDUP_WINDOW_S")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -4029,17 +4031,23 @@ fn mint_capture_card(
         );
         return Ok(None);
     }
+    // Delivery records work; it does not prove the lane switched away from
+    // its current card. Keep follow-ups visible without claiming concurrent
+    // execution or redispatching a prompt the worker already received.
+    let (active_count, active_card): (i64, Option<String>) = conn.query_row(
+        "SELECT COUNT(*), MIN(id) FROM issues WHERE session=?1 AND status='doing' AND COALESCE(archived,0)=0",
+        [session_name], |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let capture_status = if active_count > 0 { "backlog" } else { "doing" };
     let needs_self = amux_core::board::title_needs_self_description(&title);
     let mut row = crate::db::board_store::create_issue(
         conn,
         &crate::db::board_store::NewIssue {
             title,
             desc: captured_desc,
-            // `doing`, NOT `todo`: an owned `todo` ledger card is Runnable to the
-            // planner and its prompt was re-dispatched, double-running every
-            // direct prompt (AMUX-2613). `doing` + agent owner is Assigned, never
-            // re-dispatched.
-            status: "doing".into(),
+            // Neither Doing nor triggered Backlog is redispatched (AMUX-2613).
+            // Only the first capture may establish the lane's execution claim.
+            status: capture_status.into(),
             session: Some(session_name.to_string()),
             item_type: "code".into(),
             creator: "amux".into(),
@@ -4069,6 +4077,14 @@ fn mint_capture_card(
         },
         now_ms / 1000,
     )?;
+    if active_count > 0 {
+        row.source_ref = Some("Already delivered owner follow-up; claim explicitly when switching work".into());
+        row.next_action = Some("Read the delivered prompt and claim this card when executing it; do not resend the prompt".into());
+        tracing::info!(session = session_name, card = %row.id, ?active_card,
+            measured = true, n_considered = active_count,
+            verdict = "capture_pending_active_claim",
+            "owner follow-up captured in backlog; existing Doing claim retained (AMUX-4228)");
+    }
     let stamp = chrono::Local::now().format("%H:%M").to_string();
     row.log = Some(crate::db::board_store::append_log(
         row.log.as_deref(),
@@ -4338,7 +4354,7 @@ pub(crate) async fn cmd_hist_record_full(
         if row_id > 0 {
             let cap_isolated = session_is_isolated(&cap_session);
             let cap_text_for_capture = cap_text.clone();
-            let minted: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            let minted: std::sync::Arc<std::sync::Mutex<Option<CapturedCardReceipt>>> =
                 std::sync::Arc::new(std::sync::Mutex::new(None));
             let minted_w = minted.clone();
             let sess_log = cap_session.clone();
@@ -4350,7 +4366,7 @@ pub(crate) async fn cmd_hist_record_full(
                             "UPDATE cmd_history SET card_id = ?1 WHERE id = ?2",
                             rusqlite::params![row.id, row_id],
                         )?;
-                        *minted_w.lock().unwrap() = Some(row.id.clone());
+                        *minted_w.lock().unwrap() = Some((row.id.clone(), row.status.clone()));
                         let ev = crate::db::PendingEvent {
                             entity_type: amux_core::revision::EntityType::Task,
                             entity_id: row.id.clone(),
@@ -4369,17 +4385,17 @@ pub(crate) async fn cmd_hist_record_full(
                 // detector. grep "ledger: auto-captured".
                 Ok(_) => {
                     let captured_id = minted.lock().ok().and_then(|mut id| id.take());
-                    if let Some(cid) = captured_id {
+                    if let Some((cid, capture_status)) = captured_id {
                         tracing::info!(session = %sess_log, card_id = %cid,
                             owner_isolated = cap_isolated,
                             "ledger: auto-captured board card from delivered prompt");
                         emit_event(
                             state,
                             &sess_log,
-                            "task.claimed",
+                            if capture_status == "doing" { "task.claimed" } else { "task.captured" },
                             Some(json!({
                                 "issue": cid,
-                                "status": "doing",
+                                "status": capture_status,
                                 "reason": "delivered-owner-prompt",
                             })),
                             None,
@@ -11215,7 +11231,7 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         {
             let (sess3, text3) = (session.clone(), text.clone());
             let now_ms = (now_f64() * 1000.0) as i64;
-            let minted: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            let minted: std::sync::Arc<std::sync::Mutex<Option<CapturedCardReceipt>>> =
                 std::sync::Arc::new(std::sync::Mutex::new(None));
             let minted_w = minted.clone();
             let res = state
@@ -11249,7 +11265,7 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                                   AND card_id IS NULL ORDER BY id DESC LIMIT 1)",
                                 rusqlite::params![row.id, sess3, text3],
                             )?;
-                            *minted_w.lock().unwrap() = Some(row.id.clone());
+                            *minted_w.lock().unwrap() = Some((row.id.clone(), row.status.clone()));
                             let ev = crate::db::PendingEvent {
                                 entity_type: amux_core::revision::EntityType::Task,
                                 entity_id: row.id.clone(),
@@ -11268,16 +11284,16 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                 // future silent stop is a queryable absence, not an invisible one.
                 Ok(_) => {
                     let captured_id = minted.lock().ok().and_then(|mut id| id.take());
-                    if let Some(cid) = captured_id {
+                    if let Some((cid, capture_status)) = captured_id {
                         tracing::info!(session = %session, id = %id, card_id = %cid,
                             "ledger: auto-captured board card from STEERING-delivered prompt (AMUX-3148)");
                         emit_event(
                             state,
                             &session,
-                            "task.claimed",
+                            if capture_status == "doing" { "task.claimed" } else { "task.captured" },
                             Some(json!({
                                 "issue": cid,
-                                "status": "doing",
+                                "status": capture_status,
                                 "reason": "steering-delivered-owner-prompt",
                             })),
                             None,
@@ -21089,6 +21105,21 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM issues WHERE session='lane-cap'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 2, "each distinct durable command reaches the work ledger");
+        let conn = st.store.read().unwrap();
+        let doing: i64 = conn.query_row("SELECT COUNT(*) FROM issues WHERE session='lane-cap' AND status='doing'", [], |r| r.get(0)).unwrap();
+        assert_eq!(doing, 1, "delivery of a follow-up must not manufacture concurrent Doing claims");
+        let (pending, trigger): (String, Option<String>) = conn.query_row(
+            "SELECT status, source_ref FROM issues WHERE session='lane-cap' AND id<>?1", [&card_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(pending, "backlog");
+        assert!(trigger.is_some(), "already-delivered follow-up must not auto-promote and redispatch");
+        let claims: i64 = conn.query_row("SELECT COUNT(*) FROM session_events WHERE session='lane-cap' AND type='task.claimed'", [], |r| r.get(0)).unwrap();
+        assert_eq!(claims, 1, "a captured follow-up must not replace the runtime claim");
+        let captures: i64 = conn.query_row("SELECT COUNT(*) FROM session_events WHERE session='lane-cap' AND type='task.captured'", [], |r| r.get(0)).unwrap();
+        assert_eq!(captures, 1, "the pending delivery still has a durable receipt");
+        drop(conn);
+
 
         // 3. [no-board] (skip_board=true) mints nothing.
         cmd_hist_record_full(
@@ -23639,6 +23670,9 @@ mod steer_boundary_tests {
                 // The open manual card must NOT block a new user task.
                 let first = super::mint_capture_card(conn, "s", "build the connectors tab", now_ms)?;
                 assert!(first.is_some(), "a new task must card even with an open manual card");
+                assert_eq!(first.as_ref().unwrap().status, "backlog", "a delivered prompt must preserve the active manual claim");
+                assert!(first.as_ref().unwrap().source_ref.is_some());
+
                 // In production the recorder atomically attaches the minted id
                 // to this exact cmd_history row; the retry predicate reads that
                 // durable link rather than comparing truncated card prose.

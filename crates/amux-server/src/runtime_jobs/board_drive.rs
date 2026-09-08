@@ -1632,6 +1632,9 @@ fn backlog_by_type_count(conn: &Connection, session: &str) -> usize {
 /// How many drainable backlog cards remain. Reported beside the promotion so
 /// the trace answers "is this lane about to run dry" without a second query.
 fn drainable_backlog_ids(conn: &Connection, session: &str, now: f64) -> Vec<String> {
+    // AMUX-4228: a parked capture is an already-delivered prompt, not an
+    // external condition that eventually goes stale. Only an explicit claim
+    // (or an intentional move to Todo) should dispatch that work again.
     let reclaim_cut = now - reclaim_cooldown_s();
     let verified_cut = (now as i64) - SOURCE_REF_STALE_S;
     let candidates = conn
@@ -1645,6 +1648,7 @@ fn drainable_backlog_ids(conn: &Connection, session: &str, now: f64) -> Vec<Stri
                            AND e.ts > ?2 AND e.data LIKE '%\"' || i.id || '\"%') \
            AND NOT (COALESCE(i.source_ref,'') <> '' AND COALESCE(i.last_verified_at,0) > ?3) \
            AND COALESCE(i.blocked_on,'') = '' \
+           AND NOT (COALESCE(i.source,'')='capture' AND COALESCE(i.source_ref,'') <> '') \
          ORDER BY COALESCE(i.created,0) ASC, i.id ASC",
         )
         .and_then(|mut st| {
@@ -8208,6 +8212,16 @@ mod tests {
             backlog_candidates(&conn, "blk", now as i64).into_iter().map(|c| c.0).collect();
         assert_eq!(listed, vec!["BL-2".to_string()], "an unblocked card must still drain");
         assert_eq!(drainable_backlog_ids(&conn, "blk", now), vec!["BL-2".to_string()]);
+    }
+
+    #[test]
+    fn delivered_capture_is_not_redispatched_after_its_trigger_ages() {
+        let conn = board_db();
+        add_card(&conn, "DELIVERED", "lane", "backlog", "Owner follow-up", "SCOPE: already delivered");
+        add_card(&conn, "ORDINARY", "lane", "backlog", "Independent work", "SCOPE: ready to dispatch");
+        conn.execute("UPDATE issues SET source='capture',source_ref='Already delivered; claim explicitly',last_verified_at=1 WHERE id='DELIVERED'", []).unwrap();
+        assert_eq!(drainable_backlog_ids(&conn, "lane", now_f64()), vec!["ORDINARY".to_string()],
+            "an aged observation must not replay a delivered owner prompt; ordinary backlog remains eligible");
     }
 
     #[test]
