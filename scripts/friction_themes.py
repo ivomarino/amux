@@ -68,6 +68,11 @@ MIXPEEK_REPO = os.environ.get("MIXPEEK_REPO") or os.path.expanduser("~/Dev/mixpe
 DAYS = float(os.environ.get("FRICTION_DAYS", "1"))
 BASELINE_DAYS = float(os.environ.get("FRICTION_BASELINE_DAYS", "14"))
 MAX_PER_SIGNAL = int(os.environ.get("FRICTION_MAX_EVIDENCE", "6"))
+# Distinct lanes receiving a message in the SAME minute before that minute is
+# called a fan-out, and the share of evidence in such minutes before the whole
+# signal is called a broadcast.
+BROADCAST_LANES = int(os.environ.get("FRICTION_BROADCAST_LANES", "5"))
+BROADCAST_SHARE = float(os.environ.get("FRICTION_BROADCAST_SHARE", "0.5"))
 
 # Board id prefix -> which repo's fix sites that card's friction points at.
 # Unlisted prefixes are reported under 'other' rather than silently dropped:
@@ -449,6 +454,42 @@ def concentration(pairs):
     days = {d for _, d in lane_days}
     top_lane, top_n = lanes.most_common(1)[0]
     share = top_n / len(pairs)
+
+    # ONE LANE, not one calendar date. `len(days) == 1` was the old incident
+    # test and it could not fire on a rolling window: a 24h window starting at
+    # 11:01 always covers two dates, so on 2026-09-08 all 11 active signals
+    # reported distinct_days=2 and incident_shaped=False — including
+    # deploy-live at n=39 from ONE lane at 100%, the exact specimen this
+    # docstring cites. The same five-message, four-minute, one-lane incident
+    # read True at noon and False at 00:02; the verdict was decided by where
+    # midnight fell, not by the data.
+    #
+    # Span replaced it for one draft and suppressed that same specimen from the
+    # other side: deploy-live ran 21.1h of a 24h window, so any "clustered"
+    # threshold reads it as chronic. Inside a one-day window you cannot tell a
+    # burst from a chronic lane problem, and you do not need to — a signal from
+    # ONE lane must not increment a FLEET theme either way. So the boolean asks
+    # only what the window can answer, and the span is published beside it for
+    # a reader at a wider window.
+    span_ms = max(ts for _, ts in pairs) - min(ts for _, ts in pairs)
+
+    # FAN-OUT: one message delivered to many lanes reads as maximal breadth.
+    # The mirror of the incident shape and the more dangerous of the two,
+    # because every number above makes a broadcast look MORE like a theme:
+    # measured 2026-09-08, one minute (09-07 18:09) carried an identical
+    # message to 41 lanes, another to 28, and "continue" to 24 and 19 — while
+    # rule-restatement:idle-stall reported 55 lanes with a top-lane share of
+    # 31%, the most theme-shaped concentration a signal can have. Counting
+    # those as 83 independent observations of a friction is the same error as
+    # counting one incident 39 times, one axis over.
+    by_minute = defaultdict(set)
+    for sess, ts in pairs:
+        by_minute[int(ts // 60_000)].add(sess)
+    widest_minute = max(len(v) for v in by_minute.values())
+    fanout_minutes = {m for m, v in by_minute.items() if len(v) >= BROADCAST_LANES}
+    in_fanout = sum(1 for _, ts in pairs if int(ts // 60_000) in fanout_minutes)
+    fanout_share = in_fanout / len(pairs)
+
     return {
         "sampled_over": len(pairs),
         "distinct_lanes": len(lanes),
@@ -456,9 +497,17 @@ def concentration(pairs):
         "distinct_days": len(days),
         "top_lane": top_lane,
         "top_lane_share": round(share, 2),
-        # One lane, one day, and more than a couple of messages. Stated as what
-        # the numbers ARE, so a reader who disagrees can see why.
-        "incident_shaped": bool(len(lanes) == 1 and len(days) == 1 and len(pairs) >= 3),
+        "evidence_span_hours": round(span_ms / 3_600_000, 1),
+        "widest_minute_lanes": widest_minute,
+        "fanout_share": round(fanout_share, 2),
+        # One lane, clustered inside the window, and more than a couple of
+        # messages. Stated as what the numbers ARE, so a reader who disagrees
+        # can see why.
+        "incident_shaped": bool(len(lanes) == 1 and len(pairs) >= 3),
+        # Most of the evidence arrived in minutes where one message reached
+        # many lanes at once. Not a per-lane friction, however wide it looks.
+        "broadcast_shaped": bool(widest_minute >= BROADCAST_LANES
+                                 and fanout_share >= BROADCAST_SHARE),
     }
 
 
@@ -1015,11 +1064,24 @@ def main():
         print(f"  {s.headline}")
         c = s.concentration
         if c:
-            flag = "  <-- INCIDENT-SHAPED: one lane, one day" if c["incident_shaped"] else ""
+            # Both flags print. A payload field the default view drops is a
+            # field nobody reads (ethos rule 1), and broadcast_shaped exists
+            # precisely because the numbers beside it look reassuring.
+            flags = []
+            if c["incident_shaped"]:
+                flags.append("  <-- INCIDENT-SHAPED: one lane, clustered in time")
+            if c["broadcast_shaped"]:
+                flags.append(f"  <-- BROADCAST-SHAPED: {int(c['fanout_share']*100)}% of "
+                             f"evidence arrived in fan-out minutes "
+                             f"(widest: {c['widest_minute_lanes']} lanes in one minute). "
+                             f"Lane breadth here is delivery, not adoption.")
             print(f"  concentration: {c['distinct_lanes']} lane(s), "
                   f"{c['distinct_lane_days']} lane-day(s), "
                   f"top lane {c['top_lane']} {int(c['top_lane_share']*100)}% "
-                  f"(over all {c['sampled_over']}){flag}")
+                  f"(over all {c['sampled_over']}), "
+                  f"span {c['evidence_span_hours']}h")
+            for f in flags:
+                print(f)
         if s.detail:
             print(f"  detail: {json.dumps(s.detail)}")
         for e in s.evidence[:MAX_PER_SIGNAL]:
