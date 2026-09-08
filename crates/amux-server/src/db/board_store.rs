@@ -2956,9 +2956,40 @@ pub fn folded_into(log: Option<&str>) -> Option<String> {
     let marker = "capture folded into ";
     log.unwrap_or_default()
         .lines()
-        .filter_map(|line| line.rfind(marker).map(|at| line[at + marker.len()..].trim()))
+        .filter_map(|line| {
+            // THE MARKER MUST BEGIN THE ENTRY, not merely appear in it.
+            //
+            // The first cut used `rfind`, which matched anywhere on the line,
+            // and a live callback caught it within the hour: mixpeek-frustrations
+            // wrote an outcome note DISCUSSING this very fix, containing
+            //   its own Actions line read "capture folded into AF-615", and ...
+            // That note is embedded in the card's STATUS log entry, so the scan
+            // matched the quotation and parsed the target as `AF-615"` — the
+            // trailing quote survived because it is not sentence punctuation.
+            // The callback then read: folded this capture into AF-615". A
+            // positional match landing on prose ABOUT the marker is the same
+            // self-referential trap `every_send_failure_literal_is_classified`
+            // documents against its own docstring.
+            //
+            // The server writes this as a standalone entry, so requiring it at
+            // the start is both tighter and truer to the producer. Entries carry
+            // a `HH:MM` backtick stamp and may carry a `session: ` attribution,
+            // both of which are stripped before the test.
+            let body = line.trim();
+            let body = match body.strip_prefix('`').and_then(|r| r.split_once('`')) {
+                Some((_stamp, rest)) => rest.trim_start(),
+                None => body,
+            };
+            // `<session>: capture folded into X` — only a prefix with no spaces
+            // in it, so a sentence ending in a colon cannot qualify.
+            let body = match body.split_once(": ") {
+                Some((head, rest)) if !head.contains(' ') && rest.starts_with(marker) => rest,
+                _ => body,
+            };
+            body.strip_prefix(marker)
+        })
         .filter_map(|rest| rest.split_whitespace().next())
-        .map(|id| id.trim_end_matches(['.', ',', ';', ')']).to_string())
+        .map(|id| id.trim_end_matches(['.', ',', ';', ')', '"', '\'', ']']).to_string())
         .rfind(|id| !id.is_empty())
 }
 
@@ -5280,6 +5311,27 @@ column=silent type:code=outranked(2)"
             "an ordinary discard is not a fold");
         assert_eq!(folded_into(Some("capture folded into ")), None,
             "a fold with no target names nothing");
+
+        // THE LIVE SPECIMEN, caught by a callback within the hour of shipping
+        // the first cut. An outcome note DISCUSSING this fix is embedded in the
+        // card's STATUS entry; matching it produced the target `AF-615"` and a
+        // callback reading `folded this capture into AF-615"`.
+        let quoting = "`17:31` STATUS (board): Final outcome: discarded (from doing). \
+                       Their fix reads a server-authored \"capture folded into <ID>\" line, \
+                       and its own Actions line read \"capture folded into AF-615\", so";
+        assert_eq!(folded_into(Some(quoting)), None,
+            "prose QUOTING the marker is not a fold");
+
+        // And the real entry still matches with that attribution prefix present.
+        assert_eq!(
+            folded_into(Some("`17:31` amux-frustrations: capture folded into AF-615")),
+            Some("AF-615".to_string())
+        );
+        // A stray quote on a REAL fold line must not become part of the id.
+        assert_eq!(
+            folded_into(Some("capture folded into AF-615\"")),
+            Some("AF-615".to_string())
+        );
     }
 
     /// One test for the whole ladder rather than five, because the property is
