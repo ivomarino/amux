@@ -2182,8 +2182,10 @@ fn select_runtime_marker<'a>(
 ) -> RuntimeMarkerSelection<'a> {
     let live_claims: Vec<&TaskMarker> = markers
         .iter()
-        .filter(|marker| marker.0 >= started_at)
         .filter(|marker| {
+            // A Doing row is the durable release boundary. A process/runtime
+            // restart must not make an earlier claimed card stale while the
+            // board still says this lane owns it.
             marker.1.as_deref().is_some_and(|card| {
                 doing_by_id
                     .get(card)
@@ -4135,14 +4137,17 @@ mod tests {
             (10.0, Some("ATE-92".into()), false, "task.claimed".into()),
             (20.0, None, true, "task.cardless".into()),
         ];
-        let selected = select_runtime_marker(&markers, 0.0, "lane", &doing);
+        // The claim belongs to the prior runtime life; it is still current
+        // because its owned board row remains Doing. The newer control turn
+        // belongs to this life and cannot implicitly release it.
+        let selected = select_runtime_marker(&markers, 15.0, "lane", &doing);
         assert_eq!(selected.marker.and_then(|marker| marker.1.as_deref()), Some("ATE-92"));
         assert!(!selected.conflicting_live_claims);
         assert!(selected.newer_cardless_suppressed);
 
         // A terminal/released card no longer appears in Doing, so the later
         // explicit cardless turn correctly becomes the runtime's truth.
-        let released = select_runtime_marker(&markers, 0.0, "lane", &BTreeMap::new());
+        let released = select_runtime_marker(&markers, 15.0, "lane", &BTreeMap::new());
         assert!(released.marker.is_some_and(|marker| marker.2));
         assert!(!released.conflicting_live_claims);
         assert!(!released.newer_cardless_suppressed);
