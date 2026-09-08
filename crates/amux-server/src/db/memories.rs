@@ -11,7 +11,7 @@
 //! (config-sized, not log-sized), so the resolver's correctness is worth
 //! more than an index scan.
 
-use amux_core::memory::{visible, MemoryEntry, MemoryProvenance, MemoryType};
+use amux_core::memory::{visible_at, MemoryEntry, MemoryProvenance, MemoryType};
 use amux_core::scope::{ResolutionTarget, Scope};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -34,8 +34,8 @@ fn type_from_db(s: &str) -> Result<MemoryType, serde_json::Error> {
     serde_json::from_str(&format!("\"{s}\""))
 }
 
-const COLS: &str =
-    "id, scope, name, content, memory_type, version, created_at, updated_at, deleted_at, provenance";
+const COLS: &str = "id, scope, name, content, memory_type, version, created_at, updated_at, \
+                    deleted_at, provenance, expires_at, last_validated_at, superseded_by";
 
 fn entry_from_row(r: &Row<'_>) -> rusqlite::Result<MemoryEntry> {
     let id: String = r.get(0)?;
@@ -45,6 +45,8 @@ fn entry_from_row(r: &Row<'_>) -> rusqlite::Result<MemoryEntry> {
     let updated_at: String = r.get(7)?;
     let deleted_at: Option<String> = r.get(8)?;
     let provenance: String = r.get(9)?;
+    let expires_at: Option<String> = r.get(10)?;
+    let last_validated_at: Option<String> = r.get(11)?;
     Ok(MemoryEntry {
         id: amux_core::ids::MemoryId::parse(&id).map_err(|e| corrupt(0, e))?,
         scope: serde_json::from_str::<Scope>(&scope).map_err(|e| corrupt(1, e))?,
@@ -64,6 +66,15 @@ fn entry_from_row(r: &Row<'_>) -> rusqlite::Result<MemoryEntry> {
             .map_err(|e| corrupt(8, e))?,
         provenance: serde_json::from_str::<MemoryProvenance>(&provenance)
             .map_err(|e| corrupt(9, e))?,
+        expires_at: expires_at
+            .map(|s| s.parse::<DateTime<Utc>>())
+            .transpose()
+            .map_err(|e| corrupt(10, e))?,
+        last_validated_at: last_validated_at
+            .map(|s| s.parse::<DateTime<Utc>>())
+            .transpose()
+            .map_err(|e| corrupt(11, e))?,
+        superseded_by: r.get(12)?,
     })
 }
 
@@ -78,7 +89,7 @@ pub fn scope_to_db(scope: &Scope) -> String {
 /// via `MemoryEntry::new`).
 pub fn insert(conn: &Connection, e: &MemoryEntry) -> rusqlite::Result<()> {
     conn.execute(
-        &format!("INSERT INTO _amux_memories ({COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)"),
+        &format!("INSERT INTO _amux_memories ({COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)"),
         params![
             e.id.as_str(),
             scope_to_db(&e.scope),
@@ -90,6 +101,9 @@ pub fn insert(conn: &Connection, e: &MemoryEntry) -> rusqlite::Result<()> {
             e.updated_at.to_rfc3339(),
             e.deleted_at.map(|t| t.to_rfc3339()),
             serde_json::to_string(&e.provenance).map_err(|er| corrupt(9, er))?,
+            e.expires_at.map(|t| t.to_rfc3339()),
+            e.last_validated_at.map(|t| t.to_rfc3339()),
+            e.superseded_by.as_deref(),
         ],
     )?;
     Ok(())
@@ -145,7 +159,10 @@ pub fn list_visible(
     target: &ResolutionTarget,
 ) -> rusqlite::Result<Vec<MemoryEntry>> {
     let all = list_all(conn)?;
-    Ok(visible(&all, target).into_iter().cloned().collect())
+    Ok(visible_at(&all, target, Utc::now())
+        .into_iter()
+        .cloned()
+        .collect())
 }
 
 /// Persist the mutated fields of an entry AFTER a core transition
@@ -161,13 +178,17 @@ pub fn persist_mutation(
 ) -> rusqlite::Result<usize> {
     conn.execute(
         "UPDATE _amux_memories
-         SET content = ?1, version = ?2, updated_at = ?3, deleted_at = ?4
-         WHERE id = ?5 AND version = ?6",
+         SET content = ?1, version = ?2, updated_at = ?3, deleted_at = ?4,
+             expires_at = ?5, last_validated_at = ?6, superseded_by = ?7
+         WHERE id = ?8 AND version = ?9",
         params![
             e.content,
             e.version as i64,
             e.updated_at.to_rfc3339(),
             e.deleted_at.map(|t| t.to_rfc3339()),
+            e.expires_at.map(|t| t.to_rfc3339()),
+            e.last_validated_at.map(|t| t.to_rfc3339()),
+            e.superseded_by.as_deref(),
             e.id.as_str(),
             expected_version_before as i64,
         ],

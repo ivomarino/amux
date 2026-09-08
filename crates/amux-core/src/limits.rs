@@ -25,6 +25,21 @@ pub struct ExecutionLimits {
     pub max_attempts: u32,
     pub max_tokens: u64,
     pub max_wall_clock_secs: u64,
+    /// Number of observed tool invocations across all attempts.
+    #[serde(default = "default_max_tool_calls")]
+    pub max_tool_calls: u64,
+    /// Cost in millionths of a US dollar, avoiding floating-point budget
+    /// comparisons. $25 = 25_000_000 micro-USD.
+    #[serde(default = "default_max_cost_microusd")]
+    pub max_cost_microusd: u64,
+}
+
+const fn default_max_tool_calls() -> u64 {
+    1_000
+}
+
+const fn default_max_cost_microusd() -> u64 {
+    25_000_000
 }
 
 impl Default for ExecutionLimits {
@@ -34,6 +49,8 @@ impl Default for ExecutionLimits {
             max_attempts: 5,
             max_tokens: 500_000,
             max_wall_clock_secs: 4 * 3600,
+            max_tool_calls: default_max_tool_calls(),
+            max_cost_microusd: default_max_cost_microusd(),
         }
     }
 }
@@ -51,6 +68,10 @@ pub struct AttemptRecord {
     pub rejected_evidence: Vec<String>,
     pub tokens_spent: u64,
     pub wall_clock_secs: u64,
+    #[serde(default)]
+    pub tool_calls: u64,
+    #[serde(default)]
+    pub cost_microusd: u64,
     /// Whether decomposition was attempted (Invariant 47 step 1); two failed
     /// decompositions lead to `Quarantined`.
     pub decomposition_attempted: bool,
@@ -82,6 +103,8 @@ pub enum ExhaustedLimit {
     Attempts,
     Tokens,
     WallClock,
+    ToolCalls,
+    Cost,
 }
 
 /// Result of [`check`].
@@ -126,6 +149,22 @@ pub fn check(
             which: ExhaustedLimit::WallClock,
         };
     }
+    let tool_calls = attempts
+        .iter()
+        .fold(0u64, |acc, a| acc.saturating_add(a.tool_calls));
+    if tool_calls >= limits.max_tool_calls {
+        return LimitCheck::Exhausted {
+            which: ExhaustedLimit::ToolCalls,
+        };
+    }
+    let cost = attempts
+        .iter()
+        .fold(0u64, |acc, a| acc.saturating_add(a.cost_microusd));
+    if cost >= limits.max_cost_microusd {
+        return LimitCheck::Exhausted {
+            which: ExhaustedLimit::Cost,
+        };
+    }
     LimitCheck::WithinLimits
 }
 
@@ -144,6 +183,8 @@ mod tests {
             rejected_evidence: vec!["cargo test exit 101: assertion failed in gate_eval".into()],
             tokens_spent: tokens,
             wall_clock_secs: 60,
+            tool_calls: 1,
+            cost_microusd: 10_000,
             decomposition_attempted: false,
             tree_status: None,
             at: t0(),
@@ -155,6 +196,8 @@ mod tests {
             max_attempts: 3,
             max_tokens: 1_000,
             max_wall_clock_secs: 100,
+            max_tool_calls: 100,
+            max_cost_microusd: 1_000_000,
         }
     }
 
@@ -196,6 +239,28 @@ mod tests {
             check(&l, &[attempt(1, 1)], 100),
             LimitCheck::Exhausted {
                 which: ExhaustedLimit::WallClock
+            }
+        );
+    }
+
+    #[test]
+    fn tool_and_cost_budgets_trip_at_their_thresholds() {
+        let mut l = limits();
+        l.max_tool_calls = 2;
+        let records = [attempt(1, 1), attempt(2, 1)];
+        assert_eq!(
+            check(&l, &records, 0),
+            LimitCheck::Exhausted {
+                which: ExhaustedLimit::ToolCalls
+            }
+        );
+
+        l.max_tool_calls = 100;
+        l.max_cost_microusd = 20_000;
+        assert_eq!(
+            check(&l, &records, 0),
+            LimitCheck::Exhausted {
+                which: ExhaustedLimit::Cost
             }
         );
     }

@@ -106,6 +106,13 @@ pub struct WindowStats {
     pub tasks_completed: u32,
     pub failures: u32,
     pub all_items_blocked: bool,
+    /// At least one non-terminal task exists. An empty queue is healthy, not
+    /// evidence that a progress-producing fleet is stalled.
+    pub has_live_work: bool,
+    /// The store contains observations spanning a complete window. Without
+    /// this guard, a newly started server trips the no-progress breaker before
+    /// it has had a fair chance to complete anything.
+    pub window_elapsed: bool,
 }
 
 /// Fleet-level thresholds. All windows share `window_secs`; the breaker is
@@ -133,7 +140,7 @@ impl FleetCircuitBreaker {
     /// no-progress (the least specific: everything else also shows up as no
     /// progress, so it goes last to avoid masking the real discriminator).
     pub fn evaluate(&self, window: &WindowStats) -> Option<CircuitOpenReason> {
-        if window.tokens_spent >= self.window_budget_tokens {
+        if self.window_budget_tokens > 0 && window.tokens_spent >= self.window_budget_tokens {
             return Some(CircuitOpenReason::SpendRateExceeded {
                 window_tokens: window.tokens_spent,
                 budget: self.window_budget_tokens,
@@ -142,13 +149,16 @@ impl FleetCircuitBreaker {
         if window.all_items_blocked {
             return Some(CircuitOpenReason::AllItemsBlocked);
         }
-        if window.failures >= self.max_failures_per_window {
+        if self.max_failures_per_window > 0 && window.failures >= self.max_failures_per_window {
             return Some(CircuitOpenReason::ErrorRateExceeded {
                 failures: window.failures,
                 window_secs: self.window_secs,
             });
         }
-        if window.tasks_completed < self.min_progress_per_window {
+        if window.has_live_work
+            && window.window_elapsed
+            && window.tasks_completed < self.min_progress_per_window
+        {
             return Some(CircuitOpenReason::NoProgress {
                 window_secs: self.window_secs,
             });
@@ -162,6 +172,33 @@ impl FleetCircuitBreaker {
     /// itself does not take a clock.
     pub fn trip(&self, window: &WindowStats, at: DateTime<Utc>) -> Option<FleetState> {
         self.evaluate(window).map(|reason| FleetState::open(reason, at))
+    }
+
+    /// Whether an emergency state may close on this observation.
+    ///
+    /// A no-progress or all-blocked trip cannot require a completion before
+    /// recovery: while open, the planner deliberately makes no assignments,
+    /// so that requirement would deadlock the fleet. Runnable work returning
+    /// is enough to permit one probe assignment. Spend/error trips still wait
+    /// for their measured window to clear, and a manual stop never auto-closes.
+    pub fn can_recover(&self, state: &FleetState, window: &WindowStats) -> bool {
+        match state {
+            FleetState::Normal => false,
+            FleetState::CircuitOpen {
+                reason: CircuitOpenReason::ManualStop,
+                ..
+            } => false,
+            FleetState::CircuitOpen {
+                reason: CircuitOpenReason::AllItemsBlocked | CircuitOpenReason::NoProgress { .. },
+                ..
+            } if window.has_live_work && !window.all_items_blocked => matches!(
+                self.evaluate(window),
+                None | Some(CircuitOpenReason::NoProgress { .. })
+            ),
+            FleetState::CircuitOpen { .. } | FleetState::Reconciling { .. } => {
+                self.evaluate(window).is_none()
+            }
+        }
     }
 }
 
@@ -224,6 +261,8 @@ mod tests {
             tasks_completed: 3,
             failures: 1,
             all_items_blocked: false,
+            has_live_work: true,
+            window_elapsed: true,
         }
     }
 
@@ -245,6 +284,9 @@ mod tests {
                 budget: 1_000
             })
         );
+        let mut disabled = breaker();
+        disabled.window_budget_tokens = 0;
+        assert_eq!(disabled.evaluate(&w), None);
     }
 
     #[test]
@@ -262,6 +304,16 @@ mod tests {
         let mut b = breaker();
         b.min_progress_per_window = 0;
         assert_eq!(b.evaluate(&w), None);
+
+        let mut warming = healthy();
+        warming.tasks_completed = 0;
+        warming.window_elapsed = false;
+        assert_eq!(breaker().evaluate(&warming), None);
+
+        let mut empty = healthy();
+        empty.tasks_completed = 0;
+        empty.has_live_work = false;
+        assert_eq!(breaker().evaluate(&empty), None);
     }
 
     #[test]
@@ -277,6 +329,9 @@ mod tests {
                 window_secs: 14_400
             })
         );
+        let mut disabled = breaker();
+        disabled.max_failures_per_window = 0;
+        assert_eq!(disabled.evaluate(&w), None);
     }
 
     #[test]
@@ -320,6 +375,51 @@ mod tests {
         assert_eq!(open.close(), Some(FleetState::Normal));
         // Reconciling cannot re-enter reconciling.
         assert_eq!(rec.begin_reconciling(t0()), None);
+    }
+
+    #[test]
+    fn structural_and_progress_breakers_allow_a_probe_when_work_is_runnable() {
+        let mut stalled = healthy();
+        stalled.tasks_completed = 0;
+        let progress_open = FleetState::open(
+            CircuitOpenReason::NoProgress {
+                window_secs: breaker().window_secs,
+            },
+            t0(),
+        );
+        assert!(breaker().can_recover(&progress_open, &stalled));
+
+        let blocked_open = FleetState::open(CircuitOpenReason::AllItemsBlocked, t0());
+        assert!(breaker().can_recover(&blocked_open, &stalled));
+
+        stalled.tokens_spent = breaker().window_budget_tokens;
+        assert!(
+            !breaker().can_recover(&progress_open, &stalled),
+            "a structural probe must not bypass a live spend breaker"
+        );
+        stalled.tokens_spent = 500;
+        stalled.all_items_blocked = true;
+        assert!(!breaker().can_recover(&blocked_open, &stalled));
+    }
+
+    #[test]
+    fn measured_and_manual_breakers_do_not_close_early() {
+        let mut costly = healthy();
+        costly.tokens_spent = breaker().window_budget_tokens;
+        let spend_open = FleetState::open(
+            CircuitOpenReason::SpendRateExceeded {
+                window_tokens: costly.tokens_spent,
+                budget: breaker().window_budget_tokens,
+            },
+            t0(),
+        );
+        assert!(!breaker().can_recover(&spend_open, &costly));
+        costly.tokens_spent = 0;
+        assert!(breaker().can_recover(&spend_open, &costly));
+
+        let manual = FleetState::open(CircuitOpenReason::ManualStop, t0());
+        assert!(!breaker().can_recover(&manual, &healthy()));
+        assert!(!breaker().can_recover(&FleetState::Normal, &healthy()));
     }
 
     #[test]

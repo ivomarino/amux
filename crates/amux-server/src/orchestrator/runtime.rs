@@ -44,6 +44,17 @@ pub fn foreign_worker_id(name: &str) -> amux_core::ids::WorkerId {
     amux_core::ids::WorkerId::from_ulid(ulid::Ulid::from_parts(0, h as u128))
 }
 
+fn decomposition_depth(
+    conn: &rusqlite::Connection,
+    semantic_task_id: &str,
+) -> rusqlite::Result<u32> {
+    conn.query_row(
+        "SELECT COALESCE(MAX(depth),0) FROM _amux_decompositions WHERE child_task_id=?1",
+        [semantic_task_id],
+        |r| r.get(0),
+    )
+}
+
 /// Hydrate every worker row into a core `Worker`. Shared by the tick loop
 /// AND the /api/metrics/fleet provider view, so the dashboard's per-provider
 /// picture is derived from the same rows by the same code as the mechanism
@@ -73,10 +84,9 @@ pub struct Runtime {
     pub tick_secs: u64,
     /// Heartbeat cadence in ticks (heartbeat every Nth tick).
     pub heartbeat_every: u64,
-    /// Fleet circuit breaker (RR-0048b, Invariant 48). The state lives here,
-    /// in memory: a restart resets to Normal, and the first post-restart
-    /// window re-trips if the condition persists — a breaker that survives
-    /// its own process is a breaker nobody can reset.
+    /// Fleet circuit breaker (RR-0048b, Invariant 48). State is hydrated from
+    /// `_amux_fleet_state`; an emergency brake that silently resets on process
+    /// restart is not an emergency brake.
     pub breaker: amux_core::circuit::FleetCircuitBreaker,
     pub fleet_state: std::sync::Mutex<amux_core::circuit::FleetState>,
     /// Agent protocol for command delivery (None until a transport is
@@ -356,32 +366,33 @@ impl Runtime {
         // Evaluate under the lock WITHOUT awaiting (the guard is not Send);
         // publish the change after the guard drops.
         let (fleet_state, changed) = {
-            let mut fs = self.fleet_state.lock().unwrap();
-            let mut changed = None;
+            let fs = self.fleet_state.lock().unwrap();
+            let mut next = None;
             match &*fs {
                 amux_core::circuit::FleetState::Normal => {
                     if let Some(tripped) = self.breaker.trip(&window, now) {
                         tracing::warn!(state = ?tripped, "fleet circuit OPENED");
-                        *fs = tripped.clone();
-                        changed = Some(tripped);
+                        next = Some(tripped);
                     }
                 }
                 _ => {
-                    // Open/reconciling: a healthy window is the auto-close
-                    // signal — the fleet demonstrably moves again.
-                    if self.breaker.evaluate(&window).is_none() {
+                    // Open/reconciling: measured breakers wait for their
+                    // window to clear. Structural/no-progress breakers may
+                    // admit one probe when runnable work reappears; requiring
+                    // a completion while assignments are halted deadlocks.
+                    if self.breaker.can_recover(&fs, &window) {
                         if let Some(closed) = fs.close() {
                             tracing::info!("fleet circuit CLOSED (window healthy)");
-                            *fs = closed.clone();
-                            changed = Some(closed);
+                            next = Some(closed);
                         }
                     }
                 }
             }
-            (fs.clone(), changed)
+            (next.clone().unwrap_or_else(|| fs.clone()), next)
         };
         if let Some(state) = &changed {
-            self.publish_fleet_state(state).await.ok();
+            self.publish_fleet_state(state).await?;
+            *self.fleet_state.lock().unwrap() = state.clone();
         }
 
         // Fleet-wide provider coordination (RR-0044b): ONE derivation per
@@ -426,12 +437,37 @@ impl Runtime {
         });
 
         // Anti-livelock (RR-0048a): limits filter what actually executes.
-        let (proceed, exhaustion) = amux_core::orchestrator::enforce_limits(
-            plan.assignments.clone(),
-            &amux_core::limits::ExecutionLimits::default(),
-            now,
-            &BTreeMap::new(),
-        );
+        let (proceed, exhaustion) = {
+            let conn = self.store.read()?;
+            let mut proceed = Vec::new();
+            let mut exhaustion = Vec::new();
+            for assignment in plan.assignments.clone() {
+                let semantic = crate::orchestrator::context::issue_by_internal_id(
+                    &conn,
+                    &assignment.task,
+                )?;
+                let limits = match semantic.as_ref() {
+                    Some(row) => crate::db::harness_store::get_budget(&conn, &row.id)?
+                        .map(|(limits, _)| limits)
+                        .unwrap_or_default(),
+                    None => amux_core::limits::ExecutionLimits::default(),
+                };
+                let depth: u32 = match semantic.as_ref() {
+                    Some(row) => decomposition_depth(&conn, &row.id)?,
+                    None => 0,
+                };
+                let depths = [(assignment.task.clone(), depth)].into_iter().collect();
+                let (mut allowed, mut actions) = amux_core::orchestrator::enforce_limits(
+                    vec![assignment],
+                    &limits,
+                    now,
+                    &depths,
+                );
+                proceed.append(&mut allowed);
+                exhaustion.append(&mut actions);
+            }
+            (proceed, exhaustion)
+        };
         let plan = TickPlan { assignments: proceed, ..plan };
         self.execute(&plan).await?;
         for action in exhaustion {
@@ -476,29 +512,58 @@ impl Runtime {
     /// can never disagree about what happened (ethos rule 4).
     fn window_stats(&self, now: DateTime<Utc>) -> anyhow::Result<amux_core::circuit::WindowStats> {
         let conn = self.store.read()?;
-        let cutoff = (now - chrono::Duration::seconds(self.breaker.window_secs as i64)).to_rfc3339();
+        let cutoff_at = now - chrono::Duration::seconds(self.breaker.window_secs as i64);
+        let cutoff = cutoff_at.to_rfc3339();
+        let cutoff_epoch = cutoff_at.timestamp();
         let completed: u32 = conn.query_row(
             r#"SELECT COUNT(*) FROM _amux_state_events WHERE at > ?1
-             AND entity_type = 'task' AND mutation LIKE '%"to":"done"%'"#,
-            params![cutoff], |r| r.get(0)).unwrap_or(0);
-        let failures: u32 = conn.query_row(
-            "SELECT COUNT(*) FROM _amux_state_events WHERE at > ?1
-             AND mutation LIKE '%interrupted%'",
-            params![cutoff], |r| r.get(0)).unwrap_or(0);
+             AND entity_type = 'task' AND mutation LIKE '%"to":"verified"%'"#,
+            params![cutoff], |r| r.get(0))?;
+        let attempt_failures: u32 = conn.query_row(
+            "SELECT COUNT(*) FROM _amux_attempts WHERE at > ?1",
+            params![cutoff], |r| r.get(0))?;
+        let verification_failures: u32 = conn.query_row(
+            "SELECT COUNT(*) FROM _amux_verifications WHERE created_at > ?1 AND verdict='failed'",
+            params![cutoff_epoch], |r| r.get(0))?;
+        let tokens_spent: u64 = conn.query_row(
+            "SELECT COALESCE(SUM(input+cache_read+cache_write+output),0)
+             FROM token_ledger WHERE ts > ?1",
+            params![cutoff_epoch], |r| r.get(0))?;
+        let has_live_work: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM issues WHERE deleted IS NULL AND COALESCE(archived,0)=0
+             AND LOWER(status) IN ('backlog','todo','doing','in progress','review','needsyou',
+                                   'needs you','blocked'))",
+            [], |r| r.get(0))?;
+        let runnable_or_assigned: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM issues WHERE deleted IS NULL AND COALESCE(archived,0)=0
+             AND LOWER(status) IN ('todo','doing','in progress'))",
+            [], |r| r.get(0))?;
+        let earliest_event: Option<String> = conn.query_row(
+            "SELECT MIN(at) FROM _amux_state_events",
+            [], |r| r.get(0))?;
+        let earliest_event = earliest_event
+            .map(|at| at.parse::<DateTime<Utc>>())
+            .transpose()?;
         Ok(amux_core::circuit::WindowStats {
-            // Token accounting joins with the turn ledger (Phase 4); 0 keeps
-            // the spend trip disabled rather than fed invented numbers.
-            tokens_spent: 0,
+            tokens_spent,
             tasks_completed: completed,
-            failures,
-            all_items_blocked: false,
+            failures: attempt_failures.saturating_add(verification_failures),
+            all_items_blocked: has_live_work && !runnable_or_assigned,
+            has_live_work,
+            window_elapsed: earliest_event.is_some_and(|at| at <= cutoff_at),
         })
     }
 
     async fn publish_fleet_state(&self, state: &amux_core::circuit::FleetState) -> anyhow::Result<()> {
         let payload = serde_json::to_string(state)?;
+        let persisted = payload.clone();
         self.store
-            .write_async(move |_conn| {
+            .write_async(move |conn| {
+                conn.execute(
+                    "INSERT INTO _amux_fleet_state(singleton,state,updated_at) VALUES(1,?1,?2)
+                     ON CONFLICT(singleton) DO UPDATE SET state=?1,updated_at=?2",
+                    params![persisted, Utc::now().to_rfc3339()],
+                )?;
                 Ok(WriteOutcome {
                     applied: true,
                     events: vec![PendingEvent {
@@ -683,6 +748,103 @@ impl Runtime {
                 })
                 .await?;
         }
+        // Capability decisions happen before snapshots, commands, or leases.
+        // A denied assignment must leave no half-created execution state.
+        let mut authorized_assignments = Vec::new();
+        for asg in &plan.assignments {
+            let worker = asg.worker.clone();
+            let task = asg.task.clone();
+            let decision = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let decision_w = decision.clone();
+            self.store
+                .write_async(move |conn| {
+                    let policy = crate::api::policy::authorize_dispatch(conn, &worker, &task)?;
+                    let allowed = policy.effect == amux_core::policy::CapabilityEffect::Allow;
+                    let mut events = Vec::new();
+                    if !allowed {
+                        events.push(PendingEvent {
+                            entity_type: EntityType::Other("policy_blocked".into()),
+                            entity_id: format!("{worker}:{task}"),
+                            mutation: MutationKind::Created,
+                            payload: None,
+                        });
+                    }
+
+                    // A durable policy refusal must also leave the task in a
+                    // durable non-runnable state. Otherwise the planner sees
+                    // the same todo card next tick and emits an unbounded
+                    // stream of identical receipts without human-visible
+                    // progress. Rate limits are deliberately excluded: they
+                    // are temporary and should be retried after the window.
+                    let destination = match policy.effect {
+                        amux_core::policy::CapabilityEffect::Ask => Some("needsyou"),
+                        amux_core::policy::CapabilityEffect::Deny => Some("blocked"),
+                        amux_core::policy::CapabilityEffect::Allow
+                        | amux_core::policy::CapabilityEffect::RateLimited => None,
+                    };
+                    if let Some(destination) = destination {
+                        if let Some(row) =
+                            crate::orchestrator::context::issue_by_internal_id(conn, &task)?
+                        {
+                            let reason = format!(
+                                "dispatch blocked by capability policy: {}",
+                                policy.rationale
+                            );
+                            if destination == "needsyou" {
+                                let ask_actor = row
+                                    .requested_by
+                                    .as_deref()
+                                    .filter(|value| !value.trim().is_empty())
+                                    .unwrap_or("amux-admin");
+                                conn.execute(
+                                    "UPDATE issues SET ask_type='decision', ask_question=?2,
+                                     ask_unblocks=?3, ask_actor=?4 WHERE id=?1",
+                                    rusqlite::params![
+                                        row.id,
+                                        format!(
+                                            "Should this worker be allowed to execute {} under the current capability policy?",
+                                            row.id
+                                        ),
+                                        "Approving this capability allows the orchestrator to dispatch the task.",
+                                        ask_actor,
+                                    ],
+                                )?;
+                            }
+                            if let Ok(outcome) = crate::db::advance::advance(
+                                conn,
+                                &row.id,
+                                destination,
+                                "orchestrator",
+                                &crate::db::advance::AdvanceOpts {
+                                    force: true,
+                                    reason: Some(reason.clone()),
+                                    log_line: Some(reason),
+                                    skip_continuation: true,
+                                    ..Default::default()
+                                },
+                            )? {
+                                events.extend(outcome.events);
+                            }
+                        }
+                    }
+                    *decision_w.lock().expect("policy decision") = Some(policy);
+                    Ok(WriteOutcome {
+                        applied: !allowed,
+                        events,
+                    })
+                })
+                .await?;
+            if decision
+                .lock()
+                .expect("policy decision")
+                .as_ref()
+                .is_some_and(|decision| {
+                    decision.effect == amux_core::policy::CapabilityEffect::Allow
+                })
+            {
+                authorized_assignments.push(asg.clone());
+            }
+        }
         // Immutable context snapshots (RR-0070, Invariant 27): record exactly
         // what each assigned worker will receive, BEFORE the command that
         // delivers it is enqueued. INSERT OR IGNORE on the assignment's
@@ -690,10 +852,14 @@ impl Runtime {
         // re-records nothing and bumps no revision. A task the board no
         // longer resolves is skipped as an honest no-op (the assignment
         // itself will fail downstream and say so there).
-        for asg in &plan.assignments {
+        for asg in &authorized_assignments {
             let worker_id = asg.worker.clone();
             let task_id = asg.task.clone();
             let key = asg.idempotency_key.clone();
+            let context_budget = std::env::var("AMUX_CONTEXT_MAX_CHARS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(120_000);
             self.store
                 .write_async(move |conn| {
                     let Some(task) =
@@ -701,24 +867,35 @@ impl Runtime {
                     else {
                         return Ok(WriteOutcome { applied: false, events: vec![] });
                     };
-                    let snap = crate::orchestrator::context::assemble_context(
-                        conn, &worker_id, &task,
+                    let handoff_recorded = crate::orchestrator::context::record_assignment_handoff(
+                        conn, &worker_id, &task, &key,
+                    )?;
+                    let snap = crate::orchestrator::context::assemble_context_with_budget(
+                        conn, &worker_id, &task, context_budget,
                     )?;
                     let recorded = crate::orchestrator::context::record_snapshot(
                         conn, &key, &task_id, &worker_id, &snap,
                     )?;
+                    let mut events = Vec::new();
+                    if recorded {
+                        events.push(PendingEvent {
+                            entity_type: EntityType::Other("context_snapshot".into()),
+                            entity_id: snap.content_hash.clone(),
+                            mutation: MutationKind::Created,
+                            payload: None,
+                        });
+                    }
+                    if handoff_recorded {
+                        events.push(PendingEvent {
+                            entity_type: EntityType::Other("handoff".into()),
+                            entity_id: key.clone(),
+                            mutation: MutationKind::Created,
+                            payload: None,
+                        });
+                    }
                     Ok(WriteOutcome {
-                        applied: recorded,
-                        events: if recorded {
-                            vec![PendingEvent {
-                                entity_type: EntityType::Other("context_snapshot".into()),
-                                entity_id: snap.content_hash.clone(),
-                                mutation: MutationKind::Created,
-                                payload: None,
-                            }]
-                        } else {
-                            vec![]
-                        },
+                        applied: recorded || handoff_recorded,
+                        events,
                     })
                 })
                 .await?;
@@ -726,7 +903,7 @@ impl Runtime {
         // Assignments: lease + an ExecuteTask command the pump delivers
         // through the agent protocol — the full loop: board task -> lease
         // -> command -> headless CLI run.
-        for asg in &plan.assignments {
+        for asg in &authorized_assignments {
             let cmd_id = amux_core::ids::CommandId::from_ulid(ulid::Ulid::new());
             let worker_id = asg.worker.clone();
             let task_id = asg.task.clone();
@@ -747,7 +924,7 @@ impl Runtime {
                 })
                 .await?;
         }
-        for asg in &plan.assignments {
+        for asg in &authorized_assignments {
             let task = asg.task.to_string();
             let worker = asg.worker.to_string();
             let acquired = asg.lease.acquired_at.to_rfc3339();
@@ -909,12 +1086,113 @@ impl Runtime {
                     })
                     .await?;
             }
-            amux_core::orchestrator::ExhaustionAction::Decompose { .. } => {
+            amux_core::orchestrator::ExhaustionAction::Decompose { task, depth } => {
                 self.store
-                    .write_async(move |_conn| {
+                    .write_async(move |conn| {
+                        let Some(parent) = crate::orchestrator::context::issue_by_internal_id(
+                            conn, &task,
+                        )? else {
+                            return Ok(WriteOutcome {
+                                applied: true,
+                                events: vec![exhaustion_event],
+                            });
+                        };
+                        let failures: Vec<String> = {
+                            let mut stmt = conn.prepare(
+                                "SELECT record FROM _amux_attempts WHERE task_id=?1 ORDER BY attempt ASC",
+                            )?;
+                            let rows: Vec<String> = stmt
+                                .query_map([task.as_str()], |r| r.get::<_, String>(0))?
+                                .collect::<Result<_, _>>()?;
+                            rows.into_iter()
+                                .map(|raw| {
+                                    serde_json::from_str::<amux_core::limits::AttemptRecord>(&raw)
+                                        .map_err(|error| {
+                                            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                                        })
+                                })
+                                .collect::<Result<Vec<_>, _>>()?
+                                .into_iter()
+                                .map(|record| record.failure_reason)
+                                .collect()
+                        };
+                        let checkpoint = crate::db::harness_store::get_checkpoint(conn, &parent.id)?;
+                        let checkpoint = checkpoint
+                            .as_ref()
+                            .map(serde_json::to_string_pretty)
+                            .transpose()
+                            .map_err(|error| {
+                                rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                            })?
+                            .unwrap_or_else(|| "none recorded".into());
+                        let desc = format!(
+                            "Parent {} exhausted its execution budget. Produce a smaller, independently verifiable continuation.\n\nPrior failures:\n{}\n\nCheckpoint:\n{}",
+                            parent.id,
+                            failures.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n"),
+                            checkpoint,
+                        );
+                        let child = crate::db::board_store::create_issue(
+                            conn,
+                            &crate::db::board_store::NewIssue {
+                                title: format!("Decompose and continue {}", parent.id),
+                                desc,
+                                status: "todo".into(),
+                                session: parent.session.clone(),
+                                shepherd: parent.shepherd.clone(),
+                                item_type: "investigation".into(),
+                                creator: "orchestrator".into(),
+                                owner_type: "agent".into(),
+                                due: parent.due.clone(),
+                                due_time: parent.due_time.clone(),
+                                reviewer: parent.reviewer.clone(),
+                                depends_on: vec![],
+                                gate: vec![],
+                                tags: vec!["harness:decomposition".into(), format!("parent:{}", parent.id)],
+                                ask_type: None,
+                                ask_question: None,
+                                ask_unblocks: None,
+                                ask_actor: None,
+                                source: Some("orchestrator-decomposition".into()),
+                                requested_by: parent.session.clone(),
+                                callback_session: parent.session.clone(),
+                                callback_prompt: Some(format!("Use the result to decide whether to reopen {}", parent.id)),
+                            },
+                            now.timestamp(),
+                        )?;
+                        conn.execute(
+                            "INSERT INTO _amux_decompositions(parent_task_id,child_task_id,depth,status,created_at)
+                             VALUES(?1,?2,?3,'created',?4)",
+                            params![parent.id, child.id, depth, now.to_rfc3339()],
+                        )?;
+                        let reason = format!(
+                            "execution budget exhausted; continuation decomposed into {}",
+                            child.id
+                        );
+                        let result = crate::db::advance::advance(
+                            conn,
+                            &parent.id,
+                            "quarantined",
+                            "orchestrator",
+                            &crate::db::advance::AdvanceOpts {
+                                force: true,
+                                reason: Some(reason.clone()),
+                                log_line: Some(reason),
+                                skip_continuation: true,
+                                ..Default::default()
+                            },
+                        )?;
+                        let mut events = vec![exhaustion_event, PendingEvent {
+                            entity_type: EntityType::Task,
+                            entity_id: child.id.clone(),
+                            mutation: MutationKind::Created,
+                            payload: Some(child.snapshot()),
+                        }];
+                        if let Ok(outcome) = result {
+                            events.extend(outcome.events);
+                        }
                         Ok(WriteOutcome {
                             applied: true,
-                            events: vec![exhaustion_event],
+                            events,
                         })
                     })
                     .await?;
@@ -1161,63 +1439,39 @@ impl Runtime {
                     }
                 }
                 amux_core::protocol::WorkerCommand::ExecuteTask(task_id) => {
-                    // The MODEL needs the WORK, not a task id (the live
-                    // golden bridged this with a CLAUDE.md briefing — the
-                    // real fix). Build the feed-forward prompt from the
-                    // board row + attempt history (Invariant 49).
-                    let prompt_text = {
+                    // Deliver the immutable snapshot recorded before enqueue.
+                    // Reconstructing from the current board here can change
+                    // goalposts between planning and execution, and was also
+                    // dropping prior attempts entirely.
+                    let snapshot = {
                         let conn = self.store.read()?;
-                        let row = {
-                            // internal id -> semantic row: scan open issues
-                            // re-minting ids (the interop shim is one-way).
-                            let rows = crate::db::board_store::list_issues(
-                                &conn,
-                                &[],
-                                &[],
-                                crate::db::board_store::ArchivedFilter::ActiveOnly,
-                            )
-                            .unwrap_or_default();
-                            rows.into_iter().find(|r| {
-                                crate::db::board_store::internal_id(&r.id) == *task_id
-                            })
-                        };
-                        match row {
-                            Some(r) => {
-                                let asg = amux_core::orchestrator::WorkAssignment {
-                                    task: task_id.clone(),
-                                    worker: worker.clone(),
-                                    attempt: cmd.attempts + 1,
-                                    lease: amux_core::orchestrator::Lease {
-                                        task: task_id.clone(),
-                                        worker: worker.clone(),
-                                        acquired_at: now,
-                                        expires_at: now,
-                                        generation: 0,
-                                    },
-                                    idempotency_key: cmd.idempotency_key.clone(),
-                                    prior_attempts: vec![],
-                                };
-                                format!(
-                                    "{}
-(board card {} — move it through the board as you work)",
-                                    amux_core::orchestrator::assignment_prompt(
-                                        &r.title, &r.desc, &asg
-                                    ),
-                                    r.id
-                                )
-                            }
-                            None => serde_json::to_string(&cmd.command).unwrap_or_default(),
-                        }
+                        crate::orchestrator::context::load_snapshot(
+                            &conn,
+                            &cmd.idempotency_key,
+                        )?
                     };
-                    protocol
-                        .send_prompt(
-                            &worker,
-                            crate::opencode::Prompt {
-                                text: prompt_text,
-                                idempotency_key: cmd.idempotency_key.clone(),
-                            },
-                        )
-                        .await
+                    match snapshot {
+                        Some(snapshot) => {
+                            let prompt_text = format!(
+                                "{}\n(board task {} — update its durable checkpoint and move it through the board as you work)",
+                                crate::orchestrator::context::render_snapshot(&snapshot),
+                                task_id,
+                            );
+                            protocol
+                                .send_prompt(
+                                    &worker,
+                                    crate::opencode::Prompt {
+                                        text: prompt_text,
+                                        idempotency_key: cmd.idempotency_key.clone(),
+                                    },
+                                )
+                                .await
+                        }
+                        None => Err(crate::opencode::ProtocolError::Transport(format!(
+                            "immutable context snapshot missing for assignment {} (task {})",
+                            cmd.idempotency_key, task_id
+                        ))),
+                    }
                 }
                 other => {
                     protocol
@@ -2047,6 +2301,61 @@ mod adherence_tests {
         .unwrap()
     }
 
+    #[test]
+    fn decomposition_depth_follows_semantic_child_chain() {
+        let conn = crate::db::migrate::test_memdb();
+        conn.execute(
+            "INSERT INTO _amux_decompositions(parent_task_id,child_task_id,depth,status,created_at)
+             VALUES('AMUX-1','AMUX-2',1,'created','2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO _amux_decompositions(parent_task_id,child_task_id,depth,status,created_at)
+             VALUES('AMUX-2','AMUX-3',2,'created','2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(decomposition_depth(&conn, "AMUX-1").unwrap(), 0);
+        assert_eq!(decomposition_depth(&conn, "AMUX-2").unwrap(), 1);
+        assert_eq!(decomposition_depth(&conn, "AMUX-3").unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn denied_dispatch_parks_the_card_and_does_not_retry_forever() {
+        let store = store();
+        let worker = seed_worker(&store, 77, "policy-denied");
+        let worker_for_write = worker.clone();
+        store
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE _amux_workers SET permissions='[\"deny:execute_task\"]' WHERE id=?1",
+                    [worker_for_write.as_str()],
+                )?;
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
+            })
+            .unwrap();
+        let semantic = seed_issue(&store, "policy denied work", "policy-denied", "todo");
+        let runtime = runtime(store.clone(), None, false);
+
+        runtime.tick_once(false).await.unwrap();
+        assert_eq!(issue_field(&store, &semantic, "status"), "blocked");
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM _amux_policy_receipts"), 1);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM _amux_commands"), 0);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM _amux_leases"), 0);
+
+        runtime.tick_once(false).await.unwrap();
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM _amux_policy_receipts"),
+            1,
+            "a parked policy denial must not generate another receipt each tick"
+        );
+    }
+
     /// M1 + M6: an idle Rust worker with NO eligible board card receives
     /// NOTHING — no invented work (Invariant 20) — and cards owned by the
     /// Python fleet are never assigned, leased, or mutated
@@ -2130,6 +2439,8 @@ mod adherence_tests {
                         rejected_evidence: vec![],
                         tokens_spent: 100,
                         wall_clock_secs: 60,
+                        tool_calls: 1,
+                        cost_microusd: 0,
                         decomposition_attempted: n >= 4,
                         tree_status: None,
                         at: Utc::now() - chrono::Duration::minutes(60 - n as i64),
