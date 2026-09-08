@@ -9419,41 +9419,42 @@ fn compose_drop_counts(
     let (mut deleted, mut unrecognised, mut in_roster) = (0usize, 0usize, false);
     for line in existing.lines() {
         let t = line.trim();
-        // RESET ON THE NEXT HEADING, never latch (ts-gke, reviewing 78dffd39
-        // against a REAL file instead of my fixtures). Setting this true and
-        // never clearing it implements "skip the roster" as "skip everything
-        // from the roster heading to EOF", which is only harmless while the
-        // roster is last.
+        // A POINTER IS COUNTED WHEREVER IT SITS. The roster guard suppresses
+        // only NON-pointer lines (ts-gke, after measuring the residual left by
+        // my previous two attempts at this).
         //
-        // Measured on the file this will actually meet,
-        // ~/.claude/projects/-Users-ethan-Dev-mixpeek/memory/MEMORY.md: the
-        // roster heading is line 88 of 210, with 62 POINTER LINES and 55
-        // non-empty prose lines AFTER it. The latching version examined 87
-        // lines and skipped 119 — blind over exactly the region where agent
-        // content accumulates, which is the region this function exists to
-        // measure.
+        // Attempt 1 latched at the roster heading and skipped to EOF: 119 lines
+        // blind. Attempt 2 reset on the next `## ` heading, which shrank it to
+        // 7 and did not close it, because an agent append lands at the end of
+        // whatever section it falls into. On the real file six live pointers sit
+        // at lines 147-153: after the roster TABLE ended, still under the roster
+        // HEADING, so a heading-scoped guard swallowed them.
         //
-        // The merge itself was never affected: `preserved_agent_pointers` has
-        // no roster guard at all and preserves those 62. A REPORTING defect,
-        // not data loss, and worth fixing anyway because a disclosure that
-        // cannot see part of what it discloses is this card's own failure one
-        // layer further along.
+        // Measured on ~/.claude/projects/-Users-ethan-Dev-mixpeek/memory/MEMORY.md:
+        //   roster heading 88 | first pointer after it 147 | next heading 154
+        //   pointer lines inside the roster's scope: 6
+        //   roster TABLE rows that are pointer-shaped:  0
         //
-        // Resetting on any `## ` also makes the roster's POSITION irrelevant,
-        // so this keeps working if emit order changes again.
+        // That last zero is what makes this safe rather than clever: the roster
+        // is a `| ... |` table plus two prose lines and contains no `- [..](..)`
+        // line at all, so a pointer inside its scope is by definition NOT roster
+        // content. It also makes the guard indifferent to WHERE the roster sits
+        // and whether a heading follows it, which is the property both previous
+        // versions lacked.
         if t.starts_with("## ") {
             in_roster = t.starts_with("## Fleet — who else is running");
         }
-        if in_roster || t.is_empty() {
-            continue;
-        }
         match re.captures(line) {
+            // Always, roster scope or not: see the note above.
             Some(c) => {
                 if !mem_dir.join(&c[1]).is_file() {
                     deleted += 1;
                 }
             }
             None => {
+                if in_roster || t.is_empty() {
+                    continue;
+                }
                 if !composed.contains(t) {
                     unrecognised += 1;
                 }
@@ -18783,10 +18784,19 @@ mod tests {
         std::fs::write(d.join("before.md"), "x\n").unwrap();
         std::fs::write(d.join("after.md"), "x\n").unwrap();
 
+        std::fs::write(d.join("inscope.md"), "x\n").unwrap();
+        // THE SHAPE ON DISK RIGHT NOW, which both earlier fixes missed: an
+        // append lands at the end of whatever section it falls into, so these
+        // sit AFTER the roster TABLE and BEFORE the next heading. A
+        // heading-scoped guard still swallows them. On the real mixpeek index
+        // that is six live pointers at lines 147-153, roster heading 88, next
+        // heading 154.
         let existing = concat!(
             "- [Before](before.md) — a pointer ahead of the roster\n",
             "\n## Fleet — who else is running (auto-generated, do not edit)\n",
             "| worker | groups |\n|---|---|\n| peer | x |\n",
+            "- [InScope](inscope.md) — appended INSIDE the roster section\n",
+            "- [GoneInScope](gone-inscope.md) — deleted target, same position\n",
             "\n## Session pointers appended after the roster\n",
             "- [After](after.md) — a live pointer BELOW the roster\n",
             "- [Vanished](vanished.md) — its file is gone, must be counted\n",
@@ -18800,13 +18810,18 @@ mod tests {
         let out = super::preserved_agent_pointers(d, composed);
         assert!(out.contains("(before.md)"), "pointer above the roster: {out}");
         assert!(out.contains("(after.md)"), "pointer BELOW the roster: {out}");
+        assert!(
+            out.contains("(inscope.md)"),
+            "pointer appended INSIDE the roster section, after its table: {out}"
+        );
 
         // THE DEFECT: with a latching flag both of these were 0, because
         // everything from line 2 to EOF was skipped.
         let (deleted, unrecognised) = super::compose_drop_counts(existing, composed, d);
         assert_eq!(
-            deleted, 1,
-            "a deleted-target pointer BELOW the roster must still be counted"
+            deleted, 2,
+            "BOTH deleted-target pointers must be counted: one below the next heading, \
+             and one appended inside the roster section after its table"
         );
         assert_eq!(
             unrecognised, 2,
