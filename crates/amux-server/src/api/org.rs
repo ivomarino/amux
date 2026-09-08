@@ -24,7 +24,7 @@
 use super::calendar::query_rows_json;
 use super::AppState;
 use crate::db::{PendingEvent, WriteOutcome};
-use crate::integrations::email::base64url_nopad;
+use crate::integrations::email::{base64url_decode, base64url_nopad};
 use amux_core::revision::{EntityType, MutationKind};
 use axum::extract::{Form, Path, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
@@ -43,6 +43,8 @@ const VERIFIED_MEMBER_HEADER: &str = "x-amux-local-member-verified";
 const MEMBER_SCOPE_LEVEL_HEADER: &str = "x-amux-local-member-scope-level";
 const MEMBER_SCOPE_NAME_HEADER: &str = "x-amux-local-member-scope-name";
 const MEMBER_ACTOR_HEADER: &str = "x-amux-local-member-actor";
+const MEMBER_TEAM_ID_HEADER: &str = "x-amux-local-member-team-id";
+const MEMBER_TEAM_NAME_B64_HEADER: &str = "x-amux-local-member-team-name-b64";
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -51,6 +53,11 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/members/{id}",
             axum::routing::patch(patch_member).delete(delete_member),
+        )
+        .route("/teams", get(list_teams).post(create_team))
+        .route(
+            "/teams/{id}",
+            axum::routing::patch(patch_team).delete(delete_team),
         )
         .route("/invites", get(list_invites).post(create_invite))
         .route("/invites/{token}", axum::routing::delete(delete_invite))
@@ -153,6 +160,19 @@ pub(crate) fn local_member_scope(headers: &HeaderMap) -> Option<MemberScope> {
     // are validated, but fail closed if an operator edited the DB by hand.
     parse_member_scope(level, name)
         .or_else(|| Some(MemberScope::Worker("__invalid_member_scope__".into())))
+}
+
+/// Team assignment resolved from server-installed identity headers.  Scope is
+/// enforced independently above, while this metadata lets the UI explain why
+/// a member has that access without exposing the org administration APIs.
+pub(crate) fn local_member_team(headers: &HeaderMap) -> Option<Value> {
+    if !is_verified_local_member(headers) {
+        return None;
+    }
+    let id = headers.get(MEMBER_TEAM_ID_HEADER)?.to_str().ok()?;
+    let encoded = headers.get(MEMBER_TEAM_NAME_B64_HEADER)?.to_str().ok()?;
+    let name = String::from_utf8(base64url_decode(encoded).ok()?).ok()?;
+    (!id.is_empty()).then(|| json!({"id": id, "name": name}))
 }
 
 pub(crate) fn scoped_worker_names(scope: &MemberScope) -> Vec<String> {
@@ -328,6 +348,8 @@ struct MemberIdentity {
     id: String,
     email: String,
     scope: MemberScope,
+    team_id: String,
+    team_name: String,
 }
 
 fn member_cookie(headers: &HeaderMap) -> Option<&str> {
@@ -363,6 +385,8 @@ pub async fn local_member_identity(
     req.headers_mut().remove(MEMBER_SCOPE_LEVEL_HEADER);
     req.headers_mut().remove(MEMBER_SCOPE_NAME_HEADER);
     req.headers_mut().remove(MEMBER_ACTOR_HEADER);
+    req.headers_mut().remove(MEMBER_TEAM_ID_HEADER);
+    req.headers_mut().remove(MEMBER_TEAM_NAME_B64_HEADER);
     req.headers_mut().remove("x-amux-user-id");
     req.headers_mut().remove("x-amux-user-email");
     let Some(token) = member_cookie(req.headers()).map(str::to_string) else {
@@ -372,8 +396,14 @@ pub async fn local_member_identity(
     let identity = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemberIdentity>> {
         let conn = store.read()?;
         Ok(conn.query_row(
-            "SELECT m.id, m.email, m.scope_level, m.scope_name FROM org_invites i \
-             JOIN org_members m ON m.id=i.used_by \
+            "SELECT m.id, m.email, \
+                    CASE WHEN t.id IS NOT NULL THEN t.scope_level \
+                         WHEN COALESCE(m.team_id,'')='' THEN m.scope_level ELSE 'worker' END, \
+                    CASE WHEN t.id IS NOT NULL THEN t.scope_name \
+                         WHEN COALESCE(m.team_id,'')='' THEN m.scope_name ELSE '__invalid_team_scope__' END, \
+                    COALESCE(t.id,''), COALESCE(t.name,'') \
+             FROM org_invites i JOIN org_members m ON m.id=i.used_by \
+             LEFT JOIN org_teams t ON t.id=m.team_id \
              WHERE i.token=?1 AND i.used_at IS NOT NULL",
             [&token],
             |row| {
@@ -387,6 +417,8 @@ pub async fn local_member_identity(
                     // broadest possible grant.
                     scope: parse_member_scope(&level, &name)
                         .unwrap_or(MemberScope::Worker("__invalid_member_scope__".into())),
+                    team_id: row.get(4)?,
+                    team_name: row.get(5)?,
                 })
             },
         ).optional()?)
@@ -425,6 +457,17 @@ pub async fn local_member_identity(
     }
     req.headers_mut().insert("x-amux-user-id", id);
     req.headers_mut().insert("x-amux-user-email", email);
+    if !member.team_id.is_empty() {
+        let (Ok(team_id), Ok(team_name)) = (
+            HeaderValue::from_str(&member.team_id),
+            HeaderValue::from_str(&base64url_nopad(member.team_name.as_bytes())),
+        ) else {
+            tracing::warn!(target: "amux::local_invite", verdict = "member_header_rejected", field = "team", member_id = %member.id, "stored local member team is not a valid HTTP header");
+            return next.run(req).await;
+        };
+        req.headers_mut().insert(MEMBER_TEAM_ID_HEADER, team_id);
+        req.headers_mut().insert(MEMBER_TEAM_NAME_B64_HEADER, team_name);
+    }
     if let Ok(actor) = HeaderValue::from_str(&format!("member:{}", member.email)) {
         req.headers_mut().insert(MEMBER_ACTOR_HEADER, actor);
     }
@@ -587,6 +630,105 @@ fn resolve_scope_target(
     }
 }
 
+#[derive(Debug, Clone)]
+struct TeamAssignment {
+    id: String,
+    name: String,
+    scope: MemberScope,
+    exists: bool,
+}
+
+fn team_by_id(
+    conn: &rusqlite::Connection,
+    id: &str,
+) -> rusqlite::Result<Option<TeamAssignment>> {
+    conn.query_row(
+        "SELECT id,name,scope_level,scope_name FROM org_teams WHERE id=?1",
+        [id],
+        |row| {
+            let level: String = row.get(2)?;
+            let name: String = row.get(3)?;
+            Ok(TeamAssignment {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                scope: parse_member_scope(&level, &name)
+                    .unwrap_or(MemberScope::Worker("__invalid_team_scope__".into())),
+                exists: true,
+            })
+        },
+    )
+    .optional()
+}
+
+fn assignment_from_body(
+    conn: &rusqlite::Connection,
+    body: &Value,
+) -> Result<TeamAssignment, Value> {
+    if let Some(id) = body.get("team_id").and_then(Value::as_str).map(str::trim) {
+        if id.is_empty() {
+            return Err(json!({"error":"team_id must not be empty"}));
+        }
+        return team_by_id(conn, id)
+            .map_err(|e| json!({"error":e.to_string()}))?
+            .ok_or_else(|| json!({"error":"team not found","team_id":id}));
+    }
+
+    // Compatibility for pre-team API callers: resolve their direct scope and
+    // bind it to a real team.  This keeps every accepted user team-backed
+    // without making a rolling server/dashboard deployment drop old clients.
+    let requested = requested_scope(body)?;
+    let Some(scope) = resolve_scope_target(conn, &requested) else {
+        return Err(json!({
+            "error":"scope target does not exist",
+            "scope_level":requested.level(),
+            "scope_name":requested.name(),
+        }));
+    };
+    let existing = conn
+        .query_row(
+            "SELECT id,name FROM org_teams WHERE scope_level=?1 AND scope_name=?2 \
+             ORDER BY CASE WHEN id='team_global' THEN 0 ELSE 1 END,created_at,id LIMIT 1",
+            rusqlite::params![scope.level(), scope.name()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|e| json!({"error":e.to_string()}))?;
+    if let Some((id, name)) = existing {
+        return Ok(TeamAssignment { id, name, scope, exists: true });
+    }
+    let suffix = ulid::Ulid::new().to_string().to_lowercase();
+    let label = match &scope {
+        MemberScope::Global => "Everyone".to_string(),
+        MemberScope::Group(name) => format!("Group: {name} ({})", &suffix[..6]),
+        MemberScope::Worker(name) => format!("Worker: {name} ({})", &suffix[..6]),
+    };
+    Ok(TeamAssignment {
+        id: format!("team_{suffix}"),
+        name: label,
+        scope,
+        exists: false,
+    })
+}
+
+fn ensure_assignment(
+    conn: &rusqlite::Connection,
+    team: &TeamAssignment,
+) -> rusqlite::Result<()> {
+    if !team.exists {
+        conn.execute(
+            "INSERT INTO org_teams (id,name,scope_level,scope_name,created_at) VALUES (?1,?2,?3,?4,?5)",
+            rusqlite::params![
+                team.id,
+                team.name,
+                team.scope.level(),
+                team.scope.name(),
+                chrono::Utc::now().timestamp(),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn invite_fingerprint(token: &str) -> String {
     use sha2::Digest as _;
     hex::encode(sha2::Sha256::digest(token.as_bytes()))[..12].to_string()
@@ -597,26 +739,33 @@ struct InviteView {
     workspace: String,
     email: Option<String>,
     scope: MemberScope,
+    team_name: String,
 }
 
-type InviteRow = (Option<String>, i64, Option<i64>, String, String);
+type InviteRow = (Option<String>, i64, Option<i64>, String, String, String, String);
 
 #[derive(Debug)]
 enum InviteLookup { Live(InviteView), Missing, Used, Expired }
 
 fn lookup_invite(conn: &rusqlite::Connection, token: &str) -> rusqlite::Result<InviteLookup> {
     let row: Option<InviteRow> = conn.query_row(
-        "SELECT email, expires_at, used_at, scope_level, scope_name FROM org_invites WHERE token=?1", [token],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        "SELECT i.email,i.expires_at,i.used_at, \
+                CASE WHEN t.id IS NOT NULL THEN t.scope_level \
+                     WHEN COALESCE(i.team_id,'')='' THEN i.scope_level ELSE 'worker' END, \
+                CASE WHEN t.id IS NOT NULL THEN t.scope_name \
+                     WHEN COALESCE(i.team_id,'')='' THEN i.scope_name ELSE '__invalid_team_scope__' END, \
+                COALESCE(t.id,''),COALESCE(t.name,'') \
+         FROM org_invites i LEFT JOIN org_teams t ON t.id=i.team_id WHERE i.token=?1", [token],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
     ).optional()?;
-    let Some((email, expires_at, used_at, scope_level, scope_name)) = row else { return Ok(InviteLookup::Missing) };
+    let Some((email, expires_at, used_at, scope_level, scope_name, _team_id, team_name)) = row else { return Ok(InviteLookup::Missing) };
     if used_at.is_some() { return Ok(InviteLookup::Used); }
     if expires_at <= chrono::Utc::now().timestamp() { return Ok(InviteLookup::Expired); }
     let workspace = conn.query_row("SELECT name FROM org WHERE id='default'", [], |row| row.get(0))
         .optional()?.unwrap_or_else(|| "My Workspace".to_string());
     let scope = parse_member_scope(&scope_level, &scope_name)
         .unwrap_or(MemberScope::Worker("__invalid_member_scope__".into()));
-    Ok(InviteLookup::Live(InviteView { workspace, email, scope }))
+    Ok(InviteLookup::Live(InviteView { workspace, email, scope, team_name }))
 }
 
 fn invite_error(status: StatusCode, title: &str, detail: &str) -> Response {
@@ -659,8 +808,8 @@ async fn invite_page(State(state): State<AppState>, Path(token): Path<String>) -
                 format!("{} {}", invite.scope.level(), invite.scope.name())
             };
             let body = format!(
-                "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Join {workspace}</title><style>{css}</style></head><body><main><div class=\"mark\">A</div><h1>Join {workspace}</h1><p>You were invited to collaborate in this Amux workspace with access to <strong>{access}</strong>.</p><form method=\"post\"><label for=\"email\">Email</label><input id=\"email\" name=\"email\" type=\"email\" maxlength=\"254\" required autocomplete=\"email\" value=\"{email}\"{readonly}><label for=\"name\">Name</label><input id=\"name\" name=\"name\" maxlength=\"80\" autocomplete=\"name\" placeholder=\"How teammates will see you\"><button type=\"submit\">Join workspace</button></form><div class=\"note\">This signs this browser into this local Amux instance.</div></main></body></html>",
-                workspace = html_escape(&invite.workspace), css = INVITE_CSS, email = html_escape(email), access = html_escape(&access),
+                "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Join {workspace}</title><style>{css}</style></head><body><main><div class=\"mark\">A</div><h1>Join {workspace}</h1><p>You were invited to the <strong>{team}</strong> team with access to <strong>{access}</strong>.</p><form method=\"post\"><label for=\"email\">Email</label><input id=\"email\" name=\"email\" type=\"email\" maxlength=\"254\" required autocomplete=\"email\" value=\"{email}\"{readonly}><label for=\"name\">Name</label><input id=\"name\" name=\"name\" maxlength=\"80\" autocomplete=\"name\" placeholder=\"How teammates will see you\"><button type=\"submit\">Join workspace</button></form><div class=\"note\">This signs this browser into this local Amux instance. Access follows the team’s scope.</div></main></body></html>",
+                workspace = html_escape(&invite.workspace), css = INVITE_CSS, email = html_escape(email), access = html_escape(&access), team = html_escape(if invite.team_name.is_empty() { "Legacy access" } else { &invite.team_name }),
             );
             (StatusCode::OK, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response()
         }
@@ -716,10 +865,16 @@ async fn accept_invite(
     let write = state.store.write_async(move |conn| {
         let now = chrono::Utc::now().timestamp();
         let row: Option<InviteRow> = conn.query_row(
-            "SELECT email, expires_at, used_at, scope_level, scope_name FROM org_invites WHERE token=?1", [&token_w],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            "SELECT i.email,i.expires_at,i.used_at, \
+                    CASE WHEN t.id IS NOT NULL THEN t.scope_level \
+                         WHEN COALESCE(i.team_id,'')='' THEN i.scope_level ELSE 'worker' END, \
+                    CASE WHEN t.id IS NOT NULL THEN t.scope_name \
+                         WHEN COALESCE(i.team_id,'')='' THEN i.scope_name ELSE '__invalid_team_scope__' END, \
+                    COALESCE(t.id,''),COALESCE(t.name,'') \
+             FROM org_invites i LEFT JOIN org_teams t ON t.id=i.team_id WHERE i.token=?1", [&token_w],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
         ).optional()?;
-        let Some((bound_email, expires_at, used_at, scope_level, scope_name)) = row else {
+        let Some((bound_email, expires_at, used_at, scope_level, scope_name, team_id, _team_name)) = row else {
             *outcome_w.lock().expect("accept outcome") = Some(AcceptOutcome::Missing);
             return Ok(WriteOutcome { applied: false, events: vec![] });
         };
@@ -744,8 +899,8 @@ async fn accept_invite(
             Some(id) => {
                 conn.execute(
                     "UPDATE org_members SET name=CASE WHEN ?1='' THEN name ELSE ?1 END, \
-                     scope_level=?2, scope_name=?3 WHERE id=?4",
-                    rusqlite::params![name_w, scope.level(), scope.name(), id],
+                     scope_level=?2, scope_name=?3, team_id=?4 WHERE id=?5",
+                    rusqlite::params![name_w, scope.level(), scope.name(), team_id, id],
                 )?;
                 (id, false)
             }
@@ -754,9 +909,9 @@ async fn accept_invite(
                     email_w.split('@').next().unwrap_or(&email_w).to_string()
                 } else { name_w.clone() };
                 conn.execute(
-                    "INSERT INTO org_members (id,email,name,role,joined_at,scope_level,scope_name) \
-                     VALUES (?1,?2,?3,'member',?4,?5,?6)",
-                    rusqlite::params![member_id_candidate, email_w, display_name, now, scope.level(), scope.name()],
+                    "INSERT INTO org_members (id,email,name,role,joined_at,scope_level,scope_name,team_id) \
+                     VALUES (?1,?2,?3,'member',?4,?5,?6,?7)",
+                    rusqlite::params![member_id_candidate, email_w, display_name, now, scope.level(), scope.name(), team_id],
                 )?;
                 (member_id_candidate, true)
             }
@@ -871,8 +1026,11 @@ pub async fn list_members(State(state): State<AppState>) -> Response {
         let conn = store.read()?;
         Ok(query_rows_json(
             &conn,
-            "SELECT id, email, name, role, joined_at, scope_level, scope_name \
-             FROM org_members ORDER BY joined_at",
+            "SELECT m.id,m.email,m.name,m.role,m.joined_at, \
+                    COALESCE(t.scope_level,m.scope_level) AS scope_level, \
+                    COALESCE(t.scope_name,m.scope_name) AS scope_name, \
+                    COALESCE(t.id,'') AS team_id, COALESCE(t.name,'Legacy access') AS team_name \
+             FROM org_members m LEFT JOIN org_teams t ON t.id=m.team_id ORDER BY m.joined_at",
             &[],
         )?)
     })
@@ -891,34 +1049,32 @@ pub async fn patch_member(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    let requested = match requested_scope(&body) {
-        Ok(scope) => scope,
-        Err(body) => return err(StatusCode::BAD_REQUEST, body),
-    };
     let conn = match state.store.read() {
         Ok(conn) => conn,
         Err(e) => return internal(e),
     };
-    let Some(scope) = resolve_scope_target(&conn, &requested) else {
-        return err(
-            StatusCode::BAD_REQUEST,
-            json!({
-                "error": "scope target does not exist",
-                "scope_level": requested.level(),
-                "scope_name": requested.name(),
-            }),
-        );
+    let team = match assignment_from_body(&conn, &body) {
+        Ok(team) => team,
+        Err(body) => return err(StatusCode::BAD_REQUEST, body),
     };
     drop(conn);
     let id_w = id.clone();
-    let level = scope.level().to_string();
-    let name = scope.name().to_string();
+    let team_w = team.clone();
     let write = state
         .store
         .write_async(move |conn| {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM org_members WHERE id=?1)",
+                [&id_w],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Ok(WriteOutcome { applied: false, events: vec![] });
+            }
+            ensure_assignment(conn, &team_w)?;
             let n = conn.execute(
-                "UPDATE org_members SET scope_level=?1, scope_name=?2 WHERE id=?3",
-                rusqlite::params![level, name, id_w],
+                "UPDATE org_members SET team_id=?1,scope_level=?2,scope_name=?3 WHERE id=?4",
+                rusqlite::params![team_w.id, team_w.scope.level(), team_w.scope.name(), id_w],
             )?;
             Ok(WriteOutcome {
                 applied: n > 0,
@@ -933,8 +1089,10 @@ pub async fn patch_member(
         Ok(outcome) if outcome.applied => Json(json!({
             "ok": true,
             "id": id,
-            "scope_level": scope.level(),
-            "scope_name": scope.name(),
+            "team_id": team.id,
+            "team_name": team.name,
+            "scope_level": team.scope.level(),
+            "scope_name": team.scope.name(),
         }))
         .into_response(),
         Ok(_) => err(StatusCode::NOT_FOUND, json!({"error": "member not found"})),
@@ -964,6 +1122,205 @@ pub async fn delete_member(State(state): State<AppState>, Path(id): Path<String>
     }
 }
 
+// ---- /api/org/teams ------------------------------------------------------
+
+pub async fn list_teams(State(state): State<AppState>) -> Response {
+    let store = state.store.clone();
+    let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Value>> {
+        let conn = store.read()?;
+        Ok(query_rows_json(
+            &conn,
+            "SELECT t.id,t.name,t.scope_level,t.scope_name,t.created_at, \
+                    COUNT(DISTINCT m.id) AS member_count, \
+                    COUNT(DISTINCT CASE WHEN i.used_at IS NULL AND i.expires_at>?1 THEN i.token END) AS pending_invite_count \
+             FROM org_teams t \
+             LEFT JOIN org_members m ON m.team_id=t.id \
+             LEFT JOIN org_invites i ON i.team_id=t.id \
+             GROUP BY t.id \
+             ORDER BY CASE WHEN t.id='team_global' THEN 0 ELSE 1 END,lower(t.name)",
+            &[&chrono::Utc::now().timestamp()],
+        )?)
+    })
+    .await;
+    match joined {
+        Ok(Ok(rows)) => Json(Value::Array(rows)).into_response(),
+        Ok(Err(e)) => internal(e),
+        Err(e) => internal(e),
+    }
+}
+
+fn team_definition(
+    conn: &rusqlite::Connection,
+    body: &Value,
+) -> Result<(String, MemberScope), Value> {
+    let name: String = body
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(80)
+        .collect();
+    if name.is_empty() {
+        return Err(json!({"error":"team name required"}));
+    }
+    let requested = requested_scope(body)?;
+    let Some(scope) = resolve_scope_target(conn, &requested) else {
+        return Err(json!({
+            "error":"scope target does not exist",
+            "scope_level":requested.level(),
+            "scope_name":requested.name(),
+        }));
+    };
+    Ok((name, scope))
+}
+
+pub async fn create_team(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Response {
+    let conn = match state.store.read() {
+        Ok(conn) => conn,
+        Err(e) => return internal(e),
+    };
+    let (name, scope) = match team_definition(&conn, &body) {
+        Ok(value) => value,
+        Err(body) => return err(StatusCode::BAD_REQUEST, body),
+    };
+    drop(conn);
+    let id = format!("team_{}", ulid::Ulid::new().to_string().to_lowercase());
+    let id_w = id.clone();
+    let name_w = name.clone();
+    let level = scope.level().to_string();
+    let target = scope.name().to_string();
+    let write = state
+        .store
+        .write_async(move |conn| {
+            conn.execute(
+                "INSERT INTO org_teams (id,name,scope_level,scope_name,created_at) VALUES (?1,?2,?3,?4,?5)",
+                rusqlite::params![id_w,name_w,level,target,chrono::Utc::now().timestamp()],
+            )?;
+            Ok(WriteOutcome {
+                applied: true,
+                events: vec![ev("org_team", &id_w, MutationKind::Created)],
+            })
+        })
+        .await;
+    match write {
+        Ok(_) => {
+            tracing::info!(target:"amux::local_invite", verdict="team_created", team_id=%id,
+                scope_level=scope.level(), scope_name=scope.name(), "workspace team created");
+            (StatusCode::CREATED, Json(json!({
+                "id":id,"name":name,"scope_level":scope.level(),"scope_name":scope.name(),
+                "member_count":0,"pending_invite_count":0,
+            }))).into_response()
+        }
+        Err(e) if e.to_string().contains("UNIQUE constraint failed: org_teams.name") => {
+            err(StatusCode::CONFLICT, json!({"error":"team name already exists"}))
+        }
+        Err(e) => internal(e),
+    }
+}
+
+pub async fn patch_team(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    if id == "team_global" {
+        return err(StatusCode::CONFLICT, json!({"error":"the Everyone team must remain global"}));
+    }
+    let conn = match state.store.read() {
+        Ok(conn) => conn,
+        Err(e) => return internal(e),
+    };
+    let (name, scope) = match team_definition(&conn, &body) {
+        Ok(value) => value,
+        Err(body) => return err(StatusCode::BAD_REQUEST, body),
+    };
+    drop(conn);
+    let id_w = id.clone();
+    let name_w = name.clone();
+    let level = scope.level().to_string();
+    let target = scope.name().to_string();
+    let write = state
+        .store
+        .write_async(move |conn| {
+            let n = conn.execute(
+                "UPDATE org_teams SET name=?1,scope_level=?2,scope_name=?3 WHERE id=?4",
+                rusqlite::params![name_w,level,target,id_w],
+            )?;
+            if n > 0 {
+                // Keep the 0059 columns coherent for rolling binaries and
+                // forensic exports; current authorization reads the team.
+                conn.execute(
+                    "UPDATE org_members SET scope_level=?1,scope_name=?2 WHERE team_id=?3",
+                    rusqlite::params![level,target,id_w],
+                )?;
+                conn.execute(
+                    "UPDATE org_invites SET scope_level=?1,scope_name=?2 WHERE team_id=?3",
+                    rusqlite::params![level,target,id_w],
+                )?;
+            }
+            Ok(WriteOutcome {
+                applied: n > 0,
+                events: (n > 0).then(|| ev("org_team", &id_w, MutationKind::Updated)).into_iter().collect(),
+            })
+        })
+        .await;
+    match write {
+        Ok(outcome) if outcome.applied => Json(json!({
+            "ok":true,"id":id,"name":name,"scope_level":scope.level(),"scope_name":scope.name(),
+        })).into_response(),
+        Ok(_) => err(StatusCode::NOT_FOUND, json!({"error":"team not found"})),
+        Err(e) if e.to_string().contains("UNIQUE constraint failed: org_teams.name") => {
+            err(StatusCode::CONFLICT, json!({"error":"team name already exists"}))
+        }
+        Err(e) => internal(e),
+    }
+}
+
+pub async fn delete_team(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    if id == "team_global" {
+        return err(StatusCode::CONFLICT, json!({"error":"the Everyone team cannot be deleted"}));
+    }
+    let id_w = id.clone();
+    let verdict: Arc<Mutex<Option<&'static str>>> = Arc::new(Mutex::new(None));
+    let verdict_w = verdict.clone();
+    let write = state
+        .store
+        .write_async(move |conn| {
+            let references: i64 = conn.query_row(
+                "SELECT (SELECT COUNT(*) FROM org_members WHERE team_id=?1) + \
+                        (SELECT COUNT(*) FROM org_invites WHERE team_id=?1 AND used_at IS NULL AND expires_at>?2)",
+                rusqlite::params![id_w, chrono::Utc::now().timestamp()],
+                |row| row.get(0),
+            )?;
+            if references > 0 {
+                *verdict_w.lock().expect("team delete verdict") = Some("in_use");
+                return Ok(WriteOutcome { applied: false, events: vec![] });
+            }
+            let n = conn.execute("DELETE FROM org_teams WHERE id=?1", [&id_w])?;
+            *verdict_w.lock().expect("team delete verdict") = Some(if n > 0 { "deleted" } else { "missing" });
+            Ok(WriteOutcome {
+                applied: n > 0,
+                events: (n > 0).then(|| ev("org_team", &id_w, MutationKind::Deleted)).into_iter().collect(),
+            })
+        })
+        .await;
+    if let Err(e) = write {
+        return internal(e);
+    }
+    let result = match *verdict.lock().expect("team delete verdict") {
+        Some("deleted") => Json(json!({"ok":true})).into_response(),
+        Some("in_use") => err(StatusCode::CONFLICT, json!({
+            "error":"move members and revoke pending invites before deleting this team"
+        })),
+        _ => err(StatusCode::NOT_FOUND, json!({"error":"team not found"})),
+    };
+    result
+}
+
 // ---- GET /api/org/invites -------------------------------------------------
 
 pub async fn list_invites(
@@ -978,9 +1335,12 @@ pub async fn list_invites(
         let now = chrono::Utc::now().timestamp();
         let mut rows = query_rows_json(
             &conn,
-            "SELECT token, email, created_at, expires_at, used_at, used_by, scope_level, scope_name \
-             FROM org_invites WHERE used_at IS NULL AND expires_at > ?1 \
-             ORDER BY created_at DESC",
+            "SELECT i.token,i.email,i.created_at,i.expires_at,i.used_at,i.used_by, \
+                    COALESCE(t.scope_level,i.scope_level) AS scope_level, \
+                    COALESCE(t.scope_name,i.scope_name) AS scope_name, \
+                    COALESCE(t.id,'') AS team_id,COALESCE(t.name,'Legacy access') AS team_name \
+             FROM org_invites i LEFT JOIN org_teams t ON t.id=i.team_id \
+             WHERE i.used_at IS NULL AND i.expires_at > ?1 ORDER BY i.created_at DESC",
             &[&now],
         )?;
         for r in &mut rows {
@@ -1015,23 +1375,13 @@ pub async fn create_invite(
         tracing::warn!(target: "amux::local_invite", verdict = "create_rejected", reason = "invalid_email", "local invite creation rejected");
         return err(StatusCode::BAD_REQUEST, json!({ "error": "valid email required" }));
     }
-    let requested = match requested_scope(&body) {
-        Ok(scope) => scope,
-        Err(body) => return err(StatusCode::BAD_REQUEST, body),
-    };
     let conn = match state.store.read() {
         Ok(conn) => conn,
         Err(e) => return internal(e),
     };
-    let Some(scope) = resolve_scope_target(&conn, &requested) else {
-        return err(
-            StatusCode::BAD_REQUEST,
-            json!({
-                "error": "scope target does not exist",
-                "scope_level": requested.level(),
-                "scope_name": requested.name(),
-            }),
-        );
+    let team = match assignment_from_body(&conn, &body) {
+        Ok(team) => team,
+        Err(body) => return err(StatusCode::BAD_REQUEST, body),
     };
     drop(conn);
     let token = token_urlsafe(24);
@@ -1039,16 +1389,16 @@ pub async fn create_invite(
     let expires = now + 7 * 86400;
     let token_w = token.clone();
     let email_w = email.clone();
-    let scope_level = scope.level().to_string();
-    let scope_name = scope.name().to_string();
+    let team_w = team.clone();
     let write = state
         .store
         .write_async(move |conn| {
+            ensure_assignment(conn, &team_w)?;
             conn.execute(
                 "INSERT INTO org_invites \
-                 (token, email, created_at, expires_at, scope_level, scope_name) \
-                 VALUES (?1,?2,?3,?4,?5,?6)",
-                rusqlite::params![token_w, email_w, now, expires, scope_level, scope_name],
+                 (token,email,created_at,expires_at,scope_level,scope_name,team_id) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                rusqlite::params![token_w,email_w,now,expires,team_w.scope.level(),team_w.scope.name(),team_w.id],
             )?;
             Ok(WriteOutcome {
                 applied: true,
@@ -1060,7 +1410,7 @@ pub async fn create_invite(
         Ok(_) => {
             tracing::info!(target: "amux::local_invite", verdict = "created",
                 bound_email = email.as_deref().unwrap_or("open"), expires_at = expires,
-                scope_level = scope.level(), scope_name = scope.name(),
+                team_id=%team.id, scope_level = team.scope.level(), scope_name = team.scope.name(),
                 "local invite created");
             let url = format!("{}/invite/{token}", base_url(&headers, &uri));
             (
@@ -1069,8 +1419,10 @@ pub async fn create_invite(
                     "token": token,
                     "url": url,
                     "expires_at": expires,
-                    "scope_level": scope.level(),
-                    "scope_name": scope.name(),
+                    "team_id":team.id,
+                    "team_name":team.name,
+                    "scope_level": team.scope.level(),
+                    "scope_name": team.scope.name(),
                 })),
             )
                 .into_response()
@@ -1554,17 +1906,30 @@ mod tests {
         let (created, _, body) = raw_send(
             &app,
             "POST",
-            "/api/org/invites",
-            // The API also accepts a registry id, but persists the canonical
+            "/api/org/teams",
+            // Team creation accepts a registry id but stores the canonical
             // display/session name used by fleet and board authorization.
-            r#"{"email":"worker-guest@example.com","scope_level":"worker","scope_name":"wrk_allowed"}"#,
+            r#"{"name":"Équipe autorisée","scope_level":"worker","scope_name":"wrk_allowed"}"#,
+            &[("authorization", "Bearer owner-token"), ("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(created, StatusCode::CREATED, "{body}");
+        let team: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(team["scope_level"], "worker");
+        assert_eq!(team["scope_name"], "allowed-worker");
+        let team_id = team["id"].as_str().unwrap();
+        let invite_payload = json!({"email":"worker-guest@example.com","team_id":team_id}).to_string();
+        let (created, _, body) = raw_send(
+            &app,
+            "POST",
+            "/api/org/invites",
+            &invite_payload,
             &[("authorization", "Bearer owner-token"), ("content-type", "application/json")],
         )
         .await;
         assert_eq!(created, StatusCode::CREATED, "{body}");
         let invitation: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(invitation["scope_level"], "worker");
-        assert_eq!(invitation["scope_name"], "allowed-worker");
+        assert_eq!(invitation["team_id"], team_id);
         let token = invitation["token"].as_str().unwrap();
         let (accepted, headers, _) = raw_send(
             &app,
@@ -1585,6 +1950,7 @@ mod tests {
             identity["access_scope"],
             json!({"level": "worker", "name": "allowed-worker"})
         );
+        assert_eq!(identity["team"], json!({"id":team_id,"name":"Équipe autorisée"}));
 
         let (allowed, _, _) = raw_send(
             &app,
@@ -1622,7 +1988,7 @@ mod tests {
             &app,
             "PATCH",
             &format!("/api/org/members/{member_id}"),
-            r#"{"scope_level":"global","scope_name":""}"#,
+            r#"{"team_id":"team_global"}"#,
             &[("authorization", "Bearer owner-token"), ("content-type", "application/json")],
         )
         .await;
@@ -1644,7 +2010,7 @@ mod tests {
         rusqlite::Connection::open(&db)
             .unwrap()
             .execute(
-                "UPDATE org_members SET scope_level='typo', scope_name='' WHERE id=?1",
+                "UPDATE org_members SET team_id='missing-team',scope_level='global',scope_name='' WHERE id=?1",
                 [&member_id],
             )
             .unwrap();
@@ -1653,7 +2019,7 @@ mod tests {
         let identity: Value = serde_json::from_str(&identity_body).unwrap();
         assert_eq!(
             identity["access_scope"],
-            json!({"level": "worker", "name": "__invalid_member_scope__"})
+            json!({"level": "worker", "name": "__invalid_team_scope__"})
         );
         let (fails_closed, _, _) = raw_send(
             &app,
@@ -1664,6 +2030,148 @@ mod tests {
         )
         .await;
         assert_eq!(fails_closed, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn group_team_join_reaches_only_workers_with_the_exact_group_tag() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(
+            home.path().join("sessions/allowed-worker.env"),
+            "CC_TAGS=research,priority-p1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join("sessions/other-worker.env"),
+            "CC_TAGS=research-archive\n",
+        )
+        .unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (app, _dir) = full_app();
+
+        let (created, _, body) = raw_send(
+            &app,
+            "POST",
+            "/api/org/teams",
+            r#"{"name":"Research","scope_level":"group","scope_name":"research"}"#,
+            &[("authorization", "Bearer owner-token"), ("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(created, StatusCode::CREATED, "{body}");
+        let team: Value = serde_json::from_str(&body).unwrap();
+        let team_id = team["id"].as_str().unwrap();
+        let payload = json!({"email":"group@example.com","team_id":team_id}).to_string();
+        let (created, _, body) = raw_send(
+            &app,
+            "POST",
+            "/api/org/invites",
+            &payload,
+            &[("authorization", "Bearer owner-token"), ("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(created, StatusCode::CREATED, "{body}");
+        let invite: Value = serde_json::from_str(&body).unwrap();
+        let token = invite["token"].as_str().unwrap();
+        let (accepted, headers, _) = raw_send(
+            &app,
+            "POST",
+            &format!("/invite/{token}"),
+            "email=group%40example.com&name=Group+Member",
+            &[("content-type", "application/x-www-form-urlencoded")],
+        )
+        .await;
+        assert_eq!(accepted, StatusCode::SEE_OTHER);
+        let cookie = headers[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap();
+        let (_, _, identity_body) =
+            raw_send(&app, "GET", "/api/identity", "", &[("cookie", cookie)]).await;
+        let identity: Value = serde_json::from_str(&identity_body).unwrap();
+        assert_eq!(identity["team"], json!({"id":team_id,"name":"Research"}));
+        assert_eq!(identity["access_scope"], json!({"level":"group","name":"research"}));
+
+        let (allowed, _, _) = raw_send(
+            &app,
+            "GET",
+            "/api/sessions/allowed-worker/output",
+            "",
+            &[("cookie", cookie)],
+        )
+        .await;
+        assert_ne!(allowed, StatusCode::FORBIDDEN);
+        let (denied, _, body) = raw_send(
+            &app,
+            "GET",
+            "/api/sessions/other-worker/output",
+            "",
+            &[("cookie", cookie)],
+        )
+        .await;
+        assert_eq!(denied, StatusCode::FORBIDDEN, "{body}");
+    }
+
+    #[tokio::test]
+    async fn team_lifecycle_refuses_to_delete_a_team_that_still_grants_access() {
+        let (app, _dir) = full_app();
+        let (created, _, body) = raw_send(
+            &app,
+            "POST",
+            "/api/org/teams",
+            r#"{"name":"Temporary","scope_level":"global","scope_name":""}"#,
+            &[("authorization", "Bearer owner-token"), ("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(created, StatusCode::CREATED, "{body}");
+        let team: Value = serde_json::from_str(&body).unwrap();
+        let team_id = team["id"].as_str().unwrap();
+
+        let payload = json!({"team_id":team_id}).to_string();
+        let (invited, _, body) = raw_send(
+            &app,
+            "POST",
+            "/api/org/invites",
+            &payload,
+            &[("authorization", "Bearer owner-token"), ("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(invited, StatusCode::CREATED, "{body}");
+        let invite: Value = serde_json::from_str(&body).unwrap();
+        let token = invite["token"].as_str().unwrap();
+        let (blocked, _, body) = raw_send(
+            &app,
+            "DELETE",
+            &format!("/api/org/teams/{team_id}"),
+            "",
+            &[("authorization", "Bearer owner-token")],
+        )
+        .await;
+        assert_eq!(blocked, StatusCode::CONFLICT, "{body}");
+
+        let (revoked, _, body) = raw_send(
+            &app,
+            "DELETE",
+            &format!("/api/org/invites/{token}"),
+            "",
+            &[("authorization", "Bearer owner-token")],
+        )
+        .await;
+        assert_eq!(revoked, StatusCode::OK, "{body}");
+        let (patched, _, body) = raw_send(
+            &app,
+            "PATCH",
+            &format!("/api/org/teams/{team_id}"),
+            r#"{"name":"Temporary renamed","scope_level":"global","scope_name":""}"#,
+            &[("authorization", "Bearer owner-token"), ("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(patched, StatusCode::OK, "{body}");
+        let (deleted, _, body) = raw_send(
+            &app,
+            "DELETE",
+            &format!("/api/org/teams/{team_id}"),
+            "",
+            &[("authorization", "Bearer owner-token")],
+        )
+        .await;
+        assert_eq!(deleted, StatusCode::OK, "{body}");
     }
 
     #[tokio::test]

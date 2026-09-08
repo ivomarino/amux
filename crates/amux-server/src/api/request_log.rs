@@ -1617,6 +1617,8 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/org", methods: &["GET", "PATCH"] },
     RouteEntry { path: "/api/org/members", methods: &["GET"] },
     RouteEntry { path: "/api/org/members/{id}", methods: &["PATCH", "DELETE"] },
+    RouteEntry { path: "/api/org/teams", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/org/teams/{id}", methods: &["PATCH", "DELETE"] },
     RouteEntry { path: "/api/org/invites", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/org/invites/{token}", methods: &["DELETE"] },
     RouteEntry { path: "/api/gmail/accounts", methods: &["GET"] },

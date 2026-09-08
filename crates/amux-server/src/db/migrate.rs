@@ -353,6 +353,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0059_local_member_scope",
         sql: include_str!("../../migrations/0059_local_member_scope.sql"),
     },
+    Migration {
+        version: 60,
+        name: "0060_org_teams",
+        sql: include_str!("../../migrations/0060_org_teams.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.
@@ -1207,6 +1212,60 @@ mod tests {
         apply_one(&conn, sql).unwrap();
         apply_one(&conn, sql).unwrap(); // second run: column exists, skipped
         assert!(column_exists(&conn, "t", "b").unwrap());
+    }
+
+    #[test]
+    fn team_migration_preserves_every_legacy_scope_without_widening_access() {
+        let conn = Connection::open_in_memory().unwrap();
+        for migration in MIGRATIONS.iter().filter(|migration| migration.version <= 59) {
+            apply_one(&conn, migration.sql).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO org_members (id,email,role,joined_at,scope_level,scope_name) \
+             VALUES ('member-group','g@example.com','member',1,'group','research'), \
+                    ('member-worker','w@example.com','member',2,'worker','tubescience'), \
+                    ('member-global','a@example.com','member',3,'global','')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO org_invites (token,created_at,expires_at,scope_level,scope_name) \
+             VALUES ('legacy-group',1,9999999999,'group','research')",
+            [],
+        )
+        .unwrap();
+
+        let migration = MIGRATIONS.iter().find(|migration| migration.version == 60).unwrap();
+        apply_one(&conn, migration.sql).unwrap();
+
+        let rows: Vec<(String, String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT m.id,t.scope_level,t.scope_name FROM org_members m \
+                     JOIN org_teams t ON t.id=m.team_id ORDER BY m.id",
+                )
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            rows,
+            vec![
+                ("member-global".into(), "global".into(), "".into()),
+                ("member-group".into(), "group".into(), "research".into()),
+                ("member-worker".into(), "worker".into(), "tubescience".into()),
+            ]
+        );
+        let invite_scope: (String, String) = conn
+            .query_row(
+                "SELECT t.scope_level,t.scope_name FROM org_invites i JOIN org_teams t ON t.id=i.team_id WHERE i.token='legacy-group'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(invite_scope, ("group".into(), "research".into()));
     }
 }
 

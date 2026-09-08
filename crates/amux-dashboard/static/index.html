@@ -246,14 +246,20 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <div class="settings-sep"></div>
         <div class="settings-section" id="settings-team-section">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
-            <div class="settings-section-label" style="margin:0;">Team</div>
-            <button class="btn" id="settings-team-invite" style="font-size:0.7rem;padding:2px 8px;" onclick="openTeamInvite()">+ Invite</button>
+            <div class="settings-section-label" style="margin:0;">Workspace access</div>
+            <div style="display:flex;gap:5px;">
+              <button class="btn" id="settings-team-create" style="font-size:0.7rem;padding:2px 8px;" onclick="openTeamEditor()">+ Team</button>
+              <button class="btn" id="settings-team-invite" style="font-size:0.7rem;padding:2px 8px;" onclick="openTeamInvite()">+ Invite</button>
+            </div>
           </div>
           <div id="settings-org-name-wrap" style="margin-bottom:6px;">
             <input id="settings-org-name" class="search-input" type="text" placeholder="Workspace name"
               style="width:100%;box-sizing:border-box;font-size:0.8rem;"
               onblur="saveOrgName(this.value)" onkeydown="if(event.key==='Enter')this.blur()">
           </div>
+          <div style="font-size:0.68rem;color:var(--dim);margin:7px 0 3px;">Teams and access scopes</div>
+          <div id="settings-teams-list" style="font-size:0.78rem;color:var(--dim);display:flex;flex-direction:column;gap:4px;"></div>
+          <div style="font-size:0.68rem;color:var(--dim);margin:9px 0 3px;">People</div>
           <div id="settings-members-list" style="font-size:0.78rem;color:var(--dim);"></div>
         </div>
         <!-- Cloud trial/billing card — populated only when the gateway answers

@@ -1016,3 +1016,25 @@ fn global_banners_never_outrank_the_peek_overlay() {
         );
     }
 }
+
+#[test]
+fn workspace_invites_and_members_are_assigned_through_scoped_teams() {
+    let app = asset("app.js");
+    let html = asset("index.html");
+    for needle in [
+        "function openTeamEditor",
+        "fetch('/api/org/teams')",
+        "JSON.stringify({email, team_id})",
+        "JSON.stringify({team_id})",
+        "_workspaceTeamScope",
+    ] {
+        assert!(app.contains(needle), "workspace team UI lost `{needle}`");
+    }
+    for needle in ["Workspace access", "settings-teams-list", "+ Team", "+ Invite"] {
+        assert!(html.contains(needle), "workspace access shell lost `{needle}`");
+    }
+    assert!(
+        !app.contains("JSON.stringify({email, scope_level, scope_name})"),
+        "the invite UI regressed to copying a one-off scope onto the user instead of assigning a team"
+    );
+}
