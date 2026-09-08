@@ -528,10 +528,10 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
         "let _boardSnapshotEpoch = 0",
         "snapshotEpoch !== _boardSnapshotEpoch",
         "function _runtimeBoardPresentation(s)",
-        "Number(truth.card_count) !== 1",
+        "if (status !== 'linked' || !cardId)",
         "_runtimeBoardSyncBadge()",
     ] {
-        assert!(app.contains(needle), "a stale poll may again publish a false WORKING/no-card combination without `{needle}`");
+        assert!(app.contains(needle), "a stale poll may publish an unmeasured or stale card link without `{needle}`");
     }
     for rejected in ["no board task claimed", "board-unclaimed-mount", "_activeWithoutClaim"] {
         assert!(!app.contains(rejected), "runtime activity must not manufacture the board pseudo-state `{rejected}`");

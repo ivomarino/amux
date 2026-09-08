@@ -131,3 +131,26 @@ fixtures now provide an actionable next step because they test dispatch and
 compensation, not the refusal of incomplete cards. The complete board-drive
 unit module then passed: 128 passed, 0 failed. The cache-reset route is also added to the native boundary registry, so the
 existing route-composition gate describes the route already mounted in main.
+
+## Final gate and supervisor follow-up
+
+The runtime-job module passed 528 tests, with one ignored. A mutation on a clean
+90a601eb worktree forced maintenance back onto the HTTP runtime: the real
+health/board request regression failed with `maintenance blocked HTTP for
+2.105875958s`. The mutation trap restored the clean tree. Workspace all-target
+Clippy then exited 0 on the restored commit.
+
+The full suite exposed two remaining dashboard guards: the UI change had
+written `amux-0.9.840` instead of the required `amux-v0.9.840`, and an old guard
+still required an independent card-count predicate removed when the client
+began trusting the server's measured linked status. APP_VER and CACHE now
+advance together to 0.9.841 with the correct prefix; the linkage guard checks
+the measured linked-status/card-id refusal that actually ships. Final results
+are recorded on AMUX-4225 after the clean committed checks finish.
+
+A bounded native unified-log read found launchd reporting `service inactive`
+and `removing service: com.amux.server-rs` at 10:09:37.847641/847642 EDT, just
+before PID 91066's 10:09:40 start. This narrows the unexplained boot to a
+supervisor service-removal event; the available records do not identify its
+caller. Receipts: `launchd-restart-evidence.json`, `launchd-restart-detail.json`
+and `launchd-restart-context.json` under the private incident directory.
