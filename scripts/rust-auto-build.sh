@@ -44,10 +44,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-head=$(git -C "$REPO" log -1 --format=%H -- crates/ Cargo.toml Cargo.lock 2>/dev/null || echo none)
-last=$(cat "$STAMP" 2>/dev/null || echo "")
-[ "$head" = "$last" ] && exit 0
-
 # The sha that will actually be BUILT — the worktree below is created from
 # `rev-parse HEAD`. `$head` is a different thing: the last commit that touched
 # the build inputs, used as the rebuild stamp key. They differ routinely on a
@@ -58,7 +54,83 @@ last=$(cat "$STAMP" 2>/dev/null || echo "")
 # below name a sha, and they run before the build begins. Having them print
 # `$head` was the same defect in its cheapest form — a contention log that
 # names a commit which is not the one the winning process is building.
+head=$(git -C "$REPO" log -1 --format=%H -- crates/ Cargo.toml Cargo.lock 2>/dev/null || echo none)
 built_sha=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo "$head")
+last=$(cat "$STAMP" 2>/dev/null || echo "")
+
+# A build stamp records what this script installed. It is deliberately NOT
+# accepted as proof of the running image: another checkout can replace the
+# binary after the stamp was written. The ATE-93 takeover had exactly that
+# shape — stamp=the elected mainline revision, /api/health=a foreign local
+# revision, and the builder exited 0 without touching the live image.
+#
+# The activation authority is one exact committed ref, not "a commit reachable
+# from main". A stale child of main can still include half-finished work, and a
+# divergent tip has no ancestry relationship that licenses it to replace the
+# fleet. An intentional pin remains possible only by explicitly naming its ref
+# at service configuration time; a worker's checkout/branch is never authority.
+ACTIVATION_REF="${AMUX_RS_ACTIVATION_REF:-origin/main}"
+
+server_api_base() {
+  local api
+  api="${AMUX_URL:-}"
+  if [ -z "$api" ] && [ -r "$HOME/.amux/endpoint.json" ]; then
+    api=$(python3 - "$HOME/.amux/endpoint.json" <<'PY' 2>/dev/null || true
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+    print(d.get('canonical_url') or d.get('url') or d.get('endpoint') or '')
+except Exception:
+    pass
+PY
+)
+  fi
+  printf '%s\n' "${api:-https://localhost:8824}"
+}
+
+# One measurement owns both the decision and its receipt. A later successful
+# curl must never be used to explain an earlier timeout (AMUX-4225).
+measure_live_identity() {
+  local url body rc=0
+  url="${AMUX_RS_HEALTH_URL:-$(server_api_base)/api/health}"
+  body=$(curl -sk --max-time 4 "$url" 2>/dev/null) || rc=$?
+  live=""
+  identity_reason="curl_exit=$rc"
+  if [ "$rc" != 0 ]; then return 1; fi
+  live=$(printf '%s' "$body" | python3 -c '
+import json,re,sys
+try:
+    d=json.load(sys.stdin)
+    commit=d.get("commit_full") or d.get("commit", "")
+    if not isinstance(commit,str) or not re.fullmatch(r"[0-9a-f]{12,40}",commit):
+        raise ValueError("invalid commit")
+    print(commit)
+except Exception:
+    raise SystemExit(1)
+' 2>/dev/null) || { identity_reason="invalid_commit"; return 1; }
+}
+
+activation_authorized() {
+  local authority
+  authority=$(git -C "$REPO" rev-parse --verify -q "${ACTIVATION_REF}^{commit}" 2>/dev/null) || {
+    echo "== !! ACTIVATION AUTHORITY UNMEASURED $built_sha — cannot resolve $ACTIVATION_REF; refusing installation" >> "$LOG"
+    return 1
+  }
+  if [ "$built_sha" != "$authority" ]; then
+    echo "== !! ACTIVATION AUTHORITY REFUSED $built_sha — authority is $ACTIVATION_REF ($authority); a checkout-local or stale revision may not replace the elected image" >> "$LOG"
+    return 1
+  fi
+  return 0
+}
+
+# Provenance and disk-only seams never install or restart anything. Keeping
+# them outside the authority gate lets their hermetic fixtures stay about the
+# operation they actually exercise.
+if [ "${AMUX_RS_BUILD_PROVENANCE_ONLY:-}" != "1" ] \
+   && [ "${AMUX_RS_DISK_CLEAR_ONLY:-}" != "1" ] \
+   && ! activation_authorized; then
+  exit 0
+fi
 
 # ── SINGLE-INSTANCE LOCK (AMUX-2927) ────────────────────────────────────────
 # Two invocations — the 60s launchd cycle and a human running this by hand —
@@ -98,28 +170,105 @@ echo $$ > "$LOCK/pid"
 # rebuilding it is the wasted-cycle half of the reported bug ("each next SOLO
 # cycle built the identical sha fine").
 last=$(cat "$STAMP" 2>/dev/null || echo "")
-[ "$head" = "$last" ] && exit 0
+if [ "${AMUX_RS_BUILD_PROVENANCE_ONLY:-}" != "1" ] \
+   && [ "${AMUX_RS_DISK_CLEAR_ONLY:-}" != "1" ]; then
+  # A process can have waited behind a different checkout's build. Re-check both
+  # authority and the observed image after taking the global lock; otherwise a
+  # pre-lock answer can become a false permission while we were waiting.
+  if ! activation_authorized; then
+    exit 0
+  fi
+  if [ "$head" = "$last" ]; then
+    if ! measure_live_identity; then
+      echo "== $(date '+%F %T') !! ACTIVATION IDENTITY UNMEASURED expected=$built_sha trigger=$head $identity_reason measured=false action=defer — unavailable health is not evidence of image drift" >> "$LOG"
+      exit 0
+    fi
+    case "$built_sha" in
+      "$live"*)
+        echo "== $(date '+%F %T') ACTIVATION IDENTITY MATCH expected=$built_sha live=$live measured=true action=skip" >> "$LOG"
+        exit 0 ;;
+      *)
+        # The elected bytes may already be installed while the old process is
+        # awaiting its next adoption tick. Recompiling them cannot help it.
+        if python3 - "$INSTALL" "${INSTALL}.identity.json" "$built_sha" <<'PYINSTALLED' 2>/dev/null
+import hashlib,json,sys
+try:
+    d=json.load(open(sys.argv[2]))
+    with open(sys.argv[1], 'rb') as f: digest=hashlib.sha256(f.read()).hexdigest()[:16]
+    raise SystemExit(0 if d.get('sha') == sys.argv[3] and d.get('build') == digest else 1)
+except (OSError,ValueError):
+    raise SystemExit(1)
+PYINSTALLED
+        then
+          echo "== $(date '+%F %T') !! ACTIVATION AWAITING ADOPTION expected=$built_sha live=$live installed_match=true measured=true action=skip_rebuild" >> "$LOG"
+          exit 0
+        fi
+        echo "== $(date '+%F %T') !! ACTIVATION STAMP DRIFT $built_sha live=$live measured=true action=rebuild — measured foreign image" >> "$LOG" ;;
+    esac
+  fi
+fi
 
-# PROVENANCE (AEAB-12). This builder rebuilds whenever $REPO's local HEAD moves
-# and does not care whether HEAD is on main or on somebody's feature branch. The
-# server then self-adopts within 5s. That permissiveness is CORRECT and must stay:
-# this machine survived weeks deliberately pinned to an unmerged fix branch, and
-# "only build main" would delete the rollback mechanism.
+# A COMMITTED stale-base tip can still be unsafe to adopt.  The real ATE-93
+# specimen was exactly that: 7c6f7b80 was not a revert of 31768303; it was a
+# divergent unpushed tip whose automatic adoption replaced the live image.
 #
-# The defect is that a deliberate pin and an ACCIDENTAL feature branch are
-# byte-identical to the builder, and the accidental one is announced nowhere. On
-# 2026-08-17 a commit made on a branch inside this checkout was serving the whole
-# fleet 76 seconds later and stayed there 9h42m — no CI had run on it, no review —
-# while the machine also could not track upstream, so the daily update schedule
-# silently did nothing. Everything looked healthy the entire time.
-#
-# So: say it. NOT a refusal, a fact, written where consumers can find it.
-#
-# The predicate is "HEAD is contained in main OR origin/main". Checking only
-# origin/main would false-positive right after a merge, because this script
-# deliberately does not fetch (it must not reach the network on a 60s timer) and
-# the local remote-tracking ref lags. Local `main` moves on the merge itself, so
-# the pair covers both orders.
+# Ask the currently running server about the COMMIT'S attributed worker, not
+# this launchd process.  A linked non-owner cannot deploy while the semantic
+# concern remains pending.  The first binary that introduces this endpoint
+# naturally sees a 404 from its predecessor; that one bootstrap adoption is
+# named in the log, while any later unknown answer REFUSES adoption rather than
+# treating an unmeasured permit as permission.
+overlap_deploy_permitted() {
+  local lane api reply code body allowed
+  # These seams exit before compilation/install. Requiring a live permit here
+  # made disk-cleanup diagnostics silently stop on hosts without an amux server.
+  if [ "${AMUX_RS_BUILD_PROVENANCE_ONLY:-}" = "1" ] \
+     || [ "${AMUX_RS_DISK_CLEAR_ONLY:-}" = "1" ]; then
+    echo "== OVERLAP GUARD NOT APPLICABLE $built_sha — diagnostic-only run cannot install a binary (provenance=${AMUX_RS_BUILD_PROVENANCE_ONLY:-0}, disk-clear=${AMUX_RS_DISK_CLEAR_ONLY:-0})" >> "$LOG"
+    return 0
+  fi
+  lane=$(git -C "$REPO" log -1 --format='%(trailers:key=Amux-Session,valueonly,separator=)' "$built_sha" 2>/dev/null | head -n1)
+  case "$lane" in
+    ""|"(human)") return 0 ;;
+  esac
+  api=$(server_api_base)
+  reply=$(curl -sk --max-time 8 -w $'\n%{http_code}' \
+    "$api/api/board/overlap/deployment-permit?session=$lane" 2>/dev/null) || {
+      echo "== !! OVERLAP GUARD UNMEASURED $built_sha — permit probe failed for $lane; refusing adoption" >> "$LOG"
+      return 1
+    }
+  code=${reply##*$'\n'}
+  body=${reply%$'\n'*}
+  if [ "$code" = "404" ]; then
+    echo "== !! OVERLAP GUARD BOOTSTRAP $built_sha — running server predates permit endpoint; allowing first adoption only" >> "$LOG"
+    return 0
+  fi
+  if [ "$code" != "200" ]; then
+    echo "== !! OVERLAP GUARD REFUSED $built_sha — permit HTTP $code for $lane: ${body:0:300}" >> "$LOG"
+    return 1
+  fi
+  allowed=$(printf '%s' "$body" | python3 -c 'import json,sys; print("yes" if json.load(sys.stdin).get("allowed") is True else "no")' 2>/dev/null || echo no)
+  if [ "$allowed" != yes ]; then
+    echo "== !! OVERLAP GUARD REFUSED $built_sha — $lane is a linked non-owner; reconcile/scope-split before deployment: ${body:0:500}" >> "$LOG"
+    return 1
+  fi
+  return 0
+}
+
+if ! overlap_deploy_permitted; then
+  # Do not advance the stamp: a later explicit reconciliation must make this
+  # exact committed tree eligible again, and the refusal line above is a sweep
+  # signal rather than a silent no-op.
+  exit 0
+fi
+
+# PROVENANCE (AEAB-12). Provenance still records whether this checkout happens
+# to be on main, but it is no longer an activation decision. ATE-93 showed why:
+# a valid-looking local stamp and an off-main live image can coexist after a
+# foreign builder runs. The exact `ACTIVATION_REF` gate above is the sole normal
+# activation authority. It deliberately does not fetch on the timer; freshness
+# is a human/CI action, while a stale remote-tracking ref fails closed instead
+# of silently adopting a checkout-local commit.
 on_main=no
 if git -C "$REPO" merge-base --is-ancestor HEAD main 2>/dev/null \
    || git -C "$REPO" merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
@@ -515,15 +664,36 @@ fi
              "Create the identity (see AMUX-3527) or set AMUX_CODESIGN_IDENTITY."
       fi
     fi
-    mv -f "$INSTALL_TMP" "$INSTALL"
+    PROV_JSON=$(python3 - "$INSTALL_TMP" "$PROV_JSON" "$head" <<'PYIDENTITY'
+import hashlib,json,sys
+with open(sys.argv[1], 'rb') as f:
+    build=hashlib.file_digest(f, 'sha256').hexdigest()[:16] if hasattr(hashlib, 'file_digest') else hashlib.sha256(f.read()).hexdigest()[:16]
+d=json.loads(sys.argv[2]); d.update(build=build, trigger=sys.argv[3])
+print(json.dumps(d))
+PYIDENTITY
+)
+    # Publish identity before the executable. Readers require its hash to
+    # match the candidate, so neither half of the rename pair can lie.
+    printf '%s\n' "$PROV_JSON" > "${INSTALL}.identity.json.new.$$"
+    mv -f "${INSTALL}.identity.json.new.$$" "${INSTALL}.identity.json"
+
+    if cmp -s "$INSTALL_TMP" "$INSTALL"; then
+      echo "== ACTIVATION IDENTICAL BINARY sha=$built_sha action=skip_install — keeping executable inode and mtime; no self-adoption"
+      rm -f "$INSTALL_TMP"
+      install_action=unchanged
+    else
+      mv -f "$INSTALL_TMP" "$INSTALL"
+      install_action=replaced
+    fi
     INSTALL_TMP=""
     echo "$head" > "$STAMP"
+    printf '%s\n' "$PROV_JSON" > "$PROV_FILE" 2>/dev/null || true
+    echo "== ACTIVATION INSTALLED identity=$PROV_JSON"
     # AEAB-50: only NOW is this true. Written after the atomic install so the
     # file means "what is installed" rather than "what was attempted". On the
     # failure branch below it is left alone, so it keeps naming the last good
     # build — which is exactly what that branch says is still running.
-    printf '%s\n' "$PROV_JSON" > "$PROV_FILE" 2>/dev/null || true
-    echo "== installed atomically; running server will self-adopt within 5s"
+    echo "== installation action=$install_action; running server will verify identity before adoption"
   else
     echo "== BUILD FAILED for $head — running server keeps the last good build"
     echo "-- diagnostics (every error, with context) ---------------------------"

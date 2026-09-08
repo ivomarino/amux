@@ -1939,7 +1939,8 @@ pub enum RenameDisposition {
     KeepForAudit(&'static str),
 }
 
-/// EVERY table with a session-name column, and its disposition.
+/// EVERY session-name field, and its disposition. A bare table name means its
+/// `session` column; any differently-named field is written as `table.column`.
 ///
 /// THE LIST USED TO BE THE BUG. The cascade carried two hand-maintained arrays,
 /// and a table added later simply never joined them — no error, no warning, the
@@ -1949,11 +1950,16 @@ pub enum RenameDisposition {
 /// `telegram_mappings` (chat routing, so messages would address a dead name).
 ///
 /// `tests/rename_covers_every_session_table.rs` enumerates the schema BUILT FROM
-/// MIGRATIONS and fails on any table missing here, so the next one cannot join
-/// that gap quietly — the same argument AF-328 made for the issues fixture.
-pub const SESSION_SCOPED_TABLES: &[(&str, RenameDisposition)] = &[
+/// MIGRATIONS and fails on any session-name field missing here, so the next one
+/// cannot join that gap quietly — the same argument AF-328 made for the issues
+/// fixture.
+pub const SESSION_SCOPED_FIELDS: &[(&str, RenameDisposition)] = &[
     // -- the lane's own state: must follow the rename --
     ("issues", RenameDisposition::Migrate),
+    ("issues.reviewer", RenameDisposition::Migrate),
+    ("issues.shepherd", RenameDisposition::Migrate),
+    ("issues.requested_by", RenameDisposition::Migrate),
+    ("issues.callback_session", RenameDisposition::Migrate),
     ("schedules", RenameDisposition::Migrate),
     ("session_gates", RenameDisposition::Migrate),
     ("saved_messages", RenameDisposition::Migrate),
@@ -1965,11 +1971,18 @@ pub const SESSION_SCOPED_TABLES: &[(&str, RenameDisposition)] = &[
     ("tasks", RenameDisposition::Migrate),
     ("task_windows", RenameDisposition::Migrate),
     ("telegram_mappings", RenameDisposition::Migrate),
+    ("telegram_mappings.last_routed_session", RenameDisposition::Migrate),
     ("mdai_runs", RenameDisposition::Migrate),
     ("board_drive_nudge_state", RenameDisposition::Migrate),
     ("dictation_history", RenameDisposition::Migrate),
     ("reclaim_quarantine", RenameDisposition::Migrate),
     ("send_dedup", RenameDisposition::Migrate),
+    // An unresolved overlap is live coordination, not historical attribution:
+    // its owner authorization, completion/deployment guard, and pending
+    // callback must continue to address the renamed worker.
+    ("board_overlap_coordination.owner_session", RenameDisposition::Migrate),
+    ("board_overlap_members", RenameDisposition::Migrate),
+    ("board_overlap_callbacks.target_session", RenameDisposition::Migrate),
     // -- history written under the old name: keeps it, on purpose --
     (
         "session_events",
@@ -1993,21 +2006,34 @@ pub const SESSION_SCOPED_TABLES: &[(&str, RenameDisposition)] = &[
         "reclaim_scans",
         RenameDisposition::KeepForAudit("a scan is a dated observation, not live state"),
     ),
+    (
+        "_amux_request_log.amux_session",
+        RenameDisposition::KeepForAudit("the caller name records who made the request at the time"),
+    ),
+    (
+        "board_overlap_coordination.resolved_by_session",
+        RenameDisposition::KeepForAudit(
+            "the resolver name attributes a completed reconciliation decision at the time",
+        ),
+    ),
 ];
 
 /// The `Migrate` tables a plain `SET session=?1 WHERE session=?2` handles —
 /// everything except the ones [`RENAME_MIGRATIONS`] already covers with custom
 /// SQL (those filter on `deleted IS NULL` or touch a second column).
 pub fn simple_rename_tables() -> Vec<&'static str> {
-    const CUSTOM: [&str; 4] = ["issues", "schedules", "session_gates", "saved_messages"];
-    SESSION_SCOPED_TABLES
+    SESSION_SCOPED_FIELDS
         .iter()
-        .filter(|(t, d)| matches!(d, RenameDisposition::Migrate) && !CUSTOM.contains(t))
+        .filter(|(field, d)| {
+            matches!(d, RenameDisposition::Migrate)
+                && !field.contains('.')
+                && !RENAME_MIGRATIONS.iter().any(|(custom, _)| custom == field)
+        })
         .map(|(t, _)| *t)
         .collect()
 }
 
-pub const RENAME_MIGRATIONS: [(&str, &str); 6] = [
+pub const RENAME_MIGRATIONS: [(&str, &str); 11] = [
     ("issues", "UPDATE issues SET session=?1 WHERE session=?2 AND deleted IS NULL"),
     // BEYOND PYTHON, and the reason AMUX-3749 exists: the cascade
     // migrated a card's OWNER and left the two columns that address
@@ -2024,9 +2050,29 @@ pub const RENAME_MIGRATIONS: [(&str, &str); 6] = [
         "issues.shepherd",
         "UPDATE issues SET shepherd=?1 WHERE shepherd=?2 AND deleted IS NULL",
     ),
+    (
+        "issues.requested_by",
+        "UPDATE issues SET requested_by=?1 WHERE requested_by=?2 AND deleted IS NULL",
+    ),
+    (
+        "issues.callback_session",
+        "UPDATE issues SET callback_session=?1 WHERE callback_session=?2 AND deleted IS NULL",
+    ),
     ("schedules", "UPDATE schedules SET session=?1 WHERE session=?2"),
     ("session_gates", "UPDATE session_gates SET session=?1 WHERE session=?2"),
     ("saved_messages", "UPDATE saved_messages SET session=?1 WHERE session=?2"),
+    (
+        "board_overlap_coordination.owner_session",
+        "UPDATE board_overlap_coordination SET owner_session=?1 WHERE owner_session=?2",
+    ),
+    (
+        "board_overlap_callbacks.target_session",
+        "UPDATE board_overlap_callbacks SET target_session=?1 WHERE target_session=?2",
+    ),
+    (
+        "telegram_mappings.last_routed_session",
+        "UPDATE telegram_mappings SET last_routed_session=?1 WHERE last_routed_session=?2",
+    ),
 ];
 
 /// Does this name resolve to a REGISTERED worker?
@@ -2515,6 +2561,21 @@ fn codex_rollout_files() -> Vec<(std::time::SystemTime, PathBuf)> {
 /// resolver can associate it with the worker life that created it instead of
 /// assigning the newest sibling rollout to every worker in that directory.
 fn rollout_identity(path: &Path) -> Option<(String, f64)> {
+    // Only the immutable session_meta header is cached, never turn events.
+    // Checking uniqueness must cover the full population (an 80-file cutoff
+    // can hide the other candidate), but fleet readers need not reopen every
+    // historical header for every worker. Unreadable headers are not cached: a newborn
+    // rollout may still be writing its first line.
+    type IdentityCache = std::collections::HashMap<PathBuf, (std::time::Instant, Option<(String, f64)>)>;
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<IdentityCache>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Ok(c) = cache.lock() {
+        if let Some((at, identity)) = c.get(path) {
+            if at.elapsed().as_secs() < 30 {
+                return identity.clone();
+            }
+        }
+    }
     let Ok(f) = std::fs::File::open(path) else { return None };
     let mut reader = std::io::BufReader::new(f);
     let mut line = String::new();
@@ -2524,42 +2585,53 @@ fn rollout_identity(path: &Path) -> Option<(String, f64)> {
     if v.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
         return None;
     }
-    let cwd = normalize_work_dir(v.pointer("/payload/cwd").and_then(|c| c.as_str())?);
-    let started = v
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .and_then(parse_iso8601)?;
-    Some((cwd, started))
+    // A spawned agent shares the cwd and may start in the same window, but
+    // its turn boundaries describe that agent, never the worker's main turn.
+    let identity = if v.pointer("/payload/source").is_some_and(Value::is_object) {
+        None
+    } else {
+        let cwd = normalize_work_dir(v.pointer("/payload/cwd").and_then(|c| c.as_str())?);
+        let started = v.get("timestamp").and_then(Value::as_str).and_then(parse_iso8601)?;
+        Some((cwd, started))
+    };
+    if let Ok(mut c) = cache.lock() {
+        c.retain(|_, (at, _)| at.elapsed().as_secs() < 30);
+        c.insert(path.to_path_buf(), (std::time::Instant::now(), identity.clone()));
+    }
+    identity
 }
 
 const CODEX_ROLLOUT_START_WINDOW_S: f64 = 15.0 * 60.0;
 const CODEX_ROLLOUT_EARLY_GRACE_S: f64 = 30.0;
 
-/// Pick the rollout born nearest this worker life, never merely the newest
-/// rollout in the same checkout.  The bounded window accommodates startup
+/// Pick a rollout only when this worker life's startup window is unambiguous.
+/// The bounded window accommodates startup
 /// pickers (the live ATE-42 specimen created its rollout six minutes after
-/// `last_started`) while refusing to borrow a later sibling's conversation.
+/// `last_started`). Nearness is not ownership: AMUX-4220 had two workers
+/// starting together, and both selected the same sibling's completed turn.
 fn rollout_for_worker_start<'a>(
     files: &'a [(std::time::SystemTime, PathBuf)],
     cwd: &str,
     started: f64,
-) -> Option<&'a PathBuf> {
+) -> Result<Option<&'a PathBuf>, Vec<&'a PathBuf>> {
     if cwd.is_empty() || started <= 0.0 {
-        return None;
+        return Ok(None);
     }
-    files
+    let candidates: Vec<_> = files
         .iter()
-        .take(80)
         .filter_map(|(_, path)| {
             let (rollout_cwd, rollout_started) = rollout_identity(path)?;
             let delta = rollout_started - started;
             (rollout_cwd == cwd
                 && (-CODEX_ROLLOUT_EARLY_GRACE_S..=CODEX_ROLLOUT_START_WINDOW_S)
                     .contains(&delta))
-                .then_some((delta.abs(), path))
+                .then_some(path)
         })
-        .min_by(|(a, _), (b, _)| a.total_cmp(b))
-        .map(|(_, path)| path)
+        .collect();
+    if candidates.len() > 1 {
+        return Err(candidates);
+    }
+    Ok(candidates.first().copied())
 }
 
 /// Map a codex/ollama worker to its live Codex rollout file: a recorded
@@ -2584,6 +2656,9 @@ pub(crate) fn codex_rollout_path(name: &str) -> Option<PathBuf> {
         }) {
             return Some(p.clone());
         }
+        // A missing explicit identity is not permission to borrow a sibling.
+        warn_codex_rollout_unresolved(name, "claimed_rollout_missing", &[], &sid);
+        return None;
     }
     // 2. Worker-life match. `cwd + newest` cross-linked every worker sharing
     //    a checkout: an active sibling made an idle prompt read WORKING.  A
@@ -2591,7 +2666,25 @@ pub(crate) fn codex_rollout_path(name: &str) -> Option<PathBuf> {
     //    Codex has given us a durable thread id, so use it and decline to guess
     //    outside the bounded startup window.
     let started = meta_i64(&meta, "last_started") as f64;
-    rollout_for_worker_start(&files, &wd, started).cloned()
+    match rollout_for_worker_start(&files, &wd, started) {
+        Ok(path) => path.cloned(),
+        Err(candidates) => {
+            warn_codex_rollout_unresolved(name, "ambiguous_worker_rollout", &candidates, "");
+            None
+        }
+    }
+}
+
+fn warn_codex_rollout_unresolved(name: &str, verdict: &str, candidates: &[&PathBuf], claim: &str) {
+    let now = crate::config::now_f64();
+    let key = format!("codex-rollout-resolution:{name}:{verdict}");
+    if crate::log_dedupe::first_this_bucket(&key, crate::log_dedupe::hour_bucket(now)) {
+        let files: Vec<_> = candidates.iter().filter_map(|p| p.file_name()).collect();
+        tracing::warn!(target: "status_truth", session = name, verdict,
+            measured = true, n_considered = candidates.len(), candidates = ?files,
+            codex_session_id = claim,
+            "Codex rollout ownership unresolved; refusing a guessed status/transcript; record the worker's proven codex_session_id (AMUX-4220)");
+    }
 }
 
 /// The latest structured Codex turn boundary recorded in a rollout file.
@@ -2608,6 +2701,7 @@ pub(crate) struct CodexTurnSignal {
     pub state: String,
     pub ts: f64,
     pub boundary: String,
+    pub rollout_file: Option<String>,
 }
 
 fn codex_turn_signal_from_events(lines: &[Value]) -> Option<CodexTurnSignal> {
@@ -2632,6 +2726,7 @@ fn codex_turn_signal_from_events(lines: &[Value]) -> Option<CodexTurnSignal> {
             state: state.into(),
             ts,
             boundary: boundary.into(),
+            rollout_file: None,
         });
     }
     latest
@@ -2649,7 +2744,8 @@ pub(crate) fn codex_rollout_turn_signal(name: &str) -> Option<CodexTurnSignal> {
         return None;
     }
     let path = codex_rollout_path(name)?;
-    let signal = codex_turn_signal_from_events(&iter_jsonl_tail(&path, 32_000_000))?;
+    let mut signal = codex_turn_signal_from_events(&iter_jsonl_tail(&path, 32_000_000))?;
+    signal.rollout_file = path.file_name().map(|p| p.to_string_lossy().into_owned());
     if matches!(signal.boundary.as_str(), "turn_aborted" | "turn.aborted") {
         let now = chrono::Utc::now().timestamp() as f64;
         let key = format!("codex-turn-aborted:{name}:{}", signal.ts);
@@ -3826,6 +3922,8 @@ pub(crate) fn redact_prompt_secrets(s: &str) -> String {
     out
 }
 
+type CapturedCardReceipt = (String, String);
+
 fn mint_capture_card(
     conn: &rusqlite::Connection,
     session_name: &str,
@@ -3880,10 +3978,10 @@ fn mint_capture_card(
     // The former time-only test swallowed every distinct command sent within 45s,
     // preventing the model from ever seeing or decomposing that work. Equality is
     // checked against the exact captured description; a distinct follow-up cards
-    // immediately, and a manual work card never blocks a capture. Captures mint
-    // `doing` (never re-dispatched), so an extra card cannot re-run work — the
-    // AMUX-2613 double-run the old dedup was conflated with stays fixed by the
-    // `doing` mint, not by this skip.
+    // immediately, and a manual work card never blocks a capture. The first
+    // capture claims Doing; follow-ups use triggered Backlog until the worker
+    // explicitly switches. Neither state redispatches already-delivered work
+    // (AMUX-2613); capture and execution attribution remain separate.
     let window_s: i64 = std::env::var("AMUX_CAPTURE_DEDUP_WINDOW_S")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -3907,17 +4005,49 @@ fn mint_capture_card(
         );
         return Ok(None);
     }
+    // AF-568: the window above is sized for a TRANSPORT RETRY and is also the only
+    // guard on the STEERING delivery path, whose whole purpose is to wait for the
+    // lane's next turn boundary. One broadcast on 2026-09-07 was enqueued at 18:09
+    // and steering-delivered at 18:26; at 17 minutes the 45s window correctly saw
+    // nothing and minted a second card for the same prompt. 46 of 56 lanes got a
+    // duplicate that way and two got three, because the delay a window has to
+    // tolerate here is however long a lane takes to reach a boundary, which is
+    // unbounded by design and so cannot be tuned.
+    //
+    // So dedupe against the table the mint itself writes, with no time box while
+    // the card is still open. `cmd_history` cannot answer this: the duplicates have
+    // no row of their own, since the linking UPDATE claims the most recent UNCARDED
+    // row for the text and the direct delivery already claimed the only one.
+    if let Some(open_id) =
+        crate::db::board_store::open_capture_with_desc(conn, session_name, &captured_desc)?
+    {
+        // Two-fix rule: name the SURVIVOR, so a wrongly suppressed distinct prompt
+        // is a line someone can find rather than an absent card nobody can.
+        // grep "ledger: capture duplicates an open card".
+        tracing::info!(
+            session = %session_name,
+            open_card = %open_id,
+            "ledger: capture duplicates an open card for the same prompt; not minting a second (AF-568)"
+        );
+        return Ok(None);
+    }
+    // Delivery records work; it does not prove the lane switched away from
+    // its current card. Keep follow-ups visible without claiming concurrent
+    // execution or redispatching a prompt the worker already received.
+    let (active_count, active_card): (i64, Option<String>) = conn.query_row(
+        "SELECT COUNT(*), MIN(id) FROM issues WHERE session=?1 AND status='doing' AND COALESCE(archived,0)=0",
+        [session_name], |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let capture_status = if active_count > 0 { "backlog" } else { "doing" };
     let needs_self = amux_core::board::title_needs_self_description(&title);
     let mut row = crate::db::board_store::create_issue(
         conn,
         &crate::db::board_store::NewIssue {
             title,
             desc: captured_desc,
-            // `doing`, NOT `todo`: an owned `todo` ledger card is Runnable to the
-            // planner and its prompt was re-dispatched, double-running every
-            // direct prompt (AMUX-2613). `doing` + agent owner is Assigned, never
-            // re-dispatched.
-            status: "doing".into(),
+            // Neither Doing nor triggered Backlog is redispatched (AMUX-2613).
+            // Only the first capture may establish the lane's execution claim.
+            status: capture_status.into(),
             session: Some(session_name.to_string()),
             item_type: "code".into(),
             creator: "amux".into(),
@@ -3947,6 +4077,14 @@ fn mint_capture_card(
         },
         now_ms / 1000,
     )?;
+    if active_count > 0 {
+        row.source_ref = Some("Already delivered owner follow-up; claim explicitly when switching work".into());
+        row.next_action = Some("Read the delivered prompt and claim this card when executing it; do not resend the prompt".into());
+        tracing::info!(session = session_name, card = %row.id, ?active_card,
+            measured = true, n_considered = active_count,
+            verdict = "capture_pending_active_claim",
+            "owner follow-up captured in backlog; existing Doing claim retained (AMUX-4228)");
+    }
     let stamp = chrono::Local::now().format("%H:%M").to_string();
     row.log = Some(crate::db::board_store::append_log(
         row.log.as_deref(),
@@ -4110,6 +4248,7 @@ pub(crate) async fn cmd_hist_record_full(
     };
     let msg_row_id_w = msg_row_id.clone();
     let cap_session = session.clone();
+    let truth_session = cap_session.clone();
     let cap_text = text.clone();
     let _ = state
         .store
@@ -4214,19 +4353,20 @@ pub(crate) async fn cmd_hist_record_full(
         let row_id = msg_row_id.load(std::sync::atomic::Ordering::SeqCst);
         if row_id > 0 {
             let cap_isolated = session_is_isolated(&cap_session);
-            let minted: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            let cap_text_for_capture = cap_text.clone();
+            let minted: std::sync::Arc<std::sync::Mutex<Option<CapturedCardReceipt>>> =
                 std::sync::Arc::new(std::sync::Mutex::new(None));
             let minted_w = minted.clone();
             let sess_log = cap_session.clone();
             let res = state
                 .store
-                .write_async(move |conn| match mint_capture_card(conn, &cap_session, &cap_text, now_ms)? {
+                .write_async(move |conn| match mint_capture_card(conn, &cap_session, &cap_text_for_capture, now_ms)? {
                     Some(row) => {
                         conn.execute(
                             "UPDATE cmd_history SET card_id = ?1 WHERE id = ?2",
                             rusqlite::params![row.id, row_id],
                         )?;
-                        *minted_w.lock().unwrap() = Some(row.id.clone());
+                        *minted_w.lock().unwrap() = Some((row.id.clone(), row.status.clone()));
                         let ev = crate::db::PendingEvent {
                             entity_type: amux_core::revision::EntityType::Task,
                             entity_id: row.id.clone(),
@@ -4244,16 +4384,61 @@ pub(crate) async fn cmd_hist_record_full(
                 // arriving — plus the cmd_history.card_id NULL rate — is the
                 // detector. grep "ledger: auto-captured".
                 Ok(_) => {
-                    if let Some(cid) = minted.lock().unwrap().take() {
+                    let captured_id = minted.lock().ok().and_then(|mut id| id.take());
+                    if let Some((cid, capture_status)) = captured_id {
                         tracing::info!(session = %sess_log, card_id = %cid,
                             owner_isolated = cap_isolated,
                             "ledger: auto-captured board card from delivered prompt");
+                        emit_event(
+                            state,
+                            &sess_log,
+                            if capture_status == "doing" { "task.claimed" } else { "task.captured" },
+                            Some(json!({
+                                "issue": cid,
+                                "status": capture_status,
+                                "reason": "delivered-owner-prompt",
+                            })),
+                            None,
+                            "prompt-capture",
+                        )
+                        .await;
                     }
                 }
                 Err(e) => tracing::warn!(session = %sess_log, error = %e,
                     owner_isolated = cap_isolated,
                     "ledger auto-capture FAILED; prompt recorded without a board card"),
             }
+        }
+    }
+    if is_user && landed {
+        let cardless_reason = if skip_board {
+            Some("explicit-no-board")
+        } else if amux_core::board::is_informational_query(&cap_text) {
+            Some("informational-query")
+        } else if amux_core::board::title_from_prompt(&cap_text).is_none() {
+            Some("control-prompt")
+        } else {
+            None
+        };
+        if let Some(reason) = cardless_reason {
+            emit_event(
+                state,
+                &truth_session,
+                "task.cardless",
+                Some(json!({"reason": reason})),
+                None,
+                "prompt-capture",
+            )
+            .await;
+            tracing::info!(
+                target: "amux::sessions",
+                session = %truth_session,
+                reason,
+                measured = true,
+                n_considered = 1,
+                verdict = "cardless-allowed",
+                "runtime/board truth: delivered owner prompt is explicitly cardless"
+            );
         }
     }
 }
@@ -6967,9 +7152,18 @@ async fn poll_shell_prompt(name: &str, timeout_ms: u64) -> bool {
 }
 
 async fn type_line(name: &str, line: &str) {
-    let _ = send_literal(name, line).await;
-    sleep_ms(100).await;
-    send_key(name, "Enter").await;
+    // AMUX-4203: separate clients could lose Enter under load and concatenate
+    // shell setup with the next command. Keep both operations in one queue.
+    let pt = pt(name);
+    let args = shell_line_args(&pt, line);
+    if !matches!(tmux(&args).await, Some(o) if o.status.success()) {
+        tracing::warn!(session = %name, line_bytes = line.len(), verdict = "shell_line_submission_failed",
+            "worker shell setup line was not confirmed by tmux; command text omitted to protect credentials");
+    }
+}
+
+fn shell_line_args<'a>(pt: &'a str, line: &'a str) -> [&'a str; 10] {
+    ["send-keys", "-t", pt, "-l", line, ";", "send-keys", "-t", pt, "Enter"]
 }
 
 fn build_claude_cmd(cfg: &EnvFile, flags: &str, default_flags: &str, session_flag: &str, extra_flags: &str) -> String {
@@ -7667,6 +7861,10 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
         poll_shell_prompt(name, 3000).await;
     } else {
         // Fresh tmux session hosting the user's login shell (py:24647).
+        let create_server = match crate::backend::tmux_health::may_create_server().await {
+            Ok(allowed) => allowed,
+            Err(error) => return (false, error),
+        };
         let cols = tmux_cols();
         let rows = tmux_rows();
         let scheme = if std::env::args().any(|a| a == "--no-tls") { "http" } else { "https" };
@@ -7675,6 +7873,9 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
             "-n".into(), name.into(), "-c".into(), work_dir.clone(),
             "-x".into(), cols, "-y".into(), rows,
         ];
+        if !create_server {
+            args.insert(0, "-N".into());
+        }
         // ISOLATED (AMUX-3232): a raw agent is "just tmux plus Claude Code". The
         // amux harness reaches a lane through these four env vars. AMUX_SESSION
         // and AMUX_URL are what the global Claude Code hooks
@@ -7943,6 +8144,26 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
     )
     .await;
     (true, "started".into())
+}
+
+/// Start the exact provider configured for a board-driven worker, and do not
+/// report a successful wake until the common liveness predicate can see it.
+///
+/// This remains a narrow wrapper around [`start_session`], so provider/model
+/// restart behavior—including Codex's self-update relaunch—stays in the one
+/// provider-aware launcher rather than a board-specific copy.
+pub(crate) async fn start_for_board_dispatch(state: &AppState, name: &str) -> Result<(), String> {
+    if session_is_isolated(name) {
+        return Err("isolated workers never receive board automation".into());
+    }
+    let (started, detail) = start_session(state, name, "", false).await;
+    if !started {
+        return Err(detail);
+    }
+    if !is_running(name).await {
+        return Err(format!("start reported '{detail}', but no live provider process remains"));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -9265,6 +9486,160 @@ fn compose_worker_block(name: &str, session_content: &str) -> String {
 /// `AMUX_HOME`), so a test that called `write_claude_memory` would overwrite the
 /// developer's own `~/.claude/.../MEMORY.md`. Everything this function reads is
 /// rooted at `AMUX_HOME`, so it is safe to exercise directly.
+/// Index lines an AGENT appended straight to MEMORY.md, which the compose would
+/// otherwise destroy (AF-578).
+///
+/// MEMORY.md is written by `fs::write` from the server's own sources, so it is a
+/// FULL REBUILD. Anything not in those sources dies on the next compose. That
+/// collides head-on with the memory instruction every session carries, which
+/// says to write a memory file and then "add a one-line pointer in MEMORY.md":
+/// an agent following its own instructions writes into the volatile half.
+///
+/// Measured 2026-09-07 on this box: 44 memory files on disk,
+/// ~/.claude/projects/-Users-ethan-Dev-amux/memory/MEMORY.md indexing 5 of them,
+/// and the server source `~/.amux/memory/amux-frustrations.md` carrying ~25
+/// pointers with NO overlap with those 5. Two indexes, not two views of one.
+/// Reported up from ts-gke (TG-3374) as a truncation problem; truncation is the
+/// SECOND loss.
+///
+/// THE FILES SURVIVE AND THE POINTERS DO NOT, which is why this reads as
+/// working: the write succeeds, the .md persists, and only discoverability is
+/// lost. 39 of 44 were already content with no index entry.
+///
+/// A DELETED MEMORY MUST STAY DELETED. The memory rules tell sessions to remove
+/// memories that turn out to be wrong, so a pointer whose target file is gone is
+/// NOT preserved: resurrecting it would make deletion impossible and quietly
+/// restore a fact somebody retracted.
+/// (deleted-target pointers, unrecognised lines) that a compose will DROP.
+///
+/// Pulled out of the warn so the claim is falsifiable. A `tracing::warn!` that
+/// nothing asserts is a disclosure nobody can test, which is the failure this
+/// whole card is about one layer along (ts-gke asked exactly this: does a MIXED
+/// file behave the way the warn says).
+///
+/// The two counts mean opposite things and must not be summed:
+///   deleted-target  a pointer whose file is gone. Dropped ON PURPOSE.
+///   unrecognised    a line this merge cannot carry. A real loss, and for a
+///                   PROSE-shaped source (headings and paragraphs, no pointer
+///                   lines) it is every line.
+fn compose_drop_counts(
+    existing: &str,
+    composed: &str,
+    mem_dir: &std::path::Path,
+) -> (usize, usize) {
+    let re = cached_re!(r"(?m)^- \[[^\]]+\]\(([A-Za-z0-9._-]+\.md)\)");
+    let (mut deleted, mut unrecognised, mut in_roster) = (0usize, 0usize, false);
+    for line in existing.lines() {
+        let t = line.trim();
+        // A POINTER IS COUNTED WHEREVER IT SITS. The roster guard suppresses
+        // only NON-pointer lines (ts-gke, after measuring the residual left by
+        // my previous two attempts at this).
+        //
+        // Attempt 1 latched at the roster heading and skipped to EOF: 119 lines
+        // blind. Attempt 2 reset on the next `## ` heading, which shrank it to
+        // 7 and did not close it, because an agent append lands at the end of
+        // whatever section it falls into. On the real file six live pointers sit
+        // at lines 147-153: after the roster TABLE ended, still under the roster
+        // HEADING, so a heading-scoped guard swallowed them.
+        //
+        // Measured on ~/.claude/projects/-Users-ethan-Dev-mixpeek/memory/MEMORY.md:
+        //   roster heading 88 | first pointer after it 147 | next heading 154
+        //   pointer lines inside the roster's scope: 6
+        //   roster TABLE rows that are pointer-shaped:  0
+        //
+        // That last zero is what makes this safe rather than clever: the roster
+        // is a `| ... |` table plus two prose lines and contains no `- [..](..)`
+        // line at all, so a pointer inside its scope is by definition NOT roster
+        // content. It also makes the guard indifferent to WHERE the roster sits
+        // and whether a heading follows it, which is the property both previous
+        // versions lacked.
+        if t.starts_with("## ") {
+            in_roster = t.starts_with("## Fleet — who else is running");
+        }
+        match re.captures(line) {
+            // Always, roster scope or not: see the note above.
+            Some(c) => {
+                if !mem_dir.join(&c[1]).is_file() {
+                    deleted += 1;
+                }
+            }
+            None => {
+                if in_roster || t.is_empty() {
+                    continue;
+                }
+                if !composed.contains(t) {
+                    unrecognised += 1;
+                }
+            }
+        }
+    }
+    (deleted, unrecognised)
+}
+
+fn preserved_agent_pointers(mem_dir: &std::path::Path, composed: &str) -> String {
+    let existing = match std::fs::read_to_string(mem_dir.join("MEMORY.md")) {
+        Ok(t) => t,
+        Err(_) => return String::new(), // no prior file: nothing to preserve
+    };
+    let re = cached_re!(r"(?m)^- \[[^\]]+\]\(([A-Za-z0-9._-]+\.md)\)");
+    let mut kept: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in existing.lines() {
+        let Some(c) = re.captures(line) else { continue };
+        let target = c[1].to_string();
+        if target.eq_ignore_ascii_case("MEMORY.md") {
+            continue;
+        }
+        // Already carried by the sources: re-emitting would duplicate it, and a
+        // duplicate index line is the same defect one layer along.
+        if composed.contains(&format!("({target})")) {
+            continue;
+        }
+        if !seen.insert(target.clone()) {
+            continue; // idempotent: composing twice must not grow the file
+        }
+        if !mem_dir.join(&target).is_file() {
+            continue; // deleted memory: see the doc comment
+        }
+        kept.push(line.trim_end().to_string());
+    }
+    // SAY WHAT IS BEING DROPPED (ts-gke, and the two-fix rule). A destructive
+    // rebuild that cannot name what it removed is unobservable from outside,
+    // which is the same class as a guard that reads green while skipped. Two
+    // populations, counted separately because they mean opposite things:
+    //   - a pointer whose FILE is gone: dropped ON PURPOSE, so deletion works
+    //   - anything else a session wrote: dropped because this merge only
+    //     understands pointer lines
+    //
+    // THAT SECOND COUNT IS A REAL LIMIT OF THIS FIX, not a formality. Lane
+    // memory sources are not all pointer-shaped: ts-gke.md is `## Heading` plus
+    // prose with zero `- [Title](file.md)` lines, so for a lane in that style
+    // this preserves nothing and the warn is the only signal anyone gets.
+    // grep "memory: compose dropped".
+    let (dropped_deleted, unrecognised) = compose_drop_counts(&existing, composed, mem_dir);
+    if dropped_deleted > 0 || unrecognised > 0 {
+        tracing::warn!(
+            dir = %mem_dir.display(),
+            preserved = kept.len(),
+            dropped_deleted_target = dropped_deleted,
+            unrecognised_lines = unrecognised,
+            "memory: compose dropped session-written content it could not carry (AF-578); \
+             only `- [Title](file.md)` lines are preserved"
+        );
+    }
+    if kept.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n## Session-written pointers (preserved across compose — AF-578)\n\n\
+         These were appended to MEMORY.md by a session rather than written to \
+         ~/.amux/memory/<worker>.md. They are carried forward on every rebuild so \
+         following the memory instruction does not silently lose the entry. To make \
+         one durable in the server's own index instead, add it to that file.\n\n{}\n",
+        kept.join("\n")
+    )
+}
+
 fn compose_memory_doc(name: &str, global_content: &str, session_content: &str) -> String {
     let mut parts = Vec::new();
     // RULES FIRST (AF-297). Binding constraints buried under prose are
@@ -9341,7 +9716,13 @@ fn write_claude_memory(name: &str, work_dir: &str) {
     }
     // The roster rides on the SAME write, so it is refreshed whenever the
     // session's memory is — no separate job to fall behind the fleet.
-    let composed = composed + &fleet_roster();
+    // ORDER IS LOAD-BEARING: preserved pointers BEFORE the roster, so the roster
+    // stays last. Under a read ceiling the tail is what gets dropped, and the
+    // roster is auto-generated and re-derivable while a memory pointer is not
+    // (ts-gke's option 3, which their mixpeek file violates with 122 lines after
+    // the roster).
+    let preserved = preserved_agent_pointers(&claude_mem_dir, &composed);
+    let composed = composed + &preserved + &fleet_roster();
     let _ = std::fs::write(&claude_mem_file, &composed);
 }
 
@@ -10850,7 +11231,7 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         {
             let (sess3, text3) = (session.clone(), text.clone());
             let now_ms = (now_f64() * 1000.0) as i64;
-            let minted: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            let minted: std::sync::Arc<std::sync::Mutex<Option<CapturedCardReceipt>>> =
                 std::sync::Arc::new(std::sync::Mutex::new(None));
             let minted_w = minted.clone();
             let res = state
@@ -10884,7 +11265,7 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                                   AND card_id IS NULL ORDER BY id DESC LIMIT 1)",
                                 rusqlite::params![row.id, sess3, text3],
                             )?;
-                            *minted_w.lock().unwrap() = Some(row.id.clone());
+                            *minted_w.lock().unwrap() = Some((row.id.clone(), row.status.clone()));
                             let ev = crate::db::PendingEvent {
                                 entity_type: amux_core::revision::EntityType::Task,
                                 entity_id: row.id.clone(),
@@ -10902,14 +11283,57 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                 // announces its captures the same way the direct path does, so a
                 // future silent stop is a queryable absence, not an invisible one.
                 Ok(_) => {
-                    if let Some(cid) = minted.lock().unwrap().take() {
+                    let captured_id = minted.lock().ok().and_then(|mut id| id.take());
+                    if let Some((cid, capture_status)) = captured_id {
                         tracing::info!(session = %session, id = %id, card_id = %cid,
                             "ledger: auto-captured board card from STEERING-delivered prompt (AMUX-3148)");
+                        emit_event(
+                            state,
+                            &session,
+                            if capture_status == "doing" { "task.claimed" } else { "task.captured" },
+                            Some(json!({
+                                "issue": cid,
+                                "status": capture_status,
+                                "reason": "steering-delivered-owner-prompt",
+                            })),
+                            None,
+                            "prompt-capture",
+                        )
+                        .await;
                     }
                 }
                 Err(e) => tracing::warn!(session = %session, error = %e,
                     "ledger auto-capture FAILED on steering delivery; prompt delivered without a board card"),
             }
+        }
+        if guard.is_empty()
+            && sender.is_empty()
+            && (amux_core::board::title_from_prompt(&text).is_none()
+                || amux_core::board::is_informational_query(&text))
+        {
+            let reason = if amux_core::board::is_informational_query(&text) {
+                "informational-query"
+            } else {
+                "control-prompt"
+            };
+            emit_event(
+                state,
+                &session,
+                "task.cardless",
+                Some(json!({"reason": reason})),
+                None,
+                "prompt-capture",
+            )
+            .await;
+            tracing::info!(
+                target: "amux::sessions",
+                session = %session,
+                reason,
+                measured = true,
+                n_considered = 1,
+                verdict = "cardless-allowed",
+                "runtime/board truth: steering-delivered owner prompt is explicitly cardless"
+            );
         }
         // The metadata AMUX-2643's "direct vs queued" view needs, recorded on
         // EVERY delivery path: how it was queued, how long it waited, whether
@@ -17062,11 +17486,24 @@ async fn rename_session(state: &AppState, name: &str, raw_new: &str) -> Response
     steps.extend(counts.lock().unwrap().iter().cloned());
     // Say WHICH tables kept the old name and WHY, rather than naming one of
     // them and leaving the rest to look like an oversight.
-    for (t, d) in SESSION_SCOPED_TABLES {
+    for (t, d) in SESSION_SCOPED_FIELDS {
         if let RenameDisposition::KeepForAudit(why) = d {
             steps.push(format!("db.{t}: keeps the old name — {why}"));
         }
     }
+    let overlap_outcomes: Vec<&str> = steps
+        .iter()
+        .filter(|step| step.starts_with("db.board_overlap_"))
+        .map(String::as_str)
+        .collect();
+    tracing::info!(
+        marker = "session_rename_overlap_lineage",
+        old_session = name,
+        new_session = %new_name,
+        n_fields = overlap_outcomes.len(),
+        outcomes = ?overlap_outcomes,
+        "session rename reconciled live overlap addresses and retained historical attribution"
+    );
     // 9. Re-export AMUX_SESSION for future panes (py:76416) — best-effort;
     //    the RUNNING shell keeps its env until restart, same as Python.
     if is_running(&new_name).await {
@@ -18476,6 +18913,246 @@ fn getrandom_fill(buf: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
+    #[derive(Clone)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    struct CapturedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter(self.0.clone())
+        }
+    }
+
+    impl std::io::Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// AF-578. CONTENT AFTER THE ROSTER, which is the shape this merge will meet
+    /// on first run and which none of my other fixtures had.
+    ///
+    /// ts-gke caught it by reviewing against a real file instead of my tests:
+    /// every cell I wrote puts the roster last or omits it, because that is the
+    /// shape my own fix CREATES. The existing files were written before
+    /// roster-last existed. Measured on the mixpeek index: roster heading at
+    /// line 88 of 210, with 62 pointer lines and 55 prose lines after it.
+    #[test]
+    fn the_drop_counts_see_content_after_the_roster_block() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let d = dir.path();
+        std::fs::write(d.join("before.md"), "x\n").unwrap();
+        std::fs::write(d.join("after.md"), "x\n").unwrap();
+
+        std::fs::write(d.join("inscope.md"), "x\n").unwrap();
+        // THE SHAPE ON DISK RIGHT NOW, which both earlier fixes missed: an
+        // append lands at the end of whatever section it falls into, so these
+        // sit AFTER the roster TABLE and BEFORE the next heading. A
+        // heading-scoped guard still swallows them. On the real mixpeek index
+        // that is six live pointers at lines 147-153, roster heading 88, next
+        // heading 154.
+        let existing = concat!(
+            "- [Before](before.md) — a pointer ahead of the roster\n",
+            "\n## Fleet — who else is running (auto-generated, do not edit)\n",
+            "| worker | groups |\n|---|---|\n| peer | x |\n",
+            "- [InScope](inscope.md) — appended INSIDE the roster section\n",
+            "- [GoneInScope](gone-inscope.md) — deleted target, same position\n",
+            "\n## Session pointers appended after the roster\n",
+            "- [After](after.md) — a live pointer BELOW the roster\n",
+            "- [Vanished](vanished.md) — its file is gone, must be counted\n",
+            "Prose a session wrote below the roster.\n",
+        );
+        std::fs::write(d.join("MEMORY.md"), existing).unwrap();
+        let composed = "# Shared Context\n";
+
+        // The merge always saw these; it has no roster guard. Pinned so the two
+        // halves cannot drift apart later.
+        let out = super::preserved_agent_pointers(d, composed);
+        assert!(out.contains("(before.md)"), "pointer above the roster: {out}");
+        assert!(out.contains("(after.md)"), "pointer BELOW the roster: {out}");
+        assert!(
+            out.contains("(inscope.md)"),
+            "pointer appended INSIDE the roster section, after its table: {out}"
+        );
+
+        // THE DEFECT: with a latching flag both of these were 0, because
+        // everything from line 2 to EOF was skipped.
+        let (deleted, unrecognised) = super::compose_drop_counts(existing, composed, d);
+        assert_eq!(
+            deleted, 2,
+            "BOTH deleted-target pointers must be counted: one below the next heading, \
+             and one appended inside the roster section after its table"
+        );
+        assert_eq!(
+            unrecognised, 2,
+            "prose below the roster must be counted (the heading and the line), \
+             and the roster's own table rows must NOT be"
+        );
+    }
+
+    /// AF-578, asked for by ts-gke as the assumption they most wanted falsified:
+    /// does a MIXED source (some pointers, some prose) behave the way the warn
+    /// claims, or does "no pointer lines found" quietly read as "nothing to
+    /// preserve"? Same code path, different bugs.
+    ///
+    /// Their own lane is the motivating case: ts-gke.md is 17 prose sections and
+    /// ZERO pointer lines, so for that shape this merge preserves nothing and the
+    /// warn is the only signal anyone gets. That has to be COUNTED, not assumed.
+    #[test]
+    fn a_mixed_source_preserves_its_pointers_and_counts_the_prose_it_cannot_carry() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let d = dir.path();
+        std::fs::write(d.join("live.md"), "x\n").unwrap();
+
+        // MIXED: one live pointer, one deleted pointer, and prose a human would
+        // call memory.
+        let mixed = concat!(
+            "- [Live](live.md) — a pointer, preserved\n",
+            "- [Dead](dead.md) — pointer whose file is gone, dropped on purpose\n",
+            "## A prose section a session wrote\n",
+            "Some content with no pointer line at all.\n",
+            "**Why:** prose sources are a real shape (ts-gke.md is entirely this).\n",
+        );
+        std::fs::write(d.join("MEMORY.md"), mixed).unwrap();
+        let composed = "# Shared Context\n";
+
+        let out = super::preserved_agent_pointers(d, composed);
+        assert!(out.contains("(live.md)"), "the pointer half must survive: {out}");
+        assert!(!out.contains("(dead.md)"), "the deleted target must not: {out}");
+
+        let (deleted, unrecognised) = super::compose_drop_counts(mixed, composed, d);
+        assert_eq!(deleted, 1, "exactly the one pointer whose file is gone");
+        assert_eq!(
+            unrecognised, 3,
+            "every prose line must be COUNTED as unrecognised, not silently dropped"
+        );
+
+        // PURE-PROSE, ts-gke's actual file shape. Nothing is preserved, and the
+        // count is the only thing standing between that and silence. Asserting
+        // it is non-zero is the difference between "nothing to preserve" and
+        // "could not preserve anything".
+        let prose = concat!(
+            "## Liveness is not identity\n",
+            "A worker answering is not the worker you addressed.\n",
+        );
+        std::fs::write(d.join("MEMORY.md"), prose).unwrap();
+        assert_eq!(
+            super::preserved_agent_pointers(d, composed),
+            "",
+            "a prose-only source preserves nothing, by design"
+        );
+        let (_d2, u2) = super::compose_drop_counts(prose, composed, d);
+        assert_eq!(u2, 2, "and every one of its lines is counted as at-risk, not zero");
+    }
+
+    /// AF-578. MEMORY.md is rebuilt wholesale from the server's sources, so a
+    /// pointer a session appended there (which the memory instruction tells every
+    /// session to do) died on the next compose. Measured on this box before the
+    /// fix: 44 memory files, 5 indexed in MEMORY.md, and the server source
+    /// carrying ~25 with zero overlap.
+    ///
+    /// Cell 2 is the one that keeps this honest. Preserving everything would make
+    /// DELETION IMPOSSIBLE, and the memory rules tell sessions to remove memories
+    /// that turn out to be wrong. A pointer whose file is gone must stay gone.
+    #[test]
+    fn a_session_written_pointer_survives_compose_unless_its_memory_was_deleted() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let d = dir.path();
+        std::fs::write(d.join("kept.md"), "a real memory\n").unwrap();
+        std::fs::write(d.join("already.md"), "carried by the sources\n").unwrap();
+        // NOTE: no gone.md on disk — that memory was deleted.
+        std::fs::write(
+            d.join("MEMORY.md"),
+            // EVERY POINTER LINE STARTS AT COLUMN 0, as it does in a real
+            // MEMORY.md, because the regex is anchored with `^`. An earlier
+            // version of this fixture carried 13 leading spaces on lines 2-4
+            // and they matched NOTHING, so the gone/already/roster cells all
+            // passed vacuously. Mutation A (removing the file-existence check)
+            // stayed GREEN, which is what exposed it: three of five cells were
+            // asserting about candidates the regex had already skipped.
+            concat!(
+                "- [Kept](kept.md) — written by a session\n",
+                "- [Gone](gone.md) — deleted memory, must NOT come back\n",
+                "- [Already](already.md) — the sources have this one\n",
+                "\n## Fleet — who else is running (auto-generated, do not edit)\n",
+                "| worker | groups |\n|---|---|\n| peer | x |\n",
+            ),
+        )
+        .unwrap();
+
+        let composed = "# Shared Context\n- [Already](already.md) — from the server source\n";
+        let out = super::preserved_agent_pointers(d, composed);
+
+        assert!(out.contains("(kept.md)"), "a session-written pointer must survive: {out}");
+        assert!(
+            !out.contains("(gone.md)"),
+            "a pointer whose memory FILE was deleted must not be resurrected: {out}"
+        );
+        assert!(
+            !out.contains("(already.md)"),
+            "a pointer the sources already carry must not be duplicated: {out}"
+        );
+        // The roster's table rows are not pointer lines and must not be dragged in.
+        assert!(!out.contains("| worker |"), "the roster is not a pointer: {out}");
+
+        // IDEMPOTENT. The output is written back into MEMORY.md, so the next
+        // compose reads its own emission. Growing on every tick would turn this
+        // fix into the accumulation it prevents.
+        let round2 = {
+            std::fs::write(d.join("MEMORY.md"), format!("{composed}{out}")).unwrap();
+            super::preserved_agent_pointers(d, composed)
+        };
+        assert_eq!(
+            round2.matches("(kept.md)").count(),
+            1,
+            "composing twice must not duplicate the preserved pointer: {round2}"
+        );
+    }
+
+    #[test]
+    fn tmux_shell_setup_keeps_line_and_enter_in_one_command() {
+        use std::process::Command;
+        if Command::new("tmux").arg("-V").output().is_err() {
+            eprintln!("tmux unavailable; live shell submission test not measured");
+            return;
+        }
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = dir.path().join("socket");
+        struct PrivateServer(std::path::PathBuf);
+        impl Drop for PrivateServer {
+            fn drop(&mut self) {
+                let _ = Command::new("tmux").arg("-S").arg(&self.0).arg("kill-server").output();
+            }
+        }
+        let _server = PrivateServer(socket.clone());
+        let created = Command::new("tmux").arg("-S").arg(&socket)
+            .args(["new-session", "-d", "-s", "amux-shell-line-proof", "/bin/sh"])
+            .output().unwrap();
+        assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+        let pt = super::pt("shell-line-proof");
+        let receipt = dir.path().join("receipt");
+        for value in ["first", "second"] {
+            let line = format!("printf '%s\\n' {value} >> {}", super::sh_quote(&receipt.to_string_lossy()));
+            let out = Command::new("tmux").arg("-S").arg(&socket)
+                .args(super::shell_line_args(&pt, &line)).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let result = std::fs::read_to_string(&receipt).unwrap_or_default();
+            if result == "first\nsecond\n" { break; }
+            assert!(std::time::Instant::now() < deadline, "shell did not receive two complete lines: {result:?}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
 
     /// ATE-75: the suggestion probe ran successfully but found nothing to
     /// submit. That is a measured no-op, never a confirmed message.
@@ -20448,6 +21125,21 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM issues WHERE session='lane-cap'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 2, "each distinct durable command reaches the work ledger");
+        let conn = st.store.read().unwrap();
+        let doing: i64 = conn.query_row("SELECT COUNT(*) FROM issues WHERE session='lane-cap' AND status='doing'", [], |r| r.get(0)).unwrap();
+        assert_eq!(doing, 1, "delivery of a follow-up must not manufacture concurrent Doing claims");
+        let (pending, trigger): (String, Option<String>) = conn.query_row(
+            "SELECT status, source_ref FROM issues WHERE session='lane-cap' AND id<>?1", [&card_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(pending, "backlog");
+        assert!(trigger.is_some(), "already-delivered follow-up must not auto-promote and redispatch");
+        let claims: i64 = conn.query_row("SELECT COUNT(*) FROM session_events WHERE session='lane-cap' AND type='task.claimed'", [], |r| r.get(0)).unwrap();
+        assert_eq!(claims, 1, "a captured follow-up must not replace the runtime claim");
+        let captures: i64 = conn.query_row("SELECT COUNT(*) FROM session_events WHERE session='lane-cap' AND type='task.captured'", [], |r| r.get(0)).unwrap();
+        assert_eq!(captures, 1, "the pending delivery still has a durable receipt");
+        drop(conn);
+
 
         // 3. [no-board] (skip_board=true) mints nothing.
         cmd_hist_record_full(
@@ -21545,15 +22237,15 @@ CLAUDE-POSTFIX-COMPLETE
 
         let amux_start = parse_iso8601("2026-09-03T21:44:10Z").unwrap();
         let e2e_start = parse_iso8601("2026-09-03T23:39:24Z").unwrap();
-        assert_eq!(rollout_for_worker_start(&files, &cwd, amux_start), Some(&older));
-        assert_eq!(rollout_for_worker_start(&files, &cwd, e2e_start), Some(&newer));
+        assert_eq!(rollout_for_worker_start(&files, &cwd, amux_start), Ok(Some(&older)));
+        assert_eq!(rollout_for_worker_start(&files, &cwd, e2e_start), Ok(Some(&newer)));
         assert_eq!(
             rollout_for_worker_start(
                 &files,
                 &cwd,
                 parse_iso8601("2026-09-03T21:50:00Z").unwrap()
             ),
-            None,
+            Ok(None),
             "a pre-restart rollout must not be adopted by the new worker life"
         );
         assert_eq!(
@@ -21562,9 +22254,47 @@ CLAUDE-POSTFIX-COMPLETE
                 &cwd,
                 parse_iso8601("2026-09-04T12:00:00Z").unwrap()
             ),
-            None,
+            Ok(None),
             "outside the bounded startup window the safe answer is unknown"
         );
+    }
+
+    #[test]
+    fn codex_rollout_fallback_refuses_nearest_sibling_even_beyond_the_old_scan_cap() {
+        // AMUX-4220: research started at 22:04:12, pitr at 22:04:14;
+        // their rollouts were born just 1.318 seconds apart. Both nearest
+        // matches chose pitr, so research inherited pitr's idle boundary.
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = normalize_work_dir(dir.path().to_str().unwrap());
+        let write = |name: &str, ts: &str, source: Value| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, json!({"timestamp": ts, "type": "session_meta",
+                "payload": {"cwd": cwd, "source": source}}).to_string()).unwrap();
+            path
+        };
+        let pitr = write("rollout-pitr.jsonl", "2026-09-07T22:09:19.439Z", json!("cli"));
+        let research = write("rollout-research.jsonl", "2026-09-07T22:09:20.757Z", json!("cli"));
+        let child = write("rollout-child.jsonl", "2026-09-07T22:04:13Z",
+            json!({"subagent": {"thread_spawn": {"parent_thread_id": "research"}}}));
+        let stamp = std::time::SystemTime::UNIX_EPOCH;
+        let started = parse_iso8601("2026-09-07T22:04:12Z").unwrap();
+        let mut files = vec![(stamp, child), (stamp, pitr.clone()), (stamp, research.clone())];
+        for start in [started, parse_iso8601("2026-09-07T22:04:14Z").unwrap()] {
+            let ambiguous = rollout_for_worker_start(&files, &cwd, start).unwrap_err();
+            assert_eq!(ambiguous.len(), 2, "subagents are not main-turn candidates");
+            assert!(ambiguous.contains(&&pitr) && ambiguous.contains(&&research));
+        }
+        files.reverse();
+        assert!(rollout_for_worker_start(&files, &cwd, started).is_err());
+        files.retain(|(_, p)| p != &pitr);
+        assert_eq!(rollout_for_worker_start(&files, &cwd, started), Ok(Some(&research)));
+
+        // A partial population cannot prove uniqueness. A quiet sibling may
+        // fall behind 80 newer rollouts from completely unrelated work.
+        let unrelated = write("rollout-old.jsonl", "2026-09-06T22:09:19Z", json!("cli"));
+        files.extend((0..80).map(|_| (stamp, unrelated.clone())));
+        files.push((stamp, pitr));
+        assert!(rollout_for_worker_start(&files, &cwd, started).is_err());
     }
 
     /// Codex's trust-directory picker, byte shape captured live 2026-08-11
@@ -22452,6 +23182,14 @@ CLAUDE-POSTFIX-COMPLETE
     /// attached rows, retry-after-partial convergence, target collision.
     #[tokio::test]
     async fn rename_is_convergent_journaled_and_collision_safe() {
+        let captured_logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(CapturedLogs(captured_logs.clone()))
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join("sessions")).unwrap();
         let _home = crate::api::settings::test_env::set_home(home.path());
@@ -22463,10 +23201,29 @@ CLAUDE-POSTFIX-COMPLETE
             .store
             .write_async(|conn| {
                 conn.execute_batch(
-                    "INSERT INTO issues (id, title, session, status, owner_type, created, updated)
-                        VALUES ('I-1', 'card', 'rn-old', 'doing', 'agent', 1, 1);
+                    "INSERT INTO issues
+                        (id, title, session, status, owner_type, created, updated,
+                         requested_by, callback_session)
+                        VALUES ('I-1', 'card', 'rn-old', 'doing', 'agent', 1, 1,
+                                'rn-old', 'rn-old');
                      INSERT INTO schedules (id, title, session, command, created, updated)
-                        VALUES ('S-1', 'sched', 'rn-old', 'noop', 1, 1);",
+                        VALUES ('S-1', 'sched', 'rn-old', 'noop', 1, 1);
+                     INSERT INTO telegram_mappings (chat_id, session, last_routed_session)
+                        VALUES (1, 'rn-old', 'rn-old');
+                     INSERT INTO board_overlap_coordination
+                        (coordination_id, semantic_key, concern, owner_card_id, owner_session,
+                         resolution, resolution_note, resolved_by_card_id, resolved_by_session,
+                         resolved_at, created_at, updated_at)
+                        VALUES ('OVL-rename', 'rename-fixture', 'lineage', 'I-1', 'rn-old',
+                                'scope-split', 'fixture resolution', 'I-1', 'rn-old', 1, 1, 1);
+                     INSERT INTO board_overlap_members
+                        (coordination_id, card_id, session, base_commit, head_commit, worktree,
+                         intent, self_reported, created_at, last_seen_at)
+                        VALUES ('OVL-rename', 'I-1', 'rn-old', 'base', 'head', '/tmp/rn-old',
+                                'rename fixture', 1, 1, 1);
+                     INSERT INTO board_overlap_callbacks
+                        (coordination_id, target_session, message_id, state, updated_at)
+                        VALUES ('OVL-rename', 'rn-old', 'MSG-rename', 'delivered', 1);",
                 )?;
                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
             })
@@ -22510,19 +23267,67 @@ CLAUDE-POSTFIX-COMPLETE
         assert!(meta_path("rn-new").exists() && log_path("rn-new").exists());
         let steps = v["steps"].to_string();
         assert!(steps.contains("db.issues: 1 row(s)"), "{steps}");
+        assert!(steps.contains("db.issues.requested_by: 1 row(s)"), "{steps}");
+        assert!(steps.contains("db.issues.callback_session: 1 row(s)"), "{steps}");
         assert!(steps.contains("db.schedules: 1 row(s)"), "{steps}");
+        assert!(
+            steps.contains("db.telegram_mappings.last_routed_session: 1 row(s)"),
+            "{steps}"
+        );
         assert!(steps.contains("db.steering_queue: 1 row(s)"), "{steps}");
+        assert!(
+            steps.contains("db.board_overlap_coordination.owner_session: 1 row(s)"),
+            "{steps}"
+        );
+        assert!(steps.contains("db.board_overlap_members: 1 row(s)"), "{steps}");
+        assert!(
+            steps.contains("db.board_overlap_callbacks.target_session: 1 row(s)"),
+            "{steps}"
+        );
+        assert!(
+            steps.contains("db.board_overlap_coordination.resolved_by_session: keeps the old name"),
+            "{steps}"
+        );
         assert!(steps.contains("prefs.session_reports: key migrated"), "{steps}");
         {
             let conn = state.store.read().unwrap();
-            let sess: String = conn
-                .query_row("SELECT session FROM issues WHERE id='I-1'", [], |r| r.get(0))
+            let (sess, requester, issue_callback): (String, String, String) = conn
+                .query_row(
+                    "SELECT session, requested_by, callback_session FROM issues WHERE id='I-1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
                 .unwrap();
             assert_eq!(sess, "rn-new");
+            assert_eq!((requester.as_str(), issue_callback.as_str()), ("rn-new", "rn-new"));
             let sched: String = conn
                 .query_row("SELECT session FROM schedules WHERE id='S-1'", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(sched, "rn-new");
+            let (owner, member, callback, resolver): (String, String, String, String) = conn
+                .query_row(
+                    "SELECT c.owner_session, m.session, cb.target_session, c.resolved_by_session
+                       FROM board_overlap_coordination c
+                       JOIN board_overlap_members m USING (coordination_id)
+                       JOIN board_overlap_callbacks cb USING (coordination_id)
+                      WHERE c.coordination_id='OVL-rename'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (owner.as_str(), member.as_str(), callback.as_str()),
+                ("rn-new", "rn-new", "rn-new")
+            );
+            assert_eq!(resolver, "rn-old", "completed reconciliation attribution is historical");
+            let telegram_route: String = conn
+                .query_row(
+                    "SELECT last_routed_session FROM telegram_mappings WHERE chat_id=1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(telegram_route, "rn-new");
             // Journal: started + completed events both present (rule 4).
             let n: i64 = conn
                 .query_row(
@@ -22533,6 +23338,12 @@ CLAUDE-POSTFIX-COMPLETE
                 .unwrap();
             assert!(n >= 2, "rename must journal start+finish, found {n}");
         }
+        let logs = String::from_utf8(captured_logs.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("marker=\"session_rename_overlap_lineage\""),
+            "missing exact sweep marker: {logs}"
+        );
+        assert!(logs.contains("n_fields=4"), "marker must say how much it measured: {logs}");
 
         // 3. Retry-after-partial: simulate a crash that moved ONLY the env
         //    file, leaving meta/log/DB under the old name — the retry of the
@@ -22879,6 +23690,9 @@ mod steer_boundary_tests {
                 // The open manual card must NOT block a new user task.
                 let first = super::mint_capture_card(conn, "s", "build the connectors tab", now_ms)?;
                 assert!(first.is_some(), "a new task must card even with an open manual card");
+                assert_eq!(first.as_ref().unwrap().status, "backlog", "a delivered prompt must preserve the active manual claim");
+                assert!(first.as_ref().unwrap().source_ref.is_some());
+
                 // In production the recorder atomically attaches the minted id
                 // to this exact cmd_history row; the retry predicate reads that
                 // durable link rather than comparing truncated card prose.
@@ -22898,6 +23712,65 @@ mod steer_boundary_tests {
                 // classify or decompose it.
                 let rapid = super::mint_capture_card(conn, "s", "also wire slack", now_ms + 2_000)?;
                 assert!(rapid.is_some(), "a distinct rapid task must card immediately");
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+    }
+
+    /// AF-568. The 45s window guards a TRANSPORT RETRY, and the steering path it
+    /// also guards waits for the lane's next turn boundary. On 2026-09-07 one
+    /// broadcast was enqueued at 18:09 and steering-delivered at 18:26: the window
+    /// had long expired, so a second card minted for the same prompt. 46 of 56
+    /// lanes got a duplicate and two got three.
+    ///
+    /// The delay is unbounded by design, so this is bounded by the card's LIFECYCLE
+    /// rather than by a longer window. Both halves are asserted, because a check
+    /// that blocks everything would pass the first one alone.
+    #[tokio::test]
+    async fn a_capture_does_not_double_card_a_prompt_the_lane_still_holds_open() {
+        let (state, _tmp) = tstate();
+        let now_ms = 1_700_000_000_000i64;
+        state
+            .store
+            .write_async(move |conn| {
+                let first = super::mint_capture_card(conn, "s", "recover and continue", now_ms)?;
+                let first_id = first.as_ref().expect("the first delivery must card").id.clone();
+                // The direct path links the minted id to the row it recorded. The
+                // steering duplicate never gets a row of its own, which is why the
+                // cmd_history guard cannot see it.
+                conn.execute(
+                    "INSERT INTO cmd_history(text,type,session,ts,origin,card_id) \
+                     VALUES(?1,'user','s',?2,'test',?3)",
+                    rusqlite::params!["recover and continue", now_ms, first_id],
+                )?;
+
+                // THE BUG: the same prompt, steering-delivered 17 minutes later.
+                // Far outside any retry window, and the card is still open.
+                let late = now_ms + 17 * 60 * 1_000;
+                let dup = super::mint_capture_card(conn, "s", "recover and continue", late)?;
+                assert!(
+                    dup.is_none(),
+                    "a prompt whose capture card is still open must not card twice, \
+                     however late the delivery lands"
+                );
+
+                // AND THE CHECK MUST STILL BE ABLE TO PASS. Once the lane has closed
+                // the card, the same words are a new task and card normally, so a
+                // green above means "deduped" rather than "blocked everything".
+                conn.execute("UPDATE issues SET status='done' WHERE id=?1", rusqlite::params![first_id])?;
+                let after_close =
+                    super::mint_capture_card(conn, "s", "recover and continue", late + 1_000)?;
+                assert!(
+                    after_close.is_some(),
+                    "once the card is closed an identical prompt is new work and must card"
+                );
+
+                // A DIFFERENT lane holding an identical open capture must not block
+                // this one: the duplicate is per-session, and the incident was one
+                // prompt broadcast to 56 lanes that each legitimately needed a card.
+                let peer = super::mint_capture_card(conn, "other", "recover and continue", late)?;
+                assert!(peer.is_some(), "a peer lane's open capture must not suppress this lane's");
                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
             })
             .await

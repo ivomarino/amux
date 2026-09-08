@@ -143,11 +143,16 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
         )),
         Ok(conn) => {
             let since = crate::config::now_f64() - 14.0 * 86400.0;
-            let mut acc: std::collections::HashMap<(String, String), (i64, i64)> =
+            let mut acc: std::collections::HashMap<(String, String), (i64, i64, i64, i64)> =
                 std::collections::HashMap::new();
             let rows = conn
                 .prepare(
-                    "SELECT method, path,                             SUM(CASE WHEN status >= 200 AND status < 300 THEN 1 ELSE 0 END),                             COUNT(*)                      FROM _amux_request_log WHERE ts >= ?1 GROUP BY method, path",
+                    "SELECT method, path, \
+                            SUM(CASE WHEN status >= 200 AND status < 300 THEN 1 ELSE 0 END), \
+                            COUNT(*), \
+                            SUM(CASE WHEN status >= 400 AND status < 500 THEN 1 ELSE 0 END), \
+                            SUM(CASE WHEN status >= 500 THEN 1 ELSE 0 END) \
+                     FROM _amux_request_log WHERE ts >= ?1 GROUP BY method, path",
                 )
                 .and_then(|mut stmt| {
                     stmt.query_map([since], |r| {
@@ -156,24 +161,25 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
                             r.get::<_, String>(1)?,
                             r.get::<_, i64>(2)?,
                             r.get::<_, i64>(3)?,
+                            r.get::<_, i64>(4)?,
+                            r.get::<_, i64>(5)?,
                         ))
                     })
                     .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
                 })
                 .unwrap_or_default();
-            for (method, path, ok, n) in rows {
+            for (method, path, ok, n, c4, c5) in rows {
                 let shape = crate::api::request_log::normalize_target_verb(&path);
-                let e = acc.entry((method, shape)).or_insert((0, 0));
+                let e = acc.entry((method, shape)).or_insert((0, 0, 0, 0));
                 e.0 += ok;
                 e.1 += n;
+                e.2 += c4;
+                e.3 += c5;
             }
             let groups: Vec<checks::RouteOutcomeRow> = acc
                 .into_iter()
-                .map(|((method, shape), (ok, n))| checks::RouteOutcomeRow {
-                    method,
-                    shape,
-                    n,
-                    ok,
+                .map(|((method, shape), (ok, n, client_err, server_err))| {
+                    checks::RouteOutcomeRow { method, shape, n, ok, client_err, server_err }
                 })
                 .collect();
             out.extend(checks::mounted_routes_answer(&groups, &mounted));
@@ -260,6 +266,7 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // path INIT-1's KillMode=process already covers (an OOM kill of the
     // pane, a manual kill, a crash).
     out.extend(registered_lanes_running_check().await);
+    out.push(crate::backend::tmux_health::observe().await.invariant());
 
     tm.mark(&out, "5c. every registered, non-archived lane actually has");
     // -- 5d. did any pane's WHOLE systemd scope just get OOM-killed, not just
@@ -1094,8 +1101,10 @@ fn status_pane_check(state: &AppState) -> Vec<InvariantResult> {
         .into_iter()
         .map(|(name, pane_says_working)| {
             let rep = signals.reports.get(&name).cloned().unwrap_or(json!({}));
+            let (status, status_explain) = signals.derive_status_explain(&name, true);
             checks::LaneTruth {
-                status: signals.derive_status(&name, true),
+                status,
+                status_explain,
                 pane_says_working,
                 report_state: rep["state"].as_str().unwrap_or("").into(),
                 report_age_s: signals.now - rep["ts"].as_f64().unwrap_or(signals.now),

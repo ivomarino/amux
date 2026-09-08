@@ -75,8 +75,23 @@ lanes=$(printf '%s' "$facts" | cut -f1 | sort -u)
 lane_state() {  # -> "isolated" | "reachable" | "unknown:<why>"
   local lane="$1"
   [ -z "$API" ] && { echo "unknown:AMUX_URL unset"; return; }
-  local body
-  body=$(curl -sk --max-time 5 "$API/api/sessions/$lane" 2>/dev/null) || { echo "unknown:session lookup failed"; return; }
+  # BUDGET SIZED FROM THE MEASURED BASELINE, not guessed (AC-422, amux-cloud).
+  # Three back-to-back probes to this endpoint took 2.83s, 2.74s and 3.73s. The
+  # old --max-time 5 therefore spent 55-75% of its budget on a good day, so a
+  # false "lookup failed" was built in rather than rare, and each one routes the
+  # pusher to must-ask for a lane that refuses the send. 12s plus one retry, so
+  # a spike has to be sustained across two attempts to degrade the verdict.
+  #
+  # The fail DIRECTION is unchanged and is the safety property: a timeout can
+  # only move a lane isolated -> unknown, never to "reachable", because reachable
+  # requires a parsed payload with isolated=false and no timeout can manufacture
+  # one. More budget lowers the false-unknown rate; it cannot create a false
+  # clear.
+  local body attempt rc=1
+  for attempt in 1 2; do
+    if body=$(curl -sk --max-time 12 "$API/api/sessions/$lane" 2>/dev/null); then rc=0; break; fi
+  done
+  [ "$rc" -ne 0 ] && { echo "unknown:session lookup failed (2 attempts, 12s each)"; return; }
   [ -z "$body" ] && { echo "unknown:empty response"; return; }
   printf '%s' "$body" | python3 -c '
 import json,sys
@@ -118,7 +133,24 @@ EOF
   echo "  will push it. Pushing is defensible; claiming consent is not. (AF-548)"
   echo
 }
-[ -n "$unknown" ] && { echo "REACHABILITY UNKNOWN — treat as must-ask, not as clear:"; printf '%s' "$unknown"; echo; }
+[ -n "$unknown" ] && {
+  echo "REACHABILITY UNKNOWN. Treat as must-ask; it is not a clear answer:"
+  printf '%s' "$unknown"
+  # Closes the loop for the flaky-probe case (AC-422). Without this line the
+  # pusher tries the send the section just told them to make, it is REFUSED, and
+  # they are back at AF-548's dead end for that one commit with nothing telling
+  # them why.
+  # SELF-CONTAINED ON PURPOSE. This block prints when the lookup FAILED, and in
+  # that run nothing was classified isolated, so there is no CANNOT BE ASKED
+  # section above it to point at. An earlier draft said "state the exemption
+  # above" and referred to text that is absent on exactly the path that prints
+  # this. Caught by running the forced-failure case rather than reading it.
+  echo "  If you send and the send is REFUSED as isolated, that is the answer:"
+  echo "  the lookup was down, not the lane. Push, and state this in your push:"
+  echo "  the author is an isolated lane that refuses worker-origin sends, so"
+  echo "  consent could not be obtained. Do not imply you asked. (AF-548)"
+  echo
+}
 
 # ---- what the Rust gates cannot speak for -----------------------------------
 # Computed, never written: the test of a summary line is what input would change

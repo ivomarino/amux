@@ -586,6 +586,10 @@ async function _upgradeCheckout(billing) {
 }
 
 let sessions = [];
+// A stream update and a poll response are two snapshots of the same runtime
+// truth. A request begun before an SSE update must not finish later and put the
+// old task attribution back on screen.
+let _sessionsSnapshotEpoch = 0;
 let archivedExpanded = false;
 let gitInfo = {};  // {sessionName: {branch, repo, _conflict}}
 let _initialLoad = true;   // true until first data arrives from server
@@ -613,6 +617,7 @@ function _sessStatusKey(s) {
   if (!s.running) return 'stopped';
   if (s.status === 'rate_limited') return 'rate_limited';
   if (s.status === 'api_error') return 'api_error';
+  if (s.status === 'unattributed') return 'waiting';
   if (s.status === 'active') return 'working';
   if (s.status === 'waiting') return 'waiting';
   return 'idle';
@@ -2929,6 +2934,7 @@ function _staleShellRecover() {
 
 let _sessEtag = null;
 async function fetchSessions() {
+  const snapshotEpoch = _sessionsSnapshotEpoch;
   try {
     // AMUX-3504: conditional fetch — the server hashes the (now byte-stable)
     // payload, so an unchanged fleet answers 304 with no body. That is the
@@ -2949,6 +2955,10 @@ async function fetchSessions() {
       console.warn('sessions fetch returned non-array (status ' + r.status + ') — keeping previous set');
       return;
     }
+    if (snapshotEpoch !== _sessionsSnapshotEpoch) {
+      console.info('sessions poll completed behind a newer stream snapshot; discarded');
+      return;
+    }
     consecutiveFailures = 0;
     _lastDataTime = Date.now();
     if (_initialLoad) { _initialLoad = false; }
@@ -2958,6 +2968,7 @@ async function fetchSessions() {
       _checkSessionTransitions(data);
       lastSessionsJSON = j;
       sessions = data;
+      _sessionsSnapshotEpoch++;
       // Quota-full store: drop the cache rather than let the throw break rendering
       try { localStorage.setItem('amux_sessions_cache', j); }
       catch (e2) { try { localStorage.removeItem('amux_sessions_cache'); } catch (e3) {} }
@@ -3107,6 +3118,7 @@ function updatePeekStatus() {
   if (!s) { el.innerHTML = ''; return; }
   _renderPeekWorkerActions(s);
   let badge = '';
+  const runtimeBoard = _runtimeBoardPresentation(s);
   // NAME · STATUS · MODEL, and nothing else (Ethan, 2026-08-11: "top we only
   // need the task name, status and model"). `_liveWorkLine` used to append the
   // worker's current progress line — "Perusing… (4m 11s · ↓ 5.4k tokens)" — up
@@ -3119,7 +3131,11 @@ function updatePeekStatus() {
   // the same output live, so this was a lossy 60-char summary of something
   // already on screen. amux is mobile-first — when the phone and a nice-to-have
   // trade off, the phone wins.
-  if (s.status === 'active')  badge = '<span class="status-badge active">working</span>' + _agentsChip(s);
+  if (s.status === 'active')  badge = runtimeBoard.syncing
+    ? _runtimeBoardSyncBadge()
+    : '<span class="status-badge active">working</span>' + _agentsChip(s)
+      + (runtimeBoard.cardless ? _runtimeBoardCardlessBadge() : '');
+  else if (s.status === 'unattributed') badge = _runtimeBoardSplitBadge(s);
   else if (s.status === 'waiting') badge = '<span class="status-badge waiting"' + _waitingTitle(s) + '>' + _waitingLabel(s) + '</span>';
   else if (s.status === 'rate_limited') badge = '<span class="status-badge rate-limited">rate limited</span>';
   else if (s.status === 'api_error') badge = `<span class="status-badge rate-limited" title="API Error ${esc(s.api_error_code || '5xx')} — server-side and retryable. Send &quot;continue&quot;.">API ${esc(s.api_error_code || '5xx')}</span>`;
@@ -3268,22 +3284,65 @@ function _cardBoardStatusCounts(name) {
   });
   return counts;
 }
-// The ONE board card a worker explicitly claims through `task_board_id`.
-//
-// Do not derive this from "worker active + card doing". A worker may have more
-// than one historical/captured card in doing (TubeScience had four), while one
-// terminal turn can execute only one parent task. The old newest-doing fallback
-// made all four cards say "Working now" and could also replace the task named by
-// the status hook with whichever card happened to be touched last. An active
-// worker can also be answering an informational message that correctly produced
-// no card. Runtime activity is not a board error state; guessing a task is wrong.
+// The server's measured runtime/board object is the ONE source for a worker's
+// active card. `boardItems` may arrive before or after it, so it may decorate a
+// board row but can never decide the worker's badge, task, or card link.
+function _runtimeBoardCardId(s) {
+  const truth = s && s.runtime_board;
+  if (!truth || truth.measured !== true || truth.status !== 'linked') return '';
+  return String(truth.card_id || '').trim();
+}
+
 function _cardDoingItem(name) {
   const session = (sessions || []).find(s => s.name === name);
-  const claimed = String(session && session.task_board_id || '').trim();
+  const claimed = _runtimeBoardCardId(session);
   if (!claimed) return null;
   return (boardItems || []).find(c =>
     !c.deleted && !c.archived && c.session === name && c.status === 'doing' && c.id === claimed
   ) || null;
+}
+
+// A card's runtime badge, text and link make one statement. The server owns
+// that statement; when an old cache/response lacks the measured object, or the
+// object reports a contradiction, rendering a neutral synchronization state is
+// more honest than rebuilding WORKING from a separate board snapshot.
+function _runtimeBoardPresentation(s) {
+  if (!s || s.status !== 'active') return { syncing: false, cardless: false, cardId: '' };
+  const truth = s.runtime_board;
+  if (!truth || truth.measured !== true) return { syncing: true, cardless: false, cardId: '' };
+  const status = String(truth.status || truth.verdict || '');
+  if (status === 'cardless-allowed') return { syncing: false, cardless: true, cardId: '' };
+  const cardId = String(truth.card_id || '').trim();
+  if (status !== 'linked' || !cardId) {
+    return { syncing: true, cardless: false, cardId: '' };
+  }
+  return { syncing: false, cardless: false, cardId };
+}
+
+function _runtimeBoardSyncBadge() {
+  return '<span class="status-badge active" title="The worker is running; the board link is still being resolved after a restart.">working</span>';
+}
+
+function _runtimeBoardCardlessBadge() {
+  return '<span class="status-badge" style="margin-left:4px;" title="The server measured this as an explicit informational or control turn, not board work.">cardless turn</span>';
+}
+
+function _runtimeBoardSplitBadge(s) {
+  if (!s || s.status !== 'unattributed') return '';
+  const truth = s.runtime_board || {};
+  const verdict = String(truth.verdict || 'unattributed');
+  const observed = truth.observed_card_id ? ' Observed ' + esc(truth.observed_card_id) + '.' : '';
+  const isRunning = truth.runtime_status === 'active';
+  if (verdict === 'active-conflicting-claims') {
+    return '<span class="status-badge rate-limited" title="This running worker has more than one live task claim, so AMUX will not guess.'
+      + observed + ' Diagnostic: ' + esc(verdict) + '.">card conflict</span>';
+  }
+  if (isRunning) {
+    return '<span class="status-badge active" title="Running. Board link: ' + esc(verdict) + '.'
+      + observed + '">working</span>';
+  }
+  return '<span class="status-badge waiting" title="' + esc(verdict) + '.'
+    + observed + '">working</span>';
 }
 
 // Turn the board-drive trace into the smallest useful operator explanation.
@@ -3604,8 +3663,10 @@ function render() {
         ? '<div class="empty">Can\u2019t reach the server \u2014 ' + consecutiveFailures +
           ' failed attempt' + (consecutiveFailures === 1 ? '' : 's') + '.<br>' +
           '<span style="color:var(--dim);font-size:0.85rem;">This is a connection problem, not an ' +
-          'empty workspace. Workers may exist and be unreachable.</span></div>'
-        : '<div class="empty"><span class="loading-spinner"></span>Connecting to server…</div>';
+          'empty workspace. Workers may exist and be unreachable.</span><br>' +
+          '<a href="/api/_clear_sw" style="color:var(--accent);font-size:0.8rem;">Clear cache &amp; reload</a></div>'
+        : '<div class="empty"><span class="loading-spinner"></span>Connecting to server…<br>' +
+          '<a href="/api/_clear_sw" style="color:var(--dim);font-size:0.75rem;margin-top:8px;display:inline-block;">Stuck? Clear cache</a></div>';
     } else {
       el.innerHTML = '<div class="empty">No workers yet.<br>Tap <strong>+</strong> to create one.' +
         (!online ? '<br><span style="color:var(--yellow)">You\'re offline — workers created now will sync when connected.</span>' : '') + '</div>';
@@ -3670,15 +3731,14 @@ function render() {
     const model = sessionConfiguredModel(s);
     const effort = provider === 'claude' ? flagValue(flags, '--effort') : '';
     const pLabel = providerLabel(provider);
-    const liveBoardTask = _cardDoingItem(s.name);
-    // A board transition and the next sessions poll are not atomic. Render the
-    // SSE-synced doing card immediately, then naturally converge on the server
-    // fields on the next poll. This also repairs old/stale task summaries while
-    // the board has a stronger, current fact.
-    const displayTaskName = liveBoardTask ? (liveBoardTask.title || liveBoardTask.id) : (s.task_name || '');
-    const displayTaskSource = liveBoardTask ? 'board' : s.task_source;
-    const displayTaskBoardId = liveBoardTask ? liveBoardTask.id : s.task_board_id;
-    const taskStale = liveBoardTask ? 0 : _taskStaleAge(s);
+    const runtimeBoard = _runtimeBoardPresentation(s);
+    // The measured object and the task text were serialized together by the
+    // server. Do not let a faster/slower board poll replace either side with a
+    // different snapshot; it is presentation-only evidence for the board view.
+    const displayTaskName = s.task_name || runtimeBoard.cardId || '';
+    const displayTaskSource = runtimeBoard.cardId ? 'board' : s.task_source;
+    const displayTaskBoardId = runtimeBoard.cardId;
+    const taskStale = runtimeBoard.cardId ? 0 : _taskStaleAge(s);
     const offCached = !!(_peekIndex && _peekIndex[s.name]);
     const taskDim = taskStale && displayTaskSource === 'board';   // stale board title shown as last resort
     // AF-148: a lane with no active card falls back to its static DESCRIPTION,
@@ -3696,7 +3756,7 @@ function render() {
     // Same discriminator the stale case already uses, applied to the case it
     // skipped. Not a mood, not a guess: the field was in the payload the whole
     // time and one consumer read it for one branch.
-    const taskIsDesc = displayTaskSource === 'desc' && !!displayTaskName;
+    const taskIsDesc = !runtimeBoard.cardless && displayTaskSource === 'desc' && !!displayTaskName;
     return `
     <div class="card ${isExp ? 'expanded' : ''}" data-session="${esc(s.name)}" onclick="event.stopPropagation();toggle('${s.name}')">
       <div class="card-header" onclick="headerTap('${s.name}', event)" onmousedown="tileMouseDown(event,'${s.name}')">
@@ -3715,7 +3775,8 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
               that hits the banner never fires Stop and the active latch keeps
               claiming work). The payload now only reports FUTURE limits, so when
               rate_limited_until is set it is the true state and it supersedes
-              the status badge outright (AMUX-2566). */ ''}          ${s.rate_limited_until ? '' : `${s.status === 'rate_limited' ? '<span class="status-badge rate-limited" title="Hit a usage limit (on credits or waiting for reset)">rate limited</span>' : ''}${s.status === 'active' ? '<span class="status-badge active">working</span>' + _agentsChip(s) : ''}
+              the status badge outright (AMUX-2566). */ ''}          ${s.rate_limited_until ? '' : `${s.status === 'rate_limited' ? '<span class="status-badge rate-limited" title="Hit a usage limit (on credits or waiting for reset)">rate limited</span>' : ''}${s.status === 'active' ? (runtimeBoard.syncing ? _runtimeBoardSyncBadge() : '<span class="status-badge active">working</span>' + _agentsChip(s) + (runtimeBoard.cardless ? _runtimeBoardCardlessBadge() : '')) : ''}
+          ${s.status === 'unattributed' ? _runtimeBoardSplitBadge(s) : ''}
           ${s.status === 'waiting' ? `<span class="status-badge waiting"${_waitingTitle(s)}>${_waitingLabel(s)}</span>${_stalledFor(s)}` : ''}
           ${s.status === 'idle' ? '<span class="status-badge idle">idle</span>' : ''}`}
           ${s.rate_limited_until ? `<span class="status-badge rate-limited" title="${s.rate_limit_weekly ? 'Weekly limit' : 'Rate-limited'} — auto-resume at ${_fmtResetTime(s.rate_limited_until)}">${s.rate_limit_weekly ? 'Weekly limit until' : 'Rate-limited until'} ${_fmtResetTime(s.rate_limited_until)}</span>` : ''}
@@ -5985,10 +6046,6 @@ async function toggleIsolated(session) {
 
 async function clearScrollback(session) {
   closeAllMenus();
-  await apiCall(API + '/api/sessions/' + session + '/keys', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ keys: '' })
-  });
   await apiCall(API + '/api/sessions/' + session + '/clear', { method: 'POST' });
 }
 
@@ -9052,7 +9109,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.831';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.841';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -10903,33 +10960,39 @@ function applyPeekSearch(keepIndex, doScroll) {
   // Search the rendered text, not serialized HTML. Entities and ANSI/link
   // spans must not turn one visible phrase into missing or duplicate matches.
   body.innerHTML = lastPeekHTML;
-  const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
-  const nodes = [];
-  let text = '', node;
-  while ((node = walker.nextNode())) {
-    nodes.push({node, start:text.length, end:text.length + node.data.length});
-    text += node.data;
-  }
-  const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const ranges = [...text.matchAll(new RegExp(escaped, 'gi'))].map(m => ({start:m.index,end:m.index + m[0].length}));
+  _peekReclassifyPrompts();
+  const roots = _peekMsgNavKind === 'all' ? [body]
+    : [...body.querySelectorAll('.peek-prompt')].filter(el => el.dataset.msgKind === _peekMsgNavKind);
   _peekMatches = [];
-  let firstRange = 0;
-  for (const entry of nodes) {
-    while (firstRange < ranges.length && ranges[firstRange].end <= entry.start) firstRange++;
-    if (firstRange >= ranges.length || ranges[firstRange].start >= entry.end) continue;
-    const fragment = document.createDocumentFragment();
-    let offset = 0;
-    for (let i = firstRange; i < ranges.length && ranges[i].start < entry.end; i++) {
-      const start = Math.max(0, ranges[i].start - entry.start), end = Math.min(entry.node.length, ranges[i].end - entry.start);
-      fragment.append(document.createTextNode(entry.node.data.slice(offset, start)));
-      const mark = document.createElement('span');
-      mark.className = 'peek-highlight'; mark.dataset.idx = String(i);
-      mark.textContent = entry.node.data.slice(start, end); fragment.append(mark);
-      if (!_peekMatches[i]) _peekMatches[i] = mark;
-      offset = end;
+  for (const root of roots) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    let text = '', node;
+    while ((node = walker.nextNode())) {
+      nodes.push({node, start:text.length, end:text.length + node.data.length});
+      text += node.data;
     }
-    fragment.append(document.createTextNode(entry.node.data.slice(offset)));
-    entry.node.replaceWith(fragment);
+    const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const ranges = [...text.matchAll(new RegExp(escaped, 'gi'))].map(m => ({start:m.index,end:m.index + m[0].length}));
+    const matchBase = _peekMatches.length;
+    let firstRange = 0;
+    for (const entry of nodes) {
+      while (firstRange < ranges.length && ranges[firstRange].end <= entry.start) firstRange++;
+      if (firstRange >= ranges.length || ranges[firstRange].start >= entry.end) continue;
+      const fragment = document.createDocumentFragment();
+      let offset = 0;
+      for (let i = firstRange; i < ranges.length && ranges[i].start < entry.end; i++) {
+        const start = Math.max(0, ranges[i].start - entry.start), end = Math.min(entry.node.length, ranges[i].end - entry.start);
+        fragment.append(document.createTextNode(entry.node.data.slice(offset, start)));
+        const mark = document.createElement('span');
+        mark.className = 'peek-highlight'; mark.dataset.idx = String(matchBase + i);
+        mark.textContent = entry.node.data.slice(start, end); fragment.append(mark);
+        if (!_peekMatches[matchBase + i]) _peekMatches[matchBase + i] = mark;
+        offset = end;
+      }
+      fragment.append(document.createTextNode(entry.node.data.slice(offset)));
+      entry.node.replaceWith(fragment);
+    }
   }
   _peekReclassifyPrompts();
   if (!keepIndex || peekSearchIndex >= _peekMatches.length) peekSearchIndex = 0;
@@ -11038,8 +11101,8 @@ function _peekMsgPrompts() {
 }
 function _peekMsgCount(prompts) {
   const searching = !!peekSearchQuery.trim();
-  const label = searching ? 'Matches' : _peekMsgNavKind === 'all' ? 'All'
-    : (_MSG_KIND[_peekMsgNavKind] || _MSG_KIND.unknown).label;
+  const selectedKind = _peekMsgNavKind === 'all' ? 'All' : (_MSG_KIND[_peekMsgNavKind] || _MSG_KIND.unknown).label;
+  const label = searching ? selectedKind + ' matches' : selectedKind;
   const count = document.getElementById('peek-msg-count');
   if (count) {
     const selected = prompts.findIndex(p => p.classList.contains(searching ? 'current' : 'peek-msg-current'));
@@ -11048,7 +11111,7 @@ function _peekMsgCount(prompts) {
     count.setAttribute('aria-label', label + ': ' + value + ' in loaded output');
   }
   const select = document.getElementById('peek-msg-kind');
-  if (select) { select.value = searching ? 'matches' : _peekMsgNavKind; select.disabled = searching; }
+  if (select) { select.value = _peekMsgNavKind; select.disabled = false; }
   document.getElementById('peek-nav-label').textContent = searching ? 'Find' : 'Messages';
   for (const btn of document.querySelectorAll('#peek-msg-nav .peek-nav-btn')) {
     // Zero loaded matches still permits loading earlier output. It is not a
@@ -11129,10 +11192,12 @@ function _peekNavBeacon(verdict, prompts, target) {
   const body = document.getElementById('peek-body');
   const geometry = target && _peekJumpGeometry(target);
   const searching = !!peekSearchQuery.trim();
+  if (searching && target && _peekMsgNavKind !== 'all'
+      && target.closest('.peek-prompt')?.dataset.msgKind !== _peekMsgNavKind) verdict = 'filter-mismatch';
   try {
     fetch(API + '/api/client-debug', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ kind: 'peek-message-nav', verdict, session: peekSession, ver: APP_VER,
-        measured: true, n_considered: prompts.length, filter: searching ? 'matches' : _peekMsgNavKind,
+        measured: true, n_considered: prompts.length, filter: _peekMsgNavKind,
         mode: searching ? 'search' : 'messages',
         index: searching ? peekSearchIndex : _peekMsgIndex, target_kind: target?.closest('.peek-prompt')?.dataset.msgKind || null,
         target_visible: !!geometry && geometry.visible,
@@ -11200,7 +11265,8 @@ function _peekMsgNavSelect(kind) {
   _peekMsgNavKind = kind;
   _peekMsgIndex = -1;
   document.querySelectorAll('#peek-body .peek-msg-current').forEach(p => p.classList.remove('peek-msg-current'));
-  _peekReclassifyPrompts();
+  if (peekSearchQuery.trim()) applyPeekSearch(false, true);
+  else _peekReclassifyPrompts();
 }
 
 // ── Peek command bar ──
@@ -14535,6 +14601,17 @@ function _linkifyUrls(safeHtml) {
     });
   } catch (e) { return safeHtml; }
 }
+function _msgOpenCard(cardId) {
+  const id = String(cardId || '').trim();
+  if (!id) {
+    _bdAudit('message-card-nav', { verdict: 'refused-empty', measured: true, n_considered: 0 });
+    return;
+  }
+  _bdAudit('message-card-nav', { verdict: 'opened', card_id: id, measured: true, n_considered: 1 });
+  switchView('board');
+  setTimeout(() => openBoardDetail(id), 250);
+}
+
 function _msgCardChip(cardId, message) {
   if (!cardId) return '';
   const live = (typeof boardItems !== 'undefined' && Array.isArray(boardItems))
@@ -14562,12 +14639,13 @@ function _msgCardChip(cardId, message) {
     : st;
   const undec = c && ((c.log || '').indexOf('capture: worker prompt') !== -1) && st === 'todo';
   const lastCommit = c ? (((c.log || '').match(/commit ([0-9a-f]{7,12}) \u2014 [^\n]*/g) || []).pop() || '') : '';
-  return '<span class="msg-card-chip" onclick="event.stopPropagation();switchView(\'board\');setTimeout(() => openBoardDetail(\'' + escJs(cardId) + '\'), 250);" '
+  return '<button type="button" class="msg-card-chip" onclick="event.stopPropagation();_msgOpenCard(\'' + escJs(cardId) + '\');" '
+    + 'aria-label="Open task ' + esc(cardId) + (displaySt ? ', ' + esc(displaySt) : '') + '" '
     + 'title="' + esc(c ? (c.title || '') : 'card no longer on the board') + (lastCommit ? '\n' + esc(lastCommit) : '') + '" '
-    + 'style="cursor:pointer;font-size:0.68rem;border:1px solid ' + (c ? stC(st) : 'var(--border)') + ';border-radius:6px;padding:1px 7px;white-space:nowrap;'
+    + 'style="border-color:' + (c ? stC(st) : 'var(--border)') + ';'
     + 'color:' + (c ? stC(st) : 'var(--dim)') + ';">\u2192 ' + esc(cardId)
     + (c ? ' \u00B7 ' + esc(undec ? 'captured, not yet decomposed' : displaySt) : ' \u00B7 gone')
-    + (lastCommit ? ' \u00B7 \u2318' : '') + '</span>';
+    + (lastCommit ? ' \u00B7 \u2318' : '') + '</button>';
 }
 
 // Canonical message row. THREE surfaces fetch /api/history and each kept its own
@@ -17470,6 +17548,27 @@ async function _autoCacheDirFiles(path, entries) {
     } catch(_) { break; }   // offline / error — stop quietly
   }
 }
+let _filesToolbarFault = '';
+function _filesToolbarCheck() {
+  requestAnimationFrame(() => {
+    const toolbar = document.querySelector('#files-view > .fe-toolbar');
+    const menu = document.getElementById('files-overflow-btn');
+    if (!toolbar?.getClientRects().length || !menu) return;
+    const bounds = toolbar.getBoundingClientRect(), more = menu.getBoundingClientRect();
+    const first = [...toolbar.querySelectorAll('button')].find(el => el.getClientRects().length);
+    const wrapped = first && Math.abs(first.getBoundingClientRect().top - more.top) > 4;
+    const overflow = more.right > bounds.right + 1 || toolbar.scrollWidth > toolbar.clientWidth + 1;
+    const fault = wrapped || overflow ? [innerWidth, wrapped, overflow].join(':') : '';
+    if (fault && fault !== _filesToolbarFault) {
+      fetch(API + '/api/client-debug', {method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({kind:'files-toolbar-layout',verdict:'wrapped-or-overflowing',
+          measured:true,n_considered:toolbar.querySelectorAll('button').length,
+          viewport:innerWidth,wrapped,overflow,ver:APP_VER})}).catch(() => {});
+    }
+    _filesToolbarFault = fault;
+  });
+}
+window.addEventListener('resize', _filesToolbarCheck);
 async function loadFiles(path) {
   const body = document.getElementById('files-body');
   body.innerHTML = '<div style="padding:16px;color:var(--dim)">Loading...</div>';
@@ -17490,6 +17589,7 @@ async function loadFiles(path) {
     crumbHtml += '<span class="fe-crumb-sep">›</span><span class="fe-crumb" onclick="loadFiles(\'' + cp.replace(/'/g, "\\'") + '\')">' + esc(part) + '</span>';
   }
   document.getElementById('files-breadcrumb').innerHTML = crumbHtml;
+  _filesToolbarCheck();
   try {
     const r = await fetch(API + '/api/ls?path=' + encodeURIComponent(path) + (_filesShowHidden ? '&hidden=1' : ''));
     const data = await r.json();
@@ -21442,6 +21542,7 @@ function _fmtRelTime(ts) {
 // ═══════ BOARD ═══════
 let activeView = 'sessions';
 let boardItems = [];
+let _boardSnapshotEpoch = 0;
 // The exact set the last renderBoard() painted, after every filter. Export uses
 // it so "export" always means "what I am looking at". See renderBoard().
 let _boardLastVisible = [];
@@ -24349,6 +24450,7 @@ async function fetchBoard() {
   // Saved views sync via /api/prefs so a view made on the desktop is on the
   // phone. Fetched once, not on every board poll.
   if (!_boardViewsLoaded) { _boardViewsLoaded = true; await _boardViewsLoad(); }
+  const snapshotEpoch = _boardSnapshotEpoch;
   try {
     const boardHeaders = {};
     if (_boardEtag) boardHeaders['If-None-Match'] = _boardEtag;
@@ -24411,6 +24513,10 @@ async function fetchBoard() {
       console.warn('board fetch returned non-array (status ' + r.status + ') — keeping previous set');
       return;
     }
+    if (snapshotEpoch !== _boardSnapshotEpoch) {
+      console.info('board poll completed behind a newer stream snapshot; discarded');
+      return;
+    }
     const j = JSON.stringify(data);
     const itemsChanged = j !== lastBoardJSON;
     if (itemsChanged || statusesChanged) {
@@ -24439,6 +24545,7 @@ async function fetchBoard() {
       } else {
         boardItems = _mergeArchived(data);
       }
+      _boardSnapshotEpoch++;
       _cacheBoardJSON(j);
       renderBoard();
       _nudgeWorkersOnBoardChange();
@@ -27244,11 +27351,44 @@ function _bdConfigureGo(item) {
   };
 }
 
+function _bdAudit(kind, detail) {
+  try {
+    fetch(API + '/api/client-debug', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({ kind, ver: APP_VER }, detail || {})),
+    }).catch(() => {});
+  } catch (e) {}
+}
+
+const _bdArtifactAuditSeen = new Set();
+function _bdArtifactHref(target) {
+  try {
+    const parsed = new URL(String(target), window.location.href);
+    const loopback = parsed.hostname === 'localhost'
+      || parsed.hostname === '127.0.0.1'
+      || parsed.hostname === '[::1]';
+    if (loopback && parsed.port === '8824') {
+      const normalized = window.location.origin + parsed.pathname + parsed.search + parsed.hash;
+      if (!_bdArtifactAuditSeen.has(target)) {
+        _bdArtifactAuditSeen.add(target);
+        _bdAudit('artifact-link-normalized', {
+          verdict: 'same-server-origin-rewritten', measured: true, n_considered: 1,
+          original: String(target), normalized,
+        });
+      }
+      return normalized;
+    }
+  } catch (e) {}
+  return String(target);
+}
+
 function _bdArtifactRef(a) {
   const ref = String((a && a.ref) || '');
   const target = String((a && a.resolved_ref) || ref);
   if (/^https?:\/\//i.test(target)) {
-    return '<a href="' + esc(target) + '" target="_blank" rel="noopener noreferrer">' + esc(ref) + '</a>';
+    const href = _bdArtifactHref(target);
+    return '<a href="' + esc(href) + '" data-original-ref="' + esc(ref)
+      + '" target="_blank" rel="noopener noreferrer">' + esc(href === target ? ref : href) + '</a>';
   }
   const refPath = ref.replace(/#.*$/, '');
   const targetPath = target.replace(/#.*$/, '');
@@ -27402,9 +27542,11 @@ function _bdRenderMeta(item) {
       const key = String((a && a.ref) || '');
       if (key && !artifactSeen.has(key)) { artifactSeen.add(key); artifacts.push(a); }
     });
-  if (artifacts.length) {
-    html += '<section class="bd-card-section"><h4>Produced assets (' + artifacts.length + ')</h4>'
-      + artifacts.map(a => {
+  const retiredArtifacts = artifacts.filter(a => ['invalid', 'superseded'].includes(String((a && a.state) || '')));
+  const producedArtifacts = artifacts.filter(a => !['invalid', 'superseded'].includes(String((a && a.state) || '')));
+  if (producedArtifacts.length) {
+    html += '<section class="bd-card-section"><h4>Produced assets (' + producedArtifacts.length + ')</h4>'
+      + producedArtifacts.map(a => {
         const availability = a && a.availability || {};
         const availabilityText = availability.state === 'missing' ? ' · missing'
           : availability.state === 'available' ? ' · available'
@@ -27416,6 +27558,15 @@ function _bdRenderMeta(item) {
         + (a.description ? '<div style="color:var(--dim)">' + esc(a.description) + '</div>' : '') + '</div>';
       }).join('');
     html += '</section>';
+  }
+  if (retiredArtifacts.length) {
+    html += '<section class="bd-card-section bd-retired-artifacts"><h4>Retired artifacts ('
+      + retiredArtifacts.length + ')</h4>'
+      + retiredArtifacts.map(a => '<div class="board-detail-meta-row"><code>'
+        + esc(String((a && a.ref) || '')) + '</code> <span style="color:var(--dim)">· '
+        + esc(String((a && a.state) || 'retired')) + '</span>'
+        + (a && a.description ? '<div style="color:var(--dim)">' + esc(a.description) + '</div>' : '')
+        + '</div>').join('') + '</section>';
   }
 
   const activity = _bdWorkerActivity(item);
@@ -29949,6 +30100,7 @@ function connectSSE() {
           // list. The class test now forbids any bare `workers =` assignment in
           // client code.
           sessions = msg.payload;
+          _sessionsSnapshotEpoch++;
           // Quota-full store: drop the cache rather than let the throw break SSE handling
           try { localStorage.setItem('amux_sessions_cache', j); }
           catch (e2) { try { localStorage.removeItem('amux_sessions_cache'); } catch (e3) {} }
@@ -29981,6 +30133,7 @@ function connectSSE() {
           // archived cards were lazily loaded, or an SSE push would wipe them
           // out from under an is:archived query.
           boardItems = _mergeArchived(msg.payload);
+          _boardSnapshotEpoch++;
           _cacheBoardJSON(j);
           // Mirror to IDB for full offline durability (iOS-safe)
           _idb.applyIssueDelta(msg.payload);

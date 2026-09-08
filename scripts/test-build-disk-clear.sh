@@ -18,6 +18,9 @@ cd "$(dirname "$0")/.."
 SCRIPT="$(pwd)/scripts/rust-auto-build.sh"
 PASS=0; FAIL=0
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+# Cleanup diagnostics cannot depend on a running server or an inherited fleet
+# endpoint. This also reproduces CI, where no deployment-permit server exists.
+export AMUX_URL=http://127.0.0.1:1
 
 # The script redirects its whole build block to $LOG, so stdout is empty by
 # design — read the log it actually writes. AMUX_RS_BUILD_LOG is the existing
@@ -50,8 +53,8 @@ bad()  { FAIL=$((FAIL+1)); echo "FAIL: $1"; echo "  got: ${2:-<empty>}"; }
 # --- (a) both caches present: the IDLE one must be named FIRST -------------
 H="$TMP/both"; mkdir -p "$H/.amux/rust-build-target" "$H/.amux/rust-build-target-e2e-head"
 out=$(run "$H")
-idle_line=$(printf '%s\n' "$out" | grep -n "idle e2e target dir" | head -1 | cut -d: -f1)
-shared_line=$(printf '%s\n' "$out" | grep -n "SHARED target dir" | head -1 | cut -d: -f1)
+idle_line=$(printf '%s\n' "$out" | grep -n "idle e2e target dir" | head -1 | cut -d: -f1 || true)
+shared_line=$(printf '%s\n' "$out" | grep -n "SHARED target dir" | head -1 | cut -d: -f1 || true)
 if [ -n "$idle_line" ] && [ -n "$shared_line" ] && [ "$idle_line" -lt "$shared_line" ]; then ok
 else bad "(a) the idle e2e cache must be cleared BEFORE the shared one" "$out"; fi
 
@@ -297,7 +300,20 @@ else bad "(l) the override must SAY it overrode a peer, not clear silently" "$ou
 # case it always was semantically, without changing what the `if` reads.
 #
 # The shipped detector consumes the output too, so it is unaffected either way.
-_real_builds="$( { pgrep -x rustc; pgrep -x cargo; } 2>/dev/null | tr -d '[:space:]' || true )"
+# `|| true` on EACH pgrep, because the STATUS IS IGNORED here: the decision below
+# reads the OUTPUT ($_real_builds being empty or not), never the exit code. On an
+# IDLE host both pgreps exit 1, `pipefail` propagates that through the
+# substitution, and `set -euo pipefail` then aborts the whole harness BEFORE it
+# prints anything. That is what turned CI red from 39ac1877 to 55920e07: it could
+# not reproduce on this box, where a builder keeps a cargo process alive so the
+# pgrep matches and the status is 0. Green here, red on any idle runner.
+#
+# MERGE NOTE: amux-frustrations and the 1133c2f2 author fixed this independently
+# within the hour, mine as `)" || true` on the assignment and theirs per-command.
+# Both work; theirs is kept because it leaves the assignment's own status
+# meaningful instead of blanketing it, and this comment is kept because it
+# carries the measured cause.
+_real_builds="$( { pgrep -x rustc || true; pgrep -x cargo || true; } 2>/dev/null | tr -d '[:space:]')"
 if [ -n "$_real_builds" ]; then
   echo "SKIP (m): a real cargo/rustc is running on this host, so the no-peer"
   echo "         precondition cannot be established. Not counted as a pass."
@@ -323,6 +339,20 @@ else
   if printf '%s\n' "$out9" | grep -q "DEFERRED"; then
     bad "(m) a command line that merely MENTIONS cargo must not read as a build" "$out9"
   else ok; fi
+fi
+
+# (n) THE IDLE-HOST CELL, and it must not depend on whether this host is idle.
+# Every cell above that could catch the abort is inside the `else` branch that
+# only runs when nothing is building, so on a machine with a live builder the
+# whole population is unreachable and the suite reports PASS. This cell runs the
+# same construct with names that can never match, under the same shell options,
+# so it reproduces the idle-runner condition on any host.
+if out_n=$(bash -c 'set -euo pipefail
+x="$( { pgrep -x amux_no_such_rustc; pgrep -x amux_no_such_cargo; } 2>/dev/null | tr -d "[:space:]")" || true
+printf "REACHED[%s]" "$x"' 2>/dev/null) && [ "$out_n" = "REACHED[]" ]; then
+  ok
+else
+  bad "(n) the no-match probe must REACH its decision under set -euo pipefail" "$out_n"
 fi
 
 echo

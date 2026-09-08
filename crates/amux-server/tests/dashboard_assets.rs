@@ -319,12 +319,19 @@ fn message_card_links_survive_the_capped_board_working_set() {
         "message.card_archived",
         "message.card_deleted",
         "const c = live ||",
+        "<button type=\"button\" class=\"msg-card-chip\"",
     ] {
         assert!(
             body.contains(needle),
             "message card chip lost authoritative history metadata `{needle}`"
         );
     }
+    assert!(
+        app.contains("function _msgOpenCard(cardId)")
+            && app.contains("_bdAudit('message-card-nav'")
+            && body.contains("_msgOpenCard("),
+        "message-card controls must use the shared navigation helper and emit a durable client-debug verdict"
+    );
     assert!(
         app.contains("_msgCardChip(typeof e === 'string' ? '' : (e.card_id || ''), e)"),
         "the shared history row must pass its authoritative card metadata to the chip"
@@ -337,6 +344,10 @@ fn message_card_links_survive_the_capped_board_working_set() {
         app.contains("async function openBoardDetail(id)")
             && app.contains("await apiCall(API + '/api/board/' + encodeURIComponent(id))"),
         "clicking a message's older/terminal task must hydrate it even when the capped board list omitted it"
+    );
+    assert!(
+        !body.contains("<span class=\"msg-card-chip\""),
+        "the message-to-card relation must be a semantic keyboard-accessible control, not a click-handled span"
     );
 }
 
@@ -445,15 +456,18 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
     let app = asset("app.js");
     let index = asset("index.html");
     let helper_start = app
-        .find("function _cardDoingItem(name)")
-        .expect("dashboard must derive the live doing card from SSE-synced board data");
+        .find("function _runtimeBoardCardId(s)")
+        .expect("dashboard must derive the live doing card from the server's measured runtime truth");
     let helper_tail = &app[helper_start..];
     let helper_end = helper_tail
         .find("function _nudgeWorkersOnBoardChange()")
         .expect("live-card helper must precede board-change invalidation");
     let helper = &helper_tail[..helper_end];
     for needle in [
-        "session.task_board_id",
+        "function _runtimeBoardCardId(s)",
+        "truth.measured !== true",
+        "truth.status !== 'linked'",
+        "truth.card_id",
         "c.id === claimed",
         "c.session === name",
         "c.status === 'doing'",
@@ -467,13 +481,18 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
         .expect("session-card renderer must exist");
     let render = &app[render_start..render_start + 16_000.min(app.len() - render_start)];
     for needle in [
-        "const liveBoardTask = _cardDoingItem(s.name)",
-        "liveBoardTask ? (liveBoardTask.title || liveBoardTask.id)",
-        "liveBoardTask ? liveBoardTask.id : s.task_board_id",
+        "const runtimeBoard = _runtimeBoardPresentation(s);",
+        "runtimeBoard.cardId",
+        "const displayTaskName = s.task_name || runtimeBoard.cardId || '';",
+        "runtimeBoard.syncing ? _runtimeBoardSyncBadge()",
         "_taskIdChip({task_board_id: displayTaskBoardId})",
     ] {
         assert!(render.contains(needle), "session card lost live board linkage `{needle}`");
     }
+    assert!(
+        !render.contains("_cardDoingItem(s.name)"),
+        "the worker card must not rebuild runtime truth from an independently refreshed boardItems snapshot"
+    );
     assert!(
         app.contains("board-card-live-label\"><span class=\"board-live-dot\"></span>Working now"),
         "a live board card needs an explicit visible label, not only a border or tooltip"
@@ -482,6 +501,37 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
         app.contains("const _liveNow = !!(_liveCard && _liveCard.id === item.id)"),
         "only the explicitly claimed card may say Working now"
     );
+    for needle in [
+        "function _runtimeBoardSplitBadge(s)",
+        "s.status !== 'unattributed'",
+        "active-conflicting-claims",
+        ">card conflict</span>",
+        ">card syncing</span>",
+        "truth.verdict",
+    ] {
+        assert!(app.contains(needle), "unattributed runtime lost its server-verdict treatment `{needle}`");
+    }
+    assert!(
+        app.contains("verdict === 'active-conflicting-claims'")
+            && app.contains("status-badge rate-limited")
+            && app.contains("status-badge waiting"),
+        "only competing live claims should receive the red conflict treatment"
+    );
+    assert!(
+        !app.contains(">runtime/board split</span>"),
+        "a recoverable task-link lag must not be presented as a red runtime failure"
+    );
+    for needle in [
+        "let _sessionsSnapshotEpoch = 0",
+        "snapshotEpoch !== _sessionsSnapshotEpoch",
+        "let _boardSnapshotEpoch = 0",
+        "snapshotEpoch !== _boardSnapshotEpoch",
+        "function _runtimeBoardPresentation(s)",
+        "Number(truth.card_count) !== 1",
+        "_runtimeBoardSyncBadge()",
+    ] {
+        assert!(app.contains(needle), "a stale poll may again publish a false WORKING/no-card combination without `{needle}`");
+    }
     for rejected in ["no board task claimed", "board-unclaimed-mount", "_activeWithoutClaim"] {
         assert!(!app.contains(rejected), "runtime activity must not manufacture the board pseudo-state `{rejected}`");
         assert!(!index.contains(rejected), "the removed pseudo-state must not retain a dead mount `{rejected}`");
@@ -734,6 +784,10 @@ fn board_detail_leads_with_actionable_task_context() {
         "item.gate_requirements",
         "item.asset_links",
         "a.resolved_ref",
+        "_bdArtifactHref(",
+        "window.location.origin",
+        "Retired artifacts (",
+        "const retiredArtifacts =",
         "const explicitPath =",
         "const serverResolvedPath =",
         "<button type=\"button\" class=\"file-link board-artifact-file\"",
@@ -896,4 +950,60 @@ fn worker_board_opens_current_work_without_expanding_every_idle_lane() {
         !board.contains("const collapsed = _sessionGroupCollapsed[name || '__none__']"),
         "the old undefined-means-every-worker-open default returned"
     );
+}
+
+/// AF-390 fixed `#email-approvals-banner` swallowing clicks on the peek
+/// overlay's fixed-position controls (`.overlay { z-index: 100 }`): an
+/// in-flow global banner with `z-index: 200` painted over it once the banner
+/// grew tall enough (narrow viewport -> its text wraps -> its box reaches
+/// further down the screen). The fix set that ONE banner to `z-index: 90`
+/// and left a comment stating the rule for every future one: "NOTHING IN
+/// NORMAL FLOW MAY OUTRANK THESE TWO... If you add another global strip, put
+/// it under 100 too."
+///
+/// AMUX-126 (2026-09-07): three more global banners violated exactly that
+/// rule — `#no-apikey-banner`, `#org-banner`, `#org-invite-banner` all still
+/// carried `z-index: 200`, inherited from before AF-390 landed and never
+/// updated to match. CI caught the symptom (a real `locator.click` timeout on
+/// mobile/ios-safari in `terminal-message-navigation.spec.ts`, `#no-apikey-
+/// banner` named in the error as the element "intercepting pointer events")
+/// but nothing had checked the RULE itself — a comment stating an invariant
+/// is not a check that can fail (ethos rule 7). This scans every global
+/// banner div for its inline z-index and fails if a new one is ever added (or
+/// an old one edited) above the overlay's own 100.
+#[test]
+fn global_banners_never_outrank_the_peek_overlay() {
+    let html = asset("index.html");
+    // Every id in this list is a banner that renders in NORMAL DOCUMENT FLOW
+    // (not `position: fixed`) at the top of the page, in the same screen band
+    // as `.overlay` (z-index 100) and `#board-detail-overlay` (z-index 150) —
+    // exactly the AF-390 hazard. A banner added under a NEW id needs adding
+    // here too, or this test cannot see it.
+    let banner_ids =
+        ["no-apikey-banner", "org-banner", "org-invite-banner", "email-approvals-banner"];
+    for id in banner_ids {
+        let needle = format!("id=\"{id}\" style=\"");
+        let start = html.find(&needle).unwrap_or_else(|| panic!("banner #{id} not found in index.html — did it move or get renamed?"));
+        let tail = &html[start..];
+        let tag_end = tail.find('>').expect("unterminated div tag");
+        let style_attr = &tail[..tag_end];
+        let zi_key = "z-index:";
+        let zi_start = style_attr
+            .find(zi_key)
+            .unwrap_or_else(|| panic!("banner #{id} has no inline z-index at all — add one under 100, don't rely on the cascade default"))
+            + zi_key.len();
+        let zi_rest = &style_attr[zi_start..];
+        let zi_end = zi_rest.find(';').unwrap_or(zi_rest.len());
+        let z: i32 = zi_rest[..zi_end]
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("banner #{id}'s z-index isn't a plain integer: {e}"));
+        assert!(
+            z < 100,
+            "banner #{id} has z-index:{z} -- AF-390's rule is nothing in normal flow may outrank \
+             the peek overlay (z-index:100); a tall-wrapped banner at {z} will paint over and \
+             swallow clicks on the overlay's own controls exactly like AF-390 did. Use 90, matching \
+             #email-approvals-banner."
+        );
+    }
 }

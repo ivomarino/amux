@@ -75,6 +75,45 @@ def main():
     # Mention, not invocation — the same class the heredoc pins above cover.
     A("add -A mentioned in a commit message", 'git commit -m "never git add -A here" -- f.txt', False)
 
+    # MC-1712 — `\b` AFTER A LITERAL WORD IS SATISFIED BY A HYPHEN, so the
+    # matcher reads `commit-tree` as `commit`. Reported by mixpeek-cicd, who hit
+    # it on the exact pattern CLAUDE.md recommends for this checkout: build a
+    # tree against a temp GIT_INDEX_FILE, then commit-tree, so you never cp into
+    # a worktree other lanes are using. They were told "bare `git commit` would
+    # sweep 47 file(s) of index-vs-HEAD DRIFT" about a command that reads
+    # neither the index nor the worktree and structurally cannot sweep anything.
+    #
+    # The documented escape did not fit either: AMUX_ALLOW_SWEEP_COMMIT=47
+    # asserts an intent to commit 47 files, which was false, so taking it would
+    # have put a wrong claim in the audit trail. They hand-built the commit
+    # object with `git hash-object -t commit -w --stdin` instead.
+    #
+    # Swept the sibling verbs rather than only the reported one: `add` and
+    # `fetch` have real hyphenated forms too.
+    # THE REPRODUCIBLE ONE, and it is not the rule the report named. `--all`
+    # makes it reach the `-a/--all` matcher, which refuses with "commits EVERY
+    # modified tracked file" about a command that reads the object database and
+    # never touches the index. Measured on the unfixed guard: rc=2.
+    # THE PRIMARY CELL: launch-videos' exact command. QUOTING is the variable
+    # that makes it reachable — the scrubber blanks quoted strings, so the tree
+    # operand disappears and _commit_has_pathspec stops exempting it, and the
+    # sweep verdict fires. Measured against HEAD's guard: rc=2 "would sweep",
+    # and rc=0 after. The UNQUOTED spelling never blocked, which is why the
+    # first report was not reproducible from what it recorded.
+    A("quoted commit-tree is not commit", 'git commit-tree "$tree" -p "$BASE" -F msg', False)
+    A("commit-graph --all is not commit --all", "git commit-graph write --all", False)
+    A("commit-tree --all is not commit --all", "git commit-tree $T -p $P --all", False)
+    # The plain forms did NOT block even before the fix, because
+    # _commit_has_pathspec reads their tree/subcommand operand as a pathspec and
+    # exempts them. Pinned so a later change to that helper cannot turn the
+    # accidental exemption into a refusal without saying so.
+    A("commit-tree plain", "git commit-tree $T -p $P", False)
+    A("commit-graph plain", "git commit-graph write --reachable", False)
+    A("fetch-pack is not fetch", "git fetch-pack --all origin", False)
+    A("add--interactive is not add", "git add--interactive --patch", False)
+    # ...and the real verbs must STILL block, or the fix is a hole rather than a fix.
+    A("plain commit -a still blocks", "git commit -a -m x", True)
+
     # quoted mentions (existing behavior, regression pins)
     A("quoted commit-msg mention", 'git commit -m "never git reset --hard again" -- f.txt', False)
     A("echo quoted amend mention", 'echo "recipe: git commit --amend needs a pin"', False)
@@ -834,8 +873,77 @@ def main():
             "AF-507/control: a genuine 40-file commit with NO drift was blocked (rc=%s). "
             "The signal is drift, not size. stderr: %r" % (_rc, _err[:300]))
 
+    # ---- AF-577: `git config` from inside a LINKED WORKTREE writes SHARED ----
+    # A linked worktree has no config of its own unless
+    # extensions.worktreeConfig is enabled, so a bare `git config` there rewrites
+    # the file the main checkout and every sibling worktree read. Through this
+    # channel `core.bare true` killed every work-tree operation for every lane on
+    # the mixpeek checkout for ~30 minutes, and the identity half authored 9
+    # commits as `t <t@t.t>` (mixpeek-general, 132a2b8a).
+    #
+    # SHARED_ROOT IS DELIBERATELY A DIRECTORY THAT IS NOT THIS REPO. A linked
+    # worktree is never inside the checkout it belongs to (ours live in /tmp, per
+    # CLAUDE.md:185), so a check gated on AMUX_SHARED_CHECKOUTS could not fire on
+    # any real target. The first draft sat after that gate and returned 0 for all
+    # cells including `core.bare true`; passing an unrelated shared_root here is
+    # what stops it silently drifting back behind the gate.
+    _wt = tempfile.mkdtemp(prefix="guardwt-")
+    _wt_main = os.path.join(_wt, "main")
+    _wt_linked = os.path.join(_wt, "linked")
+    subprocess.run(["git", "init", "-q", "-b", "main", _wt_main], capture_output=True)
+    git(_wt_main, "config", "user.email", "a@b.c")
+    git(_wt_main, "config", "user.name", "ab")
+    subprocess.run(["git", "-C", _wt_main, "commit", "-q", "--allow-empty", "-m", "init"],
+                   capture_output=True)
+    subprocess.run(["git", "-C", _wt_main, "worktree", "add", "-q", _wt_linked, "-b", "side"],
+                   capture_output=True)
+    _elsewhere = os.path.join(_wt, "not-the-repo")
+    os.makedirs(_elsewhere, exist_ok=True)
+
+    _wtcases = [
+        ("git config user.email t@t.t", _wt_linked, True,
+         "the identity write that authored 9 commits as t@t.t"),
+        ("git config core.bare true", _wt_linked, True,
+         "the write that took a whole fleet down"),
+        ("git config --add remote.o.url u", _wt_linked, True, "--add is a write"),
+        ("git config --unset user.email", _wt_linked, True, "--unset writes the SHARED file"),
+        # The MAIN checkout owns its own config; refusing there would break every
+        # legitimate repo-level setting and is the obvious over-reach.
+        ("git config user.email t@t.t", _wt_main, False,
+         "the main checkout writing its own config is not this defect"),
+        ("git config --global user.email t@t.t", _wt_linked, False, "--global is an exit"),
+        ("git config --worktree core.bare true", _wt_linked, False, "--worktree is an exit"),
+        ("git config --file /tmp/x k v", _wt_linked, False, "--file is an exit"),
+        # READS. `git config user.email` and `git config user.email x` differ only
+        # in operand count and no flag separates them.
+        ("git config user.email", _wt_linked, False, "a bare key is a READ"),
+        ("git config --get user.email", _wt_linked, False, "--get is a READ"),
+        ("git config -l", _wt_linked, False, "-l is a READ"),
+        # Not a repo: the probe cannot run, so it must not produce a verdict.
+        ("git config user.email t@t.t", _elsewhere, False,
+         "no repo -> unmeasured -> must not block (AF-559)"),
+        ("echo hello", _wt_linked, False, "a non-git command is untouched"),
+    ]
+    _wtcfg = len(_wtcases)
+    for _c, _d, _want_block, _why in _wtcases:
+        _rc, _err = run_hook(_c, _d, _elsewhere)
+        _blocked = _rc == 2
+        if _blocked != _want_block:
+            failures.append(
+                "AF-577: %r in %s -> blocked=%s, want %s (%s). stderr: %r"
+                % (_c, "linked" if _d == _wt_linked else os.path.basename(_d),
+                   _blocked, _want_block, _why, _err[:200]))
+    # The refusal must NOT offer --local, which in a linked worktree IS the shared
+    # file. Recommending it would name the defect as its own cure.
+    _rc, _err = run_hook("git config core.bare true", _wt_linked, _elsewhere)
+    _wtcfg += 1
+    if "--local" not in _err or "NOT one of them" not in _err:
+        failures.append(
+            "AF-577: the refusal must explicitly rule OUT --local; got %r" % _err[:300])
+
     total = (len(cases) + len(trio) + len(quad) + len(matrix) + _bodies + 1
-             + len(redir_cases) + _mr101 + _subst + _lockcases + _amendlock + _sweep)
+             + len(redir_cases) + _mr101 + _subst + _lockcases + _amendlock + _sweep
+             + _wtcfg)
     if failures:
         print(f"FAIL {len(failures)}/{total}:")
         for f in failures:

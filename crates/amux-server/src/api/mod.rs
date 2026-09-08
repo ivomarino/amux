@@ -464,6 +464,7 @@ pub fn router(state: AppState) -> Router {
         // a revocable member cookie; the outer identity layer below resolves
         // it before auth and request logging.
         .merge(org::public_routes())
+        .route("/api/_clear_sw", axum::routing::get(static_files::clear_sw_landing))
         .merge(static_files::routes())
         .merge(protected)
         .with_state(state);

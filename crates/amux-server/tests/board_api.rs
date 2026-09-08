@@ -2184,6 +2184,36 @@ async fn done_requires_an_asset_link_and_gate_ack_cannot_fake_it() {
     )
     .await;
     assert_eq!(st, StatusCode::CREATED, "artifact registration failed: {artifact}");
+    let artifact_id = artifact["id"].as_str().unwrap();
+    let (st, _, retired) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}/artifacts/{artifact_id}"),
+        Some(json!({ "state": "invalid" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "retiring the artifact failed: {retired}");
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "done", "evidence": EV, "gate_ack": true })),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::CONFLICT,
+        "a retired artifact must not remain valid gate evidence: {v}"
+    );
+    assert_eq!(v["code"], json!("done_requires_asset_link"));
+    let (st, _, restored) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}/artifacts/{artifact_id}"),
+        Some(json!({ "state": "created" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "restoring the artifact failed: {restored}");
     let (st, _, v) = send(
         &app,
         "PATCH",
@@ -2418,6 +2448,100 @@ async fn lifecycle_todo_doing_review_done_verified_via_state_machine() {
     .await;
     assert_eq!(st, StatusCode::CONFLICT);
     assert!(v["error"].as_str().unwrap().contains("archive it instead"), "{v}");
+}
+
+#[tokio::test]
+async fn owner_doing_transition_records_claim_and_claim_repairs_a_missing_marker() {
+    let (app, store, _dir) = app_with_store();
+
+    let direct = create(
+        &app,
+        json!({
+            "title": "owner starts work directly",
+            "type": "chore",
+            "session": "direct-owner",
+        }),
+    )
+    .await;
+    let direct_id = direct["id"].as_str().unwrap();
+    let (st, _, direct_started) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{direct_id}"),
+        Some(json!({
+            "status": "doing",
+            "gate_ack": true,
+            "next_action": "exercise the direct-start attribution path",
+        })),
+        &[("X-Amux-Session", "direct-owner")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "owner start: {direct_started}");
+    let direct_markers: i64 = store
+        .read()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM session_events WHERE session='direct-owner' \
+             AND type='task.claimed' AND json_extract(data,'$.issue')=?1 \
+             AND source='board-patch'",
+            [direct_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(direct_markers, 1, "`board doing` must carry the same exact claim as `board claim`");
+
+    // A coordinator can move another lane's assigned card to Doing without
+    // claiming that runtime. The owning lane's idempotent `/claim` is the
+    // sanctioned repair and emits exactly one marker for this state entry.
+    let repair = create(
+        &app,
+        json!({
+            "title": "repair an older unmarked doing card",
+            "type": "chore",
+            "session": "repair-owner",
+        }),
+    )
+    .await;
+    let repair_id = repair["id"].as_str().unwrap();
+    let (st, _, moved) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{repair_id}"),
+        Some(json!({
+            "status": "doing",
+            "gate_ack": true,
+            "next_action": "exercise the repair path",
+        })),
+        &[("X-Amux-Session", "coordinator")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "coordinator move: {moved}");
+
+    for expected_repaired in [true, false] {
+        let (st, _, claimed) = send_with(
+            &app,
+            "POST",
+            &format!("/api/board/{repair_id}/claim"),
+            Some(json!({})),
+            &[("X-Amux-Session", "repair-owner")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "repair claim: {claimed}");
+        assert_eq!(claimed["already"], json!(true), "{claimed}");
+        assert_eq!(claimed["attribution_repaired"], json!(expected_repaired), "{claimed}");
+    }
+    let repair_markers: i64 = store
+        .read()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM session_events WHERE session='repair-owner' \
+             AND type='task.claimed' AND json_extract(data,'$.issue')=?1 \
+             AND source='board-claim-repair'",
+            [repair_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(repair_markers, 1, "repeated repair must not inflate task.claimed history");
 }
 
 // ---- PYTHON INTEROP: a live-shaped row survives the Rust API -------------
@@ -4215,6 +4339,67 @@ async fn terminal_transition_records_summary_and_preserves_provenance_for_provid
     }
 }
 
+/// ATE-93 live acceptance: reopening a discarded card must not keep presenting
+/// that old terminal summary as the current run's result. The terminal record
+/// stays in the append-only log, while an explicitly supplied current result
+/// replaces it atomically with the reopening transition.
+#[tokio::test]
+async fn reopening_terminal_card_retires_stale_summary_without_erasing_history() {
+    let (app, _dir) = app();
+    let lane = "reopened-summary-worker";
+    let made = create(
+        &app,
+        json!({
+            "title": "reopened terminal summary",
+            "status": "doing",
+            "type": "chore",
+            "session": lane,
+        }),
+    )
+    .await;
+    let id = made["id"].as_str().unwrap();
+
+    let (st, _, discarded) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({
+            "status": "discarded",
+            "evidence": "none: initial capture classification",
+        })),
+        &[("X-Amux-Worker", lane)],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "discard failed: {discarded}");
+    let (_, _, terminal) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    let old_summary = terminal["last_result"].as_str().unwrap().to_string();
+    assert!(old_summary.starts_with("Final outcome: discarded"), "{terminal}");
+
+    let current_result = "Current reconciliation run has live acceptance in progress.";
+    let (st, _, reopened) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({
+            "status": "todo",
+            "last_result": current_result,
+        })),
+        &[("X-Amux-Worker", lane)],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "reopen failed: {reopened}");
+
+    let (_, _, detail) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(detail["status"], json!("todo"));
+    assert_eq!(detail["last_result"], json!(current_result), "stale Work summary survived: {detail}");
+    let log = detail["log"].as_str().unwrap_or("");
+    assert!(log.contains(&old_summary), "terminal history was erased: {log}");
+    assert!(
+        log.contains("terminal summary retired on reopen"),
+        "reopen did not leave a sweep-visible card marker: {log}"
+    );
+}
+
 /// A refused terminal transition must not manufacture a final summary. This
 /// is the unhappy half of the same four provider-shaped capture inputs.
 #[tokio::test]
@@ -4616,6 +4801,27 @@ async fn artifact_crud_is_exact_and_missing_targets_fail_honestly() {
     .await;
     assert_eq!(st, StatusCode::CREATED, "{made}");
     let aid = made["id"].as_str().unwrap();
+
+    for retired_state in ["invalid", "superseded"] {
+        let (st, _, patched) = send(
+            &app,
+            "PATCH",
+            &format!("/api/board/{a}/artifacts/{aid}"),
+            Some(json!({"state": retired_state})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{retired_state} must be a durable artifact disposition: {patched}");
+        let (_, _, listed) = send(&app, "GET", &format!("/api/board/{a}/artifacts"), None).await;
+        assert_eq!(listed[0]["state"], json!(retired_state));
+    }
+    let (st, _, restored) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{a}/artifacts/{aid}"),
+        Some(json!({"state": "created"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "fixture must restore the active state: {restored}");
 
     let (st, _, wrong_patch) = send(
         &app,

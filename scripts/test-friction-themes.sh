@@ -558,9 +558,114 @@ assert m.concentration([]) is None
 assert m.concentration([("a", None)]) is None
 PY
 then
-  ok "I: one lane on one day is incident-shaped; the same n over five lanes is not"
+  ok "I: one clustered lane is incident-shaped; the same n over five lanes is not"
 else
   bad "I: concentration cannot separate an incident from a class"
+fi
+
+# ---------------------------------------------------------------------------
+# J: the incident verdict must not depend on where MIDNIGHT falls (AF-585)
+#
+# Block I above pins the incident shape, and it passed for three days while the
+# production path could not fire it once. Its timestamps are clustered at `now`,
+# so they land on one calendar date ~99.7% of the day; real evidence comes from
+# a ROLLING 24h window, which always covers two dates. On 2026-09-08 all 11
+# active signals reported distinct_days=2 and incident_shaped=False, including
+# deploy-live at n=39 from ONE lane at 100% — the exact specimen block I cites.
+#
+# Fixed timestamps, deliberately: `now` is what hid this.
+# ---------------------------------------------------------------------------
+if python3 - <<'PY'
+import importlib.util, time
+spec = importlib.util.spec_from_file_location("ft", "scripts/friction_themes.py")
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+
+def at(s):
+    return time.mktime(time.strptime(s, "%Y-%m-%d %H:%M")) * 1000
+
+# ONE incident, five messages, four minutes wide. Placed twice: mid-afternoon,
+# and straddling midnight. The data is identical; only the wall clock differs.
+noon = [("amux-testing-e2e", at("2026-09-08 12:00") - i * 60_000) for i in range(5)]
+midn = [("amux-testing-e2e", at("2026-09-08 00:02") - i * 60_000) for i in range(5)]
+a, b = m.concentration(noon), m.concentration(midn)
+
+assert a["distinct_days"] == 1 and b["distinct_days"] == 2, (a, b)
+assert a["incident_shaped"] is True, a
+assert b["incident_shaped"] is True, b   # <-- False before AF-585
+assert a["sampled_over"] == b["sampled_over"] == 5
+
+# The control still has to hold at the same window: spread lanes over spread
+# days is not an incident however the dates fall.
+DAY = 86400_000
+cls = m.concentration([("lane-%d" % i, at("2026-09-08 12:00") - i * DAY)
+                       for i in range(5)])
+assert cls["incident_shaped"] is False, cls
+
+# THE CITED SPECIMEN, at its real measured shape: deploy-live on 2026-09-08 was
+# n=39 from one lane spanning 21.1h of a 24h window. A "clustered in time"
+# threshold suppresses it from the opposite side to the calendar bug, so pin it
+# directly rather than trusting that a burst test covers it.
+long_run = m.concentration([("amux-testing-e2e",
+                             at("2026-09-08 08:51") - i * (21.1 * 3600_000 / 38))
+                            for i in range(39)])
+assert long_run["distinct_lanes"] == 1, long_run
+assert long_run["evidence_span_hours"] >= 21.0, long_run
+assert long_run["incident_shaped"] is True, long_run
+PY
+then
+  ok "J: the same incident reads incident-shaped at noon and across midnight"
+else
+  bad "J: incident_shaped is decided by the calendar date, not by the data"
+fi
+
+# ---------------------------------------------------------------------------
+# K: one message to many lanes is not many lanes hitting one friction (AF-585)
+#
+# The mirror of J and the more dangerous half, because every other number makes
+# a broadcast look MORE like a theme: maximum distinct_lanes, minimum top-lane
+# share. Measured 2026-09-08 in a single 24h window: 41 lanes got one identical
+# message in the minute at 18:09, 28 in another, and "continue" reached 24 and
+# 19. rule-restatement:idle-stall then reported n=83 over 55 lanes with a 31%
+# top-lane share, which is the most theme-shaped concentration a signal can
+# have, and OCCURRENCES increments off exactly that.
+# ---------------------------------------------------------------------------
+if python3 - <<'PY'
+import importlib.util, time
+spec = importlib.util.spec_from_file_location("ft", "scripts/friction_themes.py")
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+t = time.mktime(time.strptime("2026-09-08 12:00", "%Y-%m-%d %H:%M")) * 1000
+DAY = 86400_000
+
+# The real shape: one send, 41 lanes, one minute.
+bc = m.concentration([("lane-%d" % i, t) for i in range(41)])
+assert bc["distinct_lanes"] == 41, bc          # looks maximally broad
+assert bc["top_lane_share"] < 0.03, bc         # and maximally unconcentrated
+assert bc["widest_minute_lanes"] == 41, bc
+assert bc["fanout_share"] == 1.0, bc
+assert bc["broadcast_shaped"] is True, bc
+assert bc["incident_shaped"] is False, bc
+
+# THE CONTROL, and it is the one that matters: a genuine class must NOT be
+# called a broadcast. Forty-one lanes, but each on its own day and its own
+# minute. Without this, returning broadcast_shaped=True unconditionally passes.
+real = m.concentration([("lane-%d" % i, t - i * DAY - i * 60_000)
+                        for i in range(41)])
+assert real["distinct_lanes"] == 41, real
+assert real["widest_minute_lanes"] == 1, real
+assert real["fanout_share"] == 0.0, real
+assert real["broadcast_shaped"] is False, real
+
+# Same n, same lane count, opposite verdicts — the whole point of the block.
+assert bc["sampled_over"] == real["sampled_over"] == 41
+
+# A handful of lanes coinciding in one minute is coincidence, not a broadcast.
+few = m.concentration([("lane-%d" % i, t) for i in range(3)])
+assert few["broadcast_shaped"] is False, few
+PY
+then
+  ok "K: 41 lanes in one minute is a broadcast; 41 lanes over 41 days is a class"
+else
+  bad "K: concentration reports a fan-out as maximal breadth"
 fi
 
 # ---------------------------------------------------------------------------

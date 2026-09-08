@@ -56,3 +56,40 @@ async fn api_health_is_an_alias_and_not_a_second_implementation() {
     let (bogus, _) = get("/api/health-not-a-route").await;
     assert_eq!(bogus, 404, "the alias must be one route, not a prefix catch-all");
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn exhausted_read_pool_keeps_health_identity_and_runtime_responsive() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(amux_server::db::Store::open(&dir.path().join("health.db")).unwrap());
+    let state = AppState {
+        store: store.clone(), started: std::time::Instant::now(), build_hash: "pinned-image".into(),
+        auth_token: None, reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    };
+    let mut held = Vec::new();
+    while let Some(conn) = store.try_read() { held.push(conn); }
+    assert!(!held.is_empty());
+    // Simulate fleet work borrowing every connection. A real OS thread releases
+    // them even if the old synchronous health handler blocks the entire runtime.
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        drop(held);
+    });
+    let started = std::time::Instant::now();
+    let request = amux_server::api::health::health(axum::extract::State(state.clone()));
+    let heartbeat = async {
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        started.elapsed()
+    };
+    let ((status, axum::Json(body)), heartbeat_delay) = tokio::join!(request, heartbeat);
+    let elapsed = started.elapsed();
+    release.join().unwrap();
+    assert!(elapsed < std::time::Duration::from_millis(250), "health waited for fleet work: {elapsed:?}");
+    assert!(heartbeat_delay < std::time::Duration::from_millis(250), "health blocked the runtime: {heartbeat_delay:?}");
+    assert_eq!(status.as_u16(), 503);
+    assert_eq!(body.build, "pinned-image");
+    assert!(!body.board.measured);
+    assert_eq!(body.board.error.as_deref(), Some("read_pool_exhausted"));
+    let (status, axum::Json(body)) = amux_server::api::health::health(axum::extract::State(state)).await;
+    assert_eq!(status.as_u16(), 200);
+    assert!(body.board.measured && body.board.ok);
+}

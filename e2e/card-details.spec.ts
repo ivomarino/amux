@@ -36,12 +36,14 @@ test.describe('board card details', () => {
     const card = (await created.json()).id as string;
 
     for (const artifact of [
-      { kind: 'implementation', ref: '/tmp/amux-card-details/result.md', description: 'created file' },
-      { kind: 'verification', ref: 'https://127.0.0.1:1/amux-card-details', description: 'unreachable verification URL' },
+      { kind: 'implementation', ref: '/tmp/amux-card-details/result.md', description: 'created file', state: 'created' },
+      { kind: 'verification', ref: 'https://127.0.0.1:1/amux-card-details', description: 'unreachable verification URL', state: 'created' },
+      { kind: 'verification', ref: 'https://localhost:8824/api/health', description: 'same amux server', state: 'created' },
+      { kind: 'verification', ref: 'https://example.test/amux/commit/not-real', description: 'superseded guessed commit', state: 'invalid' },
     ]) {
       const response = await request.post(`/api/board/${encodeURIComponent(card)}/artifacts`, {
         headers: auth,
-        data: { ...artifact, state: 'created' },
+        data: artifact,
       });
       expect(response.ok(), `must attach ${artifact.ref}`).toBeTruthy();
     }
@@ -55,10 +57,11 @@ test.describe('board card details', () => {
     await expect(details).toHaveText('Details');
     await expect(page.locator('#bd-tab-lineage')).toHaveCount(0);
     await expect(page.locator('#bd-lineage')).toHaveCount(0);
-    await expect(page.locator('#bd-meta')).toContainText('Produced assets (2)', { timeout: 15_000 });
+    await expect(page.locator('#bd-meta')).toContainText('Produced assets (3)', { timeout: 15_000 });
+    await expect(page.locator('#bd-meta')).toContainText('Retired artifacts (1)');
     await expect(page.locator('#bd-preview')).toContainText('Visible task context from authoritative hydration.');
 
-    const assets = page.locator('#bd-meta .bd-card-section', { hasText: 'Produced assets (2)' });
+    const assets = page.locator('#bd-meta .bd-card-section', { hasText: 'Produced assets (3)' });
     const file = assets.locator('button.file-link', { hasText: '/tmp/amux-card-details/result.md' });
     await expect(file).toHaveCount(1);
     await expect(file).toHaveAttribute('type', 'button');
@@ -69,6 +72,17 @@ test.describe('board card details', () => {
     await expect(url).toHaveAttribute('target', '_blank');
     await expect(url).toHaveAttribute('rel', /noopener/);
     await expect(assets).toContainText('reachability not checked');
+    const origin = await page.evaluate(() => window.location.origin);
+    const sameServer = assets.locator('a[data-original-ref="https://localhost:8824/api/health"]');
+    await expect(sameServer).toHaveAttribute('href', `${origin}/api/health`);
+    await expect(sameServer).toHaveText(`${origin}/api/health`);
+    await expect(assets).not.toContainText('https://localhost:8824');
+    await expect(assets.locator('a, button.file-link')).toHaveCount(3);
+
+    const retired = page.locator('#bd-meta .bd-card-section', { hasText: 'Retired artifacts (1)' });
+    await expect(retired).toContainText('https://example.test/amux/commit/not-real');
+    await expect(retired).toContainText('invalid');
+    await expect(retired.locator('a, button')).toHaveCount(0);
 
     await page.locator('#bd-tab-history').click();
     await expect(page.locator('#bd-tab-history')).toHaveClass(/active/);

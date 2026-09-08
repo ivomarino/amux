@@ -4,6 +4,7 @@ import { test, expect } from './fixtures';
 // that used to cross block boundaries and Codex's different prompt glyph.
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => localStorage.setItem('amux_walkthrough_done', '1'));
+  await page.route(/\/api\/sessions(?:\?.*)?$/, route => route.fulfill({json:[{name:'nav-probe',dir:'/tmp/toolbar-probe',running:true,status:'working'}]}));
   await page.goto('/');
   await page.waitForFunction(() => typeof (window as any).highlightPrompts === 'function');
   await page.evaluate(() => {
@@ -81,8 +82,8 @@ test('search navigation shares real matches and reports an empty filter', async 
   });
   await page.getByRole('button', { name: 'Find in terminal', exact: true }).click();
   await page.getByRole('searchbox', { name: 'Find in terminal', exact: true }).fill('needle');
-  await expect(page.locator('#peek-msg-kind')).toHaveValue('matches');
-  await expect(page.locator('#peek-msg-kind')).toBeDisabled();
+  await expect(page.locator('#peek-msg-kind')).toHaveValue('all');
+  await expect(page.locator('#peek-msg-kind')).toBeEnabled();
   await page.getByRole('button', { name: 'Next message', exact: true }).click();
   await expect(page.locator('#peek-msg-count')).toHaveText('2/2');
   await expect.poll(() => beacons.filter(b => b.verdict === 'landed').length).toBe(1);
@@ -103,6 +104,51 @@ test('search navigation shares real matches and reports an empty filter', async 
   await expect.poll(() => beacons.filter(b => b.verdict === 'no-targets').length).toBe(1);
   await expect(page.locator('#peek-msg-count')).toHaveText('0');
   await expect(page.locator('#toast')).toContainText('This worker has no saved earlier output.');
+});
+
+test('search retains the selected message type and filters matches when it changes', async ({ page }, testInfo) => {
+  await page.evaluate(() => {
+    eval("_peekMsgRows = [{session:'nav-probe',type:'direct',text:'needle from the owner'}, {session:'nav-probe',type:'direct',text:'another needle from the owner'}]");
+    const raw = '› needle from the owner\nAssistant needle output\n❯ [amux-origin:peer] needle from a worker\nAssistant\n› another needle from the owner\nAssistant\n❯ [Scheduled] needle from the scheduler\n';
+    eval('lastPeekHTML = _peekHtml(' + JSON.stringify(raw) + '); _lastLiveHTML=lastPeekHTML; _peekHistoryHTML="";');
+    (window as any).applyPeekSearch(false, false);
+  });
+  await page.locator('#peek-msg-kind').selectOption('human');
+  await page.getByRole('button', { name: 'Find in terminal', exact: true }).click();
+  await page.locator('#peek-search').fill('needle');
+  await expect(page.locator('#peek-msg-kind')).toHaveValue('human');
+  await expect(page.locator('#peek-msg-kind')).toBeEnabled();
+  await expect(page.locator('#peek-msg-count')).toHaveText('1/2');
+  expect(await page.locator('.peek-highlight').evaluateAll(nodes => nodes.map(n => (n.closest('.peek-prompt') as HTMLElement)?.dataset.msgKind))).toEqual(['human', 'human']);
+  await page.getByRole('button', { name: 'Next message', exact: true }).click();
+  await expect(page.locator('#peek-msg-count')).toHaveText('2/2');
+  await page.screenshot({ path: testInfo.outputPath('human-search-filter.png') });
+  await page.locator('#peek-msg-kind').selectOption('session');
+  await expect(page.locator('#peek-search')).toHaveValue('needle');
+  await expect(page.locator('#peek-msg-count')).toHaveText('1/1');
+  await expect(page.locator('.peek-highlight')).toHaveCount(1);
+  expect(await page.locator('.peek-highlight').evaluate(el => (el.closest('.peek-prompt') as HTMLElement)?.dataset.msgKind)).toBe('session');
+  await page.locator('#peek-msg-kind').selectOption('all');
+  await expect(page.locator('#peek-msg-count')).toHaveText('1/5');
+});
+
+test('file actions stay beside the breadcrumb at phone width', async ({ page }, testInfo) => {
+  await page.route('**/api/ls?*', route => route.fulfill({ json: {
+    path: '/Users/example/Vault/Self', entries: [{ name: 'Journal', type: 'dir' }, { name: 'Vision', type: 'dir' }],
+  } }));
+  await page.evaluate(() => (window as any).openExplore('/Users/example/Vault/Self', 'self'));
+  await expect(page.locator('#files-body')).toContainText('Journal');
+  const layout = await page.locator('#files-view > .fe-toolbar').evaluate(el => {
+    const first = el.querySelector('#files-back-session-btn')!.getBoundingClientRect();
+    const more = el.querySelector('#files-overflow-btn')!.getBoundingClientRect();
+    return { delta: Math.abs(first.top - more.top), right: more.right, edge: el.getBoundingClientRect().right, overflow: el.scrollWidth > el.clientWidth + 1 };
+  });
+  expect(layout.delta).toBeLessThan(4);
+  expect(layout.right).toBeLessThanOrEqual(layout.edge);
+  expect(layout.overflow).toBe(false);
+  await page.locator('#files-overflow-btn').click();
+  await expect(page.locator('#files-overflow-menu')).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath('file-toolbar.png') });
 });
 
 test('toolbar has one horizontal row, explicit filters and reachable named actions', async ({ page }) => {

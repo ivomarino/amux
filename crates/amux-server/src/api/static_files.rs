@@ -140,7 +140,15 @@ async fn serve_path(
     match DashboardAssets::get(path) {
         Some(content) => {
             let mime = mime_for(path);
-            ([(header::CONTENT_TYPE, mime)], content.data.into_owned()).into_response()
+            let mut resp =
+                ([(header::CONTENT_TYPE, mime)], content.data.into_owned()).into_response();
+            if path == "sw.js" {
+                resp.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    "no-cache".parse().unwrap(),
+                );
+            }
+            resp
         }
         // SPA fallback: unknown NON-API paths get the shell so client routing
         // works offline-first.
@@ -180,7 +188,12 @@ fn establish_owner_session(state: &AppState) -> Response {
     let cookie = format!(
         "{OWNER_COOKIE}={value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000"
     );
-    let mut response = Redirect::to("/").into_response();
+    // Redirect to /api/_clear_sw, which is outside the SW's intercept scope
+    // (the SW passes through all /api/* paths). That page unregisters the
+    // stale SW, clears caches, then redirects to /. Without this, an old SW
+    // serves a cached HTML shell that predates the cookie and the auth token
+    // is missing (iOS "connecting forever" bug).
+    let mut response = Redirect::to("/api/_clear_sw").into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&cookie).expect("hex owner-session cookie is a valid header"),
@@ -191,6 +204,34 @@ fn establish_owner_session(state: &AppState) -> Response {
         "an explicit owner URL credential was exchanged for an HttpOnly session"
     );
     response
+}
+
+/// Tiny HTML page that unregisters service workers and clears caches,
+/// then redirects to /. Served at /api/_clear_sw so the old SW (which
+/// passes through /api/* paths) cannot intercept it.
+pub async fn clear_sw_landing() -> Response {
+    const PAGE: &str = r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>amux</title></head><body>
+<p style="font-family:system-ui;text-align:center;margin-top:40vh">Refreshing...</p>
+<script>
+(async () => {
+  try {
+    const regs = await navigator.serviceWorker.getRegistrations();
+    await Promise.all(regs.map(r => r.unregister()));
+  } catch(e) {}
+  try {
+    const keys = await caches.keys();
+    await Promise.all(keys.map(k => caches.delete(k)));
+  } catch(e) {}
+  location.replace('/');
+})();
+</script></body></html>"#;
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8"),
+         (header::CACHE_CONTROL, "no-store")],
+        PAGE,
+    ).into_response()
 }
 
 fn serve_shell(
@@ -545,7 +586,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        assert_eq!(response.headers()[header::LOCATION], "/");
+        assert_eq!(response.headers()[header::LOCATION], "/api/_clear_sw");
         let set_cookie = response.headers()[header::SET_COOKIE].to_str().unwrap();
         assert!(set_cookie.contains("HttpOnly") && set_cookie.contains("Secure"), "{set_cookie}");
         assert!(!set_cookie.contains("tok123"), "the raw bearer must not be copied into the cookie");

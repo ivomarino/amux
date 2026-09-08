@@ -119,6 +119,9 @@ const MOUNTED_ANSWERS_BLIND_SPOTS: &[&str] = &[
     "never-called routes are invisible — this reads the request log, not the route table",
     "a route answering 2xx for one input and failing the rest can stay above the threshold at low n",
     "keys on STATUS ONLY: a route returning 200 with an error body passes this check",
+    "a route whose CORRECT answer is a refusal (an authorization gate returning 4xx by \
+     design) has 0% 2xx and is reported here as not answering — read the 4xx/5xx split \
+     in the evidence before calling it broken",
 ];
 
 /// One (method, route-shape) group from the request log. `shape` must come from
@@ -129,6 +132,14 @@ pub struct RouteOutcomeRow {
     pub shape: String,
     pub n: i64,
     pub ok: i64,
+    /// 4xx: the route ANSWERED and refused. Carried separately because "0% 2xx"
+    /// cannot tell a working authorization gate from a dead route, and this
+    /// check reported `POST /api/email/reply 0/12 2xx` as a failure while all
+    /// 12 were 403s from the external-email gate doing exactly its job
+    /// (`external_email_allowed` is false for all 132 sessions, deliberately).
+    pub client_err: i64,
+    /// 5xx: the route FAILED. This is the half that is never correct-by-design.
+    pub server_err: i64,
 }
 
 /// Minimum calls before a shape is judged at all. Named rather than inlined so
@@ -190,10 +201,24 @@ pub fn mounted_routes_answer(
                     "a route in ROUTE_TABLE answers 2xx for more than {}% of its calls",
                     MOUNTED_ANSWERS_MAX_OK_PCT
                 ),
-                format!("{} {} — {}/{} 2xx", r.method, r.shape, r.ok, r.n),
+                // The SPLIT beside the count, not the count alone. A reader
+                // seeing "0/12 2xx" concludes the route is dead; seeing
+                // "0/12 2xx (12 4xx, 0 5xx)" can ask whether refusing is the
+                // job. Naming what should appear BESIDE the answer is the
+                // whole of ethos rule 4.
+                format!(
+                    "{} {} — {}/{} 2xx ({} 4xx, {} 5xx)",
+                    r.method, r.shape, r.ok, r.n, r.client_err, r.server_err
+                ),
             )
             .entity(format!("{} {}", r.method, r.shape))
-            .evidence(ev(serde_json::json!({ "n": r.n, "ok": r.ok }))),
+            .evidence(ev(serde_json::json!({
+                "n": r.n,
+                "ok": r.ok,
+                "client_err_4xx": r.client_err,
+                "server_err_5xx": r.server_err,
+                "refusal_shaped": r.server_err == 0 && r.client_err > 0,
+            }))),
         );
     }
     if failed == 0 {
@@ -637,6 +662,17 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     // migration landed at 04:1x and the check was red by the next sweep, which
     // is the check doing exactly what it exists for.
     ("board_drive_nudge_state", "last_nudge_at", false),
+    // ATE-93 overlap coordination stamps every table from board.rs `now_secs()`
+    // inside the same transaction as the board log/evidence writes. All seven
+    // are therefore seconds; declaring them together keeps callback retries,
+    // member sightings, resolution provenance, and merged refs comparable.
+    ("board_overlap_callbacks", "updated_at", false),
+    ("board_overlap_coordination", "created_at", false),
+    ("board_overlap_coordination", "resolved_at", false),
+    ("board_overlap_coordination", "updated_at", false),
+    ("board_overlap_members", "created_at", false),
+    ("board_overlap_members", "last_seen_at", false),
+    ("board_overlap_refs", "created_at", false),
     ("cmd_history", "delivered_at", true),
     ("cmd_history", "queued_at", true),
     ("cmd_history", "ts", true),
@@ -1306,14 +1342,24 @@ pub fn status_agrees_with_pane(lanes: &[LaneTruth]) -> Vec<InvariantResult> {
         // report IS worth a card). The dominant drop producer, reports fired
         // into a 10s restart window, died with AMUX-3458's exec adoption;
         // this grace covers the residue.
-        if l.pane_says_working && l.status == "idle" && l.report_age_s > 120.0 {
+        // AMUX-4220: the raw hook report may be ignored entirely. Codex's
+        // structured boundary then owns both the status and its race window.
+        // Keep the actual derivation in the incident; a stale stop-hook must
+        // not be presented as the cause of a different signal's decision.
+        let decided_by = l.status_explain["decided_by"].as_str().unwrap_or("unknown");
+        let idle_signal_age_s = if decided_by == "codex_rollout" {
+            l.status_explain["codex_rollout"]["age_s"].as_f64().unwrap_or(l.report_age_s)
+        } else {
+            l.report_age_s
+        };
+        if l.pane_says_working && l.status == "idle" && idle_signal_age_s > 120.0 {
             out.push(
                 InvariantResult::fail(
                     ID,
                     "a lane whose pane is mid-turn is not reported idle",
                     format!(
-                        "card={} while the pane shows work (report={} age={:.0}s source={})",
-                        l.status, l.report_state, l.report_age_s, l.report_source
+                        "card={} while the pane shows work (decided_by={} idle_signal_age={:.0}s; report={} age={:.0}s source={})",
+                        l.status, decided_by, idle_signal_age_s, l.report_state, l.report_age_s, l.report_source
                     ),
                 )
                 .entity(&l.name)
@@ -1325,10 +1371,10 @@ pub fn status_agrees_with_pane(lanes: &[LaneTruth]) -> Vec<InvariantResult> {
                     "report_age_s": l.report_age_s,
                     "report_source": l.report_source,
                     "report_origin": l.report_origin,
-                    "class": "report-outranks-physical-evidence",
-                    "incident": "AMUX-2646: a hand-run hook test wrote idle onto a live \
-                                 working lane; an idle report never decays, so nothing \
-                                 could contradict it",
+                    "decided_by": decided_by,
+                    "idle_signal_age_s": idle_signal_age_s,
+                    "status_explain": l.status_explain,
+                    "class": "derived-idle-disagrees-with-working-pane",
                 })),
             );
         } else {
@@ -1420,6 +1466,9 @@ pub struct LaneTruth {
     pub name: String,
     /// What the card says (the derived status).
     pub status: String,
+    /// Captured by the same derivation, at evaluation time, not reconstructed
+    /// later after the pane or winning signal has changed.
+    pub status_explain: serde_json::Value,
     /// What the pane says — computed with the SAME detectors the derivation
     /// uses, so the check and the mechanism cannot disagree about what
     /// "working" means.
@@ -4797,6 +4846,7 @@ mod negative_controls {
         let lanes = vec![LaneTruth {
             name: "amux-rust".into(),
             status: "idle".into(),
+            status_explain: json!({"decided_by": "report"}),
             pane_says_working: true,
             report_state: "idle".into(),
             report_age_s: 1076.0,
@@ -4822,6 +4872,7 @@ mod negative_controls {
         let lanes = vec![LaneTruth {
             name: "amux-gtm".into(),
             status: "idle".into(),
+            status_explain: json!({"decided_by": "report"}),
             pane_says_working: true,
             report_state: "idle".into(),
             report_age_s: 8.0,
@@ -4835,6 +4886,31 @@ mod negative_controls {
         );
     }
 
+    #[test]
+    fn codex_pane_disagreement_records_the_deciding_signal_and_uses_its_age() {
+        let mut lane = LaneTruth {
+            name: "mvs-research".into(), status: "idle".into(), pane_says_working: true,
+            report_state: "idle".into(), report_age_s: 107736.0,
+            report_source: "stop-hook".into(), report_origin: "mvs-research".into(),
+            status_explain: json!({"decided_by": "codex_rollout",
+                "report": {"applied": false, "from_this_life": false},
+                "codex_rollout": {"state": "idle", "age_s": 8.0,
+                    "boundary": "task_complete", "applied": true,
+                    "rollout_file": "rollout-sibling.jsonl"}}),
+        };
+        assert_eq!(status_agrees_with_pane(&[lane.clone()])[0].status, Status::Pass,
+            "a fresh provider boundary has grace even when an ignored hook is days old");
+        lane.status_explain["codex_rollout"]["age_s"] = json!(3000.0);
+        // Conversely, a fresh ignored hook cannot hide an aged contradiction.
+        lane.report_age_s = 1.0;
+        let r = status_agrees_with_pane(&[lane.clone()]).remove(0);
+        assert_eq!(r.status, Status::Fail);
+        assert!(r.observed.contains("decided_by=codex_rollout"), "{r:?}");
+        assert_eq!(r.evidence["status_explain"], lane.status_explain);
+        assert_eq!(r.evidence["idle_signal_age_s"], json!(3000.0));
+        assert_eq!(r.evidence["class"], "derived-idle-disagrees-with-working-pane");
+    }
+
     /// ...and must NOT fire in the other direction. A lane reported `active`
     /// with a quiet pane is a long tool call or a subagent, which is normal —
     /// a check that fires on normal operation is one people switch off.
@@ -4843,6 +4919,7 @@ mod negative_controls {
         let lanes = vec![LaneTruth {
             name: "amux".into(),
             status: "active".into(),
+            status_explain: json!({"decided_by": "report"}),
             pane_says_working: false,
             report_state: "active".into(),
             report_age_s: 4.0,
@@ -4859,6 +4936,7 @@ mod negative_controls {
         let lanes = vec![LaneTruth {
             name: "amux".into(),
             status: "active".into(),
+            status_explain: json!({"decided_by": "report"}),
             pane_says_working: true,
             report_state: "active".into(),
             report_age_s: 2.0,
@@ -4877,6 +4955,7 @@ mod negative_controls {
         let lanes = vec![LaneTruth {
             name: "gtm-engine".into(),
             status: "active".into(),
+            status_explain: json!({"decided_by": "report"}),
             pane_says_working: false,
             report_state: "idle".into(),
             report_age_s: 30.0,
@@ -4899,6 +4978,7 @@ mod negative_controls {
         let lanes = vec![LaneTruth {
             name: "gtm-engine".into(),
             status: "active".into(),
+            status_explain: json!({"decided_by": "report"}),
             pane_says_working: false,
             report_state: "idle".into(),
             report_age_s: 120.0, // past the 60s window
@@ -4917,6 +4997,7 @@ mod negative_controls {
         let lanes = vec![LaneTruth {
             name: "gtm-engine".into(),
             status: "active".into(),
+            status_explain: json!({"decided_by": "report"}),
             pane_says_working: true,
             report_state: "idle".into(),
             report_age_s: 30.0,
@@ -5151,6 +5232,73 @@ mod negative_controls {
     /// AF-453, both arms. A check that flags every mounted route would satisfy
     /// the first assertion alone and be worthless, so the healthy-route arm is
     /// what makes this a test rather than a tautology.
+    /// AF-298 follow-up. "0% 2xx" cannot tell a DEAD route from a working
+    /// authorization gate, and this check reported one of each with the same
+    /// sentence. Live specimen, 2026-09-07: `POST /api/email/reply 0/12 2xx` was
+    /// filed as not answering while all 12 were 403s from the external-email
+    /// gate refusing exactly as designed (`external_email_allowed` is false for
+    /// all 132 sessions, deliberately, because external mail is drafted for the
+    /// owner to send).
+    ///
+    /// The verdict does not change: a mounted route with no 2xx is still worth a
+    /// human look, and suppressing 4xx-only shapes would hide `GET
+    /// /api/workers/{id}`, whose 404s are wrong. What changes is that the split
+    /// is PUBLISHED beside the count, so a reader can tell the two apart without
+    /// going to the request log. Ethos rule 4: name what should appear beside
+    /// the answer.
+    #[test]
+    fn a_refusing_gate_and_a_dead_route_are_told_apart_in_the_evidence() {
+        let mounted: Vec<(&str, &[&str])> =
+            vec![("/api/email/reply", &["POST"]), ("/api/torrents", &["GET"])];
+        let rows = vec![
+            // A GATE doing its job: answered every time, refused every time.
+            RouteOutcomeRow {
+                method: "POST".into(),
+                shape: "/api/email/reply".into(),
+                n: 12,
+                ok: 0,
+                client_err: 12,
+                server_err: 0,
+            },
+            // A route actually FAILING. Same 0% 2xx, opposite meaning.
+            RouteOutcomeRow {
+                method: "GET".into(),
+                shape: "/api/torrents".into(),
+                n: 44,
+                ok: 0,
+                client_err: 0,
+                server_err: 44,
+            },
+        ];
+        let rs = mounted_routes_answer(&rows, &mounted);
+        let fails: Vec<_> = rs.iter().filter(|r| r.status == Status::Fail).collect();
+        assert_eq!(fails.len(), 2, "both are still reported: {rs:?}");
+
+        let gate = fails
+            .iter()
+            .find(|r| r.entity_key == "POST /api/email/reply")
+            .expect("the gate is reported");
+        let dead = fails
+            .iter()
+            .find(|r| r.entity_key == "GET /api/torrents")
+            .expect("the dead route is reported");
+
+        // THE DISCRIMINATOR. Without the split both observed lines read "0/N 2xx"
+        // and nothing in the payload separates a refusal from a failure.
+        assert!(
+            gate.observed.contains("(12 4xx, 0 5xx)"),
+            "the gate must publish its refusal shape: {}",
+            gate.observed
+        );
+        assert!(
+            dead.observed.contains("(0 4xx, 44 5xx)"),
+            "the dead route must publish its failure shape: {}",
+            dead.observed
+        );
+        assert_eq!(gate.evidence["detail"]["refusal_shaped"], serde_json::json!(true));
+        assert_eq!(dead.evidence["detail"]["refusal_shaped"], serde_json::json!(false));
+    }
+
     #[test]
     fn a_mounted_route_that_never_answers_is_reported_and_a_healthy_one_is_not() {
         let mounted: Vec<(&str, &[&str])> = vec![
@@ -5159,16 +5307,16 @@ mod negative_controls {
         ];
         let rows = vec![
             // The live specimen: mounted, called 15 times, answered 0.
-            RouteOutcomeRow { method: "GET".into(), shape: "/api/workers/{id}".into(), n: 15, ok: 0 },
+            RouteOutcomeRow { method: "GET".into(), shape: "/api/workers/{id}".into(), n: 15, ok: 0, client_err: 15, server_err: 0 },
             // ARM 2 — a HEALTHY mounted route. Without this the check could
             // flag everything and still pass arm 1.
-            RouteOutcomeRow { method: "POST".into(), shape: "/api/workers/{id}/send".into(), n: 4368, ok: 4006 },
+            RouteOutcomeRow { method: "POST".into(), shape: "/api/workers/{id}/send".into(), n: 4368, ok: 4006, client_err: 300, server_err: 62 },
             // Below the threshold: judged on nothing, so reported as nothing.
-            RouteOutcomeRow { method: "GET".into(), shape: "/api/workers/{id}".into(), n: 0, ok: 0 },
+            RouteOutcomeRow { method: "GET".into(), shape: "/api/workers/{id}".into(), n: 0, ok: 0, client_err: 0, server_err: 0 },
             // UNMOUNTED and failing: a client guessing a URL. /api/logs/analyze
             // already reports these as 404 groups with nearest_routes, and this
             // check must not double-file them.
-            RouteOutcomeRow { method: "GET".into(), shape: "/api/stripe/status".into(), n: 430, ok: 0 },
+            RouteOutcomeRow { method: "GET".into(), shape: "/api/stripe/status".into(), n: 430, ok: 0, client_err: 430, server_err: 0 },
         ];
         let rs = mounted_routes_answer(&rows, &mounted);
         let fails: Vec<_> = rs.iter().filter(|r| r.status == Status::Fail).collect();
@@ -5185,7 +5333,7 @@ mod negative_controls {
         // means "nothing failed loudly enough, often enough, with a status",
         // and a reader who cannot see that will read it as "every route answers".
         let clean = mounted_routes_answer(
-            &[RouteOutcomeRow { method: "POST".into(), shape: "/api/workers/{id}/send".into(), n: 4368, ok: 4006 }],
+            &[RouteOutcomeRow { method: "POST".into(), shape: "/api/workers/{id}/send".into(), n: 4368, ok: 4006, client_err: 300, server_err: 62 }],
             &mounted,
         );
         assert_eq!(clean.len(), 1);
@@ -5193,10 +5341,16 @@ mod negative_controls {
         let ev = &clean[0].evidence;
         assert_eq!(ev["measured"], true);
         assert_eq!(ev["n_considered"], 1, "a zero finding is only readable beside its population");
-        assert_eq!(ev["blind_spots"].as_array().map(|a| a.len()), Some(4),
-                   "all four blind spots ship with every result");
+        // The COUNT is pinned on purpose, so growing the list is a decision
+        // somebody makes rather than a line that slips in. It grew to 5 when the
+        // refusal-shaped spot was added; this assertion is what made that
+        // visible instead of silent.
+        assert_eq!(ev["blind_spots"].as_array().map(|a| a.len()), Some(5),
+                   "all five blind spots ship with every result");
         assert!(ev["blind_spots"].to_string().contains("error body"),
                 "the status-only blind spot is the one most likely to be forgotten");
+        assert!(ev["blind_spots"].to_string().contains("CORRECT answer is a refusal"),
+                "a working authorization gate reads as 0% 2xx and must be named as a blind spot");
 
         // ARM 4 — an empty log is UNKNOWN, never a pass. This is the trap
         // route.callers_have_routes already guards: a probe that could not run

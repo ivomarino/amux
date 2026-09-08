@@ -1256,6 +1256,36 @@ const GIT_READ_SUBCMDS: &[&str] = &[
 /// A path that is a DESTINATION anywhere in the command stays claimable, so
 /// `cp a.rs b.rs; cp b.rs c.rs` still attributes `b.rs`. Only paths that are
 /// exclusively sources are spared.
+/// The paths a command could CLAIM as an edit, before the mtime gate.
+///
+/// Extracted from `recent_edit_paths` so the carve-outs are testable at the
+/// layer that decides (AF-550). The function-level test for `source_only_paths`
+/// pinned the helper and NOT the wiring: mutating the call site
+/// (`if source_only.contains(cand)` -> `if false`) left all 73 git_guard tests
+/// green, so unwiring the carve-out entirely changed no test. That is ethos
+/// rule 7's case exactly, a check pinning the wrong layer being as green as one
+/// pinning the right layer.
+///
+/// Returns candidates only. Whether a candidate is really an edit is still the
+/// mtime gate's call, which is what keeps "naming a path" from meaning "writing
+/// it".
+fn claimable_path_candidates(cmd: &str) -> Vec<String> {
+    if cmd.is_empty() || is_pure_read_command(cmd) {
+        return Vec::new();
+    }
+    let source_only = source_only_paths(cmd);
+    pathlike_re()
+        .find_iter(cmd)
+        .filter_map(|m| {
+            let cand = m.as_str().trim_matches(|c| "'\"),;:".contains(c));
+            if cand.len() < 4 || source_only.contains(cand) {
+                return None;
+            }
+            Some(cand.to_string())
+        })
+        .collect()
+}
+
 fn source_only_paths(cmd: &str) -> std::collections::HashSet<String> {
     const COPY_VERBS: &[&str] = &["cp", "install"];
     let mut sources: std::collections::HashSet<String> = Default::default();
@@ -2410,22 +2440,14 @@ fn recent_edit_paths(name: &str, since_secs: f64, firsthand_only: bool) -> EditS
                     // path but writes nothing. The mtime gate below cannot tell a
                     // read from a write, so a PEER's write moving the mtime under
                     // a reader would mint a false co-author. Reads attribute nothing.
-                    if is_pure_read_command(cmd) {
-                        continue;
-                    }
                     // AF-550: a path this command only READS (a `cp` source) is
                     // not an edit record, even though the command as a whole
-                    // writes. The mtime gate below cannot tell a peer's
-                    // concurrent write from ours.
-                    let source_only = source_only_paths(cmd);
-                    for m in pathlike_re().find_iter(cmd) {
-                        let cand = m.as_str().trim_matches(|c| "'\"),;:".contains(c));
-                        if cand.len() < 4 {
-                            continue;
-                        }
-                        if source_only.contains(cand) {
-                            continue;
-                        }
+                    // writes. Both carve-outs (pure-read commands, copy sources)
+                    // now live in `claimable_path_candidates` so they are
+                    // testable at the layer that decides rather than only as
+                    // helpers.
+                    for cand in claimable_path_candidates(cmd) {
+                        let cand = cand.as_str();
                         let abs = if Path::new(cand).is_absolute() {
                             PathBuf::from(cand)
                         } else if work_hint.is_empty() {
@@ -5471,6 +5493,50 @@ mod tests {
     /// concurrent write to SRC from ours. The lane that copies a peer's file
     /// OUT to verify it then gets an edit record for it, and the peer is warned
     /// that "the WORK ITSELF is at risk" from their own reviewer.
+    /// AF-550's WIRING, which the helper test above does not cover.
+    ///
+    /// Found while trying to validate the frustrations entry: mutating the call
+    /// site (`if source_only.contains(cand)` -> `if false`) left all 73
+    /// git_guard tests green. Unwiring the carve-out entirely from the claim
+    /// loop changed no test, so the entry could not be validated on a suite that
+    /// could not fail for the thing it was about.
+    ///
+    /// This drives the decision the loop actually makes. The mtime gate after it
+    /// is deliberately out of scope: naming a path is not writing it, and that
+    /// separation is what keeps this honest.
+    #[test]
+    fn the_claim_loop_skips_copy_sources_and_pure_reads_not_just_the_helper() {
+        let src = "crates/amux-server/src/api/session_verbs.rs";
+        let dst = "/tmp/scratch/session_verbs.rs";
+
+        // THE AF-550 SPECIMEN: verifying a peer's work by copying it OUT must
+        // not attribute their file to the reader.
+        let got = claimable_path_candidates(&format!("cp {src} {dst}"));
+        assert!(
+            !got.iter().any(|p| p == src),
+            "the copy SOURCE must not be claimable: {got:?}"
+        );
+        assert!(
+            got.iter().any(|p| p == dst),
+            "the copy DESTINATION must still be claimable: {got:?}"
+        );
+
+        // A pure read claims nothing at all, even though it names a path.
+        assert!(
+            claimable_path_candidates(&format!("grep -n foo {src}")).is_empty(),
+            "a pure-read command claims nothing"
+        );
+
+        // AND THE CONTROL: an ordinary write still claims. Without this, a
+        // version that returned an empty Vec for everything would pass both
+        // assertions above and disable attribution entirely.
+        let wrote = claimable_path_candidates(&format!("echo x >> {src}"));
+        assert!(
+            wrote.iter().any(|p| p == src),
+            "an ordinary write must still be claimable: {wrote:?}"
+        );
+    }
+
     #[test]
     fn a_copy_source_is_read_not_written_but_a_copy_destination_is_claimed() {
         let src = "crates/amux-server/src/api/session_verbs.rs";
@@ -6150,11 +6216,15 @@ mod tests {
         assert_eq!(before.0["unclaimed"].as_array().unwrap().len(), paths.len());
 
         let now = now_epoch();
+        // Compute this once. Re-evaluating the subtraction at the assertion
+        // site can differ by one f64 ULP across codegen targets even though
+        // the JSON round trip preserved the value exactly.
+        let observed_mtime = now - 10.0;
         let reports: Vec<Value> = paths
             .iter()
             .map(|path| {
                 json!({
-                    "path": repo.join(path), "mtime": now - 10.0,
+                    "path": repo.join(path), "mtime": observed_mtime,
                 })
             })
             .collect();
@@ -6177,7 +6247,11 @@ mod tests {
             .unwrap();
         let legacy_map: HashMap<String, f64> = serde_json::from_str(&saved).unwrap();
         assert_eq!(legacy_map.len(), paths.len());
-        assert_eq!(legacy_map[&realpath(&repo.join(paths[0]))], now - 10.0);
+        assert_eq!(
+            legacy_map[&realpath(&repo.join(paths[0]))],
+            observed_mtime,
+            "the observation timestamp must survive its JSON/SQLite round trip exactly"
+        );
 
         // This is the production loader, not a manually populated GuardInputs.
         let (code, after) = staged_guard_inner(Some(state), headers(&requester), body).await;

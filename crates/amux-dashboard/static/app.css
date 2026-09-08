@@ -1226,6 +1226,8 @@
     display: flex; align-items: center; gap: 4px; padding: 6px 10px; flex-wrap: wrap;
     border-bottom: 1px solid var(--border); flex-shrink: 0; background: var(--card);
   }
+  #files-view > .fe-toolbar { flex-wrap: nowrap; min-width: 0; }
+  #files-breadcrumb { flex-basis: 0; }
   .fe-tb-btn {
     background: none; border: 1px solid var(--border); border-radius: 5px;
     color: var(--dim); cursor: pointer; padding: 4px 8px; font-size: 0.75rem;
@@ -4354,6 +4356,10 @@
   .bd-card-section { border:1px solid var(--border); border-radius:9px; padding:10px 12px; background:var(--panel2, rgba(255,255,255,0.025)); display:flex; flex-direction:column; gap:6px; }
   .bd-card-section h4 { margin:0 0 2px; color:var(--text); font-size:0.72rem; text-transform:uppercase; letter-spacing:0.055em; }
   .bd-link-chip { font:inherit; cursor:pointer; }
+  .msg-card-chip { cursor:pointer; font:inherit; font-size:0.68rem; border:1px solid var(--border); border-radius:6px;
+    padding:2px 8px; white-space:nowrap; background:var(--panel2, rgba(255,255,255,0.035)); font-weight:600; }
+  .msg-card-chip:hover, .msg-card-chip:focus-visible { background:rgba(88,166,255,0.12); outline:2px solid var(--accent); outline-offset:1px; }
+  .bd-retired-artifacts { opacity:0.78; }
   .bd-gate { padding:6px 0; border-top:1px solid var(--border); }
   .bd-gate:first-of-type { border-top:0; padding-top:0; }
   .bd-gate-head { display:flex; align-items:center; gap:7px; color:var(--dim); font-size:0.7rem; text-transform:uppercase; }

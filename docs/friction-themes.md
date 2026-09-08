@@ -96,8 +96,8 @@ scope was assessed on amux evidence and is re-measured across both repos daily.
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-09-06
-OCCURRENCES: 4
+LAST_SEEN: 2026-09-08
+OCCURRENCES: 5
 SIGNALS: board-resting:*, rule-restatement:backlog-growth
 FIX_SITE: crates/amux-server/src/api/board*, plus a runtime job
 CARDS: AF-317
@@ -119,12 +119,18 @@ the backlog it exists to prevent. Hit live this pass: routing AF-111 to its owne
 was refused with `todo_wip_limit_reached ... amux already holds 121 todo card(s)`,
 and the honest move was `backlog` with a trigger.
 
+Re-measured 2026-09-08: `board-resting:mixpeek:blocked` is 40 cards, median age
+36.8d, 90% over a week, oldest 56.0d, +4 against 36 seven days ago, still
+`growing: true`. The median age keeps climbing (32.8d on 09-04, 34.9d on 09-06,
+36.8d today) and is again the oldest resting queue in this file, so the queue is
+not draining and turning over, it is aging in place.
+
 ## `needsyou` is the cheap escape hatch, so the real asks are buried
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-09-06
-OCCURRENCES: 6
+LAST_SEEN: 2026-09-08
+OCCURRENCES: 7
 LAST_SEEN_NOTE: re-measured 2026-09-05 in BOTH repos for the first time; still GROWING
 SIGNALS: board-resting:*:needsyou, cross-lane-repeat
 FIX_SITE: board status gate (`needsyou` requires a typed `--ask`) AND an owner-side
@@ -195,12 +201,17 @@ needs:you cards name Ethan as the blocker and nothing tells him". A queue whose
 own backlog contains the card describing the queue is the accumulation this theme
 names.
 
+Re-measured 2026-09-08: amux `needsyou` is 66 cards, median age 14.8d, 70% over
+a week, oldest 39.7d, and **+20 against the 46 open 7 days ago**, carrying
+`growing: true`. This is a board-state signal, so neither of the two counting
+defects AF-585 fixed can touch it.
+
 ## Nudging is the dominant channel and the loop has no negative feedback
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-09-06
-OCCURRENCES: 3
+LAST_SEEN: 2026-09-08
+OCCURRENCES: 4
 SIGNALS: nudge-no-movement, rule-restatement:idle-stall
 FIX_SITE: `idle_backlog_drain_cooldown_s()` and the board_drive job
 CARDS: AF-319
@@ -240,6 +251,21 @@ view must share the predicate of the mechanism it describes). Shipped as a
 MECHANISM, not a sentence: `board.todo_is_reachable_by_dispatch`, 7d409d0a,
 AF-535. What surfaced it was a human typing "this workers board is evident if
 the board system still not working".
+
+Re-measured 2026-09-08, and the measurement itself had to be repaired first
+(AF-585, d308ecfd). `rule-restatement:idle-stall` reads n=83 over 55 lanes with
+a 31% top-lane share, which is the most theme-shaped concentration a signal can
+have. It is a FAN-OUT: 65% of that evidence arrived in minutes where one message
+reached five or more lanes, and the widest single minute carried an identical
+message to 41 lanes (09-07 18:09, "start all non-archived workers"), with 28 in
+another and bare "continue" reaching 24 and 19. `rule-restatement:duplicate-work`
+is the same minutes, n=65 over 54 lanes, 83% fan-out.
+
+So the 83 is not 55 lanes independently hitting a friction, and this theme is
+counted on the fan-out itself rather than on lane breadth. Broadcasting to 41
+lanes at once IS the theme: nudging is the channel, and when the loop does not
+move the queue the correction available to a human is to send the same sentence
+to everybody. `nudge-no-movement` did not fire this pass.
 
 ## Verification is something Ethan has to demand, every single time
 SCOPE: both
@@ -361,8 +387,8 @@ message seven hours before the complaint.
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-09-06
-OCCURRENCES: 5
+LAST_SEEN: 2026-09-08
+OCCURRENCES: 6
 SIGNALS: ledger-cluster:instruments, rule-restatement:instrument-lies
 FIX_SITE: the `measured`/`n_considered` contract + `tests/diagnostic_contract.rs`
 CARDS: AF-320, AF-394
@@ -428,6 +454,25 @@ measurement did not run:
 - `GET /api/board?all=1` includes ARCHIVED rows, so a count over it reported 183
   stranded cards where 3 were live. Caught before filing, only because a second
   measurement disagreed. Same family as AF-460.
+
+Re-measured 2026-09-08: `ledger-cluster:instruments` gained 4 open entries in
+one day spanning both repos (2 amux / 2 mixpeek) against 170 open in total, the
+largest standing cluster in either ledger for the sixth pass running.
+
+The sharpest specimen this pass is FIRST-PARTY: this sweep's own instrument.
+`concentration()` in `scripts/friction_themes.py` exists so that `n` cannot pass
+one incident off as a fleet theme, and it was 0 for 11 — it could not fire at
+all. Its incident test required `len(days) == 1` while the window is a rolling
+24h that always covers two calendar dates, so the same five-message, four-minute,
+one-lane incident read True at 12:00 and False at 00:02. Its own unit test missed
+it for three days by clustering synthetic timestamps at `now`, which lands on one
+date ~99.7% of the day while production never does. A second blind spot had no
+detector at all: one message fanned out to many lanes reads as MAXIMUM breadth.
+Both fixed in d308ecfd with mutation-checked tests; after the fix 5 of 11 signals
+flag, including the top four by n. AF-585.
+
+This is the theme's own shape applied to the tool that measures the theme, and
+it is the reason today's two loudest signals did not increment as breadth.
 
 ## A fix ships, its tests pass, and it does nothing in production
 SCOPE: amux
@@ -597,8 +642,8 @@ one has already produced a "message was swallowed" incident that was false.
 SCOPE: both
 STATUS: absorbed
 FIRST_SEEN: 2026-09-03
-LAST_SEEN: 2026-09-03
-OCCURRENCES: 1
+LAST_SEEN: 2026-09-08
+OCCURRENCES: 2
 SIGNALS: rule-restatement:backlog-growth
 FIX_SITE: `~/.claude/CLAUDE.md` board section, held by
 `board_drive::tests::the_global_prompt_names_the_real_backlog_dispatch_key`
@@ -630,3 +675,59 @@ rather than passing when the global prompt is absent (cloud image). Rename the k
 and the test fails; drop the paragraph and the test fails. Watch
 `rule-restatement:backlog-growth` next run: if it stays at 20+ with the prose
 live, the prose lost and the fix site is the nudge text, not the prompt.
+
+Checked 2026-09-08, because the paragraph above names the exact test: with the
+prose live, `rule-restatement:backlog-growth` is n=15, down from the 23 that
+prompted it, against a 1.62/day baseline. Below the 20+ that would have said the
+prose lost, and still ~9x baseline, so this is not yet a clean read either way.
+Concentration is the reason to withhold a verdict rather than the number: 3
+lanes, 67% of it one lane (amux-testing-e2e), so most of the remaining 15 is one
+lane's overnight run and not fleet-wide demand for a switch that now has a name.
+Watch it again on a day that lane is quiet.
+
+## A gate asks for something the card cannot truthfully provide, so the honest move is `--force`
+SCOPE: both
+STATUS: open
+FIRST_SEEN: 2026-09-08
+LAST_SEEN: 2026-09-08
+OCCURRENCES: 1
+SIGNALS: ledger-cluster:board-gates
+FIX_SITE: the gate precedence walk in `crates/amux-server/src/db/board_store.rs`
+(`GateSource`), which resolves card > worker > group > column > type_default and
+lets only the LAST tier derive from the item type
+CARDS: AF-570, AF-586
+EVIDENCE: `ledger-cluster:board-gates` gained 5 open entries in one day spanning
+both repos (1 amux / 4 mixpeek) against 100 open in total (5 amux / 95 mixpeek).
+
+Two independent specimens in two days, at two different tiers of the same walk:
+
+- AF-570 (2026-09-07): the `group:amux` verified gate demands "functionality
+  change is live and exercised" from card types that produce no functionality
+  change.
+- AF-586 (2026-09-08), reported live by the `tubescience` lane during this
+  sweep: its WORKER-scope done gate is `["Implemented and merged", "Tests / lint
+  pass", "Peer reviewed"]` and applies to every card type. Confirmed by reading
+  `GET /api/board/session-gates`. Four forced closes in one day (TUBES-2483,
+  TUBES-2484, TUBES-2493 research; TUBES-2503 relaying a verbal authorization),
+  because acking "merged/tested/peer-reviewed" for a source-read or an
+  authorization relay would be false.
+
+This is ethos rule 3 as a mechanism: for a research or ops card on such a lane
+there is NO truthful path through the gate, so the logged bypass is the honest
+move and the gate teaches every lane that `--force` is routine. The refusal is
+not silent about it either — it says "retyping will NOT change it" — so the
+operator is correctly told that the one lever that looks like it should work
+does not.
+
+WHY THIS IS A MECHANISM CARD AND NOT A PARAGRAPH: `@additive` already shipped
+for AF-570, and it solves the ADJACENT problem (a scoped gate that should add to
+the type default rather than replace it). Applied here it makes things worse: it
+would keep the code criteria AND add the type's, so the research card still
+cannot pass. What is missing is type-AWARENESS in the scoped tiers, or letting an
+explicit retype outrank a scoped gate. No sentence in any prompt file can absorb
+this; a lane that reads the rule and agrees with it still cannot close the card.
+
+NOT COUNTED as a `rule-restatement` signal: nothing here came from Ethan
+restating anything. It came from the ledger cluster and from a peer lane
+reporting its own blocked closes, which is the source this theme should be read
+from.

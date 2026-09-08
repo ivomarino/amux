@@ -356,14 +356,32 @@ def check_deploy_freshness():
         except Exception:
             return ""
     sh("git", "fetch", "origin", "-q")
-    deployed = sh("gh", "run", "list", "--workflow=deploy-cloud.yml", "-L", "20",
-                  "--json", "headSha,conclusion", "-q",
-                  'map(select(.conclusion=="success"))[0].headSha')
+    # -L 100, and filter in Python rather than with a jq -q selector: during a
+    # prolonged red-CI stretch EVERY deploy-cloud run is 'skipped', so the last
+    # SUCCESS scrolls far past a 20-run window. At -L 20 this returned empty and
+    # reported "gh failed?", which is three different states ("gh failed", "no
+    # runs", "last success beyond the window") collapsed into one string and,
+    # worse, blinds the FROZEN detector during exactly the long-red-CI scenario
+    # AC-344 exists to catch (an error return skips the FROZEN branch below). So
+    # distinguish them honestly and publish n_considered beside the answer
+    # (ethos rule 4; seen live 2026-09-08, 25+ consecutive skips past -L 20).
+    raw = sh("gh", "run", "list", "--workflow=deploy-cloud.yml", "-L", "100",
+             "--json", "headSha,conclusion")
+    if not raw:
+        return {"error": "deploy-cloud freshness probe: gh run list returned nothing (gh failed or unauthenticated)"}
+    try:
+        runs = json.loads(raw)
+    except Exception:
+        return {"error": "deploy-cloud freshness probe: unparseable gh output"}
+    n = len(runs)
+    deployed = next((r.get("headSha", "") for r in runs if r.get("conclusion") == "success"), "")
     if not deployed:
-        return {"error": "no successful deploy-cloud run found (gh failed?)"}
+        return {"error": "no successful deploy-cloud run in last %d runs "
+                         "(all skipped/failed — main CI red for an extended period?)" % n,
+                "n_considered": n}
     behind = sh("git", "rev-list", "--count", "%s..origin/main" % deployed)
     behind = int(behind) if behind.isdigit() else -1
-    res = {"deployed": deployed[:12], "behind": behind}
+    res = {"deployed": deployed[:12], "behind": behind, "n_considered": n}
     if behind <= 0:
         res["state"] = "current"
         return res

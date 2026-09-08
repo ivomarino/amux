@@ -57,6 +57,7 @@
 // - Toggle inputs (.theme-toggle input) are opacity:0/size:0 — the USER
 //   clicks the visible .theme-track sibling, so the tests do too.
 import { test, expect } from './fixtures';
+import { E2E_ANTHROPIC_KEY } from './test-env';
 import type { Page, APIRequestContext } from '@playwright/test';
 
 // Deterministic theme baseline: initTheme falls back to prefers-color-scheme
@@ -425,16 +426,17 @@ test('settings_api_key_anthropic', async ({ page, request }, testInfo) => {
 
   // Restore: the UI has no "clear key" affordance (saveApiKey returns early on
   // empty input), so restoration goes through the same endpoint the Save
-  // button uses. An empty file value falls back to process env → the exact
-  // pre-test masked reading.
+  // button uses. An empty persisted value SHADOWS the process prerequisite;
+  // restore that known non-secret value explicitly so later specs retain the
+  // same configured-install state this test received.
   testInfo.annotations.push({
     type: 'restore-via-api',
     description:
-      'UI cannot clear a saved key (empty input is a no-op in saveApiKey); restored via PATCH /api/settings/env {"ANTHROPIC_API_KEY": ""}',
+      'UI cannot clear a saved key (empty input is a no-op in saveApiKey); restored the isolated harness baseline via PATCH /api/settings/env',
   });
   const restore = await request.patch('/api/settings/env', {
     headers: authHeaders(token),
-    data: { ANTHROPIC_API_KEY: '' },
+    data: { ANTHROPIC_API_KEY: E2E_ANTHROPIC_KEY },
   });
   expect(restore.status()).toBe(200);
   const after = (await (
@@ -492,14 +494,23 @@ test('settings_api_key_survives_slow_env_refresh', async ({ page, request }) => 
   ]);
   expect(res.status()).toBe(200);
 
-  // Restore (same route as the sibling test; empty value falls back to
-  // process env).
+  // Restore the exact shared harness baseline. A present-but-empty value in
+  // server.env deliberately means CLEARED and shadows the process env; writing
+  // '' here used to remove the prerequisite for every later spec in this
+  // project's shared server. On a loaded CI runner settings finished before
+  // the terminal files, so one cleanup turned into 22 unrelated pointer-event
+  // timeouts behind the no-key banner. Keep the postcondition explicit so a
+  // future cleanup cannot silently poison the rest of the project again.
   await page.unroute('**/api/settings/env');
   const restore = await request.patch('/api/settings/env', {
     headers: authHeaders(token),
-    data: { ANTHROPIC_API_KEY: '' },
+    data: { ANTHROPIC_API_KEY: E2E_ANTHROPIC_KEY },
   });
   expect(restore.status()).toBe(200);
+  const restored = (await (
+    await request.get('/api/settings/env', { headers: authHeaders(token) })
+  ).json()) as Record<string, string>;
+  expect(restored.ANTHROPIC_API_KEY).toMatch(/cret$/);
 });
 
 test('settings_commit_guard', async ({ page, request }) => {

@@ -56,6 +56,7 @@ pub struct Health {
     /// compiles the working tree, so a bare sha would overclaim);
     /// "unknown" outside a git checkout (the cloud image).
     pub commit: &'static str,
+    pub commit_full: &'static str,
     pub uptime_s: u64,
     pub rev: Option<u64>,
     pub store: &'static str,
@@ -479,50 +480,53 @@ fn fd_health() -> Option<FdHealth> {
 }
 
 pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>) {
-    // A store that cannot answer the revision query is degraded — surface
-    // that instead of a green lie (ethos rule 7: a check must be able to
-    // fail).
-    let (rev, store, code) = match state.store.current_rev() {
-        Ok(rev) => (Some(rev.0), "ok", StatusCode::OK),
-        Err(_) => (None, "hung", StatusCode::SERVICE_UNAVAILABLE),
-    };
-    // AF-332: exercise the REAL board read. This is the one probe here that
-    // deserializes a row, because the outage it exists to catch was a row-
-    // mapping failure that `current_rev()` above answered "ok" straight
-    // through. Bounded to one row: /health is polled constantly and
-    // `list_issues` is unbounded.
-    let board = match state.store.read() {
-        Ok(conn) => match crate::db::board_store::probe_board_read(&conn) {
-            Ok(n) => BoardProbe { measured: true, ok: true, rows_mapped: n, error: None },
-            Err(e) => {
-                // The two-fix rule: the fix, plus a signal that makes the next
-                // occurrence self-announce. This WARN is what a log sweep
-                // greps; without it the field is only visible to whoever
-                // happens to curl /health during the window, which is exactly
-                // how the 20-minute outage went unnoticed.
-                tracing::warn!(
-                    target: "health",
-                    "[health/board-probe AF-332] the board row mapper FAILED: {e}. \
-                     GET /api/board is very likely 5xx for the whole fleet right now; \
-                     `store` cannot see this class because it only checks current_rev()."
-                );
-                BoardProbe {
-                    measured: true,
-                    ok: false,
-                    rows_mapped: 0,
-                    error: Some(e.to_string()),
-                }
+    // AMUX-4225: a pooled read can wait 30s and SQLite itself can wait 5s.
+    // Neither may occupy a Tokio worker, including the worker accepting TLS.
+    // One in-flight probe per store prevents timed-out requests from filling
+    // the blocking pool. The permit stays WITH the work after HTTP times out.
+    let started = std::time::Instant::now();
+    let phase = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let result = match state.store.health_probe.clone().try_acquire_owned() {
+        Ok(permit) => {
+            let store = state.store.clone();
+            let phase = phase.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                phase.store(1, std::sync::atomic::Ordering::Relaxed);
+                let conn = store.try_read().ok_or("read_pool_exhausted")?;
+                phase.store(2, std::sync::atomic::Ordering::Relaxed);
+                let rev: u64 = conn.query_row("SELECT rev FROM _amux_rev WHERE id = 1", [], |r| r.get(0))
+                    .map_err(|_| "revision_read_failed")?;
+                phase.store(3, std::sync::atomic::Ordering::Relaxed);
+                let board = match crate::db::board_store::probe_board_read(&conn) {
+                    Ok(n) => BoardProbe { measured: true, ok: true, rows_mapped: n, error: None },
+                    Err(e) => {
+                        tracing::warn!(target: "health", error = %e, verdict = "board_mapper_failed",
+                            "health board row mapper failed (AF-332)");
+                        BoardProbe { measured: true, ok: false, rows_mapped: 0, error: Some(e.to_string()) }
+                    }
+                };
+                Ok((rev, board))
+            });
+            match tokio::time::timeout(std::time::Duration::from_millis(250), task).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err("probe_task_failed"),
+                Err(_) => Err("probe_deadline_exceeded"),
             }
-        },
-        // Could not even take the connection. `measured:false` because the
-        // probe did not run, which is NOT the same claim as "the board is
-        // broken" and must not render as one.
-        Err(_) => BoardProbe {
-            measured: false,
-            ok: false,
-            rows_mapped: 0,
-            error: Some("store lock unavailable; probe did not run".into()),
-        },
+        }
+        Err(_) => Err("probe_already_in_flight"),
+    };
+    let (rev, store, code, board) = match result {
+        Ok((rev, board)) => (Some(rev), "ok", StatusCode::OK, board),
+        Err(reason) => {
+            tracing::warn!(target: "health", verdict = reason, measured = false,
+                phase = phase.load(std::sync::atomic::Ordering::Relaxed),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                commit = env!("AMUX_BUILD_COMMIT"), build = %state.build_hash,
+                pid = std::process::id(), "health store probe unavailable; returning identity without blocking the runtime");
+            (None, "hung", StatusCode::SERVICE_UNAVAILABLE,
+                BoardProbe { measured: false, ok: false, rows_mapped: 0, error: Some(reason.into()) })
+        }
     };
     let board_bad = board.measured && !board.ok;
     let fds = fd_health();
@@ -560,6 +564,7 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
             board,
             build: state.build_hash.clone(),
             commit: env!("AMUX_BUILD_COMMIT"),
+            commit_full: env!("AMUX_BUILD_COMMIT_FULL"),
             uptime_s: state.started.elapsed().as_secs(),
             rev,
             store,
@@ -591,13 +596,28 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
 /// shell served 49, and no log line could say why (ethos rule 4: the
 /// instrument must express the discriminator, from the consumer's vantage).
 pub async fn debug_tmux() -> axum::Json<serde_json::Value> {
-    let out = std::process::Command::new("tmux")
-        .args([
-            "list-sessions",
-            "-F",
-            "#{session_name}\t#{session_activity}\t#{session_created}",
-        ])
-        .output();
+    let socket_ownership = crate::backend::tmux_health::observe().await;
+    let _ = socket_ownership.invariant();
+    let mut command = tokio::process::Command::new("tmux");
+    command.kill_on_drop(true).args([
+        "-N",
+        "list-sessions",
+        "-F",
+        "#{session_name}\t#{session_activity}\t#{session_created}",
+    ]);
+    let list_result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        command.output(),
+    )
+    .await;
+    let out = match list_result {
+        Ok(out) => out.map_err(|e| e.to_string()),
+        Err(_) => {
+            tracing::warn!(target: "amux::tmux", verdict = "diagnostic_probe_timeout",
+                "tmux diagnostic list timed out after 3s; socket ownership evidence is retained");
+            Err("tmux list-sessions timed out after 3s".to_string())
+        }
+    };
     let which = std::process::Command::new("which").arg("tmux").output();
     // AMUX-3700: how often a pane capture had to be KILLED on its deadline.
     // A bounded capture is invisible by construction — the request succeeds and
@@ -619,11 +639,14 @@ pub async fn debug_tmux() -> axum::Json<serde_json::Value> {
         Ok(o) => crate::api::measured::measured(
             serde_json::json!({
             "spawn": "ok",
+            "socket_ownership": socket_ownership,
             "pane_capture_timeouts": pane_timeouts,
             "pane_capture_last_timeout": pane_last,
+            "pane_capture_last_timeout_detail": crate::api::sessions_legacy::PANE_CAPTURE_LAST_TIMEOUT_DETAIL.lock().ok().and_then(|last| last.clone()),
             "pane_capture_note": "captures killed on AMUX_PANE_CAPTURE_TIMEOUT_S (default 3s). \
                                   In-memory, so a restart resets it; a non-zero count means \
-                                  tmux is not answering and some lane previews are missing.",
+                                  a probe missed its deadline and some lane previews may be missing. \
+                                  last_timeout_detail distinguishes child exit from pipe EOF and counts drained bytes.",
             "exit": o.status.to_string(),
             "stdout_bytes": o.stdout.len(),
             "stdout_lines": String::from_utf8_lossy(&o.stdout).lines().count(),
@@ -639,8 +662,15 @@ pub async fn debug_tmux() -> axum::Json<serde_json::Value> {
             String::from_utf8_lossy(&o.stdout).lines().count(),
         ),
         Err(e) => crate::api::measured::unmeasured(
-            serde_json::json!({ "spawn": "failed", "error": e.to_string() }),
-            "tmux could not be spawned from this process, so the fleet was never listed",
+            serde_json::json!({
+                "spawn": "failed",
+                "error": e,
+                "socket_ownership": socket_ownership,
+                "pane_capture_timeouts": pane_timeouts,
+                "pane_capture_last_timeout": pane_last,
+                "pane_capture_last_timeout_detail": crate::api::sessions_legacy::PANE_CAPTURE_LAST_TIMEOUT_DETAIL.lock().ok().and_then(|last| last.clone())
+            }),
+            "tmux could not be spawned or did not answer within 3s; the fleet was never listed",
         ),
     })
 }

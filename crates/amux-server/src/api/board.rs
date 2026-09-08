@@ -29,9 +29,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rusqlite::OptionalExtension;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 pub fn routes() -> Router<AppState> {
@@ -62,6 +63,12 @@ pub fn routes() -> Router<AppState> {
         .route("/bulk-migrate", axum::routing::post(bulk_migrate))
         // Static /needsyou outranks /{id}. The one owner view (AF-318).
         .route("/needsyou", get(needsyou_queue))
+        // A semantic-concern claim is deliberately separate from a card claim:
+        // two cards may coexist, but two workers must not both complete/deploy
+        // the same concern merely because they learned about each other late.
+        .route("/overlap", post(reconcile_overlap))
+        .route("/overlap/deployment-permit", get(overlap_deployment_permit))
+        .route("/overlap/{coordination_id}", get(get_overlap))
         // DELETE was never registered, so the SPA's own Delete button on a
         // card 405'd — and `deleteBoardItem` removes the card optimistically
         // BEFORE the request, so the card vanished, the server kept it, and it
@@ -5398,20 +5405,1529 @@ async fn decompose_item(
     }
 }
 
-/// POST /api/board/{id}/claim — atomically take a `todo` or `backlog` card and
-/// start it.
+// Claim endpoint context continues below the self-contained overlap subsystem.
+// ---- Durable semantic-overlap reconciliation (ATE-93) --------------------
+
+/// The durable source record for a concern-level work election.  This is not a
+/// new work primitive: it is a board relation between existing cards.  The
+/// coordination id is stable across retries, process restart, and
+/// provider/model switches, so a late reply can converge on the same record.
+#[derive(Debug, Clone, Serialize)]
+struct OverlapRecord {
+    coordination_id: String,
+    semantic_key: String,
+    concern: String,
+    owner_card_id: String,
+    owner_session: String,
+    resolution: String,
+    resolution_note: Option<String>,
+    resolved_by_card_id: Option<String>,
+    resolved_by_session: Option<String>,
+    resolved_at: Option<i64>,
+    role: String,
+    relation: String,
+    newly_elected: bool,
+    newly_linked: bool,
+    participants: Vec<OverlapParticipant>,
+    evidence: Vec<String>,
+    assets: Vec<String>,
+    callback: Option<OverlapCallback>,
+    callbacks: Vec<OverlapCallback>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OverlapParticipant {
+    self_reported: bool,
+    card_id: String,
+    session: String,
+    base_commit: String,
+    head_commit: String,
+    worktree: String,
+    intent: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OverlapCallback {
+    target_session: String,
+    message_id: String,
+    state: String,
+    error: Option<String>,
+}
+
+/// Kept raw until the handler derives `session` from its server-stamped
+/// header.  Letting a body nominate the claimant would re-create the exact
+/// ownership ambiguity this endpoint is supposed to settle.
+#[derive(Debug, Clone, Deserialize)]
+struct OverlapBody {
+    semantic_key: String,
+    concern: String,
+    card_id: String,
+    peer_card_id: String,
+    peer_session: String,
+    base_commit: String,
+    head_commit: String,
+    worktree: String,
+    intent: String,
+    #[serde(default)]
+    evidence: Vec<String>,
+    #[serde(default)]
+    assets: Vec<String>,
+    /// Only the elected owner may resolve a concern.  `scope-split` is the
+    /// explicit escape that permits the linked peer to complete its now
+    /// separate concern; `merged` deliberately does not permit a second Done.
+    #[serde(default)]
+    resolution: Option<String>,
+    #[serde(default)]
+    resolution_note: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct OverlapInput {
+    semantic_key: String,
+    concern: String,
+    card_id: String,
+    session: String,
+    peer_card_id: String,
+    peer_session: String,
+    base_commit: String,
+    head_commit: String,
+    worktree: String,
+    intent: String,
+    evidence: Vec<String>,
+    assets: Vec<String>,
+    resolution: Option<String>,
+    resolution_note: Option<String>,
+}
+
+fn overlap_text(field: &str, raw: &str, min: usize, max: usize) -> Result<String, String> {
+    let value = raw.trim();
+    if value.len() < min || value.len() > max || value.chars().any(char::is_control) {
+        return Err(format!("{field} must be {min}..={max} printable bytes"));
+    }
+    Ok(value.to_string())
+}
+
+fn overlap_refs(field: &str, refs: &[String]) -> Result<Vec<String>, String> {
+    if refs.len() > 32 {
+        return Err(format!("{field} accepts at most 32 references"));
+    }
+    let mut out = Vec::new();
+    for reference in refs {
+        let clean = overlap_text(field, reference, 1, 512)?;
+        if !out.contains(&clean) {
+            out.push(clean);
+        }
+    }
+    Ok(out)
+}
+
+fn normalize_overlap(body: OverlapBody, session: String) -> Result<OverlapInput, String> {
+    let semantic_key =
+        overlap_text("semantic_key", &body.semantic_key, 3, 240)?.to_ascii_lowercase();
+    let concern = overlap_text("concern", &body.concern, 3, 160)?
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let card_id = overlap_text("card_id", &body.card_id, 3, 80)?;
+    let peer_card_id = overlap_text("peer_card_id", &body.peer_card_id, 3, 80)?;
+    if card_id == peer_card_id {
+        return Err("card_id and peer_card_id must name distinct cards".into());
+    }
+    let peer_session = overlap_text("peer_session", &body.peer_session, 1, 160)?;
+    let base_commit = overlap_text("base_commit", &body.base_commit, 7, 64)?;
+    let head_commit = overlap_text("head_commit", &body.head_commit, 7, 64)?;
+    for (name, sha) in [("base_commit", &base_commit), ("head_commit", &head_commit)] {
+        if !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("{name} must be a commit-shaped hexadecimal id"));
+        }
+    }
+    let resolution = body
+        .resolution
+        .as_deref()
+        .map(|v| overlap_text("resolution", v, 3, 32))
+        .transpose()?;
+    if let Some(ref value) = resolution {
+        if !matches!(value.as_str(), "merged" | "scope-split" | "released") {
+            return Err("resolution must be one of merged, scope-split, released".into());
+        }
+    }
+    let resolution_note = match (resolution.as_deref(), body.resolution_note.as_deref()) {
+        (Some(_), Some(note)) => Some(overlap_text("resolution_note", note, 3, 1_000)?),
+        (Some(_), None) => return Err("resolution_note is required when resolving an overlap".into()),
+        (None, _) => None,
+    };
+    Ok(OverlapInput {
+        semantic_key,
+        concern,
+        card_id,
+        session,
+        peer_card_id,
+        peer_session,
+        base_commit,
+        head_commit,
+        worktree: overlap_text("worktree", &body.worktree, 1, 512)?,
+        intent: overlap_text("intent", &body.intent, 3, 2_000)?,
+        evidence: overlap_refs("evidence", &body.evidence)?,
+        assets: overlap_refs("assets", &body.assets)?,
+        resolution,
+        resolution_note,
+    })
+}
+
+fn overlap_coordination_id(semantic_key: &str, concern: &str) -> String {
+    use sha2::Digest as _;
+    let mut digest = sha2::Sha256::new();
+    digest.update(semantic_key.as_bytes());
+    digest.update([0]);
+    digest.update(concern.as_bytes());
+    format!("OVL-{}", &format!("{:x}", digest.finalize())[..16])
+}
+
+fn overlap_row(
+    conn: &rusqlite::Connection,
+    coordination_id: &str,
+    caller_card_id: &str,
+    newly_elected: bool,
+    newly_linked: bool,
+    callback_target: Option<&str>,
+) -> rusqlite::Result<Option<OverlapRecord>> {
+    let header: Option<(String, String, String, String, String)> = conn
+        .query_row(
+            "SELECT semantic_key, concern, owner_card_id, owner_session, resolution \
+             FROM board_overlap_coordination WHERE coordination_id=?1",
+            [coordination_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?;
+    let Some((semantic_key, concern, owner_card_id, owner_session, resolution)) = header else {
+        return Ok(None);
+    };
+    let (resolution_note, resolved_by_card_id, resolved_by_session, resolved_at) = conn.query_row(
+        "SELECT resolution_note, resolved_by_card_id, resolved_by_session, resolved_at \
+         FROM board_overlap_coordination WHERE coordination_id=?1",
+        [coordination_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    let mut members = conn.prepare(
+        "SELECT card_id, session, base_commit, head_commit, worktree, intent, self_reported \
+         FROM board_overlap_members WHERE coordination_id=?1 ORDER BY created_at, card_id",
+    )?;
+    let participants = members
+        .query_map([coordination_id], |r| {
+            Ok(OverlapParticipant {
+                self_reported: r.get(6)?,
+                card_id: r.get(0)?,
+                session: r.get(1)?,
+                base_commit: r.get(2)?,
+                head_commit: r.get(3)?,
+                worktree: r.get(4)?,
+                intent: r.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut refs = conn.prepare(
+        "SELECT kind, ref_value FROM board_overlap_refs WHERE coordination_id=?1 \
+         ORDER BY kind, created_at, ref_value",
+    )?;
+    let mut evidence = Vec::new();
+    let mut assets = Vec::new();
+    for row in refs.query_map([coordination_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })? {
+        let (kind, value) = row?;
+        let values = if kind == "evidence" { &mut evidence } else { &mut assets };
+        if !values.contains(&value) {
+            values.push(value);
+        }
+    }
+    // GET must expose the same durable callback lineage as POST. A delivered
+    // steering receipt outranks the enqueue-time cache on the coordination.
+    let mut callback_rows = conn.prepare(
+        "SELECT target_session, message_id, \
+                CASE WHEN EXISTS (SELECT 1 FROM steering_history h WHERE h.id=c.message_id) \
+                     THEN 'delivered' ELSE c.state END, error \
+         FROM board_overlap_callbacks c WHERE coordination_id=?1 ORDER BY target_session",
+    )?;
+    let callbacks = callback_rows.query_map([coordination_id], |r| {
+        Ok(OverlapCallback {
+            target_session: r.get(0)?, message_id: r.get(1)?, state: r.get(2)?, error: r.get(3)?,
+        })
+    })?.collect::<Result<Vec<_>, _>>()?;
+    let callback = callbacks.iter()
+        .find(|c| Some(c.target_session.as_str()) == callback_target).cloned();
+    let role = if caller_card_id.is_empty() {
+        "observer"
+    } else if owner_card_id == caller_card_id {
+        "owner"
+    } else {
+        "peer"
+    };
+    // Different concern names are not proof of an agreed scope split.
+    let relation = match resolution.as_str() {
+        "scope-split" | "merged" | "released" => resolution.clone(),
+        _ if role == "owner" => "elected".into(),
+        _ => "duplicate-linked".into(),
+    };
+    Ok(Some(OverlapRecord {
+        coordination_id: coordination_id.to_string(),
+        semantic_key,
+        concern,
+        owner_card_id,
+        owner_session,
+        resolution,
+        resolution_note,
+        resolved_by_card_id,
+        resolved_by_session,
+        resolved_at,
+        role: role.to_string(),
+        relation,
+        newly_elected,
+        newly_linked,
+        participants,
+        evidence,
+        assets,
+        callback,
+        callbacks,
+    }))
+}
+
+fn append_overlap_log(
+    conn: &rusqlite::Connection,
+    card_id: &str,
+    line: &str,
+    assets: &[String],
+    now: i64,
+    events: &mut Vec<PendingEvent>,
+) -> rusqlite::Result<()> {
+    let Some(mut card) = bs::get_issue(conn, card_id)? else {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    };
+    card.log = Some(bs::append_log(card.log.as_deref(), &hhmm(), line));
+    card.updated = now;
+    card.rev += 1;
+    card.version += 1;
+    bs::save_patched(conn, &mut card)?;
+    events.push(ev_snap(&card, MutationKind::Updated));
+    for artifact in crate::db::artifact_store::insert_captured_refs(
+        conn,
+        card_id,
+        assets.to_vec(),
+        "durable board-overlap reconciliation asset",
+        now,
+    )? {
+        events.push(PendingEvent {
+            entity_type: EntityType::Other("artifact".into()),
+            entity_id: artifact.id,
+            mutation: MutationKind::Created,
+            payload: None,
+        });
+    }
+    Ok(())
+}
+
+/// The same predicate backs the friendly HTTP refusal, the deployment permit,
+/// and migration 0057's trigger.  The trigger is the last line of defense;
+/// this helper is what lets a caller see the elected concern, cards, and exit
+/// instead of a raw SQLite abort.
+#[derive(Debug, Clone, Serialize)]
+struct OverlapCompletionBlocker {
+    coordination_id: String,
+    semantic_key: String,
+    concern: String,
+    owner_card_id: String,
+    owner_session: String,
+    resolution: String,
+}
+
+fn overlap_completion_blockers(
+    conn: &rusqlite::Connection,
+    card_id: Option<&str>,
+    session: Option<&str>,
+) -> rusqlite::Result<Vec<OverlapCompletionBlocker>> {
+    let mut query = "SELECT c.coordination_id, c.semantic_key, c.concern, c.owner_card_id, c.owner_session, c.resolution \
+                     FROM board_overlap_members m \
+                     JOIN board_overlap_coordination c ON c.coordination_id=m.coordination_id \
+                     WHERE m.card_id <> c.owner_card_id \
+                       AND c.resolution NOT IN ('scope-split','released')".to_string();
+    let mut params: Vec<String> = Vec::new();
+    if let Some(card_id) = card_id {
+        query.push_str(" AND m.card_id=?");
+        params.push(card_id.to_string());
+    }
+    if let Some(session) = session {
+        query.push_str(" AND m.session=?");
+        params.push(session.to_string());
+    }
+    query.push_str(" ORDER BY c.created_at, c.coordination_id");
+    let mut statement = conn.prepare(&query)?;
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(params), |r| {
+            Ok(OverlapCompletionBlocker {
+                coordination_id: r.get(0)?,
+                semantic_key: r.get(1)?,
+                concern: r.get(2)?,
+                owner_card_id: r.get(3)?,
+                owner_session: r.get(4)?,
+                resolution: r.get(5)?,
+            })
+        })?;
+    let blockers = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(blockers)
+}
+
+/// The one-writer transaction is the election.  A concurrent request can only
+/// observe the elected header and become a linked peer; it cannot replace the
+/// owner, erase provenance, or turn a late discovery into a second deploy.
+fn record_overlap_on_conn(
+    conn: &rusqlite::Connection,
+    input: &OverlapInput,
+    now: i64,
+) -> rusqlite::Result<(OverlapRecord, Vec<PendingEvent>)> {
+    let coordination_id = overlap_coordination_id(&input.semantic_key, &input.concern);
+    let newly_elected = conn.execute(
+        "INSERT OR IGNORE INTO board_overlap_coordination \
+         (coordination_id, semantic_key, concern, owner_card_id, owner_session, created_at, updated_at) \
+         VALUES (?1,?2,?3,?4,?5,?6,?6)",
+        rusqlite::params![
+            coordination_id,
+            input.semantic_key,
+            input.concern,
+            input.card_id,
+            input.session,
+            now,
+        ],
+    )? > 0;
+    let newly_linked = conn.execute(
+        "INSERT INTO board_overlap_members \
+         (coordination_id, card_id, session, base_commit, head_commit, worktree, intent, self_reported, created_at, last_seen_at) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,1,?8,?8) \
+         ON CONFLICT(coordination_id, card_id) DO UPDATE SET \
+            session=excluded.session, base_commit=excluded.base_commit, head_commit=excluded.head_commit, \
+            worktree=excluded.worktree, intent=excluded.intent, self_reported=1, last_seen_at=excluded.last_seen_at \
+         WHERE board_overlap_members.self_reported=0",
+        rusqlite::params![
+            coordination_id,
+            input.card_id,
+            input.session,
+            input.base_commit,
+            input.head_commit,
+            input.worktree,
+            input.intent,
+            now,
+        ],
+    )? > 0;
+    // Link the other card now, even when its worker is gone. Its provenance is
+    // deliberately provisional until that worker self-reports; the callback
+    // and the completion/deployment guard must not wait for a live provider.
+    conn.execute(
+        "INSERT OR IGNORE INTO board_overlap_members \
+         (coordination_id, card_id, session, base_commit, head_commit, worktree, intent, self_reported, created_at, last_seen_at) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,0,?8,?8)",
+        rusqlite::params![
+            coordination_id,
+            input.peer_card_id,
+            input.peer_session,
+            input.base_commit,
+            input.head_commit,
+            input.worktree,
+            format!("peer identity linked by {}; self-report pending", input.session),
+            now,
+        ],
+    )?;
+    for (kind, refs) in [("evidence", &input.evidence), ("asset", &input.assets)] {
+        for reference in refs {
+            conn.execute(
+                "INSERT OR IGNORE INTO board_overlap_refs \
+                 (coordination_id, kind, ref_value, card_id, created_at) VALUES (?1,?2,?3,?4,?5)",
+                rusqlite::params![coordination_id, kind, reference, input.card_id, now],
+            )?;
+        }
+    }
+    let callback_target = (input.peer_session != input.session).then(|| input.peer_session.clone());
+    if let Some(target) = &callback_target {
+        let message_id = format!("overlap:{}:{}", coordination_id, target);
+        conn.execute(
+            "INSERT OR IGNORE INTO board_overlap_callbacks \
+             (coordination_id, target_session, message_id, state, updated_at) VALUES (?1,?2,?3,'pending',?4)",
+            rusqlite::params![coordination_id, target, message_id, now],
+        )?;
+    }
+
+    let resolution_changed = if let Some(resolution) = &input.resolution {
+        conn.execute(
+            "UPDATE board_overlap_coordination \
+             SET resolution=?1, resolution_note=?2, resolved_by_card_id=?3, \
+                 resolved_by_session=?4, resolved_at=?5, updated_at=?5 \
+             WHERE coordination_id=?6 AND owner_card_id=?3 AND owner_session=?4 \
+               AND resolution <> ?1",
+            rusqlite::params![
+                resolution,
+                input.resolution_note,
+                input.card_id,
+                input.session,
+                now,
+                coordination_id,
+            ],
+        )? > 0
+    } else {
+        false
+    };
+
+    crate::api::session_verbs::ensure_fleet_tables(conn)?;
+    let elected = overlap_row(conn, &coordination_id, &input.card_id,
+        newly_elected, newly_linked, callback_target.as_deref())?
+        .expect("the election was inserted or already existed");
+    let owner_label = format!("elected owner [{}] ({})", elected.owner_card_id, elected.owner_session);
+    let prefix = format!("overlap coordination {coordination_id}:");
+    // Refresh old, misleading lineage on an ordinary retry. Append, never
+    // rewrite history; subsequent retries are idempotent.
+    let mut stale_lineage = false;
+    for id in [&input.card_id, &input.peer_card_id] {
+        let card = bs::get_issue(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        if let Some(line) = card.log.as_deref().unwrap_or("").lines().rev().find(|line| line.contains(&prefix)) {
+            stale_lineage |= !line.contains(&owner_label) || !line.contains("; reporter [");
+        }
+    }
+    let mut events = Vec::new();
+    if newly_linked || resolution_changed || stale_lineage {
+        let line = format!(
+            "{prefix} concern={}; semantic={}; {owner_label}; reporter [{}] ({}) — linked [{}] ({}) — callback={}; base={} head={}; intent: {}; resolution: {}; resolution note: {}; evidence: {}; assets: {}",
+            elected.concern,
+            elected.semantic_key,
+            input.card_id,
+            input.session,
+            input.peer_card_id,
+            input.peer_session,
+            callback_target
+                .as_deref()
+                .map(|target| format!("overlap:{coordination_id}:{target}"))
+                .unwrap_or_else(|| "(same worker)".into()),
+            input.base_commit,
+            input.head_commit,
+            input.intent,
+            elected.resolution,
+            elected.resolution_note.as_deref().unwrap_or("(pending)"),
+            if elected.evidence.is_empty() { "(none)".into() } else { elected.evidence.join(", ") },
+            if elected.assets.is_empty() { "(none)".into() } else { elected.assets.join(", ") },
+        );
+        append_overlap_log(conn, &input.card_id, &line, &elected.assets, now, &mut events)?;
+        append_overlap_log(conn, &input.peer_card_id, &line, &elected.assets, now, &mut events)?;
+        tracing::info!(marker = "board_overlap_lineage_recorded", coordination = %coordination_id,
+            owner_card = %elected.owner_card_id, owner_session = %elected.owner_session,
+            reporter_card = %input.card_id, resolution = %elected.resolution,
+            "board overlap lineage records the durable election and the reporting worker separately");
+        if stale_lineage {
+            tracing::warn!(marker = "board_overlap_lineage_refreshed", coordination = %coordination_id,
+                owner_card = %elected.owner_card_id, reporter_card = %input.card_id,
+                "appended corrected overlap lineage; prior history mislabeled the reporter as owner or omitted attribution");
+        }
+    }
+    crate::api::session_verbs::ensure_fleet_tables(conn)?;
+    for (session, card_id) in [
+        (&input.session, &input.card_id),
+        (&input.peer_session, &input.peer_card_id),
+    ] {
+        conn.execute(
+            "INSERT OR IGNORE INTO session_events (ts, session, type, data, idem, source) \
+             VALUES (?1,?2,'board.overlap',?3,?4,'board-overlap')",
+            rusqlite::params![
+                now as f64,
+                session,
+                json!({"coordination_id": coordination_id, "card_id": card_id, "semantic_key": input.semantic_key, "concern": input.concern}).to_string(),
+                format!("overlap:{coordination_id}:{card_id}"),
+            ],
+        )?;
+    }
+    conn.execute(
+        "UPDATE board_overlap_coordination SET updated_at=?1 WHERE coordination_id=?2",
+        rusqlite::params![now, coordination_id],
+    )?;
+    let record = overlap_row(
+        conn,
+        &coordination_id,
+        &input.card_id,
+        newly_elected,
+        newly_linked,
+        callback_target.as_deref(),
+    )?
+    .expect("overlap header was inserted or already existed");
+    Ok((record, events))
+}
+
+async fn update_overlap_callback(
+    state: &AppState,
+    coordination_id: &str,
+    target_session: &str,
+    next_state: &str,
+    error: Option<String>,
+) {
+    let (coordination_id, target_session, next_state) = (
+        coordination_id.to_string(),
+        target_session.to_string(),
+        next_state.to_string(),
+    );
+    let _ = state
+        .store
+        .write_async(move |conn| {
+            conn.execute(
+                "UPDATE board_overlap_callbacks SET state=?1, error=?2, updated_at=?3 \
+                 WHERE coordination_id=?4 AND target_session=?5",
+                rusqlite::params![
+                    next_state,
+                    error,
+                    now_secs(),
+                    coordination_id,
+                    target_session
+                ],
+            )?;
+            Ok(WriteOutcome {
+                applied: true,
+                events: vec![],
+            })
+        })
+        .await;
+}
+
+async fn reconcile_overlap(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<OverlapBody>,
+) -> Response {
+    let (_, session) = actor_from_headers(&headers);
+    if session == "api-anonymous" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "overlap reconciliation needs X-Amux-Session; ownership cannot be elected anonymously"})),
+        )
+            .into_response();
+    }
+    let input = match normalize_overlap(body, session.clone()) {
+        Ok(v) => v,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response()
+        }
+    };
+    let ownership = {
+        let conn = match state.store.read() {
+            Ok(v) => v,
+            Err(e) => return internal(e),
+        };
+        match (
+            bs::get_issue(&conn, &input.card_id),
+            bs::get_issue(&conn, &input.peer_card_id),
+        ) {
+            (Ok(Some(own)), Ok(Some(peer))) => (
+                own.session.unwrap_or_default() == input.session,
+                peer.session.unwrap_or_default() == input.peer_session,
+            ),
+            (Ok(None), _) | (_, Ok(None)) => return not_found("card_id or peer_card_id"),
+            (Err(e), _) | (_, Err(e)) => return internal(e),
+        }
+    };
+    if !ownership.0 {
+        tracing::warn!(
+            marker = "board_overlap_owner_refused",
+            card = %input.card_id,
+            caller = %input.session,
+            "board overlap reconciliation refused: caller does not own its source card"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "caller must own card_id; peer cards are linked but never claimed"})),
+        )
+            .into_response();
+    }
+    if !ownership.1 {
+        tracing::warn!(
+            marker = "board_overlap_peer_refused",
+            card = %input.card_id,
+            peer_card = %input.peer_card_id,
+            claimed_peer = %input.peer_session,
+            "board overlap reconciliation refused: peer card owner does not match peer_session"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "peer_session must match peer_card_id's current owner; reconciliation never fabricates a peer callback target",
+                "code": "board_overlap_peer_owner_mismatch",
+            })),
+        )
+            .into_response();
+    }
+    if input.resolution.is_some() {
+        let coordination_id = overlap_coordination_id(&input.semantic_key, &input.concern);
+        let conn = match state.store.read() {
+            Ok(v) => v,
+            Err(e) => return internal(e),
+        };
+        let elected: Option<(String, String)> = match conn
+            .query_row(
+                "SELECT owner_card_id, owner_session FROM board_overlap_coordination WHERE coordination_id=?1",
+                [&coordination_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+        {
+            Ok(v) => v,
+            Err(e) => return internal(e),
+        };
+        if let Some((owner_card, owner_session)) = elected {
+            if owner_card != input.card_id || owner_session != input.session {
+                tracing::warn!(
+                    marker = "board_overlap_resolution_refused",
+                    coordination = %coordination_id,
+                    caller_card = %input.card_id,
+                    caller = %input.session,
+                    owner_card,
+                    owner_session,
+                    "only the elected overlap owner may release or scope-split the concern"
+                );
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "error": "only the elected owner may reconcile this overlap",
+                        "code": "board_overlap_resolution_owner_required",
+                        "coordination_id": coordination_id,
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let record_slot = Arc::new(Mutex::new(None));
+    let record_slot_w = record_slot.clone();
+    let input_w = input.clone();
+    let write = state
+        .store
+        .write_async(move |conn| {
+            let (record, events) = record_overlap_on_conn(conn, &input_w, now_secs())?;
+            *record_slot_w.lock().expect("overlap result slot poisoned") = Some(record);
+            Ok(WriteOutcome {
+                applied: true,
+                events,
+            })
+        })
+        .await;
+    if let Err(e) = write {
+        tracing::warn!(
+            marker = "board_overlap_record_failed",
+            card = %input.card_id,
+            peer_card = %input.peer_card_id,
+            error = %e,
+            "board overlap reconciliation was not persisted; no completion/deploy claim is valid"
+        );
+        return internal(e);
+    }
+    let mut record = record_slot
+        .lock()
+        .expect("overlap result slot poisoned")
+        .clone()
+        .expect("overlap transaction produced a result");
+    if record.newly_elected {
+        tracing::info!(
+            marker = "board_overlap_elected",
+            coordination = %record.coordination_id,
+            semantic = %record.semantic_key,
+            concern = %record.concern,
+            owner_card = %record.owner_card_id,
+            owner_session = %record.owner_session,
+            "board overlap ownership elected atomically"
+        );
+    } else if record.newly_linked {
+        tracing::warn!(
+            marker = "board_overlap_peer_linked",
+            coordination = %record.coordination_id,
+            owner_card = %record.owner_card_id,
+            peer_card = %input.card_id,
+            "late-discovered overlapping work linked to existing owner; peer must not independently complete/deploy"
+        );
+    }
+    let mut delivery = "not-needed".to_string();
+    if let Some(callback) = record.callback.clone() {
+        if matches!(callback.state.as_str(), "pending" | "retryable") {
+            let notice = format!(
+                "[Board overlap {}] semantic concern `{}` is {}. Owner: [{}] / {}. Linked cards: [{}] and [{}]. Base {}, head {}. Intent: {}. Evidence: {}. Assets: {}. Reconcile before completion or deployment; this durable callback survives provider/model changes.",
+                record.coordination_id,
+                record.concern,
+                record.relation,
+                record.owner_card_id,
+                record.owner_session,
+                input.card_id,
+                input.peer_card_id,
+                input.base_commit,
+                input.head_commit,
+                input.intent,
+                if record.evidence.is_empty() { "(none)".into() } else { record.evidence.join(", ") },
+                if record.assets.is_empty() { "(none)".into() } else { record.assets.join(", ") },
+            );
+            match crate::api::session_verbs::steer_enqueue_idempotent(
+                &state,
+                &callback.target_session,
+                &notice,
+                &format!("board-overlap:{}", record.coordination_id),
+                &input.session,
+                &callback.message_id,
+            )
+            .await
+            {
+                Ok(_) => {
+                    update_overlap_callback(
+                        &state,
+                        &record.coordination_id,
+                        &callback.target_session,
+                        "queued",
+                        None,
+                    )
+                    .await;
+                    delivery = "queued".into();
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        marker = "board_overlap_callback_retryable",
+                        coordination = %record.coordination_id,
+                        target = %callback.target_session,
+                        reason,
+                        "board overlap is durable but its peer callback was not queued; retry this request after the peer is recoverable"
+                    );
+                    update_overlap_callback(
+                        &state,
+                        &record.coordination_id,
+                        &callback.target_session,
+                        "retryable",
+                        Some(reason.to_string()),
+                    )
+                    .await;
+                    delivery = "retryable".into();
+                }
+            }
+            let conn = match state.store.read() {
+                Ok(v) => v,
+                Err(e) => return internal(e),
+            };
+            record = match overlap_row(
+                &conn,
+                &record.coordination_id,
+                &input.card_id,
+                record.newly_elected,
+                record.newly_linked,
+                Some(&callback.target_session),
+            ) {
+                Ok(Some(v)) => v,
+                Ok(None) => return internal("overlap record disappeared after callback update"),
+                Err(e) => return internal(e),
+            };
+        } else {
+            delivery = callback.state;
+        }
+    }
+    let status = if delivery == "retryable" {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    (
+        status,
+        Json(json!({"ok": true, "coordination": record, "delivery": delivery})),
+    )
+        .into_response()
+}
+
+async fn get_overlap(
+    State(state): State<AppState>,
+    Path(coordination_id): Path<String>,
+) -> Response {
+    let conn = match state.store.read() {
+        Ok(v) => v,
+        Err(e) => return internal(e),
+    };
+    match overlap_row(&conn, &coordination_id, "", false, false, None) {
+        Ok(Some(record)) => Json(json!({"ok": true, "coordination": record})).into_response(),
+        Ok(None) => not_found(&coordination_id),
+        Err(e) => internal(e),
+    }
+}
+
+/// Builder/push preflight.  The actor is the committing worker named by the
+/// commit trailer, not the process that happens to run the builder, so a stale
+/// shared-checkout head cannot deploy a linked peer's concern under another
+/// session's identity.  `measured` travels with the result: an unavailable
+/// preflight must not be mistaken for permission by the caller.
+async fn overlap_deployment_permit(
+    State(state): State<AppState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let session = q.get("session").map(String::as_str).unwrap_or("").trim();
+    if session.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "session query parameter required", "measured": false})),
+        )
+            .into_response();
+    }
+    let conn = match state.store.read() {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": e.to_string(), "measured": false})),
+            )
+                .into_response()
+        }
+    };
+    match overlap_completion_blockers(&conn, None, Some(session)) {
+        Ok(blockers) if blockers.is_empty() => Json(json!({
+            "allowed": true,
+            "measured": true,
+            "session": session,
+            "blockers": [],
+        }))
+        .into_response(),
+        Ok(blockers) => {
+            tracing::warn!(
+                marker = "board_overlap_deploy_refused",
+                session,
+                blockers = blockers.len(),
+                coordination = %blockers[0].coordination_id,
+                "deployment preflight refused: worker is a linked non-owner on an unreconciled concern"
+            );
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "allowed": false,
+                    "measured": true,
+                    "session": session,
+                    "blockers": blockers,
+                    "how_to_fix": "The elected owner must record a scope-split or released reconciliation on /api/board/overlap before this worker independently deploys.",
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": e.to_string(), "measured": false, "session": session})),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod overlap_reconciliation_tests {
+    use super::*;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn store() -> crate::db::SharedStore {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::db::Store::open(&dir.path().join("overlap.db")).unwrap());
+        // The writer and read pool outlive this helper.  The OS cleans the test
+        // directory, but the Store must retain a valid path for this test.
+        std::mem::forget(dir);
+        store
+    }
+
+    fn state(store: crate::db::SharedStore) -> AppState {
+        AppState {
+            store,
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+            reconciled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+
+    fn new_card(session: &str) -> bs::NewIssue {
+        bs::NewIssue {
+            title: format!("overlap card for {session}"),
+            desc: "durable semantic overlap test card".into(),
+            status: "doing".into(),
+            session: Some(session.into()),
+            item_type: "code".into(),
+            creator: session.into(),
+            owner_type: "agent".into(),
+            due: None,
+            due_time: None,
+            reviewer: None,
+            shepherd: None,
+            depends_on: vec![],
+            gate: vec![],
+            tags: vec![],
+            ask_type: None,
+            ask_question: None,
+            ask_unblocks: None,
+            ask_actor: None,
+            source: Some("agent".into()),
+            requested_by: None,
+            callback_session: None,
+            callback_prompt: None,
+        }
+    }
+
+    fn seed_card(store: &crate::db::SharedStore, session: &str) -> String {
+        let slot = Arc::new(Mutex::new(None));
+        let slot_w = slot.clone();
+        let card = new_card(session);
+        store
+            .write(move |conn| {
+                let row = bs::create_issue(conn, &card, 1_700_000_000)?;
+                *slot_w.lock().unwrap() = Some(row.id);
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
+            })
+            .unwrap();
+        let id = slot.lock().unwrap().clone().unwrap();
+        id
+    }
+
+    fn input(
+        card_id: String,
+        session: &str,
+        peer_card_id: String,
+        peer_session: &str,
+        concern: &str,
+    ) -> OverlapInput {
+        OverlapInput {
+            semantic_key: "deployment:31768303d1d8:7c6f7b802f5a".into(),
+            concern: concern.into(),
+            card_id,
+            session: session.into(),
+            peer_card_id,
+            peer_session: peer_session.into(),
+            base_commit: "31768303d1d89d8db9d51aa728e8deb80ca884c5".into(),
+            head_commit: "7c6f7b802f5af15cb9f4e4c4848a8329e1b72c7b".into(),
+            worktree: "/tmp/overlap-fixture".into(),
+            intent:
+                "reconcile a divergent stale-base deployment without overwriting either concern"
+                    .into(),
+            evidence: vec!["git show --name-only 7c6f7b80".into()],
+            assets: vec!["crates/amux-server/src/runtime_jobs/board_drive.rs".into()],
+            resolution: None,
+            resolution_note: None,
+        }
+    }
+
+    async fn record(store: crate::db::SharedStore, input: OverlapInput) -> OverlapRecord {
+        let slot = Arc::new(Mutex::new(None));
+        let slot_w = slot.clone();
+        store
+            .write_async(move |conn| {
+                let (record, events) = record_overlap_on_conn(conn, &input, 1_700_000_001)?;
+                *slot_w.lock().unwrap() = Some(record);
+                Ok(WriteOutcome {
+                    applied: true,
+                    events,
+                })
+            })
+            .await
+            .unwrap();
+        let result = slot.lock().unwrap().clone().unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn collision_31768303_vs_7c6f7b80_elects_one_owner_atomically() {
+        let db = store();
+        let left = seed_card(&db, "handoff-producer-0907");
+        let right = seed_card(&db, "handoff-consumer-0907");
+        let (a, b) = tokio::join!(
+            record(
+                db.clone(),
+                input(
+                    left.clone(),
+                    "handoff-producer-0907",
+                    right.clone(),
+                    "handoff-consumer-0907",
+                    "deployment adoption"
+                ),
+            ),
+            record(
+                db.clone(),
+                input(
+                    right,
+                    "handoff-consumer-0907",
+                    left,
+                    "handoff-producer-0907",
+                    "deployment adoption"
+                ),
+            ),
+        );
+        assert_ne!(
+            a.newly_elected, b.newly_elected,
+            "exactly one writer wins the SQLite election"
+        );
+        assert_eq!(a.coordination_id, b.coordination_id);
+        assert_eq!(a.owner_card_id, b.owner_card_id);
+        assert_eq!(a.owner_session, b.owner_session);
+        assert_eq!(
+            a.participants.len(),
+            2,
+            "both late-discovered workers remain visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_concerns_keep_independent_elections_until_explicit_resolution() {
+        let db = store();
+        let a = seed_card(&db, "runtime-owner");
+        let b = seed_card(&db, "invariant-owner");
+        let runtime = record(
+            db.clone(),
+            input(
+                a.clone(),
+                "runtime-owner",
+                b.clone(),
+                "invariant-owner",
+                "runtime truth and recovery",
+            ),
+        )
+        .await;
+        let invariants = record(
+            db,
+            input(
+                b,
+                "invariant-owner",
+                a,
+                "runtime-owner",
+                "invariant measured truth",
+            ),
+        )
+        .await;
+        assert_eq!(runtime.relation, "elected");
+        assert_eq!(invariants.relation, "elected");
+        assert_ne!(runtime.coordination_id, invariants.coordination_id);
+    }
+
+    #[tokio::test]
+    async fn duplicate_cards_evidence_and_assets_converge_without_overwrite() {
+        let db = store();
+        let a = seed_card(&db, "first-worker");
+        let b = seed_card(&db, "second-worker");
+        let first = record(
+            db.clone(),
+            input(
+                a.clone(),
+                "first-worker",
+                b.clone(),
+                "second-worker",
+                "same deploy concern",
+            ),
+        )
+        .await;
+        let mut second_input = input(b, "second-worker", a, "first-worker", "same deploy concern");
+        second_input.evidence = vec!["git merge-base --is-ancestor 31768303 7c6f7b80 -> 1".into()];
+        second_input.assets = vec!["crates/amux-server/src/invariants/checks.rs".into()];
+        let second = record(db, second_input).await;
+        assert_eq!(second.coordination_id, first.coordination_id);
+        assert_eq!(second.role, "peer");
+        assert_eq!(second.participants.len(), 2);
+        assert!(second
+            .evidence
+            .iter()
+            .any(|v| v.contains("show --name-only")));
+        assert!(second.evidence.iter().any(|v| v.contains("merge-base")));
+        assert!(second.assets.iter().any(|v| v.ends_with("board_drive.rs")));
+        assert!(second.assets.iter().any(|v| v.ends_with("checks.rs")));
+    }
+
+    #[tokio::test]
+    async fn late_peer_log_names_the_elected_owner_not_the_reporting_peer() {
+        let db = store();
+        let owner = seed_card(&db, "first-worker");
+        let peer = seed_card(&db, "second-worker");
+        record(db.clone(), input(owner.clone(), "first-worker", peer.clone(), "second-worker", "same concern")).await;
+        let result = record(db.clone(), input(peer.clone(), "second-worker", owner.clone(), "first-worker", "same concern")).await;
+        assert_eq!(result.owner_card_id, owner);
+        let conn = db.read().unwrap();
+        for card in [&owner, &peer] {
+            let row = bs::get_issue(&conn, card).unwrap().unwrap();
+            let log = row.log.unwrap();
+            let latest = log.lines().last().unwrap();
+            assert!(latest.contains(&format!("elected owner [{owner}] (first-worker)")), "lineage contradicts election: {latest}");
+            assert!(latest.contains(&format!("reporter [{peer}] (second-worker)")), "reporter attribution lost: {latest}");
+        }
+    }
+
+    #[tokio::test]
+    async fn readback_keeps_resolution_provenance_and_both_durable_callbacks() {
+        let db = store();
+        let owner = seed_card(&db, "first-worker");
+        let peer = seed_card(&db, "second-worker");
+        let mut report = input(owner.clone(), "first-worker", peer.clone(), "second-worker", "same concern");
+        let elected = record(db.clone(), report.clone()).await;
+        let consumer = input(peer.clone(), "second-worker", owner.clone(), "first-worker", "same concern");
+        record(db.clone(), consumer.clone()).await;
+        report.resolution = Some("scope-split".into());
+        report.resolution_note = Some("first-worker owns server; second-worker owns dashboard".into());
+        record(db.clone(), report.clone()).await;
+        let app = Router::new().nest("/api/board", routes()).with_state(state(db.clone()));
+        let (status, body) = call(&app, "GET", &format!("/api/board/overlap/{}", elected.coordination_id), "first-worker", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let row = &body["coordination"];
+        assert_eq!(row["resolution_note"], report.resolution_note.unwrap());
+        assert_eq!(row["resolved_by_card_id"], owner);
+        assert_eq!(row["relation"], "scope-split");
+        assert_eq!(row["callbacks"].as_array().unwrap().len(), 2);
+        let refs = row["evidence"].as_array().unwrap();
+        assert_eq!(refs.len(), consumer.evidence.len(), "shared references are a union, with provenance retained in storage");
+        assert_eq!(row["participants"][0]["self_reported"], true);
+        // Independent concern names are not evidence that a split was agreed.
+        let other = record(db.clone(), input(peer, "second-worker", owner, "first-worker", "another concern")).await;
+        assert_eq!(other.resolution, "pending");
+        assert_ne!(other.relation, "scope-split");
+    }
+
+    #[tokio::test]
+    async fn retry_appends_one_correction_to_legacy_lineage_without_rewriting_history() {
+        let db = store();
+        let owner = seed_card(&db, "first-worker");
+        let peer = seed_card(&db, "second-worker");
+        let owner_report = input(owner.clone(), "first-worker", peer.clone(), "second-worker", "same concern");
+        let peer_report = input(peer.clone(), "second-worker", owner.clone(), "first-worker", "same concern");
+        let elected = record(db.clone(), owner_report).await;
+        record(db.clone(), peer_report.clone()).await;
+        let wrong = format!("overlap coordination {}: elected owner [{}] (second-worker)", elected.coordination_id, peer);
+        let wrong_w = wrong.clone();
+        let cards = [owner.clone(), peer.clone()];
+        db.write(move |conn| {
+            for id in cards {
+                conn.execute("UPDATE issues SET log=?1 WHERE id=?2", rusqlite::params![wrong_w, id])?;
+            }
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        record(db.clone(), peer_report.clone()).await;
+        let corrected = bs::get_issue(&db.read().unwrap(), &peer).unwrap().unwrap().log.unwrap();
+        assert!(corrected.starts_with(&wrong), "legacy history must remain intact");
+        assert_eq!(corrected.lines().count(), 2, "retry must append a correction");
+        assert!(corrected.lines().last().unwrap().contains(&format!("elected owner [{owner}] (first-worker)")));
+        record(db.clone(), peer_report).await;
+        for id in [owner, peer] {
+            assert_eq!(bs::get_issue(&db.read().unwrap(), &id).unwrap().unwrap().log.unwrap(), corrected,
+                "replay must correct both cards exactly once");
+        }
+    }
+
+    async fn call(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        session: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("x-amux-session", session);
+        let payload = if let Some(body) = body {
+            request = request.header("content-type", "application/json");
+            axum::body::Body::from(body.to_string())
+        } else {
+            axum::body::Body::empty()
+        };
+        let response = app
+            .clone()
+            .oneshot(request.body(payload).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn post(app: &Router, session: &str, body: Value) -> (StatusCode, Value) {
+        call(app, "POST", "/api/board/overlap", session, Some(body)).await
+    }
+
+    #[tokio::test]
+    async fn vanished_peer_and_model_switch_keep_the_handoff_callback_recoverable() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let db = store();
+        let producer = seed_card(&db, "handoff-producer-0907");
+        let consumer = seed_card(&db, "handoff-consumer-0907");
+        let app = Router::new()
+            .nest("/api/board", routes())
+            .with_state(state(db.clone()));
+        let payload = json!({
+                "semantic_key": "controlled-handoff-0907",
+                "concern": "deployment adoption",
+                "card_id": producer,
+                "peer_card_id": consumer,
+                "peer_session": "handoff-consumer-0907",
+                "base_commit": "31768303d1d89d8db9d51aa728e8deb80ca884c5",
+                "head_commit": "7c6f7b802f5af15cb9f4e4c4848a8329e1b72c7b",
+                "worktree": "/tmp/handoff-producer-0907",
+                "intent": "controlled producer to consumer handoff",
+                "evidence": ["producer evidence"],
+                "assets": ["crates/amux-server/src/api/board.rs"]
+            });
+        let mut mismatched_peer = payload.clone();
+        mismatched_peer["peer_session"] = json!("wrong-worker");
+        let (forbidden, rejected) = post(&app, "handoff-producer-0907", mismatched_peer).await;
+        assert_eq!(forbidden, StatusCode::FORBIDDEN);
+        assert_eq!(rejected["code"], "board_overlap_peer_owner_mismatch");
+
+        // Missing worker state is a durable retry, never a fabricated delivery.
+        let (missing, pending) = post(&app, "handoff-producer-0907", payload.clone()).await;
+        assert_eq!(missing, StatusCode::ACCEPTED);
+        assert_eq!(pending["coordination"]["callback"]["state"], "retryable");
+        assert_eq!(pending["coordination"]["callback"]["error"], "no-env-file");
+        // Supply the fixture's own persisted identity; never depend on a real
+        // worker's env file or whichever AMUX_HOME another test selected.
+        std::fs::write(home.path().join("sessions/handoff-consumer-0907.env"), "CC_TAGS=\"test\"\n").unwrap();
+        let (status, reply) = post(&app, "handoff-producer-0907", payload.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a recovered consumer is a durable queued handoff: {reply}"
+        );
+        assert_eq!(reply["delivery"], "queued");
+        assert_eq!(
+            reply["coordination"]["callback"]["target_session"],
+            "handoff-consumer-0907"
+        );
+        let message_id = reply["coordination"]["callback"]["message_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let conn = db.read().unwrap();
+        let queued: String = conn
+            .query_row(
+                "SELECT id FROM steering_queue WHERE id=?1 AND session='handoff-consumer-0907'",
+                [&message_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            queued, message_id,
+            "callback is keyed by durable worker name, not provider/model process state"
+        );
+        let (retry_status, retry) = post(&app, "handoff-producer-0907", payload).await;
+        assert_eq!(retry_status, StatusCode::OK);
+        assert_eq!(retry["coordination"]["callback"]["message_id"], message_id);
+        let callbacks: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM steering_queue WHERE id=?1 AND session='handoff-consumer-0907'",
+                [&message_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(callbacks, 1, "a retry/model switch refreshes one stable callback, never duplicates delivery");
+    }
+
+    #[tokio::test]
+    async fn linked_peer_cannot_complete_or_deploy_until_owner_scope_splits() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        for worker in ["handoff-producer-0907", "handoff-consumer-0907"] {
+            std::fs::write(home.path().join(format!("sessions/{worker}.env")), "CC_TAGS=\"test\"\n").unwrap();
+        }
+        let db = store();
+        let producer = seed_card(&db, "handoff-producer-0907");
+        let consumer = seed_card(&db, "handoff-consumer-0907");
+        let app = Router::new()
+            .nest("/api/board", routes())
+            .with_state(state(db));
+        let payload = json!({
+            "semantic_key": "controlled-handoff-0907",
+            "concern": "deployment adoption",
+            "card_id": producer,
+            "peer_card_id": consumer,
+            "peer_session": "handoff-consumer-0907",
+            "base_commit": "31768303d1d89d8db9d51aa728e8deb80ca884c5",
+            "head_commit": "7c6f7b802f5af15cb9f4e4c4848a8329e1b72c7b",
+            "worktree": "/tmp/handoff-producer-0907",
+            "intent": "controlled producer to consumer handoff",
+            "evidence": ["git merge-base --is-ancestor 31768303 7c6f7b80 -> 1"],
+            "assets": ["crates/amux-server/src/api/board.rs"]
+        });
+        let (created, overlap) = post(&app, "handoff-producer-0907", payload.clone()).await;
+        assert_eq!(created, StatusCode::OK);
+        let coordination_id = overlap["coordination"]["coordination_id"].as_str().unwrap();
+        let producer_card = payload["card_id"].as_str().unwrap().to_string();
+        let consumer_card = payload["peer_card_id"].as_str().unwrap().to_string();
+        // Both cards carry the same durable coordination, reciprocal card id,
+        // source callback id, and merged asset text.  This pins the UI-facing
+        // links rather than only the hidden election rows.
+        for (card, peer) in [
+            (producer_card.as_str(), consumer_card.as_str()),
+            (consumer_card.as_str(), producer_card.as_str()),
+        ] {
+            let (status, detail) = call(
+                &app,
+                "GET",
+                &format!("/api/board/{card}"),
+                "handoff-producer-0907",
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let text = detail.to_string();
+            assert!(text.contains(coordination_id), "card must link the coordination: {text}");
+            assert!(text.contains(peer), "card must link its peer card: {text}");
+            assert!(text.contains("overlap:"), "card must link the durable callback/message: {text}");
+            assert!(text.contains("board.rs"), "card must surface the merged asset reference: {text}");
+        }
+
+        let (blocked, completion) = call(
+            &app,
+            "PATCH",
+            &format!("/api/board/{consumer_card}"),
+            "handoff-consumer-0907",
+            Some(json!({"status":"done", "force":true, "reason":"must not bypass overlap"})),
+        )
+        .await;
+        assert_eq!(blocked, StatusCode::CONFLICT);
+        assert_eq!(completion["code"], "board_overlap_completion_blocked");
+
+        let (blocked_verified, verified_completion) = call(
+            &app,
+            "PATCH",
+            &format!("/api/board/{consumer_card}"),
+            "handoff-consumer-0907",
+            Some(json!({"status":"verified", "force":true, "reason":"must not bypass overlap"})),
+        )
+        .await;
+        assert_eq!(blocked_verified, StatusCode::CONFLICT);
+        assert_eq!(
+            verified_completion["code"],
+            "board_overlap_completion_blocked"
+        );
+
+        let (deployment, permit) = call(
+            &app,
+            "GET",
+            "/api/board/overlap/deployment-permit?session=handoff-consumer-0907",
+            "handoff-consumer-0907",
+            None,
+        )
+        .await;
+        assert_eq!(deployment, StatusCode::CONFLICT);
+        assert_eq!(permit["allowed"], false);
+        assert_eq!(permit["blockers"][0]["coordination_id"], overlap["coordination"]["coordination_id"]);
+
+        let mut resolve = payload;
+        resolve["resolution"] = json!("scope-split");
+        resolve["resolution_note"] = json!("consumer owns a distinct deployment concern after explicit review");
+        let (resolved, _) = post(&app, "handoff-producer-0907", resolve).await;
+        assert_eq!(resolved, StatusCode::OK, "only the elected owner can release the peer");
+
+        let (allowed, completion) = call(
+            &app,
+            "PATCH",
+            &format!("/api/board/{consumer_card}"),
+            "handoff-consumer-0907",
+            Some(json!({"status":"done", "force":true, "reason":"explicit scope split"})),
+        )
+        .await;
+        assert_eq!(allowed, StatusCode::OK, "scope split clears the trigger and the HTTP gate: {completion}");
+
+        let (permit_status, permit) = call(
+            &app,
+            "GET",
+            "/api/board/overlap/deployment-permit?session=handoff-consumer-0907",
+            "handoff-consumer-0907",
+            None,
+        )
+        .await;
+        assert_eq!(permit_status, StatusCode::OK);
+        assert_eq!(permit["allowed"], true);
+    }
+}
+
+/// Record the causal runtime marker for work the owning lane explicitly moved
+/// into `doing`. `amux board doing` and `amux board claim` are both documented
+/// ways to start work; only the latter used to write this marker, leaving the
+/// sessions API with a live Doing card and an unrelated older claim.
 ///
-/// The assignment notifications tell every session to run `amux board claim
-/// <id>`, and the CLI has always POSTed here — but the route was never mounted,
-/// so the call hit the GET-only SPA catch-all (405), the CLI printed a good
-/// message and (pre-fix) exited 0, and the card was untouched (AMUX-3131, the
-/// AMUX-2140 class one layer down: the sanctioned instruction was theatre). It
-/// now runs the SAME operation auto-pickup uses (`claim_card_from`:
-/// compare-and-swap ->doing, assign the claimer, emit `task.claimed` for the
-/// 24h re-claim cooldown), so a manual claim and an auto-pickup are one
-/// mechanism. Backlog is claimable HERE only (AMUX-3450): the CLI help always
-/// promised todo/backlog and a peer handover relied on it, but auto-pickup's
-/// CAS stays todo-only so parking a card mid-race still defeats the pickup.
+/// The state-entry timestamp makes this idempotent per Doing lifecycle. That
+/// matters because `/claim` on an already-owned Doing card is the sanctioned
+/// repair path, and repeated repairs must not inflate the repeat-offer ledger.
+fn ensure_owner_doing_claim(
+    conn: &Connection,
+    row: &IssueRow,
+    actor: &str,
+    source: &str,
+    from: &str,
+) -> rusqlite::Result<bool> {
+    if row.status != "doing" || row.session.as_deref() != Some(actor) {
+        return Ok(false);
+    }
+    let entered = row.entered_state_at.map(|at| at as f64).unwrap_or(0.0);
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_events \
+         WHERE session=?1 AND type='task.claimed' AND ts>=?2 \
+         AND json_extract(data,'$.issue')=?3)",
+        rusqlite::params![actor, entered, row.id],
+        |r| r.get(0),
+    )?;
+    if exists {
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT INTO session_events (ts,session,type,data,source) VALUES (?,?,?,?,?)",
+        rusqlite::params![
+            crate::config::now_f64(),
+            actor,
+            "task.claimed",
+            json!({"issue": row.id, "status": "doing", "from": from}).to_string(),
+            source,
+        ],
+    )?;
+    tracing::info!(
+        target: "amux::board",
+        marker = "owner_doing_claim_recorded",
+        task = %row.id,
+        worker = actor,
+        %source,
+        %from,
+        measured = true,
+        n_considered = 1,
+        "owner-started Doing work now has an exact runtime/board claim marker"
+    );
+    Ok(true)
+}
+
+async fn repair_owned_doing_claim(
+    state: &AppState,
+    session: &str,
+    card: &str,
+) -> anyhow::Result<bool> {
+    let repaired = Arc::new(Mutex::new(false));
+    let repaired_w = repaired.clone();
+    let session = session.to_string();
+    let card = card.to_string();
+    let write = state
+        .store
+        .write_async(move |conn| {
+            let Some(row) = bs::get_issue(conn, &card)? else {
+                return Ok(WriteOutcome { applied: false, events: vec![] });
+            };
+            let inserted = ensure_owner_doing_claim(
+                conn,
+                &row,
+                &session,
+                "board-claim-repair",
+                "doing",
+            )?;
+            *repaired_w.lock().expect("claim repair result slot poisoned") = inserted;
+            Ok(WriteOutcome { applied: inserted, events: vec![] })
+        })
+        .await?;
+    let inserted = *repaired.lock().expect("claim repair result slot poisoned");
+    debug_assert_eq!(write.applied, inserted);
+    Ok(inserted)
+}
+
+/// POST /api/board/{id}/claim — atomically take a `todo` or `backlog` card and
+/// start it. The CLI and auto-pickup share its compare-and-swap ->doing,
+/// assignment, and `task.claimed` event. Backlog remains claimable here while
+/// auto-pickup stays todo-only, so a peer handover cannot race a parked card.
 pub async fn claim_item(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -5521,13 +7037,20 @@ pub async fn claim_item(
                 }
             }
         }
-        "doing" if owner == session => (
-            StatusCode::OK,
-            Json(json!({
-                "ok": true, "id": id, "status": "doing", "session": session, "already": true,
-            })),
-        )
-            .into_response(),
+        "doing" if owner == session => {
+            let attribution_repaired = match repair_owned_doing_claim(&state, &session, &id).await {
+                Ok(v) => v,
+                Err(e) => return internal(e),
+            };
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true, "id": id, "status": "doing", "session": session,
+                    "already": true, "attribution_repaired": attribution_repaired,
+                })),
+            )
+                .into_response()
+        }
         other => (
             StatusCode::CONFLICT,
             Json(json!({
@@ -6764,7 +8287,16 @@ pub async fn patch_item(
             // with stale prose and turn an idempotent retry into a second
             // applied write. A new terminal entry still flows through the
             // normal setter and save_patched replaces it atomically.
+            let reopening_terminal_card = bs::is_terminal_status(&row.status)
+                && map
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .and_then(bs::parse_status)
+                    .is_some_and(|target| {
+                        !bs::is_terminal_status(bs::db_status_spelling(target))
+                    });
             let terminal_summary_locked = bs::is_terminal_status(&row.status)
+                && !reopening_terminal_card
                 && row
                     .last_result
                     .as_deref()
@@ -7609,23 +9141,37 @@ pub async fn patch_item(
                         // a reproducible command, but a command is not a
                         // produced asset. Keep the documented honest no-asset
                         // escape, and otherwise require an actual pointer.
-                        let evidence_names_artifact = next.evidence.as_deref().is_some_and(|e| {
-                            bs::has_asset_link(e)
-                                || (e.trim().to_ascii_lowercase().starts_with("none:")
-                                    && bs::evidence_verdict(e) == bs::EvidenceVerdict::Ok)
-                        });
                         // The explicit artifact registry is the canonical
                         // structured path. Requiring its ref to be duplicated
                         // in prose made a successful `amux board artifact`
                         // write insufficient to close its own task.
-                        let registered_artifact = crate::db::artifact_store::list_for_task(
-                            conn,
-                            &next.id,
-                        )?
-                        .iter()
-                        .any(|a| !a.ref_value.trim().is_empty());
-                        let has_link = bs::has_asset_link(&next.desc)
-                            || next.log.as_deref().is_some_and(bs::has_asset_link)
+                        let registered_artifacts =
+                            crate::db::artifact_store::list_for_task(conn, &next.id)?;
+                        let retired_refs: HashSet<&str> = registered_artifacts
+                            .iter()
+                            .filter(|a| crate::db::artifact_store::is_retired_state(&a.state))
+                            .map(|a| a.ref_value.as_str())
+                            .collect();
+                        let text_has_active_asset = |text: &str| {
+                            bs::asset_refs(text)
+                                .iter()
+                                .any(|reference| !retired_refs.contains(reference.as_str()))
+                        };
+                        // A durable invalid/superseded disposition must apply
+                        // everywhere evidence is consumed, not only in the UI.
+                        // Otherwise the retired ref can still satisfy this
+                        // gate by being repeated in --evidence.
+                        let evidence_names_artifact = next.evidence.as_deref().is_some_and(|e| {
+                            text_has_active_asset(e)
+                                || (e.trim().to_ascii_lowercase().starts_with("none:")
+                                    && bs::evidence_verdict(e) == bs::EvidenceVerdict::Ok)
+                        });
+                        let registered_artifact = registered_artifacts.iter().any(|a| {
+                            !a.ref_value.trim().is_empty()
+                                && !crate::db::artifact_store::is_retired_state(&a.state)
+                        });
+                        let has_link = text_has_active_asset(&next.desc)
+                            || next.log.as_deref().is_some_and(text_has_active_asset)
                             || evidence_names_artifact
                             || registered_artifact;
                         if !has_link {
@@ -7916,6 +9462,66 @@ pub async fn patch_item(
                     // The gate is on the TRANSITION, never on the 445 already
                     // there: a retroactive sweep would be this same guess made
                     // once more, at scale, by the party least able to check it
+                    // A force may bypass a workflow gate with an attributed
+                    // audit trail. It must NOT let a linked peer publish a
+                    // second completion: overlap ownership is work identity,
+                    // not a checklist preference. Migration 0057 repeats this
+                    // predicate for alternate writers; this branch supplies an
+                    // actionable 409 instead of a raw SQLite error.
+                    if matches!(target, TaskStatus::Done | TaskStatus::Verified) {
+                        match overlap_completion_blockers(conn, Some(&next.id), None) {
+                            Ok(blockers) if !blockers.is_empty() => {
+                                let blocker = &blockers[0];
+                                tracing::warn!(
+                                    marker = "board_overlap_completion_refused",
+                                    card = %next.id,
+                                    attempted = %bs::db_status_spelling(target),
+                                    coordination = %blocker.coordination_id,
+                                    owner_card = %blocker.owner_card_id,
+                                    owner_session = %blocker.owner_session,
+                                    "linked non-owner completion refused before an independent Done/Verified declaration"
+                                );
+                                return finish(
+                                    &slot_w,
+                                    PatchOut::Refused(
+                                        StatusCode::CONFLICT,
+                                        json!({
+                                            "error": "overlap reconciliation blocks independent completion",
+                                            "code": "board_overlap_completion_blocked",
+                                            "ok": false,
+                                            "blocked": true,
+                                            "item": next.id,
+                                            "attempted_status": bs::db_status_spelling(target),
+                                            "overlap": blocker,
+                                            "how_to_fix": "Do not force this. Ask the elected owner to record an explicit scope-split or released reconciliation; merged work remains owned by the elected card.",
+                                        }),
+                                    ),
+                                    no_write(),
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(
+                                    marker = "board_overlap_completion_unmeasured",
+                                    card = %next.id,
+                                    error = %e,
+                                    "completion refused because overlap ownership could not be measured"
+                                );
+                                return finish(
+                                    &slot_w,
+                                    PatchOut::Refused(
+                                        StatusCode::SERVICE_UNAVAILABLE,
+                                        json!({
+                                            "error": "overlap ownership could not be measured; refusing completion rather than guessing",
+                                            "code": "board_overlap_completion_unmeasured",
+                                            "measured": false,
+                                        }),
+                                    ),
+                                    no_write(),
+                                );
+                            }
+                        }
+                    }
                     // (ethos rule 8). They drain by being re-asked.
                     // THE CONTINUATION GATE, on the same door and by the same
                     // shape (AMUX-3946). A card entering `doing` must say what
@@ -8699,6 +10305,17 @@ pub async fn patch_item(
             }
             next.updated = now_secs();
             bs::save_patched(conn, &mut next)?;
+            if let Some((from, to)) = &status_event {
+                if to == "doing" {
+                    ensure_owner_doing_claim(
+                        conn,
+                        &next,
+                        &actor_name,
+                        "board-patch",
+                        from,
+                    )?;
+                }
+            }
             // AF-137 / AMUX-3464: retiring an auto-filed REPORT re-arms its
             // detector. The filing dedupe is a PERMANENT session_events idem
             // row ("a restart must not refile"), so a discarded report whose
@@ -10131,6 +11748,7 @@ async fn create_artifact(
 async fn patch_artifact(
     State(state): State<AppState>,
     Path((id, aid)): Path<(String, String)>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
     let new_state = body.get("state").and_then(|v| v.as_str()).map(|s| s.to_string());
@@ -10152,8 +11770,10 @@ async fn patch_artifact(
         }
     }
     let now = chrono::Utc::now().timestamp();
+    let (_, actor) = actor_from_headers(&headers);
     let task_for_log = id.clone();
     let aid_for_log = aid.clone();
+    let state_for_log = new_state.clone();
     let write = state.store.write_async(move |conn| {
         if bs::get_issue(conn, &id)?.is_none() {
             return Err(rusqlite::Error::QueryReturnedNoRows);
@@ -10183,7 +11803,24 @@ async fn patch_artifact(
         })
     }).await;
     match write {
-        Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
+        Ok(_) => {
+            if let Some(ref disposition) = state_for_log {
+                if crate::db::artifact_store::is_retired_state(disposition) {
+                    tracing::warn!(
+                        target: "amux::board",
+                        marker = "artifact_retired",
+                        task = %task_for_log,
+                        artifact = %aid_for_log,
+                        worker = %actor,
+                        state = %disposition,
+                        measured = true,
+                        n_considered = 1,
+                        "board artifact retained for audit but retired from valid produced assets"
+                    );
+                }
+            }
+            (StatusCode::OK, Json(json!({"ok": true}))).into_response()
+        }
         Err(e) if is_missing_task(&e) => {
             tracing::warn!(
                 marker = "artifact_target_missing",

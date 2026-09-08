@@ -505,7 +505,10 @@ _UPGRADE_HTML = """<!DOCTYPE html>
     <div class="logout"><a href="/api/cloud-logout">Log out</a></div>
   </div>
   <script>
+    let _checkingOut = false;
     async function checkout(billing) {
+      if (_checkingOut) return;   // in-flight guard: a rapid double-click or retry
+      _checkingOut = true;        // loop otherwise fires N POSTs -> N Stripe sessions
       document.getElementById('error').textContent = '';
       try {
         const r = await fetch('/api/stripe/checkout', {
@@ -513,9 +516,10 @@ _UPGRADE_HTML = """<!DOCTYPE html>
           body: JSON.stringify({ billing })
         });
         const d = await r.json();
-        if (d.url) location.href = d.url;
-        else document.getElementById('error').textContent = d.error || 'Failed to start checkout';
+        if (d.url) { location.href = d.url; return; }  // success navigates away; leave guard set
+        document.getElementById('error').textContent = d.error || 'Failed to start checkout';
       } catch(e) { document.getElementById('error').textContent = 'Connection error'; }
+      _checkingOut = false;       // reset only on failure, so the user can retry
     }
   </script>
 </body>
@@ -588,7 +592,10 @@ _BUDGET_HTML = """<!DOCTYPE html>
     <div class="logout"><a href="/api/cloud-logout">Log out</a></div>
   </div>
   <script>
+    let _checkingOut = false;
     async function checkout(billing) {
+      if (_checkingOut) return;   // in-flight guard: a rapid double-click or retry
+      _checkingOut = true;        // loop otherwise fires N POSTs -> N Stripe sessions
       document.getElementById('error').textContent = '';
       try {
         const r = await fetch('/api/stripe/checkout', {
@@ -596,9 +603,10 @@ _BUDGET_HTML = """<!DOCTYPE html>
           body: JSON.stringify({ billing: billing, platform_fee: true })
         });
         const d = await r.json();
-        if (d.url) location.href = d.url;
-        else document.getElementById('error').textContent = d.error || 'Failed to start checkout';
+        if (d.url) { location.href = d.url; return; }  // success navigates away; leave guard set
+        document.getElementById('error').textContent = d.error || 'Failed to start checkout';
       } catch(e) { document.getElementById('error').textContent = 'Connection error'; }
+      _checkingOut = false;       // reset only on failure, so the user can retry
     }
   </script>
 </body>

@@ -159,6 +159,8 @@ pub static PANE_CAPTURE_TIMEOUTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static PANE_CAPTURE_LAST_TIMEOUT: std::sync::Mutex<Option<(String, f64)>> =
     std::sync::Mutex::new(None);
+pub static PANE_CAPTURE_LAST_TIMEOUT_DETAIL: std::sync::Mutex<Option<serde_json::Value>> =
+    std::sync::Mutex::new(None);
 
 /// One `tmux capture-pane`, bounded.
 ///
@@ -223,82 +225,128 @@ fn probe_budget() -> std::time::Duration {
 /// and stderr when tmux fails, and converting it to the stdout-only helper
 /// would have silently dropped that diagnostic to buy the timeout. Widening the
 /// helper keeps both.
+/// Drain both output pipes while polling the child. Waiting for exit first
+/// deadlocks as soon as either pipe fills, then misreports amux's unread pipe
+/// as a stalled tmux server (AMUX-4203). The deadline also covers pipe EOF:
+/// a descendant can keep a pipe open after the direct child has exited.
 fn run_bounded_output(
     mut cmd: std::process::Command,
     budget: std::time::Duration,
     lane: &str,
 ) -> Option<std::process::Output> {
-    let mut child = cmd.spawn().ok()?;
+    use std::io::{self, Read};
+    use std::os::fd::AsRawFd;
+
+    fn nonblocking(pipe: &impl AsRawFd) -> io::Result<()> {
+        // SAFETY: pipe owns this valid descriptor throughout both fcntl calls.
+        let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
+        if flags == -1 || unsafe {
+            libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+        } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn drain(pipe: &mut Option<impl Read>, bytes: &mut Vec<u8>) -> io::Result<bool> {
+        let mut progressed = false;
+        let mut buf = [0; 8192];
+        // Fairness per pass, not an output limit: revisit the deadline and the
+        // other pipe even when a producer writes continuously.
+        for _ in 0..32 {
+            let Some(reader) = pipe.as_mut() else { break };
+            match reader.read(&mut buf) {
+                Ok(0) => { *pipe = None; break; }
+                Ok(n) => { bytes.extend_from_slice(&buf[..n]); progressed = true; }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(progressed)
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            tracing::warn!(target: "amux::sessions", lane, %error,
+                verdict = "probe_spawn_failed", measured = false,
+                "fleet probe could not start; no tmux response was measured");
+            return None;
+        }
+    };
+    let pid = child.id();
     let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if start.elapsed() >= budget {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    PANE_CAPTURE_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if let Ok(mut l) = PANE_CAPTURE_LAST_TIMEOUT.lock() {
-                        *l = Some((lane.to_string(), crate::config::now_f64()));
-                    }
-                    tracing::warn!(
-                        target: "amux::sessions",
-                        lane = %lane,
-                        budget_s = budget.as_secs_f64(),
-                        "fleet-list probe exceeded its budget and was killed (AF-301). Before \
-                         this bound the same call was a bare `.output()` with no timeout, and a \
-                         wedged tmux held GET /api/sessions for as long as tmux took — 697s on \
-                         2026-08-28, which starved the runtime and 500'd the dashboard."
-                    );
-                    return None;
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut status = None;
+    let result = (|| -> io::Result<Option<std::process::Output>> {
+        if let Some(pipe) = &stdout_pipe { nonblocking(pipe)?; }
+        if let Some(pipe) = &stderr_pipe { nonblocking(pipe)?; }
+        loop {
+            let stdout_progress = drain(&mut stdout_pipe, &mut stdout)?;
+            let stderr_progress = drain(&mut stderr_pipe, &mut stderr)?;
+            if status.is_none() { status = child.try_wait()?; }
+            if let Some(status) = status {
+                if stdout_pipe.is_none() && stderr_pipe.is_none() {
+                    return Ok(Some(std::process::Output {
+                        status, stdout: std::mem::take(&mut stdout), stderr: std::mem::take(&mut stderr),
+                    }));
                 }
+            }
+            if start.elapsed() >= budget { return Ok(None); }
+            if !stdout_progress && !stderr_progress {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            Err(_) => return None,
+        }
+    })();
+    match result {
+        Ok(Some(out)) => Some(out),
+        failure => {
+            let _ = child.kill();
+            let _ = child.wait();
+            match failure {
+                Ok(None) => {
+                    PANE_CAPTURE_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let now = crate::config::now_f64();
+                    if let Ok(mut last) = PANE_CAPTURE_LAST_TIMEOUT.lock() {
+                        *last = Some((lane.to_string(), now));
+                    }
+                    let phase = if status.is_some() { "pipe_eof" } else { "child_exit" };
+                    let detail = json!({"measured": true, "n_considered": 1,
+                        "lane": lane, "pid": pid, "ts": now, "phase": phase,
+                        "elapsed_s": start.elapsed().as_secs_f64(), "budget_s": budget.as_secs_f64(),
+                        "stdout_bytes": stdout.len(), "stderr_bytes": stderr.len(),
+                        "child_exited": status.is_some()});
+                    if let Ok(mut last) = PANE_CAPTURE_LAST_TIMEOUT_DETAIL.lock() { *last = Some(detail.clone()); }
+                    tracing::warn!(target: "amux::sessions", lane, pid, phase,
+                        budget_s = budget.as_secs_f64(), elapsed_s = start.elapsed().as_secs_f64(),
+                        stdout_bytes = stdout.len(), stderr_bytes = stderr.len(),
+                        verdict = "probe_output_timeout",
+                        "fleet probe exceeded its deadline while draining output; partial output is discarded (AMUX-4203)");
+                    crate::backend::tmux_health::capture_after_probe_timeout(detail);
+                }
+                Err(error) => {
+                    tracing::warn!(target: "amux::sessions", lane, pid, %error,
+                        stdout_bytes = stdout.len(), stderr_bytes = stderr.len(),
+                        verdict = "probe_output_io_failed", "fleet probe output could not be measured");
+                }
+                Ok(Some(_)) => unreachable!(),
+            }
+            None
         }
     }
-    child.wait_with_output().ok()
 }
 
 fn run_bounded(
-    mut cmd: std::process::Command,
+    cmd: std::process::Command,
     budget: std::time::Duration,
     lane: &str,
 ) -> Option<String> {
-    use std::io::Read;
-    let mut child = cmd.spawn().ok()?;
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if start.elapsed() >= budget {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    PANE_CAPTURE_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if let Ok(mut l) = PANE_CAPTURE_LAST_TIMEOUT.lock() {
-                        *l = Some((lane.to_string(), crate::config::now_f64()));
-                    }
-                    tracing::warn!(
-                        target: "amux::sessions",
-                        lane = %lane,
-                        budget_s = budget.as_secs_f64(),
-                        "tmux capture-pane exceeded its budget and was killed — this lane's \
-                         preview is absent this round (AMUX-3700). Before this bound, one hung \
-                         capture blocked GET /api/sessions for as long as tmux took."
-                    );
-                    return None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            Err(_) => return None,
-        }
-    }
-    // Small payload (30 lines), so the pipe cannot fill and deadlock the child
-    // before it exits; reading after the wait is safe here for that reason.
-    let mut s = String::new();
-    child.stdout.take()?.read_to_string(&mut s).ok()?;
-    Some(s.trim().to_string())
+    let out = run_bounded_output(cmd, budget, lane)?;
+    String::from_utf8(out.stdout).ok().map(|s| s.trim().to_string())
 }
 
 /// Derive the waiting_reason from a pane capture: "permission_prompt",
@@ -1736,6 +1784,7 @@ impl FleetSignals {
             ex.insert("codex_rollout".into(), json!({
                 "state": signal.state,
                 "boundary": signal.boundary,
+                "rollout_file": signal.rollout_file,
                 "age_s": (self.now - signal.ts).max(0.0),
                 "from_this_life": from_this_life,
                 "applied": from_this_life,
@@ -2131,6 +2180,247 @@ fn resolve_task_name(
         (t.to_string(), "board")
     } else {
         (desc.to_string(), "desc")
+    }
+}
+
+/// Reconcile the runtime verdict with the board attribution exposed by the
+/// sessions API.
+///
+/// `active` is a stronger claim than "the pane exists": it says the model is
+/// working on either one exact, still-owned `doing` card or on an explicitly
+/// cardless informational/control turn. A missing or stale card reference must
+/// not retain the ordinary WORKING status, because every dashboard consumer
+/// would otherwise present runtime activity and board ownership as two
+/// contradictory truths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeBoardTruth {
+    status: String,
+    card_id: String,
+    card_live: bool,
+    verdict: &'static str,
+    measured: bool,
+    n_considered: usize,
+    violation: bool,
+}
+
+/// A causal marker emitted by direct delivery or runtime task ownership.
+///
+/// Markers are retained as a timeline: a later control/cardless turn cannot
+/// erase an earlier claim while that card still exists as this lane's Doing
+/// work. The board row is the release signal, so no second, lossy ownership
+/// state is needed here.
+type TaskMarker = (f64, Option<String>, bool, String);
+
+struct RuntimeMarkerSelection<'a> {
+    marker: Option<&'a TaskMarker>,
+    conflicting_live_claims: bool,
+    newer_cardless_suppressed: bool,
+}
+
+/// The surviving exact `task.claimed` identities behind runtime reconciliation.
+///
+/// Kept as a small shared primitive because recovery dispatch must make the
+/// same ownership decision the sessions API publishes: one exact live claim is
+/// actionable even beside unrelated Doing rows; two distinct ones are an
+/// explicit ambiguity, never a newest-row guess.
+pub(crate) fn surviving_claimed_card_ids(
+    markers: &[TaskMarker],
+    session: &str,
+    doing_by_id: &BTreeMap<String, (String, String, i64)>,
+) -> BTreeSet<String> {
+    markers
+        .iter()
+        .filter_map(|marker| {
+            let card = marker.1.as_deref()?;
+            doing_by_id
+                .get(card)
+                .filter(|(owner, _, _)| owner == session)
+                .map(|_| card.to_string())
+        })
+        .collect()
+}
+
+/// Select the causal marker which describes this runtime now.
+///
+/// A still-live claimed card is sticky across later informational/control
+/// prompts. If two distinct claimed cards are live, naming either would be a
+/// guess, so retain the newest only as diagnostic evidence and publish the
+/// conflict to reconciliation instead.
+fn select_runtime_marker<'a>(
+    markers: &'a [TaskMarker],
+    started_at: f64,
+    session: &str,
+    doing_by_id: &BTreeMap<String, (String, String, i64)>,
+) -> RuntimeMarkerSelection<'a> {
+    let live_claims: Vec<&TaskMarker> = markers
+        .iter()
+        .filter(|marker| {
+            // A Doing row is the durable release boundary. A process/runtime
+            // restart must not make an earlier claimed card stale while the
+            // board still says this lane owns it.
+            marker.1.as_deref().is_some_and(|card| {
+                doing_by_id
+                    .get(card)
+                    .is_some_and(|(owner, _, _)| owner == session)
+            })
+        })
+        .collect();
+    let distinct_live_claims = surviving_claimed_card_ids(markers, session, doing_by_id);
+    if let Some(marker) = live_claims
+        .into_iter()
+        .max_by(|left, right| left.0.total_cmp(&right.0))
+    {
+        return RuntimeMarkerSelection {
+            marker: Some(marker),
+            conflicting_live_claims: distinct_live_claims.len() > 1,
+            newer_cardless_suppressed: markers
+                .iter()
+                .any(|other| other.0 >= started_at && other.2 && other.0 > marker.0),
+        };
+    }
+    RuntimeMarkerSelection {
+        marker: markers
+            .iter()
+            .filter(|marker| marker.0 >= started_at)
+            .max_by(|left, right| left.0.total_cmp(&right.0)),
+        conflicting_live_claims: false,
+        newer_cardless_suppressed: false,
+    }
+}
+
+fn reconcile_runtime_board(
+    running: bool,
+    runtime_status: &str,
+    claimed_card: Option<&str>,
+    claimed_card_valid: bool,
+    conflicting_live_claims: bool,
+    cardless_allowed: bool,
+    doing_count: usize,
+) -> RuntimeBoardTruth {
+    let claimed = claimed_card.unwrap_or_default().trim();
+    if !running {
+        return RuntimeBoardTruth {
+            status: String::new(),
+            card_id: String::new(),
+            card_live: false,
+            verdict: "not-running",
+            measured: true,
+            n_considered: doing_count,
+            violation: false,
+        };
+    }
+    if runtime_status != "active" {
+        return RuntimeBoardTruth {
+            status: runtime_status.to_string(),
+            card_id: if claimed_card_valid { claimed.to_string() } else { String::new() },
+            card_live: false,
+            verdict: "runtime-not-active",
+            measured: true,
+            n_considered: doing_count,
+            violation: false,
+        };
+    }
+    // One exact live causal marker is stronger evidence than an aggregate
+    // count: other Doing rows can be stale, subagent-owned, or unrelated.
+    // Only distinct surviving claimed identities make the runtime ambiguous.
+    if !claimed.is_empty() && claimed_card_valid && !conflicting_live_claims {
+        return RuntimeBoardTruth {
+            status: "active".into(),
+            card_id: claimed.to_string(),
+            card_live: true,
+            verdict: "linked",
+            measured: true,
+            n_considered: doing_count,
+            violation: false,
+        };
+    }
+    if claimed.is_empty() && cardless_allowed && !conflicting_live_claims {
+        return RuntimeBoardTruth {
+            status: "active".into(),
+            card_id: String::new(),
+            card_live: false,
+            verdict: "cardless-allowed",
+            measured: true,
+            n_considered: doing_count,
+            violation: false,
+        };
+    }
+    RuntimeBoardTruth {
+        // Preserve the physical activity as a distinct state for diagnostics,
+        // but do not publish the ordinary WORKING value without its board
+        // operand. The build-array integration logs this violation.
+        status: "unattributed".into(),
+        card_id: String::new(),
+        card_live: false,
+        verdict: if conflicting_live_claims {
+            "active-conflicting-claims"
+        } else if claimed.is_empty() {
+            "active-without-card"
+        } else if claimed_card_valid {
+            "active-multiple-doing"
+        } else {
+            "active-card-invalid"
+        },
+        measured: true,
+        n_considered: doing_count,
+        violation: true,
+    }
+}
+
+fn announce_runtime_board_truth(
+    session: &str,
+    runtime_status: &str,
+    observed_card: &str,
+    truth: &RuntimeBoardTruth,
+) {
+    static ACTIVE_VIOLATIONS: std::sync::OnceLock<std::sync::Mutex<BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    let active = ACTIVE_VIOLATIONS.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()));
+    let Ok(mut active) = active.lock() else { return };
+    if truth.violation {
+        if active.insert(session.to_string()) {
+            tracing::warn!(
+                target: "amux::sessions",
+                %session,
+                runtime_status,
+                observed_card,
+                verdict = truth.verdict,
+                measured = truth.measured,
+                n_considered = truth.n_considered,
+                "runtime/board truth violation: WORKING withheld until one exact live card is attributable"
+            );
+        }
+    } else if active.remove(session) {
+        tracing::info!(
+            target: "amux::sessions",
+            %session,
+            verdict = truth.verdict,
+            measured = truth.measured,
+            n_considered = truth.n_considered,
+            "runtime/board truth healed"
+        );
+    }
+}
+
+/// A cardless marker is a turn classification, not an implicit release. Log
+/// the precedence once per active lane so a fleet sweep can find this causal
+/// edge without turning normal polling into log noise.
+fn announce_sticky_runtime_claim(session: &str, observed_card: &str, suppressed: bool) {
+    static STICKY_CLAIMS: std::sync::OnceLock<std::sync::Mutex<BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    let active = STICKY_CLAIMS.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()));
+    let Ok(mut active) = active.lock() else { return };
+    if suppressed {
+        if active.insert(session.to_string()) {
+            tracing::info!(
+                target: "amux::sessions",
+                %session,
+                observed_card,
+                "runtime/board sticky claim preserved across a later cardless control marker"
+            );
+        }
+    } else {
+        active.remove(session);
     }
 }
 
@@ -2895,6 +3185,20 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             "task_time": 0,
             "task_updated": 0,
             "task_board_id": "",
+            // The client treats an unmeasured verdict as synchronizing, never
+            // as a licence to display WORKING beside a generic description.
+            // The reconciliation below replaces this on every successful list
+            // build; its presence also makes an old/incomplete snapshot honest.
+            "runtime_board": {
+                "measured": false,
+                "status": "unmeasured",
+                "verdict": "unmeasured",
+                "card_id": serde_json::Value::Null,
+                "card_count": 0,
+                "n_considered": 0,
+                "card_live": false,
+                "violation": false,
+            },
             "task_board_age": 0,
             "sched_on": 0,
             "sched_off": 0,
@@ -2992,6 +3296,16 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
             "task_override": "",
             "task_override_updated": 0,
             "task_board_id": "",
+            "runtime_board": {
+                "measured": false,
+                "status": "unmeasured",
+                "verdict": "unmeasured",
+                "card_id": serde_json::Value::Null,
+                "card_count": 0,
+                "n_considered": 0,
+                "card_live": false,
+                "violation": false,
+            },
             "task_updated": 0,
             "task_board_age": 0,
             "last_activity": 0,
@@ -3028,6 +3342,8 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
              ORDER BY updated ASC",
         )?;
         let mut doing: BTreeMap<String, (String, String, i64)> = BTreeMap::new();
+        let mut doing_by_id: BTreeMap<String, (String, String, i64)> = BTreeMap::new();
+        let mut doing_counts: BTreeMap<String, usize> = BTreeMap::new();
         for row in stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -3037,14 +3353,149 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
             ))
         })? {
             let (sess, id, title, updated) = row?;
+            *doing_counts.entry(sess.clone()).or_default() += 1;
+            doing_by_id.insert(id.clone(), (sess.clone(), title.clone(), updated));
             doing.insert(sess, (id, title, updated));
+        }
+
+        // Exact runtime attribution is a causal fact, not "whichever doing
+        // card was edited last". A directly delivered human prompt is linked
+        // atomically through cmd_history.card_id; manual/automatic pickup emits
+        // task.claimed. Keep the whole causal timeline: a newer cardless
+        // control prompt is not a release of a still-live claimed card.
+        let mut task_markers: BTreeMap<String, Vec<TaskMarker>> = BTreeMap::new();
+        if let Ok(mut messages) = conn.prepare(
+            "SELECT session, text, card_id, ts FROM cmd_history \
+             WHERE type='user' AND COALESCE(submit_verdict,'') <> 'stuck' \
+             ORDER BY ts ASC, id ASC",
+        ) {
+            let rows = messages.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (session, text, card_id, ts_ms) = row?;
+                let card_id = card_id.filter(|id| !id.trim().is_empty());
+                let cardless = card_id.is_none()
+                    && (amux_core::board::title_from_prompt(&text).is_none()
+                        || amux_core::board::is_informational_query(&text));
+                if card_id.is_some() || cardless {
+                    task_markers
+                        .entry(session)
+                        .or_default()
+                        .push((
+                            ts_ms as f64 / 1000.0,
+                            card_id,
+                            cardless,
+                            if cardless { "cardless-prompt" } else { "message-card" }.into(),
+                        ));
+                }
+            }
+        }
+        if let Ok(mut events) = conn.prepare(
+            "SELECT session, type, data, ts FROM session_events \
+             WHERE type IN ('task.claimed','task.cardless') ORDER BY ts ASC, id ASC",
+        ) {
+            let rows = events.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, f64>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (session, kind, data, ts) = row?;
+                let parsed = data
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                let card_id = parsed["issue"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string);
+                let cardless = kind == "task.cardless";
+                if card_id.is_some() || cardless {
+                    task_markers
+                        .entry(session)
+                        .or_default()
+                        .push((ts, card_id, cardless, kind));
+                }
+            }
         }
         let now = signals.now as i64;
         for v in out.iter_mut() {
             let Some(name) = v["name"].as_str().map(String::from) else {
                 continue;
             };
-            let board = doing.get(&name);
+            let runtime_status = v["status"].as_str().unwrap_or("").to_string();
+            let running = v["running"].as_bool().unwrap_or(false);
+            let selection = task_markers
+                .get(&name)
+                .map(|markers| {
+                    select_runtime_marker(
+                        markers,
+                        signals.started.get(&name).copied().unwrap_or(0.0),
+                        &name,
+                        &doing_by_id,
+                    )
+                })
+                .unwrap_or(RuntimeMarkerSelection {
+                    marker: None,
+                    conflicting_live_claims: false,
+                    newer_cardless_suppressed: false,
+                });
+            let marker = selection.marker;
+            let observed_card = marker
+                .and_then(|(_, card, _, _)| card.as_deref())
+                .unwrap_or("");
+            let exact_board = if observed_card.is_empty() {
+                None
+            } else {
+                doing_by_id.get(observed_card)
+            }
+            .filter(|(owner, _, _)| owner == &name);
+            // At a boundary, preserve the existing WIP label fallback. During
+            // active runtime only the causal marker may name the live card.
+            let board = (!selection.conflicting_live_claims || runtime_status != "active")
+                .then_some(exact_board)
+                .flatten()
+                .or_else(|| {
+                if runtime_status == "active" { None } else { doing.get(&name) }
+                });
+            let causal_card = marker.and_then(|(_, card, _, _)| card.as_deref());
+            // `doing_by_id` intentionally stores (owner, title, updated), so
+            // its first tuple field is the lane name—not the card id. Keep the
+            // causal marker's ID when it still matches that row, including at
+            // an idle boundary; only a markerless WIP fallback reads `doing`.
+            let (claimed_card, claimed_card_valid) = if causal_card.is_some() && exact_board.is_some() {
+                (causal_card, true)
+            } else if runtime_status == "active" {
+                (causal_card, exact_board.is_some())
+            } else {
+                (board.map(|(id, _, _)| id.as_str()), board.is_some())
+            };
+            let doing_count = doing_counts.get(&name).copied().unwrap_or(0);
+            let truth = reconcile_runtime_board(
+                running,
+                &runtime_status,
+                claimed_card,
+                claimed_card_valid,
+                selection.conflicting_live_claims,
+                marker.is_some_and(|(_, _, cardless, _)| *cardless),
+                doing_count,
+            );
+            announce_runtime_board_truth(&name, &runtime_status, observed_card, &truth);
+            announce_sticky_runtime_claim(
+                &name,
+                observed_card,
+                selection.newer_cardless_suppressed,
+            );
             let board_updated = board.map(|(_, _, u)| *u).unwrap_or(0);
             let board_fresh = board.is_some() && now - board_updated <= 86400;
             let meta = load_meta(&name);
@@ -3079,8 +3530,25 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
             v["task_source"] = json!(tsrc);
             v["task_override"] = json!(summary);
             v["task_override_updated"] = json!(summary_ts);
-            v["task_board_id"] =
-                json!(if tsrc == "board" { board.map(|(i, _, _)| i.clone()).unwrap_or_default() } else { String::new() });
+            v["status"] = json!(truth.status);
+            v["task_board_id"] = json!(truth.card_id);
+            v["runtime_board"] = json!({
+                "measured": truth.measured,
+                // `status` is the compact client contract; retain the
+                // descriptive `verdict` spelling for logs and older clients.
+                "status": truth.verdict,
+                "n_considered": truth.n_considered,
+                "card_count": truth.n_considered,
+                "verdict": truth.verdict,
+                "violation": truth.violation,
+                "runtime_status": runtime_status,
+                "card_live": truth.card_live,
+                "card_id": if truth.card_id.is_empty() { serde_json::Value::Null } else { json!(truth.card_id) },
+                "observed_card_id": if observed_card.is_empty() { serde_json::Value::Null } else { json!(observed_card) },
+                "source": marker.map(|(_, _, _, source)| source.as_str()).unwrap_or("none"),
+                "cardless_allowed": marker.is_some_and(|(_, _, cardless, _)| *cardless),
+                "cardless_suppressed_by_live_claim": selection.newer_cardless_suppressed,
+            });
             // A summary-sourced task now carries its own stamp (AMUX-2676);
             // it is 0 only for tasks written before that existed, and 0 still
             // means "unknown" rather than "just now" — the client must not
@@ -3468,6 +3936,50 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
 #[cfg(test)]
 mod tests {
     use super::*;
+    static PROBE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn bounded_probe_drains_large_stdout_and_stderr_before_waiting() {
+        let _guard = PROBE_TEST_LOCK.lock().unwrap();
+        use std::process::{Command, Stdio};
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "head -c 262144 /dev/zero; head -c 262144 /dev/zero >&2"])
+            .stdout(Stdio::piped()).stderr(Stdio::piped());
+        let out = run_bounded_output(cmd, std::time::Duration::from_secs(3), "large-probe")
+            .expect("a productive child must not be killed because amux left its output pipe full");
+        assert!(out.status.success());
+        assert_eq!(out.stdout, vec![0; 262144]);
+        assert_eq!(out.stderr, vec![0; 262144]);
+    }
+
+    #[test]
+    fn bounded_probe_pane_capture_preserves_large_output() {
+        let _guard = PROBE_TEST_LOCK.lock().unwrap();
+        use std::process::{Command, Stdio};
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "head -c 262144 /dev/zero"])
+            .stdout(Stdio::piped()).stderr(Stdio::null());
+        let out = run_bounded(cmd, std::time::Duration::from_secs(3), "large-pane")
+            .expect("pane length in lines does not bound bytes in its output pipe");
+        assert_eq!(out.as_bytes(), vec![0; 262144]);
+    }
+
+    #[test]
+    fn bounded_probe_deadline_survives_continuous_output_and_inherited_pipes() {
+        let _guard = PROBE_TEST_LOCK.lock().unwrap();
+        use std::process::{Command, Stdio};
+        for (script, phase) in [("exec yes x", "child_exit"), ("sleep 2 & printf finished", "pipe_eof")] {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", script]).stdout(Stdio::piped()).stderr(Stdio::null());
+            let started = std::time::Instant::now();
+            assert!(run_bounded_output(cmd, std::time::Duration::from_millis(150), "deadline-probe").is_none());
+            assert!(started.elapsed() < std::time::Duration::from_secs(1), "pipe reads escaped the deadline");
+            let detail = PANE_CAPTURE_LAST_TIMEOUT_DETAIL.lock().unwrap().clone().unwrap();
+            assert_eq!(detail["phase"], phase);
+            assert_eq!(detail["measured"], true);
+            assert!(detail["stdout_bytes"].as_u64().unwrap() > 0);
+        }
+    }
 
     #[test]
     fn confirmed_model_must_match_provider_and_current_process_life() {
@@ -3508,6 +4020,7 @@ mod tests {
     /// waits patiently, which is the bug.
     #[test]
     fn a_pane_capture_that_never_returns_is_killed_on_its_budget() {
+        let _guard = PROBE_TEST_LOCK.lock().unwrap();
         use std::process::{Command, Stdio};
         let budget = std::time::Duration::from_millis(300);
 
@@ -3766,6 +4279,90 @@ mod tests {
         let (name, src) = resolve_task_name(None, false, "", false, "just the role");
         assert_eq!(src, "desc");
         assert_eq!(name, "just the role");
+    }
+
+    /// ATE-92: a control/checkpoint turn does not release still-live causal
+    /// board work. Only terminal/released board state can let cardless win.
+    #[test]
+    fn a_live_claim_is_sticky_across_newer_cardless_markers() {
+        let mut doing = BTreeMap::new();
+        doing.insert("ATE-92".into(), ("lane".into(), "title".into(), 1));
+        let markers = vec![
+            (10.0, Some("ATE-92".into()), false, "task.claimed".into()),
+            (20.0, None, true, "task.cardless".into()),
+        ];
+        // The claim belongs to the prior runtime life; it is still current
+        // because its owned board row remains Doing. The newer control turn
+        // belongs to this life and cannot implicitly release it.
+        let selected = select_runtime_marker(&markers, 15.0, "lane", &doing);
+        assert_eq!(selected.marker.and_then(|marker| marker.1.as_deref()), Some("ATE-92"));
+        assert!(!selected.conflicting_live_claims);
+        assert!(selected.newer_cardless_suppressed);
+
+        // A terminal/released card no longer appears in Doing, so the later
+        // explicit cardless turn correctly becomes the runtime's truth.
+        let released = select_runtime_marker(&markers, 15.0, "lane", &BTreeMap::new());
+        assert!(released.marker.is_some_and(|marker| marker.2));
+        assert!(!released.conflicting_live_claims);
+        assert!(!released.newer_cardless_suppressed);
+
+        doing.insert("ATE-93".into(), ("lane".into(), "other".into(), 2));
+        let conflicting = vec![
+            (10.0, Some("ATE-92".into()), false, "task.claimed".into()),
+            (20.0, Some("ATE-93".into()), false, "task.claimed".into()),
+        ];
+        assert!(select_runtime_marker(&conflicting, 0.0, "lane", &doing).conflicting_live_claims);
+    }
+
+    /// ATE-92: one decision owns the runtime/board join. These cells are the
+    /// whole contract: exact live attribution, explicit non-task exemption,
+    /// missing/invalid attribution, idle suppression, and a vanished worker.
+    #[test]
+    fn runtime_board_reconciliation_requires_exact_attribution_except_cardless_turns() {
+        let linked = reconcile_runtime_board(true, "active", Some("ATE-92"), true, false, false, 3);
+        assert_eq!(linked.status, "active");
+        assert_eq!(linked.card_id, "ATE-92");
+        assert!(linked.card_live);
+        assert_eq!(linked.verdict, "linked");
+        assert!(linked.measured);
+        assert_eq!(linked.n_considered, 3, "an exact claim beats unrelated Doing rows");
+        assert!(!linked.violation);
+
+        let conflicting = reconcile_runtime_board(true, "active", Some("ATE-92"), true, true, false, 2);
+        assert_eq!(conflicting.status, "unattributed");
+        assert_eq!(conflicting.verdict, "active-conflicting-claims");
+        assert!(conflicting.card_id.is_empty(), "two surviving exact claims must stay explicit ambiguity");
+        assert!(conflicting.violation);
+
+        let informational = reconcile_runtime_board(true, "active", None, false, false, true, 0);
+        assert_eq!(informational.status, "active");
+        assert_eq!(informational.verdict, "cardless-allowed");
+        assert!(!informational.card_live);
+        assert!(!informational.violation);
+
+        let missing = reconcile_runtime_board(true, "active", None, false, false, false, 2);
+        assert_eq!(missing.status, "unattributed");
+        assert_eq!(missing.verdict, "active-without-card");
+        assert!(missing.violation);
+        assert_eq!(missing.n_considered, 2);
+
+        let invalid = reconcile_runtime_board(true, "active", Some("ATE-OLD"), false, false, false, 1);
+        assert_eq!(invalid.status, "unattributed");
+        assert_eq!(invalid.verdict, "active-card-invalid");
+        assert!(invalid.card_id.is_empty(), "a stale/wrong card must not be exposed as live");
+        assert!(invalid.violation);
+
+        let idle = reconcile_runtime_board(true, "idle", Some("ATE-92"), true, false, false, 1);
+        assert_eq!(idle.status, "idle");
+        assert_eq!(idle.card_id, "ATE-92", "idle WIP remains visible but is not live");
+        assert!(!idle.card_live, "an idle runtime must never highlight its doing card");
+        assert_eq!(idle.verdict, "runtime-not-active");
+
+        let vanished = reconcile_runtime_board(false, "active", Some("ATE-92"), true, false, false, 1);
+        assert!(vanished.status.is_empty());
+        assert!(vanished.card_id.is_empty());
+        assert!(!vanished.card_live);
+        assert_eq!(vanished.verdict, "not-running");
     }
 
     /// AMUX-2904. A lane's Stop hook fires when the MAIN turn ends, so a lane
@@ -4426,6 +5023,7 @@ Claude usage limit reached. Your limit will reset at 3pm.
                 state: "active".into(),
                 ts: s.now - 120.0,
                 boundary: "task_started".into(),
+                rollout_file: Some("rollout-codex-lane.jsonl".into()),
             },
         );
         let (status, ex) = s.derive_status_explain("codex-lane", true);
@@ -4435,6 +5033,7 @@ Claude usage limit reached. Your limit will reset at 3pm.
         );
         assert_eq!(ex["decided_by"], json!("codex_rollout"));
         assert_eq!(ex["codex_rollout"]["applied"], json!(true));
+        assert_eq!(ex["codex_rollout"]["rollout_file"], json!("rollout-codex-lane.jsonl"));
 
         let signal = s.codex_turns.get_mut("codex-lane").unwrap();
         signal.state = "idle".into();
@@ -4484,6 +5083,7 @@ Claude usage limit reached. Your limit will reset at 3pm.
                 state: "idle".into(),
                 ts: s.now - 1.0,
                 boundary: "turn_aborted".into(),
+                rollout_file: None,
             },
         );
 

@@ -131,9 +131,15 @@ test('worker request stays on one card and returns one terminal callback', async
       headers: auth,
     });
     expect(history.ok()).toBeTruthy();
-    const linked = (await history.json()).filter((m: any) => m.card_id === card);
-    expect(linked.filter((m: any) => m.delivery === 'board')).toHaveLength(1);
-    expect(linked.filter((m: any) => m.type === 'task-callback')).toHaveLength(1);
+    const linked = await history.json();
+    expect(linked.filter((m: any) => m.card_id === card && m.delivery === 'board')).toHaveLength(1);
+    // Completion resumes the original requester task. The callback text keeps
+    // the child id, while the hard card edge deliberately points at `parent`.
+    expect(linked.filter((m: any) =>
+      m.type === 'task-callback'
+      && m.card_id === parent
+      && String(m.text || '').includes(`[task callback ${card}:`),
+    )).toHaveLength(1);
 
     // The compact card UI must expose the same facts and clickable source link;
     // this is the operator-facing acceptance, not only an API assertion.
@@ -145,7 +151,21 @@ test('worker request stays on one card and returns one terminal callback', async
     await expect(meta).toContainText(requester);
     await expect(meta).toContainText('queued');
     await expect(meta).toContainText('/tmp/amux-callback-e2e/result.md');
-    await expect(meta.locator('button', { hasText: /^MSG-/ })).toHaveCount(2);
+    const sourceMessages = meta.locator('button', { hasText: /^MSG-/ });
+    await expect(sourceMessages).toHaveCount(1);
+
+    // Card -> exact source message -> same card is a two-way relation. The
+    // reverse edge used to be a click-handled span, which looked like inert
+    // prose and was absent from the keyboard accessibility tree.
+    const sourceMessage = (await sourceMessages.first().textContent()) || '';
+    await sourceMessages.first().click();
+    await expect(page.locator('#msgs-search')).toHaveValue(sourceMessage);
+    const backToCard = page.locator(`#msgs-list button.msg-card-chip`, { hasText: card }).first();
+    await expect(backToCard).toBeVisible({ timeout: 15_000 });
+    await expect(backToCard).toHaveAttribute('type', 'button');
+    await backToCard.click();
+    await expect(page.locator('#board-detail-overlay')).toHaveClass(/active/, { timeout: 15_000 });
+    await expect(page.locator('#bd-key')).toHaveText(card);
   } finally {
     if (card) await request.delete(`/api/board/${encodeURIComponent(card)}`, { headers: auth }).catch(() => {});
     if (parent) await request.delete(`/api/board/${encodeURIComponent(parent)}`, { headers: auth }).catch(() => {});

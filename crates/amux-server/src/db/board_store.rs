@@ -1230,13 +1230,22 @@ pub fn effective_gate_trail(
     // Consult everything FIRST, decide after. Interleaving the two is what made
     // "consulted and empty" and "never asked" indistinguishable.
     let card = row.gate_criteria();
-    let worker = session.and_then(|s| scoped_gate(conn, s, target));
+    let worker_raw = session.and_then(|s| scoped_gate(conn, s, target));
+    let worker_additive = worker_raw.as_ref().map(|(_, a)| *a).unwrap_or(false);
+    let worker = worker_raw.map(|(c, _)| c);
     let mut group_merged: Vec<String> = Vec::new();
     let mut group_hits: Vec<String> = Vec::new();
+    let mut group_additive = false;
     if session.is_some() {
         for group in groups {
-            if let Some(list) = scoped_gate(conn, &format!("group:{group}"), target) {
+            if let Some((list, additive)) = scoped_gate(conn, &format!("group:{group}"), target) {
                 group_hits.push(group.clone());
+                // ANY contributing group asking to be additive makes the merged
+                // group tier additive. Union across groups is already this
+                // function's rule for criteria, and a mixed answer has no
+                // meaning: the merged list is one tier, so it either defers to
+                // the type or replaces it.
+                group_additive = group_additive || additive;
                 for c in list {
                     if !group_merged.contains(&c) {
                         group_merged.push(c);
@@ -1255,13 +1264,33 @@ pub fn effective_gate_trail(
     // override is empty and the two agree by definition.
     let type_default = default_gates_for(&row.item_type, target);
 
+    // AF-570: an ADDITIVE winning tier keeps the type default instead of
+    // replacing it. Type first, so the card's own definition of finished leads
+    // and the scope's process criteria follow. Deduped, because a scope is
+    // allowed to restate a criterion the type already has and nobody should be
+    // asked to acknowledge it twice.
+    let union_with_type = |scope_criteria: Vec<String>| -> Vec<String> {
+        let mut out = type_default.clone();
+        for c in scope_criteria {
+            if !out.contains(&c) {
+                out.push(c);
+            }
+        }
+        out
+    };
     let (criteria, source, winner) = if !card.is_empty() {
         (card.clone(), GateSource::Card, "card")
     } else if let Some(g) = worker.clone() {
+        let g = if worker_additive { union_with_type(g) } else { g };
         (g, GateSource::Worker(session.unwrap_or("").to_string()), "worker")
     } else if !group_merged.is_empty() {
+        let g = if group_additive {
+            union_with_type(group_merged.clone())
+        } else {
+            group_merged.clone()
+        };
         (
-            group_merged.clone(),
+            g,
             GateSource::Group(groups.iter().cloned().collect::<Vec<_>>().join(", ")),
             "group",
         )
@@ -1398,11 +1427,29 @@ impl GateSource {
 /// One scope's gate row from `session_gates` (scope key is a session name or
 /// `group:<name>`), or None when the row is absent, empty, or unreadable —
 /// every "cannot tell" inherits the next tier rather than opening the gate.
+/// The marker a scoped gate uses to declare itself ADDITIVE (AF-570).
+///
+/// A scoped gate normally REPLACES every tier below it, which is what makes the
+/// precedence readable. That is wrong for a gate whose criteria are about HOW a
+/// card was checked rather than WHAT it is: group:amux wants "a different worker
+/// reviewed it, and checked rather than believed" to apply to every card, while
+/// still letting each item TYPE say what being finished means for it. Under
+/// replacement those two cannot both be true, so setting the group gate to the
+/// peer criteria alone silently removes "Confirmed working in prod" from every
+/// `code` card (found by amux-cloud, reading effective_gate_trail, before this
+/// was built rather than after it shipped).
+pub const GATE_ADDITIVE_MARKER: &str = "@additive";
+
+/// An operator-authored gate for a scope, plus whether it is ADDITIVE.
+///
+/// OPT-IN, so this is a no-op for every gate that does not carry the marker: the
+/// fleet's other groups resolve through this same function and were not part of
+/// the decision to change amux's gate.
 fn scoped_gate(
     conn: &rusqlite::Connection,
     scope: &str,
     target: TaskStatus,
-) -> Option<Vec<String>> {
+) -> Option<(Vec<String>, bool)> {
     let id = status_to_db(target, "");
     let gate: Option<String> = conn
         .query_row(
@@ -1412,12 +1459,25 @@ fn scoped_gate(
         )
         .ok()?;
     let list: Vec<String> = serde_json::from_str(&gate?).ok()?;
+    let mut additive = false;
     let list: Vec<String> = list
         .into_iter()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        .filter(|s| {
+            if s.eq_ignore_ascii_case(GATE_ADDITIVE_MARKER) {
+                additive = true;
+                false // the marker is a directive, never a criterion to acknowledge
+            } else {
+                true
+            }
+        })
         .collect();
-    (!list.is_empty()).then_some(list)
+    // A gate of ONLY the marker holds no criteria, so it is not a rule and must
+    // not win its tier. Returning it would hand the winner an empty criteria
+    // list, which reads as "no gate" and opens the strictest transitions -- the
+    // same failure `configured_gate` documents one function down.
+    (!list.is_empty()).then_some((list, additive))
 }
 
 /// The operator-authored gate for a column, or None.
@@ -2649,6 +2709,58 @@ pub struct NewIssue {
     pub callback_prompt: Option<String>,
 }
 
+/// The id of an OPEN capture card this session already holds for a byte-identical
+/// prompt, if there is one (AF-568).
+///
+/// This is the cross-path capture dedupe. It reads `issues` rather than
+/// `cmd_history` for two reasons that are separate and both load-bearing:
+///
+/// - `cmd_history` only records the DIRECT delivery. A steering-delivered capture
+///   claims the most recent UNCARDED row for its text, so when the direct delivery
+///   already carded the only row, the duplicate is minted with no history row at
+///   all. Counting history rows therefore undercounts captures, and a guard reading
+///   it cannot see the very duplicates it exists to stop.
+/// - Every mint writes `issues`, so a third delivery path added later is covered
+///   without knowing this function exists.
+///
+/// NO TIME WINDOW, deliberately. The delay this must tolerate is however long the
+/// lane takes to reach a turn boundary, which is unbounded by design; the incident
+/// that prompted this ran 16 to 25 minutes. The bound is the card's own LIFECYCLE
+/// instead: once the lane has closed or discarded it, an identical prompt is a new
+/// task and mints normally.
+///
+/// `deleted IS NULL` and the terminal-status exclusion are the whole predicate. An
+/// ARCHIVED but still-open card counts as present: archiving hides a card from
+/// views and autonomy loops, and re-minting one the lane deliberately put away is
+/// the noise this is here to prevent.
+///
+/// KNOWN IMPRECISION, stated rather than hidden: `desc` is the prompt TRUNCATED to
+/// 300 chars, so two genuinely different prompts sharing a 300-char prefix compare
+/// equal here and the second is suppressed. The cmd_history guard above does not
+/// have this edge, because it compares the full text. Accepted because the two
+/// cards would be indistinguishable on the board anyway (both descs are the same
+/// 300 chars), and because the caller logs the SURVIVING card id on every
+/// suppression, so a wrongly dropped prompt is a greppable line rather than a
+/// missing card nobody can see. If that line ever shows up for prompts that are not
+/// duplicates, the fix is to store a full-prompt hash on the card, not a longer
+/// desc.
+pub fn open_capture_with_desc(
+    conn: &Connection,
+    session: &str,
+    desc: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT id FROM issues \
+         WHERE session = ?1 AND source = 'capture' AND \"desc\" = ?2 \
+           AND deleted IS NULL \
+           AND status NOT IN ('done', 'verified', 'discarded') \
+         ORDER BY created DESC LIMIT 1",
+        params![session, desc],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+}
+
 /// Insert a new card, replicating the Python POST exactly: id minted from
 /// the shared counter, `pos` = (min non-zero pos in the column) - 1024 (new
 /// card at the top of its lane), int timestamps, `notified` 0. Returns the
@@ -2833,7 +2945,13 @@ fn terminal_summary(
     let mut assets = Vec::new();
     let mut seen = HashSet::new();
     for artifact in crate::db::artifact_store::list_for_task(conn, &row.id)? {
-        if !artifact.ref_value.trim().is_empty() && seen.insert(artifact.ref_value.clone()) {
+        // Insert retired refs into `seen` too: otherwise the same invalid ref
+        // can be reintroduced from free-text evidence one loop below and wear
+        // a valid-looking state again.
+        if !artifact.ref_value.trim().is_empty()
+            && seen.insert(artifact.ref_value.clone())
+            && !crate::db::artifact_store::is_retired_state(&artifact.state)
+        {
             assets.push(artifact.ref_value);
         }
     }
@@ -2943,9 +3061,43 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
     // item at the ONE write choke point every status transition uses. This is
     // intentionally not a PATCH-handler side effect: board-drive, epic
     // completion and future transition producers all call save_patched too.
-    let previous_status: Option<String> = conn
-        .query_row("SELECT status FROM issues WHERE id = ?1", params![row.id], |r| r.get(0))
+    let previous: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT status, last_result FROM issues WHERE id = ?1",
+            params![row.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .ok();
+    let previous_status = previous.as_ref().map(|(status, _)| status.clone());
+    let reopened_terminal_summary = previous.as_ref().is_some_and(|(status, summary)| {
+        is_terminal_status(status)
+            && !is_terminal_status(&row.status)
+            && summary
+                .as_deref()
+                .is_some_and(|text| text.starts_with("Final outcome:"))
+    });
+    if reopened_terminal_summary {
+        // If this same atomic PATCH supplied a current-run result, preserve it.
+        // Otherwise clear only the generated terminal projection. The old
+        // Final outcome already remains in the append-only card log.
+        if row
+            .last_result
+            .as_deref()
+            .is_some_and(|text| text.starts_with("Final outcome:"))
+        {
+            row.last_result = None;
+        }
+        let hhmm = chrono::Local::now().format("%H:%M").to_string();
+        row.log = Some(append_log(
+            row.log.as_deref(),
+            &hhmm,
+            &format!(
+                "STATUS (board): terminal summary retired on reopen to {}; prior Final outcome remains in history; current Work summary {}.",
+                row.status,
+                if row.last_result.is_some() { "replaced" } else { "reset" }
+            ),
+        ));
+    }
     let terminal_transition = previous_status
         .as_deref()
         .is_some_and(|status| status != row.status && is_terminal_status(&row.status));
@@ -3059,6 +3211,19 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
             to = %row.status,
             artifacts = terminal_summary_assets,
             "board terminal transition recorded a final summary"
+        );
+    }
+    if reopened_terminal_summary && changed == 1 {
+        tracing::warn!(
+            target: "amux::board",
+            marker = "terminal_summary_retired_on_reopen",
+            task_id = %row.id,
+            from = previous_status.as_deref().unwrap_or("unknown"),
+            to = %row.status,
+            replacement = row.last_result.is_some(),
+            measured = true,
+            n_considered = 1,
+            "reopened card retired its stale generated terminal summary"
         );
     }
     Ok(changed)
@@ -5123,6 +5288,108 @@ column=silent type:code=outranked(2)"
             &groups(&["ops"]),
         );
         assert_eq!(got, vec!["Group rule"]);
+    }
+
+    /// AF-570. An ADDITIVE scoped gate unions with the type default instead of
+    /// replacing it, and one WITHOUT the marker still replaces.
+    ///
+    /// Three cells, and the third is the one that matters. amux-cloud pointed out
+    /// that asserting only the two additive outcomes proves the OUTCOME and not
+    /// that the flag is READ: if the union were hardcoded, both additive cells
+    /// still pass, because that is what group:amux wants anyway, while every
+    /// gate in the fleet that never opted in silently flips to union. The
+    /// replace-when-unset cell is what guarantees no other group moved.
+    ///
+    /// Cell 2 is amux-cloud's "test the type you did NOT set out to change": the
+    /// case this feature exists for is `investigation`, so `code` is where a
+    /// mistake would hide. Setting the group gate to the peer criteria alone,
+    /// under the replacement semantics this replaces, silently drops
+    /// "Confirmed working in prod" from every code card.
+    #[test]
+    fn an_additive_scoped_gate_unions_with_the_type_default_and_a_plain_one_replaces() {
+        let peer = r#"["@additive","Peer-reviewed by a DIFFERENT worker","That peer verified it themselves"]"#;
+
+        // CELL 1: the type this was built for. It gains a truthful bar it can
+        // actually satisfy, plus the peer criteria.
+        let c = conn_with(None, None);
+        add_session_gates(&c);
+        scope_gate(&c, "group:amux", "verified", peer);
+        let inv = effective_gate_scoped(
+            &c,
+            &row_for("amux-frustrations", "investigation", None),
+            TaskStatus::Verified,
+            &groups(&["amux"]),
+        );
+        assert!(
+            inv.iter().any(|g| g == "Outcome confirmed to still hold"),
+            "an investigation must keep its own type bar: {inv:?}"
+        );
+        assert!(
+            inv.iter().any(|g| g.starts_with("Peer-reviewed")),
+            "and still carry the group peer criteria: {inv:?}"
+        );
+
+        // CELL 2: the type NOT being changed. This is where the regression hides.
+        let code = effective_gate_scoped(
+            &c,
+            &row_for("amux-frustrations", "code", None),
+            TaskStatus::Verified,
+            &groups(&["amux"]),
+        );
+        for want in [
+            "Deployed to prod",
+            "Confirmed working in prod",
+            "Zero regressions",
+        ] {
+            assert!(
+                code.iter().any(|g| g == want),
+                "code must NOT lose {want:?} to the group gate: {code:?}"
+            );
+        }
+        assert!(
+            code.iter().any(|g| g.starts_with("Peer-reviewed")),
+            "and code still answers to the group peer criteria: {code:?}"
+        );
+
+        // CELL 3: NO marker, so replacement is unchanged. Without this cell a
+        // hardcoded union passes cells 1 and 2 while moving every gate in the
+        // fleet that never opted in.
+        let c2 = conn_with(None, None);
+        add_session_gates(&c2);
+        scope_gate(&c2, "group:ops", "verified", r#"["Ops rule"]"#);
+        let plain = effective_gate_scoped(
+            &c2,
+            &row_for("backend", "code", None),
+            TaskStatus::Verified,
+            &groups(&["ops"]),
+        );
+        assert_eq!(
+            plain,
+            vec!["Ops rule"],
+            "a gate WITHOUT the marker must still REPLACE the type default: {plain:?}"
+        );
+
+        // CELL 4: the marker is a directive, never a criterion. Nobody should be
+        // asked to acknowledge "@additive", and a gate of only the marker holds
+        // no rule, so it must not win its tier with an empty list (which reads as
+        // no gate and opens the transition).
+        assert!(
+            !inv.iter().any(|g| g == GATE_ADDITIVE_MARKER),
+            "the marker must not surface as a criterion: {inv:?}"
+        );
+        let c3 = conn_with(None, None);
+        add_session_gates(&c3);
+        scope_gate(&c3, "group:amux", "verified", r#"["@additive"]"#);
+        let only_marker = effective_gate_scoped(
+            &c3,
+            &row_for("amux-frustrations", "code", None),
+            TaskStatus::Verified,
+            &groups(&["amux"]),
+        );
+        assert!(
+            only_marker.iter().any(|g| g == "Confirmed working in prod"),
+            "a marker-only gate holds no rule and must fall through, not open the gate: {only_marker:?}"
+        );
     }
 
     /// A worker in several groups answers to ALL of them: union, in sorted
