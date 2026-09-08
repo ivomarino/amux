@@ -80,6 +80,35 @@ class CargoReclaimTests(unittest.TestCase):
         self.assertEqual(lock.stat().st_ino, before)
         self.assertFalse(self.marker.exists())
 
+    def measured_active(self, targets):
+        """`active_processes` over the AMBIENT table, or a skip naming why not.
+
+        These two cells spawn a real process and assert about the real probe,
+        which is the point of them. But the probe walks EVERY pid, and on a
+        hardened runner one uninspectable `/proc/<pid>/exe` makes it fail
+        closed for the whole table before it can answer about our own pid.
+        That is deliberate (process_executable's docstring says so) and it is
+        not something these cells can assert through.
+
+        Measured 2026-09-08: both errored on GitHub with
+        `PermissionError: [Errno 13] Permission denied: '/proc/1226/exe'`,
+        reddening `checks` on main and on every PR that merged main. They pass
+        on this project's dev box only because it is macOS, where
+        process_executable's linux branch never runs at all, so the ambient
+        table is never walked. Green on the author's machine by construction.
+
+        A test cannot assert from a probe that could not run (ethos rule 4), so
+        an unmeasured table is a SKIP that names the pid, not a pass and not a
+        failure. The hardened path itself stays covered deterministically by
+        test_hardened_linux_proc_uses_known_command_identity and
+        test_hardened_linux_proc_still_fails_closed_for_unknown_binary, which
+        inject readlink/which instead of reading the host.
+        """
+        try:
+            return guard.active_processes(targets)
+        except guard.Deferred as unmeasured:
+            self.skipTest('ambient process table unmeasurable on this host: %s' % unmeasured)
+
     def test_direct_test_binary_without_cargo_parent_prevents_deletion(self):
         binary = self.artifacts / 'orphan-test-0123456789abcdef'
         source = self.base / 'test.c'
@@ -87,7 +116,7 @@ class CargoReclaimTests(unittest.TestCase):
         subprocess.run(['cc', str(source), '-o', str(binary)], check=True, capture_output=True)
         proc = subprocess.Popen([str(binary)])
         try:
-            active, count = guard.active_processes([self.root])
+            active, count = self.measured_active([self.root])
             self.assertIn(str(proc.pid), active)
             self.assertGreater(count, 0)
             with self.assertRaises(guard.Deferred):
@@ -158,7 +187,7 @@ class CargoReclaimTests(unittest.TestCase):
     def test_command_line_mentions_do_not_become_builds(self):
         proc = subprocess.Popen(['sh', '-c', 'sleep 30 # cargo rustc build'])
         try:
-            active, _ = guard.active_processes([self.root])
+            active, _ = self.measured_active([self.root])
             self.assertNotIn(str(proc.pid), active)
         finally:
             proc.terminate()
