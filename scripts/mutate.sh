@@ -59,7 +59,12 @@ refuse_self_mutation() {
   echo "  passed and the only symptom was the NEXT run refusing with an argument" >&2
   echo "  error." >&2
   echo "  To test a change to this script, copy it and mutate the copy:" >&2
-  echo "    cp $target /tmp/mutate-under-test.sh && $0 run /tmp/mutate-under-test.sh ..." >&2
+  echo "    M=\$(mktemp -t mutate-under-test) && cp $target \"\$M\" && $0 run \"\$M\" ..." >&2
+  echo "  (mktemp, NOT a fixed /tmp name: every lane on this box shares one /tmp" >&2
+  echo "   under one uid, so two lanes testing a mutate change at the same time" >&2
+  echo "   truncate the same inode — the exact hazard this refusal is about, one" >&2
+  echo "   file along. gtm-media-assets measured 99 hand-invented gp*.sh suffixes" >&2
+  echo "   in /tmp from the fleet routing around the same thing, 2026-09-08.)" >&2
   exit 2
 }
 
