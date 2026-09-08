@@ -4244,3 +4244,15 @@ CARD: AMUX-4225
 SYMPTOM: The exact published 765e9ea2 suite reported two unclassified HTTP 500 outcomes containing only doing. Both were (false, "doing") match-arm inputs in the recovered prompt attribution path, not returned messages. Separately, the guard-default test inherited AMUX_TASK_GUARD=1 from host settings or another test's config load; the same executable passed alone with a clean environment.
 COST: Correct production behavior failed the publication gate, obscuring the distinction between a regression, ambient test state and an extractor error. The full run also reached an unrelated real-home filesystem probe that stayed blocked beyond its budget; its interruption and the integration-target continuation are recorded separately under ~/.amux/logs/amux-4225/.
 FIX: Exclude tuple literals followed by a match arrow while retaining actual failure returns and the existing positive controls. Emit gate_probe with measured population, excluded match patterns and unclassified count. The guard-default fixture explicitly clears its two effective values in its private server.env so live process settings cannot override the defaults under test. No runtime refusal policy or fleet state changes.
+
+---
+## A bounded process snapshot failed a guard for adding useful fields
+AREA: tests
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux
+CARD: AMUX-4225
+SYMPTOM: The published recovery build retained one bounded ps snapshot outside the fleet loop, extending its parent-only projection with PID, state and command fields. sessions_probes_are_bounded required the old exact argument string and called the new snapshot absent.
+COST: A false missing-liveness-probe verdict obscured a passing bounded-process implementation during the final fleet preservation gate.
+FIX: Verify the single external ps invocation, full-population flag, parent identity field and bounded call with its diagnostic identity; allow additional projected columns. The no-subprocess-inside-the-loop assertion remains. The gate emits bounded_fleet_process_snapshot with its measured population and actual arguments.
