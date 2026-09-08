@@ -14,7 +14,12 @@ After=network-online.target
 # ends up trying to (re)start a unit that's already being restarted. The
 # timer is the only thing that should be starting this.
 Type=oneshot
-ExecStart=$SCRIPT_DIR/scripts/rust-auto-build.sh
+ExecStart=$SCRIPT_DIR/scripts/rust-auto-build-authority.sh
+# The authority wrapper resolves the exact remote-tracking mainline ref into a
+# clean detached worktree before it invokes rust-auto-build.sh. This keeps a
+# shared checkout's locally-ahead HEAD from becoming a second deployment path.
+Environment="AMUX_AUTHORITY_REPO=$SCRIPT_DIR"
+Environment="AMUX_RS_ACTIVATION_REF=origin/main"
 # Needed so AMUX_REMOTE_BUILD_HOST (and anything else server.env carries)
 # actually reaches this script — found missing 2026-08-31 wiring the
 # remote-build offload: the unit set CARGO_TARGET_DIR explicitly but never
