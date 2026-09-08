@@ -2927,6 +2927,41 @@ fn terminal_action_digest(log: Option<&str>) -> (usize, String) {
 }
 
 /// Build the one terminal summary that both the API and dashboard can render.
+/// The card this one was FOLDED into, if it was.
+///
+/// `api::board` writes `capture folded into <ID>` when an auto-captured prompt
+/// is turned into real work, so this is a server-authored line, not free text
+/// a lane happened to phrase that way.
+///
+/// It exists because a fold and a drop are opposite outcomes that the terminal
+/// summary rendered identically. Reported 2026-09-08 by mixpeek-frustrations
+/// and independently by mixpeek-cicd, five instances across two lanes in one
+/// session. Their specimen:
+///
+///   [task callback MS-1369] ... closed the request without resolving the
+///   dependency. State: discarded. Outcome: Final outcome: discarded (from
+///   doing). Recorded terminal outcome: not supplied. Actions: 2 recorded;
+///   latest: capture folded into MS-1370. Tests/deployment/live evidence: not
+///   recorded. Linked assets: none recorded.
+///
+/// Every clause is true and the sum is false: MS-1369 was a capture shell
+/// folded into MS-1370..MS-1375, six real cards with real content. The reader
+/// has to open the board to tell that from a request dropped on the floor, and
+/// the routing lane is told a peer abandoned their work. Both reporters chased
+/// it; one of them chased it twice.
+///
+/// The discriminator was already IN the payload, on the Actions line. This
+/// reads it instead of printing it beside a contradicting summary.
+pub fn folded_into(log: Option<&str>) -> Option<String> {
+    let marker = "capture folded into ";
+    log.unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.rfind(marker).map(|at| line[at + marker.len()..].trim()))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .map(|id| id.trim_end_matches(['.', ',', ';', ')']).to_string())
+        .rfind(|id| !id.is_empty())
+}
+
 /// Artifact-registry refs are combined with refs in evidence so a proof link
 /// cannot disappear merely because an older producer did not register it.
 fn terminal_summary(
@@ -2967,6 +3002,26 @@ fn terminal_summary(
     } else {
         assets.join(", ")
     };
+    // A FOLD IS NOT A DROP, so it does not get the drop's sentence. The four
+    // "not supplied / not recorded / none recorded" clauses below are all true
+    // of a capture shell and all misleading about it: the work is on the card
+    // it was folded into. Say that, and say where.
+    if let Some(target) = folded_into(row.log.as_deref()) {
+        let tail = if assets.is_empty() {
+            String::new()
+        } else {
+            format!(" Linked assets: {linked_assets}.")
+        };
+        return Ok((
+            format!(
+                "Final outcome: folded into {target} (from {from}, recorded {}). \
+                 This was a capture shell, not a unit of work: its work, evidence and \
+                 assets are on {target}.{tail}",
+                row.status
+            ),
+            assets.len(),
+        ));
+    }
     Ok((
         format!(
             "Final outcome: {} (from {}). Recorded terminal outcome: {}. Actions: {} recorded; latest: {}. Tests/deployment/live evidence: {}. Linked assets: {}.",
@@ -5186,6 +5241,47 @@ column=silent type:code=outranked(2)"
     /// re-derive, and concluded the override was pinned per-card. Worker and
     /// Group are exactly the rungs that were never asserted.
     ///
+    /// A fold must be readable as a fold, from the log alone.
+    ///
+    /// Reported 2026-09-08 by mixpeek-frustrations and, independently, by
+    /// mixpeek-cicd: five capture shells across two lanes whose terminal
+    /// summary said "discarded ... not supplied ... not recorded ... none
+    /// recorded", which is the wording a genuinely dropped request produces.
+    /// Each had in fact been folded into real cards, and the fold target was
+    /// printed on the summary's own Actions line while it said so.
+    #[test]
+    fn a_folded_capture_is_distinguishable_from_a_dropped_one() {
+        // The server-authored line (api::board writes exactly this).
+        assert_eq!(
+            folded_into(Some("claimed\ncapture folded into MS-1370\n")),
+            Some("MS-1370".to_string())
+        );
+        // Timestamp/backtick prefixes are how the log actually renders.
+        assert_eq!(
+            folded_into(Some("`12:01` amux: capture folded into AF-604")),
+            Some("AF-604".to_string())
+        );
+        // Trailing punctuation must not become part of the id.
+        assert_eq!(
+            folded_into(Some("capture folded into MS-1370.")),
+            Some("MS-1370".to_string())
+        );
+        // The LAST fold wins, so a re-fold is not reported at its first target.
+        assert_eq!(
+            folded_into(Some("capture folded into A-1\ncapture folded into A-2")),
+            Some("A-2".to_string())
+        );
+
+        // CONTROLS. Without these, a helper returning Some(..) unconditionally
+        // passes everything above, and every discarded card would claim a fold.
+        assert_eq!(folded_into(None), None);
+        assert_eq!(folded_into(Some("")), None);
+        assert_eq!(folded_into(Some("discarded: duplicate of MS-1370")), None,
+            "an ordinary discard is not a fold");
+        assert_eq!(folded_into(Some("capture folded into ")), None,
+            "a fold with no target names nothing");
+    }
+
     /// One test for the whole ladder rather than five, because the property is
     /// a mapping and the interesting failure is two rungs agreeing when they
     /// should differ.

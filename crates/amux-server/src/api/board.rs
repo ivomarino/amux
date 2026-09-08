@@ -2153,9 +2153,22 @@ pub(crate) async fn dispatch_pending_callbacks(
             .as_deref()
             .or(row.evidence.as_deref())
             .unwrap_or("The complete action log and produced assets are on the task card.");
-        let resolution = if bs::dependency_is_resolved(&row.status, &row.item_type) {
+        // A FOLD IS NOT AN ABANDONMENT. `capture folded into <ID>` means the
+        // lane did the right thing: amux auto-captured an inbound routed
+        // message as a card, they carded the real work properly, and discarded
+        // the empty shell. Telling the ROUTING lane that their peer "closed the
+        // request without resolving the dependency" puts a false accusation in
+        // front of the one party who will act on it.
+        let folded = bs::folded_into(row.log.as_deref());
+        let folded_note;
+        let resolution = if let Some(target) = folded.as_deref() {
+            folded_note = format!("folded this capture into {target}");
+            folded_note.as_str()
+        } else if bs::dependency_is_resolved(&row.status, &row.item_type) {
             "resolved the dependency"
-        } else { "closed the request without resolving the dependency" };
+        } else {
+            "closed the request without resolving the dependency"
+        };
         let mut prompt = format!(
             "[task callback {}: {}] {} {}. \
              State: {}.\nOutcome: {}\nOpen board card {} for verification evidence, action history, \
