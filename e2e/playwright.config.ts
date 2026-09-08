@@ -8,6 +8,7 @@ import { defineConfig, devices } from '@playwright/test';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
+import { E2E_ANTHROPIC_KEY } from './test-env';
 
 // ONE SERVER AND ONE AMUX_HOME PER PROJECT — not one shared by all of them
 // (AF-46, measured 2026-08-13).
@@ -45,6 +46,16 @@ const TARGETS = [
   // for it, so the list is gone; do not reintroduce one to quiet a red.
   { name: 'ios-safari', port: 18843, use: { ...devices['iPhone 15'] } },
 ];
+
+// The broad suite exercises dashboard/runtime behaviour, not a real Anthropic
+// credential. A clean CI home has no key, which makes the product correctly
+// show the self-hosted setup banner. On narrow viewports that banner covers the
+// terminal toolbar, so one missing external prerequisite turns every later
+// click test into a 30s pointer-interception timeout. Seed an obviously
+// non-secret test value at the PROCESS layer: settings_api_key_anthropic still
+// overwrites/restores it through the real endpoint, while unrelated specs run
+// in the configured-install state they actually assume.
+console.log('[e2e] provider prerequisite: seeded a non-secret test key; missing-key setup UI is outside this broad suite.');
 
 // One temp home per TARGET, created eagerly so each server and its tests agree.
 const homes: Record<string, string> = Object.fromEntries(
@@ -180,6 +191,7 @@ export default defineConfig({
     env: {
       AMUX_HOME: homes[t.name],
       AMUX_RS_PORT: String(t.port),
+      ANTHROPIC_API_KEY: E2E_ANTHROPIC_KEY,
       // A browser test necessarily connects over loopback, which the server
       // deliberately auth-bypasses (Python parity). Without this, every
       // "rejects a bad token" assertion is a check that cannot pass — it was

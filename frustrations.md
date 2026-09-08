@@ -3829,3 +3829,30 @@ FIX: Declare callback updates, coordination create/update/resolve stamps, member
   create/last-seen stamps, and merged-reference creation as seconds beside the
   existing board timestamps. The exhaustive timestamp-unit guard now makes any
   future schema drift fail with the exact missing table and column.
+
+---
+## Clean CI turned one missing provider prerequisite into 34 unrelated pointer timeouts
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-93
+SYMPTOM: Exact-SHA Rust CI passed 354 browser scenarios, then 34 mobile/WebKit
+  terminal cases waited 30 seconds each because the clean test home correctly
+  displayed `#no-apikey-banner` over their controls. Two independent stale
+  fixtures also failed: default-model restoration called `selectOption` on the
+  shipped text input, and Working-now created four Doing rows without one causal
+  `task.claimed` identity.
+COST: The required ATE-93 CI gate ran 23 minutes before reporting 37 failures,
+  and one absent external prerequisite looked like dozens of terminal regressions.
+FIX: The broad harness now announces and supplies an obvious non-secret provider
+  test value, keeping unrelated specs in their configured-install prerequisite.
+  The settings test restores the text input through fill+blur, and Working-now
+  creates its exact owner through the real claim endpoint. Its UI-only runtime
+  activation preserves that exact server-produced identity instead of expecting
+  a stopped fixture to project as live. The API-key scenario restores the known
+  harness baseline explicitly because a persisted empty value shadows the
+  process fallback. Missing-key behavior remains product behavior; it is no
+  longer accidental global state for tests whose acceptance has nothing to do
+  with provider setup.

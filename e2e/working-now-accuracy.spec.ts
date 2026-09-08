@@ -18,7 +18,10 @@ test('one active worker marks exactly its claimed card as Working now', async ({
         headers: auth,
         data: {
           title: `concurrent-looking task ${i}`,
-          status: 'doing',
+          // One causal claim, not aggregate Doing order, is the runtime truth.
+          // Leave the first card claimable so the real claim endpoint emits
+          // task.claimed; the other three are deliberate unrelated Doing rows.
+          status: i === 1 ? 'todo' : 'doing',
           session: worker,
           owner_type: 'agent',
           type: 'chore',
@@ -28,6 +31,21 @@ test('one active worker marks exactly its claimed card as Working now', async ({
       cards.push((await made.json()).id);
     }
 
+    const claim = await request.post(`/api/board/${cards[0]}/claim`, {
+      headers: { ...auth, 'X-Amux-Worker': worker },
+    });
+    expect(claim.ok(), 'fixture must create one exact causal owner').toBeTruthy();
+    const claimed = (await claim.json()).id as string;
+    expect(claimed).toBe(cards[0]);
+
+    const claimedCardResponse = await request.get(`/api/board/${claimed}`, { headers: auth });
+    expect(claimedCardResponse.ok()).toBeTruthy();
+    expect(await claimedCardResponse.json()).toMatchObject({
+      id: claimed,
+      status: 'doing',
+      session: worker,
+    });
+
     // A stopped fixture has no physical pane, so the real status projection
     // correctly refuses to call it active even after a synthetic hook report.
     // Keep the real session and board projections, changing only the one field
@@ -36,9 +54,24 @@ test('one active worker marks exactly its claimed card as Working now', async ({
     const sessionResponse = await request.get('/api/sessions', { headers: auth });
     const sessionRows = await sessionResponse.json();
     const row = sessionRows.find((s: any) => s.name === worker);
-    const claimed = row?.task_board_id || '';
-    expect(claimed, 'the real server must project exactly one current doing card').toBeTruthy();
+    expect(row?.runtime_board?.verdict).toBe('not-running');
+    expect(row?.task_board_id).toBe('');
+
+    // Preserve the real server's exact claimed identity while supplying only
+    // the physical runtime state this renderer needs. Starting an actual tmux
+    // model process would turn a deterministic browser golden into an external
+    // side effect; a stopped registered worker is correctly `not-running`.
     row.status = 'active';
+    row.task_board_id = claimed;
+    row.runtime_board = {
+      measured: true,
+      n_considered: 4,
+      verdict: 'linked',
+      status: 'linked',
+      card_id: claimed,
+      card_live: true,
+      violation: false,
+    };
     await page.route('**/api/sessions', route => route.fulfill({
       status: 200,
       contentType: 'application/json',
