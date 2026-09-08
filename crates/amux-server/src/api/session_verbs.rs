@@ -9419,8 +9419,30 @@ fn compose_drop_counts(
     let (mut deleted, mut unrecognised, mut in_roster) = (0usize, 0usize, false);
     for line in existing.lines() {
         let t = line.trim();
-        if t.starts_with("## Fleet — who else is running") {
-            in_roster = true;
+        // RESET ON THE NEXT HEADING, never latch (ts-gke, reviewing 78dffd39
+        // against a REAL file instead of my fixtures). Setting this true and
+        // never clearing it implements "skip the roster" as "skip everything
+        // from the roster heading to EOF", which is only harmless while the
+        // roster is last.
+        //
+        // Measured on the file this will actually meet,
+        // ~/.claude/projects/-Users-ethan-Dev-mixpeek/memory/MEMORY.md: the
+        // roster heading is line 88 of 210, with 62 POINTER LINES and 55
+        // non-empty prose lines AFTER it. The latching version examined 87
+        // lines and skipped 119 — blind over exactly the region where agent
+        // content accumulates, which is the region this function exists to
+        // measure.
+        //
+        // The merge itself was never affected: `preserved_agent_pointers` has
+        // no roster guard at all and preserves those 62. A REPORTING defect,
+        // not data loss, and worth fixing anyway because a disclosure that
+        // cannot see part of what it discloses is this card's own failure one
+        // layer further along.
+        //
+        // Resetting on any `## ` also makes the roster's POSITION irrelevant,
+        // so this keeps working if emit order changes again.
+        if t.starts_with("## ") {
+            in_roster = t.starts_with("## Fleet — who else is running");
         }
         if in_roster || t.is_empty() {
             continue;
@@ -18745,6 +18767,53 @@ fn getrandom_fill(buf: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
+
+    /// AF-578. CONTENT AFTER THE ROSTER, which is the shape this merge will meet
+    /// on first run and which none of my other fixtures had.
+    ///
+    /// ts-gke caught it by reviewing against a real file instead of my tests:
+    /// every cell I wrote puts the roster last or omits it, because that is the
+    /// shape my own fix CREATES. The existing files were written before
+    /// roster-last existed. Measured on the mixpeek index: roster heading at
+    /// line 88 of 210, with 62 pointer lines and 55 prose lines after it.
+    #[test]
+    fn the_drop_counts_see_content_after_the_roster_block() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let d = dir.path();
+        std::fs::write(d.join("before.md"), "x\n").unwrap();
+        std::fs::write(d.join("after.md"), "x\n").unwrap();
+
+        let existing = concat!(
+            "- [Before](before.md) — a pointer ahead of the roster\n",
+            "\n## Fleet — who else is running (auto-generated, do not edit)\n",
+            "| worker | groups |\n|---|---|\n| peer | x |\n",
+            "\n## Session pointers appended after the roster\n",
+            "- [After](after.md) — a live pointer BELOW the roster\n",
+            "- [Vanished](vanished.md) — its file is gone, must be counted\n",
+            "Prose a session wrote below the roster.\n",
+        );
+        std::fs::write(d.join("MEMORY.md"), existing).unwrap();
+        let composed = "# Shared Context\n";
+
+        // The merge always saw these; it has no roster guard. Pinned so the two
+        // halves cannot drift apart later.
+        let out = super::preserved_agent_pointers(d, composed);
+        assert!(out.contains("(before.md)"), "pointer above the roster: {out}");
+        assert!(out.contains("(after.md)"), "pointer BELOW the roster: {out}");
+
+        // THE DEFECT: with a latching flag both of these were 0, because
+        // everything from line 2 to EOF was skipped.
+        let (deleted, unrecognised) = super::compose_drop_counts(existing, composed, d);
+        assert_eq!(
+            deleted, 1,
+            "a deleted-target pointer BELOW the roster must still be counted"
+        );
+        assert_eq!(
+            unrecognised, 2,
+            "prose below the roster must be counted (the heading and the line), \
+             and the roster's own table rows must NOT be"
+        );
+    }
 
     /// AF-578, asked for by ts-gke as the assumption they most wanted falsified:
     /// does a MIXED source (some pointers, some prose) behave the way the warn
