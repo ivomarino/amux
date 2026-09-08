@@ -205,11 +205,11 @@ pub async fn start(target_port: Option<u16>) -> Result<TunnelState, String> {
     DROPPED.store(0, Ordering::Relaxed);
     rl_window().lock().unwrap_or_else(|e| e.into_inner()).clear();
 
-    let h = tokio::spawn(run(token, gateway(), target_base, generation));
     // Registered so a dead relay is visible on /api/system-jobs rather than
     // silently absent. `None` interval: this is a long-poll, not a tick, so a
     // staleness verdict computed from an interval would be meaningless.
-    crate::runtime_jobs::registry::adopt(crate::runtime_jobs::registry::ids::TUNNEL, None, &h);
+    let _handle = super::registry::spawn_loop(
+        super::registry::ids::TUNNEL, None, run(token, gateway(), target_base, generation));
 
     // Wait briefly for the first registration so the caller's response can
     // carry the URL instead of a null the UI has to poll for.

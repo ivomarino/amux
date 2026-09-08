@@ -4082,3 +4082,24 @@ FIX: Search retains an editable type filter and finds matches only inside that
   proof: 12 passed across desktop, 375px Chromium and iPhone WebKit; screenshots
   reviewed. The browser proof used changed assets with an isolated pinned
   backend, so it required no fleet access or additional Rust compilation.
+
+---
+## Separate background tasks still held the HTTP runtime for seconds
+AREA: scheduler
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux
+CARD: AMUX-4225
+SYMPTOM: Newly shipped runtime_job_blocking_poll logs measured individual
+  commit-mention-notes, board-drive, orchestrator-runtime and autofix polls
+  holding Tokio workers for 3914ms, 2484ms, 1128ms and 1078ms. Each job had its
+  own task but shared executor threads with health, TLS and worker API calls.
+COST: Owner and TubeScience hit 20s coordination API timeouts; the earlier
+  empty native stack sample could not name the synchronous work responsible.
+FIX: Existing registered jobs use a separate process-owned maintenance runtime,
+  including the two loops that previously spawned before registration. Boot
+  and slow-poll logs name the runtime pool and full source/PID identity. The
+  regression blocks maintenance while real health and board requests must
+  return; host CPU/IO contention and the original unannounced stop remain
+  separate, explicitly unproven parts of the historical incident.

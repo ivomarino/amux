@@ -2313,7 +2313,7 @@ pub async fn nudge_tick(state: &AppState, lanes: &[(String, String)], now: f64) 
 /// "went idle" is lost and an already-idle lane waits for a transition that
 /// never comes.
 pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    super::registry::spawn_loop(super::registry::ids::COMMIT_NUDGE, None, async move {
         let every = std::env::var("AMUX_COMMIT_NUDGE_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())

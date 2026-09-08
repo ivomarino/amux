@@ -117,6 +117,12 @@ pub fn build_hash() -> String {
 }
 
 pub fn run() {
+    let maintenance = tokio::runtime::Builder::new_multi_thread()
+        .thread_name("amux-maintenance")
+        .enable_all()
+        .build()
+        .expect("maintenance runtime");
+    runtime_jobs::executor::install(maintenance.handle().clone());
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async_main());
 }
@@ -340,6 +346,10 @@ async fn async_main() {
     // reader that starts up cannot report an age spanning the outage without
     // the outage itself already being on the record.
     runtime_jobs::heartbeat::record_boot(&store, cfg.port);
+    tracing::info!(target: "runtime", verdict = "maintenance_runtime_isolated",
+        runtime_pool = runtime_jobs::executor::pool_name(), pid = std::process::id(),
+        commit = env!("AMUX_BUILD_COMMIT_FULL"),
+        "registered maintenance jobs run on separate threads from HTTP and TLS");
 
     // Migration-rehearsal mode (Phase 11): open + migrate + report + exit.
     // Lets docs/rust-migration/migration-rehearsal.sh exercise the EXACT production
@@ -478,13 +488,9 @@ async fn async_main() {
     drop(runtime_jobs::pane_size::spawn());
     // The idle uncommitted-work nudge (AMUX-2638). Ownership comes from the
     // staged-guard, never from the dirty tree — see the module docs for the
-    // three sweeps that rule exists to prevent. It owns its own tokio::spawn
-    // (it decides whether to run at all from AMUX_COMMIT_NUDGE_SECS), so it is
-    // `adopt`ed rather than spawned here — same contract, same call site.
-    {
-        let h = runtime_jobs::commit_nudge::spawn(state.clone());
-        jobs::adopt(jobs::ids::COMMIT_NUDGE, None, &h);
-    }
+    // three sweeps that rule exists to prevent. Its spawn owns the registry
+    // entry and selects the maintenance runtime like every other loop.
+    drop(runtime_jobs::commit_nudge::spawn(state.clone()));
 
     // AUTOFIX (AMUX-2681) — notice, file, hand off. Runs in the SERVER, on
     // purpose: the thing that watches for breakage must not share fate with

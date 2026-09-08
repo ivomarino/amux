@@ -55,6 +55,7 @@ pub mod commit_nudge;
 pub mod context_health;
 pub mod status_history;
 pub mod disk_watch;
+pub(crate) mod executor;
 pub mod ghost_rescue;
 pub mod heartbeat;
 pub mod mac_health;
@@ -84,10 +85,9 @@ use tokio::time::MissedTickBehavior;
 /// a different type from [`scheduler::DurableSchedule`] and must stay one:
 /// no persistence, no history, no audit — by design, not by omission.
 ///
-/// Each task runs on its OWN spawned tokio task driven by
-/// `tokio::time::interval`, so a slow or wedged task cannot delay any other
-/// task (the plan's non-blocking requirement; contrast Python's shared
-/// `_JOB_REGISTRY` thread). A run that overshoots its interval delays only
+/// Each task runs on a spawned Tokio task on the maintenance runtime, driven
+/// by `tokio::time::interval`. Synchronous polls can delay other maintenance
+/// jobs but cannot occupy HTTP runtime threads. A run that overshoots its interval delays only
 /// its own next tick (`MissedTickBehavior::Delay` — no catch-up burst),
 /// mirroring the Python registry's `_running` skip guard.
 pub struct PeriodicTask {
@@ -228,7 +228,7 @@ where
     // report a tick it did not run. See registry's docs for the three loops
     // that were dead for hours with nothing visible anywhere.
     let job_id = name.clone();
-    let handle = tokio::spawn(async move {
+    let handle = executor::spawn(async move {
         let mut tick = tokio::time::interval(interval);
         // Delay, not Burst: a run that overshoots must not be "paid back"
         // with a rapid-fire catch-up volley (the spin-catcher lesson — a

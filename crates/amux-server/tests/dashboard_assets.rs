@@ -506,11 +506,12 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
         "s.status !== 'unattributed'",
         "active-conflicting-claims",
         ">card conflict</span>",
-        ">card syncing</span>",
         "truth.verdict",
     ] {
         assert!(app.contains(needle), "unattributed runtime lost its server-verdict treatment `{needle}`");
     }
+    assert!(!app.contains(">card syncing</span>"),
+        "normal runtime attribution lag must not manufacture a card-syncing warning");
     assert!(
         app.contains("verdict === 'active-conflicting-claims'")
             && app.contains("status-badge rate-limited")

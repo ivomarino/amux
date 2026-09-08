@@ -71,3 +71,63 @@ spent awaiting IO. It supplies the missing attribution for the next stall.
   times unchanged. Full publication gates and post-adoption measurements are
   recorded on the card when they finish; these focused results are not a claim
   that the entire historical stall has been explained.
+
+## Live attribution and runtime isolation follow-up
+
+The poll instrumentation supplied new evidence after normal adoption of
+`451cafb6` through origin/main. At 11:30 onward, PID 91066 logged individual
+synchronous polls of 3914ms (`commit-mention-notes`), 2484ms (`board-drive`),
+1128ms (`orchestrator-runtime`) and 1078ms (`autofix`). Later, on full commit
+`d3d329ea0ada6511e75359c627986fdf37eea6df`, it still logged a 1706ms autofix
+poll at 11:52:30 and a 1859ms board-drive poll at 11:52:38. Private receipt:
+`runtime-poll-evidence.log`. A separate task on the same Tokio runtime did not
+isolate HTTP/TLS from this synchronous work.
+
+A complete scan also found an 89,318ms orchestrator poll ending 11:36:07,
+25,492ms board-drive poll ending 11:35:09, and 87,855ms commit-mention-notes
+poll ending 11:49:40. These are elapsed times, not measured CPU consumption.
+The follow-up adds per-poll thread CPU time and a separate measured flag so
+waiting/descheduling cannot silently be described as CPU work. Maxima and
+their exact timestamp/source lines are in `runtime-poll-summary.json`.
+
+The follow-up gives the existing registered jobs a process-owned maintenance
+runtime. Both periodic jobs and long-lived loops use the common executor;
+commit-nudge and the tunnel relay now enter through the same registry spawn.
+Job identities, intervals, manual triggers and abort handles are preserved.
+The HTTP listener and request tasks retain their own runtime. The binary owns
+both runtimes; library tests retain their caller-owned runtime and teardown.
+Boot logs name the selected runtime pool, and slow-poll logs keep job, pool,
+PID, full source identity and elapsed time. This protects request executor
+threads; it does not pretend to remove shared CPU, disk or database contention.
+
+The regression deliberately blocks the maintenance runtime's sole worker for
+up to two seconds while dispatching the real health handler and board route
+onto the HTTP runtime's sole worker. It requires HTTP 200, a measured health
+result and completion below 500ms. Running the handler directly on the test
+thread would hide the original starvation, so the request itself is spawned.
+
+Live builder receipts at 11:41:52, 11:42:52, 11:43:53 and 11:45:29 reported
+identity match/action=skip for db4b88e6. After one genuinely new d3d329ea build,
+11:49:52, 11:51:02 and 11:52:03 also skipped the matching installed revision.
+PID 91066 survived self-adoption. The 11:52:21 health read returned HTTP 200,
+full d3d329ea / build e316da5fb3697063 in 872ms. A fleet read briefly counted
+50 active entries; the immediately saved follow-up returned all 54 original
+non-archived workers running, with no name/archive/running differences from
+the recovery snapshot. The transient count is not proof of four worker exits.
+The lane runtime truth names exactly AMUX-4225 as its one live Doing claim.
+
+## Publication gate findings
+
+The clean detached 451cafb6 snapshot passed workspace all-target Clippy. Its
+full server suite reported 2367 passed, 8 failed and 32 ignored across 56
+targets; this is not a green-suite receipt. The exact parent 38a4b99a reproduced
+the idle-worker and concurrent-dispatch fixture failures and the missing
+`/api/_clear_sw` route-table declaration. Two other parent controls could not
+compile while shared debug artifacts disappeared, so those controls are
+unmeasured. The dashboard guard still required a `card syncing` badge that a
+peer intentionally removed; it is corrected to reject its reintroduction.
+The dispatch failures named `has no next_action (continuation gate)`. These
+fixtures now provide an actionable next step because they test dispatch and
+compensation, not the refusal of incomplete cards. The complete board-drive
+unit module then passed: 128 passed, 0 failed. The cache-reset route is also added to the native boundary registry, so the
+existing route-composition gate describes the route already mounted in main.
