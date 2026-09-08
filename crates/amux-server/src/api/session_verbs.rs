@@ -4137,8 +4137,8 @@ fn mint_capture_card(
     // held ANY open agent card — so only the FIRST task of a work-session reached
     // the board and every later prompt was silent ("none of these have board
     // items"). It applied a STEERING-path guard to genuine new user tasks: this
-    // path is `is_user` only, and a user prompt IS a new task (orchestrator steers
-    // arrive via the delivered path, not here). Manual work cards also counted, so
+    // path is reached only for task-bearing deliveries, and a human, schedule,
+    // or peer command IS a new task. Manual work cards also counted, so
     // being mid-work on ANY card blanked the ledger entirely.
     //
     // Narrowed to the guard's real purpose: don't double-card an IDENTICAL retry.
@@ -4278,6 +4278,43 @@ struct CaptureAssociation {
     created: bool,
 }
 
+fn arm_peer_callback(
+    conn: &rusqlite::Connection,
+    row: &mut crate::db::board_store::IssueRow,
+    requester: &str,
+) -> rusqlite::Result<()> {
+    let requester = requester.trim();
+    if requester.is_empty() {
+        return Ok(());
+    }
+    let mut newly_armed = false;
+    if row.requested_by.as_deref().is_none_or(str::is_empty) {
+        row.requested_by = Some(requester.to_string());
+    }
+    if row.callback_session.as_deref().is_none_or(str::is_empty) {
+        row.callback_session = Some(requester.to_string());
+        newly_armed = true;
+    }
+    if row.callback_prompt.as_deref().is_none_or(str::is_empty) {
+        row.callback_prompt = Some(
+            "Notify the requesting worker with the terminal outcome and every produced asset."
+                .to_string(),
+        );
+    }
+    // An identical transport retry can reuse the open capture card.  Preserve
+    // an already pending/dispatching/queued callback rather than rewinding its
+    // durable outbox state and sending the completion twice.
+    if newly_armed
+        || row
+            .callback_state
+            .as_deref()
+            .is_none_or(|state| matches!(state, "" | "refused"))
+    {
+        row.callback_state = Some("armed".to_string());
+    }
+    crate::db::board_store::save_patched(conn, row).map(|_| ())
+}
+
 /// Distinct semantic board ids named by a delivered owner prompt.
 fn prompt_card_refs(text: &str) -> Vec<String> {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -4328,8 +4365,31 @@ fn associate_capture_card(
             "ledger: substantive prompt named multiple live owned cards; capturing an explicit reconciliation card"
         );
     }
-    Ok(mint_capture_card(conn, session_name, body, now_ms)?
-        .map(|row| CaptureAssociation { row, created: true }))
+    if let Some(row) = mint_capture_card(conn, session_name, body, now_ms)? {
+        return Ok(Some(CaptureAssociation { row, created: true }));
+    }
+
+    // An identical retry is still a message in the source-of-truth ledger.
+    // `mint_capture_card` deliberately suppresses a duplicate card, but the
+    // old caller interpreted that as "this message has no task" and left its
+    // `cmd_history.card_id` null.  Re-associate the message with the exact open
+    // survivor so the message↔task links remain bidirectional and a peer retry
+    // cannot lose its already-armed callback.
+    let redacted = redact_prompt_secrets(body);
+    if amux_core::board::title_from_prompt(&redacted).is_some()
+        && !amux_core::board::is_informational_query(&redacted)
+    {
+        let desc_body: String = redacted.chars().take(300).collect();
+        let captured_desc = format!("**Prompt:** {desc_body}");
+        if let Some(id) =
+            crate::db::board_store::open_capture_with_desc(conn, session_name, &captured_desc)?
+        {
+            if let Some(row) = crate::db::board_store::get_issue(conn, &id)? {
+                return Ok(Some(CaptureAssociation { row, created: false }));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// The most recent row for (session, text) that was actually DELIVERED, newer
@@ -4427,7 +4487,13 @@ pub(crate) async fn cmd_hist_record_full(
     let cap_ctype = ctype.clone();
     let cap_origin = origin.clone();
 
-    let is_user = ctype == "user";
+    // Every producer which can hand substantive work to a worker participates
+    // in the same task ledger.  Treating only `user` as task-bearing made
+    // schedules and worker-to-worker requests invisible on the recipient's
+    // board—the exact opposite of the board-managed callback contract.  The
+    // semantic classifier below still exempts questions and control prompts,
+    // so widening the producer set does not card `/compact`, "status?", etc.
+    let task_bearing = matches!(ctype.as_str(), "user" | "schedule" | "session");
     // Carry the recorded row id out of the write so auto-capture can link the card.
     let msg_row_id = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     // delivered_at IS NOT A COPY OF ts ANY MORE (AMUX-3541).
@@ -4557,12 +4623,13 @@ pub(crate) async fn cmd_hist_record_full(
         .await;
     }
 
-    // NO SILENT WORK (AMUX-3071): associate a HUMAN task prompt with a ledger
+    // NO SILENT WORK (AMUX-3071): associate every task-bearing delivery with a ledger
     // card and link it to the message row. Separate write so a capture failure can never roll
     // back the message record — the message is the durable entity, the card its
     // consequence (CLAUDE.md: hang the consequence off the write that happened).
-    // Gated on ctype=="user": inter-session ("session") and scheduler ("schedule")
-    // messages are not the recipient's task and must not spam the board.
+    // Human, inter-session ("session") and scheduler ("schedule") work all
+    // belong to the recipient.  Questions/control messages still remain
+    // cardless via the semantic predicate, rather than a producer allow-list.
     // ISOLATED DOES NOT MEAN INVISIBLE WORK (AMUX-4159). Isolation controls
     // what amux injects into a worker and whether peers/automation can reach it;
     // it does not change the fact that an owner's delivered prompt is work in
@@ -4578,7 +4645,7 @@ pub(crate) async fn cmd_hist_record_full(
     // keeping; the card is a consequence that did not happen.
     let substantive = amux_core::board::title_from_prompt(&cap_text).is_some()
         && !amux_core::board::is_informational_query(&cap_text);
-    if is_user && landed && substantive {
+    if task_bearing && landed && substantive {
         let row_id = msg_row_id.load(std::sync::atomic::Ordering::SeqCst);
         if row_id > 0 {
             let cap_isolated = session_is_isolated(&cap_session);
@@ -4587,6 +4654,8 @@ pub(crate) async fn cmd_hist_record_full(
                 std::sync::Arc::new(std::sync::Mutex::new(None));
             let associated_w = associated.clone();
             let sess_log = cap_session.clone();
+            let peer_requester = (cap_ctype == "session" && !cap_origin.trim().is_empty())
+                .then(|| cap_origin.clone());
             let res = state
                 .store
                 .write_async(move |conn| match associate_capture_card(
@@ -4595,7 +4664,10 @@ pub(crate) async fn cmd_hist_record_full(
                     &cap_text_for_capture,
                     now_ms,
                 )? {
-                    Some(association) => {
+                    Some(mut association) => {
+                        if let Some(requester) = peer_requester.as_deref() {
+                            arm_peer_callback(conn, &mut association.row, requester)?;
+                        }
                         conn.execute(
                             "UPDATE cmd_history SET card_id = ?1 WHERE id = ?2",
                             rusqlite::params![association.row.id, row_id],
@@ -4707,7 +4779,7 @@ pub(crate) async fn cmd_hist_record_full(
             }
         }
     }
-    if is_user && landed {
+    if task_bearing && landed {
         let cardless_reason = if amux_core::board::is_informational_query(&cap_text) {
             Some("informational-query")
         } else if amux_core::board::title_from_prompt(&cap_text).is_none() {
@@ -11816,15 +11888,13 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         // items wtf"): its prompts queue while it is mid-turn and drain through
         // HERE, past the one place that cards. Mirror the direct path's predicate:
         //   guard == ""    — not a board-drive nudge / auto-pickup / self-describe
-        //   sender == ""   — a human/dashboard send, not a peer relay (which carries
-        //                    the server-verified origin and is type='session', never
-        //                    the recipient's own task — same split as 9720 vs 9722)
+        //   sender is deliberately NOT a gate: a substantive peer request is
+        //                    recipient work and must be managed by this board too.
         //   title Some     — a real task, not control text / [no-board] / a keypress
         // Separate write so a capture failure can never roll back the delivery, and
         // IDEMPOTENT: skip if this exact prompt was already carded (the enqueue path
         // may have minted at record time), so a queued message is never double-carded.
         if guard.is_empty()
-            && sender.is_empty()
             && amux_core::board::title_from_prompt(&text).is_some()
             && !amux_core::board::is_informational_query(&text)
         {
@@ -11833,6 +11903,7 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
             let associated: std::sync::Arc<std::sync::Mutex<Option<CaptureAssociation>>> =
                 std::sync::Arc::new(std::sync::Mutex::new(None));
             let associated_w = associated.clone();
+            let peer_requester = sender.clone();
             let res = state
                 .store
                 .write_async(move |conn| {
@@ -11855,7 +11926,10 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                         return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
                     }
                     match associate_capture_card(conn, &sess3, &text3, now_ms)? {
-                        Some(association) => {
+                        Some(mut association) => {
+                            if !peer_requester.trim().is_empty() {
+                                arm_peer_callback(conn, &mut association.row, &peer_requester)?;
+                            }
                             // Link the most recent uncarded cmd_history row for this
                             // prompt, if the enqueue recorded one without carding it.
                             conn.execute(
@@ -11945,7 +12019,6 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
             }
         }
         if guard.is_empty()
-            && sender.is_empty()
             && (amux_core::board::title_from_prompt(&text).is_none()
                 || amux_core::board::is_informational_query(&text))
         {
@@ -21699,8 +21772,9 @@ mod tests {
     // AMUX-3071: the send path lost Python's _autotask_from_command at the
     // 792ce1f cutover (2026-08-09), so 330 human prompts recorded card_id=NULL
     // and left no board trace. A real task prompt must now mint a `doing` card
-    // and stamp cmd_history.card_id; informational/control and inter-session
-    // messages must not. `[no-board]` can prevent a duplicate only by reusing
+    // and stamp cmd_history.card_id; informational/control messages must not.
+    // Schedules and inter-session requests use the same recipient-owned task
+    // contract. `[no-board]` can prevent a duplicate only by reusing
     // an exact live card; it cannot erase substantive work attribution.
     #[tokio::test]
     async fn a_human_prompt_auto_captures_and_links_a_ledger_card() {
@@ -21895,16 +21969,94 @@ mod tests {
             "informational turns are the narrow cardless exception"
         );
 
-        // 6. Inter-session ("session") messages are not the recipient's task.
+        // 6. A substantive inter-session request is recipient work and uses
+        //    the same linked board contract as a human or schedule command.
         cmd_hist_record_full(
             &st, "lane-x", "Coordinate the rollout with the other lane and report back",
             "session", "peer-lane", false, DeliveryMeta::direct(),
         )
         .await;
-        assert!(
+        let peer_card = q(
+            "SELECT card_id FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1",
+            "lane-x",
+        )
+        .expect("substantive inter-session requests must be board-managed and linked");
+        let callback: (Option<String>, Option<String>, Option<String>) = st
+            .store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT requested_by, callback_session, callback_state FROM issues \
+                 WHERE id=(SELECT card_id FROM cmd_history WHERE session='lane-x' ORDER BY id DESC LIMIT 1)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(callback.0.as_deref(), Some("peer-lane"));
+        assert_eq!(callback.1.as_deref(), Some("peer-lane"));
+        assert_eq!(callback.2.as_deref(), Some("armed"));
+
+        // A transport retry links to the one surviving task without rewinding
+        // a callback which has already entered the durable outbox.
+        let peer_card_w = peer_card.clone();
+        st.store
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE issues SET callback_state='pending' WHERE id=?1",
+                    [&peer_card_w],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+        cmd_hist_record_full(
+            &st, "lane-x", "Coordinate the rollout with the other lane and report back",
+            "session", "peer-lane", false, DeliveryMeta::direct(),
+        )
+        .await;
+        assert_eq!(
             q("SELECT card_id FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1", "lane-x")
+                .as_deref(),
+            Some(peer_card.as_str()),
+            "the retrying source message must link to the surviving task"
+        );
+        let (peer_tasks, callback_state): (i64, Option<String>) = st
+            .store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*), MAX(callback_state) FROM issues WHERE session='lane-x'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(peer_tasks, 1, "an identical retry must not duplicate its task");
+        assert_eq!(
+            callback_state.as_deref(),
+            Some("pending"),
+            "an identical retry must not re-arm and duplicate a pending callback"
+        );
+
+        // 7. Schedules follow the same rule, while an informational scheduled
+        //    check remains the narrow cardless case.
+        cmd_hist_record_full(
+            &st, "lane-schedule", "Generate the weekly launch report and save its assets",
+            "schedule", "schedule:weekly", false, DeliveryMeta::direct(),
+        )
+        .await;
+        assert!(
+            q("SELECT card_id FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1", "lane-schedule")
+                .is_some(),
+            "substantive scheduled work must create and link its recipient card"
+        );
+        cmd_hist_record_full(
+            &st, "lane-schedule-info", "what is the current status?",
+            "schedule", "schedule:status", false, DeliveryMeta::direct(),
+        )
+        .await;
+        assert!(
+            q("SELECT card_id FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1", "lane-schedule-info")
                 .is_none(),
-            "inter-session messages must not spam the board"
+            "informational scheduled checks must not create board work"
         );
     }
 

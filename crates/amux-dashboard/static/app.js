@@ -35492,17 +35492,33 @@ let _sqlSchemaLoaded = false;
 
 function _sqlInit() { if (!_sqlSchemaLoaded) { _sqlSchemaLoaded = true; _dbLoadSchema(); } }
 
+async function _sqlFetchJson(url, options) {
+  const response = await fetch(url, options);
+  const text = await response.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : {}; }
+  catch (e) {
+    throw new Error('HTTP ' + response.status + ': ' + (text.trim().slice(0, 240) || 'non-JSON response'));
+  }
+  if (!response.ok || data.error) {
+    throw new Error((data && data.error) || ('HTTP ' + response.status));
+  }
+  return data;
+}
+
 async function _dbLoadSchema() {
   const side = document.getElementById('db-tables');
   if (side) side.innerHTML = '<div style="color:var(--dim);font-size:0.74rem;padding:6px;">Loading…</div>';
   try {
-    const d = await fetch(API + '/api/sql/schema').then(r => r.json());
-    if (d.error) { if (side) side.innerHTML = '<div style="color:#f85149;font-size:0.74rem;padding:6px;">' + esc(d.error) + '</div>'; return; }
+    const d = await _sqlFetchJson(API + '/api/sql/schema');
     _dbTables = d.tables || [];
     const f = document.getElementById('db-filter');
     _dbRenderSidebar(f ? f.value : '');
     if (_dbTable) _dbRenderStructure();
-  } catch (e) { if (side) side.innerHTML = '<div style="color:#f85149;font-size:0.74rem;padding:6px;">schema failed</div>'; }
+  } catch (e) {
+    _sqlSchemaLoaded = false;
+    if (side) side.innerHTML = '<div style="color:#f85149;font-size:0.74rem;padding:6px;">Schema failed: ' + esc(e.message) + '<br><button class="btn" style="margin-top:6px;" onclick="_sqlInit()">Retry</button></div>';
+  }
 }
 
 function _dbFilter(q) { _dbRenderSidebar(q); }
@@ -35552,13 +35568,15 @@ async function _dbLoadData() {
   try {
     const q = '?table=' + encodeURIComponent(_dbTable) + '&limit=' + _dbLimit + '&offset=' + _dbOffset +
       (_dbSort ? '&sort=' + encodeURIComponent(_dbSort) + '&dir=' + _dbDir : '');
-    const d = await fetch(API + '/api/sql/rows' + q).then(r => r.json());
-    if (d.error) { status.classList.add('err'); status.textContent = d.error; grid.innerHTML = '<div style="padding:16px;color:#f85149;">' + esc(d.error) + '</div>'; return; }
+    const d = await _sqlFetchJson(API + '/api/sql/rows' + q);
     _dbRenderGrid(grid, d.columns, d.rows, true);
     _dbRenderPager(d);
     const t = _dbTables.find(x => x.name === _dbTable);
     status.textContent = t && t.writable ? 'Read/write · wb_*' : 'Read-only';
-  } catch (e) { status.classList.add('err'); status.textContent = 'load failed'; }
+  } catch (e) {
+    status.classList.add('err'); status.textContent = 'Load failed: ' + e.message;
+    grid.innerHTML = '<div style="padding:16px;color:#f85149;">' + esc(e.message) + '</div>';
+  }
 }
 
 function _dbRenderPager(d) {
@@ -35616,18 +35634,16 @@ async function _sqlRun() {
   const results = document.getElementById('sql-results');
   status.classList.remove('err'); status.textContent = 'Running…';
   try {
-    const d = await fetch(API + '/api/sql', {
+    const d = await _sqlFetchJson(API + '/api/sql', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sql, write }),
-    }).then(r => r.json());
-    if (d.error) {
-      status.classList.add('err'); status.textContent = d.error;
-      results.innerHTML = '<div style="padding:16px;color:#f85149;font-size:0.82rem;font-family:var(--mono);white-space:pre-wrap;">' + esc(d.error) + '</div>';
-      return;
-    }
+    });
     if (d.write) { status.textContent = d.message + ' · ' + d.ms + 'ms'; _dbLoadSchema(); return; }
     _dbRenderGrid(results, d.columns, d.rows, false);
     status.textContent = d.rowcount + (d.truncated ? '+ (capped)' : '') + ' row' + (d.rowcount === 1 ? '' : 's') + ' · ' + d.ms + 'ms';
-  } catch (e) { status.classList.add('err'); status.textContent = 'request failed'; }
+  } catch (e) {
+    status.classList.add('err'); status.textContent = 'Request failed: ' + e.message;
+    results.innerHTML = '<div style="padding:16px;color:#f85149;font-size:0.82rem;font-family:var(--mono);white-space:pre-wrap;">' + esc(e.message) + '</div>';
+  }
 }
 
 // ── Notes tab ─────────────────────────────────────────────────────────────────
