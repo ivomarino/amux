@@ -3860,3 +3860,21 @@ FIX: The broad harness now announces and writes an obvious non-secret provider
   instead of poisoning later specs. Missing-key behavior remains product
   behavior; it is no longer accidental global state for tests whose acceptance
   has nothing to do with provider setup.
+
+---
+## One repeated timestamp subtraction made the exact-SHA Rust gate nondeterministic
+AREA: gates
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-93
+SYMPTOM: The guarded workspace test passed 2,064 tests and failed only
+  `stored_observations_reach_the_actual_guard_without_naming_the_reader`: its
+  separately evaluated expected timestamp differed from the stored value by one
+  f64 ULP (1788859526.403303 versus 1788859526.4033027).
+COST: Exact-SHA Rust CI ran for over four minutes and blocked ATE-93's terminal
+  gate even though the production observation round trip was correct.
+FIX: Compute the fixture timestamp once and use that same binary value for the
+  report and strict round-trip assertion. The failure now self-announces the
+  JSON/SQLite contract instead of conflating codegen rounding with persistence.
