@@ -826,6 +826,15 @@ impl FleetSignals {
         signals
     }
 
+    /// Target the worker's active window for fields such as
+    /// `#{window_activity}` and `#{pane_pid}`. Tmux accepts a bare `=session`
+    /// target for `display-message` but expands those fields to empty strings,
+    /// which made single-worker steering probes see no running lane while the
+    /// fleet-wide status path correctly reported the same worker as IDLE.
+    fn lane_probe_target(name: &str) -> String {
+        pane_target(&format!("amux-{name}"))
+    }
+
     fn load_scoped(conn: &rusqlite::Connection, lane: Option<&str>) -> Self {
         let mut activity = BTreeMap::new();
         let mut created = BTreeMap::new();
@@ -855,8 +864,8 @@ impl FleetSignals {
         let mut lsc = std::process::Command::new("tmux");
         let format = "#{session_name}:#{session_activity}:#{session_created}:#{window_activity}";
         if let Some(name) = lane {
-            let st = crate::backend::tmux::session_target(&format!("amux-{name}"));
-            lsc.args(["display-message", "-p", "-t", &st, format]);
+            let pt = Self::lane_probe_target(name);
+            lsc.args(["display-message", "-p", "-t", &pt, format]);
         } else {
             lsc.args(["list-sessions", "-F", format]);
         }
@@ -903,8 +912,8 @@ impl FleetSignals {
         let all_panes_dead = {
             let mut c = std::process::Command::new("tmux");
             if let Some(name) = lane {
-                let st = crate::backend::tmux::session_target(&format!("amux-{name}"));
-                c.args(["list-panes", "-t", &st, "-F", "#{session_name}:#{pane_dead}"]);
+                let pt = Self::lane_probe_target(name);
+                c.args(["list-panes", "-t", &pt, "-F", "#{session_name}:#{pane_dead}"]);
             } else {
                 c.args(["list-panes", "-a", "-F", "#{session_name}:#{pane_dead}"]);
             }
@@ -952,8 +961,8 @@ impl FleetSignals {
         let panes_probe = {
             let mut c = std::process::Command::new("tmux");
             if let Some(name) = lane {
-                let st = crate::backend::tmux::session_target(&format!("amux-{name}"));
-                c.args(["list-panes", "-t", &st, "-F", "#{session_name}:#{pane_pid}:#{pane_current_command}"]);
+                let pt = Self::lane_probe_target(name);
+                c.args(["list-panes", "-t", &pt, "-F", "#{session_name}:#{pane_pid}:#{pane_current_command}"]);
             } else {
                 c.args(["list-panes", "-a", "-F", "#{session_name}:#{pane_pid}:#{pane_current_command}"]);
             }
@@ -4121,6 +4130,15 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
 pub(crate) mod tests {
     use super::*;
     static PROBE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn single_lane_fleet_probe_targets_the_active_window() {
+        assert_eq!(
+            FleetSignals::lane_probe_target("mixpeek-homepage-claude"),
+            "=amux-mixpeek-homepage-claude:",
+            "a session-only target exits successfully while returning empty pane/window fields"
+        );
+    }
 
     #[test]
     fn bounded_probe_drains_large_stdout_and_stderr_before_waiting() {
