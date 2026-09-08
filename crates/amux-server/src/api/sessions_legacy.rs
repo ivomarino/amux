@@ -2154,11 +2154,75 @@ struct RuntimeBoardTruth {
     violation: bool,
 }
 
+/// A causal marker emitted by direct delivery or runtime task ownership.
+///
+/// Markers are retained as a timeline: a later control/cardless turn cannot
+/// erase an earlier claim while that card still exists as this lane's Doing
+/// work. The board row is the release signal, so no second, lossy ownership
+/// state is needed here.
+type TaskMarker = (f64, Option<String>, bool, String);
+
+struct RuntimeMarkerSelection<'a> {
+    marker: Option<&'a TaskMarker>,
+    conflicting_live_claims: bool,
+    newer_cardless_suppressed: bool,
+}
+
+/// Select the causal marker which describes this runtime now.
+///
+/// A still-live claimed card is sticky across later informational/control
+/// prompts. If two distinct claimed cards are live, naming either would be a
+/// guess, so retain the newest only as diagnostic evidence and publish the
+/// conflict to reconciliation instead.
+fn select_runtime_marker<'a>(
+    markers: &'a [TaskMarker],
+    started_at: f64,
+    session: &str,
+    doing_by_id: &BTreeMap<String, (String, String, i64)>,
+) -> RuntimeMarkerSelection<'a> {
+    let live_claims: Vec<&TaskMarker> = markers
+        .iter()
+        .filter(|marker| marker.0 >= started_at)
+        .filter(|marker| {
+            marker.1.as_deref().is_some_and(|card| {
+                doing_by_id
+                    .get(card)
+                    .is_some_and(|(owner, _, _)| owner == session)
+            })
+        })
+        .collect();
+    let distinct_live_claims: BTreeSet<&str> = live_claims
+        .iter()
+        .filter_map(|marker| marker.1.as_deref())
+        .collect();
+    if let Some(marker) = live_claims
+        .into_iter()
+        .max_by(|left, right| left.0.total_cmp(&right.0))
+    {
+        return RuntimeMarkerSelection {
+            marker: Some(marker),
+            conflicting_live_claims: distinct_live_claims.len() > 1,
+            newer_cardless_suppressed: markers
+                .iter()
+                .any(|other| other.0 >= started_at && other.2 && other.0 > marker.0),
+        };
+    }
+    RuntimeMarkerSelection {
+        marker: markers
+            .iter()
+            .filter(|marker| marker.0 >= started_at)
+            .max_by(|left, right| left.0.total_cmp(&right.0)),
+        conflicting_live_claims: false,
+        newer_cardless_suppressed: false,
+    }
+}
+
 fn reconcile_runtime_board(
     running: bool,
     runtime_status: &str,
     claimed_card: Option<&str>,
     claimed_card_valid: bool,
+    conflicting_live_claims: bool,
     cardless_allowed: bool,
     doing_count: usize,
 ) -> RuntimeBoardTruth {
@@ -2185,11 +2249,10 @@ fn reconcile_runtime_board(
             violation: false,
         };
     }
-    // A causal marker identifies WHICH card a runtime is acting on, but it
-    // cannot turn several `doing` rows into one valid runtime claim. Multiple
-    // cards are a board contradiction that needs resolution, not a license to
-    // highlight the marker's card and silently validate the rest.
-    if !claimed.is_empty() && claimed_card_valid && doing_count == 1 {
+    // One exact live causal marker is stronger evidence than an aggregate
+    // count: other Doing rows can be stale, subagent-owned, or unrelated.
+    // Only distinct surviving claimed identities make the runtime ambiguous.
+    if !claimed.is_empty() && claimed_card_valid && !conflicting_live_claims {
         return RuntimeBoardTruth {
             status: "active".into(),
             card_id: claimed.to_string(),
@@ -2200,7 +2263,7 @@ fn reconcile_runtime_board(
             violation: false,
         };
     }
-    if claimed.is_empty() && cardless_allowed {
+    if claimed.is_empty() && cardless_allowed && !conflicting_live_claims {
         return RuntimeBoardTruth {
             status: "active".into(),
             card_id: String::new(),
@@ -2218,7 +2281,9 @@ fn reconcile_runtime_board(
         status: "unattributed".into(),
         card_id: String::new(),
         card_live: false,
-        verdict: if claimed.is_empty() {
+        verdict: if conflicting_live_claims {
+            "active-conflicting-claims"
+        } else if claimed.is_empty() {
             "active-without-card"
         } else if claimed_card_valid {
             "active-multiple-doing"
@@ -2263,6 +2328,28 @@ fn announce_runtime_board_truth(
             n_considered = truth.n_considered,
             "runtime/board truth healed"
         );
+    }
+}
+
+/// A cardless marker is a turn classification, not an implicit release. Log
+/// the precedence once per active lane so a fleet sweep can find this causal
+/// edge without turning normal polling into log noise.
+fn announce_sticky_runtime_claim(session: &str, observed_card: &str, suppressed: bool) {
+    static STICKY_CLAIMS: std::sync::OnceLock<std::sync::Mutex<BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    let active = STICKY_CLAIMS.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()));
+    let Ok(mut active) = active.lock() else { return };
+    if suppressed {
+        if active.insert(session.to_string()) {
+            tracing::info!(
+                target: "amux::sessions",
+                %session,
+                observed_card,
+                "runtime/board sticky claim preserved across a later cardless control marker"
+            );
+        }
+    } else {
+        active.remove(session);
     }
 }
 
@@ -3171,10 +3258,9 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
         // Exact runtime attribution is a causal fact, not "whichever doing
         // card was edited last". A directly delivered human prompt is linked
         // atomically through cmd_history.card_id; manual/automatic pickup emits
-        // task.claimed. Whichever happened last owns the runtime pointer.
-        // Informational/control prompts are the explicit cardless exception.
-        let mut task_markers: BTreeMap<String, (f64, Option<String>, bool, String)> =
-            BTreeMap::new();
+        // task.claimed. Keep the whole causal timeline: a newer cardless
+        // control prompt is not a release of a still-live claimed card.
+        let mut task_markers: BTreeMap<String, Vec<TaskMarker>> = BTreeMap::new();
         if let Ok(mut messages) = conn.prepare(
             "SELECT session, text, card_id, ts FROM cmd_history \
              WHERE type='user' AND COALESCE(submit_verdict,'') <> 'stuck' \
@@ -3195,15 +3281,15 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
                     && (amux_core::board::title_from_prompt(&text).is_none()
                         || amux_core::board::is_informational_query(&text));
                 if card_id.is_some() || cardless {
-                    task_markers.insert(
-                        session,
-                        (
+                    task_markers
+                        .entry(session)
+                        .or_default()
+                        .push((
                             ts_ms as f64 / 1000.0,
                             card_id,
                             cardless,
                             if cardless { "cardless-prompt" } else { "message-card" }.into(),
-                        ),
-                    );
+                        ));
                 }
             }
         }
@@ -3231,10 +3317,11 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
                     .filter(|id| !id.is_empty())
                     .map(str::to_string);
                 let cardless = kind == "task.cardless";
-                if (card_id.is_some() || cardless)
-                    && task_markers.get(&session).is_none_or(|old| ts >= old.0)
-                {
-                    task_markers.insert(session, (ts, card_id, cardless, kind));
+                if card_id.is_some() || cardless {
+                    task_markers
+                        .entry(session)
+                        .or_default()
+                        .push((ts, card_id, cardless, kind));
                 }
             }
         }
@@ -3245,9 +3332,22 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
             };
             let runtime_status = v["status"].as_str().unwrap_or("").to_string();
             let running = v["running"].as_bool().unwrap_or(false);
-            let marker = task_markers.get(&name).filter(|(at, _, _, _)| {
-                *at >= signals.started.get(&name).copied().unwrap_or(0.0)
-            });
+            let selection = task_markers
+                .get(&name)
+                .map(|markers| {
+                    select_runtime_marker(
+                        markers,
+                        signals.started.get(&name).copied().unwrap_or(0.0),
+                        &name,
+                        &doing_by_id,
+                    )
+                })
+                .unwrap_or(RuntimeMarkerSelection {
+                    marker: None,
+                    conflicting_live_claims: false,
+                    newer_cardless_suppressed: false,
+                });
+            let marker = selection.marker;
             let observed_card = marker
                 .and_then(|(_, card, _, _)| card.as_deref())
                 .unwrap_or("");
@@ -3259,9 +3359,12 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
             .filter(|(owner, _, _)| owner == &name);
             // At a boundary, preserve the existing WIP label fallback. During
             // active runtime only the causal marker may name the live card.
-            let board = exact_board.or_else(|| {
+            let board = (!selection.conflicting_live_claims || runtime_status != "active")
+                .then_some(exact_board)
+                .flatten()
+                .or_else(|| {
                 if runtime_status == "active" { None } else { doing.get(&name) }
-            });
+                });
             let doing_count = doing_counts.get(&name).copied().unwrap_or(0);
             let truth = reconcile_runtime_board(
                 running,
@@ -3272,10 +3375,16 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
                     board.map(|(id, _, _)| id.as_str())
                 },
                 if runtime_status == "active" { exact_board.is_some() } else { board.is_some() },
+                selection.conflicting_live_claims,
                 marker.is_some_and(|(_, _, cardless, _)| *cardless),
                 doing_count,
             );
             announce_runtime_board_truth(&name, &runtime_status, observed_card, &truth);
+            announce_sticky_runtime_claim(
+                &name,
+                observed_card,
+                selection.newer_cardless_suppressed,
+            );
             let board_updated = board.map(|(_, _, u)| *u).unwrap_or(0);
             let board_fresh = board.is_some() && now - board_updated <= 86400;
             let meta = load_meta(&name);
@@ -3327,6 +3436,7 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
                 "observed_card_id": if observed_card.is_empty() { serde_json::Value::Null } else { json!(observed_card) },
                 "source": marker.map(|(_, _, _, source)| source.as_str()).unwrap_or("none"),
                 "cardless_allowed": marker.is_some_and(|(_, _, cardless, _)| *cardless),
+                "cardless_suppressed_by_live_claim": selection.newer_cardless_suppressed,
             });
             // A summary-sourced task now carries its own stamp (AMUX-2676);
             // it is 0 only for tasks written before that existed, and 0 still
@@ -4015,51 +4125,81 @@ mod tests {
         assert_eq!(name, "just the role");
     }
 
+    /// ATE-92: a control/checkpoint turn does not release still-live causal
+    /// board work. Only terminal/released board state can let cardless win.
+    #[test]
+    fn a_live_claim_is_sticky_across_newer_cardless_markers() {
+        let mut doing = BTreeMap::new();
+        doing.insert("ATE-92".into(), ("lane".into(), "title".into(), 1));
+        let markers = vec![
+            (10.0, Some("ATE-92".into()), false, "task.claimed".into()),
+            (20.0, None, true, "task.cardless".into()),
+        ];
+        let selected = select_runtime_marker(&markers, 0.0, "lane", &doing);
+        assert_eq!(selected.marker.and_then(|marker| marker.1.as_deref()), Some("ATE-92"));
+        assert!(!selected.conflicting_live_claims);
+        assert!(selected.newer_cardless_suppressed);
+
+        // A terminal/released card no longer appears in Doing, so the later
+        // explicit cardless turn correctly becomes the runtime's truth.
+        let released = select_runtime_marker(&markers, 0.0, "lane", &BTreeMap::new());
+        assert!(released.marker.is_some_and(|marker| marker.2));
+        assert!(!released.conflicting_live_claims);
+        assert!(!released.newer_cardless_suppressed);
+
+        doing.insert("ATE-93".into(), ("lane".into(), "other".into(), 2));
+        let conflicting = vec![
+            (10.0, Some("ATE-92".into()), false, "task.claimed".into()),
+            (20.0, Some("ATE-93".into()), false, "task.claimed".into()),
+        ];
+        assert!(select_runtime_marker(&conflicting, 0.0, "lane", &doing).conflicting_live_claims);
+    }
+
     /// ATE-92: one decision owns the runtime/board join. These cells are the
     /// whole contract: exact live attribution, explicit non-task exemption,
     /// missing/invalid attribution, idle suppression, and a vanished worker.
     #[test]
     fn runtime_board_reconciliation_requires_exact_attribution_except_cardless_turns() {
-        let linked = reconcile_runtime_board(true, "active", Some("ATE-92"), true, false, 1);
+        let linked = reconcile_runtime_board(true, "active", Some("ATE-92"), true, false, false, 3);
         assert_eq!(linked.status, "active");
         assert_eq!(linked.card_id, "ATE-92");
         assert!(linked.card_live);
         assert_eq!(linked.verdict, "linked");
         assert!(linked.measured);
-        assert_eq!(linked.n_considered, 1);
+        assert_eq!(linked.n_considered, 3, "an exact claim beats unrelated Doing rows");
         assert!(!linked.violation);
 
-        let multiple = reconcile_runtime_board(true, "active", Some("ATE-92"), true, false, 2);
-        assert_eq!(multiple.status, "unattributed");
-        assert_eq!(multiple.verdict, "active-multiple-doing");
-        assert!(multiple.card_id.is_empty(), "one active runtime may not validate two doing cards");
-        assert!(multiple.violation);
+        let conflicting = reconcile_runtime_board(true, "active", Some("ATE-92"), true, true, false, 2);
+        assert_eq!(conflicting.status, "unattributed");
+        assert_eq!(conflicting.verdict, "active-conflicting-claims");
+        assert!(conflicting.card_id.is_empty(), "two surviving exact claims must stay explicit ambiguity");
+        assert!(conflicting.violation);
 
-        let informational = reconcile_runtime_board(true, "active", None, false, true, 0);
+        let informational = reconcile_runtime_board(true, "active", None, false, false, true, 0);
         assert_eq!(informational.status, "active");
         assert_eq!(informational.verdict, "cardless-allowed");
         assert!(!informational.card_live);
         assert!(!informational.violation);
 
-        let missing = reconcile_runtime_board(true, "active", None, false, false, 2);
+        let missing = reconcile_runtime_board(true, "active", None, false, false, false, 2);
         assert_eq!(missing.status, "unattributed");
         assert_eq!(missing.verdict, "active-without-card");
         assert!(missing.violation);
         assert_eq!(missing.n_considered, 2);
 
-        let invalid = reconcile_runtime_board(true, "active", Some("ATE-OLD"), false, false, 1);
+        let invalid = reconcile_runtime_board(true, "active", Some("ATE-OLD"), false, false, false, 1);
         assert_eq!(invalid.status, "unattributed");
         assert_eq!(invalid.verdict, "active-card-invalid");
         assert!(invalid.card_id.is_empty(), "a stale/wrong card must not be exposed as live");
         assert!(invalid.violation);
 
-        let idle = reconcile_runtime_board(true, "idle", Some("ATE-92"), true, false, 1);
+        let idle = reconcile_runtime_board(true, "idle", Some("ATE-92"), true, false, false, 1);
         assert_eq!(idle.status, "idle");
         assert_eq!(idle.card_id, "ATE-92", "idle WIP remains visible but is not live");
         assert!(!idle.card_live, "an idle runtime must never highlight its doing card");
         assert_eq!(idle.verdict, "runtime-not-active");
 
-        let vanished = reconcile_runtime_board(false, "active", Some("ATE-92"), true, false, 1);
+        let vanished = reconcile_runtime_board(false, "active", Some("ATE-92"), true, false, false, 1);
         assert!(vanished.status.is_empty());
         assert!(vanished.card_id.is_empty());
         assert!(!vanished.card_live);
