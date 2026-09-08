@@ -2664,7 +2664,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <div style="color:var(--dim);font-size:0.7rem;font-family:monospace;margin-top:2px;"><script>document.write(location.host)</script></div>
       <div id="about-version" style="margin:8px 0 4px;font-size:0.95rem;font-weight:600;cursor:pointer;" onclick="forceUpdate()" title="Tap to force update">&#x21BB;</div>
       <div id="update-status" style="color:var(--dim);font-size:0.75rem;min-height:1.2em;"></div>
-      <button id="pull-btn" class="btn" onclick="pullFromRemote(this)" style="margin-top:6px;font-size:0.72rem;padding:4px 12px;">&#x2B07; Pull from remote</button>
+      <div style="display:flex;gap:6px;justify-content:center;margin-top:6px;">
+        <button id="pull-btn" class="btn" onclick="pullFromRemote(this)" style="font-size:0.72rem;padding:4px 12px;">&#x2B07; Pull from remote</button>
+        <button class="btn" style="font-size:0.72rem;padding:4px 12px;" onclick="location.href='/api/_clear_sw'" title="Unregister service workers, clear caches, and reload">&#x1F5D1; Clear cache</button>
+      </div>
       <div id="pull-status" style="color:var(--dim);font-size:0.7rem;font-family:monospace;margin-top:4px;min-height:1.2em;white-space:pre-wrap;max-height:60px;overflow-y:auto;"></div>
       <script>if(window._cloudEmail){var _pb=document.getElementById('pull-btn');if(_pb)_pb.style.display='none';}</script>
     </div>
