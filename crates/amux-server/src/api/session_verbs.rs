@@ -11095,7 +11095,13 @@ fn steer_decide_with_background(
     max_age_s: f64,
     background_working: bool,
 ) -> SteerDelivery {
-    if background_working {
+    // `reported` is already the shared, fully-derived lane verdict. A stale
+    // transcript mtime or child-process sample must not overrule its explicit
+    // idle boundary here, or the dashboard can truthfully show IDLE while the
+    // steering queue silently holds forever. Real live background work is
+    // folded into that verdict by `derive_status_explain`; keep the hard hold
+    // only while the shared verdict still says the lane is not at a boundary.
+    if background_working && reported != Some("idle") && pane_idle != Some(true) {
         SteerDelivery::Hold
     } else {
         steer_decide(reported, pane_idle, age_s, max_age_s)
@@ -11191,7 +11197,7 @@ fn reported_idle_is_boundary(subagents_live: Option<i64>, raw: &str) -> bool {
     !subagents_live.is_some_and(|count| count > 0) && !provider_background_working(raw)
 }
 
-fn warn_background_override_once(name: &str, raw: &str) {
+fn warn_background_override_once(name: &str, raw: &str, authoritative_idle: bool) {
     use std::collections::BTreeSet;
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
@@ -11200,17 +11206,29 @@ fn warn_background_override_once(name: &str, raw: &str) {
     } else {
         "claude_background_agent"
     };
-    let key = format!("{name}:{kind}");
+    let verdict = if authoritative_idle { "ignored_at_idle_boundary" } else { "held" };
+    let key = format!("{name}:{kind}:{verdict}");
     let mut seen = SEEN.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
     if !seen.insert(key) {
         return;
     }
-    tracing::warn!(
-        target: "status_truth",
-        session = name,
-        provider_signal = kind,
-        "provider_background_work_overrode_idle_report: board-drive and steering are held until the provider row clears"
-    );
+    if authoritative_idle {
+        tracing::warn!(
+            target: "status_truth",
+            session = name,
+            provider_signal = kind,
+            verdict,
+            "background activity hint contradicted the shared idle boundary and was ignored for steering delivery"
+        );
+    } else {
+        tracing::warn!(
+            target: "status_truth",
+            session = name,
+            provider_signal = kind,
+            verdict,
+            "provider_background_work_overrode_idle_report: board-drive and steering are held until the provider row clears"
+        );
+    }
 }
 
 /// WARN once per lane per stuck report, so a lane held out of the drive loop by
@@ -11349,7 +11367,9 @@ pub(crate) async fn steer_delivery_for(state: &AppState, name: &str, age_s: f64)
         || explain["provider_background_working"] == true
         || signals.provider_child_activity.contains(name);
     if background_working {
-        if let Some(raw) = signals.panes.get(name) { warn_background_override_once(name, raw); }
+        if let Some(raw) = signals.panes.get(name) {
+            warn_background_override_once(name, raw, status == "idle");
+        }
     }
     steer_decide_with_background(
         Some(&status), None, age_s, steer_max_age_s(), background_working,
@@ -26714,6 +26734,11 @@ mod steer_freeze_tests {
             steer_decide_with_background(Some("active"), None, 86_400.0, 600.0, true),
             SteerDelivery::Hold,
             "max age never authorizes interruption while background work is live"
+        );
+        assert_eq!(
+            steer_decide_with_background(Some("idle"), None, 86_400.0, 600.0, true),
+            SteerDelivery::AtBoundary,
+            "a weaker background hint cannot contradict the shared idle verdict and starve steering"
         );
 
         assert!(!provider_background_working(CODEX_BACKGROUND_FINISHED));
