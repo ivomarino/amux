@@ -18,6 +18,9 @@ cd "$(dirname "$0")/.."
 SCRIPT="$(pwd)/scripts/rust-auto-build.sh"
 PASS=0; FAIL=0
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+# Cleanup diagnostics cannot depend on a running server or an inherited fleet
+# endpoint. This also reproduces CI, where no deployment-permit server exists.
+export AMUX_URL=http://127.0.0.1:1
 
 # The script redirects its whole build block to $LOG, so stdout is empty by
 # design — read the log it actually writes. AMUX_RS_BUILD_LOG is the existing
@@ -50,8 +53,8 @@ bad()  { FAIL=$((FAIL+1)); echo "FAIL: $1"; echo "  got: ${2:-<empty>}"; }
 # --- (a) both caches present: the IDLE one must be named FIRST -------------
 H="$TMP/both"; mkdir -p "$H/.amux/rust-build-target" "$H/.amux/rust-build-target-e2e-head"
 out=$(run "$H")
-idle_line=$(printf '%s\n' "$out" | grep -n "idle e2e target dir" | head -1 | cut -d: -f1)
-shared_line=$(printf '%s\n' "$out" | grep -n "SHARED target dir" | head -1 | cut -d: -f1)
+idle_line=$(printf '%s\n' "$out" | grep -n "idle e2e target dir" | head -1 | cut -d: -f1 || true)
+shared_line=$(printf '%s\n' "$out" | grep -n "SHARED target dir" | head -1 | cut -d: -f1 || true)
 if [ -n "$idle_line" ] && [ -n "$shared_line" ] && [ "$idle_line" -lt "$shared_line" ]; then ok
 else bad "(a) the idle e2e cache must be cleared BEFORE the shared one" "$out"; fi
 

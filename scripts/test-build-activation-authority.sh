@@ -103,5 +103,43 @@ expect test "$(grep -c '^build ' "$TRACE")" = 2
 expect grep -q "ACTIVATION STAMP DRIFT $ELECTED" "$LOG"
 expect grep -q "$ELECTED" "$INSTALL"
 
+# Worker-attributed diagnostic runs must remain offline, while a real install
+# of that same commit must still fail closed without a measured overlap permit.
+git -C "$AUTH" -c user.name=test -c user.email=test@example.com commit \
+  --allow-empty -qm $'worker revision\n\nAmux-Session: fixture-worker'
+WORKER=$(git -C "$AUTH" rev-parse HEAD)
+git -C "$AUTH" update-ref refs/remotes/origin/main "$WORKER"
+mkdir -p "$FAKE_HOME/.cargo/bin"
+export CURL_TRACE="$TMP/curl.trace"
+cat > "$FAKE_HOME/.cargo/bin/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$CURL_TRACE"
+exit 7
+EOF
+chmod +x "$FAKE_HOME/.cargo/bin/curl"
+for mode in AMUX_RS_DISK_CLEAR_ONLY AMUX_RS_BUILD_PROVENANCE_ONLY; do
+  rm -f "$CURL_TRACE" "$TMP/provenance.json"
+  export "$mode=1"
+  run_builder "$AUTH"
+  unset "$mode"
+  expect test ! -e "$CURL_TRACE"
+  if [ "$mode" = AMUX_RS_BUILD_PROVENANCE_ONLY ]; then
+    expect test -s "$TMP/provenance.json"
+  else
+    expect test ! -e "$TMP/provenance.json"
+    expect grep -q "building $WORKER" "$LOG"
+  fi
+  expect grep -q "OVERLAP GUARD NOT APPLICABLE $WORKER" "$LOG"
+  expect test "$(grep -c '^build ' "$TRACE")" = 2
+  expect grep -q "$ELECTED" "$INSTALL"
+  expect test "$(cat "$STAMP")" = "$ELECTED"
+done
+run_builder "$AUTH"
+expect grep -q 'overlap/deployment-permit?session=fixture-worker' "$CURL_TRACE"
+expect grep -q "OVERLAP GUARD UNMEASURED $WORKER" "$LOG"
+expect test "$(grep -c '^build ' "$TRACE")" = 2
+expect grep -q "$ELECTED" "$INSTALL"
+expect test "$(cat "$STAMP")" = "$ELECTED"
+
 echo "test-build-activation-authority: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
