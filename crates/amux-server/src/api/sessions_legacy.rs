@@ -159,6 +159,8 @@ pub static PANE_CAPTURE_TIMEOUTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static PANE_CAPTURE_LAST_TIMEOUT: std::sync::Mutex<Option<(String, f64)>> =
     std::sync::Mutex::new(None);
+pub static PANE_CAPTURE_LAST_TIMEOUT_DETAIL: std::sync::Mutex<Option<serde_json::Value>> =
+    std::sync::Mutex::new(None);
 
 /// One `tmux capture-pane`, bounded.
 ///
@@ -223,82 +225,128 @@ fn probe_budget() -> std::time::Duration {
 /// and stderr when tmux fails, and converting it to the stdout-only helper
 /// would have silently dropped that diagnostic to buy the timeout. Widening the
 /// helper keeps both.
+/// Drain both output pipes while polling the child. Waiting for exit first
+/// deadlocks as soon as either pipe fills, then misreports amux's unread pipe
+/// as a stalled tmux server (AMUX-4203). The deadline also covers pipe EOF:
+/// a descendant can keep a pipe open after the direct child has exited.
 fn run_bounded_output(
     mut cmd: std::process::Command,
     budget: std::time::Duration,
     lane: &str,
 ) -> Option<std::process::Output> {
-    let mut child = cmd.spawn().ok()?;
+    use std::io::{self, Read};
+    use std::os::fd::AsRawFd;
+
+    fn nonblocking(pipe: &impl AsRawFd) -> io::Result<()> {
+        // SAFETY: pipe owns this valid descriptor throughout both fcntl calls.
+        let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
+        if flags == -1 || unsafe {
+            libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+        } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn drain(pipe: &mut Option<impl Read>, bytes: &mut Vec<u8>) -> io::Result<bool> {
+        let mut progressed = false;
+        let mut buf = [0; 8192];
+        // Fairness per pass, not an output limit: revisit the deadline and the
+        // other pipe even when a producer writes continuously.
+        for _ in 0..32 {
+            let Some(reader) = pipe.as_mut() else { break };
+            match reader.read(&mut buf) {
+                Ok(0) => { *pipe = None; break; }
+                Ok(n) => { bytes.extend_from_slice(&buf[..n]); progressed = true; }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(progressed)
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            tracing::warn!(target: "amux::sessions", lane, %error,
+                verdict = "probe_spawn_failed", measured = false,
+                "fleet probe could not start; no tmux response was measured");
+            return None;
+        }
+    };
+    let pid = child.id();
     let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if start.elapsed() >= budget {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    PANE_CAPTURE_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if let Ok(mut l) = PANE_CAPTURE_LAST_TIMEOUT.lock() {
-                        *l = Some((lane.to_string(), crate::config::now_f64()));
-                    }
-                    tracing::warn!(
-                        target: "amux::sessions",
-                        lane = %lane,
-                        budget_s = budget.as_secs_f64(),
-                        "fleet-list probe exceeded its budget and was killed (AF-301). Before \
-                         this bound the same call was a bare `.output()` with no timeout, and a \
-                         wedged tmux held GET /api/sessions for as long as tmux took — 697s on \
-                         2026-08-28, which starved the runtime and 500'd the dashboard."
-                    );
-                    return None;
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut status = None;
+    let result = (|| -> io::Result<Option<std::process::Output>> {
+        if let Some(pipe) = &stdout_pipe { nonblocking(pipe)?; }
+        if let Some(pipe) = &stderr_pipe { nonblocking(pipe)?; }
+        loop {
+            let stdout_progress = drain(&mut stdout_pipe, &mut stdout)?;
+            let stderr_progress = drain(&mut stderr_pipe, &mut stderr)?;
+            if status.is_none() { status = child.try_wait()?; }
+            if let Some(status) = status {
+                if stdout_pipe.is_none() && stderr_pipe.is_none() {
+                    return Ok(Some(std::process::Output {
+                        status, stdout: std::mem::take(&mut stdout), stderr: std::mem::take(&mut stderr),
+                    }));
                 }
+            }
+            if start.elapsed() >= budget { return Ok(None); }
+            if !stdout_progress && !stderr_progress {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            Err(_) => return None,
+        }
+    })();
+    match result {
+        Ok(Some(out)) => Some(out),
+        failure => {
+            let _ = child.kill();
+            let _ = child.wait();
+            match failure {
+                Ok(None) => {
+                    PANE_CAPTURE_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let now = crate::config::now_f64();
+                    if let Ok(mut last) = PANE_CAPTURE_LAST_TIMEOUT.lock() {
+                        *last = Some((lane.to_string(), now));
+                    }
+                    let phase = if status.is_some() { "pipe_eof" } else { "child_exit" };
+                    let detail = json!({"measured": true, "n_considered": 1,
+                        "lane": lane, "pid": pid, "ts": now, "phase": phase,
+                        "elapsed_s": start.elapsed().as_secs_f64(), "budget_s": budget.as_secs_f64(),
+                        "stdout_bytes": stdout.len(), "stderr_bytes": stderr.len(),
+                        "child_exited": status.is_some()});
+                    if let Ok(mut last) = PANE_CAPTURE_LAST_TIMEOUT_DETAIL.lock() { *last = Some(detail.clone()); }
+                    tracing::warn!(target: "amux::sessions", lane, pid, phase,
+                        budget_s = budget.as_secs_f64(), elapsed_s = start.elapsed().as_secs_f64(),
+                        stdout_bytes = stdout.len(), stderr_bytes = stderr.len(),
+                        verdict = "probe_output_timeout",
+                        "fleet probe exceeded its deadline while draining output; partial output is discarded (AMUX-4203)");
+                    crate::backend::tmux_health::capture_after_probe_timeout(detail);
+                }
+                Err(error) => {
+                    tracing::warn!(target: "amux::sessions", lane, pid, %error,
+                        stdout_bytes = stdout.len(), stderr_bytes = stderr.len(),
+                        verdict = "probe_output_io_failed", "fleet probe output could not be measured");
+                }
+                Ok(Some(_)) => unreachable!(),
+            }
+            None
         }
     }
-    child.wait_with_output().ok()
 }
 
 fn run_bounded(
-    mut cmd: std::process::Command,
+    cmd: std::process::Command,
     budget: std::time::Duration,
     lane: &str,
 ) -> Option<String> {
-    use std::io::Read;
-    let mut child = cmd.spawn().ok()?;
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if start.elapsed() >= budget {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    PANE_CAPTURE_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if let Ok(mut l) = PANE_CAPTURE_LAST_TIMEOUT.lock() {
-                        *l = Some((lane.to_string(), crate::config::now_f64()));
-                    }
-                    tracing::warn!(
-                        target: "amux::sessions",
-                        lane = %lane,
-                        budget_s = budget.as_secs_f64(),
-                        "tmux capture-pane exceeded its budget and was killed — this lane's \
-                         preview is absent this round (AMUX-3700). Before this bound, one hung \
-                         capture blocked GET /api/sessions for as long as tmux took."
-                    );
-                    return None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            Err(_) => return None,
-        }
-    }
-    // Small payload (30 lines), so the pipe cannot fill and deadlock the child
-    // before it exits; reading after the wait is safe here for that reason.
-    let mut s = String::new();
-    child.stdout.take()?.read_to_string(&mut s).ok()?;
-    Some(s.trim().to_string())
+    let out = run_bounded_output(cmd, budget, lane)?;
+    String::from_utf8(out.stdout).ok().map(|s| s.trim().to_string())
 }
 
 /// Derive the waiting_reason from a pane capture: "permission_prompt",
@@ -3855,6 +3903,50 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
 #[cfg(test)]
 mod tests {
     use super::*;
+    static PROBE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn bounded_probe_drains_large_stdout_and_stderr_before_waiting() {
+        let _guard = PROBE_TEST_LOCK.lock().unwrap();
+        use std::process::{Command, Stdio};
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "head -c 262144 /dev/zero; head -c 262144 /dev/zero >&2"])
+            .stdout(Stdio::piped()).stderr(Stdio::piped());
+        let out = run_bounded_output(cmd, std::time::Duration::from_secs(3), "large-probe")
+            .expect("a productive child must not be killed because amux left its output pipe full");
+        assert!(out.status.success());
+        assert_eq!(out.stdout, vec![0; 262144]);
+        assert_eq!(out.stderr, vec![0; 262144]);
+    }
+
+    #[test]
+    fn bounded_probe_pane_capture_preserves_large_output() {
+        let _guard = PROBE_TEST_LOCK.lock().unwrap();
+        use std::process::{Command, Stdio};
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "head -c 262144 /dev/zero"])
+            .stdout(Stdio::piped()).stderr(Stdio::null());
+        let out = run_bounded(cmd, std::time::Duration::from_secs(3), "large-pane")
+            .expect("pane length in lines does not bound bytes in its output pipe");
+        assert_eq!(out.as_bytes(), vec![0; 262144]);
+    }
+
+    #[test]
+    fn bounded_probe_deadline_survives_continuous_output_and_inherited_pipes() {
+        let _guard = PROBE_TEST_LOCK.lock().unwrap();
+        use std::process::{Command, Stdio};
+        for (script, phase) in [("exec yes x", "child_exit"), ("sleep 2 & printf finished", "pipe_eof")] {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", script]).stdout(Stdio::piped()).stderr(Stdio::null());
+            let started = std::time::Instant::now();
+            assert!(run_bounded_output(cmd, std::time::Duration::from_millis(150), "deadline-probe").is_none());
+            assert!(started.elapsed() < std::time::Duration::from_secs(1), "pipe reads escaped the deadline");
+            let detail = PANE_CAPTURE_LAST_TIMEOUT_DETAIL.lock().unwrap().clone().unwrap();
+            assert_eq!(detail["phase"], phase);
+            assert_eq!(detail["measured"], true);
+            assert!(detail["stdout_bytes"].as_u64().unwrap() > 0);
+        }
+    }
 
     #[test]
     fn confirmed_model_must_match_provider_and_current_process_life() {
@@ -3895,6 +3987,7 @@ mod tests {
     /// waits patiently, which is the bug.
     #[test]
     fn a_pane_capture_that_never_returns_is_killed_on_its_budget() {
+        let _guard = PROBE_TEST_LOCK.lock().unwrap();
         use std::process::{Command, Stdio};
         let budget = std::time::Duration::from_millis(300);
 

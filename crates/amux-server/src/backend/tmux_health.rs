@@ -130,6 +130,10 @@ fn socket_ownership_failure(verdict: &str) -> bool {
 }
 
 pub async fn observe() -> Observation {
+    observe_with_evidence(true).await
+}
+
+async fn observe_with_evidence(capture: bool) -> Observation {
     let uid = euid().to_string();
     let lsof_args = ["-nP", "-a", "-U", "-u", &uid, "-c", "tmux", "-Fpcn"];
     let (identity, sockets) = tokio::join!(
@@ -188,22 +192,89 @@ pub async fn observe() -> Observation {
         owners,
         verdict,
     };
-    if socket_ownership_failure(&observation.verdict) {
-        capture_stall_evidence(&observation).await;
+    if capture && socket_ownership_failure(&observation.verdict) {
+        capture_stall_evidence(&observation, "socket_ownership", None).await;
     }
     observation
 }
 
-async fn capture_stall_evidence(observation: &Observation) {
+/// Capture the first probe timeout without depending on the main runtime's
+/// ability to schedule its invariant monitor during a host-wide stall.
+pub(crate) fn capture_after_probe_timeout(probe: serde_json::Value) {
+    // Unit fixtures intentionally create hung children; they must not probe
+    // the operator's real fleet or write incident samples into their home.
+    #[cfg(test)]
+    drop(probe);
+    #[cfg(not(test))]
+    {
+        let now = crate::config::now_f64();
+        if !crate::log_dedupe::first_this_bucket("tmux-timeout-sample", (now / 60.0) as i64) {
+            return;
+        }
+        if let Err(error) = std::thread::Builder::new().name("tmux-timeout-evidence".into()).spawn(move || {
+            match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(runtime) => runtime.block_on(async {
+                    let observation = observe_with_evidence(false).await;
+                    capture_stall_evidence(&observation, "fleet_probe_timeout", Some(probe)).await;
+                }),
+                Err(error) => tracing::warn!(target: "amux::tmux", %error,
+                    verdict = "stall_evidence_runtime_failed", "timeout evidence was not measured"),
+            }
+        }) {
+            tracing::warn!(target: "amux::tmux", %error,
+                verdict = "stall_evidence_thread_failed", "timeout evidence was not measured");
+        }
+    }
+}
+
+fn host_process_summary(raw: &str) -> serde_json::Value {
+    let mut rows = Vec::new();
+    for line in raw.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(pid), Some(ppid), Some(state), Some(cpu), Some(rss)) =
+            (fields.next(), fields.next(), fields.next(), fields.next(), fields.next()) else { continue };
+        let (Ok(pid), Ok(ppid), Ok(cpu), Ok(rss)) =
+            (pid.parse::<u32>(), ppid.parse::<u32>(), cpu.parse::<f64>(), rss.parse::<u64>()) else { continue };
+        if !cpu.is_finite() { continue; }
+        rows.push(serde_json::json!({"pid": pid, "ppid": ppid, "state": state,
+            "cpu_pct": cpu, "rss_kib": rss, "executable": fields.collect::<Vec<_>>().join(" ")}));
+    }
+    let count = rows.len();
+    rows.sort_by(|a,b| b["cpu_pct"].as_f64().partial_cmp(&a["cpu_pct"].as_f64()).unwrap_or(std::cmp::Ordering::Equal));
+    let cpu: Vec<_> = rows.iter().take(20).cloned().collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row["rss_kib"].as_u64()));
+    serde_json::json!({"measured": count > 0, "n_considered": count,
+        "why_unmeasured": if count == 0 { Some("ps returned no parseable process rows") } else { None },
+        "top_cpu": cpu, "top_rss": rows.into_iter().take(20).collect::<Vec<_>>()})
+}
+
+async fn capture_stall_evidence(observation: &Observation, trigger: &str, probe: Option<serde_json::Value>) {
     let now = crate::config::now_f64();
-    let key = format!("tmux-stall-evidence:{:?}", observation.owners);
-    if !crate::log_dedupe::first_this_bucket(&key, crate::log_dedupe::hour_bucket(now)) {
+    let key = format!("tmux-stall-evidence:{trigger}:{:?}", observation.owners);
+    let bucket = if trigger == "fleet_probe_timeout" { (now / 60.0) as i64 } else { crate::log_dedupe::hour_bucket(now) };
+    if !crate::log_dedupe::first_this_bucket(&key, bucket) {
         return;
     }
     let dir = crate::api::session_verbs::home().join("logs");
-    let receipt = dir.join(format!("tmux-stall-{}.json", now as u64));
+    let receipt = dir.join(format!("tmux-stall-{}-{trigger}.json", now as u64));
     let mut evidence =
-        serde_json::json!({"at": now, "socket_ownership": observation, "samples": []});
+        serde_json::json!({"at": now, "trigger": trigger, "probe": probe, "socket_ownership": observation, "samples": []});
+    let (processes, uptime) = tokio::join!(
+        output("ps", &["-A", "-o", "pid=,ppid=,stat=,pcpu=,rss=,comm="]),
+        output("uptime", &[]),
+    );
+    evidence["host_processes"] = match processes {
+        Ok(out) if out.status.success() => host_process_summary(&String::from_utf8_lossy(&out.stdout)),
+        result => serde_json::json!({"measured": false, "n_considered": 0,
+            "why_unmeasured": match result { Ok(out) => out.status.to_string(), Err(error) => error }}),
+    };
+    evidence["host_uptime_load"] = match uptime {
+        Ok(out) if out.status.success() => serde_json::json!({"measured": true, "n_considered": 1,
+            "output": String::from_utf8_lossy(&out.stdout).trim(),
+            "available_parallelism": std::thread::available_parallelism().ok().map(|n| n.get())}),
+        result => serde_json::json!({"measured": false, "n_considered": 0,
+            "why_unmeasured": match result { Ok(out) => out.status.to_string(), Err(error) => error }}),
+    };
     for owner in observation
         .owners
         .iter()
@@ -219,7 +290,7 @@ async fn capture_stall_evidence(observation: &Observation) {
         let mut sample = serde_json::json!({"pid": owner.pid, "process_stats": stats.map(|o| String::from_utf8_lossy(&o.stdout).into_owned())});
         if cfg!(target_os = "macos") {
             let path = dir.join(format!(
-                "tmux-stall-{}-{}.sample.txt",
+                "tmux-stall-{}-{}-{trigger}.sample.txt",
                 now as u64, owner.pid
             ));
             let path_str = path.to_string_lossy().into_owned();
@@ -235,8 +306,9 @@ async fn capture_stall_evidence(observation: &Observation) {
         std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&receipt, evidence.to_string()));
     match result {
         Ok(()) => {
-            tracing::warn!(target: "amux::tmux", verdict = "live_server_stall_evidence_saved", path = %receipt.display(),
-            "unreachable tmux owner still lives; process evidence captured before recovery")
+            tracing::warn!(target: "amux::tmux", verdict = "live_server_stall_evidence_saved", trigger,
+                ownership_verdict = %observation.verdict, path = %receipt.display(),
+                "tmux incident evidence saved with host load and process summary")
         }
         Err(error) => {
             tracing::warn!(target: "amux::tmux", verdict = "stall_evidence_write_failed", %error,
@@ -297,6 +369,20 @@ pub async fn may_create_server() -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tmux_host_evidence_ranks_cpu_and_memory_independently() {
+        let summary = host_process_summary("11 1 R 150.0 1024 /usr/bin/busy\n22 1 S 0.1 999999 /Applications/Memory User\n");
+        assert_eq!(summary["measured"], true);
+        assert_eq!(summary["n_considered"], 2);
+        assert_eq!(summary["top_cpu"][0]["pid"], 11);
+        assert_eq!(summary["top_rss"][0]["pid"], 22);
+        assert_eq!(summary["top_rss"][0]["executable"], "/Applications/Memory User");
+        let invalid = host_process_summary("ps failed\n11 1 R NaN 5 bad\n");
+        assert_eq!(invalid["measured"], false);
+        assert_eq!(invalid["n_considered"], 0);
+        assert!(invalid["why_unmeasured"].is_string());
+    }
 
     #[test]
     fn tmux_socket_invariant_negative_control() {

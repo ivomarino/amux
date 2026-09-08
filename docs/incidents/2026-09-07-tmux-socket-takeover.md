@@ -100,3 +100,74 @@ A responsive replacement alone is not proof that the older owner has exited.
 These are targeted checks, not a full-suite result. The contention wrapper
 reported worktree changes during the runs; this shared checkout included
 concurrent edits. Logs are retained with the local recovery receipts.
+
+## Follow-up: a full connection queue reproduces the takeover
+
+Follow-up work beginning at 22:35 EDT narrowed the mechanism further:
+
+- The request log recorded median host load averages of 54.64 at 17:27,
+  144.92 at 17:28, and 157.63 at 17:30. The timeout burst crossed fleet
+  discovery, disk probes and background jobs; it was not confined to one pane.
+  These are contemporaneous load readings, not attribution to a process.
+- Twenty post-recovery stack samples of the replacement tmux server showed
+  median capture work of 2.0% and median waiting in `select_dispatch` of 91.7%.
+  Ordinary capture traffic in those later samples does not explain the
+  original stall. All 57 current pane captures completed when their output
+  was drained promptly; none exceeded this host's measured 65,536-byte pipe
+  capacity (largest: 16,255 bytes).
+- On an isolated tmux server, pausing only that fixture's server and filling
+  its connection queue produced **ECONNREFUSED after 128 connections**.
+  `tmux -N new-session` refused and preserved the socket. The same command
+  without `-N` created a replacement while the original server remained alive.
+  `python3 scripts/test-tmux-backlog.py` repeats both controls without touching
+  the fleet and prints a measured PASS receipt.
+
+This matches [tmux's 128-entry listen queue](https://github.com/tmux/tmux/blob/3.6a/server.c)
+and [macOS's connection-refusal path](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/uipc_usrreq.c).
+The incident's missing measurement is still what delayed the original server
+and how many connections were queued at that moment. The reproduction proves
+a route to takeover; it does not retroactively measure the incident's queue.
+
+The investigation also reproduced a separate defect in amux's bounded probe
+runner: both variants waited for child exit before draining piped output.
+A child writing 262,144 bytes was killed after three seconds because amux
+itself had filled the pipe. Both regression tests failed against the original
+runner. The runner now drains stdout and stderr while polling, with the same
+deadline covering continuously producing children and descendants that keep
+pipes open after the direct child exits.
+
+Timeout WARNs and `/api/debug/tmux` now report the child PID, elapsed time,
+drained stdout/stderr byte counts, and whether the wait was for child exit or
+pipe EOF. A first timeout schedules independent evidence collection, at most
+once per minute, so it does not rely on the busy server runtime's monitor tick.
+Receipts include host load and the top processes by CPU and resident memory,
+using executable names only. Raw output and process arguments are not logged.
+The full-queue and large-output defects are reproduced; neither is claimed as
+proof of the initiating cause at 17:27. AMUX-4203 remains open for that evidence.
+
+The owner subsequently requested reconciliation of conflicting Doing claims.
+The three prompt-generated duplicates (AMUX-4199, AMUX-4200, AMUX-4202) were
+consolidated into AMUX-4203 with links to their preserved requests and recovery
+evidence. Fourteen older claims were returned to backlog without declaring
+them complete. AMUX-4203 was claimed through the board claim endpoint and
+verified as the lane's only Doing card. Before/after board snapshots and action
+receipts are retained in the local `followup/` evidence directory.
+
+Follow-up verification:
+
+- Before the pipe fix, `scripts/test-contended.sh -p amux-server bounded_probe_ --lib`
+  failed both large-output cases: `0 passed; 2 failed`.
+- After the fix, `scripts/test-contended.sh -p amux-server --lib -- bounded_probe_ tmux_host_evidence a_pane_capture_that_never_returns`
+  → `test result: ok. 5 passed; 0 failed`.
+- `scripts/test-contended.sh -p amux-server --test diagnostic_contract --test tmux_target_audit`
+  → diagnostic contract `4 passed; 0 failed`; tmux target audit `3 passed; 0 failed`.
+- `scripts/safe-cargo.sh check --workspace` → `Finished dev profile`.
+- `python3 scripts/test-tmux-backlog.py` → `measured: true`, `verdict: PASS`,
+  128 connections before refusal, guarded socket preserved, unguarded socket replaced.
+- Runtime reconciliation → `card_count: 1`, `card_id: AMUX-4203`,
+  `source: task.claimed`, `verdict: linked`, `violation: false`.
+
+The wrapper again reported concurrent worktree edits. These targeted results
+do not claim a clean full-suite run. The timeout receipt was subsequently
+extended to carry the triggering probe's exact byte counts and PID; the commit
+gate checks that final production code as well as test targets.

@@ -637,9 +637,11 @@ pub async fn debug_tmux() -> axum::Json<serde_json::Value> {
             "socket_ownership": socket_ownership,
             "pane_capture_timeouts": pane_timeouts,
             "pane_capture_last_timeout": pane_last,
+            "pane_capture_last_timeout_detail": crate::api::sessions_legacy::PANE_CAPTURE_LAST_TIMEOUT_DETAIL.lock().ok().and_then(|last| last.clone()),
             "pane_capture_note": "captures killed on AMUX_PANE_CAPTURE_TIMEOUT_S (default 3s). \
                                   In-memory, so a restart resets it; a non-zero count means \
-                                  tmux is not answering and some lane previews are missing.",
+                                  a probe missed its deadline and some lane previews may be missing. \
+                                  last_timeout_detail distinguishes child exit from pipe EOF and counts drained bytes.",
             "exit": o.status.to_string(),
             "stdout_bytes": o.stdout.len(),
             "stdout_lines": String::from_utf8_lossy(&o.stdout).lines().count(),
@@ -658,7 +660,10 @@ pub async fn debug_tmux() -> axum::Json<serde_json::Value> {
             serde_json::json!({
                 "spawn": "failed",
                 "error": e,
-                "socket_ownership": socket_ownership
+                "socket_ownership": socket_ownership,
+                "pane_capture_timeouts": pane_timeouts,
+                "pane_capture_last_timeout": pane_last,
+                "pane_capture_last_timeout_detail": crate::api::sessions_legacy::PANE_CAPTURE_LAST_TIMEOUT_DETAIL.lock().ok().and_then(|last| last.clone())
             }),
             "tmux could not be spawned or did not answer within 3s; the fleet was never listed",
         ),
