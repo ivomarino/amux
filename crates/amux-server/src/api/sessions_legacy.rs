@@ -2168,6 +2168,29 @@ struct RuntimeMarkerSelection<'a> {
     newer_cardless_suppressed: bool,
 }
 
+/// The surviving exact `task.claimed` identities behind runtime reconciliation.
+///
+/// Kept as a small shared primitive because recovery dispatch must make the
+/// same ownership decision the sessions API publishes: one exact live claim is
+/// actionable even beside unrelated Doing rows; two distinct ones are an
+/// explicit ambiguity, never a newest-row guess.
+pub(crate) fn surviving_claimed_card_ids(
+    markers: &[TaskMarker],
+    session: &str,
+    doing_by_id: &BTreeMap<String, (String, String, i64)>,
+) -> BTreeSet<String> {
+    markers
+        .iter()
+        .filter_map(|marker| {
+            let card = marker.1.as_deref()?;
+            doing_by_id
+                .get(card)
+                .filter(|(owner, _, _)| owner == session)
+                .map(|_| card.to_string())
+        })
+        .collect()
+}
+
 /// Select the causal marker which describes this runtime now.
 ///
 /// A still-live claimed card is sticky across later informational/control
@@ -2193,10 +2216,7 @@ fn select_runtime_marker<'a>(
             })
         })
         .collect();
-    let distinct_live_claims: BTreeSet<&str> = live_claims
-        .iter()
-        .filter_map(|marker| marker.1.as_deref())
-        .collect();
+    let distinct_live_claims = surviving_claimed_card_ids(markers, session, doing_by_id);
     if let Some(marker) = live_claims
         .into_iter()
         .max_by(|left, right| left.0.total_cmp(&right.0))
