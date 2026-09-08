@@ -9398,6 +9398,49 @@ fn compose_worker_block(name: &str, session_content: &str) -> String {
 /// memories that turn out to be wrong, so a pointer whose target file is gone is
 /// NOT preserved: resurrecting it would make deletion impossible and quietly
 /// restore a fact somebody retracted.
+/// (deleted-target pointers, unrecognised lines) that a compose will DROP.
+///
+/// Pulled out of the warn so the claim is falsifiable. A `tracing::warn!` that
+/// nothing asserts is a disclosure nobody can test, which is the failure this
+/// whole card is about one layer along (ts-gke asked exactly this: does a MIXED
+/// file behave the way the warn says).
+///
+/// The two counts mean opposite things and must not be summed:
+///   deleted-target  a pointer whose file is gone. Dropped ON PURPOSE.
+///   unrecognised    a line this merge cannot carry. A real loss, and for a
+///                   PROSE-shaped source (headings and paragraphs, no pointer
+///                   lines) it is every line.
+fn compose_drop_counts(
+    existing: &str,
+    composed: &str,
+    mem_dir: &std::path::Path,
+) -> (usize, usize) {
+    let re = cached_re!(r"(?m)^- \[[^\]]+\]\(([A-Za-z0-9._-]+\.md)\)");
+    let (mut deleted, mut unrecognised, mut in_roster) = (0usize, 0usize, false);
+    for line in existing.lines() {
+        let t = line.trim();
+        if t.starts_with("## Fleet — who else is running") {
+            in_roster = true;
+        }
+        if in_roster || t.is_empty() {
+            continue;
+        }
+        match re.captures(line) {
+            Some(c) => {
+                if !mem_dir.join(&c[1]).is_file() {
+                    deleted += 1;
+                }
+            }
+            None => {
+                if !composed.contains(t) {
+                    unrecognised += 1;
+                }
+            }
+        }
+    }
+    (deleted, unrecognised)
+}
+
 fn preserved_agent_pointers(mem_dir: &std::path::Path, composed: &str) -> String {
     let existing = match std::fs::read_to_string(mem_dir.join("MEMORY.md")) {
         Ok(t) => t,
@@ -9438,31 +9481,7 @@ fn preserved_agent_pointers(mem_dir: &std::path::Path, composed: &str) -> String
     // prose with zero `- [Title](file.md)` lines, so for a lane in that style
     // this preserves nothing and the warn is the only signal anyone gets.
     // grep "memory: compose dropped".
-    let mut dropped_deleted = 0usize;
-    let mut unrecognised = 0usize;
-    let mut in_roster = false;
-    for line in existing.lines() {
-        let t = line.trim();
-        if t.starts_with("## Fleet — who else is running") {
-            in_roster = true;
-        }
-        if in_roster || t.is_empty() {
-            continue;
-        }
-        match re.captures(line) {
-            Some(c) => {
-                let target = &c[1];
-                if !mem_dir.join(target).is_file() {
-                    dropped_deleted += 1;
-                }
-            }
-            None => {
-                if !composed.contains(t) {
-                    unrecognised += 1;
-                }
-            }
-        }
-    }
+    let (dropped_deleted, unrecognised) = compose_drop_counts(&existing, composed, mem_dir);
     if dropped_deleted > 0 || unrecognised > 0 {
         tracing::warn!(
             dir = %mem_dir.display(),
@@ -18726,6 +18745,61 @@ fn getrandom_fill(buf: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
+
+    /// AF-578, asked for by ts-gke as the assumption they most wanted falsified:
+    /// does a MIXED source (some pointers, some prose) behave the way the warn
+    /// claims, or does "no pointer lines found" quietly read as "nothing to
+    /// preserve"? Same code path, different bugs.
+    ///
+    /// Their own lane is the motivating case: ts-gke.md is 17 prose sections and
+    /// ZERO pointer lines, so for that shape this merge preserves nothing and the
+    /// warn is the only signal anyone gets. That has to be COUNTED, not assumed.
+    #[test]
+    fn a_mixed_source_preserves_its_pointers_and_counts_the_prose_it_cannot_carry() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let d = dir.path();
+        std::fs::write(d.join("live.md"), "x\n").unwrap();
+
+        // MIXED: one live pointer, one deleted pointer, and prose a human would
+        // call memory.
+        let mixed = concat!(
+            "- [Live](live.md) — a pointer, preserved\n",
+            "- [Dead](dead.md) — pointer whose file is gone, dropped on purpose\n",
+            "## A prose section a session wrote\n",
+            "Some content with no pointer line at all.\n",
+            "**Why:** prose sources are a real shape (ts-gke.md is entirely this).\n",
+        );
+        std::fs::write(d.join("MEMORY.md"), mixed).unwrap();
+        let composed = "# Shared Context\n";
+
+        let out = super::preserved_agent_pointers(d, composed);
+        assert!(out.contains("(live.md)"), "the pointer half must survive: {out}");
+        assert!(!out.contains("(dead.md)"), "the deleted target must not: {out}");
+
+        let (deleted, unrecognised) = super::compose_drop_counts(mixed, composed, d);
+        assert_eq!(deleted, 1, "exactly the one pointer whose file is gone");
+        assert_eq!(
+            unrecognised, 3,
+            "every prose line must be COUNTED as unrecognised, not silently dropped"
+        );
+
+        // PURE-PROSE, ts-gke's actual file shape. Nothing is preserved, and the
+        // count is the only thing standing between that and silence. Asserting
+        // it is non-zero is the difference between "nothing to preserve" and
+        // "could not preserve anything".
+        let prose = concat!(
+            "## Liveness is not identity\n",
+            "A worker answering is not the worker you addressed.\n",
+        );
+        std::fs::write(d.join("MEMORY.md"), prose).unwrap();
+        assert_eq!(
+            super::preserved_agent_pointers(d, composed),
+            "",
+            "a prose-only source preserves nothing, by design"
+        );
+        let (_d2, u2) = super::compose_drop_counts(prose, composed, d);
+        assert_eq!(u2, 2, "and every one of its lines is counted as at-risk, not zero");
+    }
 
     /// AF-578. MEMORY.md is rebuilt wholesale from the server's sources, so a
     /// pointer a session appended there (which the memory instruction tells every
