@@ -164,6 +164,30 @@ class CargoReclaimTests(unittest.TestCase):
             proc.terminate()
             proc.wait(timeout=10)
 
+    def test_hardened_linux_proc_uses_known_command_identity(self):
+        proc = self.base / 'proc' / '1177'
+        proc.mkdir(parents=True)
+
+        def denied(_):
+            raise PermissionError('hardened procfs')
+
+        resolved = guard.process_executable(
+            '1177', 'sleep', linux=True, proc_root=self.base / 'proc',
+            readlink=denied, which=lambda name: '/usr/bin/sleep' if name == 'sleep' else None)
+        self.assertEqual(resolved, Path('/usr/bin/sleep'))
+
+    def test_hardened_linux_proc_still_fails_closed_for_unknown_binary(self):
+        proc = self.base / 'proc' / '1178'
+        proc.mkdir(parents=True)
+
+        def denied(_):
+            raise PermissionError('hardened procfs')
+
+        with self.assertRaisesRegex(guard.Deferred, 'process executable unmeasured'):
+            guard.process_executable(
+                '1178', 'orphan-test-012', linux=True, proc_root=self.base / 'proc',
+                readlink=denied, which=lambda _: None)
+
 
 if __name__ == '__main__':
     unittest.main()

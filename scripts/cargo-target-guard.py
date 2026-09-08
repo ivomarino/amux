@@ -68,6 +68,38 @@ def native_locks(target):
     return sorted(result)
 
 
+def process_executable(pid, command, *, linux=None, proc_root=Path('/proc'),
+                       readlink=None, which=None):
+    """Resolve one process without treating an unreadable /proc link as a build.
+
+    Hardened Linux runners can deny ``/proc/<pid>/exe`` for ordinary sibling
+    processes.  ``ps comm`` is still measured evidence: when its complete name
+    resolves through PATH (for example ``sleep`` or ``bash``), that executable
+    cannot be a test artifact under a Cargo target.  Truncated/custom names do
+    not resolve and therefore continue to fail closed.
+    """
+    executable = Path(command.removesuffix(' (deleted)'))
+    linux = sys.platform.startswith('linux') if linux is None else linux
+    if not linux:
+        return executable
+    readlink = os.readlink if readlink is None else readlink
+    which = shutil.which if which is None else which
+    proc = proc_root / pid
+    try:
+        if proc.stat().st_uid == os.getuid():
+            executable = Path(readlink(proc / 'exe').removesuffix(' (deleted)'))
+    except FileNotFoundError:
+        return None  # process exited during the snapshot
+    except PermissionError as error:
+        known = which(executable.name)
+        if known:
+            known = Path(known).resolve()
+            if known.name == executable.name:
+                return known
+        raise Deferred('process executable unmeasured: pid ' + pid) from error
+    return executable
+
+
 def active_processes(targets):
     try:
         output = subprocess.run(['ps', '-A', '-ww', '-o', 'pid=,comm='],
@@ -79,18 +111,11 @@ def active_processes(targets):
         raise Deferred('process probe unmeasured: empty or malformed ps output')
     active = []
     for pid, command in rows:
-        executable = Path(command.removesuffix(' (deleted)'))
         # Linux ps comm is truncated. Resolve same-user executable paths so a
         # directly launched test binary is protected after its Cargo parent exits.
-        if sys.platform.startswith('linux'):
-            proc = Path('/proc') / pid
-            try:
-                if proc.stat().st_uid == os.getuid():
-                    executable = Path(os.readlink(proc / 'exe').removesuffix(' (deleted)'))
-            except FileNotFoundError:
-                continue  # process exited during the snapshot
-            except PermissionError as error:
-                raise Deferred('process executable unmeasured: pid ' + pid) from error
+        executable = process_executable(pid, command)
+        if executable is None:
+            continue
         if executable.name in ('cargo', 'rustc', 'rustdoc', 'clippy-driver') or any(
                 executable == root or root in executable.parents for root in targets):
             active.append(pid)
