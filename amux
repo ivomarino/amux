@@ -1517,8 +1517,9 @@ PYEOF
   # judge the content. The end marker is the half that was missing: the prefix
   # already said "this is untrusted", and said nothing about how far it ran.
   #
-  # This does not stop the splice — that needs pane-level exclusion, which is
-  # AF-613 — it makes it VISIBLE and bounded, which is what lets a receiver act.
+  # This does not stop the splice — that needs pane-level exclusion between the
+  # body and the Enter, which is AF-624 — it makes it VISIBLE and bounded, which
+  # is what lets a receiver act.
   #
   # Single line, no embedded newline: send-keys -l types literally and the Enter
   # is sent separately below, so a newline here would submit the prefix alone.
