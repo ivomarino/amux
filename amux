@@ -2408,7 +2408,34 @@ if "gate" in e:
             "\nSatisfy these, then acknowledge the ones that are TRUE:\n"
             + "".join("   [ ] " + str(g) + "\n" for g in gate)
             + "\n  amux board " + tgt + " " + iid + " --checked "
-            + " ".join(_q(g) for g in gate) + "\n"
+            + " ".join(_q(g) for g in gate) + "\n")
+        # AF-571: print the RETYPE remedy only when retyping is actually the
+        # remedy. The gate resolves card -> worker -> group -> global -> type
+        # default, and only the last of those moves when you change the type.
+        # The server already tells us which we got: it emits how_to_ack.
+        # gate_source exactly when the gate came from a NON-type scope, with
+        # the words "retyping will NOT change it" in it. This block used to
+        # print the retype advice unconditionally, so a group-scoped gate
+        # produced a response that contradicted itself: an accurate JSON field
+        # saying retyping does nothing, and a closing line, last and carrying
+        # the only runnable command, saying to retype.
+        #
+        # The damage is not the wasted command. That closing line is what makes
+        # an author believe the gate has an honest exit; sending them to the one
+        # remedy that provably cannot work pushes them toward acking something
+        # untrue, which is what the line exists to prevent (ethos rule 3).
+        _hta = d.get("how_to_ack") or {}
+        _gsrc = _hta.get("gate_source")
+        if _gsrc:
+            sys.stderr.write(
+                "\nRETYPING WILL NOT CHANGE THIS GATE.\n"
+                "  " + str(_gsrc) + "\n"
+                "  What would change it: satisfy the criteria above; or hand the card\n"
+                "  to the lane the criterion is about, with\n"
+                "    amux board assign " + iid + " <lane> && amux board todo " + iid + "\n"
+                "  or change the gate at the scope that owns it.\n")
+            sys.exit(3)
+        sys.stderr.write(
             "\nIf a criterion does not apply because the card is mistyped "
             "(item_type=" + str(d.get("item_type") or "?") + "), correct the TYPE "
             "rather than acking something untrue:\n"
