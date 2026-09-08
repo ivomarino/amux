@@ -1596,6 +1596,50 @@ pub(crate) fn deps_blocking(conn: &Connection, row: &bs::IssueRow) -> Vec<String
         .cloned().collect()
 }
 
+/// Why each blocking dependency does NOT count, in the operator's own terms.
+///
+/// `deps_blocking` answers WHICH ids block; the auto-park line then said only
+/// "unfinished depends_on=<id>". "Unfinished" is the predicate's name, not the
+/// dependency's state, and the two come apart exactly where this is most
+/// confusing: a dependency that is `done` still blocks when its type completes
+/// at `verified` (`dependency_is_resolved`). So the operator reads "unfinished",
+/// opens the card, sees `done`, and concludes the parker is broken.
+///
+/// Measured 2026-09-08, reported by `primis` (AF-610): PRIMI-220 twice and
+/// PRIMI-221 once were parked within the same second as a satisfied 2/2 gate,
+/// naming PRIMI-219, which had been `done` since that morning. PRIMI-219 has NO
+/// `type`, and `core_item_type("")` falls through to `ItemType::Code`, for which
+/// `verified_is_meaningful` is true. Correct behaviour, unreadable message. The
+/// cost was not the block: the workaround was to CLEAR depends_on on both cards,
+/// which destroyed the dependency graph the parker exists to enforce.
+///
+/// A status with no operand, which is this file's own recurring defect.
+fn dep_block_reasons(conn: &Connection, ids: &[String]) -> Vec<String> {
+    ids.iter()
+        .map(|id| match bs::get_issue(conn, id) {
+            Ok(Some(row)) => {
+                let raw = row.item_type.trim();
+                let shown = if raw.is_empty() { "unset->code" } else { raw };
+                if bs::is_terminal_status(&row.status) {
+                    // Terminal and STILL blocking: name the boundary, because
+                    // this is the case that reads as a bug.
+                    format!("{id}[{}, type {shown}: completes at verified]", row.status)
+                } else {
+                    format!("{id}[{}]", row.status)
+                }
+            }
+            // Absent is not the same as unfinished, and neither is unreadable.
+            Ok(None) => format!("{id}[missing]"),
+            Err(error) => {
+                tracing::warn!(marker = "dependency_reason_unmeasured", dependency = %id,
+                    %error, measured = false, n_considered = 1,
+                    "dependency lookup failed while explaining a park");
+                format!("{id}[unreadable]")
+            }
+        })
+        .collect()
+}
+
 /// Can this `doing` row honestly consume WIP or be advertised as current?
 ///
 /// A lifecycle label cannot override the card's blocking dimensions. Keeping
@@ -5286,12 +5330,13 @@ async fn normalize_blocked_doing(state: &AppState) -> usize {
                     .filter(|reason| !reason.is_empty())
                     .unwrap_or("")
                     .to_string();
+                let detail = dep_block_reasons(conn, &blocking).join(",");
                 let reason = if !blocked_on.is_empty() && !blocking.is_empty() {
-                    format!("blocked_on={blocked_on}; unfinished depends_on={}", blocking.join(","))
+                    format!("blocked_on={blocked_on}; unresolved depends_on={detail}")
                 } else if !blocked_on.is_empty() {
                     format!("blocked_on={blocked_on}")
                 } else {
-                    format!("unfinished depends_on={}", blocking.join(","))
+                    format!("unresolved depends_on={detail}")
                 };
                 let opts = crate::db::advance::AdvanceOpts {
                     expected_from: Some("doing".into()),
@@ -7592,6 +7637,83 @@ mod tests {
     /// absent measurement as "no movement" would escalate a lane on the
     /// strength of a tick that could not have observed anything (ethos rule 4,
     /// applied to this function's own first run).
+    /// A park must name the dependency's STATE, not just call it unfinished.
+    ///
+    /// AF-610, reported by `primis`. PRIMI-220 (twice) and PRIMI-221 were parked
+    /// within the same second as a satisfied 2/2 gate, naming PRIMI-219 — which
+    /// was `done`. The behaviour is correct: PRIMI-219 has no `type`,
+    /// `core_item_type("")` falls through to ItemType::Code, and
+    /// `verified_is_meaningful(Code)` is true, so it completes at `verified`.
+    /// The MESSAGE said "unfinished depends_on=PRIMI-219", which reads as "not
+    /// done" about a card that is done.
+    ///
+    /// The cost was not the park. The workaround was to CLEAR depends_on on both
+    /// cards, destroying the dependency graph the parker exists to enforce.
+    #[test]
+    fn a_park_names_why_a_done_dependency_still_blocks() {
+        let mut conn = Connection::open_in_memory().expect("memdb");
+        crate::db::migrate::apply_all(&mut conn).expect("schema");
+        let add = |id: &str, status: &str, item_type: &str| {
+            conn.execute(
+                "INSERT INTO issues (id, title, status, type, created, updated)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                rusqlite::params![id, format!("t {id}"), status, item_type, 1_760_000_000.0_f64],
+            )
+            .expect("insert");
+        };
+        // The reported shape: done, and NO type at all.
+        add("DEP-UNTYPED", "done", "");
+        // A type whose completion boundary really is `done`.
+        add("DEP-DOC", "done", "doc");
+        // Terminal but never proof of resolution.
+        add("DEP-DISCARDED", "discarded", "doc");
+
+        let ids: Vec<String> =
+            ["DEP-UNTYPED", "DEP-DOC", "DEP-DISCARDED"].iter().map(|s| s.to_string()).collect();
+        let reasons = dep_block_reasons(&conn, &ids);
+
+        // THE POINT: the untyped `done` card must say it is done AND why that is
+        // not enough. Asserting on "done" alone would pass on the old message.
+        assert!(reasons[0].contains("done"), "must name the real status: {:?}", reasons[0]);
+        assert!(
+            reasons[0].contains("completes at verified"),
+            "must name the boundary that makes a done card still block: {:?}",
+            reasons[0]
+        );
+        assert!(reasons[0].contains("unset->code"), "must say the type defaulted: {:?}", reasons[0]);
+
+        // CONTROLS. Without these, a helper that appends the same clause to
+        // everything passes the block above.
+        assert!(!deps_blocking_contains(&conn, "DEP-DOC"), "a doc card at `done` is resolved");
+        assert!(deps_blocking_contains(&conn, "DEP-UNTYPED"), "untyped defaults to code");
+        assert!(deps_blocking_contains(&conn, "DEP-DISCARDED"), "discarded is not resolution");
+        assert!(reasons[2].contains("discarded"), "names its real status: {:?}", reasons[2]);
+
+        // Absent and unreadable are their own answers, never "unfinished".
+        let missing = dep_block_reasons(&conn, &["NOPE-1".to_string()]);
+        assert!(missing[0].contains("missing"), "{:?}", missing[0]);
+    }
+
+    /// Helper: does this id block, per the shipped predicate?
+    fn deps_blocking_contains(conn: &Connection, id: &str) -> bool {
+        !bs::dependency_resolved(conn, id).expect("dependency lookup")
+    }
+
+    /// And the rule itself, stated where a reader looking for it will find it.
+    #[test]
+    fn done_resolves_a_dependency_only_where_verified_is_not_meaningful() {
+        assert!(bs::dependency_is_resolved("verified", "code"));
+        assert!(bs::dependency_is_resolved("done", "doc"));
+        assert!(bs::dependency_is_resolved("done", "research"));
+        // Ships something, so `done` is not the end.
+        assert!(!bs::dependency_is_resolved("done", "code"));
+        assert!(!bs::dependency_is_resolved("done", "ops"));
+        // THE ONE THAT BIT: no type at all is treated as code.
+        assert!(!bs::dependency_is_resolved("done", ""));
+        // Terminal, and still not resolution.
+        assert!(!bs::dependency_is_resolved("discarded", "doc"));
+    }
+
     #[test]
     fn unheeded_counts_only_when_a_comparison_was_actually_possible() {
         // First sighting: no prior mark. Counts as movement, never as silence.
