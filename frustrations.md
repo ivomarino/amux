@@ -4061,3 +4061,24 @@ FIX: Capture checks the active Doing population in the writer transaction.
   capture_pending_active_claim, the existing card and population. Focused
   capture tests: 21 passed, including distinct prompt preservation, one active
   claim, a pending delivery receipt, and retry deduplication.
+
+---
+## Terminal Find discarded the message-type filter and the file menu consumed its own phone row
+AREA: dashboard
+SEVERITY: friction
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux
+CARD: AMUX-4229, AMUX-4227, AMUX-4230
+SYMPTOM: Entering a search changed Human to a disabled Search results selector
+  and searched all terminal output. The file breadcrumb's 180px flex basis
+  wrapped the ellipsis onto an otherwise empty second row at phone width.
+COST: Owner supplied two screenshots and had to request filtering and compact
+  controls explicitly; changing message type could not narrow an active search.
+FIX: Search retains an editable type filter and finds matches only inside that
+  kind's message blocks. The file toolbar shrinks the breadcrumb on one row;
+  the worker menu uses vertical dots. Client beacons retain the selected type,
+  flag mismatched targets, and report file-toolbar wrapping/overflow. Browser
+  proof: 12 passed across desktop, 375px Chromium and iPhone WebKit; screenshots
+  reviewed. The browser proof used changed assets with an isolated pinned
+  backend, so it required no fleet access or additional Rust compilation.

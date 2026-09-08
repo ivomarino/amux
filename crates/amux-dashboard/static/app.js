@@ -9101,7 +9101,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.839';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.840';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -10952,33 +10952,39 @@ function applyPeekSearch(keepIndex, doScroll) {
   // Search the rendered text, not serialized HTML. Entities and ANSI/link
   // spans must not turn one visible phrase into missing or duplicate matches.
   body.innerHTML = lastPeekHTML;
-  const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
-  const nodes = [];
-  let text = '', node;
-  while ((node = walker.nextNode())) {
-    nodes.push({node, start:text.length, end:text.length + node.data.length});
-    text += node.data;
-  }
-  const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const ranges = [...text.matchAll(new RegExp(escaped, 'gi'))].map(m => ({start:m.index,end:m.index + m[0].length}));
+  _peekReclassifyPrompts();
+  const roots = _peekMsgNavKind === 'all' ? [body]
+    : [...body.querySelectorAll('.peek-prompt')].filter(el => el.dataset.msgKind === _peekMsgNavKind);
   _peekMatches = [];
-  let firstRange = 0;
-  for (const entry of nodes) {
-    while (firstRange < ranges.length && ranges[firstRange].end <= entry.start) firstRange++;
-    if (firstRange >= ranges.length || ranges[firstRange].start >= entry.end) continue;
-    const fragment = document.createDocumentFragment();
-    let offset = 0;
-    for (let i = firstRange; i < ranges.length && ranges[i].start < entry.end; i++) {
-      const start = Math.max(0, ranges[i].start - entry.start), end = Math.min(entry.node.length, ranges[i].end - entry.start);
-      fragment.append(document.createTextNode(entry.node.data.slice(offset, start)));
-      const mark = document.createElement('span');
-      mark.className = 'peek-highlight'; mark.dataset.idx = String(i);
-      mark.textContent = entry.node.data.slice(start, end); fragment.append(mark);
-      if (!_peekMatches[i]) _peekMatches[i] = mark;
-      offset = end;
+  for (const root of roots) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    let text = '', node;
+    while ((node = walker.nextNode())) {
+      nodes.push({node, start:text.length, end:text.length + node.data.length});
+      text += node.data;
     }
-    fragment.append(document.createTextNode(entry.node.data.slice(offset)));
-    entry.node.replaceWith(fragment);
+    const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const ranges = [...text.matchAll(new RegExp(escaped, 'gi'))].map(m => ({start:m.index,end:m.index + m[0].length}));
+    const matchBase = _peekMatches.length;
+    let firstRange = 0;
+    for (const entry of nodes) {
+      while (firstRange < ranges.length && ranges[firstRange].end <= entry.start) firstRange++;
+      if (firstRange >= ranges.length || ranges[firstRange].start >= entry.end) continue;
+      const fragment = document.createDocumentFragment();
+      let offset = 0;
+      for (let i = firstRange; i < ranges.length && ranges[i].start < entry.end; i++) {
+        const start = Math.max(0, ranges[i].start - entry.start), end = Math.min(entry.node.length, ranges[i].end - entry.start);
+        fragment.append(document.createTextNode(entry.node.data.slice(offset, start)));
+        const mark = document.createElement('span');
+        mark.className = 'peek-highlight'; mark.dataset.idx = String(matchBase + i);
+        mark.textContent = entry.node.data.slice(start, end); fragment.append(mark);
+        if (!_peekMatches[matchBase + i]) _peekMatches[matchBase + i] = mark;
+        offset = end;
+      }
+      fragment.append(document.createTextNode(entry.node.data.slice(offset)));
+      entry.node.replaceWith(fragment);
+    }
   }
   _peekReclassifyPrompts();
   if (!keepIndex || peekSearchIndex >= _peekMatches.length) peekSearchIndex = 0;
@@ -11087,8 +11093,8 @@ function _peekMsgPrompts() {
 }
 function _peekMsgCount(prompts) {
   const searching = !!peekSearchQuery.trim();
-  const label = searching ? 'Matches' : _peekMsgNavKind === 'all' ? 'All'
-    : (_MSG_KIND[_peekMsgNavKind] || _MSG_KIND.unknown).label;
+  const selectedKind = _peekMsgNavKind === 'all' ? 'All' : (_MSG_KIND[_peekMsgNavKind] || _MSG_KIND.unknown).label;
+  const label = searching ? selectedKind + ' matches' : selectedKind;
   const count = document.getElementById('peek-msg-count');
   if (count) {
     const selected = prompts.findIndex(p => p.classList.contains(searching ? 'current' : 'peek-msg-current'));
@@ -11097,7 +11103,7 @@ function _peekMsgCount(prompts) {
     count.setAttribute('aria-label', label + ': ' + value + ' in loaded output');
   }
   const select = document.getElementById('peek-msg-kind');
-  if (select) { select.value = searching ? 'matches' : _peekMsgNavKind; select.disabled = searching; }
+  if (select) { select.value = _peekMsgNavKind; select.disabled = false; }
   document.getElementById('peek-nav-label').textContent = searching ? 'Find' : 'Messages';
   for (const btn of document.querySelectorAll('#peek-msg-nav .peek-nav-btn')) {
     // Zero loaded matches still permits loading earlier output. It is not a
@@ -11178,10 +11184,12 @@ function _peekNavBeacon(verdict, prompts, target) {
   const body = document.getElementById('peek-body');
   const geometry = target && _peekJumpGeometry(target);
   const searching = !!peekSearchQuery.trim();
+  if (searching && target && _peekMsgNavKind !== 'all'
+      && target.closest('.peek-prompt')?.dataset.msgKind !== _peekMsgNavKind) verdict = 'filter-mismatch';
   try {
     fetch(API + '/api/client-debug', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ kind: 'peek-message-nav', verdict, session: peekSession, ver: APP_VER,
-        measured: true, n_considered: prompts.length, filter: searching ? 'matches' : _peekMsgNavKind,
+        measured: true, n_considered: prompts.length, filter: _peekMsgNavKind,
         mode: searching ? 'search' : 'messages',
         index: searching ? peekSearchIndex : _peekMsgIndex, target_kind: target?.closest('.peek-prompt')?.dataset.msgKind || null,
         target_visible: !!geometry && geometry.visible,
@@ -11249,7 +11257,8 @@ function _peekMsgNavSelect(kind) {
   _peekMsgNavKind = kind;
   _peekMsgIndex = -1;
   document.querySelectorAll('#peek-body .peek-msg-current').forEach(p => p.classList.remove('peek-msg-current'));
-  _peekReclassifyPrompts();
+  if (peekSearchQuery.trim()) applyPeekSearch(false, true);
+  else _peekReclassifyPrompts();
 }
 
 // ── Peek command bar ──
@@ -17531,6 +17540,27 @@ async function _autoCacheDirFiles(path, entries) {
     } catch(_) { break; }   // offline / error — stop quietly
   }
 }
+let _filesToolbarFault = '';
+function _filesToolbarCheck() {
+  requestAnimationFrame(() => {
+    const toolbar = document.querySelector('#files-view > .fe-toolbar');
+    const menu = document.getElementById('files-overflow-btn');
+    if (!toolbar?.getClientRects().length || !menu) return;
+    const bounds = toolbar.getBoundingClientRect(), more = menu.getBoundingClientRect();
+    const first = [...toolbar.querySelectorAll('button')].find(el => el.getClientRects().length);
+    const wrapped = first && Math.abs(first.getBoundingClientRect().top - more.top) > 4;
+    const overflow = more.right > bounds.right + 1 || toolbar.scrollWidth > toolbar.clientWidth + 1;
+    const fault = wrapped || overflow ? [innerWidth, wrapped, overflow].join(':') : '';
+    if (fault && fault !== _filesToolbarFault) {
+      fetch(API + '/api/client-debug', {method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({kind:'files-toolbar-layout',verdict:'wrapped-or-overflowing',
+          measured:true,n_considered:toolbar.querySelectorAll('button').length,
+          viewport:innerWidth,wrapped,overflow,ver:APP_VER})}).catch(() => {});
+    }
+    _filesToolbarFault = fault;
+  });
+}
+window.addEventListener('resize', _filesToolbarCheck);
 async function loadFiles(path) {
   const body = document.getElementById('files-body');
   body.innerHTML = '<div style="padding:16px;color:var(--dim)">Loading...</div>';
@@ -17551,6 +17581,7 @@ async function loadFiles(path) {
     crumbHtml += '<span class="fe-crumb-sep">›</span><span class="fe-crumb" onclick="loadFiles(\'' + cp.replace(/'/g, "\\'") + '\')">' + esc(part) + '</span>';
   }
   document.getElementById('files-breadcrumb').innerHTML = crumbHtml;
+  _filesToolbarCheck();
   try {
     const r = await fetch(API + '/api/ls?path=' + encodeURIComponent(path) + (_filesShowHidden ? '&hidden=1' : ''));
     const data = await r.json();

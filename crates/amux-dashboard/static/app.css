@@ -1226,6 +1226,8 @@
     display: flex; align-items: center; gap: 4px; padding: 6px 10px; flex-wrap: wrap;
     border-bottom: 1px solid var(--border); flex-shrink: 0; background: var(--card);
   }
+  #files-view > .fe-toolbar { flex-wrap: nowrap; min-width: 0; }
+  #files-breadcrumb { flex-basis: 0; }
   .fe-tb-btn {
     background: none; border: 1px solid var(--border); border-radius: 5px;
     color: var(--dim); cursor: pointer; padding: 4px 8px; font-size: 0.75rem;
