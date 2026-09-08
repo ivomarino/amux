@@ -2177,6 +2177,70 @@ mod tests {
         assert_eq!(detail["id"].as_str().unwrap(), id);
     }
 
+    /// ATE-92 acceptance contract: the HTTP session projection, not only a
+    /// helper test, must carry one measured runtime/board verdict. A client
+    /// may never have to reconstruct its WORKING badge from a separate board
+    /// poll, and one runtime may not validate two `doing` cards.
+    #[tokio::test]
+    async fn legacy_sessions_http_serializes_measured_runtime_board_truth() {
+        crate::api::sessions_legacy::SUPPRESS_FLEET_FOR_TEST
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let (app, dir) = app();
+        let now = chrono::Utc::now().timestamp();
+        let marker_ts = now as f64 + 60.0;
+        let conn = rusqlite::Connection::open(dir.path().join("amux-test.db")).unwrap();
+        for (worker, session) in [("linked", "ses-linked"), ("multiple", "ses-multiple")] {
+            conn.execute(
+                "INSERT INTO _amux_workers (id, display_name, state, created_at, updated_at) \
+                 VALUES (?1, ?2, '{\"state\":\"active\"}', 'now', 'now')",
+                rusqlite::params![format!("wrk-{worker}"), worker],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO _amux_sessions (id, worker_id, backend, backend_ref, started_at) \
+                 VALUES (?1, ?2, 'tmux', ?3, 'now')",
+                rusqlite::params![session, format!("wrk-{worker}"), format!("amux-{worker}")],
+            )
+            .unwrap();
+        }
+        for (id, session) in [("LINKED-1", "linked"), ("MULTI-1", "multiple"), ("MULTI-2", "multiple")] {
+            conn.execute(
+                "INSERT INTO issues (id, title, status, session, creator, created, updated) \
+                 VALUES (?1, ?2, 'doing', ?3, 'test', ?4, ?4)",
+                rusqlite::params![id, format!("title {id}"), session, now],
+            )
+            .unwrap();
+        }
+        for (session, card) in [("linked", "LINKED-1"), ("multiple", "MULTI-1")] {
+            conn.execute(
+                "INSERT INTO session_events (ts, session, type, data, source) \
+                 VALUES (?1, ?2, 'task.claimed', ?3, 'test')",
+                rusqlite::params![marker_ts, session, json!({"issue": card}).to_string()],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        crate::api::sessions_legacy::invalidate_sessions_cache();
+
+        let (status, _, payload) = send(&app, "GET", "/api/sessions", None).await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        let rows = payload.as_array().expect("legacy session array");
+        let linked = rows.iter().find(|row| row["name"] == "linked").expect("linked row");
+        assert_eq!(linked["runtime_board"]["measured"], json!(true), "{linked}");
+        assert_eq!(linked["runtime_board"]["status"], json!("linked"), "{linked}");
+        assert_eq!(linked["runtime_board"]["card_id"], json!("LINKED-1"), "{linked}");
+        assert_eq!(linked["runtime_board"]["card_count"], json!(1), "{linked}");
+        assert_eq!(linked["task_board_id"], json!("LINKED-1"), "{linked}");
+
+        let multiple = rows.iter().find(|row| row["name"] == "multiple").expect("multiple row");
+        assert_eq!(multiple["status"], json!("unattributed"), "{multiple}");
+        assert_eq!(multiple["runtime_board"]["measured"], json!(true), "{multiple}");
+        assert_eq!(multiple["runtime_board"]["status"], json!("active-multiple-doing"), "{multiple}");
+        assert_eq!(multiple["runtime_board"]["card_count"], json!(2), "{multiple}");
+        assert!(multiple["runtime_board"]["card_id"].is_null(), "{multiple}");
+        assert!(multiple["task_board_id"].as_str().unwrap_or_default().is_empty(), "{multiple}");
+    }
+
     #[tokio::test]
     async fn conflicting_name_fields_are_400_and_legacy_name_is_accepted() {
         let (app, _dir) = app();

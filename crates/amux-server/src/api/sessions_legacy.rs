@@ -2185,7 +2185,11 @@ fn reconcile_runtime_board(
             violation: false,
         };
     }
-    if !claimed.is_empty() && claimed_card_valid {
+    // A causal marker identifies WHICH card a runtime is acting on, but it
+    // cannot turn several `doing` rows into one valid runtime claim. Multiple
+    // cards are a board contradiction that needs resolution, not a license to
+    // highlight the marker's card and silently validate the rest.
+    if !claimed.is_empty() && claimed_card_valid && doing_count == 1 {
         return RuntimeBoardTruth {
             status: "active".into(),
             card_id: claimed.to_string(),
@@ -2216,6 +2220,8 @@ fn reconcile_runtime_board(
         card_live: false,
         verdict: if claimed.is_empty() {
             "active-without-card"
+        } else if claimed_card_valid {
+            "active-multiple-doing"
         } else {
             "active-card-invalid"
         },
@@ -2989,6 +2995,20 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             "task_time": 0,
             "task_updated": 0,
             "task_board_id": "",
+            // The client treats an unmeasured verdict as synchronizing, never
+            // as a licence to display WORKING beside a generic description.
+            // The reconciliation below replaces this on every successful list
+            // build; its presence also makes an old/incomplete snapshot honest.
+            "runtime_board": {
+                "measured": false,
+                "status": "unmeasured",
+                "verdict": "unmeasured",
+                "card_id": serde_json::Value::Null,
+                "card_count": 0,
+                "n_considered": 0,
+                "card_live": false,
+                "violation": false,
+            },
             "task_board_age": 0,
             "sched_on": 0,
             "sched_off": 0,
@@ -3086,6 +3106,16 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
             "task_override": "",
             "task_override_updated": 0,
             "task_board_id": "",
+            "runtime_board": {
+                "measured": false,
+                "status": "unmeasured",
+                "verdict": "unmeasured",
+                "card_id": serde_json::Value::Null,
+                "card_count": 0,
+                "n_considered": 0,
+                "card_live": false,
+                "violation": false,
+            },
             "task_updated": 0,
             "task_board_age": 0,
             "last_activity": 0,
@@ -3284,7 +3314,11 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
             v["task_board_id"] = json!(truth.card_id);
             v["runtime_board"] = json!({
                 "measured": truth.measured,
+                // `status` is the compact client contract; retain the
+                // descriptive `verdict` spelling for logs and older clients.
+                "status": truth.verdict,
                 "n_considered": truth.n_considered,
+                "card_count": truth.n_considered,
                 "verdict": truth.verdict,
                 "violation": truth.violation,
                 "runtime_status": runtime_status,
@@ -3986,14 +4020,20 @@ mod tests {
     /// missing/invalid attribution, idle suppression, and a vanished worker.
     #[test]
     fn runtime_board_reconciliation_requires_exact_attribution_except_cardless_turns() {
-        let linked = reconcile_runtime_board(true, "active", Some("ATE-92"), true, false, 3);
+        let linked = reconcile_runtime_board(true, "active", Some("ATE-92"), true, false, 1);
         assert_eq!(linked.status, "active");
         assert_eq!(linked.card_id, "ATE-92");
         assert!(linked.card_live);
         assert_eq!(linked.verdict, "linked");
         assert!(linked.measured);
-        assert_eq!(linked.n_considered, 3);
+        assert_eq!(linked.n_considered, 1);
         assert!(!linked.violation);
+
+        let multiple = reconcile_runtime_board(true, "active", Some("ATE-92"), true, false, 2);
+        assert_eq!(multiple.status, "unattributed");
+        assert_eq!(multiple.verdict, "active-multiple-doing");
+        assert!(multiple.card_id.is_empty(), "one active runtime may not validate two doing cards");
+        assert!(multiple.violation);
 
         let informational = reconcile_runtime_board(true, "active", None, false, true, 0);
         assert_eq!(informational.status, "active");
