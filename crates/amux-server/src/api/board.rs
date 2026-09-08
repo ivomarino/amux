@@ -7220,6 +7220,57 @@ mod af413_discarded_tests {
                             "force": true, "reason": "why"})).is_empty());
     }
 
+    /// A gate refusal must not send the reader after a lever that cannot move.
+    ///
+    /// AF-586, tubescience: four forced closes in one day on a lane whose
+    /// WORKER-scope done gate is ["Implemented and merged", "Tests / lint pass",
+    /// "Peer reviewed"], applied to research and ops cards. One refusal site
+    /// branched on retype_would_help(); the other hardcoded "fix the type" for
+    /// everyone, so the caller retyped, got the identical refusal, and was left
+    /// with --force.
+    #[test]
+    fn a_refusal_only_blames_the_type_when_the_type_is_the_lever() {
+        use crate::db::board_store::GateSource;
+
+        // The one case where retyping IS the fix.
+        let from_type = retype_hint_for(Some(&GateSource::TypeDefault));
+        assert!(from_type.contains("the TYPE is wrong"), "{from_type}");
+
+        // Every scope that IGNORES the type must say so instead, and must not
+        // tell the reader to retype.
+        for src in [
+            GateSource::Worker("tubescience".into()),
+            GateSource::Group("amux".into()),
+            GateSource::Column,
+            GateSource::Card,
+        ] {
+            let hint = retype_hint_for(Some(&src));
+            assert_ne!(hint, from_type, "{src:?} must not get the type-default advice");
+            assert!(
+                !hint.contains("the TYPE is wrong"),
+                "{src:?} names a lever that cannot move: {hint}"
+            );
+        }
+
+        // The three that are scoped ALSO say retyping will not help, in words.
+        for src in [
+            GateSource::Worker("tubescience".into()),
+            GateSource::Group("amux".into()),
+            GateSource::Column,
+        ] {
+            let hint = retype_hint_for(Some(&src));
+            assert!(
+                hint.to_lowercase().contains("retyping will not change it"),
+                "{src:?} should say retyping will not change it: {hint}"
+            );
+        }
+
+        // CONTROL. With no resolved source we cannot claim the type is not the
+        // lever either, so the default advice stands. Without this, returning
+        // the scoped explanation unconditionally would pass everything above.
+        assert_eq!(retype_hint_for(None), from_type);
+    }
+
     /// `folded_into` is a control key and must be listed, or a hand-rolled fold
     /// lands in `ignored_fields` and the caller is told nothing changed while
     /// the summary keeps rendering the four not-recorded clauses.
@@ -7835,6 +7886,33 @@ pub(crate) fn desc_replace_destroys_peer_prose(
     // append_not_just_the_field_name` first — the LONGER-replacement case has a
     // net loss of zero and is the one a floor cannot see.
     !lines.any(|l| new.contains(l))
+}
+
+/// The "is the TYPE the lever?" hint for a gate refusal, in ONE place.
+///
+/// Retyping only changes the gate when the gate CAME from the type. A worker-,
+/// group-, column- or card-scoped gate ignores the type entirely, so telling
+/// that caller to fix the type names a lever that cannot move: they retype, get
+/// the identical refusal, and are left with --force.
+///
+/// It lives here because two refusal sites answered this question differently.
+/// One branched on `GateSource::retype_would_help()`; the other hardcoded "the
+/// TYPE is wrong, fix the type" for every caller. tubescience hit the second on
+/// 2026-09-08, four forced closes in one day on a lane whose WORKER-scope done
+/// gate is ["Implemented and merged", "Tests / lint pass", "Peer reviewed"],
+/// applied to research and ops cards (AF-586). Two copies of one rule is how
+/// they came apart, so there is one copy now.
+///
+/// Whether those criteria SHOULD apply to a research card is a separate and
+/// still-open decision. This only stops a refusal sending the reader after a fix
+/// that cannot work.
+pub(crate) fn retype_hint_for(gate_source: Option<&bs::GateSource>) -> String {
+    match gate_source {
+        Some(src) if !src.retype_would_help() => src.explain(),
+        _ => "If these criteria don't fit the work, the TYPE is wrong, so fix the type \
+              rather than the truth."
+            .to_string(),
+    }
 }
 
 pub async fn patch_item(
@@ -9747,6 +9825,29 @@ pub async fn patch_item(
                                 })
                                 .collect();
                             if !missing.is_empty() {
+                                // ASK THE SAME QUESTION THE SIBLING SITE ASKS (AF-586).
+                                //
+                                // This refusal told every caller "the TYPE is wrong, fix the
+                                // type" unconditionally, which is only true when the gate came
+                                // FROM the type. A worker-, group- or column-scoped gate ignores
+                                // the type, so the advice names a lever that cannot move: the
+                                // caller retypes, gets the identical refusal, and is left with
+                                // --force.
+                                //
+                                // Reported by tubescience 2026-09-08, four forced closes in one
+                                // day on a lane whose WORKER-scope done gate is ["Implemented and
+                                // merged", "Tests / lint pass", "Peer reviewed"], applied to
+                                // research and ops cards. GateSource::retype_would_help() exists
+                                // for exactly this question and the other refusal site already
+                                // calls it; this one never did.
+                                //
+                                // Whether those criteria SHOULD apply to a research card is a
+                                // separate decision and still open. This only stops the refusal
+                                // sending the reader after a fix that cannot work.
+                                //
+                                // Bound before the json! because a `match` used as a macro value
+                                // breaks its delimiter parsing.
+                                let retype_hint = retype_hint_for(gate_src.as_ref());
                                 return finish(
                                     &slot_w,
                                     PatchOut::Refused(
@@ -9766,7 +9867,7 @@ pub async fn patch_item(
                                                 "or_gate_ack": true,
                                                 "or_force": "true (explicit bypass; logged)",
                                                 "contract": format!("GET /api/board/contract?card={} (the RESOLVED gate for this card — the bare contract lists only type defaults, AF-112)", next.id),
-                                                "wrong_type?": "If these criteria don't fit the work, the TYPE is wrong — fix the type, not the truth.",
+                                                "wrong_type?": retype_hint,
                                             },
                                         }),
                                     ),
