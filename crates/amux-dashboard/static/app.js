@@ -3786,7 +3786,7 @@ function render() {
     // time and one consumer read it for one branch.
     const taskIsDesc = !runtimeBoard.cardless && displayTaskSource === 'desc' && !!displayTaskName;
     return `
-    <div class="card ${isExp ? 'expanded' : ''}" data-session="${esc(s.name)}" onclick="event.stopPropagation();toggle('${s.name}')">
+    <div class="card ${isExp ? 'expanded' : ''}" data-session="${esc(s.name)}" data-worker-status="${_sessStatusKey(s)}" onclick="event.stopPropagation();toggle('${s.name}')">
       <div class="card-header" onclick="headerTap('${s.name}', event)" onmousedown="tileMouseDown(event,'${s.name}')">
         <div class="card-header-top">
           <div class="card-drag-handle" title="Drag to reorder"><svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor"><circle cx="3" cy="3" r="1.3"/><circle cx="7" cy="3" r="1.3"/><circle cx="3" cy="8" r="1.3"/><circle cx="7" cy="8" r="1.3"/><circle cx="3" cy="13" r="1.3"/><circle cx="7" cy="13" r="1.3"/></svg></div>
@@ -3921,6 +3921,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
     let sortedFiltered;
     sortedFiltered = [...filtered].sort(_sortFnFor(sortMode));
     el.innerHTML = draftCards + sortedFiltered.map(_renderSessionCard).join('');
+    _checkWorkerStatusOrder();
     for (const [id, d] of Object.entries(savedInputs)) { const inp = document.getElementById(id); if (inp) { inp.value = d.value; autoGrow(inp); } }
     _restoreCardFocus(focusedId, savedInputs);
     _renderArchivedSection();
@@ -3936,21 +3937,9 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
 
   // Group mode: group by session status
   if (layoutMode === 'group' && !activeTag && !q) {
-    const STATUS_GROUPS = [
-      { key: 'active',  label: 'Working',     defaultOpen: true  },
-      { key: 'waiting', label: 'Needs Input', defaultOpen: true  },
-      { key: 'api_error', label: 'API Error', defaultOpen: true  },
-      { key: 'idle',    label: 'Idle',        defaultOpen: true  },
-      { key: 'stopped', label: 'Stopped',     defaultOpen: false },
-    ];
-    const buckets = { active: [], waiting: [], api_error: [], idle: [], stopped: [] };
-    filtered.forEach(s => {
-      if (!s.running)              buckets.stopped.push(s);
-      else if (s.status === 'active')  buckets.active.push(s);
-      else if (s.status === 'waiting') buckets.waiting.push(s);
-      else if (s.status === 'api_error') buckets.api_error.push(s);
-      else                             buckets.idle.push(s);
-    });
+    const STATUS_GROUPS = _WORKER_STATUS_GROUPS;
+    const buckets = Object.fromEntries(STATUS_GROUPS.map(g => [g.key, []]));
+    filtered.forEach(s => buckets[_sessStatusKey(s)].push(s));
     // Sort within each bucket: alpha (pinned → name) or pinned → last activity
     for (const key of Object.keys(buckets)) {
       if (sortMode !== 'natural') {
@@ -3984,7 +3973,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
       });
       el.innerHTML = draftCards + groupHtml;
     } else {
-      el.innerHTML = draftCards + filtered.map(_renderSessionCard).join('');
+      el.innerHTML = draftCards + (nonEmpty.length ? buckets[nonEmpty[0].key] : []).map(_renderSessionCard).join('');
     }
   } else {
     // list mode (flat) or group mode with active filter: flat list
@@ -3992,6 +3981,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
     el.innerHTML = draftCards + flatList.map(_renderSessionCard).join('');
     if (layoutMode === 'list') requestAnimationFrame(initSortable);
   }
+  _checkWorkerStatusOrder();
   _updateResetBtn();
 
   // Restore input values, cursor positions and focus after re-rendering
@@ -9192,7 +9182,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.841';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.842';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -21164,10 +21154,10 @@ document.addEventListener('keydown', (e) => {
 
 // ═══════ LAYOUT MODES (list / grid) ═══════
 let layoutMode = localStorage.getItem('amux_layout') || 'grid';
-let sortMode = localStorage.getItem('amux_sort_mode') || 'natural';
+let sortMode = localStorage.getItem('amux_sort_mode') || 'status';
 // A mode persisted by an older build (or hand-edited) must not leave the
 // list sorting by a comparator that no longer exists.
-if (!['natural','human','alpha','status'].includes(sortMode)) sortMode = 'natural';
+if (!['natural','human','alpha','status'].includes(sortMode)) sortMode = 'status';
 if (document.body) setTimeout(() => _sortBtnSync(), 0);
 else document.addEventListener('DOMContentLoaded', () => _sortBtnSync());
 let cardOrder = JSON.parse(localStorage.getItem('amux_card_order') || '[]');
@@ -21179,6 +21169,18 @@ let _tileJustDragged = false; // keep for toggle() guard
 // Sort that matches the server's list_sessions() order:
 // pinned > running > status priority (active/waiting=0, idle/none=1) > last_activity desc
 const _STATUS_PRI = {active: 0, waiting: 0, idle: 1, '': 1};
+// Status sorting and grouping share the same keys as the displayed filters.
+// Pins cannot move an idle worker into the working group (AMUX-4237).
+const _WORKER_STATUS_GROUPS = [
+  { key: 'working', label: 'Working', defaultOpen: true },
+  { key: 'waiting', label: 'Needs Input', defaultOpen: true },
+  { key: 'api_error', label: 'API Error', defaultOpen: true },
+  { key: 'rate_limited', label: 'Rate Limited', defaultOpen: true },
+  { key: 'idle', label: 'Idle', defaultOpen: true },
+  { key: 'stopped', label: 'Stopped', defaultOpen: false },
+];
+const _WORKER_STATUS_PRI = Object.fromEntries(_WORKER_STATUS_GROUPS.map((g, i) => [g.key, i]));
+let _workerStatusOrderVerdict = '';
 function _naturalSortSessions(a, b) {
   if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
   if (a.running !== b.running) return a.running ? -1 : 1;
@@ -21209,11 +21211,31 @@ function _humanSortSessions(a, b) {
 
 // Status order, then recency within each bucket.
 function _statusSortSessions(a, b) {
-  if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
-  if (a.running !== b.running) return a.running ? -1 : 1;
-  const ap = _STATUS_PRI[a.status] ?? 1, bp = _STATUS_PRI[b.status] ?? 1;
+  const ap = _WORKER_STATUS_PRI[_sessStatusKey(a)], bp = _WORKER_STATUS_PRI[_sessStatusKey(b)];
   if (ap !== bp) return ap - bp;
-  return (b.last_activity || 0) - (a.last_activity || 0);
+  if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
+  return (b.last_activity || 0) - (a.last_activity || 0)
+    || (a.name || '').localeCompare(b.name || '');
+}
+
+function _checkWorkerStatusOrder() {
+  if (sortMode !== 'status' || _frozen) return;
+  // Read the rendered snapshot, not a newer SSE payload while a menu/input
+  // intentionally holds the previous cards on screen.
+  const cards = [...document.querySelectorAll('#cards .card[data-worker-status]')];
+  if (!cards.length) return;
+  const keys = cards.map(c => c.dataset.workerStatus);
+  const at = keys.findIndex((key, i) => i > 0 && _WORKER_STATUS_PRI[key] < _WORKER_STATUS_PRI[keys[i - 1]]);
+  const verdict = at < 0 ? 'status-order-ok' : 'status-order-violation';
+  const signature = verdict + ':' + layoutMode + ':' + (at < 0 ? '' : keys[at - 1] + '>' + keys[at]);
+  if (_workerStatusOrderVerdict === signature) return;
+  _workerStatusOrderVerdict = signature;
+  const violation = at < 0 ? null : { before: cards[at - 1].dataset.session, after: cards[at].dataset.session };
+  try {
+    fetch(API + '/api/client-debug', { method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ kind: 'worker-status-order', verdict, measured: true, n_considered: cards.length,
+        layout: layoutMode, mode: sortMode, violation, ver: APP_VER }) }).catch(() => {});
+  } catch (e) {}
 }
 
 function _sortFnFor(mode) {
@@ -21245,16 +21267,11 @@ function toggleFreeze() {
     const visible = sessions.filter(s => !s.archived);
     let ordered;
     if (layoutMode === 'group') {
-      const buckets = {active: [], waiting: [], idle: [], stopped: []};
-      visible.forEach(s => {
-        if (!s.running) buckets.stopped.push(s);
-        else if (s.status === 'active') buckets.active.push(s);
-        else if (s.status === 'waiting') buckets.waiting.push(s);
-        else buckets.idle.push(s);
-      });
+      const buckets = Object.fromEntries(_WORKER_STATUS_GROUPS.map(g => [g.key, []]));
+      visible.forEach(s => buckets[_sessStatusKey(s)].push(s));
       const sortFn = _sortFnFor(sortMode);
       for (const k of Object.keys(buckets)) buckets[k].sort(sortFn);
-      ordered = [...buckets.active, ...buckets.waiting, ...buckets.idle, ...buckets.stopped];
+      ordered = _WORKER_STATUS_GROUPS.flatMap(g => buckets[g.key]);
     } else {
       ordered = [...visible].sort(_sortFnFor(sortMode));
     }
@@ -21292,7 +21309,7 @@ const _SORT_OPTS = [
   { id: 'natural', label: 'Recent activity',     hint: 'Any traffic, including schedules and other workers' },
   { id: 'human',   label: 'Last message from me', hint: 'Ignores schedulers and session-to-session' },
   { id: 'alpha',   label: 'Name (A–Z)',      hint: 'Stable — the order stops shifting under you' },
-  { id: 'status',  label: 'Status',               hint: 'Active, then waiting, then idle, then stopped' },
+  { id: 'status',  label: 'Status',               hint: 'Working, needs input, errors, rate limited, idle, stopped' },
 ];
 const _SORT_GLYPH = { natural: '⇅', human: '●', alpha: 'A↓', status: '☷' };
 
@@ -21328,7 +21345,7 @@ function closeSortMenu() {
   if (m) m.style.display = 'none';
 }
 function setSortMode(mode) {
-  sortMode = _SORT_OPTS.some(o => o.id === mode) ? mode : 'natural';
+  sortMode = _SORT_OPTS.some(o => o.id === mode) ? mode : 'status';
   localStorage.setItem('amux_sort_mode', sortMode);
   closeSortMenu();
   _sortBtnSync();

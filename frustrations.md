@@ -4220,3 +4220,15 @@ FIX: For this proof, Cargo's RUSTC_WORKSPACE_WRAPPER namespaces workspace
   The private receipt and reproducible wrapper are in ~/.amux/logs/amux-4225/.
   This corrects the verification setup; the default test-contended warning
   alone remains insufficient proof of executable provenance.
+
+---
+## Status sorting mixed working and waiting workers and let idle pins lead
+AREA: ui
+SEVERITY: confuses
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux
+CARD: AMUX-4237
+SYMPTOM: Ethan reported mixpeek-general positioned oddly and requested status ordering by default. The default was Recent activity, while the Status comparator was identical to it: working and waiting shared one priority and pins outranked status. Grouped rendering also discarded its sorted bucket when only one group remained.
+COST: A worker's position did not reliably communicate its displayed state; recent traffic and pins could split the expected status order.
+FIX: Default to Status and share the displayed status keys across ranking, grouping and frozen-order capture. Working, needs-input, API-error, rate-limited, idle and stopped remain distinct; pins and activity order within each state. A rendered-DOM worker-status-order beacon reports measured population and status-order-violation to the durable client-debug log. Browser regressions exercise mixpeek-general, status changes, single-group sorting, freeze, explicit preference preservation and a deliberately inverted DOM: 9 passed across desktop, mobile and iOS Safari.
