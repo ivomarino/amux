@@ -44,10 +44,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-head=$(git -C "$REPO" log -1 --format=%H -- crates/ Cargo.toml Cargo.lock 2>/dev/null || echo none)
-last=$(cat "$STAMP" 2>/dev/null || echo "")
-[ "$head" = "$last" ] && exit 0
-
 # The sha that will actually be BUILT — the worktree below is created from
 # `rev-parse HEAD`. `$head` is a different thing: the last commit that touched
 # the build inputs, used as the rebuild stamp key. They differ routinely on a
@@ -58,7 +54,93 @@ last=$(cat "$STAMP" 2>/dev/null || echo "")
 # below name a sha, and they run before the build begins. Having them print
 # `$head` was the same defect in its cheapest form — a contention log that
 # names a commit which is not the one the winning process is building.
+head=$(git -C "$REPO" log -1 --format=%H -- crates/ Cargo.toml Cargo.lock 2>/dev/null || echo none)
 built_sha=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo "$head")
+last=$(cat "$STAMP" 2>/dev/null || echo "")
+
+# A build stamp records what this script installed. It is deliberately NOT
+# accepted as proof of the running image: another checkout can replace the
+# binary after the stamp was written. The ATE-93 takeover had exactly that
+# shape — stamp=the elected mainline revision, /api/health=a foreign local
+# revision, and the builder exited 0 without touching the live image.
+#
+# The activation authority is one exact committed ref, not "a commit reachable
+# from main". A stale child of main can still include half-finished work, and a
+# divergent tip has no ancestry relationship that licenses it to replace the
+# fleet. An intentional pin remains possible only by explicitly naming its ref
+# at service configuration time; a worker's checkout/branch is never authority.
+ACTIVATION_REF="${AMUX_RS_ACTIVATION_REF:-origin/main}"
+
+server_api_base() {
+  local api
+  api="${AMUX_URL:-}"
+  if [ -z "$api" ] && [ -r "$HOME/.amux/endpoint.json" ]; then
+    api=$(python3 - "$HOME/.amux/endpoint.json" <<'PY' 2>/dev/null || true
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+    print(d.get('url') or d.get('endpoint') or '')
+except Exception:
+    pass
+PY
+)
+  fi
+  printf '%s\n' "${api:-https://localhost:8824}"
+}
+
+live_server_commit() {
+  local url body
+  url="${AMUX_RS_HEALTH_URL:-$(server_api_base)/api/health}"
+  body=$(curl -sk --max-time 4 "$url" 2>/dev/null) || return 1
+  printf '%s' "$body" | python3 -c '
+import json,sys
+try:
+    commit=json.load(sys.stdin).get("commit", "")
+    if not isinstance(commit, str) or not commit:
+        raise ValueError("missing commit")
+    print(commit)
+except Exception:
+    raise SystemExit(1)
+' 2>/dev/null
+}
+
+activation_authorized() {
+  local authority
+  authority=$(git -C "$REPO" rev-parse --verify -q "${ACTIVATION_REF}^{commit}" 2>/dev/null) || {
+    echo "== !! ACTIVATION AUTHORITY UNMEASURED $built_sha — cannot resolve $ACTIVATION_REF; refusing installation" >> "$LOG"
+    return 1
+  }
+  if [ "$built_sha" != "$authority" ]; then
+    echo "== !! ACTIVATION AUTHORITY REFUSED $built_sha — authority is $ACTIVATION_REF ($authority); a checkout-local or stale revision may not replace the elected image" >> "$LOG"
+    return 1
+  fi
+  return 0
+}
+
+stamp_matches_live_image() {
+  local live
+  [ "$head" = "$last" ] || return 1
+  live=$(live_server_commit) || return 1
+  case "$built_sha" in
+    "$live"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Provenance and disk-only seams never install or restart anything. Keeping
+# them outside the authority gate lets their hermetic fixtures stay about the
+# operation they actually exercise.
+if [ "${AMUX_RS_BUILD_PROVENANCE_ONLY:-}" != "1" ] \
+   && [ "${AMUX_RS_DISK_CLEAR_ONLY:-}" != "1" ] \
+   && ! activation_authorized; then
+  exit 0
+fi
+
+if [ "${AMUX_RS_BUILD_PROVENANCE_ONLY:-}" != "1" ] \
+   && [ "${AMUX_RS_DISK_CLEAR_ONLY:-}" != "1" ] \
+   && stamp_matches_live_image; then
+  exit 0
+fi
 
 # ── SINGLE-INSTANCE LOCK (AMUX-2927) ────────────────────────────────────────
 # Two invocations — the 60s launchd cycle and a human running this by hand —
@@ -98,7 +180,22 @@ echo $$ > "$LOCK/pid"
 # rebuilding it is the wasted-cycle half of the reported bug ("each next SOLO
 # cycle built the identical sha fine").
 last=$(cat "$STAMP" 2>/dev/null || echo "")
-[ "$head" = "$last" ] && exit 0
+if [ "${AMUX_RS_BUILD_PROVENANCE_ONLY:-}" != "1" ] \
+   && [ "${AMUX_RS_DISK_CLEAR_ONLY:-}" != "1" ]; then
+  # A process can have waited behind a different checkout's build. Re-check both
+  # authority and the observed image after taking the global lock; otherwise a
+  # pre-lock answer can become a false permission while we were waiting.
+  if ! activation_authorized; then
+    exit 0
+  fi
+  if stamp_matches_live_image; then
+    exit 0
+  fi
+  if [ "$head" = "$last" ]; then
+    live=$(live_server_commit 2>/dev/null || true)
+    echo "== !! ACTIVATION STAMP DRIFT $built_sha — stamp says this revision installed, but /api/health reports ${live:-unmeasured}; rebuilding the elected image" >> "$LOG"
+  fi
+fi
 
 # A COMMITTED stale-base tip can still be unsafe to adopt.  The real ATE-93
 # specimen was exactly that: 7c6f7b80 was not a revert of 31768303; it was a
@@ -116,19 +213,7 @@ overlap_deploy_permitted() {
   case "$lane" in
     ""|"(human)") return 0 ;;
   esac
-  api="${AMUX_URL:-}"
-  if [ -z "$api" ] && [ -r "$HOME/.amux/endpoint.json" ]; then
-    api=$(python3 - "$HOME/.amux/endpoint.json" <<'PY' 2>/dev/null || true
-import json,sys
-try:
-    d=json.load(open(sys.argv[1]))
-    print(d.get('url') or d.get('endpoint') or '')
-except Exception:
-    pass
-PY
-)
-  fi
-  api="${api:-https://localhost:8824}"
+  api=$(server_api_base)
   reply=$(curl -sk --max-time 8 -w $'\n%{http_code}' \
     "$api/api/board/overlap/deployment-permit?session=$lane" 2>/dev/null) || {
       echo "== !! OVERLAP GUARD UNMEASURED $built_sha — permit probe failed for $lane; refusing adoption" >> "$LOG"
@@ -159,26 +244,13 @@ if ! overlap_deploy_permitted; then
   exit 0
 fi
 
-# PROVENANCE (AEAB-12). This builder rebuilds whenever $REPO's local HEAD moves
-# and does not care whether HEAD is on main or on somebody's feature branch. The
-# server then self-adopts within 5s. That permissiveness is CORRECT and must stay:
-# this machine survived weeks deliberately pinned to an unmerged fix branch, and
-# "only build main" would delete the rollback mechanism.
-#
-# The defect is that a deliberate pin and an ACCIDENTAL feature branch are
-# byte-identical to the builder, and the accidental one is announced nowhere. On
-# 2026-08-17 a commit made on a branch inside this checkout was serving the whole
-# fleet 76 seconds later and stayed there 9h42m — no CI had run on it, no review —
-# while the machine also could not track upstream, so the daily update schedule
-# silently did nothing. Everything looked healthy the entire time.
-#
-# So: say it. NOT a refusal, a fact, written where consumers can find it.
-#
-# The predicate is "HEAD is contained in main OR origin/main". Checking only
-# origin/main would false-positive right after a merge, because this script
-# deliberately does not fetch (it must not reach the network on a 60s timer) and
-# the local remote-tracking ref lags. Local `main` moves on the merge itself, so
-# the pair covers both orders.
+# PROVENANCE (AEAB-12). Provenance still records whether this checkout happens
+# to be on main, but it is no longer an activation decision. ATE-93 showed why:
+# a valid-looking local stamp and an off-main live image can coexist after a
+# foreign builder runs. The exact `ACTIVATION_REF` gate above is the sole normal
+# activation authority. It deliberately does not fetch on the timer; freshness
+# is a human/CI action, while a stale remote-tracking ref fails closed instead
+# of silently adopting a checkout-local commit.
 on_main=no
 if git -C "$REPO" merge-base --is-ancestor HEAD main 2>/dev/null \
    || git -C "$REPO" merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
