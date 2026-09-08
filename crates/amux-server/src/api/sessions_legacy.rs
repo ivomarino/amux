@@ -3367,16 +3367,24 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
                 .or_else(|| {
                 if runtime_status == "active" { None } else { doing.get(&name) }
                 });
+            let causal_card = marker.and_then(|(_, card, _, _)| card.as_deref());
+            // `doing_by_id` intentionally stores (owner, title, updated), so
+            // its first tuple field is the lane name—not the card id. Keep the
+            // causal marker's ID when it still matches that row, including at
+            // an idle boundary; only a markerless WIP fallback reads `doing`.
+            let (claimed_card, claimed_card_valid) = if causal_card.is_some() && exact_board.is_some() {
+                (causal_card, true)
+            } else if runtime_status == "active" {
+                (causal_card, exact_board.is_some())
+            } else {
+                (board.map(|(id, _, _)| id.as_str()), board.is_some())
+            };
             let doing_count = doing_counts.get(&name).copied().unwrap_or(0);
             let truth = reconcile_runtime_board(
                 running,
                 &runtime_status,
-                if runtime_status == "active" {
-                    marker.and_then(|(_, card, _, _)| card.as_deref())
-                } else {
-                    board.map(|(id, _, _)| id.as_str())
-                },
-                if runtime_status == "active" { exact_board.is_some() } else { board.is_some() },
+                claimed_card,
+                claimed_card_valid,
                 selection.conflicting_live_claims,
                 marker.is_some_and(|(_, _, cardless, _)| *cardless),
                 doing_count,

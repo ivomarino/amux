@@ -2193,6 +2193,7 @@ mod tests {
             ("linked", "ses-linked"),
             ("multiple", "ses-multiple"),
             ("sticky", "ses-sticky"),
+            ("tubescience", "ses-tubescience"),
             ("released", "ses-released"),
             ("conflict", "ses-conflict"),
         ] {
@@ -2214,6 +2215,7 @@ mod tests {
             ("MULTI-1", "multiple"),
             ("MULTI-2", "multiple"),
             ("STICKY-1", "sticky"),
+            ("TUBES-2459", "tubescience"),
             ("CONFLICT-1", "conflict"),
             ("CONFLICT-2", "conflict"),
         ] {
@@ -2234,6 +2236,7 @@ mod tests {
             ("linked", "LINKED-1"),
             ("multiple", "MULTI-1"),
             ("sticky", "STICKY-1"),
+            ("tubescience", "TUBES-2459"),
             ("released", "RELEASED-1"),
             ("conflict", "CONFLICT-1"),
             ("conflict", "CONFLICT-2"),
@@ -2245,7 +2248,7 @@ mod tests {
             )
             .unwrap();
         }
-        for session in ["sticky", "released"] {
+        for session in ["sticky", "tubescience", "released"] {
             conn.execute(
                 "INSERT INTO session_events (ts, session, type, data, source) \
                  VALUES (?1, ?2, 'task.cardless', '{}', 'test')",
@@ -2283,6 +2286,17 @@ mod tests {
         assert_eq!(sticky["runtime_board"]["cardless_suppressed_by_live_claim"], json!(true), "{sticky}");
         assert_eq!(sticky["task_board_id"], json!("STICKY-1"), "{sticky}");
 
+        let tubescience = rows.iter().find(|row| row["name"] == "tubescience").expect("active TubeScience row");
+        assert_eq!(tubescience["status"], json!("active"), "{tubescience}");
+        assert_eq!(tubescience["runtime_board"]["status"], json!("linked"), "{tubescience}");
+        for value in [
+            &tubescience["runtime_board"]["card_id"],
+            &tubescience["task_board_id"],
+            &tubescience["runtime_board"]["observed_card_id"],
+        ] {
+            assert_eq!(value, &json!("TUBES-2459"), "{tubescience}");
+        }
+
         let released = rows.iter().find(|row| row["name"] == "released").expect("released row");
         assert_eq!(released["runtime_board"]["status"], json!("cardless-allowed"), "{released}");
         assert_eq!(released["runtime_board"]["card_count"], json!(0), "{released}");
@@ -2295,6 +2309,30 @@ mod tests {
         assert_eq!(conflict["runtime_board"]["status"], json!("active-conflicting-claims"), "{conflict}");
         assert_eq!(conflict["runtime_board"]["card_count"], json!(2), "{conflict}");
         assert!(conflict["runtime_board"]["card_id"].is_null(), "{conflict}");
+
+        let conn = rusqlite::Connection::open(dir.path().join("amux-test.db")).unwrap();
+        conn.execute(
+            "UPDATE _amux_workers SET state = '{\"state\":\"idle\"}' WHERE display_name = 'tubescience'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        crate::api::sessions_legacy::invalidate_sessions_cache();
+        let (status, _, idle_payload) = send(&app, "GET", "/api/sessions", None).await;
+        assert_eq!(status, StatusCode::OK, "{idle_payload}");
+        let idle_tubescience = idle_payload
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["name"] == "tubescience"))
+            .expect("idle TubeScience row");
+        assert_eq!(idle_tubescience["status"], json!("idle"), "{idle_tubescience}");
+        assert_eq!(idle_tubescience["runtime_board"]["status"], json!("runtime-not-active"), "{idle_tubescience}");
+        for value in [
+            &idle_tubescience["runtime_board"]["card_id"],
+            &idle_tubescience["task_board_id"],
+            &idle_tubescience["runtime_board"]["observed_card_id"],
+        ] {
+            assert_eq!(value, &json!("TUBES-2459"), "{idle_tubescience}");
+        }
     }
 
     #[tokio::test]
