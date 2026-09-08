@@ -7109,7 +7109,11 @@ fn discarded_by_refusal(map: &serde_json::Map<String, Value>) -> Vec<String> {
         .filter(|k| k.as_str() != "status")
         .filter(|k| {
             PATCH_WRITABLE.contains(&k.as_str())
-                || matches!(k.as_str(), "desc_append" | "callback")
+                // `folded_into` joins them: it carries CONTENT (the server
+                // writes a log line from it) and a caller who is told nothing
+                // changed cannot tell a registered fold from an ignored field,
+                // which is the failure this whole thread is about.
+                || matches!(k.as_str(), "desc_append" | "callback" | "folded_into")
         })
         .cloned()
         .collect();
@@ -7216,6 +7220,16 @@ mod af413_discarded_tests {
                             "force": true, "reason": "why"})).is_empty());
     }
 
+    /// `folded_into` is a control key and must be listed, or a hand-rolled fold
+    /// lands in `ignored_fields` and the caller is told nothing changed while
+    /// the summary keeps rendering the four not-recorded clauses.
+    #[test]
+    fn folded_into_is_a_control_key_and_not_a_writable_column() {
+        assert!(!PATCH_WRITABLE.contains(&"folded_into"), "it names no column");
+        assert!(PATCH_CONTROL.contains(&"folded_into"), "and it must not be ignored");
+        assert_eq!(keys(json!({"status": "discarded", "folded_into": "MS-1370"})), ["folded_into"]);
+    }
+
     /// ...except `desc_append`, the one control key that carries CONTENT. It is
     /// the sanctioned way to add to a card someone else is also writing, so
     /// dropping an append silently is the same loss as dropping a desc.
@@ -7233,7 +7247,11 @@ mod af413_discarded_tests {
     }
 }
 
-const PATCH_CONTROL: [&str; 10] = [
+const PATCH_CONTROL: [&str; 11] = [
+    // The lane ASSERTS that this card was folded into another. It is not read
+    // from prose: the caller names the target and the SERVER writes the
+    // canonical `capture folded into <ID>` line that `folded_into()` parses.
+    "folded_into",
     "expect_rev",
     "gate_ack",
     "gate_checked",
@@ -8017,6 +8035,46 @@ pub async fn patch_item(
                     }
                 }
             };
+            // A HAND-ROLLED FOLD MUST BE AS READABLE AS A PEER-DRIVEN ONE.
+            //
+            // b3db93fd taught the terminal summary and the task callback to
+            // recognise a fold, by reading the `capture folded into <ID>` line
+            // that the peer-fold path writes. mixpeek-frustrations then measured
+            // the gap that leaves, on their own cards:
+            //
+            //   MS-1369  discarded   server fold line present: True
+            //   SP-713   discarded   present: True
+            //   MF-888   discarded   present: FALSE
+            //   MF-890   discarded   present: FALSE
+            //   MF-893   discarded   present: FALSE
+            //
+            // The last three were folded BY HAND (`board progress` then `board
+            // discard`), which authors no such line, so they still rendered with
+            // the four not-recorded clauses this fix exists to remove. The
+            // predicate was right and its input was not always written.
+            //
+            // So the caller names the target and the server writes the line.
+            // That is an assertion a lane makes about its OWN action, which is
+            // categorically different from inferring a fold out of a free-text
+            // progress note — the classifier both reporters explicitly ruled
+            // out, because guessing intent from prose fails open in the
+            // expensive direction.
+            if let Some(target) = body_str(&map, "folded_into")
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+            {
+                // A card folded into ITSELF is nonsense and would make the
+                // summary point at the shell the reader is already looking at.
+                if target != next.id {
+                    let old_log = next.log.as_deref().unwrap_or("").trim_end().to_string();
+                    let line = format!("capture folded into {target}");
+                    next.log = Some(if old_log.is_empty() {
+                        line
+                    } else {
+                        format!("{old_log}\n{line}")
+                    });
+                }
+            }
             // Nullable epoch seconds. An explicit null CLEARS (re-arming a
             // trigger for re-verification); absent leaves it alone.
             if let Some(v) = map.get("last_verified_at") {

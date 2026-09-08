@@ -1944,6 +1944,7 @@ of the five, it is not a block on a person:
 _board_transition() {
   local id="$1" status="$2"; shift 2
   local ack="" newtype="" override="" rev="" outcome="" trigger="" force_reason=""
+  local folded_into=""
   local reviewer="" want_stdin="" evidence="" want_ev_stdin=""
   local checked=()
   while [[ $# -gt 0 ]]; do
@@ -1986,6 +1987,15 @@ _board_transition() {
       --evidence-file) [[ -r "${2:-}" ]] || die "--evidence-file needs a readable path"
                        evidence="$(cat "$2")"; shift 2 ;;
       --trigger) trigger="${2:-}"; [[ -n "$trigger" ]] || die "--trigger needs text"; shift 2 ;;
+      # --folded-into names the card this one's work moved to, so a HAND-ROLLED
+      # fold reads like the peer-driven one. The server writes the canonical
+      # `capture folded into <ID>` line from it; this does not author log text.
+      #
+      # Measured by mixpeek-frustrations on their own cards after b3db93fd:
+      # MS-1369 and SP-713 had the server line (peer-folded, covered), while
+      # MF-888/MF-890/MF-893 did NOT, because they folded by hand with
+      # `board progress` then `board discard`. Same shape, wrong summary.
+      --folded-into) folded_into="${2:-}"; [[ -n "$folded_into" ]] || die "--folded-into needs an ISSUE-ID"; shift 2 ;;
       --ack) ack=1; shift ;;
       --checked)
         shift
@@ -2195,12 +2205,13 @@ if ign:
   # empty, while 9 of those cards carried a good "[FORCED] <why>" in the desc:
   # --force had already refused to run without a reason, and it simply never
   # reached the ledger.
-  body=$(S="$status" A="$ack" T="$newtype" O="$override" R="$rev" G="$trigger" F="$force_reason" V="$reviewer" python3 -c '
+  body=$(S="$status" A="$ack" T="$newtype" O="$override" R="$rev" G="$trigger" F="$force_reason" V="$reviewer" FI="$folded_into" python3 -c '
 import json, os, sys, time
 b = {"status": os.environ["S"]}
 if os.environ.get("A"): b["gate_ack"] = True
 if os.environ.get("T"): b["type"] = os.environ["T"]
 if os.environ.get("V"): b["reviewer"] = os.environ["V"]
+if os.environ.get("FI"): b["folded_into"] = os.environ["FI"]
 if os.environ.get("O"): b["override_doing"] = True
 if os.environ.get("R"): b["rev"] = int(os.environ["R"])
 if os.environ.get("F"):
