@@ -86,6 +86,17 @@ pub struct MemoryEntry {
     /// and out of [`visible`].
     pub deleted_at: Option<DateTime<Utc>>,
     pub provenance: MemoryProvenance,
+    /// Optional lifecycle boundary for operational/scratch knowledge. Expired
+    /// entries stay queryable as history but leave assembled context.
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Last time a human or sensor re-confirmed the content.
+    #[serde(default)]
+    pub last_validated_at: Option<DateTime<Utc>>,
+    /// Replacement memory id. Kept as a string so imported legacy ids remain
+    /// representable without minting a false native identity.
+    #[serde(default)]
+    pub superseded_by: Option<String>,
 }
 
 impl MemoryEntry {
@@ -112,6 +123,9 @@ impl MemoryEntry {
             updated_at: at,
             deleted_at: None,
             provenance,
+            expires_at: None,
+            last_validated_at: None,
+            superseded_by: None,
         }
     }
 
@@ -146,6 +160,44 @@ impl MemoryEntry {
         Ok(true)
     }
 
+    /// Apply content and lifecycle metadata as one versioned mutation.
+    pub fn update_lifecycle(
+        &mut self,
+        content: Option<String>,
+        expires_at: Option<DateTime<Utc>>,
+        last_validated_at: Option<DateTime<Utc>>,
+        superseded_by: Option<String>,
+        at: DateTime<Utc>,
+    ) -> Result<bool, MemoryError> {
+        if self.is_deleted() {
+            return Err(MemoryError::AlreadyDeleted { id: self.id.clone() });
+        }
+        let mut changed = false;
+        if let Some(content) = content {
+            if content != self.content {
+                self.content = content;
+                changed = true;
+            }
+        }
+        if expires_at.is_some() && expires_at != self.expires_at {
+            self.expires_at = expires_at;
+            changed = true;
+        }
+        if last_validated_at.is_some() && last_validated_at != self.last_validated_at {
+            self.last_validated_at = last_validated_at;
+            changed = true;
+        }
+        if superseded_by.is_some() && superseded_by != self.superseded_by {
+            self.superseded_by = superseded_by;
+            changed = true;
+        }
+        if changed {
+            self.version += 1;
+            self.updated_at = at;
+        }
+        Ok(changed)
+    }
+
     /// Soft-delete: set `deleted_at`, keep the row. Double-delete is an
     /// error, not a no-op — a second delete arriving means two actors
     /// believed they owned the entry's lifecycle, which is worth surfacing,
@@ -176,6 +228,24 @@ pub fn visible<'a>(
     entries
         .iter()
         .filter(|e| !e.is_deleted() && e.scope.applies_to(target))
+        .collect()
+}
+
+/// Visibility at a particular instant, including expiry and supersession.
+/// The instant is supplied so core remains deterministic.
+pub fn visible_at<'a>(
+    entries: &'a [MemoryEntry],
+    target: &ResolutionTarget,
+    now: DateTime<Utc>,
+) -> Vec<&'a MemoryEntry> {
+    entries
+        .iter()
+        .filter(|e| {
+            !e.is_deleted()
+                && e.superseded_by.is_none()
+                && e.expires_at.is_none_or(|expiry| expiry > now)
+                && e.scope.applies_to(target)
+        })
         .collect()
 }
 
@@ -226,6 +296,7 @@ mod tests {
         assert_eq!(e.version, 1);
         assert_eq!(e.created_at, e.updated_at);
         assert!(e.deleted_at.is_none());
+        assert!(e.expires_at.is_none());
 
         let json = serde_json::to_string(&e).unwrap();
         let back: MemoryEntry = serde_json::from_str(&json).unwrap();
@@ -275,6 +346,19 @@ mod tests {
             .all(|e| e.scope != Scope::Worker { id: b.clone() }));
         assert!(seen.iter().any(|e| e.scope == Scope::Worker { id: a.clone() }));
         assert!(seen.iter().any(|e| e.scope == Scope::Global));
+    }
+
+    #[test]
+    fn expired_and_superseded_memories_leave_context_but_remain_history() {
+        let mut expired = entry_for(Scope::Global, "01JGXV0000000000000000AAAA");
+        expired.expires_at = Some(t0());
+        let mut superseded = entry_for(Scope::Global, "01JGXV0000000000000000BBBB");
+        superseded.superseded_by = Some("mem_replacement".into());
+        let live = entry_for(Scope::Global, "01JGXV0000000000000000CCCC");
+        let all = vec![expired, superseded, live];
+        let visible = visible_at(&all, &ResolutionTarget::default(), t1());
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, all[2].id);
     }
 
     #[test]

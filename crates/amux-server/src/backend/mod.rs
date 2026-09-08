@@ -27,7 +27,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSpec {
     pub worker: WorkerId,
-    /// e.g. `["claude", "--dangerously-skip-permissions"]` — the provider
+    /// e.g. `["claude"]` — the provider
     /// layer builds this; the backend never interprets it.
     pub command: Vec<String>,
     pub cwd: String,

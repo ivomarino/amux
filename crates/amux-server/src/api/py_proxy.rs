@@ -72,6 +72,10 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     // 404s in 24h, hand-typed).
     ("/api/health", "alias of /health; also the /api/health/invariants prefix"),
     ("/manifest.json", "PWA manifest from branding prefs"),
+    (
+        "/api/_clear_sw",
+        "service-worker cleanup landing outside the service worker intercept scope (api/static_files.rs)",
+    ),
     ("/api/calendar.ics", "iCal feed"),
     ("/api/sync", "delta sync"),
     ("/api/events", "SSE stream"),
@@ -113,6 +117,8 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/search", "universal FTS5 search over cards (incl. their log lines), messages, memories, workers, journal, schedules + the index's own drift status/reindex (api/search.rs, migration 0013, RR-0110). Net-new: python never had this route"),
     ("/api/why", "provenance explainer — correlates the state-event journal, request log, card log, schedule runs/audit and turn ledger for one entity or a time window; every line cites its table (api/why.rs, RR-0109). Net-new"),
     ("/api/verify", "verification endpoints"),
+    ("/api/harness", "production-harness checkpoints, handoffs, budgets, sensors, guides, compilation, ratchet, and health"),
+    ("/api/policy", "capability-policy evaluation, exact approvals, and durable decision receipts"),
     ("/api/prefs", "key/value prefs"),
     ("/api/criteria", "gate criteria"),
     ("/api/metrics", "metrics"),

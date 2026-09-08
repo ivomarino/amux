@@ -34,11 +34,13 @@ pub mod board;
 pub mod circuit;
 pub mod criteria;
 pub mod events;
+pub mod harness;
 pub mod ids;
 pub mod limits;
 pub mod memory;
 pub mod message;
 pub mod orchestrator;
+pub mod policy;
 pub mod protocol;
 pub mod provider;
 pub mod provider_fleet;
@@ -52,4 +54,3 @@ pub mod turn;
 pub mod verification;
 pub mod workflow;
 pub mod worker;
-

@@ -337,6 +337,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0057_board_overlap_reconciliation",
         sql: include_str!("../../migrations/0057_board_overlap_reconciliation.sql"),
     },
+    Migration {
+        version: 58,
+        name: "0058_harness_enforcement",
+        sql: include_str!("../../migrations/0058_harness_enforcement.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.

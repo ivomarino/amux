@@ -255,9 +255,21 @@ impl Bootstrap {
                 continue;
             };
 
+            let mut command = adapter.build_command(PromptMode::Interactive);
+            if row.permissions.iter().any(|permission| {
+                permission == "unsafe" || permission == "claude:skip_permissions"
+            }) && command.first().is_some_and(|binary| binary == "claude")
+            {
+                tracing::warn!(
+                    worker = %row.id,
+                    permission = "claude:skip_permissions",
+                    "worker explicitly enabled Claude's unsafe permission bypass"
+                );
+                command.push("--dangerously-skip-permissions".into());
+            }
             let spec = SessionSpec {
                 worker: worker.clone(),
-                command: adapter.build_command(PromptMode::Interactive),
+                command,
                 cwd: row.cwd.clone(),
                 // Worker-scope env only for now; the four-tier scope
                 // assembly (amux-core scope) wires in with RR-0040.
@@ -591,7 +603,7 @@ mod tests {
         assert_eq!(spawns.len(), 1);
         assert_eq!(
             spawns[0].command,
-            vec!["claude", "--dangerously-skip-permissions"]
+            vec!["claude"]
         );
         assert_eq!(spawns[0].cwd, "/tmp/bootstrap-test-cwd");
         assert_eq!(spawns[0].env.get("FOO").map(String::as_str), Some("bar"));
@@ -618,6 +630,33 @@ mod tests {
         assert_eq!(regs[0].0, id);
         assert_eq!(regs[0].1.provider, CliProvider::ClaudeCode);
         assert_eq!(regs[0].1.model.as_deref(), Some("haiku"));
+    }
+
+    #[tokio::test]
+    async fn claude_permission_bypass_requires_an_explicit_worker_permission() {
+        let (store, _dir) = store();
+        let (id, _) = seed(&store, WorkerState::Starting, "herdr", "claude", true);
+        let worker_id = id.to_string();
+        store
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE _amux_workers SET permissions='[\"claude:skip_permissions\"]' WHERE id=?1",
+                    params![worker_id],
+                )?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+        let backend = Arc::new(FakeBackend::default());
+        let registrar = Arc::new(RecordingRegistrar::default());
+        let boot = bootstrap(store, backend.clone(), registrar);
+
+        boot.pass_once().await.unwrap();
+
+        let spawns = backend.spawns.lock().unwrap();
+        assert_eq!(
+            spawns[0].command,
+            vec!["claude", "--dangerously-skip-permissions"]
+        );
     }
 
     #[tokio::test]

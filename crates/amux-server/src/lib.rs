@@ -592,6 +592,24 @@ async fn async_main() {
     ));
 
     // Orchestrator runtime: reconcile once, then tick (RR-0041).
+    let durable_fleet_state = {
+        use rusqlite::OptionalExtension;
+        let conn = store
+            .read()
+            .expect("fleet state must be readable before the orchestrator starts");
+        let raw = conn
+            .query_row(
+                "SELECT state FROM _amux_fleet_state WHERE singleton=1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .expect("durable fleet state must be queryable");
+        raw.map(|value| {
+            serde_json::from_str(&value).expect("durable fleet state must be valid JSON")
+        })
+        .unwrap_or(amux_core::circuit::FleetState::Normal)
+    };
     let runtime = Arc::new(orchestrator::runtime::Runtime {
         store: store.clone(),
         backends: backends.clone(),
@@ -602,14 +620,28 @@ async fn async_main() {
             .unwrap_or(3),
         heartbeat_every: 10,
         breaker: amux_core::circuit::FleetCircuitBreaker {
-            // Spend trip disabled until the token ledger wires in (Phase 4)
-            // — 0 budget with 0 accounting would trip instantly on lies.
-            window_budget_tokens: u64::MAX,
-            window_secs: 3600,
-            min_progress_per_window: 0, // no-progress trip opt-in via config later
-            max_failures_per_window: 50,
+            window_budget_tokens: cfg
+                .env
+                .get("AMUX_FLEET_WINDOW_TOKENS")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(5_000_000),
+            window_secs: cfg
+                .env
+                .get("AMUX_FLEET_WINDOW_SECS")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(3600),
+            min_progress_per_window: cfg
+                .env
+                .get("AMUX_FLEET_MIN_PROGRESS")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1),
+            max_failures_per_window: cfg
+                .env
+                .get("AMUX_FLEET_MAX_FAILURES")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(50),
         },
-        fleet_state: std::sync::Mutex::new(amux_core::circuit::FleetState::Normal),
+        fleet_state: std::sync::Mutex::new(durable_fleet_state),
         protocol: Some(protocol.clone() as Arc<dyn opencode::AgentProtocol>),
         pickup_unowned: cfg.env.get("AMUX_RS_PICKUP_UNOWNED").map(|v| v == "1").unwrap_or(false),
         // RR-0044b: staggered un-park interval after a provider rate-limit

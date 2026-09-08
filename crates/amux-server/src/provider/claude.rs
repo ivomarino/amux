@@ -115,10 +115,7 @@ impl ProviderAdapter for ClaudeAdapter {
         match prompt_mode {
             // The fleet-standard interactive launch (backend::SessionSpec's
             // own doc example).
-            PromptMode::Interactive => vec![
-                "claude".into(),
-                "--dangerously-skip-permissions".into(),
-            ],
+            PromptMode::Interactive => vec!["claude".into()],
             // Headless with structured lifecycle events, per the OpenCode
             // spike (docs/opencode-spike-results.md): stream-json in and out
             // (prompts arrive over stdin), --verbose is REQUIRED by the CLI
@@ -131,7 +128,6 @@ impl ProviderAdapter for ClaudeAdapter {
                 "--output-format".into(),
                 "stream-json".into(),
                 "--verbose".into(),
-                "--dangerously-skip-permissions".into(),
             ],
         }
     }
@@ -525,12 +521,14 @@ mod tests {
         let a = ClaudeAdapter::new();
         let interactive = a.build_command(PromptMode::Interactive);
         assert_eq!(interactive[0], "claude");
+        assert!(!interactive.contains(&"--dangerously-skip-permissions".to_string()));
         let headless = a.build_command(PromptMode::HeadlessStructured);
         assert_eq!(headless[0], "claude");
         // stream-json output in print mode requires --verbose, or the CLI
         // rejects the invocation — a session that dies at spawn.
         assert!(headless.contains(&"--verbose".to_string()));
         assert!(headless.contains(&"stream-json".to_string()));
+        assert!(!headless.contains(&"--dangerously-skip-permissions".to_string()));
     }
 
     // -- live probe (network + keychain) -----------------------------------

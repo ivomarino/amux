@@ -194,6 +194,14 @@ pub struct CreateMemoryBody {
     /// Defaults to human-written; workers pass their own provenance.
     #[serde(default)]
     pub provenance: Option<MemoryProvenance>,
+    /// Optional expiry for scratch/operational facts. Expired rows remain
+    /// directly readable as history but are excluded from context assembly.
+    #[serde(default)]
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub last_validated_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub superseded_by: Option<String>,
 }
 
 enum CreateOutcome {
@@ -220,7 +228,7 @@ pub async fn create_memory(
         }
     }
 
-    let entry = MemoryEntry::new(
+    let mut entry = MemoryEntry::new(
         MemoryId::from_ulid(ulid::Ulid::new()),
         body.scope,
         body.name.trim(),
@@ -229,6 +237,9 @@ pub async fn create_memory(
         body.provenance.unwrap_or(MemoryProvenance::HumanWritten),
         chrono::Utc::now(),
     );
+    entry.expires_at = body.expires_at;
+    entry.last_validated_at = body.last_validated_at;
+    entry.superseded_by = body.superseded_by;
 
     let slot: Arc<Mutex<Option<CreateOutcome>>> = Arc::new(Mutex::new(None));
     let slot_w = slot.clone();
@@ -304,7 +315,14 @@ pub async fn get_memory(State(state): State<AppState>, Path(id): Path<String>) -
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)] // Invariant 37
 pub struct PatchMemoryBody {
-    pub content: String,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub last_validated_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub superseded_by: Option<String>,
     /// Optimistic concurrency (Invariant 35/42): when present, the write
     /// only applies if the entry is still at this version; otherwise 409.
     #[serde(default)]
@@ -346,7 +364,13 @@ pub async fn patch_memory(
                 }
             }
             let before = e.version;
-            match e.update(body.content.clone(), chrono::Utc::now()) {
+            match e.update_lifecycle(
+                body.content.clone(),
+                body.expires_at,
+                body.last_validated_at,
+                body.superseded_by.clone(),
+                chrono::Utc::now(),
+            ) {
                 Err(MemoryError::AlreadyDeleted { .. }) => finish(
                     &slot_w,
                     MutateOutcome::Deleted {

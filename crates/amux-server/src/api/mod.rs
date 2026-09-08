@@ -36,6 +36,7 @@ pub mod health;
 pub mod env_config;
 pub mod gmail;
 pub mod graph;
+pub mod harness;
 pub mod history;
 pub mod reports;
 pub mod terminal;
@@ -53,6 +54,7 @@ pub mod offline_origin;
 pub mod messages;
 pub mod org;
 pub mod prefs;
+pub mod policy;
 pub mod proxies;
 pub mod tunnel;
 pub mod py_proxy;
@@ -146,6 +148,8 @@ pub fn router(state: AppState) -> Router {
         // lives here so there is one place to be wrong.
         .nest("/api/why", why::routes())
         .nest("/api/verify", verify::routes())
+        .nest("/api/harness", harness::routes())
+        .nest("/api/policy", policy::routes())
         .nest("/api/prefs", prefs::routes())
         .nest("/api/criteria", criteria::routes())
         .nest("/api/metrics", metrics::routes())
@@ -383,6 +387,10 @@ pub fn router(state: AppState) -> Router {
             "/api/offline-origin",
             axum::routing::get(offline_origin::offline_origin),
         )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            policy::enforce,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_bearer,
