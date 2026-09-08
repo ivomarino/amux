@@ -507,6 +507,13 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
         "s.status !== 'unattributed'",
         "active-conflicting-claims",
         ">card conflict</span>",
+        // `>card syncing</span>` was pinned here by 03061448 and deliberately
+        // REMOVED from app.js by 9127257d ("remove false 'card syncing'
+        // badges from worker cards"), which named three distinct causes of
+        // the badge being wrong and left this needle behind. The test then
+        // demanded a treatment the dashboard had stopped rendering on
+        // purpose, so it reddened `rust` on main from 9127257d onward while
+        // describing the failure as lost functionality.
         "truth.verdict",
     ] {
         assert!(app.contains(needle), "unattributed runtime lost its server-verdict treatment `{needle}`");

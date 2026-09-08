@@ -1144,6 +1144,7 @@ function showConnHistory() {
 // ═══════ DEVICE NAME / CLOUD IDENTITY ═══════
 let _cloudEmail = '';
 let _localMemberEmail = '';
+let _localMemberScope = null;
 let _gatewayOrgs = [];
 
 async function _initIdentity() {
@@ -1162,6 +1163,7 @@ async function _initIdentity() {
     const d = await r.json();
     _cloudEmail = d.is_cloud ? (d.email || '') : '';
     _localMemberEmail = d.is_local_member ? (d.email || '') : '';
+    _localMemberScope = d.is_local_member ? (d.access_scope || {level:'global', name:''}) : null;
     if (!d.has_api_key) {
       if (d.is_cloud) {
         // Blocking modal for cloud users — must set key before using the app
@@ -1177,6 +1179,12 @@ async function _initIdentity() {
       _showKeyWarning(d.key_error);
     }
     _applyIdentityToSettings();
+    // Settings can open before this async identity request returns. Refresh an
+    // already-open Team section so a scoped member never keeps the owner's
+    // controls from that brief pre-identity render.
+    if (document.getElementById('settings-menu')?.classList.contains('open')) {
+      loadTeamSection();
+    }
     if (_cloudEmail) {
       const lb = document.getElementById('logout-btn');
       if (lb) lb.style.display = '';
@@ -9182,7 +9190,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.844';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.845';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -32294,6 +32302,20 @@ async function loadTeamSection() {
     const list = document.getElementById('settings-members-list');
     if (!list) return;
 
+    const inviteButton = document.getElementById('settings-team-invite');
+    const orgWrap = document.getElementById('settings-org-name-wrap');
+    if (_localMemberEmail) {
+      if (inviteButton) inviteButton.style.display = 'none';
+      if (orgWrap) orgWrap.style.display = 'none';
+      const scope = _localMemberScope || {level:'global', name:''};
+      const access = scope.level === 'global' ? 'Global workspace access' :
+        (scope.level === 'group' ? 'Group: ' : 'Worker: ') + (scope.name || '—');
+      list.innerHTML = `<div style="padding:4px 0;"><div style="color:var(--text);">${esc(_localMemberEmail)}</div><div style="font-size:0.72rem;color:var(--dim);margin-top:3px;">${esc(access)} · membership is managed by the server owner</div></div>`;
+      return;
+    }
+    if (inviteButton) inviteButton.style.display = '';
+    if (orgWrap) orgWrap.style.display = '';
+
     if (_cloudEmail) {
       // Cloud mode: use gateway-level members
       const [membersRes, invitesRes, orgRes] = await Promise.all([
@@ -32338,14 +32360,17 @@ async function loadTeamSection() {
         html += members.map(m => `
           <div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;border-bottom:1px solid var(--border);">
             <span>${esc(m.name || m.email)}</span>
-            <span style="color:var(--dim);font-size:0.7rem;">${m.role}</span>
+            <span style="display:flex;align-items:center;gap:7px;color:var(--dim);font-size:0.7rem;">
+              ${esc(m.scope_level === 'global' ? 'global' : (m.scope_level + ': ' + m.scope_name))}
+              <button class="btn" data-member-scope="${esc(m.id)}" data-email="${esc(m.email || '')}" data-level="${esc(m.scope_level || 'global')}" data-name="${esc(m.scope_name || '')}" onclick="openMemberScope(this.dataset.memberScope,this.dataset.email,this.dataset.level,this.dataset.name)" style="font-size:0.64rem;padding:1px 6px;">change</button>
+            </span>
           </div>`).join('');
       }
       if (invites.length) {
         html += '<div style="margin-top:4px;font-size:0.68rem;color:var(--dim);">Pending invites:</div>';
         html += invites.map(inv => `
           <div style="display:flex;justify-content:space-between;align-items:center;padding:2px 0;">
-            <span style="font-size:0.72rem;color:var(--dim);">${esc(inv.email || 'Anyone with link')} · expires ${new Date(inv.expires_at*1000).toLocaleDateString()}</span>
+            <span style="font-size:0.72rem;color:var(--dim);">${esc(inv.email || 'Anyone with link')} · ${esc(inv.scope_level === 'global' ? 'global' : (inv.scope_level + ': ' + inv.scope_name))} · expires ${new Date(inv.expires_at*1000).toLocaleDateString()}</span>
             <button onclick="deleteInvite('${esc(inv.token)}')" style="background:none;border:none;color:var(--dim);cursor:pointer;font-size:0.65rem;">revoke</button>
           </div>`).join('');
       }
@@ -32371,39 +32396,126 @@ async function saveOrgName(val) {
 
 async function openTeamInvite() {
   closeSettings();
-  const email = await showPrompt('Invite by email (optional)', 'person@example.com');
-  if (email === null) return;
-  let res;
-  try {
-    res = await fetch('/api/org/invites', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email})});
-  } catch (e) {
-    showAlert('Failed to create invite: network error');
-    return;
-  }
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) { showAlert('Failed to create invite: ' + (data.error || 'HTTP ' + res.status)); return; }
-  if (!data.url) { showAlert('Failed to create invite: ' + (data.error || 'unknown error')); return; }
-  // Show modal with copyable link
+  const modal = _teamScopeDialog('Invite to workspace', '', 'global', '', 'Create invite');
+  const submit = modal.querySelector('#team-scope-submit');
+  submit.addEventListener('click', async () => {
+    const email = (modal.querySelector('#team-invite-email')?.value || '').trim();
+    const scope_level = modal.querySelector('#team-scope-level').value;
+    const scope_name = scope_level === 'global' ? '' : modal.querySelector('#team-scope-name').value;
+    submit.disabled = true;
+    submit.textContent = 'Creating…';
+    let res;
+    try {
+      res = await fetch('/api/org/invites', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email, scope_level, scope_name})});
+    } catch (e) {
+      _teamScopeError(modal, 'Network error');
+      submit.disabled = false;
+      submit.textContent = 'Create invite';
+      return;
+    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.url) {
+      _teamScopeError(modal, data.error || 'HTTP ' + res.status);
+      submit.disabled = false;
+      submit.textContent = 'Create invite';
+      return;
+    }
+    _renderInviteLink(modal, data);
+  });
+}
+
+function _teamScopeTargets(level, current) {
+  if (level === 'global') return [];
+  const fleet = (typeof sessions !== 'undefined' && Array.isArray(sessions)) ? sessions : [];
+  let values = level === 'worker'
+    ? fleet.map(s => s.name).filter(Boolean)
+    : fleet.flatMap(s => Array.isArray(s.tags) ? s.tags : []).filter(Boolean);
+  values = [...new Set(values)].sort((a,b) => a.localeCompare(b));
+  if (current && !values.includes(current)) values.unshift(current);
+  return values;
+}
+
+function _teamScopeDialog(title, email, level, name, submitLabel) {
   const modal = document.createElement('div');
+  modal.id = 'team-scope-modal';
   modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;z-index:9999;';
   modal.innerHTML = `<div style="background:var(--bg2,#1a1a1a);border:1px solid var(--border,#333);border-radius:12px;padding:28px;max-width:480px;width:90%;box-sizing:border-box;max-height:min(90dvh,calc(100dvh - 24px));overflow-y:auto;overscroll-behavior:contain;">
-    <h3 style="margin:0 0 8px;font-size:1rem;">Invite to workspace</h3>
-    <p style="color:var(--dim);font-size:0.82rem;margin:0 0 14px;">Share this link. It expires in 7 days.</p>
-    <div style="display:flex;gap:8px;">
-      <input id="invite-link-input" type="text" value="${esc(data.url)}" readonly
-        style="flex:1;padding:8px 10px;border-radius:6px;border:1px solid var(--border,#333);background:var(--bg,#111);color:inherit;font-size:0.8rem;min-width:0;">
-      <button onclick="(function(){var el=document.getElementById('invite-link-input');el.select();navigator.clipboard.writeText(el.value).then(()=>{this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500)})}).call(this)"
-        style="padding:8px 14px;border-radius:6px;background:var(--accent,#a78bfa);color:#000;border:none;cursor:pointer;font-weight:600;white-space:nowrap;">Copy</button>
-    </div>
-    <div style="margin-top:16px;text-align:right;">
-      <button onclick="this.closest('div[style*=fixed]').remove()"
-        style="padding:6px 18px;border-radius:6px;background:var(--bg3,#222);border:1px solid var(--border,#333);color:#ddd;cursor:pointer;">Done</button>
+    <h3 style="margin:0 0 8px;font-size:1rem;">${esc(title)}</h3>
+    ${email ? `<p style="color:var(--dim);font-size:0.82rem;margin:0 0 14px;">${esc(email)}</p>` : `<label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Email (optional)</label><input id="team-invite-email" type="email" placeholder="person@example.com" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;margin-bottom:13px;">`}
+    <label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Access level</label>
+    <select id="team-scope-level" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;">
+      <option value="global">Global — every worker and card</option><option value="group">Group — workers tagged in one group</option><option value="worker">Worker — one worker only</option>
+    </select>
+    <div id="team-scope-target-wrap" style="margin-top:13px;display:none;"><label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Target</label><select id="team-scope-name" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;"></select></div>
+    <div id="team-scope-error" style="color:var(--red,#f66);font-size:0.75rem;margin-top:10px;"></div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:18px;">
+      <button id="team-scope-cancel" class="btn">Cancel</button>
+      <button id="team-scope-submit" class="btn primary">${esc(submitLabel)}</button>
     </div>
   </div>`;
   document.body.appendChild(modal);
   modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
+  modal.querySelector('#team-scope-cancel').addEventListener('click', () => modal.remove());
+  const levelEl = modal.querySelector('#team-scope-level');
+  const targetWrap = modal.querySelector('#team-scope-target-wrap');
+  const targetEl = modal.querySelector('#team-scope-name');
+  const refresh = () => {
+    const values = _teamScopeTargets(levelEl.value, name);
+    targetWrap.style.display = levelEl.value === 'global' ? 'none' : '';
+    targetEl.innerHTML = values.map(value => `<option value="${esc(value)}">${esc(value)}</option>`).join('');
+    if (name && values.includes(name)) targetEl.value = name;
+    const submit = modal.querySelector('#team-scope-submit');
+    submit.disabled = levelEl.value !== 'global' && values.length === 0;
+    _teamScopeError(modal, values.length || levelEl.value === 'global' ? '' : 'Create or tag a worker before granting this scope.');
+  };
+  levelEl.value = level || 'global';
+  levelEl.addEventListener('change', () => { name = ''; refresh(); });
+  refresh();
+  setTimeout(() => modal.querySelector('#team-invite-email, #team-scope-level')?.focus(), 0);
+  return modal;
+}
+
+function _teamScopeError(modal, message) {
+  const el = modal.querySelector('#team-scope-error');
+  if (el) el.textContent = message || '';
+}
+
+function _renderInviteLink(modal, data) {
+  modal.firstElementChild.innerHTML = `<h3 style="margin:0 0 8px;font-size:1rem;">Invite ready</h3>
+    <p style="color:var(--dim);font-size:0.82rem;margin:0 0 14px;">${esc(data.scope_level === 'global' ? 'Global workspace access' : data.scope_level + ': ' + data.scope_name)} · expires in 7 days.</p>
+    <div style="display:flex;gap:8px;"><input id="invite-link-input" type="text" value="${esc(data.url)}" readonly style="flex:1;padding:8px 10px;border-radius:6px;border:1px solid var(--border,#333);background:var(--bg,#111);color:inherit;font-size:0.8rem;min-width:0;"><button id="invite-copy-button" class="btn primary">Copy</button></div>
+    <div style="margin-top:16px;text-align:right;"><button id="invite-done-button" class="btn">Done</button></div>`;
+  modal.querySelector('#invite-copy-button').addEventListener('click', async e => {
+    const input = modal.querySelector('#invite-link-input');
+    input.select();
+    await navigator.clipboard.writeText(input.value).catch(() => {});
+    e.currentTarget.textContent = 'Copied!';
+  });
+  modal.querySelector('#invite-done-button').addEventListener('click', () => modal.remove());
   // Auto-copy
   setTimeout(() => { try { navigator.clipboard.writeText(data.url); } catch(e) {} }, 100);
+}
+
+async function openMemberScope(id, email, level, name) {
+  const modal = _teamScopeDialog('Change member access', email, level, name, 'Save access');
+  const submit = modal.querySelector('#team-scope-submit');
+  submit.addEventListener('click', async () => {
+    const scope_level = modal.querySelector('#team-scope-level').value;
+    const scope_name = scope_level === 'global' ? '' : modal.querySelector('#team-scope-name').value;
+    submit.disabled = true;
+    const response = await fetch('/api/org/members/' + encodeURIComponent(id), {
+      method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({scope_level, scope_name})
+    }).catch(() => null);
+    const data = response ? await response.json().catch(() => ({})) : {};
+    if (!response || !response.ok) {
+      _teamScopeError(modal, data.error || 'Failed to save access');
+      submit.disabled = false;
+      return;
+    }
+    modal.remove();
+    showToast('Member access updated');
+    loadTeamSection();
+  });
 }
 
 // ── Billing ─────────────────────────────────────────────────────────────────

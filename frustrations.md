@@ -4256,3 +4256,26 @@ CARD: AMUX-4225
 SYMPTOM: The published recovery build retained one bounded ps snapshot outside the fleet loop, extending its parent-only projection with PID, state and command fields. sessions_probes_are_bounded required the old exact argument string and called the new snapshot absent.
 COST: A false missing-liveness-probe verdict obscured a passing bounded-process implementation during the final fleet preservation gate.
 FIX: Verify the single external ps invocation, full-population flag, parent identity field and bounded call with its diagnostic identity; allow additional projected columns. The no-subprocess-inside-the-loop assertion remains. The gate emits bounded_fleet_process_snapshot with its measured population and actual arguments.
+
+---
+## A local invite proved identity but granted the owner’s entire API surface
+AREA: auth
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: Codex local Tailscale multiplayer
+CARD: ATE-79
+SYMPTOM: Every accepted local/Tailscale invite became a verified member, but the
+ member row carried no resource boundary and auth returned immediately after the
+ cookie check. An invite intended for one worker could read and mutate the whole
+ fleet, board, settings, and membership API.
+COST: Local multiplayer could not be shared safely with an external collaborator;
+ the only authorization choices were full owner-equivalent data access or no access.
+FIX: Persist global/group/worker scope on invites and members, resolve it on every
+cookie-authenticated request, filter fleet and board reads, refuse cross-scope
+worker/card access, keep org administration owner-only, and make rescoping take
+effect on the existing cookie. The browser E2E now transitions one live member
+global → group → worker and proves both permitted work and cross-scope 403s.
+Member-authored cards, edits, worker creation, sends, and request-log rows derive
+their author from that verified cookie, so client-supplied creator or worker
+headers cannot rewrite multiplayer history.

@@ -15310,7 +15310,18 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     // GROUP SCOPING, before anything is delivered or recorded. The origin is the
     // SERVER-VERIFIED stamp (AMUX-1768), never a body-supplied claim, so a lane
     // cannot talk its way across a group boundary.
-    let send_origin: String = hdr_worker(headers).trim().chars().take(64).collect();
+    //
+    // An invited member is a human operating the scoped dashboard, not a peer
+    // worker. Their resource permission was already checked by the member
+    // scope guard; feeding `member:<email>` into the worker-to-worker group
+    // gate would refuse legitimate sends to the very worker they were granted.
+    // Keep the authenticated human actor separately for the message ledger.
+    let member_actor = super::org::local_member_actor(headers).map(str::to_string);
+    let send_origin: String = if member_actor.is_some() {
+        String::new()
+    } else {
+        hdr_worker(headers).trim().chars().take(64).collect()
+    };
     if std::env::var("AMUX_GROUP_SEND_ENFORCE")
         .map(|v| !matches!(v.trim(), "0" | "false" | "no"))
         .unwrap_or(true)
@@ -15461,7 +15472,11 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     let orig_text = text.clone();
     let mut origin = String::new();
     if defer_busy {
-        origin = {
+        origin = if member_actor.is_some() {
+            // A member cannot turn a human send into a peer relay by claiming
+            // source_session in the JSON body.
+            String::new()
+        } else {
             let h = hdr_worker(headers);
             if h.is_empty() { body_str(body, "source_session") } else { h }
         };
@@ -15556,7 +15571,8 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
         };
         if record_history {
             let email = headers.get("x-amux-user-email").and_then(|v| v.to_str().ok()).unwrap_or("");
-            cmd_hist_record_full(state, name, &orig_text, "user", email, skip_board, meta).await;
+            let author = member_actor.as_deref().unwrap_or(email);
+            cmd_hist_record_full(state, name, &orig_text, "user", author, skip_board, meta).await;
         } else if !origin.is_empty() && origin != name {
             cmd_hist_record_full(state, name, &orig_text, "session", &origin, false, meta).await;
         }
@@ -15604,7 +15620,8 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
             if record_history {
                 let email =
                     headers.get("x-amux-user-email").and_then(|v| v.to_str().ok()).unwrap_or("");
-                cmd_hist_record_full(state, name, &orig_text, "user", email, skip_board, meta).await;
+                let author = member_actor.as_deref().unwrap_or(email);
+                cmd_hist_record_full(state, name, &orig_text, "user", author, skip_board, meta).await;
             } else if !origin.is_empty() && origin != name {
                 cmd_hist_record_full(state, name, &orig_text, "session", &origin, false, meta).await;
             }
@@ -15625,6 +15642,9 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     };
     let send_id = send_response_id(name, &msg_id);
     let mut resp = json!({"ok": ok, "message": msg, "id": send_id});
+    if let Some(author) = member_actor {
+        resp["authored_by"] = json!(author);
+    }
     if let Some(fix) = fix {
         resp["fix"] = json!(fix);
     }

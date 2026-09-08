@@ -27,7 +27,7 @@ use crate::db::{PendingEvent, WriteOutcome};
 use crate::integrations::email::base64url_nopad;
 use amux_core::revision::{EntityType, MutationKind};
 use axum::extract::{Form, Path, Request, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -40,12 +40,18 @@ use std::sync::{Arc, Mutex};
 
 const MEMBER_COOKIE: &str = "amux_member";
 const VERIFIED_MEMBER_HEADER: &str = "x-amux-local-member-verified";
+const MEMBER_SCOPE_LEVEL_HEADER: &str = "x-amux-local-member-scope-level";
+const MEMBER_SCOPE_NAME_HEADER: &str = "x-amux-local-member-scope-name";
+const MEMBER_ACTOR_HEADER: &str = "x-amux-local-member-actor";
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(get_org).patch(patch_org))
         .route("/members", get(list_members))
-        .route("/members/{id}", axum::routing::delete(delete_member))
+        .route(
+            "/members/{id}",
+            axum::routing::patch(patch_member).delete(delete_member),
+        )
         .route("/invites", get(list_invites).post(create_invite))
         .route("/invites/{token}", axum::routing::delete(delete_invite))
 }
@@ -62,10 +68,266 @@ pub(crate) fn is_verified_local_member(headers: &HeaderMap) -> bool {
     headers.get(VERIFIED_MEMBER_HEADER).and_then(|v| v.to_str().ok()) == Some("1")
 }
 
+/// Server-verified author for an invited human. The marker and value are both
+/// removed from inbound requests below, so a member cannot impersonate a
+/// worker (or another member) by supplying the ordinary attribution headers.
+pub(crate) fn local_member_actor(headers: &HeaderMap) -> Option<&str> {
+    if !is_verified_local_member(headers) {
+        return None;
+    }
+    headers
+        .get(MEMBER_ACTOR_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// The resource boundary granted to a local/Tailscale member.
+///
+/// This is deliberately separate from `role`: every invitee remains a
+/// non-admin `member`, while scope answers which workers (and therefore which
+/// cards) that member can reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MemberScope {
+    Global,
+    Group(String),
+    Worker(String),
+}
+
+impl MemberScope {
+    pub(crate) fn level(&self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Group(_) => "group",
+            Self::Worker(_) => "worker",
+        }
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            Self::Global => "",
+            Self::Group(name) | Self::Worker(name) => name,
+        }
+    }
+
+    pub(crate) fn is_global(&self) -> bool {
+        matches!(self, Self::Global)
+    }
+
+    pub(crate) fn allows_worker(&self, worker: &str) -> bool {
+        match self {
+            Self::Global => true,
+            Self::Worker(name) => name.eq_ignore_ascii_case(worker),
+            Self::Group(group) => super::session_verbs::lane_groups(worker).contains(group),
+        }
+    }
+}
+
+fn parse_member_scope(level: &str, name: &str) -> Option<MemberScope> {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "global" if name.trim().is_empty() => Some(MemberScope::Global),
+        "group" if !name.trim().is_empty() => {
+            Some(MemberScope::Group(name.trim().to_ascii_lowercase()))
+        }
+        "worker" if !name.trim().is_empty() => Some(MemberScope::Worker(name.trim().to_string())),
+        _ => None,
+    }
+}
+
+/// Read only the headers installed by [`local_member_identity`]. An inbound
+/// copy is removed before cookie verification, so handlers can safely use this
+/// helper for filtering as well as admission.
+pub(crate) fn local_member_scope(headers: &HeaderMap) -> Option<MemberScope> {
+    if !is_verified_local_member(headers) {
+        return None;
+    }
+    let level = headers
+        .get(MEMBER_SCOPE_LEVEL_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("global");
+    let name = headers
+        .get(MEMBER_SCOPE_NAME_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    // A corrupt/unknown stored value must never widen to global. New writes
+    // are validated, but fail closed if an operator edited the DB by hand.
+    parse_member_scope(level, name)
+        .or_else(|| Some(MemberScope::Worker("__invalid_member_scope__".into())))
+}
+
+pub(crate) fn scoped_worker_names(scope: &MemberScope) -> Vec<String> {
+    match scope {
+        MemberScope::Global => Vec::new(),
+        MemberScope::Worker(worker) => vec![worker.clone()],
+        MemberScope::Group(group) => {
+            let blocked = super::groups::blocked_names(&super::groups::amux_home());
+            let mut workers: Vec<String> = std::fs::read_dir(
+                super::groups::amux_home().join("sessions"),
+            )
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let path = entry.path();
+                (path.extension().and_then(|ext| ext.to_str()) == Some("env"))
+                    .then(|| path.file_stem()?.to_str().map(str::to_string))
+                    .flatten()
+            })
+            .filter(|worker| {
+                !blocked.contains(worker) && super::session_verbs::lane_groups(worker).contains(group)
+            })
+            .collect();
+            workers.sort();
+            workers.dedup();
+            workers
+        }
+    }
+}
+
+fn forbidden(scope: &MemberScope, resource: &str) -> Response {
+    err(
+        StatusCode::FORBIDDEN,
+        json!({
+            "error": "outside local member access scope",
+            "scope_level": scope.level(),
+            "scope_name": scope.name(),
+            "resource": resource,
+        }),
+    )
+}
+
+fn resolved_worker_name(conn: &rusqlite::Connection, target: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT display_name FROM _amux_workers WHERE id=?1 OR display_name=?1 LIMIT 1",
+        [target],
+        |row| row.get(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .or_else(|| {
+        super::groups::amux_home()
+            .join("sessions")
+            .join(format!("{target}.env"))
+            .is_file()
+            .then(|| target.to_string())
+    })
+}
+
+/// Route-level guard for scoped invitees. Handlers that return collections or
+/// accept a new worker assignment also intersect/validate inside the handler;
+/// this guard closes every direct-by-id path before it can read or mutate.
+pub(crate) fn authorize_local_member_request(
+    state: &AppState,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Option<Response> {
+    let scope = local_member_scope(headers)?;
+    let path = uri.path();
+
+    // Membership and invite administration is an owner capability, not a
+    // consequence of seeing the whole workspace.
+    if path == "/api/org" || path.starts_with("/api/org/") {
+        return Some(forbidden(&scope, "organization administration"));
+    }
+    if scope.is_global() {
+        return None;
+    }
+
+    if path == "/api/identity" || path == "/api/events" {
+        return None;
+    }
+    if path == "/api/sessions" {
+        return (*method != Method::GET).then(|| forbidden(&scope, "fleet mutation"));
+    }
+    if let Some(rest) = path.strip_prefix("/api/sessions/") {
+        let worker = rest.split('/').next().unwrap_or("");
+        return (!scope.allows_worker(worker)).then(|| forbidden(&scope, worker));
+    }
+    if path == "/api/workers" || path == "/api/workers/" {
+        return Some(forbidden(&scope, "worker registry"));
+    }
+    if let Some(rest) = path.strip_prefix("/api/workers/") {
+        let target = rest.split('/').next().unwrap_or("");
+        let allowed = state
+            .store
+            .read()
+            .ok()
+            .and_then(|conn| resolved_worker_name(&conn, target))
+            .is_some_and(|worker| scope.allows_worker(&worker));
+        return (!allowed).then(|| forbidden(&scope, target));
+    }
+    if path == "/api/board" || path == "/api/board/" {
+        // GET is filtered below; POST validates the requested session in the
+        // handler before it writes.
+        return (!matches!(*method, Method::GET | Method::POST))
+            .then(|| forbidden(&scope, "board"));
+    }
+    if matches!(
+        path,
+        "/api/board/statuses"
+            | "/api/board/session-gates"
+            | "/api/board/contract"
+            | "/api/board/themes"
+    ) && *method == Method::GET
+    {
+        return None;
+    }
+    if (path == "/api/board/statuses" || path == "/api/board/session-gates")
+        && *method != Method::GET
+    {
+        return Some(forbidden(&scope, path));
+    }
+    if path == "/api/board/export" && *method == Method::GET {
+        return None;
+    }
+    if matches!(
+        path,
+        "/api/board/needsyou"
+            | "/api/board/ready"
+            | "/api/board/bulk-migrate"
+            | "/api/board/clear-done"
+    ) || path.starts_with("/api/board/statuses/")
+        || path.starts_with("/api/board/session-gates/")
+        || path == "/api/board/commit-mentions"
+        || path == "/api/board/deleted-substrate"
+    {
+        return Some(forbidden(&scope, path));
+    }
+    if let Some(rest) = path.strip_prefix("/api/board/") {
+        let id = rest.split('/').next().unwrap_or("");
+        let session: Option<Option<String>> = state.store.read().ok().and_then(|conn| {
+            conn.query_row(
+                "SELECT session FROM issues WHERE id=?1 AND deleted IS NULL",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+        });
+        return match session {
+            Some(Some(worker)) if scope.allows_worker(&worker) => None,
+            Some(_) => Some(forbidden(&scope, id)),
+            // Preserve the handler's own 404 for an unknown id.
+            None => None,
+        };
+    }
+    if matches!(path, "/api/groups" | "/api/groups/" | "/api/tags" | "/api/tags/")
+        && *method == Method::GET
+    {
+        return None;
+    }
+
+    Some(forbidden(&scope, path))
+}
+
 #[derive(Debug)]
 struct MemberIdentity {
     id: String,
     email: String,
+    scope: MemberScope,
 }
 
 fn member_cookie(headers: &HeaderMap) -> Option<&str> {
@@ -98,6 +360,11 @@ pub async fn local_member_identity(
 ) -> Response {
     // Never trust the internal marker from the wire.
     req.headers_mut().remove(VERIFIED_MEMBER_HEADER);
+    req.headers_mut().remove(MEMBER_SCOPE_LEVEL_HEADER);
+    req.headers_mut().remove(MEMBER_SCOPE_NAME_HEADER);
+    req.headers_mut().remove(MEMBER_ACTOR_HEADER);
+    req.headers_mut().remove("x-amux-user-id");
+    req.headers_mut().remove("x-amux-user-email");
     let Some(token) = member_cookie(req.headers()).map(str::to_string) else {
         return next.run(req).await;
     };
@@ -105,11 +372,23 @@ pub async fn local_member_identity(
     let identity = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemberIdentity>> {
         let conn = store.read()?;
         Ok(conn.query_row(
-            "SELECT m.id, m.email FROM org_invites i \
+            "SELECT m.id, m.email, m.scope_level, m.scope_name FROM org_invites i \
              JOIN org_members m ON m.id=i.used_by \
              WHERE i.token=?1 AND i.used_at IS NOT NULL",
             [&token],
-            |row| Ok(MemberIdentity { id: row.get(0)?, email: row.get(1)? }),
+            |row| {
+                let level: String = row.get(2)?;
+                let name: String = row.get(3)?;
+                Ok(MemberIdentity {
+                    id: row.get(0)?,
+                    email: row.get(1)?,
+                    // Corrupt rows fail closed. Defaulting here to Global
+                    // would turn a typo or partial manual migration into the
+                    // broadest possible grant.
+                    scope: parse_member_scope(&level, &name)
+                        .unwrap_or(MemberScope::Worker("__invalid_member_scope__".into())),
+                })
+            },
         ).optional()?)
     }).await;
     let member = match identity {
@@ -133,8 +412,22 @@ pub async fn local_member_identity(
         return next.run(req).await;
     };
     req.headers_mut().insert(VERIFIED_MEMBER_HEADER, HeaderValue::from_static("1"));
+    req.headers_mut().insert(
+        MEMBER_SCOPE_LEVEL_HEADER,
+        HeaderValue::from_static(member.scope.level()),
+    );
+    if !member.scope.name().is_empty() {
+        let Ok(scope_name) = HeaderValue::from_str(member.scope.name()) else {
+            tracing::warn!(target: "amux::local_invite", verdict = "member_header_rejected", field = "scope_name", member_id = %member.id, "stored local member scope is not a valid HTTP header");
+            return next.run(req).await;
+        };
+        req.headers_mut().insert(MEMBER_SCOPE_NAME_HEADER, scope_name);
+    }
     req.headers_mut().insert("x-amux-user-id", id);
     req.headers_mut().insert("x-amux-user-email", email);
+    if let Ok(actor) = HeaderValue::from_str(&format!("member:{}", member.email)) {
+        req.headers_mut().insert(MEMBER_ACTOR_HEADER, actor);
+    }
     if !req.headers().contains_key("x-amux-worker") && !req.headers().contains_key("x-amux-session") {
         if let Ok(actor) = HeaderValue::from_str(&format!("member:{}", member.email)) {
             req.headers_mut().insert("x-amux-session", actor);
@@ -233,28 +526,97 @@ fn valid_email(email: &str) -> bool {
         && email.split_once('@').is_some_and(|(local, domain)| !local.is_empty() && !domain.is_empty())
 }
 
+fn requested_scope(body: &Value) -> Result<MemberScope, Value> {
+    let level = body
+        .get("scope_level")
+        .and_then(Value::as_str)
+        .unwrap_or("global");
+    let name = body.get("scope_name").and_then(Value::as_str).unwrap_or("");
+    let Some(scope) = parse_member_scope(level, name) else {
+        return Err(json!({
+                "error": "invalid member scope",
+                "scope_level": level,
+                "scope_name": name,
+                "valid_levels": ["global", "group", "worker"],
+                "why": "group and worker scopes require a target; global must not carry one",
+            }));
+    };
+    if matches!(scope, MemberScope::Worker(ref worker) if !super::session_verbs::valid_session_name(worker)) {
+        return Err(json!({"error": "worker scope target is not a valid worker name"}));
+    }
+    if HeaderValue::from_str(scope.name()).is_err() || scope.name().len() > 128 {
+        return Err(json!({"error": "scope target must be a short HTTP-safe worker or group name"}));
+    }
+    Ok(scope)
+}
+
+/// Resolve a requested scope to the canonical value stored on the member.
+/// Worker APIs accept either the registry id or display name, but every other
+/// access check operates on the display/session name; canonicalizing here
+/// keeps an id-shaped invite from becoming a valid grant that can see nothing.
+fn resolve_scope_target(
+    conn: &rusqlite::Connection,
+    scope: &MemberScope,
+) -> Option<MemberScope> {
+    match scope {
+        MemberScope::Global => Some(MemberScope::Global),
+        MemberScope::Worker(worker) => {
+            resolved_worker_name(conn, worker).map(MemberScope::Worker)
+        }
+        MemberScope::Group(group) => {
+            let configured = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM group_config WHERE lower(name)=lower(?1))",
+                    [group],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                != 0;
+            (configured
+                || std::fs::read_dir(super::groups::amux_home().join("sessions"))
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| {
+                        entry.path().file_stem().and_then(|s| s.to_str()).map(str::to_string)
+                    })
+                    .any(|worker| super::session_verbs::lane_groups(&worker).contains(group)))
+            .then(|| MemberScope::Group(group.clone()))
+        }
+    }
+}
+
 fn invite_fingerprint(token: &str) -> String {
     use sha2::Digest as _;
     hex::encode(sha2::Sha256::digest(token.as_bytes()))[..12].to_string()
 }
 
 #[derive(Debug)]
-struct InviteView { workspace: String, email: Option<String> }
+struct InviteView {
+    workspace: String,
+    email: Option<String>,
+    scope: MemberScope,
+}
+
+type InviteRow = (Option<String>, i64, Option<i64>, String, String);
 
 #[derive(Debug)]
 enum InviteLookup { Live(InviteView), Missing, Used, Expired }
 
 fn lookup_invite(conn: &rusqlite::Connection, token: &str) -> rusqlite::Result<InviteLookup> {
-    let row: Option<(Option<String>, i64, Option<i64>)> = conn.query_row(
-        "SELECT email, expires_at, used_at FROM org_invites WHERE token=?1", [token],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    let row: Option<InviteRow> = conn.query_row(
+        "SELECT email, expires_at, used_at, scope_level, scope_name FROM org_invites WHERE token=?1", [token],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
     ).optional()?;
-    let Some((email, expires_at, used_at)) = row else { return Ok(InviteLookup::Missing) };
+    let Some((email, expires_at, used_at, scope_level, scope_name)) = row else { return Ok(InviteLookup::Missing) };
     if used_at.is_some() { return Ok(InviteLookup::Used); }
     if expires_at <= chrono::Utc::now().timestamp() { return Ok(InviteLookup::Expired); }
     let workspace = conn.query_row("SELECT name FROM org WHERE id='default'", [], |row| row.get(0))
         .optional()?.unwrap_or_else(|| "My Workspace".to_string());
-    Ok(InviteLookup::Live(InviteView { workspace, email }))
+    let scope = parse_member_scope(&scope_level, &scope_name)
+        .unwrap_or(MemberScope::Worker("__invalid_member_scope__".into()));
+    Ok(InviteLookup::Live(InviteView { workspace, email, scope }))
 }
 
 fn invite_error(status: StatusCode, title: &str, detail: &str) -> Response {
@@ -291,9 +653,14 @@ async fn invite_page(State(state): State<AppState>, Path(token): Path<String>) -
         Ok(Ok(InviteLookup::Live(invite))) => {
             let email = invite.email.as_deref().unwrap_or("");
             let readonly = if invite.email.is_some() { " readonly" } else { "" };
+            let access = if invite.scope.is_global() {
+                "the whole workspace".to_string()
+            } else {
+                format!("{} {}", invite.scope.level(), invite.scope.name())
+            };
             let body = format!(
-                "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Join {workspace}</title><style>{css}</style></head><body><main><div class=\"mark\">A</div><h1>Join {workspace}</h1><p>You were invited to collaborate in this Amux workspace.</p><form method=\"post\"><label for=\"email\">Email</label><input id=\"email\" name=\"email\" type=\"email\" maxlength=\"254\" required autocomplete=\"email\" value=\"{email}\"{readonly}><label for=\"name\">Name</label><input id=\"name\" name=\"name\" maxlength=\"80\" autocomplete=\"name\" placeholder=\"How teammates will see you\"><button type=\"submit\">Join workspace</button></form><div class=\"note\">This signs this browser into this local Amux instance.</div></main></body></html>",
-                workspace = html_escape(&invite.workspace), css = INVITE_CSS, email = html_escape(email),
+                "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Join {workspace}</title><style>{css}</style></head><body><main><div class=\"mark\">A</div><h1>Join {workspace}</h1><p>You were invited to collaborate in this Amux workspace with access to <strong>{access}</strong>.</p><form method=\"post\"><label for=\"email\">Email</label><input id=\"email\" name=\"email\" type=\"email\" maxlength=\"254\" required autocomplete=\"email\" value=\"{email}\"{readonly}><label for=\"name\">Name</label><input id=\"name\" name=\"name\" maxlength=\"80\" autocomplete=\"name\" placeholder=\"How teammates will see you\"><button type=\"submit\">Join workspace</button></form><div class=\"note\">This signs this browser into this local Amux instance.</div></main></body></html>",
+                workspace = html_escape(&invite.workspace), css = INVITE_CSS, email = html_escape(email), access = html_escape(&access),
             );
             (StatusCode::OK, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response()
         }
@@ -348,11 +715,11 @@ async fn accept_invite(
     let outcome_w = outcome.clone();
     let write = state.store.write_async(move |conn| {
         let now = chrono::Utc::now().timestamp();
-        let row: Option<(Option<String>, i64, Option<i64>)> = conn.query_row(
-            "SELECT email, expires_at, used_at FROM org_invites WHERE token=?1", [&token_w],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        let row: Option<InviteRow> = conn.query_row(
+            "SELECT email, expires_at, used_at, scope_level, scope_name FROM org_invites WHERE token=?1", [&token_w],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         ).optional()?;
-        let Some((bound_email, expires_at, used_at)) = row else {
+        let Some((bound_email, expires_at, used_at, scope_level, scope_name)) = row else {
             *outcome_w.lock().expect("accept outcome") = Some(AcceptOutcome::Missing);
             return Ok(WriteOutcome { applied: false, events: vec![] });
         };
@@ -368,14 +735,18 @@ async fn accept_invite(
             *outcome_w.lock().expect("accept outcome") = Some(AcceptOutcome::EmailMismatch);
             return Ok(WriteOutcome { applied: false, events: vec![] });
         }
+        let scope = parse_member_scope(&scope_level, &scope_name)
+            .unwrap_or(MemberScope::Worker("__invalid_member_scope__".into()));
         let existing: Option<String> = conn.query_row(
             "SELECT id FROM org_members WHERE email=?1", [&email_w], |row| row.get(0),
         ).optional()?;
         let (member_id, created) = match existing {
             Some(id) => {
-                if !name_w.is_empty() {
-                    conn.execute("UPDATE org_members SET name=?1 WHERE id=?2", rusqlite::params![name_w, id])?;
-                }
+                conn.execute(
+                    "UPDATE org_members SET name=CASE WHEN ?1='' THEN name ELSE ?1 END, \
+                     scope_level=?2, scope_name=?3 WHERE id=?4",
+                    rusqlite::params![name_w, scope.level(), scope.name(), id],
+                )?;
                 (id, false)
             }
             None => {
@@ -383,8 +754,9 @@ async fn accept_invite(
                     email_w.split('@').next().unwrap_or(&email_w).to_string()
                 } else { name_w.clone() };
                 conn.execute(
-                    "INSERT INTO org_members (id,email,name,role,joined_at) VALUES (?1,?2,?3,'member',?4)",
-                    rusqlite::params![member_id_candidate, email_w, display_name, now],
+                    "INSERT INTO org_members (id,email,name,role,joined_at,scope_level,scope_name) \
+                     VALUES (?1,?2,?3,'member',?4,?5,?6)",
+                    rusqlite::params![member_id_candidate, email_w, display_name, now, scope.level(), scope.name()],
                 )?;
                 (member_id_candidate, true)
             }
@@ -499,7 +871,8 @@ pub async fn list_members(State(state): State<AppState>) -> Response {
         let conn = store.read()?;
         Ok(query_rows_json(
             &conn,
-            "SELECT id, email, name, role, joined_at FROM org_members ORDER BY joined_at",
+            "SELECT id, email, name, role, joined_at, scope_level, scope_name \
+             FROM org_members ORDER BY joined_at",
             &[],
         )?)
     })
@@ -507,6 +880,64 @@ pub async fn list_members(State(state): State<AppState>) -> Response {
     match joined {
         Ok(Ok(rows)) => Json(Value::Array(rows)).into_response(),
         Ok(Err(e)) => internal(e),
+        Err(e) => internal(e),
+    }
+}
+
+// ---- PATCH /api/org/members/{id} -----------------------------------------
+
+pub async fn patch_member(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let requested = match requested_scope(&body) {
+        Ok(scope) => scope,
+        Err(body) => return err(StatusCode::BAD_REQUEST, body),
+    };
+    let conn = match state.store.read() {
+        Ok(conn) => conn,
+        Err(e) => return internal(e),
+    };
+    let Some(scope) = resolve_scope_target(&conn, &requested) else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": "scope target does not exist",
+                "scope_level": requested.level(),
+                "scope_name": requested.name(),
+            }),
+        );
+    };
+    drop(conn);
+    let id_w = id.clone();
+    let level = scope.level().to_string();
+    let name = scope.name().to_string();
+    let write = state
+        .store
+        .write_async(move |conn| {
+            let n = conn.execute(
+                "UPDATE org_members SET scope_level=?1, scope_name=?2 WHERE id=?3",
+                rusqlite::params![level, name, id_w],
+            )?;
+            Ok(WriteOutcome {
+                applied: n > 0,
+                events: (n > 0)
+                    .then(|| ev("org_member", &id_w, MutationKind::Updated))
+                    .into_iter()
+                    .collect(),
+            })
+        })
+        .await;
+    match write {
+        Ok(outcome) if outcome.applied => Json(json!({
+            "ok": true,
+            "id": id,
+            "scope_level": scope.level(),
+            "scope_name": scope.name(),
+        }))
+        .into_response(),
+        Ok(_) => err(StatusCode::NOT_FOUND, json!({"error": "member not found"})),
         Err(e) => internal(e),
     }
 }
@@ -547,7 +978,7 @@ pub async fn list_invites(
         let now = chrono::Utc::now().timestamp();
         let mut rows = query_rows_json(
             &conn,
-            "SELECT token, email, created_at, expires_at, used_at, used_by \
+            "SELECT token, email, created_at, expires_at, used_at, used_by, scope_level, scope_name \
              FROM org_invites WHERE used_at IS NULL AND expires_at > ?1 \
              ORDER BY created_at DESC",
             &[&now],
@@ -584,17 +1015,40 @@ pub async fn create_invite(
         tracing::warn!(target: "amux::local_invite", verdict = "create_rejected", reason = "invalid_email", "local invite creation rejected");
         return err(StatusCode::BAD_REQUEST, json!({ "error": "valid email required" }));
     }
+    let requested = match requested_scope(&body) {
+        Ok(scope) => scope,
+        Err(body) => return err(StatusCode::BAD_REQUEST, body),
+    };
+    let conn = match state.store.read() {
+        Ok(conn) => conn,
+        Err(e) => return internal(e),
+    };
+    let Some(scope) = resolve_scope_target(&conn, &requested) else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": "scope target does not exist",
+                "scope_level": requested.level(),
+                "scope_name": requested.name(),
+            }),
+        );
+    };
+    drop(conn);
     let token = token_urlsafe(24);
     let now = chrono::Utc::now().timestamp();
     let expires = now + 7 * 86400;
     let token_w = token.clone();
     let email_w = email.clone();
+    let scope_level = scope.level().to_string();
+    let scope_name = scope.name().to_string();
     let write = state
         .store
         .write_async(move |conn| {
             conn.execute(
-                "INSERT INTO org_invites (token, email, created_at, expires_at) VALUES (?1,?2,?3,?4)",
-                rusqlite::params![token_w, email_w, now, expires],
+                "INSERT INTO org_invites \
+                 (token, email, created_at, expires_at, scope_level, scope_name) \
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                rusqlite::params![token_w, email_w, now, expires, scope_level, scope_name],
             )?;
             Ok(WriteOutcome {
                 applied: true,
@@ -606,11 +1060,18 @@ pub async fn create_invite(
         Ok(_) => {
             tracing::info!(target: "amux::local_invite", verdict = "created",
                 bound_email = email.as_deref().unwrap_or("open"), expires_at = expires,
+                scope_level = scope.level(), scope_name = scope.name(),
                 "local invite created");
             let url = format!("{}/invite/{token}", base_url(&headers, &uri));
             (
                 StatusCode::CREATED,
-                Json(json!({ "token": token, "url": url, "expires_at": expires })),
+                Json(json!({
+                    "token": token,
+                    "url": url,
+                    "expires_at": expires,
+                    "scope_level": scope.level(),
+                    "scope_name": scope.name(),
+                })),
             )
                 .into_response()
         }
@@ -966,6 +1427,48 @@ mod tests {
         assert_eq!(identity["email"], "guest@example.com");
         assert_eq!(identity["is_local_member"], true);
         assert_eq!(identity["is_cloud"], false);
+        assert_eq!(identity["access_scope"], json!({"level": "global", "name": ""}));
+
+        // Authorship is derived from the verified invite cookie, not from a
+        // caller-controlled creator field or ordinary worker/session header.
+        // The same author must survive into both the card and its edit history.
+        let (card_status, _, card_body) = raw_send(
+            &app,
+            "POST",
+            "/api/board",
+            r#"{"title":"member-authored","type":"chore","status":"backlog","creator":"spoofed-owner"}"#,
+            &[
+                ("cookie", cookie),
+                ("content-type", "application/json"),
+                ("x-amux-worker", "spoofed-worker"),
+                ("x-amux-user-email", "spoofed@example.com"),
+            ],
+        )
+        .await;
+        assert_eq!(card_status, StatusCode::CREATED, "{card_body}");
+        let card: Value = serde_json::from_str(&card_body).unwrap();
+        assert_eq!(card["creator"], "member:guest@example.com");
+        let card_id = card["id"].as_str().unwrap();
+        let (patch_status, _, patch_body) = raw_send(
+            &app,
+            "PATCH",
+            &format!("/api/board/{card_id}"),
+            r#"{"desc_append":"member note"}"#,
+            &[
+                ("cookie", cookie),
+                ("content-type", "application/json"),
+                ("x-amux-session", "another-spoofed-worker"),
+            ],
+        )
+        .await;
+        assert_eq!(patch_status, StatusCode::OK, "{patch_body}");
+        let patched: Value = serde_json::from_str(&patch_body).unwrap();
+        assert!(
+            patched["log"]
+                .as_str()
+                .is_some_and(|log| log.contains("member:guest@example.com: desc +11 chars")),
+            "{patch_body}"
+        );
 
         // The member shell cannot inherit the owner's bearer: real browser API
         // calls must continue to exercise the cookie boundary.
@@ -975,8 +1478,8 @@ mod tests {
         assert!(!shell.contains("window._AMUX_AUTH_TOKEN=\"owner-token\""), "{shell}");
 
         let (members_status, _, members_body) = raw_send(&app, "GET", "/api/org/members", "", &[("cookie", cookie)]).await;
-        assert_eq!(members_status, StatusCode::OK, "{members_body}");
-        assert!(members_body.contains("guest@example.com"), "{members_body}");
+        assert_eq!(members_status, StatusCode::FORBIDDEN, "{members_body}");
+        assert!(members_body.contains("organization administration"), "{members_body}");
 
         let db = dir.path().join("org-full-test.db");
         let mut actor = String::new();
@@ -988,6 +1491,25 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(actor, "member:guest@example.com");
+        let mut board_actor = String::new();
+        for _ in 0..50 {
+            board_actor = rusqlite::Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT amux_session FROM _amux_request_log \
+                     WHERE path='/api/board' AND method='POST' ORDER BY ts DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap()
+                .unwrap_or_default();
+            if !board_actor.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(board_actor, "member:guest@example.com");
 
         let member_id: String = rusqlite::Connection::open(&db).unwrap().query_row(
             "SELECT id FROM org_members WHERE email='guest@example.com'", [], |row| row.get(0)).unwrap();
@@ -1010,6 +1532,153 @@ mod tests {
         );
         let (replay, _, _) = raw_send(&app, "GET", &format!("/invite/{token}"), "", &[]).await;
         assert_eq!(replay, StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn worker_scope_is_enforced_and_owner_rescope_reaches_the_existing_cookie() {
+        let (app, dir) = full_app();
+        let db = dir.path().join("org-full-test.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            for (id, name) in [("wrk_allowed", "allowed-worker"), ("wrk_other", "other-worker")] {
+                conn.execute(
+                    "INSERT INTO _amux_workers \
+                     (id,display_name,name_aliases,cwd,provider,backend,environment,permissions,state,version,created_at,updated_at) \
+                     VALUES (?1,?2,'[]','/tmp','claude','tmux','{}','[]','{\"state\":\"stopped\"}',0,'now','now')",
+                    rusqlite::params![id, name],
+                )
+                .unwrap();
+            }
+        }
+
+        let (created, _, body) = raw_send(
+            &app,
+            "POST",
+            "/api/org/invites",
+            // The API also accepts a registry id, but persists the canonical
+            // display/session name used by fleet and board authorization.
+            r#"{"email":"worker-guest@example.com","scope_level":"worker","scope_name":"wrk_allowed"}"#,
+            &[("authorization", "Bearer owner-token"), ("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(created, StatusCode::CREATED, "{body}");
+        let invitation: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(invitation["scope_level"], "worker");
+        assert_eq!(invitation["scope_name"], "allowed-worker");
+        let token = invitation["token"].as_str().unwrap();
+        let (accepted, headers, _) = raw_send(
+            &app,
+            "POST",
+            &format!("/invite/{token}"),
+            "email=worker-guest%40example.com&name=Scoped+Guest",
+            &[("content-type", "application/x-www-form-urlencoded")],
+        )
+        .await;
+        assert_eq!(accepted, StatusCode::SEE_OTHER);
+        let cookie = headers[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap();
+
+        let (identity_status, _, identity_body) =
+            raw_send(&app, "GET", "/api/identity", "", &[("cookie", cookie)]).await;
+        assert_eq!(identity_status, StatusCode::OK, "{identity_body}");
+        let identity: Value = serde_json::from_str(&identity_body).unwrap();
+        assert_eq!(
+            identity["access_scope"],
+            json!({"level": "worker", "name": "allowed-worker"})
+        );
+
+        let (allowed, _, _) = raw_send(
+            &app,
+            "GET",
+            "/api/workers/wrk_allowed",
+            "",
+            &[("cookie", cookie)],
+        )
+        .await;
+        assert_ne!(allowed, StatusCode::FORBIDDEN);
+        let (denied, _, denied_body) = raw_send(
+            &app,
+            "GET",
+            "/api/workers/wrk_other",
+            "",
+            &[("cookie", cookie)],
+        )
+        .await;
+        assert_eq!(denied, StatusCode::FORBIDDEN, "{denied_body}");
+        let (admin, _, _) =
+            raw_send(&app, "GET", "/api/org/members", "", &[("cookie", cookie)]).await;
+        assert_eq!(admin, StatusCode::FORBIDDEN);
+        let (sync, _, _) = raw_send(&app, "GET", "/api/sync", "", &[("cookie", cookie)]).await;
+        assert_eq!(sync, StatusCode::FORBIDDEN);
+
+        let member_id: String = rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT id FROM org_members WHERE email='worker-guest@example.com'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (rescoped, _, rescope_body) = raw_send(
+            &app,
+            "PATCH",
+            &format!("/api/org/members/{member_id}"),
+            r#"{"scope_level":"global","scope_name":""}"#,
+            &[("authorization", "Bearer owner-token"), ("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(rescoped, StatusCode::OK, "{rescope_body}");
+        let (now_allowed, _, _) = raw_send(
+            &app,
+            "GET",
+            "/api/workers/wrk_other",
+            "",
+            &[("cookie", cookie)],
+        )
+        .await;
+        assert_ne!(now_allowed, StatusCode::FORBIDDEN, "same cookie must observe the rescope");
+        let (_, _, identity_body) =
+            raw_send(&app, "GET", "/api/identity", "", &[("cookie", cookie)]).await;
+        let identity: Value = serde_json::from_str(&identity_body).unwrap();
+        assert_eq!(identity["access_scope"], json!({"level": "global", "name": ""}));
+
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute(
+                "UPDATE org_members SET scope_level='typo', scope_name='' WHERE id=?1",
+                [&member_id],
+            )
+            .unwrap();
+        let (_, _, identity_body) =
+            raw_send(&app, "GET", "/api/identity", "", &[("cookie", cookie)]).await;
+        let identity: Value = serde_json::from_str(&identity_body).unwrap();
+        assert_eq!(
+            identity["access_scope"],
+            json!({"level": "worker", "name": "__invalid_member_scope__"})
+        );
+        let (fails_closed, _, _) = raw_send(
+            &app,
+            "GET",
+            "/api/workers/wrk_other",
+            "",
+            &[("cookie", cookie)],
+        )
+        .await;
+        assert_eq!(fails_closed, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn an_invite_refuses_a_scope_target_that_does_not_exist() {
+        let (app, _dir) = full_app();
+        let (status, _, body) = raw_send(
+            &app,
+            "POST",
+            "/api/org/invites",
+            r#"{"scope_level":"group","scope_name":"not-a-real-group"}"#,
+            &[("authorization", "Bearer owner-token"), ("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("scope target does not exist"), "{body}");
     }
 
     #[tokio::test]

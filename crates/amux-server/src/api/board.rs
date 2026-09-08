@@ -1707,6 +1707,18 @@ fn err(status: StatusCode, body: Value) -> Response {
     (status, Json(body)).into_response()
 }
 
+fn scoped_board_forbidden(scope: &super::org::MemberScope, resource: &str) -> Response {
+    err(
+        StatusCode::FORBIDDEN,
+        json!({
+            "error": "outside local member access scope",
+            "scope_level": scope.level(),
+            "scope_name": scope.name(),
+            "resource": resource,
+        }),
+    )
+}
+
 use super::internal;
 
 fn not_found(id: &str) -> Response {
@@ -1898,7 +1910,9 @@ fn hhmm() -> String {
 /// fixes every already-installed CLI copy at once, and closes both effects
 /// together, whereas patching curl lines fixes only the machines that upgrade.
 fn actor_from_headers(headers: &HeaderMap) -> (Actor, String) {
-    match Some(crate::api::groups::hdr_worker(headers))
+    match super::org::local_member_actor(headers)
+        .map(str::to_string)
+        .or_else(|| Some(crate::api::groups::hdr_worker(headers)))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
     {
@@ -2991,6 +3005,7 @@ pub struct ExportParams {
 
 pub async fn export_board(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(p): Query<ExportParams>,
 ) -> Response {
     let conn = match state.store.read() {
@@ -3002,11 +3017,22 @@ pub async fn export_board(
         .as_deref()
         .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
         .unwrap_or_default();
-    let workers: Vec<String> = p
+    let mut workers: Vec<String> = p
         .worker
         .as_deref()
         .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
         .unwrap_or_default();
+    if let Some(scope) = super::org::local_member_scope(&headers).filter(|scope| !scope.is_global()) {
+        if workers.iter().any(|worker| !scope.allows_worker(worker)) {
+            return scoped_board_forbidden(&scope, "board export");
+        }
+        if workers.is_empty() {
+            workers = super::org::scoped_worker_names(&scope);
+            if workers.is_empty() {
+                workers.push("__amux_no_permitted_worker__".into());
+            }
+        }
+    }
     // Default ActiveOnly: an export is a working document, and silently
     // including archived cards would overstate the board. `archived=all`
     // opts in, and the header below always says which was used.
@@ -3161,7 +3187,18 @@ pub async fn list_board(
     }
     // ETag based on global_rev — saves 3.5MB on unchanged polls.
     let rev = state.store.current_rev().map(|r| r.0).unwrap_or(0);
-    let etag_val = format!("\"board-{}\"", rev);
+    let member_scope = super::org::local_member_scope(&headers);
+    let scope_etag = member_scope
+        .as_ref()
+        .map(|scope| {
+            use sha2::Digest as _;
+            let digest = sha2::Sha256::digest(
+                format!("{}\0{}", scope.level(), scope.name()).as_bytes(),
+            );
+            format!("-{}", &hex::encode(digest)[..12])
+        })
+        .unwrap_or_default();
+    let etag_val = format!("\"board-{}{scope_etag}\"", rev);
     if let Some(inm) = headers.get("if-none-match").and_then(|v| v.to_str().ok()) {
         if inm == etag_val || inm == format!("W/{etag_val}") {
             let mut h = HeaderMap::new();
@@ -3197,7 +3234,20 @@ pub async fn list_board(
             .collect()
     };
     let status_f = split(&p.status);
-    let session_f = split(&p.session);
+    let mut session_f = split(&p.session);
+    if let Some(scope) = member_scope.as_ref().filter(|scope| !scope.is_global()) {
+        if session_f.iter().any(|worker| !scope.allows_worker(worker)) {
+            return scoped_board_forbidden(scope, "board list");
+        }
+        if session_f.is_empty() {
+            session_f = super::org::scoped_worker_names(scope);
+            if session_f.is_empty() {
+                // An empty SQL filter means "all sessions", so use an
+                // impossible sentinel when a group currently has no workers.
+                session_f.push("__amux_no_permitted_worker__".into());
+            }
+        }
+    }
     // `archived` grammar (amux-server.py:68758 + 14025, ported on AMUX-2586 fix #5):
     //   "1"/"true"/"yes"          -> archived-only
     //   any OTHER non-empty value -> non-archived only ("0", "false", "all", "2", ...)
@@ -3872,17 +3922,24 @@ pub async fn create_item(
     // present, the card is for the sender's own lane. An EXPLICIT value —
     // including explicit "" / null for a deliberately unassigned card — is
     // always respected.
-    let (_, hdr_name) = actor_from_headers(&headers);
-    let hdr_session = if hdr_name == "api-anonymous" {
+    let (_, actor_name) = actor_from_headers(&headers);
+    let hdr_session = if actor_name == "api-anonymous"
+        || super::org::is_verified_local_member(&headers)
+    {
         String::new()
     } else {
-        hdr_name.clone()
+        actor_name.clone()
     };
     let session = if map.contains_key("session") {
         body_str(&map, "session").unwrap_or_default().trim().to_string()
     } else {
         hdr_session.chars().take(64).collect()
     };
+    if let Some(scope) = super::org::local_member_scope(&headers).filter(|scope| !scope.is_global()) {
+        if session.is_empty() || !scope.allows_worker(&session) {
+            return scoped_board_forbidden(&scope, if session.is_empty() { "unassigned card" } else { &session });
+        }
+    }
 
     let status_in = body_str(&map, "status").unwrap_or_else(|| "todo".into());
     // THE SAME PREDICATE ON THE CREATE DOOR (AMUX-3929). The transition gate
@@ -3995,11 +4052,17 @@ pub async fn create_item(
     // Creator attribution (AMUX-1812): the body value is a self-reported
     // CLAIM; the verified header wins, and a disagreement is recorded.
     let claimed = body_str(&map, "creator").unwrap_or_default().trim().to_string();
-    let creator = match (&hdr_session.is_empty(), claimed.is_empty()) {
-        (false, false) if hdr_session != claimed => format!("{hdr_session} (claimed {claimed})"),
-        (false, _) => hdr_session.clone(),
-        (true, false) => claimed,
-        (true, true) => String::new(),
+    let verified_creator = (actor_name != "api-anonymous").then_some(actor_name.as_str());
+    let creator = match (verified_creator, claimed.is_empty()) {
+        // A local member's author is derived from the verified invite cookie.
+        // Old dashboard clients still send a device-name `creator`; retaining
+        // that self-reported value would make the same person appear under a
+        // different author on every device and would allow deliberate spoofing.
+        (Some(author), _) if super::org::is_verified_local_member(&headers) => author.to_string(),
+        (Some(author), false) if author != claimed => format!("{author} (claimed {claimed})"),
+        (Some(author), _) => author.to_string(),
+        (None, false) => claimed,
+        (None, true) => String::new(),
     };
 
     let owner_type = match body_str(&map, "owner_type").as_deref() {
@@ -4676,9 +4739,14 @@ mod task_asset_resolution_tests {
     }
 }
 
-pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+pub async fn get_item(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
     let store = state.store.clone();
     let key = id.clone();
+    let member_scope = super::org::local_member_scope(&headers).filter(|scope| !scope.is_global());
     let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = store.read()?;
         let Some(row) = bs::get_issue(&conn, &key)? else {
@@ -4695,6 +4763,14 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
         let children = child_ids
             .iter()
             .filter_map(|child| bs::get_issue(&conn, child).ok().flatten())
+            .filter(|child| {
+                member_scope.as_ref().is_none_or(|scope| {
+                    child
+                        .session
+                        .as_deref()
+                        .is_some_and(|worker| scope.allows_worker(worker))
+                })
+            })
             .map(|child| {
                 json!({
                     "id": child.id,
@@ -4714,7 +4790,14 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
         // A child inherits the source message of its epic for display, while
         // cmd_history.card_id itself remains attached to the root epic. That
         // keeps the Messages chip stable from prompt through completion.
-        let message_root = row.epic.as_deref().unwrap_or(&row.id);
+        // A child normally inherits its epic's prompt. For a scoped member,
+        // crossing that parent boundary could reveal a prompt on a card they
+        // cannot open, so only use the directly-authorized card as the root.
+        let message_root = if member_scope.is_some() {
+            &row.id
+        } else {
+            row.epic.as_deref().unwrap_or(&row.id)
+        };
         let mut messages = Vec::new();
         let mut msg_stmt = conn.prepare(
             "SELECT id,text,type,session,ts,origin,card_id FROM cmd_history \
@@ -7818,6 +7901,17 @@ pub async fn patch_item(
             json!({ "error": "body must be a JSON object" }),
         );
     };
+    if let Some(scope) = super::org::local_member_scope(&headers).filter(|scope| !scope.is_global()) {
+        if map.contains_key("session") {
+            let target = body_str(&map, "session").unwrap_or_default();
+            if target.is_empty() || !scope.allows_worker(&target) {
+                return scoped_board_forbidden(
+                    &scope,
+                    if target.is_empty() { "unassigned card" } else { &target },
+                );
+            }
+        }
+    }
     // AF-413: computed HERE, before `map` moves into the write closure, because
     // the refusal that needs it is built inside that closure and answered after
     // it. Cheap (a key scan) and unconditional: a value only read on the refusal
