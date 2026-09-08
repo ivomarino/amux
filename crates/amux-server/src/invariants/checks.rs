@@ -637,6 +637,17 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     // migration landed at 04:1x and the check was red by the next sweep, which
     // is the check doing exactly what it exists for.
     ("board_drive_nudge_state", "last_nudge_at", false),
+    // ATE-93 overlap coordination stamps every table from board.rs `now_secs()`
+    // inside the same transaction as the board log/evidence writes. All seven
+    // are therefore seconds; declaring them together keeps callback retries,
+    // member sightings, resolution provenance, and merged refs comparable.
+    ("board_overlap_callbacks", "updated_at", false),
+    ("board_overlap_coordination", "created_at", false),
+    ("board_overlap_coordination", "resolved_at", false),
+    ("board_overlap_coordination", "updated_at", false),
+    ("board_overlap_members", "created_at", false),
+    ("board_overlap_members", "last_seen_at", false),
+    ("board_overlap_refs", "created_at", false),
     ("cmd_history", "delivered_at", true),
     ("cmd_history", "queued_at", true),
     ("cmd_history", "ts", true),

@@ -18,7 +18,22 @@ pub struct ArtifactRow {
     pub updated_at: i64,
 }
 
-pub const ARTIFACT_STATES: &[&str] = &["created", "submitted", "merged", "deployed"];
+pub const ARTIFACT_STATES: &[&str] = &[
+    "created",
+    "submitted",
+    "merged",
+    "deployed",
+    // Audit-preserving terminal dispositions. Deleting a guessed/obsolete ref
+    // erases why it stopped being evidence; leaving it "created" presents a
+    // known falsehood as a valid output. These states keep the lineage while
+    // letting every evidence consumer exclude it honestly.
+    "invalid",
+    "superseded",
+];
+
+pub fn is_retired_state(state: &str) -> bool {
+    matches!(state, "invalid" | "superseded")
+}
 
 pub const KNOWN_KINDS: &[&str] = &[
     "implementation",

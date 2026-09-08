@@ -32,6 +32,7 @@ use axum::{Json, Router};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 pub fn routes() -> Router<AppState> {
@@ -8101,7 +8102,16 @@ pub async fn patch_item(
             // with stale prose and turn an idempotent retry into a second
             // applied write. A new terminal entry still flows through the
             // normal setter and save_patched replaces it atomically.
+            let reopening_terminal_card = bs::is_terminal_status(&row.status)
+                && map
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .and_then(bs::parse_status)
+                    .is_some_and(|target| {
+                        !bs::is_terminal_status(bs::db_status_spelling(target))
+                    });
             let terminal_summary_locked = bs::is_terminal_status(&row.status)
+                && !reopening_terminal_card
                 && row
                     .last_result
                     .as_deref()
@@ -8946,23 +8956,37 @@ pub async fn patch_item(
                         // a reproducible command, but a command is not a
                         // produced asset. Keep the documented honest no-asset
                         // escape, and otherwise require an actual pointer.
-                        let evidence_names_artifact = next.evidence.as_deref().is_some_and(|e| {
-                            bs::has_asset_link(e)
-                                || (e.trim().to_ascii_lowercase().starts_with("none:")
-                                    && bs::evidence_verdict(e) == bs::EvidenceVerdict::Ok)
-                        });
                         // The explicit artifact registry is the canonical
                         // structured path. Requiring its ref to be duplicated
                         // in prose made a successful `amux board artifact`
                         // write insufficient to close its own task.
-                        let registered_artifact = crate::db::artifact_store::list_for_task(
-                            conn,
-                            &next.id,
-                        )?
-                        .iter()
-                        .any(|a| !a.ref_value.trim().is_empty());
-                        let has_link = bs::has_asset_link(&next.desc)
-                            || next.log.as_deref().is_some_and(bs::has_asset_link)
+                        let registered_artifacts =
+                            crate::db::artifact_store::list_for_task(conn, &next.id)?;
+                        let retired_refs: HashSet<&str> = registered_artifacts
+                            .iter()
+                            .filter(|a| crate::db::artifact_store::is_retired_state(&a.state))
+                            .map(|a| a.ref_value.as_str())
+                            .collect();
+                        let text_has_active_asset = |text: &str| {
+                            bs::asset_refs(text)
+                                .iter()
+                                .any(|reference| !retired_refs.contains(reference.as_str()))
+                        };
+                        // A durable invalid/superseded disposition must apply
+                        // everywhere evidence is consumed, not only in the UI.
+                        // Otherwise the retired ref can still satisfy this
+                        // gate by being repeated in --evidence.
+                        let evidence_names_artifact = next.evidence.as_deref().is_some_and(|e| {
+                            text_has_active_asset(e)
+                                || (e.trim().to_ascii_lowercase().starts_with("none:")
+                                    && bs::evidence_verdict(e) == bs::EvidenceVerdict::Ok)
+                        });
+                        let registered_artifact = registered_artifacts.iter().any(|a| {
+                            !a.ref_value.trim().is_empty()
+                                && !crate::db::artifact_store::is_retired_state(&a.state)
+                        });
+                        let has_link = text_has_active_asset(&next.desc)
+                            || next.log.as_deref().is_some_and(text_has_active_asset)
                             || evidence_names_artifact
                             || registered_artifact;
                         if !has_link {
@@ -11528,6 +11552,7 @@ async fn create_artifact(
 async fn patch_artifact(
     State(state): State<AppState>,
     Path((id, aid)): Path<(String, String)>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
     let new_state = body.get("state").and_then(|v| v.as_str()).map(|s| s.to_string());
@@ -11549,8 +11574,10 @@ async fn patch_artifact(
         }
     }
     let now = chrono::Utc::now().timestamp();
+    let (_, actor) = actor_from_headers(&headers);
     let task_for_log = id.clone();
     let aid_for_log = aid.clone();
+    let state_for_log = new_state.clone();
     let write = state.store.write_async(move |conn| {
         if bs::get_issue(conn, &id)?.is_none() {
             return Err(rusqlite::Error::QueryReturnedNoRows);
@@ -11580,7 +11607,24 @@ async fn patch_artifact(
         })
     }).await;
     match write {
-        Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
+        Ok(_) => {
+            if let Some(ref disposition) = state_for_log {
+                if crate::db::artifact_store::is_retired_state(disposition) {
+                    tracing::warn!(
+                        target: "amux::board",
+                        marker = "artifact_retired",
+                        task = %task_for_log,
+                        artifact = %aid_for_log,
+                        worker = %actor,
+                        state = %disposition,
+                        measured = true,
+                        n_considered = 1,
+                        "board artifact retained for audit but retired from valid produced assets"
+                    );
+                }
+            }
+            (StatusCode::OK, Json(json!({"ok": true}))).into_response()
+        }
         Err(e) if is_missing_task(&e) => {
             tracing::warn!(
                 marker = "artifact_target_missing",

@@ -2833,7 +2833,13 @@ fn terminal_summary(
     let mut assets = Vec::new();
     let mut seen = HashSet::new();
     for artifact in crate::db::artifact_store::list_for_task(conn, &row.id)? {
-        if !artifact.ref_value.trim().is_empty() && seen.insert(artifact.ref_value.clone()) {
+        // Insert retired refs into `seen` too: otherwise the same invalid ref
+        // can be reintroduced from free-text evidence one loop below and wear
+        // a valid-looking state again.
+        if !artifact.ref_value.trim().is_empty()
+            && seen.insert(artifact.ref_value.clone())
+            && !crate::db::artifact_store::is_retired_state(&artifact.state)
+        {
             assets.push(artifact.ref_value);
         }
     }
@@ -2943,9 +2949,43 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
     // item at the ONE write choke point every status transition uses. This is
     // intentionally not a PATCH-handler side effect: board-drive, epic
     // completion and future transition producers all call save_patched too.
-    let previous_status: Option<String> = conn
-        .query_row("SELECT status FROM issues WHERE id = ?1", params![row.id], |r| r.get(0))
+    let previous: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT status, last_result FROM issues WHERE id = ?1",
+            params![row.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .ok();
+    let previous_status = previous.as_ref().map(|(status, _)| status.clone());
+    let reopened_terminal_summary = previous.as_ref().is_some_and(|(status, summary)| {
+        is_terminal_status(status)
+            && !is_terminal_status(&row.status)
+            && summary
+                .as_deref()
+                .is_some_and(|text| text.starts_with("Final outcome:"))
+    });
+    if reopened_terminal_summary {
+        // If this same atomic PATCH supplied a current-run result, preserve it.
+        // Otherwise clear only the generated terminal projection. The old
+        // Final outcome already remains in the append-only card log.
+        if row
+            .last_result
+            .as_deref()
+            .is_some_and(|text| text.starts_with("Final outcome:"))
+        {
+            row.last_result = None;
+        }
+        let hhmm = chrono::Local::now().format("%H:%M").to_string();
+        row.log = Some(append_log(
+            row.log.as_deref(),
+            &hhmm,
+            &format!(
+                "STATUS (board): terminal summary retired on reopen to {}; prior Final outcome remains in history; current Work summary {}.",
+                row.status,
+                if row.last_result.is_some() { "replaced" } else { "reset" }
+            ),
+        ));
+    }
     let terminal_transition = previous_status
         .as_deref()
         .is_some_and(|status| status != row.status && is_terminal_status(&row.status));
@@ -3059,6 +3099,19 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
             to = %row.status,
             artifacts = terminal_summary_assets,
             "board terminal transition recorded a final summary"
+        );
+    }
+    if reopened_terminal_summary && changed == 1 {
+        tracing::warn!(
+            target: "amux::board",
+            marker = "terminal_summary_retired_on_reopen",
+            task_id = %row.id,
+            from = previous_status.as_deref().unwrap_or("unknown"),
+            to = %row.status,
+            replacement = row.last_result.is_some(),
+            measured = true,
+            n_considered = 1,
+            "reopened card retired its stale generated terminal summary"
         );
     }
     Ok(changed)

@@ -1216,6 +1216,9 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/board/session-gates", methods: &["GET", "PATCH"] },
     RouteEntry { path: "/api/board/nudges", methods: &["GET", "PATCH"] },
     RouteEntry { path: "/api/board/clear-done", methods: &["POST"] },
+    RouteEntry { path: "/api/board/overlap", methods: &["POST"] },
+    RouteEntry { path: "/api/board/overlap/deployment-permit", methods: &["GET"] },
+    RouteEntry { path: "/api/board/overlap/{coordination_id}", methods: &["GET"] },
     RouteEntry { path: "/api/board/{id}", methods: &["GET", "PATCH", "DELETE"] },
     // The workflow-engine landing (board.rs:80-83) mounted these four and did
     // not add them here, which is what reddened `rust`. Methods read off the

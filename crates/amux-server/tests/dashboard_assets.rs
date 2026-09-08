@@ -319,12 +319,19 @@ fn message_card_links_survive_the_capped_board_working_set() {
         "message.card_archived",
         "message.card_deleted",
         "const c = live ||",
+        "<button type=\"button\" class=\"msg-card-chip\"",
     ] {
         assert!(
             body.contains(needle),
             "message card chip lost authoritative history metadata `{needle}`"
         );
     }
+    assert!(
+        app.contains("function _msgOpenCard(cardId)")
+            && app.contains("_bdAudit('message-card-nav'")
+            && body.contains("_msgOpenCard("),
+        "message-card controls must use the shared navigation helper and emit a durable client-debug verdict"
+    );
     assert!(
         app.contains("_msgCardChip(typeof e === 'string' ? '' : (e.card_id || ''), e)"),
         "the shared history row must pass its authoritative card metadata to the chip"
@@ -337,6 +344,10 @@ fn message_card_links_survive_the_capped_board_working_set() {
         app.contains("async function openBoardDetail(id)")
             && app.contains("await apiCall(API + '/api/board/' + encodeURIComponent(id))"),
         "clicking a message's older/terminal task must hydrate it even when the capped board list omitted it"
+    );
+    assert!(
+        !body.contains("<span class=\"msg-card-chip\""),
+        "the message-to-card relation must be a semantic keyboard-accessible control, not a click-handled span"
     );
 }
 
@@ -761,6 +772,10 @@ fn board_detail_leads_with_actionable_task_context() {
         "item.gate_requirements",
         "item.asset_links",
         "a.resolved_ref",
+        "_bdArtifactHref(",
+        "window.location.origin",
+        "Retired artifacts (",
+        "const retiredArtifacts =",
         "const explicitPath =",
         "const serverResolvedPath =",
         "<button type=\"button\" class=\"file-link board-artifact-file\"",

@@ -9098,7 +9098,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.832';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.833';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -14581,6 +14581,17 @@ function _linkifyUrls(safeHtml) {
     });
   } catch (e) { return safeHtml; }
 }
+function _msgOpenCard(cardId) {
+  const id = String(cardId || '').trim();
+  if (!id) {
+    _bdAudit('message-card-nav', { verdict: 'refused-empty', measured: true, n_considered: 0 });
+    return;
+  }
+  _bdAudit('message-card-nav', { verdict: 'opened', card_id: id, measured: true, n_considered: 1 });
+  switchView('board');
+  setTimeout(() => openBoardDetail(id), 250);
+}
+
 function _msgCardChip(cardId, message) {
   if (!cardId) return '';
   const live = (typeof boardItems !== 'undefined' && Array.isArray(boardItems))
@@ -14608,12 +14619,13 @@ function _msgCardChip(cardId, message) {
     : st;
   const undec = c && ((c.log || '').indexOf('capture: worker prompt') !== -1) && st === 'todo';
   const lastCommit = c ? (((c.log || '').match(/commit ([0-9a-f]{7,12}) \u2014 [^\n]*/g) || []).pop() || '') : '';
-  return '<span class="msg-card-chip" onclick="event.stopPropagation();switchView(\'board\');setTimeout(() => openBoardDetail(\'' + escJs(cardId) + '\'), 250);" '
+  return '<button type="button" class="msg-card-chip" onclick="event.stopPropagation();_msgOpenCard(\'' + escJs(cardId) + '\');" '
+    + 'aria-label="Open task ' + esc(cardId) + (displaySt ? ', ' + esc(displaySt) : '') + '" '
     + 'title="' + esc(c ? (c.title || '') : 'card no longer on the board') + (lastCommit ? '\n' + esc(lastCommit) : '') + '" '
-    + 'style="cursor:pointer;font-size:0.68rem;border:1px solid ' + (c ? stC(st) : 'var(--border)') + ';border-radius:6px;padding:1px 7px;white-space:nowrap;'
+    + 'style="border-color:' + (c ? stC(st) : 'var(--border)') + ';'
     + 'color:' + (c ? stC(st) : 'var(--dim)') + ';">\u2192 ' + esc(cardId)
     + (c ? ' \u00B7 ' + esc(undec ? 'captured, not yet decomposed' : displaySt) : ' \u00B7 gone')
-    + (lastCommit ? ' \u00B7 \u2318' : '') + '</span>';
+    + (lastCommit ? ' \u00B7 \u2318' : '') + '</button>';
 }
 
 // Canonical message row. THREE surfaces fetch /api/history and each kept its own
@@ -27297,11 +27309,44 @@ function _bdConfigureGo(item) {
   };
 }
 
+function _bdAudit(kind, detail) {
+  try {
+    fetch(API + '/api/client-debug', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({ kind, ver: APP_VER }, detail || {})),
+    }).catch(() => {});
+  } catch (e) {}
+}
+
+const _bdArtifactAuditSeen = new Set();
+function _bdArtifactHref(target) {
+  try {
+    const parsed = new URL(String(target), window.location.href);
+    const loopback = parsed.hostname === 'localhost'
+      || parsed.hostname === '127.0.0.1'
+      || parsed.hostname === '[::1]';
+    if (loopback && parsed.port === '8824') {
+      const normalized = window.location.origin + parsed.pathname + parsed.search + parsed.hash;
+      if (!_bdArtifactAuditSeen.has(target)) {
+        _bdArtifactAuditSeen.add(target);
+        _bdAudit('artifact-link-normalized', {
+          verdict: 'same-server-origin-rewritten', measured: true, n_considered: 1,
+          original: String(target), normalized,
+        });
+      }
+      return normalized;
+    }
+  } catch (e) {}
+  return String(target);
+}
+
 function _bdArtifactRef(a) {
   const ref = String((a && a.ref) || '');
   const target = String((a && a.resolved_ref) || ref);
   if (/^https?:\/\//i.test(target)) {
-    return '<a href="' + esc(target) + '" target="_blank" rel="noopener noreferrer">' + esc(ref) + '</a>';
+    const href = _bdArtifactHref(target);
+    return '<a href="' + esc(href) + '" data-original-ref="' + esc(ref)
+      + '" target="_blank" rel="noopener noreferrer">' + esc(href === target ? ref : href) + '</a>';
   }
   const refPath = ref.replace(/#.*$/, '');
   const targetPath = target.replace(/#.*$/, '');
@@ -27455,9 +27500,11 @@ function _bdRenderMeta(item) {
       const key = String((a && a.ref) || '');
       if (key && !artifactSeen.has(key)) { artifactSeen.add(key); artifacts.push(a); }
     });
-  if (artifacts.length) {
-    html += '<section class="bd-card-section"><h4>Produced assets (' + artifacts.length + ')</h4>'
-      + artifacts.map(a => {
+  const retiredArtifacts = artifacts.filter(a => ['invalid', 'superseded'].includes(String((a && a.state) || '')));
+  const producedArtifacts = artifacts.filter(a => !['invalid', 'superseded'].includes(String((a && a.state) || '')));
+  if (producedArtifacts.length) {
+    html += '<section class="bd-card-section"><h4>Produced assets (' + producedArtifacts.length + ')</h4>'
+      + producedArtifacts.map(a => {
         const availability = a && a.availability || {};
         const availabilityText = availability.state === 'missing' ? ' · missing'
           : availability.state === 'available' ? ' · available'
@@ -27469,6 +27516,15 @@ function _bdRenderMeta(item) {
         + (a.description ? '<div style="color:var(--dim)">' + esc(a.description) + '</div>' : '') + '</div>';
       }).join('');
     html += '</section>';
+  }
+  if (retiredArtifacts.length) {
+    html += '<section class="bd-card-section bd-retired-artifacts"><h4>Retired artifacts ('
+      + retiredArtifacts.length + ')</h4>'
+      + retiredArtifacts.map(a => '<div class="board-detail-meta-row"><code>'
+        + esc(String((a && a.ref) || '')) + '</code> <span style="color:var(--dim)">· '
+        + esc(String((a && a.state) || 'retired')) + '</span>'
+        + (a && a.description ? '<div style="color:var(--dim)">' + esc(a.description) + '</div>' : '')
+        + '</div>').join('') + '</section>';
   }
 
   const activity = _bdWorkerActivity(item);
