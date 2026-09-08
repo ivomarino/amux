@@ -5904,12 +5904,15 @@ async fn reconcile_overlap(
             bs::get_issue(&conn, &input.card_id),
             bs::get_issue(&conn, &input.peer_card_id),
         ) {
-            (Ok(Some(own)), Ok(Some(_))) => own.session.unwrap_or_default() == input.session,
+            (Ok(Some(own)), Ok(Some(peer))) => (
+                own.session.unwrap_or_default() == input.session,
+                peer.session.unwrap_or_default() == input.peer_session,
+            ),
             (Ok(None), _) | (_, Ok(None)) => return not_found("card_id or peer_card_id"),
             (Err(e), _) | (_, Err(e)) => return internal(e),
         }
     };
-    if !ownership {
+    if !ownership.0 {
         tracing::warn!(
             marker = "board_overlap_owner_refused",
             card = %input.card_id,
@@ -5919,6 +5922,23 @@ async fn reconcile_overlap(
         return (
             StatusCode::FORBIDDEN,
             Json(json!({"error": "caller must own card_id; peer cards are linked but never claimed"})),
+        )
+            .into_response();
+    }
+    if !ownership.1 {
+        tracing::warn!(
+            marker = "board_overlap_peer_refused",
+            card = %input.card_id,
+            peer_card = %input.peer_card_id,
+            claimed_peer = %input.peer_session,
+            "board overlap reconciliation refused: peer card owner does not match peer_session"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "peer_session must match peer_card_id's current owner; reconciliation never fabricates a peer callback target",
+                "code": "board_overlap_peer_owner_mismatch",
+            })),
         )
             .into_response();
     }
@@ -6452,6 +6472,12 @@ mod overlap_reconciliation_tests {
                 "evidence": ["producer evidence"],
                 "assets": ["crates/amux-server/src/api/board.rs"]
             });
+        let mut mismatched_peer = payload.clone();
+        mismatched_peer["peer_session"] = json!("wrong-worker");
+        let (forbidden, rejected) = post(&app, "handoff-producer-0907", mismatched_peer).await;
+        assert_eq!(forbidden, StatusCode::FORBIDDEN);
+        assert_eq!(rejected["code"], "board_overlap_peer_owner_mismatch");
+
         let (status, reply) = post(&app, "handoff-producer-0907", payload.clone()).await;
         assert_eq!(
             status,
