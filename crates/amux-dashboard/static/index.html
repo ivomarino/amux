@@ -2722,7 +2722,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <div id="debug-panel" style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px;">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
         <div style="font-size:0.78rem;font-weight:600;">Connection</div>
-        <button class="btn" style="font-size:0.65rem;padding:2px 8px;" onclick="pingServer()">Ping</button>
+        <div style="display:flex;gap:4px;">
+          <button class="btn" style="font-size:0.65rem;padding:2px 8px;" onclick="pingServer()">Ping</button>
+          <button class="btn" style="font-size:0.65rem;padding:2px 8px;" onclick="location.href='/api/_clear_sw'" title="Unregister service workers, clear caches, and reload">Clear cache</button>
+        </div>
       </div>
       <div id="debug-info" style="font-size:0.7rem;font-family:monospace;color:var(--dim);line-height:1.6;"></div>
     </div>

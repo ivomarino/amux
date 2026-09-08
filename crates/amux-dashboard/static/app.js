@@ -3653,8 +3653,10 @@ function render() {
         ? '<div class="empty">Can\u2019t reach the server \u2014 ' + consecutiveFailures +
           ' failed attempt' + (consecutiveFailures === 1 ? '' : 's') + '.<br>' +
           '<span style="color:var(--dim);font-size:0.85rem;">This is a connection problem, not an ' +
-          'empty workspace. Workers may exist and be unreachable.</span></div>'
-        : '<div class="empty"><span class="loading-spinner"></span>Connecting to server…</div>';
+          'empty workspace. Workers may exist and be unreachable.</span><br>' +
+          '<a href="/api/_clear_sw" style="color:var(--accent);font-size:0.8rem;">Clear cache &amp; reload</a></div>'
+        : '<div class="empty"><span class="loading-spinner"></span>Connecting to server…<br>' +
+          '<a href="/api/_clear_sw" style="color:var(--dim);font-size:0.75rem;margin-top:8px;display:inline-block;">Stuck? Clear cache</a></div>';
     } else {
       el.innerHTML = '<div class="empty">No workers yet.<br>Tap <strong>+</strong> to create one.' +
         (!online ? '<br><span style="color:var(--yellow)">You\'re offline — workers created now will sync when connected.</span>' : '') + '</div>';
@@ -9101,7 +9103,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.836';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.837';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
