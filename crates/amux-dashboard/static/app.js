@@ -9192,7 +9192,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.846';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.847';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -30530,6 +30530,10 @@ function enablePollingFallback() {
 //      if we look stale, otherwise just kick a fetch.
 const _SSE_STALE_MS = 18000;     // declared zombie if no data this long
 const _SSE_REFRESH_MS = 4000;    // visibility-resume refresh threshold
+// Nothing at all from the server for this long means offline, however healthy
+// every other signal looks. Above _SSE_STALE_MS plus a reconnect and a poll
+// cycle, so only real silence reaches it.
+const _NO_CONTACT_MS = 35000;
 
 function _sseLooksStale() {
   // Fall back to page load when nothing has arrived yet (AC-275). Without this the
@@ -30611,6 +30615,32 @@ setInterval(() => {
   if (_sseFallback) return;
   if (window._peekEmbed) return;
   if (_sseLooksStale()) _forceSseReconnect('watchdog stale ' + Math.round((Date.now() - _lastDataTime)/1000) + 's');
+  // A HANG MUST EVENTUALLY COUNT AS A FAILURE.
+  //
+  // `consecutiveFailures` only moves when a fetch RETURNS a failure, and the
+  // offline latch needs 2 of them. A dead tunnel returns nothing at all: the
+  // request is accepted by the local stack and never answered, `navigator
+  // .onLine` stays true because the DEVICE still has a network, and the SSE
+  // reconnect above quietly fails the same way. So every input that could say
+  // "stale" reads healthy, and the badge sits on `Polling` — claiming a
+  // fallback that is fetching — while the last render stays on screen.
+  //
+  // Reported by Ethan 2026-09-08 over Tailscale: the client "just stores
+  // everything that's been cached and presents it as if it's new". Measured in
+  // e2e/tunnel-blackhole.spec.ts: with every /api/ request accepted and never
+  // answered and the open stream severed, the indicator read `Polling` for the
+  // full 48s window and never changed.
+  //
+  // Silence is the only evidence a hang produces, so latch on silence. This is
+  // deliberately generous — well past the 18s zombie threshold and a poll cycle
+  // behind it — so an ordinary slow response can never trip it.
+  if (online && (Date.now() - (_lastDataTime || _pageLoadTime)) > _NO_CONTACT_MS) {
+    setOnline(false);
+  }
+  // Repaint every tick. updateConnectionStatus ran on events, and a hung tunnel
+  // produces none of them, so a badge could go stale and keep saying whatever
+  // it last said.
+  updateConnectionStatus();
 }, 5000);
 
 if (window._peekEmbed) {
