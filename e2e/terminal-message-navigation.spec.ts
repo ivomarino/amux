@@ -270,7 +270,7 @@ test('an explicit empty navigation loads earlier output and lands on its message
   });
   await page.route('**/api/sessions/nav-probe/log?*', route => route.fulfill({
     status: 200,
-    headers: { 'Content-Type': 'text/plain', 'X-Log-Remaining': '0' },
+    headers: { 'Content-Type': 'text/plain', 'X-Log-Remaining': '0', 'X-Amux-Session': 'nav-probe' },
     body: '› older human request\nassistant response\n',
   }));
   await page.evaluate(() => {
@@ -284,6 +284,122 @@ test('an explicit empty navigation loads earlier output and lands on its message
   await expect.poll(() => beacons.filter(b => b.verdict === 'loaded-earlier').length).toBe(1);
   await expect.poll(() => beacons.filter(b => b.verdict === 'landed').length).toBe(1);
   await expect(page.locator('#toast')).not.toHaveClass(/visible/);
+});
+
+test('rapid worker switch and reconnect cannot cross output, draft, status, card, or earlier-log identity', async ({ page }) => {
+  const beacons: any[] = [];
+  await page.route('**/api/client-debug', async route => {
+    beacons.push(route.request().postDataJSON());
+    await route.fulfill({ json: { ok: true } });
+  });
+  await page.route('**/api/sessions/identity-a/peek?*', async route => {
+    await new Promise(resolve => setTimeout(resolve, 180));
+    await route.fulfill({ json: { name: 'identity-a', output: 'FOREIGN A LIVE OUTPUT', history: '' } });
+  });
+  await page.route('**/api/sessions/identity-b/peek?*', async route => {
+    await route.fulfill({ json: { name: 'identity-b', output: 'CURRENT B LIVE OUTPUT', history: '' } });
+  });
+  await page.route('**/api/sessions/identity-a/log?*', async route => {
+    await new Promise(resolve => setTimeout(resolve, 220));
+    await route.fulfill({
+      status: 200,
+      headers: { 'Content-Type': 'text/plain', 'X-Log-Remaining': '0', 'X-Amux-Session': 'identity-a' },
+      body: 'FOREIGN A EARLIER OUTPUT',
+    });
+  });
+
+  await page.evaluate(async () => {
+    const a = { name: 'identity-a', dir: '/tmp/a', running: true, status: 'active',
+      task_name: 'Foreign active task', task_board_id: 'A-1',
+      runtime_board: { measured: true, status: 'linked', card_id: 'A-1', card_count: 1 } };
+    const b = { name: 'identity-b', dir: '/tmp/b', running: true, status: 'active',
+      task_name: 'Selected active task', task_board_id: 'B-2',
+      runtime_board: { measured: true, status: 'linked', card_id: 'B-2', card_count: 1 } };
+    eval('sessions = [' + JSON.stringify(a) + ',' + JSON.stringify(b) + ']; boardItems = ['
+      + JSON.stringify({ id: 'A-1', title: 'Foreign active task', status: 'doing', session: 'identity-a', archived: false }) + ','
+      + JSON.stringify({ id: 'B-2', title: 'Selected active task', status: 'doing', session: 'identity-b', archived: false }) + '];');
+    (window as any)._draftSave('identity-a', 'FOREIGN A UNSENT DRAFT');
+    (window as any)._draftSave('identity-b', 'CURRENT B UNSENT DRAFT');
+    await eval(`_idb.set('peek_identity-a', {
+      output: 'FOREIGN A CACHED OUTPUT', history: '', time: Date.now(), offline: true
+    })`);
+    (window as any).openPeek('identity-a');
+    // Start an earlier page for A, then switch without waiting for either A
+    // response. This is the exact stale-response race from the live overlay.
+    (window as any)._peekLoadEarlier();
+    (window as any).openPeek('identity-b');
+  });
+
+  await expect(page.locator('#peek-title')).toHaveText('identity-b');
+  await expect(page.locator('#peek-cmd-input')).toHaveValue('CURRENT B UNSENT DRAFT');
+  await expect(page.locator('#peek-task-label')).toHaveText('Selected active task');
+  await expect(page.locator('#peek-body')).toContainText('CURRENT B LIVE OUTPUT');
+
+  // A reconnect creates a new generation even for the same worker. Old A and
+  // old-B callbacks must still be unable to paint into the reopened B overlay.
+  await page.evaluate(() => {
+    (window as any).closePeek();
+    (window as any).openPeek('identity-b');
+  });
+  await page.waitForTimeout(350);
+  await expect(page.locator('#peek-title')).toHaveText('identity-b');
+  await expect(page.locator('#peek-cmd-input')).toHaveValue('CURRENT B UNSENT DRAFT');
+  await expect(page.locator('#peek-task-label')).toHaveAttribute('data-worker', 'identity-b');
+  await expect(page.locator('#peek-task-label')).toHaveAttribute('data-card', 'B-2');
+  await expect(page.locator('#peek-body')).toContainText('CURRENT B LIVE OUTPUT');
+  await expect(page.locator('#peek-body')).not.toContainText('FOREIGN A');
+  expect(await page.evaluate(() => localStorage.getItem('amux_draft_identity-a'))).toContain('FOREIGN A UNSENT DRAFT');
+  expect(beacons.some(b => b.kind === 'peek-identity-discard')).toBe(true);
+
+  // A filtered worker card's click closure is the rendered worker+card pair,
+  // not whichever globals happen to be selected by click time.
+  const clicked = await page.evaluate(() => {
+    const host = document.createElement('div');
+    host.innerHTML = (window as any)._activeTaskLink('identity-b', 'B-2', 'Selected active task');
+    document.body.appendChild(host);
+    let opened = '';
+    (window as any)._openIssue = (id: string) => { opened = id; };
+    (host.querySelector('button') as HTMLButtonElement).click();
+    host.remove();
+    return opened;
+  });
+  expect(clicked).toBe('B-2');
+});
+
+test('one source message renders every durable task link and child opens exact detail', async ({ page }) => {
+  await page.route('**/api/board/TUBES-2501', route => route.fulfill({ json: {
+    id: 'TUBES-2501', title: 'Build offline serving-coverage planner and receipt verifier',
+    desc: 'child detail', status: 'doing', session: 'tubescience', archived: false,
+    deleted: null, gate: [], tags: [], log: '', due: '', due_time: '',
+  } }));
+  await page.evaluate(() => {
+    (window as any).closePeek();
+    eval('boardItems = [];');
+    const message = {
+      id: 46222, text: 'Decompose the TubeScience acceptance work', type: 'direct',
+      session: 'tubescience', ts: Date.now(), card_id: 'TUBES-2474',
+      card_title: 'TubeScience acceptance epic', card_status: 'backlog',
+      linked_cards: [
+        { id: 'TUBES-2474', title: 'TubeScience acceptance epic', status: 'backlog', archived: false },
+        { id: 'TUBES-2501', title: 'Build offline serving-coverage planner and receipt verifier', status: 'doing', archived: false },
+      ],
+    };
+    const host = document.createElement('div');
+    host.id = 'lineage-message-probe';
+    host.innerHTML = (window as any)._cmdHistItemHTML(message, {
+      sel: new Set(), key: () => 'MSG-46222', toggle: '_msgSelToggle', resend: '_msgResend',
+      searchId: 'msgs-search', rowClass: 'msg-row', target: () => 'tubescience',
+    });
+    document.body.appendChild(host);
+  });
+
+  await expect(page.getByRole('button', { name: 'Open task TUBES-2474, backlog' })).toHaveCount(1);
+  const child = page.getByRole('button', { name: 'Open task TUBES-2501, doing' });
+  await expect(child).toHaveCount(1);
+  await child.click();
+  await expect(page.locator('#board-detail-overlay')).toHaveClass(/active/);
+  await expect(page.locator('#bd-key')).toHaveText('TUBES-2501');
+  await expect(page.locator('#bd-title')).toHaveValue('Build offline serving-coverage planner and receipt verifier');
 });
 
 

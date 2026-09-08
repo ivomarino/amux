@@ -163,6 +163,13 @@ pub struct ContextFragment {
     /// a snapshot explains itself (ethos rule 4).
     pub source: String,
     pub content: String,
+    /// Instruction/data trust is part of the snapshot identity. Imported or
+    /// retrieved content defaults to untrusted when old rows are read.
+    #[serde(default)]
+    pub trust: crate::policy::TrustLevel,
+    /// Human-readable origin (`human`, worker id, import URI, harness).
+    #[serde(default)]
+    pub provenance: String,
 }
 
 /// Exactly what a worker received on assignment (Invariant 27). Immutable
@@ -206,6 +213,13 @@ impl ContextSnapshot {
             hasher.update(f.source.as_bytes());
             hasher.update((f.content.len() as u64).to_be_bytes());
             hasher.update(f.content.as_bytes());
+            let trust = match f.trust {
+                crate::policy::TrustLevel::Trusted => 1u8,
+                crate::policy::TrustLevel::Untrusted => 0u8,
+            };
+            hasher.update([trust]);
+            hasher.update((f.provenance.len() as u64).to_be_bytes());
+            hasher.update(f.provenance.as_bytes());
         }
         let content_hash = hex::encode(hasher.finalize());
 
@@ -234,6 +248,8 @@ mod tests {
             priority,
             source: source.into(),
             content: content.into(),
+            trust: crate::policy::TrustLevel::Trusted,
+            provenance: "test".into(),
         }
     }
 
@@ -381,15 +397,15 @@ mod tests {
     #[test]
     fn hash_is_stable_against_known_fixture() {
         // Pinned hex: sha256 over the canonical encoding (u32-BE priority,
-        // u64-BE length-prefixed source and content, fragments in sorted
-        // order) of `fixture()`. If this test breaks, the ENCODING changed —
+        // u64-BE length-prefixed source/content/provenance plus trust byte,
+        // fragments in sorted order) of `fixture()`. If this test breaks, the ENCODING changed —
         // which silently invalidates every stored snapshot hash and every
         // cache built on them. That must be a deliberate, migrated change,
         // never a drive-by.
         let snap = ContextSnapshot::build(fixture());
         assert_eq!(
             snap.content_hash,
-            "303ada0404fd02216c8e85c5286d81194933917d2aeffc0012a2ee895364bffa"
+            "3f4c742528261cedfd91539e54d9361d1768a85d85bd61a3db9c0cd6c9230a2d"
         );
     }
 

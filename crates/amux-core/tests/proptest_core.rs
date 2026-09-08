@@ -146,7 +146,11 @@ proptest! {
     fn context_snapshot_hash_is_permutation_invariant(
         mut frags in proptest::collection::vec(
             (0u32..5, "[a-c]{1,4}", "[a-d]{0,6}").prop_map(|(p, s, c)| ContextFragment {
-                priority: p, source: s, content: c,
+                priority: p,
+                source: s,
+                content: c,
+                trust: amux_core::policy::TrustLevel::Trusted,
+                provenance: "proptest".into(),
             }),
             0..12,
         ),

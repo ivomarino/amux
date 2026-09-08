@@ -8,6 +8,7 @@
 
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct VerificationRow {
     pub id: String,
     pub task_id: String,
@@ -27,6 +28,9 @@ pub struct VerificationRow {
     pub actor: String,
     /// Unix seconds.
     pub created_at: i64,
+    pub criteria_version: u32,
+    pub harness_version: Option<String>,
+    pub duration_ms: u64,
 }
 
 fn row_to_verification(r: &Row<'_>) -> rusqlite::Result<VerificationRow> {
@@ -41,17 +45,21 @@ fn row_to_verification(r: &Row<'_>) -> rusqlite::Result<VerificationRow> {
         run_detail: r.get(7)?,
         actor: r.get(8)?,
         created_at: r.get(9)?,
+        criteria_version: r.get::<_, i64>(10)? as u32,
+        harness_version: r.get(11)?,
+        duration_ms: r.get::<_, i64>(12)? as u64,
     })
 }
 
 const COLS: &str = "id, task_id, verifier, criteria, evidence, verdict, reason, \
-                    run_detail, actor, created_at";
+                    run_detail, actor, created_at, criteria_version, harness_version, duration_ms";
 
 pub fn insert(conn: &Connection, row: &VerificationRow) -> rusqlite::Result<usize> {
     conn.execute(
         "INSERT INTO _amux_verifications \
-             (id, task_id, verifier, criteria, evidence, verdict, reason, run_detail, actor, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             (id, task_id, verifier, criteria, evidence, verdict, reason, run_detail, actor, created_at,
+              criteria_version, harness_version, duration_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             row.id,
             row.task_id,
@@ -63,6 +71,9 @@ pub fn insert(conn: &Connection, row: &VerificationRow) -> rusqlite::Result<usiz
             row.run_detail,
             row.actor,
             row.created_at,
+            row.criteria_version,
+            row.harness_version,
+            row.duration_ms,
         ],
     )
 }

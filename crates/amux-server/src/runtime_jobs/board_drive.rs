@@ -619,6 +619,10 @@ impl LaneTrace {
         self.open_cards = open;
         self
     }
+    fn with_card(mut self, card: &str) -> Self {
+        self.card = Some(card.to_string());
+        self
+    }
 }
 
 /// One sweep's worth of traces.
@@ -655,6 +659,10 @@ pub struct DriveReport {
     /// a terminal state. Without this, the original Messages chip remains
     /// permanently non-terminal after all of the actual work has finished.
     pub completed_epics: usize,
+    /// `doing` cards moved back to `backlog` because an explicit blocker or
+    /// unfinished dependency means no worker can honestly be working them.
+    /// Published so a zero can be distinguished from a sweep that never ran.
+    pub normalized_blocked_doing: usize,
     pub lanes: Vec<LaneTrace>,
 }
 
@@ -723,6 +731,18 @@ pub trait Fleet: Send + Sync {
         self.deliver(lane, text).await;
         Ok(())
     }
+    /// Queue one recovery delivery for one worker generation. The stable id is
+    /// the crash boundary: an implementation with a durable queue reports an
+    /// existing commitment instead of enqueueing the same resume again.
+    async fn deliver_resume(
+        &self,
+        lane: &str,
+        text: &str,
+        _delivery_id: &str,
+    ) -> Result<ResumeDelivery, String> {
+        self.deliver_work(lane, text).await?;
+        Ok(ResumeDelivery::Queued)
+    }
 
     /// Deliver a message whose text ASSERTS SOMETHING ABOUT A CARD (AMUX-3659).
     ///
@@ -745,6 +765,8 @@ pub trait Fleet: Send + Sync {
 /// gate, `steer_enqueue` for delivery.
 pub struct LiveFleet {
     pub state: AppState,
+    // One snapshot for this entire drive pass, never one full load per lane.
+    signals: Option<crate::api::sessions_legacy::FleetSignals>,
 }
 
 impl Fleet for LiveFleet {
@@ -794,7 +816,15 @@ impl Fleet for LiveFleet {
         crate::api::session_verbs::is_running(lane).await
     }
     async fn at_boundary(&self, lane: &str) -> bool {
-        crate::api::session_verbs::steer_lane_at_boundary(&self.state, lane).await
+        let status = self.signals.as_ref().and_then(|signals| signals.turn_boundary_status(lane));
+        if let Some(signals) = &self.signals {
+            let (_, explain) = signals.derive_status_explain(lane, signals.agent_running(&format!("amux-{lane}")));
+            tracing::debug!(target: "amux::board_drive", session = lane,
+                measured = status.is_some(), n_considered = 1,
+                verdict = %explain["decided_by"], at_boundary = status.as_deref() == Some("idle"),
+                "board-drive boundary uses Workers structured truth");
+        }
+        status.as_deref() == Some("idle")
     }
     async fn start_for_dispatch(&self, lane: &str) -> Result<(), String> {
         crate::api::session_verbs::start_for_board_dispatch(&self.state, lane).await
@@ -804,6 +834,39 @@ impl Fleet for LiveFleet {
     }
     async fn deliver_work(&self, lane: &str, text: &str) -> Result<(), String> {
         self.enqueue_work(lane, text).await
+    }
+    async fn deliver_resume(
+        &self,
+        lane: &str,
+        text: &str,
+        delivery_id: &str,
+    ) -> Result<ResumeDelivery, String> {
+        if !crate::api::session_verbs::is_running(lane).await {
+            return Err("worker vanished before work delivery could be queued".into());
+        }
+        let result = crate::api::session_verbs::steer_enqueue_idempotent_report(
+            &self.state,
+            lane,
+            text,
+            GUARD,
+            "",
+            delivery_id,
+        )
+        .await
+        .map_err(str::to_string)?;
+        let disposition = match result.disposition {
+            crate::api::session_verbs::StableEnqueueDisposition::New => {
+                self.record_prompt(lane, text).await;
+                ResumeDelivery::Queued
+            }
+            crate::api::session_verbs::StableEnqueueDisposition::AlreadyQueued => {
+                ResumeDelivery::AlreadyQueued
+            }
+            crate::api::session_verbs::StableEnqueueDisposition::AlreadyDelivered => {
+                ResumeDelivery::AlreadyDelivered
+            }
+        };
+        Ok(disposition)
     }
     async fn deliver_about(&self, lane: &str, text: &str, card: &str, rev: i64) {
         let _ = crate::api::session_verbs::steer_enqueue_precond(
@@ -1494,6 +1557,19 @@ pub(crate) fn deps_blocking(conn: &Connection, row: &bs::IssueRow) -> Vec<String
         .cloned().collect()
 }
 
+/// Can this `doing` row honestly consume WIP or be advertised as current?
+///
+/// A lifecycle label cannot override the card's blocking dimensions. Keeping
+/// this predicate shared by board-drive and `/api/sessions` prevents the old
+/// split where pickup correctly skipped an unfinished dependency while the
+/// worker view still highlighted the blocked card as active work.
+pub(crate) fn doing_is_unblocked(conn: &Connection, row: &bs::IssueRow) -> bool {
+    row.blocked_on
+        .as_deref()
+        .is_none_or(|reason| reason.trim().is_empty())
+        && deps_blocking(conn, row).is_empty()
+}
+
 /// For a set of blocking dep ids, return the subset that are `backlog` cards
 /// owned by `session`. These are self-resolvable: the lane can promote them
 /// to `todo` itself without any human or cross-lane action.
@@ -1589,26 +1665,37 @@ pub const DISPATCH_BACKLOG_KEY: &str = "AMUX_DISPATCH_BACKLOG_WHEN_IDLE";
 /// Same resolver shape as the gates above, so the override ladder is one thing:
 /// process env wins (the operator switch in `~/.amux/server.env`), then the
 /// worker > group > global scope files.
-pub fn dispatch_backlog_when_idle(session: &str) -> bool {
+pub(crate) fn dispatch_backlog_when_idle_in(
+    home: &std::path::Path,
+    session: &str,
+    process_value: Option<&str>,
+) -> bool {
     fn is_on(v: &str) -> bool {
         matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes")
     }
-    if let Ok(v) = std::env::var(DISPATCH_BACKLOG_KEY) {
-        if !v.trim().is_empty() {
-            return is_on(&v);
-        }
+    if let Some(v) = process_value.filter(|v| !v.trim().is_empty()) {
+        return is_on(v);
     }
     if session.is_empty() {
         return false;
     }
     crate::api::session_verbs::scoped_setting_in(
-        &crate::api::session_verbs::home(),
+        home,
         session,
         DISPATCH_BACKLOG_KEY,
     )
     .as_deref()
     .map(is_on)
     .unwrap_or(true)
+}
+
+pub fn dispatch_backlog_when_idle(session: &str) -> bool {
+    let process_value = std::env::var(DISPATCH_BACKLOG_KEY).ok();
+    dispatch_backlog_when_idle_in(
+        &crate::api::session_verbs::home(),
+        session,
+        process_value.as_deref(),
+    )
 }
 
 /// Backlog cards of a workable TYPE, before the parked/claimed exclusions.
@@ -1892,6 +1979,10 @@ fn still_promotable(conn: &Connection, row: &bs::IssueRow, arm: PromoteArm) -> b
         || row.owner_type != "agent"
         || row.archived != 0
         || is_dormant_type(&row.item_type)
+        || row
+            .blocked_on
+            .as_deref()
+            .is_some_and(|reason| !reason.trim().is_empty())
     {
         return false;
     }
@@ -1994,6 +2085,13 @@ fn backlog_due_promotions(conn: &Connection) -> (Vec<String>, usize) {
         if r.owner_type != "agent" || is_dormant_type(&r.item_type) {
             continue;
         }
+        if r
+            .blocked_on
+            .as_deref()
+            .is_some_and(|reason| !reason.trim().is_empty())
+        {
+            continue;
+        }
         if !revisit_due_now(&r) {
             continue;
         }
@@ -2043,6 +2141,13 @@ fn backlog_dep_promotions(conn: &Connection) -> (Vec<(String, Vec<String>)>, usi
     let mut held_on_trigger = 0usize;
     for r in rows {
         if r.owner_type != "agent" || is_dormant_type(&r.item_type) {
+            continue;
+        }
+        if r
+            .blocked_on
+            .as_deref()
+            .is_some_and(|reason| !reason.trim().is_empty())
+        {
             continue;
         }
         // Deps must be present and all terminal to be a candidate at all
@@ -2530,12 +2635,38 @@ pub enum Pickup {
 enum Resume {
     /// Exactly one still-eligible Doing card has a causal `task.claimed`
     /// marker for this lane. Rehydrate its normal board summary and resume it.
-    Claim { card: String, prompt: String },
+    Claim {
+        card: String,
+        prompt: String,
+        delivery_id: String,
+        cause: &'static str,
+    },
+    /// The exact claim is still the runtime truth, but this worker generation
+    /// already owns or has received it. Preserve attribution without sending
+    /// another prompt at every idle sweep.
+    Current { card: String, delivery_id: String, cause: &'static str },
     /// More than one distinct exact claim still survives. Naming either one
     /// would make the driver invent ownership, so leave both visible instead.
     Conflicting { cards: Vec<String> },
     /// There is no surviving exact claim. Ordinary advance/pickup may decide.
     None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResumeDelivery {
+    Queued,
+    AlreadyQueued,
+    AlreadyDelivered,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResumeEventOrder {
+    ts: f64,
+    id: i64,
+}
+
+fn event_after(left: ResumeEventOrder, right: ResumeEventOrder) -> bool {
+    left.ts.total_cmp(&right.ts).then(left.id.cmp(&right.id)).is_gt()
 }
 
 /// Return whether a still-Doing row can be resumed by its exact causal claim.
@@ -2556,19 +2687,47 @@ fn resumable_claim_row(conn: &Connection, session: &str, row: &bs::IssueRow, now
 }
 
 /// Select the one exact `task.claimed` identity which remains live on the
-/// board. The marker timeline can contain repeats for the same card; only
-/// distinct surviving card ids are ambiguous.
-fn select_resume(conn: &Connection, session: &str, now: f64) -> Resume {
-    let claimed_markers: Vec<(f64, Option<String>, bool, String)> = conn
+/// board, and distinguish durable ownership from a fresh recovery delivery.
+///
+/// A surviving claim is runtime TRUTH; it is not by itself permission to send
+/// again. A running worker receives recovery only when a later
+/// `session.started` proves its process generation changed, or when the prior
+/// recovery attempt explicitly failed. A stopped worker may be woken from any
+/// one exact live claim; the post-start selection then gets a new
+/// `session.started` generation from the canonical launcher.
+pub(crate) fn exact_resume_card(conn: &Connection, session: &str) -> Result<Option<String>, String> {
+    match select_resume(conn, session, now_f64(), false) {
+        Resume::Claim { card, .. } | Resume::Current { card, .. } => Ok(Some(card)),
+        Resume::None => Ok(None),
+        Resume::Conflicting { cards } => Err(format!("conflicting live task claims: {}", cards.join(", "))),
+    }
+}
+
+pub(crate) fn current_resume_delivery_id(conn: &Connection, session: &str) -> Option<String> {
+    match select_resume(conn, session, now_f64(), false) {
+        Resume::Claim { delivery_id, .. } | Resume::Current { delivery_id, .. } => Some(delivery_id),
+        _ => None,
+    }
+}
+
+pub(crate) fn resume_delivery_id(session: &str, card: Option<&str>, generation: i64) -> String {
+    format!("board-drive-resume:{session}:{}:{generation}", card.unwrap_or("scoped"))
+}
+
+fn select_resume(conn: &Connection, session: &str, now: f64, stopped: bool) -> Resume {
+    let events: Vec<(ResumeEventOrder, String, Option<String>)> = conn
         .prepare(
-            "SELECT data, ts FROM session_events WHERE session=?1 AND type='task.claimed' \
+            "SELECT id, ts, type, data FROM session_events WHERE session=?1 \
+             AND type IN ('task.claimed','task.resumed','task.resume_failed','session.started') \
              ORDER BY ts ASC, id ASC",
         )
         .and_then(|mut statement| {
             statement
                 .query_map(rusqlite::params![session], |row| {
-                    let data: Option<String> = row.get(0)?;
+                    let id: i64 = row.get(0)?;
                     let ts: f64 = row.get(1)?;
+                    let kind: String = row.get(2)?;
+                    let data: Option<String> = row.get(3)?;
                     let card = data
                         .as_deref()
                         .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
@@ -2579,11 +2738,17 @@ fn select_resume(conn: &Connection, session: &str, now: f64) -> Resume {
                                 .filter(|id| !id.is_empty())
                                 .map(str::to_string)
                         });
-                    Ok((ts, card, false, "task.claimed".to_string()))
+                    Ok((ResumeEventOrder { ts, id }, kind, card))
                 })
-                .map(|rows| rows.flatten().collect())
+                .map(|rows| rows.flatten().collect::<Vec<_>>())
         })
         .unwrap_or_default();
+
+    let claimed_markers: Vec<(f64, Option<String>, bool, String)> = events
+        .iter()
+        .filter(|(_, kind, _)| kind == "task.claimed")
+        .map(|(order, _, card)| (order.ts, card.clone(), false, "task.claimed".to_string()))
+        .collect();
 
     let mut resumable_doing = BTreeMap::new();
     for card in claimed_markers.iter().filter_map(|marker| marker.1.as_deref()) {
@@ -2605,7 +2770,67 @@ fn select_resume(conn: &Connection, session: &str, now: f64) -> Resume {
             let Some(row) = bs::get_issue(conn, &card).ok().flatten() else {
                 return Resume::None;
             };
-            Resume::Claim { prompt: resume_prompt(conn, session, &row), card }
+            let latest = |kind: &str, matching_card: bool| {
+                events
+                    .iter()
+                    .filter(|(_, event_kind, event_card)| {
+                        event_kind == kind
+                            && (!matching_card || event_card.as_deref() == Some(card.as_str()))
+                    })
+                    .map(|(order, _, _)| *order)
+                    .max_by(|left, right| {
+                        left.ts.total_cmp(&right.ts).then(left.id.cmp(&right.id))
+                    })
+            };
+            let Some(claimed) = latest("task.claimed", true) else {
+                return Resume::None;
+            };
+            let started = latest("session.started", false);
+            let resumed = latest("task.resumed", true);
+            let failed = latest("task.resume_failed", true);
+            let generation = started
+                .filter(|start| event_after(*start, claimed))
+                .unwrap_or(claimed);
+            let delivery_id = resume_delivery_id(session, Some(&card), generation.id);
+            let failed_after_success = failed.is_some_and(|failure| {
+                resumed.is_none_or(|success| event_after(failure, success))
+            });
+            let restarted_after_claim = started.is_some_and(|start| event_after(start, claimed));
+            let resumed_this_generation = resumed.is_some_and(|success| {
+                !event_after(generation, success)
+            });
+            if stopped {
+                Resume::Claim {
+                    prompt: resume_prompt(conn, session, &row),
+                    card,
+                    delivery_id,
+                    cause: "stopped-worker-exact-claim",
+                }
+            } else if failed_after_success {
+                Resume::Claim {
+                    prompt: resume_prompt(conn, session, &row),
+                    card,
+                    delivery_id,
+                    cause: "retry-after-delivery-failure",
+                }
+            } else if restarted_after_claim && !resumed_this_generation {
+                Resume::Claim {
+                    prompt: resume_prompt(conn, session, &row),
+                    card,
+                    delivery_id,
+                    cause: "worker-generation-restarted",
+                }
+            } else {
+                Resume::Current {
+                    card,
+                    delivery_id,
+                    cause: if resumed_this_generation {
+                        "recovery-already-committed-this-generation"
+                    } else {
+                        "claim-already-belongs-to-running-generation"
+                    },
+                }
+            }
         }
         _ => Resume::Conflicting { cards: live.into_iter().collect() },
     }
@@ -2785,15 +3010,24 @@ pub fn select_pickup_with(
             "SELECT id FROM issues WHERE session=?1 AND status='doing' AND deleted IS NULL \
              AND COALESCE(archived,0)=0 AND COALESCE(type,'') NOT IN ('tripwire','watch','epic') \
              AND NOT (creator='amux' AND substr(COALESCE(\"desc\",''), 1, 11) = '**Prompt:**') \
+             AND COALESCE(blocked_on,'') = '' \
              AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=issues.id \
                              AND lower(t.tag) LIKE 'needs:you%') \
              ORDER BY id",
         )
         .and_then(|mut st| {
             st.query_map(rusqlite::params![session], |r| r.get::<_, String>(0))
-                .map(|rows| rows.flatten().collect())
+                .map(|rows| rows.flatten().collect::<Vec<_>>())
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| {
+            bs::get_issue(conn, id)
+                .ok()
+                .flatten()
+                .is_some_and(|row| doing_is_unblocked(conn, &row))
+        })
+        .collect();
     if holding.len() as i64 >= cap {
         // AT THE CAP IS NOT A REASON TO LEAVE THE QUEUE BROKEN (AMUX-4040).
         // This promotion claims nothing and takes no slot; skipping it is what
@@ -3924,6 +4158,9 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
 /// the stale-delivery guard; only the verb makes it clear this is a recovery,
 /// never a second claim.
 fn resume_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String {
+    if let Some(prompt) = crate::api::session_verbs::generation_resume_prompt(conn, session, &row.id) {
+        return prompt;
+    }
     pickup_prompt(conn, session, row).replacen(
         " — work it now.",
         " — resume this still-owned task now.",
@@ -4937,6 +5174,168 @@ fn needsyou_renag_text(
 // The tick
 // ---------------------------------------------------------------------------
 
+/// Park every blocked `doing` card before WIP, resume, or current-card truth is
+/// evaluated.
+///
+/// `blocked_on` and `depends_on` used to be selection-only fields: pickup would
+/// correctly refuse the card, but its stale `doing` label still consumed WIP
+/// and `/api/sessions` advertised it as the worker's current task. TubeScience's
+/// TUBES-2459 was the live specimen. The repair is a race-safe lifecycle write,
+/// not a display exemption: `backlog` is the durable state for work that cannot
+/// run, and the existing dependency/revisit machinery is what brings it back.
+/// Isolated workers remain outside board automation entirely.
+async fn normalize_blocked_doing(state: &AppState) -> usize {
+    let candidates: Vec<String> = match state.store.read() {
+        Ok(conn) => bs::list_issues(
+            &conn,
+            &["doing".to_string()],
+            &[],
+            bs::ArchivedFilter::ActiveOnly,
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|row| {
+            row.owner_type == "agent"
+                && !is_dormant_type(&row.item_type)
+                && row
+                    .session
+                    .as_deref()
+                    .is_some_and(|lane| !crate::api::session_verbs::session_is_isolated(lane))
+                && !doing_is_unblocked(&conn, row)
+        })
+        .map(|row| row.id)
+        .collect(),
+        Err(error) => {
+            tracing::warn!(
+                target: "amux::board_drive",
+                %error,
+                measured = false,
+                n_considered = 0,
+                verdict = "blocked_doing_scan_unmeasured",
+                "board_drive: could not scan for blocked Doing cards"
+            );
+            return 0;
+        }
+    };
+
+    let mut normalized = 0usize;
+    for card in candidates {
+        let card_w = card.clone();
+        let reply = state
+            .store
+            .write_async(move |conn| {
+                let Some(row) = bs::get_issue(conn, &card_w)? else {
+                    return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+                };
+                if row.status != "doing"
+                    || row.owner_type != "agent"
+                    || row.archived != 0
+                    || is_dormant_type(&row.item_type)
+                    || doing_is_unblocked(conn, &row)
+                {
+                    return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+                }
+                let lane = row.session.clone().unwrap_or_default();
+                if lane.is_empty() || crate::api::session_verbs::session_is_isolated(&lane) {
+                    return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+                }
+                let blocking = deps_blocking(conn, &row);
+                let blocked_on = row
+                    .blocked_on
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|reason| !reason.is_empty())
+                    .unwrap_or("")
+                    .to_string();
+                let reason = if !blocked_on.is_empty() && !blocking.is_empty() {
+                    format!("blocked_on={blocked_on}; unfinished depends_on={}", blocking.join(","))
+                } else if !blocked_on.is_empty() {
+                    format!("blocked_on={blocked_on}")
+                } else {
+                    format!("unfinished depends_on={}", blocking.join(","))
+                };
+                let opts = crate::db::advance::AdvanceOpts {
+                    expected_from: Some("doing".into()),
+                    force: true,
+                    skip_continuation: true,
+                    skip_todo_wip: true,
+                    log_line: Some(format!(
+                        "Auto-parked from Doing: {reason}; blocked work cannot consume WIP"
+                    )),
+                    ..Default::default()
+                };
+                match crate::db::advance::advance(
+                    conn,
+                    &card_w,
+                    "backlog",
+                    "board_drive",
+                    &opts,
+                )? {
+                    Ok(outcome) => {
+                        conn.execute(
+                            "INSERT INTO session_events (ts,session,type,data,source) \
+                             VALUES (?1,?2,'task.blocked_normalized',?3,'board-drive')",
+                            rusqlite::params![
+                                now_f64(),
+                                lane,
+                                json!({
+                                    "issue": card_w,
+                                    "from": "doing",
+                                    "to": "backlog",
+                                    "reason": reason,
+                                    "blocking": blocking,
+                                    "blocked_on": blocked_on,
+                                    "measured": true,
+                                    "n_considered": 1,
+                                    "verdict": "blocked_doing_parked"
+                                })
+                                .to_string()
+                            ],
+                        )?;
+                        Ok(crate::db::WriteOutcome { applied: true, events: outcome.events })
+                    }
+                    Err(refusal) => {
+                        tracing::warn!(
+                            target: "amux::board_drive",
+                            card = %card_w,
+                            ?refusal,
+                            measured = true,
+                            n_considered = 1,
+                            verdict = "blocked_doing_normalization_refused",
+                            "board_drive: transition engine refused blocked Doing normalization"
+                        );
+                        Ok(crate::db::WriteOutcome { applied: false, events: vec![] })
+                    }
+                }
+            })
+            .await;
+        match reply {
+            Ok(result) if result.applied => {
+                normalized += 1;
+                tracing::warn!(
+                    target: "amux::board_drive",
+                    %card,
+                    measured = true,
+                    n_considered = 1,
+                    verdict = "blocked_doing_parked",
+                    "board_drive: blocked Doing card normalized to backlog before WIP selection"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                target: "amux::board_drive",
+                %card,
+                %error,
+                measured = false,
+                n_considered = 1,
+                verdict = "blocked_doing_normalization_write_failed",
+                "board_drive: blocked Doing normalization could not commit"
+            ),
+        }
+    }
+    normalized
+}
+
 /// One sweep over the fleet. ADVANCE BEFORE PICKUP, the same order and the same
 /// two calls Python's idle edge used (py:14389): a lane holding a doing/review
 /// card cannot be helped by pickup — WIP-1 forbids a second card — so a
@@ -4948,6 +5347,9 @@ pub async fn drive_tick<F: Fleet>(state: &AppState, fleet: &F) -> DriveReport {
         started_at: now_f64(),
         ..Default::default()
     };
+    // A blocked card cannot be current Doing state. Normalize first so every
+    // later predicate in this tick reads the same durable lifecycle truth.
+    report.normalized_blocked_doing = normalize_blocked_doing(state).await;
     // Complete root epics before dispatch so the Messages chip and the board
     // agree that a command is finished as soon as all of its leaves are.
     report.completed_epics = complete_finished_epics(state).await;
@@ -5025,7 +5427,10 @@ pub async fn drive_tick<F: Fleet>(state: &AppState, fleet: &F) -> DriveReport {
 /// fleet membership, isolation, configuration, liveness and boundary gates as
 /// the periodic sweep; the sweep remains the backstop.
 pub async fn drive_session(state: &AppState, lane: &str) -> LaneTrace {
-    let fleet = LiveFleet { state: state.clone() };
+    let fleet = LiveFleet {
+        state: state.clone(),
+        signals: crate::api::session_verbs::boundary_signals(state, None).await,
+    };
     if !fleet.lanes().iter().any(|candidate| candidate == lane) {
         let trace = if crate::api::session_verbs::session_is_isolated(lane) {
             LaneTrace::skip(lane, "isolated", "isolated workers never receive board automation")
@@ -5035,6 +5440,7 @@ pub async fn drive_session(state: &AppState, lane: &str) -> LaneTrace {
         publish_lane(trace.clone());
         return trace;
     }
+    let _ = normalize_blocked_doing(state).await;
     let _ = complete_finished_epics(state).await;
     let _ = promote_ready_backlog(state).await;
     let _ = promote_due_backlog(state).await;
@@ -5085,9 +5491,10 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
     // work is not a second WIP claim and must not be hidden by the WIP cap.
     let woke_for_dispatch = if !fleet.is_running(lane).await {
         let preflight = match state.store.read() {
-            Ok(conn) => match select_resume(&conn, lane, now_f64()) {
+            Ok(conn) => match select_resume(&conn, lane, now_f64(), true) {
                 Resume::Claim { .. } => Ok(true),
                 Resume::Conflicting { cards } => Err(cards),
+                Resume::Current { .. } => Ok(true),
                 Resume::None => Ok(matches!(
                     select_pickup(&conn, lane, now_f64()),
                     Pickup::Claim { .. } | Pickup::DrainBacklog { .. }
@@ -5154,12 +5561,13 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
         // that used to deadlock.
         let detail = match crate::api::session_verbs::lane_report(state, lane) {
             Some(r) => format!(
-                "lane is not at a turn boundary (self-report `{}` {:.0}s old, {})",
+                "lane is not at a turn boundary (self-report `{}` {:.0}s old, {}, subagents_live={:?})",
                 r.state,
                 r.age_s,
-                if r.applies { "authoritative" } else { "REFUSED as stale — pane decided" }
+                if r.applies { "authoritative" } else { "REFUSED as stale — structured FleetSignals decided" },
+                r.subagents_live
             ),
-            None => "lane is not at a turn boundary (no self-report; the pane decided)".into(),
+            None => "lane is not at a turn boundary (no self-report; structured FleetSignals decided)".into(),
         };
         return LaneTrace::skip(lane, "mid-turn", detail).with_counts(eligible, open);
     }
@@ -5170,27 +5578,42 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
         return LaneTrace::skip(lane, "store-unavailable", "could not open a read connection")
             .with_counts(eligible, open);
     };
-    let resume = select_resume(&conn, lane, now);
+    let resume = select_resume(&conn, lane, now, woke_for_dispatch);
+    drop(conn);
+    let mut current_claim = None;
     if !matches!(&resume, Resume::None) {
-        drop(conn);
         match resume {
-            Resume::Claim { card, prompt } => match fleet.deliver_work(lane, &prompt).await {
-                Ok(()) => {
-                    crate::api::session_verbs::emit_event(
-                        state,
-                        lane,
-                        "task.resumed",
-                        Some(json!({"issue": &card, "measured": true, "n_considered": 1,
-                            "verdict": "exact_live_claim_resumed"})),
-                        None,
-                        "board-drive",
-                    )
-                    .await;
-                    tracing::info!(target: "amux::board_drive", session = lane, %card,
-                        measured = true, n_considered = 1, verdict = "exact_live_claim_resumed",
-                        "board_drive: rehydrated and resumed exact live task claim");
-                    return LaneTrace::acted(lane, "resumed", &card, "rehydrated exact live claim and queued resume")
+            Resume::Claim { card, prompt, delivery_id, cause } => {
+                match fleet.deliver_resume(lane, &prompt, &delivery_id).await {
+                Ok(disposition) => {
+                    crate::api::session_verbs::record_resume_accepted(
+                        state, lane, Some(&card), &delivery_id, cause,
+                    ).await;
+                    if disposition == ResumeDelivery::Queued {
+                        tracing::info!(target: "amux::board_drive", session = lane, %card,
+                            %delivery_id, cause, measured = true, n_considered = 1,
+                            verdict = "exact_live_claim_resumed",
+                            "board_drive: rehydrated and resumed exact live task claim once for this worker generation");
+                        return LaneTrace::acted(
+                            lane,
+                            "resumed",
+                            &card,
+                            format!("queued one recovery delivery for {cause} ({delivery_id})"),
+                        )
                         .with_counts(eligible, open);
+                    }
+                    tracing::warn!(target: "amux::board_drive", session = lane, %card,
+                        %delivery_id, cause, delivery = ?disposition,
+                        measured = true, n_considered = 1,
+                        verdict = "resume_receipt_recovered_without_redelivery",
+                        "board_drive: stable recovery delivery already existed; restored its causal receipt without re-steering the owner");
+                    return LaneTrace::skip(
+                        lane,
+                        "resume-commit-recovered",
+                        format!("{card} recovery {delivery_id} was already {disposition:?}; receipt restored without another delivery"),
+                    )
+                    .with_card(&card)
+                    .with_counts(eligible, open);
                 }
                 Err(error) => {
                     crate::api::session_verbs::emit_event(
@@ -5198,12 +5621,14 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                         lane,
                         "task.resume_failed",
                         Some(json!({"issue": &card, "error": &error, "measured": true,
-                            "n_considered": 1, "verdict": "resume_delivery_failed"})),
+                            "n_considered": 1, "verdict": "resume_delivery_failed",
+                            "delivery_id": &delivery_id, "cause": cause})),
                         None,
                         "board-drive",
                     )
                     .await;
                     tracing::warn!(target: "amux::board_drive", session = lane, %card, %error,
+                        %delivery_id, cause,
                         measured = true, n_considered = 1, verdict = "resume_delivery_failed",
                         "board_drive: exact live claim remains Doing after resume delivery refusal; retry is visible next tick");
                     return LaneTrace::skip(
@@ -5213,7 +5638,28 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                     )
                     .with_counts(eligible, open);
                 }
-            },
+                }
+            }
+            Resume::Current { card, delivery_id, cause } => {
+                crate::api::session_verbs::emit_event(
+                    state,
+                    lane,
+                    "task.resume_suppressed",
+                    Some(json!({"issue": &card, "measured": true, "n_considered": 1,
+                        "verdict": "active_owner_not_resteered", "delivery_id": &delivery_id,
+                        "cause": cause})),
+                    Some(format!("task-resume-suppressed:{delivery_id}")),
+                    "board-drive",
+                )
+                .await;
+                tracing::info!(target: "amux::board_drive", session = lane, %card,
+                    %delivery_id, cause, measured = true, n_considered = 1,
+                    verdict = "active_owner_not_resteered",
+                    "board_drive: exact live claim remains runtime truth; repeat resume delivery suppressed");
+                // Recovery is already committed, but an idle owner still needs
+                // the ordinary cooldown/backoff-gated advancement decision.
+                current_claim = Some((card, cause));
+            }
             Resume::Conflicting { cards } => {
                 tracing::warn!(target: "amux::board_drive", session = lane, cards = %cards.join(","),
                     measured = true, n_considered = cards.len(), verdict = "conflicting_live_claims",
@@ -5228,6 +5674,10 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
             Resume::None => unreachable!("non-empty resume selector was matched above"),
         }
     }
+    let Ok(conn) = state.store.read() else {
+        return LaneTrace::skip(lane, "store-unavailable", "could not select canonical advancement")
+            .with_counts(eligible, open);
+    };
     let advance = select_advance(&conn, lane, &tags, now);
     let pickup = match &advance {
         Advance::Nudge { .. } => None,
@@ -5311,6 +5761,13 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
         Advance::None { reason, detail } => (*reason, detail.clone()),
         Advance::Nudge { .. } => unreachable!("handled above"),
     };
+
+    if let Some((card, cause)) = current_claim {
+        return LaneTrace::skip(lane, "active-claim-current",
+            format!("{card} remains the exact runtime card ({cause}); canonical advancement: {} — {}",
+                advance_reason.0, advance_reason.1))
+            .with_card(&card).with_counts(eligible, open);
+    }
 
     match pickup.expect("pickup computed whenever advance declined") {
         Pickup::Claim { card, prompt } => {
@@ -6284,14 +6741,23 @@ pub fn spawn(state: AppState) -> super::PeriodicTask {
                     "[board-drive] terminal task callbacks"
                 );
             }
-            let fleet = LiveFleet { state: state.clone() };
+            let fleet = LiveFleet {
+                state: state.clone(),
+                signals: crate::api::session_verbs::boundary_signals(&state, None).await,
+            };
             let r = drive_tick(&state, &fleet).await;
-            if r.assigned > 0 || r.nudged > 0 || r.promoted > 0 || r.promoted_due > 0 {
+            if r.assigned > 0
+                || r.nudged > 0
+                || r.promoted > 0
+                || r.promoted_due > 0
+                || r.normalized_blocked_doing > 0
+            {
                 tracing::info!(
                     assigned = r.assigned,
                     nudged = r.nudged,
                     promoted = r.promoted,
                     promoted_due = r.promoted_due,
+                    normalized_blocked_doing = r.normalized_blocked_doing,
                     revisit_due_total = r.revisit_due_total,
                     held_on_trigger = r.held_on_trigger,
                     lanes = r.lanes.len(),
@@ -7576,6 +8042,8 @@ mod tests {
 
     struct BoundaryFleet {
         delivered: std::sync::Mutex<Vec<(String, String)>>,
+        resume_ids: std::sync::Mutex<HashSet<String>>,
+        resume_disposition: std::sync::Mutex<Option<ResumeDelivery>>,
         running: std::sync::atomic::AtomicBool,
         boundary: std::sync::atomic::AtomicBool,
         enabled: std::sync::atomic::AtomicBool,
@@ -7587,6 +8055,8 @@ mod tests {
     impl Default for BoundaryFleet {
         fn default() -> Self {
             Self { delivered: std::sync::Mutex::new(vec![]),
+                resume_ids: std::sync::Mutex::new(HashSet::new()),
+                resume_disposition: std::sync::Mutex::new(None),
                 running: std::sync::atomic::AtomicBool::new(true),
                 boundary: std::sync::atomic::AtomicBool::new(true),
                 enabled: std::sync::atomic::AtomicBool::new(true),
@@ -7617,6 +8087,25 @@ mod tests {
             self.deliver(lane, text).await;
             Ok(())
         }
+        async fn deliver_resume(
+            &self,
+            lane: &str,
+            text: &str,
+            delivery_id: &str,
+        ) -> Result<ResumeDelivery, String> {
+            if let Some(error) = self.delivery_error.lock().unwrap().clone() {
+                return Err(error);
+            }
+            if let Some(disposition) = self.resume_disposition.lock().unwrap().take() {
+                self.resume_ids.lock().unwrap().insert(delivery_id.to_string());
+                return Ok(disposition);
+            }
+            if !self.resume_ids.lock().unwrap().insert(delivery_id.to_string()) {
+                return Ok(ResumeDelivery::AlreadyDelivered);
+            }
+            self.deliver(lane, text).await;
+            Ok(ResumeDelivery::Queued)
+        }
     }
 
     fn drive_state() -> (tempfile::TempDir, AppState, std::sync::Arc<crate::db::Store>) {
@@ -7630,8 +8119,10 @@ mod tests {
         let (id, status, owner, kind) = (id.to_string(), status.to_string(), owner.to_string(), kind.to_string());
         let now = now_f64() as i64;
         store.write(move |conn| {
-            conn.execute("INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type) \
-                          VALUES (?1,?1,'SCOPE: work\n- [ ] do it',?2,'lane',?3,?3,?4,?5)",
+            // These tests exercise dispatch and compensation, so the fixture
+            // must satisfy the continuation contract regardless of host prefs.
+            conn.execute("INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type,next_action) \
+                          VALUES (?1,?1,'SCOPE: work\n- [ ] do it',?2,'lane',?3,?3,?4,?5,'Implement the scoped work')",
                 rusqlite::params![id, status, now, owner, kind])?;
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         }).unwrap();
@@ -7648,6 +8139,16 @@ mod tests {
             conn.execute(
                 "INSERT INTO session_events (ts,session,type,data,source) VALUES (?1,'lane','task.claimed',?2,'test')",
                 rusqlite::params![now_f64(), json!({"issue": id, "status": "doing"}).to_string()],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+    }
+    fn drive_started(store: &std::sync::Arc<crate::db::Store>) {
+        store.write(|conn| {
+            conn.execute(
+                "INSERT INTO session_events (ts,session,type,data,source) \
+                 VALUES (?1,'lane','session.started','{}','test')",
+                rusqlite::params![now_f64()],
             )?;
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         }).unwrap();
@@ -7702,7 +8203,7 @@ mod tests {
         drive_card(&store, "IDLE", "todo", "agent", "code");
         let fleet = BoundaryFleet::default();
         let trace = drive_lane(&state, &fleet, "lane").await;
-        assert_eq!(trace.outcome, "assigned");
+        assert_eq!(trace.outcome, "assigned", "{trace:?}");
         assert_eq!(drive_status(&store, "IDLE"), "doing");
         assert_eq!(fleet.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(fleet.delivered.lock().unwrap().len(), 1);
@@ -7754,14 +8255,25 @@ mod tests {
         assert_eq!(drive_events(&store, "task.claimed"), 1, "resume must not create a second claim");
         assert_eq!(drive_events(&store, "task.resumed"), 1);
         assert_eq!(fleet.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
-        let delivered = fleet.delivered.lock().unwrap();
-        assert_eq!(delivered.len(), 1);
-        assert!(delivered[0].1.contains("RESUME"));
-        assert!(delivered[0].1.contains("resume this still-owned task"));
+        {
+            let delivered = fleet.delivered.lock().unwrap();
+            assert_eq!(delivered.len(), 1);
+            assert!(delivered[0].1.contains("RESUME"));
+            assert!(delivered[0].1.contains("resume this still-owned task"));
+        }
+
+        // Another idle sweep in the SAME worker generation preserves the
+        // exact runtime card but must not enqueue or record another resume.
+        fleet.boundary.store(true, std::sync::atomic::Ordering::SeqCst);
+        let repeated = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(repeated.reason, "active-claim-current", "{repeated:?}");
+        assert_eq!(fleet.delivered.lock().unwrap().len(), 1);
+        assert_eq!(drive_events(&store, "task.resumed"), 1);
+        assert_eq!(drive_events(&store, "task.resume_suppressed"), 1);
     }
 
     #[tokio::test]
-    async fn exact_claim_beats_multiple_unrelated_doing_cards() {
+    async fn running_exact_claim_beats_unrelated_doing_without_resteering_owner() {
         let (_dir, state, store) = drive_state();
         drive_card(&store, "EXACT", "doing", "agent", "code");
         drive_card(&store, "SUBAGENT", "doing", "agent", "code");
@@ -7770,10 +8282,56 @@ mod tests {
         let fleet = BoundaryFleet::default();
 
         let trace = drive_lane(&state, &fleet, "lane").await;
-        assert_eq!(trace.outcome, "resumed", "{trace:?}");
+        assert_eq!(trace.reason, "active-claim-current", "{trace:?}");
         assert_eq!(trace.card.as_deref(), Some("EXACT"));
+        assert!(fleet.delivered.lock().unwrap().is_empty());
+        assert_eq!(drive_events(&store, "task.resumed"), 0);
+        assert_eq!(drive_events(&store, "task.resume_suppressed"), 1);
+    }
+
+    #[tokio::test]
+    async fn live_fleet_boundary_reuses_its_tick_snapshot_and_structured_truth() {
+        let (_dir, state, _) = drive_state();
+        let mut signals = crate::api::sessions_legacy::tests::signals();
+        signals.running.insert("amux-lane".into());
+        signals.started.insert("lane".into(), signals.now - 7200.0);
+        signals.codex_turns.insert("lane".into(), crate::api::session_verbs::CodexTurnSignal {
+            state: "active".into(), ts: signals.now - 3600.0,
+            heartbeat_ts: signals.now - 3500.0, boundary: "task_started".into(),
+            rollout_file: None,
+        });
+        let mut fleet = LiveFleet { state, signals: Some(signals) };
+        // There is no real lane/pane in this fixture. A per-lane reload or the
+        // old pane-only gate would refuse, instead of using the tick snapshot.
+        assert!(fleet.at_boundary("lane").await);
+        assert!(fleet.at_boundary("lane").await);
+        fleet.signals.as_mut().unwrap().provider_child_activity.insert("lane".into());
+        assert!(!fleet.at_boundary("lane").await);
+        assert!(!fleet.at_boundary("unknown-worker").await);
+    }
+
+    #[tokio::test]
+    async fn current_claim_advances_once_then_obeys_cooldown_across_repeated_ticks() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "CURRENT", "doing", "agent", "code");
+        drive_claim(&store, "CURRENT");
+        store.write(|conn| {
+            conn.execute("UPDATE session_events SET ts=ts-?1 WHERE type='task.claimed'", [ADVANCE_COOLDOWN_S + 1.0])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let fleet = BoundaryFleet::default();
+        let trace = drive_lane(&state, &fleet, "lane").await;
+        assert_ne!(trace.outcome, "skipped", "Current must reach canonical advancement: {trace:?}");
+        assert_eq!(trace.card.as_deref(), Some("CURRENT"));
+        assert_eq!(drive_events(&store, "advance.nudged"), 1);
+        assert_eq!(drive_events(&store, "task.resumed"), 0);
+        for _ in 0..3 {
+            let trace = drive_lane(&state, &fleet, "lane").await;
+            assert_eq!(trace.reason, "active-claim-current", "{trace:?}");
+            assert!(trace.detail.contains("cooldown"), "{trace:?}");
+        }
         assert_eq!(fleet.delivered.lock().unwrap().len(), 1);
-        assert!(fleet.delivered.lock().unwrap()[0].1.contains("EXACT"));
+        assert_eq!(drive_events(&store, "task.resume_suppressed"), 1);
     }
 
     #[tokio::test]
@@ -7812,6 +8370,7 @@ mod tests {
         drive_card(&store, "RETRY", "doing", "agent", "code");
         drive_claim(&store, "RETRY");
         let fleet = BoundaryFleet::default();
+        fleet.running.store(false, std::sync::atomic::Ordering::SeqCst);
         *fleet.delivery_error.lock().unwrap() = Some("worker vanished before queue insert".into());
 
         let failed = drive_lane(&state, &fleet, "lane").await;
@@ -7827,6 +8386,129 @@ mod tests {
         assert_eq!(retried.outcome, "resumed", "{retried:?}");
         assert_eq!(retried.card.as_deref(), Some("RETRY"));
         assert_eq!(drive_events(&store, "task.claimed"), 1, "retry must preserve the old claim");
+        assert_eq!(drive_events(&store, "task.resumed"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_new_worker_generation_gets_exactly_one_new_recovery_delivery() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "RESTART", "doing", "agent", "code");
+        drive_claim(&store, "RESTART");
+        let fleet = BoundaryFleet::default();
+        fleet.running.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let first = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(first.outcome, "resumed", "{first:?}");
+        assert_eq!(fleet.delivered.lock().unwrap().len(), 1);
+
+        // This durable lifecycle event is emitted by the canonical launcher in
+        // production. It is the causal boundary, so a worker restart recovers
+        // the same Doing card once even across a server-process restart.
+        drive_started(&store);
+        let restarted = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(restarted.outcome, "resumed", "{restarted:?}");
+        assert_eq!(fleet.delivered.lock().unwrap().len(), 2);
+        assert_eq!(drive_events(&store, "task.resumed"), 2);
+
+        let repeated = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(repeated.reason, "active-claim-current", "{repeated:?}");
+        assert_eq!(fleet.delivered.lock().unwrap().len(), 2);
+        assert_eq!(drive_events(&store, "task.resumed"), 2);
+    }
+
+    #[tokio::test]
+    async fn startup_and_board_drive_share_one_durable_resume_per_generation_and_retry_failure() {
+        use crate::api::session_verbs as sv;
+        let (dir, state, store) = drive_state();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("lane.env"), format!("CC_DIR=\"{}\"\nCC_ISOLATED=0\n", dir.path().display())).unwrap();
+        drive_card(&store, "ATE-92", "doing", "agent", "code");
+        drive_claim(&store, "ATE-92");
+        let context = sv::StructuredResumeContext { session: "lane".into(), card: Some("ATE-92".into()), cwd: dir.path().to_string_lossy().into() };
+        for generation_number in 1..=2 {
+            let token = format!("swap-{generation_number}");
+            let pending = json!({"cc_cwd": context.cwd, "pending_structured_resume": 1,
+                "pending_structured_resume_context": &context, "pending_structured_resume_token": token});
+            let meta_path = sessions.join("lane.meta.json");
+            // Use the same meta path shape as the launcher.
+            std::fs::write(&meta_path, pending.to_string()).unwrap();
+            let start_data = json!({"resume_context": &context, "resume_token": token, "resume_reason": "provider swap"}).to_string();
+            store.write(move |conn| {
+                conn.execute("INSERT INTO session_events(ts,session,type,data) VALUES (?1,'lane','session.started',?2)",
+                    rusqlite::params![now_f64(), start_data])?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            }).unwrap();
+            let generation: i64 = store.read().unwrap().query_row("SELECT MAX(id) FROM session_events WHERE type='session.started'", [], |r| r.get(0)).unwrap();
+            let Resume::Claim { prompt, delivery_id, .. } = select_resume(&store.read().unwrap(), "lane", now_f64(), false) else { panic!("new generation needs recovery") };
+            assert!(prompt.contains(&context.cwd) && prompt.contains("amux board show ATE-92"));
+            assert!(!prompt.contains("board ls --session") && !prompt.contains(".amux/logs"));
+            if generation_number == 1 {
+                store.write(|conn| { conn.execute_batch("CREATE TRIGGER refuse_resume BEFORE INSERT ON steering_queue BEGIN SELECT RAISE(ABORT,'injected queue failure'); END;")?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] }) }).unwrap();
+                assert!(sv::enqueue_generation_resume(&state, &context, generation, "provider swap").await.is_err());
+                assert_eq!(std::fs::read_to_string(&meta_path).unwrap(), pending.to_string());
+                assert_eq!(drive_events(&store, "task.resumed"), 0);
+                store.write(|conn| { conn.execute_batch("DROP TRIGGER refuse_resume;")?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] }) }).unwrap();
+            }
+            // Startup and a board tick selected before either producer commits.
+            let (startup, board) = tokio::join!(
+                sv::enqueue_generation_resume(&state, &context, generation, "provider swap"),
+                sv::steer_enqueue_idempotent_report(&state, "lane", &prompt, sv::BOARD_DRIVE_GUARD, "", &delivery_id),
+            );
+            let startup = startup.unwrap();
+            let board = board.unwrap();
+            assert_eq!(startup.id, board.id);
+            assert_ne!(startup.disposition == sv::StableEnqueueDisposition::New,
+                       board.disposition == sv::StableEnqueueDisposition::New);
+            let queued: i64 = store.read().unwrap().query_row("SELECT COUNT(*) FROM steering_queue WHERE id=?1", [&delivery_id], |r| r.get(0)).unwrap();
+            assert_eq!(queued, 1);
+            let accepted: Value = serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+            assert!(accepted.get("pending_structured_resume_context").is_none(), "accepted queue commit consumes only its own pending token: {accepted}");
+            for _ in 0..3 {
+                let again = sv::enqueue_generation_resume(&state, &context, generation, "provider swap").await.unwrap();
+                assert_eq!(again.disposition, sv::StableEnqueueDisposition::AlreadyQueued);
+                assert!(matches!(select_resume(&store.read().unwrap(), "lane", now_f64(), false), Resume::Current { .. }));
+            }
+            // Persist delivery, then reopen the DB to simulate a server/model
+            // process losing every in-memory receipt.
+            let delivered_id = delivery_id.clone();
+            store.write(move |conn| {
+                conn.execute("INSERT INTO steering_history(id,session,text,queued_at,delivered_at) SELECT id,session,text,queued_at,?1 FROM steering_queue WHERE id=?2", rusqlite::params![now_f64(), delivered_id])?;
+                conn.execute("DELETE FROM steering_queue WHERE id=?1", [&delivered_id])?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            }).unwrap();
+            let mut reopened_state = state.clone();
+            reopened_state.store = std::sync::Arc::new(crate::db::Store::open(&dir.path().join("drive.db")).unwrap());
+            let recovered = sv::enqueue_generation_resume(&reopened_state, &context, generation, "provider swap").await.unwrap();
+            assert_eq!(recovered.disposition, sv::StableEnqueueDisposition::AlreadyDelivered);
+            assert_eq!(drive_events(&store, "task.resumed"), generation_number);
+        }
+    }
+
+    #[tokio::test]
+    async fn crash_after_durable_enqueue_recovers_receipt_without_redelivery() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "CRASH", "doing", "agent", "code");
+        drive_claim(&store, "CRASH");
+        let fleet = BoundaryFleet::default();
+        fleet.running.store(false, std::sync::atomic::Ordering::SeqCst);
+        *fleet.resume_disposition.lock().unwrap() = Some(ResumeDelivery::AlreadyDelivered);
+
+        // Simulate a prior process which durably committed/delivered the stable
+        // steering id, then died before appending task.resumed. The retry must
+        // restore that causal receipt without handing the prompt to the lane.
+        let recovered = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(recovered.reason, "resume-commit-recovered", "{recovered:?}");
+        assert!(fleet.delivered.lock().unwrap().is_empty());
+        assert_eq!(drive_events(&store, "task.resumed"), 1);
+
+        let repeated = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(repeated.reason, "active-claim-current", "{repeated:?}");
+        assert!(fleet.delivered.lock().unwrap().is_empty());
+        assert_eq!(drive_events(&store, "task.resumed"), 1);
     }
 
     #[tokio::test]
@@ -7900,6 +8582,61 @@ mod tests {
         assert_eq!(trace.card.as_deref(), Some("BACKLOG"));
         assert_eq!(drive_status(&store, "BACKLOG"), "doing");
         assert_eq!(drive_status(&store, "BLOCKED"), "todo");
+    }
+
+    /// The live TubeScience topology: TUBES-2459 was Doing while both its
+    /// `blocked_on` text and TUBES-2496 dependency said it could not proceed.
+    /// It consumed WIP, appeared as current, and left independent queue work
+    /// waiting for a human nudge. The sweep must durably park it first; the
+    /// same tick can then dispatch eligible work without re-steering the block.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn blocked_tubescience_doing_is_parked_and_independent_work_keeps_draining() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "TUBES-2459", "doing", "agent", "code");
+        drive_card(&store, "TUBES-2496", "backlog", "agent", "code");
+        drive_card(&store, "TUBES-NEXT", "todo", "agent", "code");
+        drive_claim(&store, "TUBES-2459");
+        store
+            .write(|conn| {
+                conn.execute(
+                    "UPDATE issues SET depends_on='[\"TUBES-2496\"]', \
+                         blocked_on='writer stopped at cursor 429000 pending renewed clearance' \
+                     WHERE id='TUBES-2459'",
+                    [],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+
+        // Defence in depth: even before the lifecycle writer runs, the stale
+        // Doing label cannot hold WIP against independent work.
+        let before = store.read().unwrap();
+        assert_eq!(
+            claimed(&select_pickup_with(&before, "lane", now_f64(), false)),
+            Some("TUBES-NEXT"),
+            "an unfinished dependency must not consume the WIP slot"
+        );
+        drop(before);
+
+        assert_eq!(normalize_blocked_doing(&state).await, 1);
+        assert_eq!(drive_status(&store, "TUBES-2459"), "backlog");
+        assert_eq!(drive_events(&store, "task.blocked_normalized"), 1);
+
+        let fleet = BoundaryFleet::default();
+        let trace = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(trace.outcome, "assigned", "{trace:?}");
+        assert_eq!(trace.card.as_deref(), Some("TUBES-NEXT"), "{trace:?}");
+        assert_eq!(drive_status(&store, "TUBES-NEXT"), "doing");
+        assert_eq!(drive_status(&store, "TUBES-2496"), "backlog");
+        assert_eq!(
+            drive_events(&store, "task.resumed"),
+            0,
+            "the stale blocked claim must not be resumed or advertised current"
+        );
     }
 
     #[tokio::test]
@@ -8195,6 +8932,20 @@ mod tests {
         assert!(
             drainable_backlog_ids(&conn, "blk", now).is_empty(),
             "the DRAIN itself offered a blocked card"
+        );
+        conn.execute(
+            "UPDATE issues SET due=date('now') WHERE id='BL-1'",
+            [],
+        )
+        .unwrap();
+        let (due_promotions, due_total) = backlog_due_promotions(&conn);
+        assert!(
+            due_promotions.is_empty(),
+            "an arrived date cannot overrule an unsatisfied external blocker: {due_promotions:?}"
+        );
+        assert_eq!(
+            due_total, 0,
+            "blocked work is not an eligible revisit candidate"
         );
 
         // THE CONTROL, and it is what keeps the clause from being a ban on

@@ -12,7 +12,8 @@ remain intact. No worker restart or signal to protected tmux PIDs was used.
   contention, not the initiating cause of every subsequent stall.
 - 10:03:18: watchdog health timeout, recovery 10:03:57.
 - 10:09:40: unannounced server start, PID 91066. Watchdog did not record a
-  restart-threshold firing then. The initiating stop remains unproven.
+  restart-threshold firing then. Later correlated to an explicit external
+  launchctl reload to apply plist changes (see supervisor follow-up below).
 - 10:12:56: builder began rebuilding already-stamped `a604412b492330dc67e4138b0b77443840fa72b9`,
   logging matching health commit `a604412b4923` as STAMP DRIFT. Build took 3m01s.
 - 10:14:50 and 10:15:40: watchdog timed out; 10:16:06: same-revision self-exec;
@@ -71,3 +72,101 @@ spent awaiting IO. It supplies the missing attribution for the next stall.
   times unchanged. Full publication gates and post-adoption measurements are
   recorded on the card when they finish; these focused results are not a claim
   that the entire historical stall has been explained.
+
+## Live attribution and runtime isolation follow-up
+
+The poll instrumentation supplied new evidence after normal adoption of
+`451cafb6` through origin/main. At 11:30 onward, PID 91066 logged individual
+synchronous polls of 3914ms (`commit-mention-notes`), 2484ms (`board-drive`),
+1128ms (`orchestrator-runtime`) and 1078ms (`autofix`). Later, on full commit
+`d3d329ea0ada6511e75359c627986fdf37eea6df`, it still logged a 1706ms autofix
+poll at 11:52:30 and a 1859ms board-drive poll at 11:52:38. Private receipt:
+`runtime-poll-evidence.log`. A separate task on the same Tokio runtime did not
+isolate HTTP/TLS from this synchronous work.
+
+A complete scan also found an 89,318ms orchestrator poll ending 11:36:07,
+25,492ms board-drive poll ending 11:35:09, and 87,855ms commit-mention-notes
+poll ending 11:49:40. These are elapsed times, not measured CPU consumption.
+The follow-up adds per-poll thread CPU time and a separate measured flag so
+waiting/descheduling cannot silently be described as CPU work. Maxima and
+their exact timestamp/source lines are in `runtime-poll-summary.json`.
+
+The follow-up gives the existing registered jobs a process-owned maintenance
+runtime. Both periodic jobs and long-lived loops use the common executor;
+commit-nudge and the tunnel relay now enter through the same registry spawn.
+Job identities, intervals, manual triggers and abort handles are preserved.
+The HTTP listener and request tasks retain their own runtime. The binary owns
+both runtimes; library tests retain their caller-owned runtime and teardown.
+Boot logs name the selected runtime pool, and slow-poll logs keep job, pool,
+PID, full source identity and elapsed time. This protects request executor
+threads; it does not pretend to remove shared CPU, disk or database contention.
+
+The regression deliberately blocks the maintenance runtime's sole worker for
+up to two seconds while dispatching the real health handler and board route
+onto the HTTP runtime's sole worker. It requires HTTP 200, a measured health
+result and completion below 500ms. Running the handler directly on the test
+thread would hide the original starvation, so the request itself is spawned.
+
+Live builder receipts at 11:41:52, 11:42:52, 11:43:53 and 11:45:29 reported
+identity match/action=skip for db4b88e6. After one genuinely new d3d329ea build,
+11:49:52, 11:51:02 and 11:52:03 also skipped the matching installed revision.
+PID 91066 survived self-adoption. The 11:52:21 health read returned HTTP 200,
+full d3d329ea / build e316da5fb3697063 in 872ms. A fleet read briefly counted
+50 active entries; the immediately saved follow-up returned all 54 original
+non-archived workers running, with no name/archive/running differences from
+the recovery snapshot. The transient count is not proof of four worker exits.
+The lane runtime truth names exactly AMUX-4225 as its one live Doing claim.
+
+## Publication gate findings
+
+The clean detached 451cafb6 snapshot passed workspace all-target Clippy. Its
+full server suite reported 2367 passed, 8 failed and 32 ignored across 56
+targets; this is not a green-suite receipt. The exact parent 38a4b99a reproduced
+the idle-worker and concurrent-dispatch fixture failures and the missing
+`/api/_clear_sw` route-table declaration. Two other parent controls could not
+compile while shared debug artifacts disappeared, so those controls are
+unmeasured. The dashboard guard still required a `card syncing` badge that a
+peer intentionally removed; it is corrected to reject its reintroduction.
+The dispatch failures named `has no next_action (continuation gate)`. These
+fixtures now provide an actionable next step because they test dispatch and
+compensation, not the refusal of incomplete cards. The complete board-drive
+unit module then passed: 128 passed, 0 failed. The cache-reset route is also added to the native boundary registry, so the
+existing route-composition gate describes the route already mounted in main.
+
+## Final gate and supervisor follow-up
+
+The runtime-job module passed 528 tests, with one ignored. A mutation on a clean
+90a601eb worktree forced maintenance back onto the HTTP runtime: the real
+health/board request regression failed with `maintenance blocked HTTP for
+2.105875958s`. The mutation trap restored the clean tree. Workspace all-target
+Clippy then exited 0 on the restored commit.
+
+The full suite exposed two remaining dashboard guards: the UI change had
+written `amux-0.9.840` instead of the required `amux-v0.9.840`, and an old guard
+still required an independent card-count predicate removed when the client
+began trusting the server's measured linked status. APP_VER and CACHE now
+advance together to 0.9.841 with the correct prefix; the linkage guard checks
+the measured linked-status/card-id refusal that actually ships. Final results
+are recorded on AMUX-4225 after the clean committed checks finish.
+
+A bounded native unified-log read found launchd reporting `service inactive`
+and `removing service: com.amux.server-rs` at 10:09:37.847641/847642 EDT. The
+surrounding five-second launchd window supplied the missing initiator chain:
+`launchctl[90728] <- bash[90719] <- Claude[43527]`, from an iTerm session.
+At 10:09:40.788513, launchctl[91064] successfully bootstrapped the service;
+10:09:40.799013 records the spawn of amux-server-rs[91066].
+
+The matching local command record at 10:09:31.734 explicitly ran `launchctl
+bootout` followed by `launchctl bootstrap` with the stated purpose of picking
+up all plist changes. Its 10:09:48 follow-up reported uptime 3s and the new
+65536 FD limit. This resolves that restart as an intentional external service
+reload, separate from the redundant build/adoption feedback. It appeared
+unannounced because that external reload did not carry the self-adoption
+marker. The earlier September 7 tmux initiating-stall uncertainty remains in
+its own original RCA; it is not reopened here.
+
+Receipts under the private incident directory: `launchd-restart-evidence.json`,
+`launchd-restart-detail.json`, `launchd-restart-context.json`, the concise
+`launchd-restart-summary.json`, `restart-command-summary.json` and
+`restart-purpose-summary.json`. No worker restart or protected tmux signal
+was needed to obtain this evidence.

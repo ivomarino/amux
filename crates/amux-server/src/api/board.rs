@@ -344,6 +344,8 @@ const NEEDSYOU_VIEW_CAP: usize = 10;
 pub(crate) enum FrontierExclusion {
     /// Carries the `blocked_on` dimension (AMUX-3949).
     Blocked,
+    /// Dormant containers and event watches are not actionable queue work.
+    DormantType,
     /// The continuation gate is on for this lane and the card cannot satisfy it
     /// (AMUX-3946), so `doing` would refuse it.
     NoContinuation,
@@ -364,6 +366,9 @@ pub(crate) fn frontier_exclusion(
     }
     if bs::parse_status(&row.status) == Some(TaskStatus::Blocked) {
         return Some(FrontierExclusion::Blocked);
+    }
+    if matches!(row.item_type.as_str(), "tripwire" | "watch" | "epic") {
+        return Some(FrontierExclusion::DormantType);
     }
     if gate_on
         && bs::continuation_verdict(row.next_action.as_deref().unwrap_or(""))
@@ -470,6 +475,23 @@ mod frontier_exclusion_tests {
         let mut w = r.clone();
         w.blocked_on = Some("   ".into());
         assert_eq!(frontier_exclusion(&w, true), None, "an empty string is not a block");
+    }
+
+    /// AMUX-4203/RH-125: a status update on a stale-trigger watch should append
+    /// evidence, not resurrect the watch into current WIP.
+    #[test]
+    fn dormant_types_are_never_on_the_ready_frontier() {
+        let mut r = row("todo");
+        r.next_action = Some("Poll the external source when the watcher fires".into());
+        for item_type in ["tripwire", "watch", "epic"] {
+            let mut dormant = r.clone();
+            dormant.item_type = item_type.into();
+            assert_eq!(
+                frontier_exclusion(&dormant, false),
+                Some(FrontierExclusion::DormantType),
+                "{item_type} must not be claimable queue work"
+            );
+        }
     }
 
     /// The continuation arm, and the control that it only fires when the gate is
@@ -861,6 +883,9 @@ pub(crate) fn lane_frontier(
         match frontier_exclusion(&row, gate_on) {
             Some(FrontierExclusion::Blocked) => {
                 blocked_by_deps += 1;
+                continue;
+            }
+            Some(FrontierExclusion::DormantType) => {
                 continue;
             }
             Some(FrontierExclusion::NoContinuation) => {
@@ -11972,6 +11997,7 @@ async fn apply_status_update(
         } else if let Some(exclusion) = frontier_exclusion(&row, false) {
             match exclusion {
                 FrontierExclusion::Blocked => "blocked".to_string(),
+                FrontierExclusion::DormantType => "dormant_type".to_string(),
                 FrontierExclusion::NoContinuation => unreachable!("continuation gate is off"),
             }
         } else if bs::continuation_required(Some(&actor))

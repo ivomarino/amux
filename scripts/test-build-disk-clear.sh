@@ -17,7 +17,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 SCRIPT="$(pwd)/scripts/rust-auto-build.sh"
 PASS=0; FAIL=0
-TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/amux-cargo-guard-test.XXXXXX");
+export AMUX_CARGO_GUARD_TEST_FIXTURE="$TMP"; trap 'rm -rf "$TMP"' EXIT
 # Cleanup diagnostics cannot depend on a running server or an inherited fleet
 # endpoint. This also reproduces CI, where no deployment-permit server exists.
 export AMUX_URL=http://127.0.0.1:1
@@ -84,31 +85,16 @@ if printf '%s\n' "$out3" | grep -qE "DISK LOW"; then
   bad "(d) with free space above the floor nothing may be cleared" "$out3"
 else ok; fi
 
-# --- (g) AF-415: the disk-low arm clears EVEN WITH A PEER BUILD IN FLIGHT --
-#     The neighbouring debug-SIZE arm defers while any rustc/cargo runs
-#     (AF-303). This one deliberately does not, because below the sacrifice
-#     floor ENOSPC breaks every lane anyway — so a peer build dies either way,
-#     and the difference is whether it dies diagnosably or with a full disk.
-#
-#     That asymmetry reads as an oversight, and the obvious "fix" is to add the
-#     same gate here. This cell is what makes that a deliberate choice somebody
-#     has to argue with rather than one they can quietly reverse: if a peer gate
-#     is ever added to the low-disk arm, this fails and says why.
-#     ASSERT THE EFFECT, NOT THE LOG LINE. The first version of this cell
-#     grepped for "SHARED target dir" — and the echo runs BEFORE the rm, so a
-#     peer gate inserted between them left the line intact and the cell passed
-#     while the clear was skipped. Verified by mutation: adding
-#     `[ -n "$AMUX_BUILD_PEER_PIDS_OVERRIDE" ] && continue` before the rm scored
-#     23 passed. So this runs WITHOUT the dry-run seam, against throwaway dirs
-#     under $TMP, and asks the filesystem.
+# --- (g) ATE-92: even severe disk pressure must defer an active build. ----
+# Real mutations of temp fixtures, so a misleading "deferred" log cannot pass.
 H4="$TMP/peerbuilding"; mkdir -p "$H4/.amux/rust-build-target" "$H4/.amux/rust-build-target-e2e-head"
 HOME="$H4" AMUX_RS_BUILD_LOG="$H4/build.log" AMUX_BUILD_MIN_FREE_GB=999999 \
   AMUX_BUILD_SACRIFICE_CACHE_BELOW_GB=999999 \
   AMUX_BUILD_PEER_PIDS_OVERRIDE="4242 4243" \
   AMUX_RS_DISK_CLEAR_ONLY=1 bash "$SCRIPT" >/dev/null 2>&1
 out4=$(cat "$H4/build.log" 2>/dev/null)
-if [ ! -d "$H4/.amux/rust-build-target" ]; then ok
-else bad "(g) the low-disk arm must still CLEAR with peers building — below the sacrifice floor ENOSPC breaks them anyway (AF-415)" "$out4"; fi
+if [ -d "$H4/.amux/rust-build-target" ] && printf '%s\n' "$out4" | grep -q cargo_reclaim_deferred; then ok
+else bad "(g) an active build must retain its target even below the disk floor" "$out4"; fi
 # PRECONDITION, so (g) cannot pass because the script never reached the arm:
 # the low-disk branch must actually have run.
 if printf '%s\n' "$out4" | grep -q "DISK LOW"; then ok
@@ -253,14 +239,12 @@ if [ -f "$TMP/nopeer/.amux/rust-build-target/debug/marker" ]; then
   bad "(k) debug/ should have been removed when no peer is building" "$out7"
 else ok; fi
 
-# (l) A peer IS building but disk is BELOW the fleet floor: ENOSPC outranks the
-#     peer, because running out of disk breaks the lane being protected too.
-#     A deferral with no override is a disk-full outage with better manners.
+# (l) Disk pressure never overrides active debug builds (ATE-92).
 out8=$(dbg_run peerbutfull 999999 "4242")
-if printf '%s\n' "$out8" | grep -q "Clearing"; then ok
-else bad "(l) below the fleet floor the clear must override a peer build" "$out8"; fi
-if printf '%s\n' "$out8" | grep -q "ENOSPC outranks"; then ok
-else bad "(l) the override must SAY it overrode a peer, not clear silently" "$out8"; fi
+if printf '%s\n' "$out8" | grep -q "cargo_reclaim_deferred"; then ok
+else bad "(l) below the fleet floor the clear must still defer" "$out8"; fi
+if [ -f "$TMP/peerbutfull/.amux/rust-build-target/debug/marker" ]; then ok
+else bad "(l) active debug artifacts must survive severe disk pressure" "$out8"; fi
 
 # (m) THE DETECTOR'S PRECISION, exercised for real with NO override. A process
 #     whose COMMAND LINE merely mentions cargo must not read as a build: the
@@ -324,7 +308,7 @@ else
   : > "$h/.amux/rust-build-target/debug/marker"
   out9=$(HOME="$h" AMUX_RS_BUILD_LOG="$h/build.log" AMUX_BUILD_MIN_FREE_GB=0 \
     AMUX_BUILD_SACRIFICE_CACHE_BELOW_GB=0 AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB=-1 \
-    AMUX_RS_DISK_CLEAR_ONLY=1 bash "$SCRIPT" >/dev/null 2>&1; cat "$h/build.log" 2>/dev/null)
+    AMUX_CARGO_GUARD_TEST_FIXTURE= AMUX_RS_DISK_CLEAR_ONLY=1 bash "$SCRIPT" >/dev/null 2>&1; cat "$h/build.log" 2>/dev/null)
   # A successfully killed decoy makes `wait` report its signal status. That is
   # expected cleanup, not a harness failure under `set -e`.
   kill "$DECOY" 2>/dev/null; wait "$DECOY" 2>/dev/null || true

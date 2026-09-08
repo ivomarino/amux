@@ -337,15 +337,21 @@ const MIGRATIONS: &[Migration] = &[
         name: "0057_board_overlap_reconciliation",
         sql: include_str!("../../migrations/0057_board_overlap_reconciliation.sql"),
     },
-    // Renumbered 0057 -> 0058 resolving the merge of feat/local-member-scopes
-    // into main: both branches independently claimed the next free slot, which
-    // is correct on each branch alone and a duplicate together. main's 0057
-    // had already shipped and may be recorded in live `_amux_migrations`
-    // rows, so THIS side moved.
     Migration {
         version: 58,
-        name: "0058_local_member_scope",
-        sql: include_str!("../../migrations/0058_local_member_scope.sql"),
+        name: "0058_harness_enforcement",
+        sql: include_str!("../../migrations/0058_harness_enforcement.sql"),
+    },
+    // Renumbered 0057 -> 0058 -> 0059 across two successive merges of
+    // origin/main into feat/local-member-scopes. Both branches independently
+    // claim the next free slot each time, which is correct on each branch
+    // alone and a duplicate together; main's side had already shipped and may
+    // be recorded in live `_amux_migrations` rows, so THIS side moved. It will
+    // keep moving on every refresh until this branch lands.
+    Migration {
+        version: 59,
+        name: "0059_local_member_scope",
+        sql: include_str!("../../migrations/0059_local_member_scope.sql"),
     },
 ];
 

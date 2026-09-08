@@ -71,10 +71,10 @@ fn the_fleet_list_spawns_nothing_unbounded() {
 /// It used to require `let probe_start = std::time::Instant::now();` in the
 /// source, guarding the property "fifty `pgrep -P` calls each just under budget
 /// is still minutes". 99cee1c8 (AMUX-3894) removed the loop entirely — one
-/// `ps -eo ppid=` answers "does this pid have a child" for every pid at once —
-/// so the clock it grepped for is legitimately gone and the test went red on a
-/// fix, which is the worst kind of red: it accuses the change that removed the
-/// hazard.
+/// one process-table snapshot answers "does this pid have a child" for every
+/// pid at once — so the clock it grepped for is legitimately gone and the test
+/// went red on a fix, which is the worst kind of red: it accuses the change that
+/// removed the hazard.
 ///
 /// The property is not merely retired, because the hazard is not gone; it moved.
 /// The fix's own comment names the correct invariant: "N sequential subprocesses
@@ -118,7 +118,7 @@ fn the_child_liveness_probe_is_one_subprocess_not_one_per_lane() {
             "`{spawner}` is back INSIDE the per-lane loop. That is one subprocess per lane, \
              which is the AMUX-3894 shape: ~50 spawns per cache miss, a fleet-size-dependent \
              cost that no per-call timeout can bound. Answer the question once outside the \
-             loop (`ps -eo ppid=`) and look the answer up in here. Body was:\n{body}"
+             loop (one process-table snapshot) and look the answer up in here. Body was:\n{body}"
         );
     }
 
@@ -127,9 +127,14 @@ fn the_child_liveness_probe_is_one_subprocess_not_one_per_lane() {
     // would read every shell-foreground lane as not-running.
     let outside = SRC[..at].to_string() + &SRC[end..];
     assert!(
-        outside.contains(r#"c.args(["-eo", "ppid="])"#),
-        "premise gone: the one-shot `ps -eo ppid=` probe is not outside the loop, so \
+        outside.contains(r#"c.args(["-eo", "pid=,ppid=,state=,comm="])"#),
+        "premise gone: the one-shot process-table probe is not outside the loop, so \
          'no spawns inside the loop' means 'no liveness probe at all'"
+    );
+    assert!(
+        outside.contains("sessions_with_codex_tool_children(&pane_roots, out)"),
+        "the shared process snapshot must also derive provider tool-child activity rather than \
+         adding a second per-lane process probe"
     );
 
     assert!(

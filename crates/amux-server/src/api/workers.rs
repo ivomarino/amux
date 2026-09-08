@@ -2232,6 +2232,19 @@ mod tests {
             rusqlite::params![now],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO issues (id, title, status, session, creator, created, updated) \
+             VALUES ('TUBES-2496', 'renewed clearance', 'backlog', 'tubescience', 'test', ?1, ?1)",
+            rusqlite::params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE issues SET depends_on='[\"TUBES-2496\"]', \
+                    blocked_on='writer stopped at cursor 429000 pending renewed clearance' \
+             WHERE id='TUBES-2459'",
+            [],
+        )
+        .unwrap();
         for (session, card) in [
             ("linked", "LINKED-1"),
             ("multiple", "MULTI-1"),
@@ -2248,11 +2261,17 @@ mod tests {
             )
             .unwrap();
         }
-        for session in ["sticky", "tubescience", "released"] {
+        for (session, reason) in [
+            ("sticky", "control-prompt"),
+            // The historical transport-only marker from the live specimen is
+            // deliberately invalid. It cannot make substantive work cardless.
+            ("tubescience", "explicit-no-board"),
+            ("released", "informational-query"),
+        ] {
             conn.execute(
                 "INSERT INTO session_events (ts, session, type, data, source) \
-                 VALUES (?1, ?2, 'task.cardless', '{}', 'test')",
-                rusqlite::params![marker_ts + 2.0, session],
+                 VALUES (?1, ?2, 'task.cardless', ?3, 'test')",
+                rusqlite::params![marker_ts + 2.0, session, json!({"reason": reason}).to_string()],
             )
             .unwrap();
         }
@@ -2287,15 +2306,17 @@ mod tests {
         assert_eq!(sticky["task_board_id"], json!("STICKY-1"), "{sticky}");
 
         let tubescience = rows.iter().find(|row| row["name"] == "tubescience").expect("active TubeScience row");
-        assert_eq!(tubescience["status"], json!("active"), "{tubescience}");
-        assert_eq!(tubescience["runtime_board"]["status"], json!("linked"), "{tubescience}");
-        for value in [
-            &tubescience["runtime_board"]["card_id"],
-            &tubescience["task_board_id"],
-            &tubescience["runtime_board"]["observed_card_id"],
-        ] {
-            assert_eq!(value, &json!("TUBES-2459"), "{tubescience}");
-        }
+        assert_eq!(tubescience["status"], json!("unattributed"), "{tubescience}");
+        assert_eq!(tubescience["runtime_board"]["status"], json!("active-card-invalid"), "{tubescience}");
+        assert_eq!(tubescience["runtime_board"]["blocked_doing_count"], json!(1), "{tubescience}");
+        assert_eq!(tubescience["runtime_board"]["card_count"], json!(0), "{tubescience}");
+        assert!(tubescience["runtime_board"]["card_id"].is_null(), "{tubescience}");
+        assert!(tubescience["task_board_id"].as_str().unwrap_or_default().is_empty(), "{tubescience}");
+        assert_eq!(
+            tubescience["runtime_board"]["observed_card_id"],
+            json!("TUBES-2459"),
+            "the rejected stale claim remains diagnostic evidence, never current truth: {tubescience}"
+        );
 
         let released = rows.iter().find(|row| row["name"] == "released").expect("released row");
         assert_eq!(released["runtime_board"]["status"], json!("cardless-allowed"), "{released}");
@@ -2326,13 +2347,9 @@ mod tests {
             .expect("idle TubeScience row");
         assert_eq!(idle_tubescience["status"], json!("idle"), "{idle_tubescience}");
         assert_eq!(idle_tubescience["runtime_board"]["status"], json!("runtime-not-active"), "{idle_tubescience}");
-        for value in [
-            &idle_tubescience["runtime_board"]["card_id"],
-            &idle_tubescience["task_board_id"],
-            &idle_tubescience["runtime_board"]["observed_card_id"],
-        ] {
-            assert_eq!(value, &json!("TUBES-2459"), "{idle_tubescience}");
-        }
+        assert!(idle_tubescience["runtime_board"]["card_id"].is_null(), "{idle_tubescience}");
+        assert!(idle_tubescience["task_board_id"].as_str().unwrap_or_default().is_empty(), "{idle_tubescience}");
+        assert_eq!(idle_tubescience["runtime_board"]["blocked_doing_count"], json!(1), "{idle_tubescience}");
     }
 
     #[tokio::test]

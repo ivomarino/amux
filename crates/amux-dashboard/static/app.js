@@ -742,6 +742,33 @@ function _modelClass(m) {
   return m.split(/[-\s]/)[0] || 'other';
 }
 let peekSession = null;
+// Every open/close is a new UI life, even when it names the same worker. Async
+// peek/log/IDB responses must match BOTH coordinates before touching shared
+// view state. A name-only check let a delayed response from a prior open land
+// after reconnect, including one live specimen where mixpeek-cicd output was
+// painted under amux-testing-e2e's header.
+let _peekOpenGeneration = 0;
+function _peekIdentity(name) {
+  return { name: name || peekSession || '', generation: _peekOpenGeneration };
+}
+function _peekIdentityCurrent(identity) {
+  return !!identity && !!identity.name && peekSession === identity.name
+    && _peekOpenGeneration === identity.generation;
+}
+function _peekIdentityDiscard(kind, identity, responseSession) {
+  try {
+    fetch(API + '/api/client-debug', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
+      body: JSON.stringify({ kind: 'peek-identity-discard', surface: kind,
+        requested_session: identity && identity.name || null,
+        response_session: responseSession || null, current_session: peekSession || null,
+        request_generation: identity && identity.generation,
+        current_generation: _peekOpenGeneration, verdict: 'stale_or_cross_worker_response_refused',
+        measured: true, n_considered: 1,
+        ver: (typeof APP_VER !== 'undefined' ? APP_VER : '?') })
+    }).catch(() => {});
+  } catch (e) {}
+}
 // Last session whose peek was opened — remembered across closePeek so the
 // Messages view can pre-scope its filter to "the session you came from".
 let _lastPeekedSession = '';
@@ -3114,8 +3141,17 @@ function _stalledChip(s) {
 function updatePeekStatus() {
   const el = document.getElementById('peek-session-status');
   if (!el || !peekSession) { if (el) el.innerHTML = ''; return; }
-  const s = sessions.find(s => s.name === peekSession);
+  const identity = _peekIdentity();
+  const overlay = document.getElementById('peek-overlay');
+  if (!overlay || overlay.dataset.session !== identity.name
+      || overlay.dataset.generation !== String(identity.generation)) {
+    _peekIdentityDiscard('peek-status', identity, overlay && overlay.dataset.session || '');
+    el.innerHTML = '';
+    return;
+  }
+  const s = sessions.find(s => s.name === identity.name);
   if (!s) { el.innerHTML = ''; return; }
+  _bindPeekTaskIdentity(s, identity);
   _renderPeekWorkerActions(s);
   let badge = '';
   const runtimeBoard = _runtimeBoardPresentation(s);
@@ -3829,7 +3865,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
       ${s.dir ? _renderBranchBadge(s.name, s.branch) : ''}
       ${isExp && s.desc ? `<div class="card-desc">${esc(s.desc)}</div>` : ''}
 
-      ${!isExp && displayTaskName ? `<div class="card-preview${taskDim || taskIsDesc ? ' task-stale' : ''}" style="font-weight:600;color:var(--text);">${esc(displayTaskName)}${_taskIdChip({task_board_id: displayTaskBoardId})}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}${taskIsDesc ? ` <span class="task-stale-badge">&middot; no active card</span>` : ''}</div>` : ''}
+      ${!isExp && displayTaskName ? `<div class="card-preview${taskDim || taskIsDesc ? ' task-stale' : ''}" style="font-weight:600;color:var(--text);">${displayTaskBoardId ? _activeTaskLink(s.name, displayTaskBoardId, displayTaskName) : esc(displayTaskName)}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}${taskIsDesc ? ` <span class="task-stale-badge">&middot; no active card</span>` : ''}</div>` : ''}
       ${isExp && s.preview ? `<div class="card-preview">${esc(s.preview)}</div>` : ''}
       ${logSearchMode && _logMatches[s.name] ? (() => {
         const hits = _logMatches[s.name];
@@ -3850,7 +3886,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
         <button class="btn primary" style="width:100%;" onclick="doStart('${s.name}')">&#x25B6; Start</button>
       </div>` : ''}
       <div class="panel" onclick="event.stopPropagation()">
-        ${isExp && displayTaskName ? `<div class="card-task-name${taskDim || taskIsDesc ? ' task-stale' : ''}" title="Click the id to open the board card" style="font-weight:600;"><span onclick="event.stopPropagation();editField('${s.name}','task','${escJs(s.task_override || '')}')" style="cursor:pointer;">${esc(displayTaskName)}</span>${_taskIdChip({task_board_id: displayTaskBoardId})}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}${taskIsDesc ? ` <span class="task-stale-badge">&middot; no active card</span>` : ''}</div>` : ''}
+        ${isExp && displayTaskName ? `<div class="card-task-name${taskDim || taskIsDesc ? ' task-stale' : ''}" title="Open the active board card" style="font-weight:600;">${displayTaskBoardId ? _activeTaskLink(s.name, displayTaskBoardId, displayTaskName) : `<span onclick="event.stopPropagation();editField('${s.name}','task','${escJs(s.task_override || '')}')" style="cursor:pointer;">${esc(displayTaskName)}</span>`}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}${taskIsDesc ? ` <span class="task-stale-badge">&middot; no active card</span>` : ''}</div>` : ''}
         ${isExp && s.running ? `<div class="card-timing">
           ${s.session_created ? `<div class="timing-item"><span class="timing-label">Worker</span><span class="timing-value">${fmtDuration(Math.floor(Date.now()/1000) - s.session_created)}</span></div>` : ''}
           ${s.task_time ? `<div class="timing-item"><span class="timing-label">Task</span><span class="timing-value accent">${esc(s.task_time)}</span></div>` : ''}
@@ -4066,6 +4102,61 @@ function _taskIdChip(s) {
   return ' <span class="task-id-chip" onclick="event.stopPropagation();_openIssue(\'' + escJs(id) + '\')" '
     + 'title="Open board card ' + esc(id) + '" '
     + 'style="cursor:pointer;font-size:0.7rem;font-weight:600;color:var(--accent);border:1px solid var(--accent);border-radius:6px;padding:0 6px;margin-left:4px;white-space:nowrap;">' + esc(id) + '</span>';
+}
+
+// A rendered worker/card pair is one immutable selection. If either side has
+// moved by click time, the DOM is stale and must not open/edit whatever the
+// mutable globals happen to name now. This is the card-side twin of the peek
+// open-generation guard.
+function _openWorkerCard(worker, cardId) {
+  const name = String(worker || '');
+  const id = String(cardId || '');
+  const session = (sessions || []).find(s => s.name === name);
+  const current = _runtimeBoardCardId(session);
+  if (!name || !id || current !== id) {
+    _peekIdentityDiscard('worker-card-link', { name, generation: _peekOpenGeneration }, id);
+    showToast(id + ' is no longer ' + name + '\'s active task — refreshed instead');
+    render();
+    return;
+  }
+  _openIssue(id);
+}
+
+function _activeTaskLink(worker, cardId, title) {
+  return '<button type="button" class="worker-active-task-link" data-worker="' + esc(worker)
+    + '" data-card="' + esc(cardId) + '" onclick="event.stopPropagation();_openWorkerCard(\''
+    + escJs(worker) + '\',\'' + escJs(cardId) + '\')" '
+    + 'aria-label="Open active task ' + esc(cardId) + ' for ' + esc(worker) + '" '
+    + 'title="Open board card ' + esc(cardId) + '" style="background:none;border:0;padding:0;'
+    + 'font:inherit;font-weight:inherit;color:inherit;text-align:left;cursor:pointer;">'
+    + esc(title) + ' <span class="task-id-chip" style="font-size:0.7rem;color:var(--accent);'
+    + 'border:1px solid var(--accent);border-radius:6px;padding:0 6px;white-space:nowrap;">'
+    + esc(cardId) + '</span></button>';
+}
+
+function _bindPeekTaskIdentity(s, identity) {
+  const row = document.getElementById('peek-task-row');
+  const label = document.getElementById('peek-task-label');
+  if (!row || !label || !_peekIdentityCurrent(identity) || !s || s.name !== identity.name) return;
+  const runtime = _runtimeBoardPresentation(s);
+  const cardId = runtime.cardId || '';
+  const title = runtime.syncing
+    ? 'Synchronizing runtime/board truth…'
+    : (s.task_name || cardId || '');
+  row.style.display = title ? 'flex' : 'none';
+  label.textContent = title;
+  label.dataset.worker = s.name;
+  label.dataset.card = cardId;
+  label.title = cardId ? 'Open active board card ' + cardId : 'Edit task label';
+  label.onclick = (event) => {
+    event.stopPropagation();
+    if (!_peekIdentityCurrent(identity)) {
+      _peekIdentityDiscard('peek-task-link', identity, label.dataset.card || '');
+      return;
+    }
+    if (cardId) _openWorkerCard(s.name, cardId);
+    else editField(s.name, 'task', s.task_override || '');
+  };
 }
 async function _askCardStatus(id, sess) {
   // The list item can be stale exactly when this button is most useful: an old
@@ -9312,6 +9403,8 @@ function _paintCachedPeek(cached) {
   return true;
 }
 function openPeek(name, opts) {
+  _peekOpenGeneration++;
+  const openIdentity = _peekIdentity(name);
   try { _applyPeekTabVisibility(); } catch(e) {}
   _peekPollStop('switch');   // wind down any prior open-view poller (beaconed)
   if (_transcriptTimer) { clearInterval(_transcriptTimer); _transcriptTimer = null; }
@@ -9326,6 +9419,11 @@ function openPeek(name, opts) {
     _peekFilesRestore(name);
   }
   peekSession = name;
+  const identityOverlay = document.getElementById('peek-overlay');
+  if (identityOverlay) {
+    identityOverlay.dataset.session = name;
+    identityOverlay.dataset.generation = String(openIdentity.generation);
+  }
   _lastPeekedSession = name;   // remembered for the Messages view's default filter
   _peekScrollLocked = false;
   // Reset the Plan strip so it reloads for the new session (no stale flash).
@@ -9393,9 +9491,7 @@ function openPeek(name, opts) {
   document.getElementById('peek-title').textContent = name;
   const _peekSess = sessions.find(s => s.name === name);
   const _peekTask = _peekSess && _peekSess.task_name;
-  const peekTaskRow = document.getElementById('peek-task-row');
-  peekTaskRow.style.display = _peekTask ? 'flex' : 'none';
-  if (_peekTask) document.getElementById('peek-task-label').textContent = _peekTask;
+  _bindPeekTaskIdentity(_peekSess, openIdentity);
   updatePeekStatus();
   document.getElementById('peek-body').innerHTML = '<div class="peek-loading"><div class="peek-spin-lg"></div><span>Loading latest…</span></div>';
   // Reset tab badges; will be repopulated by _peekUpdateTabCounts
@@ -9452,9 +9548,9 @@ function openPeek(name, opts) {
   // the fetch is 300ms+ the cached content — with pre-rendered HTML — paints
   // almost immediately instead of showing "Loading latest..." for 150ms+.
   _idb.get('peek_' + name).then(cached => {
-    if (peekSession !== name || !cached) return;
+    if (!_peekIdentityCurrent(openIdentity) || !cached) return;
     setTimeout(() => {
-      if (peekSession !== name) return;
+      if (!_peekIdentityCurrent(openIdentity)) return;
       if (!lastPeekHTML) {
         if (_paintCachedPeek(cached)) {
           const body = document.getElementById('peek-body');
@@ -9471,7 +9567,9 @@ function openPeek(name, opts) {
   // First fetch: live frame with notrim → paints the current terminal (the
   // LATEST) instantly, without waiting on the ~120KB full-history render. The
   // full payload follows and fills in scrollback above.
-  refreshPeek(true, true).finally(() => refreshPeek());
+  refreshPeek(true, true).finally(() => {
+    if (_peekIdentityCurrent(openIdentity)) refreshPeek();
+  });
   _schedulePeekPoll();
   // resize-on-peek + its lease removed (AMUX-2981); the capture is a fixed
   // 220-col pane the reader scrolls, so there is nothing to fit or hold.
@@ -9579,6 +9677,7 @@ function closePeek() {
     _draftSave(peekSession, val);
     _peekFilesStash(peekSession);   // the other half of the same draft
   }
+  _peekOpenGeneration++;   // invalidate every response issued by this open
   peekSession = null;
   peekSearchQuery = '';
   lastPeekHTML = '';
@@ -9592,6 +9691,8 @@ function closePeek() {
   if (splitBtn) splitBtn.classList.remove('active');
   const ov = document.getElementById('peek-overlay');
   ov.classList.remove('active', 'vv-compact', 'peek-focus');
+  delete ov.dataset.session;
+  delete ov.dataset.generation;
   ov.style.height = '';
   ov.style.top = '';
   ov.style.bottom = '';
@@ -10729,21 +10830,35 @@ function _peekEarlierHTML() {
 async function _peekLoadEarlier(options) {
   const quiet = !!(options && options.quiet);
   const name = peekSession;
-  if (!name || _peekEarlier.loading) return 'busy';
-  if (_peekEarlier.done) return 'beginning';
-  _peekEarlier.loading = true;
+  const identity = _peekIdentity(name);
+  const earlier = _peekEarlier;
+  if (!name || earlier.loading) return 'busy';
+  if (earlier.done) return 'beginning';
+  earlier.loading = true;
   let verdict = 'error';
   try {
     const r = await fetch(API + '/api/sessions/' + encodeURIComponent(name) +
-      '/log?plain=1&tail_kb=' + _PEEK_LOG_CHUNK_KB + '&before_kb=' + _peekEarlier.loadedKb,
+      '/log?plain=1&tail_kb=' + _PEEK_LOG_CHUNK_KB + '&before_kb=' + earlier.loadedKb,
       { headers: _authHeaders() });
-    if (peekSession !== name) return;
+    const responseSession = r.headers.get('X-Amux-Session') || '';
+    if (!_peekIdentityCurrent(identity)) {
+      _peekIdentityDiscard('earlier-log', identity, responseSession);
+      return 'stale';
+    }
+    if (r.ok && responseSession !== name) {
+      _peekIdentityDiscard('earlier-log', identity, responseSession);
+      return 'identity-mismatch';
+    }
     if (!r.ok) {
       if (!quiet) showToast('No saved log for this worker');
-      if (r.status === 404) _peekEarlier.hidden = true;
+      if (r.status === 404) earlier.hidden = true;
       verdict = 'missing';
     } else {
       const text = await r.text();
+      if (!_peekIdentityCurrent(identity)) {
+        _peekIdentityDiscard('earlier-log-body', identity, responseSession);
+        return 'stale';
+      }
       const remaining = parseInt(r.headers.get('X-Log-Remaining') || '0', 10);
       // THROUGH THE SAME PIPELINE AS THE LIVE VIEW (AMUX-4021). This was
       // `esc(text)`, which is raw escaped text with none of the peek render
@@ -10761,10 +10876,10 @@ async function _peekLoadEarlier(options) {
       // stops a 220-column pane rule forcing a scroller; `_linkifyPaths` and
       // `highlightPrompts` make the earlier text behave like the live text it
       // is continuous with.
-      _peekEarlier.chunks.unshift('<span class="pe-chunk">' + _peekHtml(text) + '</span>');
-      _peekEarlier.loadedKb += _PEEK_LOG_CHUNK_KB;
-      _peekEarlier.done = remaining <= 0;
-      verdict = text.trim() ? 'loaded' : (_peekEarlier.done ? 'beginning' : 'empty');
+      earlier.chunks.unshift('<span class="pe-chunk">' + _peekHtml(text) + '</span>');
+      earlier.loadedKb += _PEEK_LOG_CHUNK_KB;
+      earlier.done = remaining <= 0;
+      verdict = text.trim() ? 'loaded' : (earlier.done ? 'beginning' : 'empty');
     }
     // Paint immediately (refreshPeek skips DOM writes while scrolled up) and
     // anchor at the bottom of the just-loaded chunk so reading continues
@@ -10778,7 +10893,7 @@ async function _peekLoadEarlier(options) {
     if (!quiet) showToast('Could not load log');
     verdict = 'error';
   }
-  finally { _peekEarlier.loading = false; }
+  finally { earlier.loading = false; }
   return verdict;
 }
 
@@ -10801,6 +10916,7 @@ function _fitRules(html) {
 
 async function refreshPeek(liveOnly, bypassTrim) {
   const name = peekSession;
+  const identity = _peekIdentity(name);
   if (!name) return;
   // Refresh the Plan strip (throttled — task files change slowly).
   if (performance.now() - _peekPlanLast > 8000) { _peekPlanLast = performance.now(); _peekLoadPlan(); }
@@ -10815,9 +10931,9 @@ async function refreshPeek(liveOnly, bypassTrim) {
     // transcript history) follows and fills in scrollback. Only the full response
     // carries the ETag the poll conditions on.
     const _et = liveOnly ? _peekLiveEtag : _peekEtag;
-    const r = await fetch(API + '/api/sessions/' + name + '/peek?lines=300' + (liveOnly ? '&live=1' : '') + (bypassTrim ? '&notrim=1' : ''),
+    const r = await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/peek?lines=300' + (liveOnly ? '&live=1' : '') + (bypassTrim ? '&notrim=1' : ''),
       _et ? { headers: { 'If-None-Match': _et } } : undefined);
-    if (peekSession !== name) return;
+    if (!_peekIdentityCurrent(identity)) return;
     hidePeekLoading();   // a response arrived (200 painted below, or 304 = already latest) → drop the "Loading latest…" cue
     if (!liveOnly) _peekLastFullMs = performance.now();   // history is fresh (200 or 304)
     // AF-83: a peek on a session that NO LONGER EXISTS 404s, and this poller had
@@ -10844,6 +10960,11 @@ async function refreshPeek(liveOnly, bypassTrim) {
     if (liveOnly) _peekLiveEtag = r.headers.get('ETag') || _peekLiveEtag;
     else _peekEtag = r.headers.get('ETag') || _peekEtag;
     const data = await r.json();
+    if (!_peekIdentityCurrent(identity)) return;
+    if (data.name !== name) {
+      _peekIdentityDiscard('live-peek', identity, data.name || '');
+      return;
+    }
     // Alt-screen peeks return history + live SEPARATELY so a poll can re-render just
     // the live frame. A live=1 poll carries no history (keep what we already have);
     // non-alt/legacy shapes send one `output` blob — treat that as the live part.
@@ -10917,13 +11038,15 @@ async function refreshPeek(liveOnly, bypassTrim) {
     // Cache BOTH slices — since the live-split, `output` alone is just the tiny
     // live frame (sometimes ''), which painted an EMPTY black peek from cache
     // (social, 2026-07-16). Never write an entry with no content.
-    if (_peekHistoryRaw || _lastPeekRaw) _idb.set('peek_' + peekSession, { output: _lastPeekRaw, history: _peekHistoryRaw, liveHTML: _lastLiveHTML, histHTML: _peekHistoryHTML, time: Date.now() });
+    if (_peekHistoryRaw || _lastPeekRaw) _idb.set('peek_' + name, { output: _lastPeekRaw, history: _peekHistoryRaw, liveHTML: _lastLiveHTML, histHTML: _peekHistoryHTML, time: Date.now() });
   } catch(e) {
+    if (!_peekIdentityCurrent(identity)) return;
     console.error('peek:', e);
     hidePeekLoading();   // fetch failed — stop the "Loading latest…" cue (we fall back to cache / retry below)
     // Offline: load cached peek
     if (!lastPeekHTML || lastPeekHTML.includes('Loading...')) {
-      const cached = await _idb.get('peek_' + peekSession);
+      const cached = await _idb.get('peek_' + name);
+      if (!_peekIdentityCurrent(identity)) return;
       if (!_paintCachedPeek(cached)) {
         // No usable cache and the fetch failed (typically the server mid-restart,
         // ~11s). Say so — the poll keeps retrying and heals within seconds; a
@@ -14612,7 +14735,7 @@ function _msgOpenCard(cardId) {
   setTimeout(() => openBoardDetail(id), 250);
 }
 
-function _msgCardChip(cardId, message) {
+function _msgCardChip(cardId, message, linkedCard) {
   if (!cardId) return '';
   const live = (typeof boardItems !== 'undefined' && Array.isArray(boardItems))
     ? boardItems.find(i => i.id === cardId) : null;
@@ -14620,9 +14743,8 @@ function _msgCardChip(cardId, message) {
   // Treat the history API's authoritative issues-table metadata as a real card,
   // rather than claiming an archived/older card is "gone" merely because this
   // browser has not loaded it into `boardItems` (MSG-38618 / TUBES-2372).
-  const recorded = message && typeof message === 'object'
-    && (message.card_title != null || message.card_status != null);
-  const c = live || (recorded ? {
+  const recorded = linkedCard || (message && typeof message === 'object'
+    && (message.card_title != null || message.card_status != null) ? {
     id: cardId,
     title: message.card_title || '',
     status: message.card_status || 'todo',
@@ -14630,6 +14752,7 @@ function _msgCardChip(cardId, message) {
     deleted: message.card_deleted != null,
     log: ''
   } : null);
+  const c = live || recorded;
   const stC = st => st === 'verified' ? 'var(--green)' : st === 'done' ? '#3fb950'
     : st === 'doing' ? '#d29922' : st === 'review' ? '#bc8cff'
     : st === 'discarded' ? 'var(--dim)' : 'var(--accent)';
@@ -14646,6 +14769,22 @@ function _msgCardChip(cardId, message) {
     + 'color:' + (c ? stC(st) : 'var(--dim)') + ';">\u2192 ' + esc(cardId)
     + (c ? ' \u00B7 ' + esc(undec ? 'captured, not yet decomposed' : displaySt) : ' \u00B7 gone')
     + (lastCommit ? ' \u00B7 \u2318' : '') + '</button>';
+}
+
+function _msgCardChips(message) {
+  if (!message || typeof message === 'string') return '';
+  // The scalar is retained for old servers and historical rows. New servers
+  // return the complete durable epic lineage, because one source prompt can be
+  // decomposed into a parent plus several independently actionable children.
+  const linked = Array.isArray(message.linked_cards) ? message.linked_cards : [];
+  if (!linked.length) return _msgCardChip(message.card_id || '', message, null);
+  const seen = new Set();
+  return linked.map(card => {
+    const id = String((card && card.id) || '').trim();
+    if (!id || seen.has(id)) return '';
+    seen.add(id);
+    return _msgCardChip(id, message, card);
+  }).join('');
 }
 
 // Canonical message row. THREE surfaces fetch /api/history and each kept its own
@@ -14677,7 +14816,8 @@ function _msgNorm(x) {
            time: t, ts: t, origin: x.origin || '', kind: x.kind,
            queued: x.queued, card_id: x.card_id || '',
            card_title: x.card_title, card_status: x.card_status,
-           card_archived: x.card_archived, card_deleted: x.card_deleted };
+           card_archived: x.card_archived, card_deleted: x.card_deleted,
+           linked_cards: Array.isArray(x.linked_cards) ? x.linked_cards : [] };
 }
 // ONE row renderer for all three message surfaces. `ctx` carries only what
 // genuinely differs — which selection set the checkbox belongs to, which resend
@@ -14746,7 +14886,7 @@ function _cmdHistItemHTML(e, ctx) {
     ? `<code class="msg-id-badge" title="Message id — click to copy" onclick="event.stopPropagation();_copyMsgId('${esc(_mid)}')">MSG-${esc(_mid)}</code>`
     : '';
   const meta = tag + _msgDeliveryChip(e) + _msgSubmitChip(e) + sessTag + tsTag + idTag
-    + _msgCardChip(typeof e === 'string' ? '' : (e.card_id || ''), e);
+    + _msgCardChips(e);
   const locSess = (session || (typeof peekSession !== 'undefined' ? peekSession : '') || '').replace(/'/g,'');
   const _target = ctx.target(e) || locSess;
   // A MATCHING message is force-expanded while a search is active, even if the
@@ -27278,6 +27418,19 @@ async function saveBoardEdit() {
 // ── Board detail (full-screen) ──
 let boardDetailId = null;
 let boardDetailStatus = 'todo';
+let _boardDetailOpenGeneration = 0;
+function _boardDetailIdentityDiscard(requestedId, generation, responseId) {
+  try {
+    fetch(API + '/api/client-debug', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
+      body: JSON.stringify({ kind: 'board-detail-identity-discard', requested_card: requestedId,
+        response_card: responseId || null, current_card: boardDetailId,
+        request_generation: generation, current_generation: _boardDetailOpenGeneration,
+        verdict: 'stale_or_cross_card_response_refused', measured: true, n_considered: 1,
+        ver: APP_VER })
+    }).catch(() => {});
+  } catch (e) {}
+}
 // Persisted to localStorage (AMUX-2209): board-detail edits typed OFFLINE
 // used to live only in memory — a reload or iOS killing the backgrounded PWA
 // destroyed them. Hydrated at boot, saved on every draft write.
@@ -27664,6 +27817,8 @@ async function _bdHydrate(id) {
 }
 
 async function openBoardDetail(id) {
+  const detailGeneration = ++_boardDetailOpenGeneration;
+  const detailIdentityCurrent = () => detailGeneration === _boardDetailOpenGeneration;
   let item = boardItems.find(i => i.id === id);
   if (!item) {
     // Message history, lineage, and deep links can point at an older terminal
@@ -27672,14 +27827,28 @@ async function openBoardDetail(id) {
     // link into a silent navigation to an unrelated board overview.
     try {
       const fetched = await apiCall(API + '/api/board/' + encodeURIComponent(id));
-      if (!fetched || !fetched.id) throw new Error('Task not found');
-      item = fetched;
-      boardItems.push(fetched);
+      if (!detailIdentityCurrent()) {
+        _boardDetailIdentityDiscard(id, detailGeneration, '');
+        return;
+      }
+      if (!fetched || !fetched.ok) throw new Error('Task not found');
+      const full = await fetched.json();
+      if (!detailIdentityCurrent()) {
+        _boardDetailIdentityDiscard(id, detailGeneration, full && full.id);
+        return;
+      }
+      if (!full || full.id !== id) {
+        _boardDetailIdentityDiscard(id, detailGeneration, full && full.id);
+        throw new Error('Task identity mismatch');
+      }
+      item = full;
+      boardItems.push(full);
     } catch (e) {
       showToast('Could not open ' + id + ': ' + (e.message || e), true);
       return;
     }
   }
+  if (!detailIdentityCurrent()) return;
   boardDetailId = id;
   // Render instantly from cache, then correct it from the server. Blocking the
   // modal on a fetch would make every card open feel slow for a field most
@@ -27903,6 +28072,7 @@ function closeBoardDetail() {
     }
   }
   document.getElementById('board-detail-overlay').classList.remove('active');
+  _boardDetailOpenGeneration++;
   boardDetailId = null;
   _bdActiveDirty = false;
   // Refresh peek issues panel if open
@@ -32561,7 +32731,12 @@ function _restoreScreen() {
     } catch(e) {}
   }
   if (_ps && _ps.session) {
+    // A deliberate open/close between boot and this delayed restore is newer
+    // than saved state. Do not let the timer reopen another worker (and its
+    // draft) over what the human just selected.
+    const restoreGeneration = _peekOpenGeneration;
     setTimeout(() => {
+      if (peekSession || _peekOpenGeneration !== restoreGeneration) return;
       openPeek(_ps.session);
       // Restore the tab WITHIN the peek — guarded on the button still
       // existing, because localStorage outlives removed tabs (the notes-view
