@@ -1101,8 +1101,10 @@ fn status_pane_check(state: &AppState) -> Vec<InvariantResult> {
         .into_iter()
         .map(|(name, pane_says_working)| {
             let rep = signals.reports.get(&name).cloned().unwrap_or(json!({}));
+            let (status, status_explain) = signals.derive_status_explain(&name, true);
             checks::LaneTruth {
-                status: signals.derive_status(&name, true),
+                status,
+                status_explain,
                 pane_says_working,
                 report_state: rep["state"].as_str().unwrap_or("").into(),
                 report_age_s: signals.now - rep["ts"].as_f64().unwrap_or(signals.now),

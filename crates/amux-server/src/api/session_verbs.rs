@@ -2515,6 +2515,21 @@ fn codex_rollout_files() -> Vec<(std::time::SystemTime, PathBuf)> {
 /// resolver can associate it with the worker life that created it instead of
 /// assigning the newest sibling rollout to every worker in that directory.
 fn rollout_identity(path: &Path) -> Option<(String, f64)> {
+    // Only the immutable session_meta header is cached, never turn events.
+    // Checking uniqueness must cover the full population (an 80-file cutoff
+    // can hide the other candidate), but fleet readers need not reopen every
+    // historical header for every worker. Unreadable headers are not cached: a newborn
+    // rollout may still be writing its first line.
+    type IdentityCache = std::collections::HashMap<PathBuf, (std::time::Instant, Option<(String, f64)>)>;
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<IdentityCache>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Ok(c) = cache.lock() {
+        if let Some((at, identity)) = c.get(path) {
+            if at.elapsed().as_secs() < 30 {
+                return identity.clone();
+            }
+        }
+    }
     let Ok(f) = std::fs::File::open(path) else { return None };
     let mut reader = std::io::BufReader::new(f);
     let mut line = String::new();
@@ -2524,42 +2539,53 @@ fn rollout_identity(path: &Path) -> Option<(String, f64)> {
     if v.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
         return None;
     }
-    let cwd = normalize_work_dir(v.pointer("/payload/cwd").and_then(|c| c.as_str())?);
-    let started = v
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .and_then(parse_iso8601)?;
-    Some((cwd, started))
+    // A spawned agent shares the cwd and may start in the same window, but
+    // its turn boundaries describe that agent, never the worker's main turn.
+    let identity = if v.pointer("/payload/source").is_some_and(Value::is_object) {
+        None
+    } else {
+        let cwd = normalize_work_dir(v.pointer("/payload/cwd").and_then(|c| c.as_str())?);
+        let started = v.get("timestamp").and_then(Value::as_str).and_then(parse_iso8601)?;
+        Some((cwd, started))
+    };
+    if let Ok(mut c) = cache.lock() {
+        c.retain(|_, (at, _)| at.elapsed().as_secs() < 30);
+        c.insert(path.to_path_buf(), (std::time::Instant::now(), identity.clone()));
+    }
+    identity
 }
 
 const CODEX_ROLLOUT_START_WINDOW_S: f64 = 15.0 * 60.0;
 const CODEX_ROLLOUT_EARLY_GRACE_S: f64 = 30.0;
 
-/// Pick the rollout born nearest this worker life, never merely the newest
-/// rollout in the same checkout.  The bounded window accommodates startup
+/// Pick a rollout only when this worker life's startup window is unambiguous.
+/// The bounded window accommodates startup
 /// pickers (the live ATE-42 specimen created its rollout six minutes after
-/// `last_started`) while refusing to borrow a later sibling's conversation.
+/// `last_started`). Nearness is not ownership: AMUX-4220 had two workers
+/// starting together, and both selected the same sibling's completed turn.
 fn rollout_for_worker_start<'a>(
     files: &'a [(std::time::SystemTime, PathBuf)],
     cwd: &str,
     started: f64,
-) -> Option<&'a PathBuf> {
+) -> Result<Option<&'a PathBuf>, Vec<&'a PathBuf>> {
     if cwd.is_empty() || started <= 0.0 {
-        return None;
+        return Ok(None);
     }
-    files
+    let candidates: Vec<_> = files
         .iter()
-        .take(80)
         .filter_map(|(_, path)| {
             let (rollout_cwd, rollout_started) = rollout_identity(path)?;
             let delta = rollout_started - started;
             (rollout_cwd == cwd
                 && (-CODEX_ROLLOUT_EARLY_GRACE_S..=CODEX_ROLLOUT_START_WINDOW_S)
                     .contains(&delta))
-                .then_some((delta.abs(), path))
+                .then_some(path)
         })
-        .min_by(|(a, _), (b, _)| a.total_cmp(b))
-        .map(|(_, path)| path)
+        .collect();
+    if candidates.len() > 1 {
+        return Err(candidates);
+    }
+    Ok(candidates.first().copied())
 }
 
 /// Map a codex/ollama worker to its live Codex rollout file: a recorded
@@ -2584,6 +2610,9 @@ pub(crate) fn codex_rollout_path(name: &str) -> Option<PathBuf> {
         }) {
             return Some(p.clone());
         }
+        // A missing explicit identity is not permission to borrow a sibling.
+        warn_codex_rollout_unresolved(name, "claimed_rollout_missing", &[], &sid);
+        return None;
     }
     // 2. Worker-life match. `cwd + newest` cross-linked every worker sharing
     //    a checkout: an active sibling made an idle prompt read WORKING.  A
@@ -2591,7 +2620,25 @@ pub(crate) fn codex_rollout_path(name: &str) -> Option<PathBuf> {
     //    Codex has given us a durable thread id, so use it and decline to guess
     //    outside the bounded startup window.
     let started = meta_i64(&meta, "last_started") as f64;
-    rollout_for_worker_start(&files, &wd, started).cloned()
+    match rollout_for_worker_start(&files, &wd, started) {
+        Ok(path) => path.cloned(),
+        Err(candidates) => {
+            warn_codex_rollout_unresolved(name, "ambiguous_worker_rollout", &candidates, "");
+            None
+        }
+    }
+}
+
+fn warn_codex_rollout_unresolved(name: &str, verdict: &str, candidates: &[&PathBuf], claim: &str) {
+    let now = crate::config::now_f64();
+    let key = format!("codex-rollout-resolution:{name}:{verdict}");
+    if crate::log_dedupe::first_this_bucket(&key, crate::log_dedupe::hour_bucket(now)) {
+        let files: Vec<_> = candidates.iter().filter_map(|p| p.file_name()).collect();
+        tracing::warn!(target: "status_truth", session = name, verdict,
+            measured = true, n_considered = candidates.len(), candidates = ?files,
+            codex_session_id = claim,
+            "Codex rollout ownership unresolved; refusing a guessed status/transcript; record the worker's proven codex_session_id (AMUX-4220)");
+    }
 }
 
 /// The latest structured Codex turn boundary recorded in a rollout file.
@@ -2608,6 +2655,7 @@ pub(crate) struct CodexTurnSignal {
     pub state: String,
     pub ts: f64,
     pub boundary: String,
+    pub rollout_file: Option<String>,
 }
 
 fn codex_turn_signal_from_events(lines: &[Value]) -> Option<CodexTurnSignal> {
@@ -2632,6 +2680,7 @@ fn codex_turn_signal_from_events(lines: &[Value]) -> Option<CodexTurnSignal> {
             state: state.into(),
             ts,
             boundary: boundary.into(),
+            rollout_file: None,
         });
     }
     latest
@@ -2649,7 +2698,8 @@ pub(crate) fn codex_rollout_turn_signal(name: &str) -> Option<CodexTurnSignal> {
         return None;
     }
     let path = codex_rollout_path(name)?;
-    let signal = codex_turn_signal_from_events(&iter_jsonl_tail(&path, 32_000_000))?;
+    let mut signal = codex_turn_signal_from_events(&iter_jsonl_tail(&path, 32_000_000))?;
+    signal.rollout_file = path.file_name().map(|p| p.to_string_lossy().into_owned());
     if matches!(signal.boundary.as_str(), "turn_aborted" | "turn.aborted") {
         let now = chrono::Utc::now().timestamp() as f64;
         let key = format!("codex-turn-aborted:{name}:{}", signal.ts);
@@ -22054,15 +22104,15 @@ CLAUDE-POSTFIX-COMPLETE
 
         let amux_start = parse_iso8601("2026-09-03T21:44:10Z").unwrap();
         let e2e_start = parse_iso8601("2026-09-03T23:39:24Z").unwrap();
-        assert_eq!(rollout_for_worker_start(&files, &cwd, amux_start), Some(&older));
-        assert_eq!(rollout_for_worker_start(&files, &cwd, e2e_start), Some(&newer));
+        assert_eq!(rollout_for_worker_start(&files, &cwd, amux_start), Ok(Some(&older)));
+        assert_eq!(rollout_for_worker_start(&files, &cwd, e2e_start), Ok(Some(&newer)));
         assert_eq!(
             rollout_for_worker_start(
                 &files,
                 &cwd,
                 parse_iso8601("2026-09-03T21:50:00Z").unwrap()
             ),
-            None,
+            Ok(None),
             "a pre-restart rollout must not be adopted by the new worker life"
         );
         assert_eq!(
@@ -22071,9 +22121,47 @@ CLAUDE-POSTFIX-COMPLETE
                 &cwd,
                 parse_iso8601("2026-09-04T12:00:00Z").unwrap()
             ),
-            None,
+            Ok(None),
             "outside the bounded startup window the safe answer is unknown"
         );
+    }
+
+    #[test]
+    fn codex_rollout_fallback_refuses_nearest_sibling_even_beyond_the_old_scan_cap() {
+        // AMUX-4220: research started at 22:04:12, pitr at 22:04:14;
+        // their rollouts were born just 1.318 seconds apart. Both nearest
+        // matches chose pitr, so research inherited pitr's idle boundary.
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = normalize_work_dir(dir.path().to_str().unwrap());
+        let write = |name: &str, ts: &str, source: Value| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, json!({"timestamp": ts, "type": "session_meta",
+                "payload": {"cwd": cwd, "source": source}}).to_string()).unwrap();
+            path
+        };
+        let pitr = write("rollout-pitr.jsonl", "2026-09-07T22:09:19.439Z", json!("cli"));
+        let research = write("rollout-research.jsonl", "2026-09-07T22:09:20.757Z", json!("cli"));
+        let child = write("rollout-child.jsonl", "2026-09-07T22:04:13Z",
+            json!({"subagent": {"thread_spawn": {"parent_thread_id": "research"}}}));
+        let stamp = std::time::SystemTime::UNIX_EPOCH;
+        let started = parse_iso8601("2026-09-07T22:04:12Z").unwrap();
+        let mut files = vec![(stamp, child), (stamp, pitr.clone()), (stamp, research.clone())];
+        for start in [started, parse_iso8601("2026-09-07T22:04:14Z").unwrap()] {
+            let ambiguous = rollout_for_worker_start(&files, &cwd, start).unwrap_err();
+            assert_eq!(ambiguous.len(), 2, "subagents are not main-turn candidates");
+            assert!(ambiguous.contains(&&pitr) && ambiguous.contains(&&research));
+        }
+        files.reverse();
+        assert!(rollout_for_worker_start(&files, &cwd, started).is_err());
+        files.retain(|(_, p)| p != &pitr);
+        assert_eq!(rollout_for_worker_start(&files, &cwd, started), Ok(Some(&research)));
+
+        // A partial population cannot prove uniqueness. A quiet sibling may
+        // fall behind 80 newer rollouts from completely unrelated work.
+        let unrelated = write("rollout-old.jsonl", "2026-09-06T22:09:19Z", json!("cli"));
+        files.extend((0..80).map(|_| (stamp, unrelated.clone())));
+        files.push((stamp, pitr));
+        assert!(rollout_for_worker_start(&files, &cwd, started).is_err());
     }
 
     /// Codex's trust-directory picker, byte shape captured live 2026-08-11

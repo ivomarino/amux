@@ -1784,6 +1784,7 @@ impl FleetSignals {
             ex.insert("codex_rollout".into(), json!({
                 "state": signal.state,
                 "boundary": signal.boundary,
+                "rollout_file": signal.rollout_file,
                 "age_s": (self.now - signal.ts).max(0.0),
                 "from_this_life": from_this_life,
                 "applied": from_this_life,
@@ -4990,6 +4991,7 @@ Claude usage limit reached. Your limit will reset at 3pm.
                 state: "active".into(),
                 ts: s.now - 120.0,
                 boundary: "task_started".into(),
+                rollout_file: Some("rollout-codex-lane.jsonl".into()),
             },
         );
         let (status, ex) = s.derive_status_explain("codex-lane", true);
@@ -4999,6 +5001,7 @@ Claude usage limit reached. Your limit will reset at 3pm.
         );
         assert_eq!(ex["decided_by"], json!("codex_rollout"));
         assert_eq!(ex["codex_rollout"]["applied"], json!(true));
+        assert_eq!(ex["codex_rollout"]["rollout_file"], json!("rollout-codex-lane.jsonl"));
 
         let signal = s.codex_turns.get_mut("codex-lane").unwrap();
         signal.state = "idle".into();
@@ -5048,6 +5051,7 @@ Claude usage limit reached. Your limit will reset at 3pm.
                 state: "idle".into(),
                 ts: s.now - 1.0,
                 boundary: "turn_aborted".into(),
+                rollout_file: None,
             },
         );
 

@@ -1331,14 +1331,24 @@ pub fn status_agrees_with_pane(lanes: &[LaneTruth]) -> Vec<InvariantResult> {
         // report IS worth a card). The dominant drop producer, reports fired
         // into a 10s restart window, died with AMUX-3458's exec adoption;
         // this grace covers the residue.
-        if l.pane_says_working && l.status == "idle" && l.report_age_s > 120.0 {
+        // AMUX-4220: the raw hook report may be ignored entirely. Codex's
+        // structured boundary then owns both the status and its race window.
+        // Keep the actual derivation in the incident; a stale stop-hook must
+        // not be presented as the cause of a different signal's decision.
+        let decided_by = l.status_explain["decided_by"].as_str().unwrap_or("unknown");
+        let idle_signal_age_s = if decided_by == "codex_rollout" {
+            l.status_explain["codex_rollout"]["age_s"].as_f64().unwrap_or(l.report_age_s)
+        } else {
+            l.report_age_s
+        };
+        if l.pane_says_working && l.status == "idle" && idle_signal_age_s > 120.0 {
             out.push(
                 InvariantResult::fail(
                     ID,
                     "a lane whose pane is mid-turn is not reported idle",
                     format!(
-                        "card={} while the pane shows work (report={} age={:.0}s source={})",
-                        l.status, l.report_state, l.report_age_s, l.report_source
+                        "card={} while the pane shows work (decided_by={} idle_signal_age={:.0}s; report={} age={:.0}s source={})",
+                        l.status, decided_by, idle_signal_age_s, l.report_state, l.report_age_s, l.report_source
                     ),
                 )
                 .entity(&l.name)
@@ -1350,10 +1360,10 @@ pub fn status_agrees_with_pane(lanes: &[LaneTruth]) -> Vec<InvariantResult> {
                     "report_age_s": l.report_age_s,
                     "report_source": l.report_source,
                     "report_origin": l.report_origin,
-                    "class": "report-outranks-physical-evidence",
-                    "incident": "AMUX-2646: a hand-run hook test wrote idle onto a live \
-                                 working lane; an idle report never decays, so nothing \
-                                 could contradict it",
+                    "decided_by": decided_by,
+                    "idle_signal_age_s": idle_signal_age_s,
+                    "status_explain": l.status_explain,
+                    "class": "derived-idle-disagrees-with-working-pane",
                 })),
             );
         } else {
@@ -1445,6 +1455,9 @@ pub struct LaneTruth {
     pub name: String,
     /// What the card says (the derived status).
     pub status: String,
+    /// Captured by the same derivation, at evaluation time, not reconstructed
+    /// later after the pane or winning signal has changed.
+    pub status_explain: serde_json::Value,
     /// What the pane says — computed with the SAME detectors the derivation
     /// uses, so the check and the mechanism cannot disagree about what
     /// "working" means.
@@ -4822,6 +4835,7 @@ mod negative_controls {
         let lanes = vec![LaneTruth {
             name: "amux-rust".into(),
             status: "idle".into(),
+            status_explain: json!({"decided_by": "report"}),
             pane_says_working: true,
             report_state: "idle".into(),
             report_age_s: 1076.0,
@@ -4847,6 +4861,7 @@ mod negative_controls {
         let lanes = vec![LaneTruth {
             name: "amux-gtm".into(),
             status: "idle".into(),
+            status_explain: json!({"decided_by": "report"}),
             pane_says_working: true,
             report_state: "idle".into(),
             report_age_s: 8.0,
@@ -4860,6 +4875,31 @@ mod negative_controls {
         );
     }
 
+    #[test]
+    fn codex_pane_disagreement_records_the_deciding_signal_and_uses_its_age() {
+        let mut lane = LaneTruth {
+            name: "mvs-research".into(), status: "idle".into(), pane_says_working: true,
+            report_state: "idle".into(), report_age_s: 107736.0,
+            report_source: "stop-hook".into(), report_origin: "mvs-research".into(),
+            status_explain: json!({"decided_by": "codex_rollout",
+                "report": {"applied": false, "from_this_life": false},
+                "codex_rollout": {"state": "idle", "age_s": 8.0,
+                    "boundary": "task_complete", "applied": true,
+                    "rollout_file": "rollout-sibling.jsonl"}}),
+        };
+        assert_eq!(status_agrees_with_pane(&[lane.clone()])[0].status, Status::Pass,
+            "a fresh provider boundary has grace even when an ignored hook is days old");
+        lane.status_explain["codex_rollout"]["age_s"] = json!(3000.0);
+        // Conversely, a fresh ignored hook cannot hide an aged contradiction.
+        lane.report_age_s = 1.0;
+        let r = status_agrees_with_pane(&[lane.clone()]).remove(0);
+        assert_eq!(r.status, Status::Fail);
+        assert!(r.observed.contains("decided_by=codex_rollout"), "{r:?}");
+        assert_eq!(r.evidence["status_explain"], lane.status_explain);
+        assert_eq!(r.evidence["idle_signal_age_s"], json!(3000.0));
+        assert_eq!(r.evidence["class"], "derived-idle-disagrees-with-working-pane");
+    }
+
     /// ...and must NOT fire in the other direction. A lane reported `active`
     /// with a quiet pane is a long tool call or a subagent, which is normal —
     /// a check that fires on normal operation is one people switch off.
@@ -4868,6 +4908,7 @@ mod negative_controls {
         let lanes = vec![LaneTruth {
             name: "amux".into(),
             status: "active".into(),
+            status_explain: json!({"decided_by": "report"}),
             pane_says_working: false,
             report_state: "active".into(),
             report_age_s: 4.0,
@@ -4884,6 +4925,7 @@ mod negative_controls {
         let lanes = vec![LaneTruth {
             name: "amux".into(),
             status: "active".into(),
+            status_explain: json!({"decided_by": "report"}),
             pane_says_working: true,
             report_state: "active".into(),
             report_age_s: 2.0,
@@ -4902,6 +4944,7 @@ mod negative_controls {
         let lanes = vec![LaneTruth {
             name: "gtm-engine".into(),
             status: "active".into(),
+            status_explain: json!({"decided_by": "report"}),
             pane_says_working: false,
             report_state: "idle".into(),
             report_age_s: 30.0,
@@ -4924,6 +4967,7 @@ mod negative_controls {
         let lanes = vec![LaneTruth {
             name: "gtm-engine".into(),
             status: "active".into(),
+            status_explain: json!({"decided_by": "report"}),
             pane_says_working: false,
             report_state: "idle".into(),
             report_age_s: 120.0, // past the 60s window
@@ -4942,6 +4986,7 @@ mod negative_controls {
         let lanes = vec![LaneTruth {
             name: "gtm-engine".into(),
             status: "active".into(),
+            status_explain: json!({"decided_by": "report"}),
             pane_says_working: true,
             report_state: "idle".into(),
             report_age_s: 30.0,
