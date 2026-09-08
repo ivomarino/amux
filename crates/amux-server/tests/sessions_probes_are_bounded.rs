@@ -126,11 +126,18 @@ fn the_child_liveness_probe_is_one_subprocess_not_one_per_lane() {
     // above passes against a file that simply stopped probing at all — which
     // would read every shell-foreground lane as not-running.
     let outside = SRC[..at].to_string() + &SRC[end..];
-    assert!(
-        outside.contains(r#"c.args(["-eo", "pid=,ppid=,state=,comm="])"#),
-        "premise gone: the one-shot process-table probe is not outside the loop, so \
-         'no spawns inside the loop' means 'no liveness probe at all'"
-    );
+    let probe_start = outside.find("let ps_probe = {").expect("single process snapshot is missing");
+    let probe = outside[probe_start..].split("};").next().unwrap();
+    assert_eq!(probe.matches(r#"Command::new("ps")"#).count(), 1, "snapshot must run ps once");
+    let args = probe.lines().find(|line| line.trim_start().starts_with("c.args("))
+        .expect("process snapshot has no argument list");
+    let literals: Vec<_> = args.split('"').skip(1).step_by(2).collect();
+    assert!(literals.contains(&"-eo"), "snapshot must enumerate the full process population");
+    assert!(literals.iter().any(|columns| columns.split(',').any(|c| c == "ppid=")),
+        "snapshot must contain parent identity; additional process fields are allowed: {args}");
+    assert!(probe.contains(r#"run_bounded(c, probe_budget(), "ps/ppid")"#),
+        "the single process snapshot must retain its deadline and diagnostic identity");
+    eprintln!("gate_probe verdict=bounded_fleet_process_snapshot measured=true n_considered=1 args={args}");
     assert!(
         outside.contains("sessions_with_codex_tool_children(&pane_roots, out)"),
         "the shared process snapshot must also derive provider tool-child activity rather than \

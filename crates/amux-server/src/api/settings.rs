@@ -1133,6 +1133,9 @@ mod tests {
     fn guard_helpers_defaults_and_spellings() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
+        // Empty keys resolve to None, so this exercises the defaults without
+        // inheriting the live host's toggles or another test's config load.
+        std::fs::write(home.join("server.env"), "AMUX_COMMIT_GUARD=\nAMUX_TASK_GUARD=\n").unwrap();
         // Defaults: commit ON, task OFF.
         assert!(commit_guard_enabled(home));
         assert!(!task_guard_enabled(home));

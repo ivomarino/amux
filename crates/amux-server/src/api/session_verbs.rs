@@ -27713,6 +27713,7 @@ mod refusal_status_tests {
             "could not write session env",
         ];
         let mut found = 0usize;
+        let mut match_patterns = 0usize;
         let mut seen: Vec<String> = Vec::new();
         let mut unclassified: Vec<String> = Vec::new();
         let mut at = 0usize;
@@ -27756,11 +27757,12 @@ mod refusal_status_tests {
             if j >= bytes.len() {
                 continue;
             }
-            // A match pattern such as `(false, "doing") =>` has the same
-            // prefix as a tuple outcome, but it is an input arm rather than a
-            // returned failure. Do not ask the HTTP classifier to classify a
-            // board status just because it appears beside a boolean pattern.
-            if rest[j + 1..].trim_start().starts_with(") =>") {
+            // `(false, "doing") => ...` matches an INPUT tuple. It is not
+            // a returned failure message. Keep returned tuples in the scan.
+            if rest[j + 1..].trim_start().strip_prefix(')')
+                .is_some_and(|tail| tail.trim_start().starts_with("=>"))
+            {
+                match_patterns += 1;
                 continue;
             }
             let raw = &rest[..j];
@@ -27813,6 +27815,7 @@ mod refusal_status_tests {
                 unclassified.push(lit.clone());
             }
         }
+        eprintln!("gate_probe verdict=classified_outcomes measured=true n_considered={found} excluded_match_patterns={match_patterns} unclassified={}", unclassified.len());
         // The scan itself must have found something — an extraction bug that
         // matched nothing would pass every assertion above in silence.
         assert!(
