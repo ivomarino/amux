@@ -4177,3 +4177,46 @@ CARD: ATE-92
 SYMPTOM: A hot config change could retain saved card X after X became terminal or a different exact claim replaced it. The launch validator accepted saved Some(X) against current None, and the old worktree could then prevent startup or reintroduce stale work.
 COST: Model-swap acceptance remained unsafe across task completion, despite passing the same-card restart regression.
 FIX: Compare saved and current claim identities including None. Superseded snapshots derive the current exact card or scoped queue and current runtime/configured cwd; a removed old worktree does not block that replacement. swap_context_superseded names the old/current identities. The explicit terminal_after_hot_switch_and_changed_claim_replace_stale_launch_context regression covers both transitions.
+
+---
+## Separate background tasks still held the HTTP runtime for seconds
+AREA: scheduler
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux
+CARD: AMUX-4225
+SYMPTOM: Newly shipped runtime_job_blocking_poll logs measured individual
+  commit-mention-notes, board-drive, orchestrator-runtime and autofix polls
+  holding Tokio workers for 3914ms, 2484ms, 1128ms and 1078ms. Each job had its
+  own task but shared executor threads with health, TLS and worker API calls.
+COST: Owner and TubeScience hit 20s coordination API timeouts; the earlier
+  empty native stack sample could not name the synchronous work responsible.
+FIX: Existing registered jobs use a separate process-owned maintenance runtime,
+  including the two loops that previously spawned before registration. Boot
+  and slow-poll logs name the runtime pool and full source/PID identity. The
+  regression blocks maintenance while real health and board requests must
+  return; host CPU/IO contention and the original unannounced stop remain
+  separate, explicitly unproven parts of the historical incident.
+
+---
+## A clean detached tree ran a dashboard test executable from another checkout
+AREA: gates
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux
+CARD: AMUX-4225
+SYMPTOM: A full gate on clean 21909b7e reported a missing cache prefix and a
+  card-syncing assertion absent from that tree. The executable in the shared
+  target directory embedded a different PR review checkout as its manifest
+  path. Clean source did not imply that the process executed its test binary.
+COST: A full validation run spent more than 15 minutes and reported stale-code
+  failures that could have prompted edits to already-correct source.
+FIX: For this proof, Cargo's RUSTC_WORKSPACE_WRAPPER namespaces workspace
+  artifacts while retaining the one shared CARGO_TARGET_DIR. The wrapper pins
+  the server from its hashed compiler output for the existing AMUX_RESTART_BIN
+  test seam and logs manifest/full-commit origins, refusing a source mismatch.
+  The private receipt and reproducible wrapper are in ~/.amux/logs/amux-4225/.
+  This corrects the verification setup; the default test-contended warning
+  alone remains insufficient proof of executable provenance.

@@ -306,7 +306,7 @@ fn messages_link_schedule_ids_to_the_scheduler() {
 fn message_card_links_survive_the_capped_board_working_set() {
     let app = asset("app.js");
     let start = app
-        .find("function _msgCardChip(cardId, message)")
+        .find("function _msgCardChip(cardId, message, linkedCard)")
         .expect("message card chip must accept authoritative card metadata");
     let tail = &app[start..];
     let end = tail
@@ -318,6 +318,7 @@ fn message_card_links_survive_the_capped_board_working_set() {
         "message.card_status",
         "message.card_archived",
         "message.card_deleted",
+        "const recorded = linkedCard ||",
         "const c = live ||",
         "<button type=\"button\" class=\"msg-card-chip\"",
     ] {
@@ -333,8 +334,8 @@ fn message_card_links_survive_the_capped_board_working_set() {
         "message-card controls must use the shared navigation helper and emit a durable client-debug verdict"
     );
     assert!(
-        app.contains("_msgCardChip(typeof e === 'string' ? '' : (e.card_id || ''), e)"),
-        "the shared history row must pass its authoritative card metadata to the chip"
+        app.contains("+ _msgCardChips(e);"),
+        "the shared history row must render every authoritative task relation"
     );
     assert!(
         app.contains("card_title: x.card_title, card_status: x.card_status"),
@@ -485,7 +486,7 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
         "runtimeBoard.cardId",
         "const displayTaskName = s.task_name || runtimeBoard.cardId || '';",
         "runtimeBoard.syncing ? _runtimeBoardSyncBadge()",
-        "_taskIdChip({task_board_id: displayTaskBoardId})",
+        "_activeTaskLink(s.name, displayTaskBoardId, displayTaskName)",
     ] {
         assert!(render.contains(needle), "session card lost live board linkage `{needle}`");
     }
@@ -506,11 +507,12 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
         "s.status !== 'unattributed'",
         "active-conflicting-claims",
         ">card conflict</span>",
-        ">card syncing</span>",
         "truth.verdict",
     ] {
         assert!(app.contains(needle), "unattributed runtime lost its server-verdict treatment `{needle}`");
     }
+    assert!(!app.contains(">card syncing</span>"),
+        "normal runtime attribution lag must not manufacture a card-syncing warning");
     assert!(
         app.contains("verdict === 'active-conflicting-claims'")
             && app.contains("status-badge rate-limited")
@@ -527,10 +529,10 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
         "let _boardSnapshotEpoch = 0",
         "snapshotEpoch !== _boardSnapshotEpoch",
         "function _runtimeBoardPresentation(s)",
-        "Number(truth.card_count) !== 1",
+        "if (status !== 'linked' || !cardId)",
         "_runtimeBoardSyncBadge()",
     ] {
-        assert!(app.contains(needle), "a stale poll may again publish a false WORKING/no-card combination without `{needle}`");
+        assert!(app.contains(needle), "a stale poll may publish an unmeasured or stale card link without `{needle}`");
     }
     for rejected in ["no board task claimed", "board-unclaimed-mount", "_activeWithoutClaim"] {
         assert!(!app.contains(rejected), "runtime activity must not manufacture the board pseudo-state `{rejected}`");

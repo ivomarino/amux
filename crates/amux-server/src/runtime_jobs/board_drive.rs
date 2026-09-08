@@ -8119,8 +8119,10 @@ mod tests {
         let (id, status, owner, kind) = (id.to_string(), status.to_string(), owner.to_string(), kind.to_string());
         let now = now_f64() as i64;
         store.write(move |conn| {
-            conn.execute("INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type) \
-                          VALUES (?1,?1,'SCOPE: work\n- [ ] do it',?2,'lane',?3,?3,?4,?5)",
+            // These tests exercise dispatch and compensation, so the fixture
+            // must satisfy the continuation contract regardless of host prefs.
+            conn.execute("INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type,next_action) \
+                          VALUES (?1,?1,'SCOPE: work\n- [ ] do it',?2,'lane',?3,?3,?4,?5,'Implement the scoped work')",
                 rusqlite::params![id, status, now, owner, kind])?;
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         }).unwrap();
@@ -8201,7 +8203,7 @@ mod tests {
         drive_card(&store, "IDLE", "todo", "agent", "code");
         let fleet = BoundaryFleet::default();
         let trace = drive_lane(&state, &fleet, "lane").await;
-        assert_eq!(trace.outcome, "assigned");
+        assert_eq!(trace.outcome, "assigned", "{trace:?}");
         assert_eq!(drive_status(&store, "IDLE"), "doing");
         assert_eq!(fleet.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(fleet.delivered.lock().unwrap().len(), 1);

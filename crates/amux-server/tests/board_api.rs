@@ -4696,6 +4696,29 @@ async fn status_update_refuses_cross_worker_blocked_dependency_wip_and_later_sta
     ).await;
     assert_eq!(body["claim_verdict"], json!("external_trigger"));
 
+    let stale_watch = create(&app, json!({
+        "title":"stale external watch", "status":"backlog", "session":"watch-lane",
+        "type":"watch"
+    })).await;
+    let stale_watch_id = stale_watch["id"].as_str().unwrap().to_string();
+    let stale_watch_for_db = stale_watch_id.clone();
+    store.write(move |conn| {
+        conn.execute(
+            "UPDATE issues SET source_ref='wait for auction list', last_verified_at=?1 WHERE id=?2",
+            rusqlite::params![0i64, &stale_watch_for_db],
+        )?;
+        Ok(amux_server::db::WriteOutcome { applied: true, events: vec![] })
+    }).unwrap();
+    let (_, _, body) = send_with(
+        &app, "POST", &format!("/api/board/{stale_watch_id}/status-update"),
+        Some(json!({"text":"auction list still has not fired"})),
+        &[("X-Amux-Worker", "watch-lane")],
+    ).await;
+    assert_eq!(body["claimed"], json!(false));
+    assert_eq!(body["claim_verdict"], json!("dormant_type"));
+    let (_, _, detail) = send(&app, "GET", &format!("/api/board/{stale_watch_id}"), None).await;
+    assert_eq!(detail["status"], json!("backlog"));
+
     let holding = create(&app, json!({
         "title":"current work", "status":"doing", "session":"wip-lane"
     })).await;

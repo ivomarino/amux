@@ -898,7 +898,7 @@ where
         );
         return tokio::spawn(async {});
     }
-    let h = tokio::spawn(super::poll_watch::watch(id, fut));
+    let h = super::executor::spawn(super::poll_watch::watch(id, fut));
     register(id, "loop", interval, Some(h.abort_handle()));
     h
 }
