@@ -6047,3 +6047,63 @@ FIX: AF-506. (b) first — surface "reassign session to the owning lane" in the
  self-implementation attestation; that is a board-state change and is Ethan's to
  approve. Also fix the dispatcher's "move to review" line, which routes people
  into the refusal.
+
+## The staged-guard told a peer their work was at risk from me, because I had read the file
+VALIDATED: amux-frustrations | The entry's sentence is: the staged-guard told a peer their work was at risk from me, because I
+had read the file (copied it OUT to a scratch worktree to verify their fix). That sentence has
+stopped being true, and it took two commits to be able to say so honestly.
+
+MECHANISM: 205d53cd added `source_only_paths`, so a path a command only READS (a `cp` source)
+is not minted as an edit record even though the command as a whole writes. In this history and
+in the running build.
+
+WHY I COULD NOT VALIDATE IT ON THE FIRST ATTEMPT, recorded because it is the reusable part:
+the helper was tested and the WIRING was not. Mutating the call site
+(`if source_only.contains(cand)` -> `if false`) left all 73 git_guard tests green, so unwiring
+the carve-out entirely from the claim loop changed no test. Validating there would have signed
+off my own work on a suite that could not fail for the thing the entry is about.
+
+CLOSED BY 43c71b7e: both carve-outs moved into `claimable_path_candidates`, extracted from
+`recent_edit_paths` so the decision the loop actually makes is testable. Three cells:
+  cp <src> <dst>      source NOT claimable, destination IS
+  grep -n foo <src>   claims nothing
+  echo x >> <src>     STILL claimable (the control; without it an always-empty return
+                      passes the first two and disables attribution entirely)
+Mutation-checked both directions: dropping the carve-out reddens "the copy SOURCE must not be
+claimable"; claiming nothing reddens "the copy DESTINATION must still be claimable: []".
+
+  scripts/test-contended.sh -p amux-server --lib git_guard -> 74 passed, 0 failed (was 73)
+
+LIMIT, stated rather than hidden: this is validated at the deciding layer and in the deployed
+build, not by observing a peer commit after a read. 43c71b7e is unpushed, so CI has not run it.
+The entry's sentence is what I am retiring; the subsystem is not being declared done.
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-07
+SESSION: amux-frustrations
+CARD: AF-550
+SYMPTOM: amux-testing-e2e held an uncommitted fix to a test I had broken on origin/main.
+  To ask them to land it with evidence rather than a guess, I read the file (sed/awk) and
+  copied it OUT to a detached scratch worktree to prove their fix compiled and passed —
+  shared -> scratch, never the reverse, zero writes to the shared tree. When they went to
+  commit, the guard told them: "the staged set includes 1 file(s) whose edit records are
+  YOURS ... differs from HEAD and you have no commit for it; the WORK ITSELF is at risk —
+  CHECK THIS ONE". Nothing in that file was mine. `git diff HEAD` showed 10 added lines,
+  all of them their fixture; both of my commits to the path (4c068e80, b1f8f9e5) were
+  already on origin.
+COST: A commit stalled on a warning about a lane that had only verified it. The specific
+  cost is the phrasing "the WORK ITSELF is at risk", which is the one line that should stop
+  a commit outright, spent on a false positive — and it fires most readily against the
+  careful behaviour, since the sessions that touch a peer's file to CHECK it are exactly
+  the ones that generate reads. It also cost me the reciprocal warning ("scripts/
+  push-consent.sh was also edited by amux-cloud") on a file I had created minutes earlier,
+  which was my own mutate.sh runs moving the mtime.
+FIX: The edit record is built from Bash commands that MENTION a path, and a mention cannot
+  separate `cat`/`sed`/`awk`/`cp <src>` from a write. Two options, and the second is the
+  real one: (1) classify the verb — a read-only command naming a path is not an edit
+  record, and READ_ONLY_VERBS already exists in git_guard.rs for the shared-checkout guard;
+  (2) stop inferring from commands at all and use the tool-call record, which knows Edit
+  from Read exactly. AF-179 records the mirror of this on the co-edit side, where the guard
+  itself prints "OBSERVED claim, not a recorded write" — the victim column has the same
+  defect and no such caveat, so the weaker signal carries the stronger words.
