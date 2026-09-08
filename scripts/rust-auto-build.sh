@@ -100,6 +100,65 @@ echo $$ > "$LOCK/pid"
 last=$(cat "$STAMP" 2>/dev/null || echo "")
 [ "$head" = "$last" ] && exit 0
 
+# A COMMITTED stale-base tip can still be unsafe to adopt.  The real ATE-93
+# specimen was exactly that: 7c6f7b80 was not a revert of 31768303; it was a
+# divergent unpushed tip whose automatic adoption replaced the live image.
+#
+# Ask the currently running server about the COMMIT'S attributed worker, not
+# this launchd process.  A linked non-owner cannot deploy while the semantic
+# concern remains pending.  The first binary that introduces this endpoint
+# naturally sees a 404 from its predecessor; that one bootstrap adoption is
+# named in the log, while any later unknown answer REFUSES adoption rather than
+# treating an unmeasured permit as permission.
+overlap_deploy_permitted() {
+  local lane api reply code body allowed
+  lane=$(git -C "$REPO" log -1 --format='%(trailers:key=Amux-Session,valueonly,separator=)' "$built_sha" 2>/dev/null | head -n1)
+  case "$lane" in
+    ""|"(human)") return 0 ;;
+  esac
+  api="${AMUX_URL:-}"
+  if [ -z "$api" ] && [ -r "$HOME/.amux/endpoint.json" ]; then
+    api=$(python3 - "$HOME/.amux/endpoint.json" <<'PY' 2>/dev/null || true
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+    print(d.get('url') or d.get('endpoint') or '')
+except Exception:
+    pass
+PY
+)
+  fi
+  api="${api:-https://localhost:8824}"
+  reply=$(curl -sk --max-time 8 -w $'\n%{http_code}' \
+    "$api/api/board/overlap/deployment-permit?session=$lane" 2>/dev/null) || {
+      echo "== !! OVERLAP GUARD UNMEASURED $built_sha — permit probe failed for $lane; refusing adoption" >> "$LOG"
+      return 1
+    }
+  code=${reply##*$'\n'}
+  body=${reply%$'\n'*}
+  if [ "$code" = "404" ]; then
+    echo "== !! OVERLAP GUARD BOOTSTRAP $built_sha — running server predates permit endpoint; allowing first adoption only" >> "$LOG"
+    return 0
+  fi
+  if [ "$code" != "200" ]; then
+    echo "== !! OVERLAP GUARD REFUSED $built_sha — permit HTTP $code for $lane: ${body:0:300}" >> "$LOG"
+    return 1
+  fi
+  allowed=$(printf '%s' "$body" | python3 -c 'import json,sys; print("yes" if json.load(sys.stdin).get("allowed") is True else "no")' 2>/dev/null || echo no)
+  if [ "$allowed" != yes ]; then
+    echo "== !! OVERLAP GUARD REFUSED $built_sha — $lane is a linked non-owner; reconcile/scope-split before deployment: ${body:0:500}" >> "$LOG"
+    return 1
+  fi
+  return 0
+}
+
+if ! overlap_deploy_permitted; then
+  # Do not advance the stamp: a later explicit reconciliation must make this
+  # exact committed tree eligible again, and the refusal line above is a sweep
+  # signal rather than a silent no-op.
+  exit 0
+fi
+
 # PROVENANCE (AEAB-12). This builder rebuilds whenever $REPO's local HEAD moves
 # and does not care whether HEAD is on main or on somebody's feature branch. The
 # server then self-adopts within 5s. That permissiveness is CORRECT and must stay:
