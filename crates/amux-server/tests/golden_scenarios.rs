@@ -204,20 +204,44 @@ async fn drive_to_done(app: &axum::Router, sem: &str, actor: &str) {
     assert_eq!(v["status"], json!("done"), "{v}");
 }
 
-/// POST /api/verify/{id} with a single typed Command criterion.
-async fn run_verify(app: &axum::Router, sem: &str, cmd: &str, actor: &str) -> Value {
+/// Persist one document-authored typed Command criterion before execution.
+/// Verification is intentionally unable to accept executable criteria in its
+/// request body: it can only run this stored, versioned contract.
+async fn store_command_criterion(app: &axum::Router, sem: &str, cmd: &str) -> u32 {
     let body = json!({
         "criteria": [{
+            "id": format!("cri_{}", ulid::Ulid::new()),
             "description": format!("golden criterion: `{cmd}` exits 0"),
             "verifier": { "kind": "command", "cmd": cmd, "expected_exit": 0 },
             "required": true
-        }]
+        }],
+        "authored_by": { "kind": "document" },
+        "version": 1
     });
+    let (st, v) = send_with(
+        app,
+        "PUT",
+        &format!("/api/criteria/{sem}"),
+        Some(body),
+        &[],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "store criteria for {sem}: {v}");
+    1
+}
+
+/// POST /api/verify/{id} against an immutable stored criteria version.
+async fn run_verify(
+    app: &axum::Router,
+    sem: &str,
+    criteria_version: u32,
+    actor: &str,
+) -> Value {
     let (st, v) = send_with(
         app,
         "POST",
         &format!("/api/verify/{sem}"),
-        Some(body),
+        Some(json!({ "criteria_version": criteria_version })),
         &[("X-Amux-Session", actor)],
     )
     .await;
@@ -429,6 +453,12 @@ async fn golden_failure_and_retry() {
 
     let wid = register_worker(app, &rig.protocol, "golden-worker").await;
     let sem = create_task(app, "harden the flaky retry path", Some("golden-worker"), &[]).await;
+    let fixed_marker = rig._dir.path().join("retry-fixed");
+    let marker_arg = fixed_marker
+        .to_string_lossy()
+        .replace('\'', "'\\''");
+    let criteria_version =
+        store_command_criterion(app, &sem, &format!("test -f '{marker_arg}'")).await;
     let tid = board_store::internal_id(&sem);
     let rt = runtime(&rig, false);
 
@@ -452,12 +482,14 @@ async fn golden_failure_and_retry() {
     match &calls[0] {
         RecordedCall::SendPrompt { worker, prompt } => {
             assert_eq!(worker, &wid);
-            // The pump delivers the WORK (feed-forward assignment brief),
-            // not a serialized command (live-golden finding: the model
-            // needs the task, not its id).
+            // The pump delivers the immutable compiled context and typed
+            // handoff, not a serialized command. The task identity and
+            // objective remain visible in that richer assignment brief.
+            assert!(prompt.text.contains("AMUX CONTEXT SNAPSHOT"), "{}", prompt.text);
+            assert!(prompt.text.contains("--- handoff [trusted;"), "{}", prompt.text);
             assert!(prompt.text.contains(tid.as_str()), "{}", prompt.text);
             assert!(prompt.text.contains("harden the flaky retry path"), "{}", prompt.text);
-            assert!(prompt.text.contains("board card"), "{}", prompt.text);
+            assert!(prompt.text.contains("(board task"), "{}", prompt.text);
         }
         other => panic!("expected SendPrompt, got {other:?}"),
     }
@@ -502,7 +534,7 @@ async fn golden_failure_and_retry() {
 
     // Verification with a FAILING typed Command criterion: 200, verdict
     // Failed, task revoked back to doing with the rejection reason logged.
-    let v = run_verify(app, &sem, "false", "golden-worker").await;
+    let v = run_verify(app, &sem, criteria_version, "golden-verifier").await;
     assert_eq!(v["verdict"]["kind"], json!("failed"), "{v}");
     assert!(
         v["verdict"]["reason"].as_str().unwrap().contains("exited 1"),
@@ -516,6 +548,7 @@ async fn golden_failure_and_retry() {
     assert!(log.contains("exited 1"), "log: {log}");
 
     // Retry: the worker fixes it, claims done again, verification PASSES.
+    std::fs::write(&fixed_marker, b"fixed\n").unwrap();
     let v = patch_ok(
         app,
         &sem,
@@ -527,7 +560,7 @@ async fn golden_failure_and_retry() {
     )
     .await;
     assert_eq!(v["status"], json!("done"));
-    let v = run_verify(app, &sem, "true", "golden-worker").await;
+    let v = run_verify(app, &sem, criteria_version, "golden-verifier").await;
     assert_eq!(v["verdict"]["kind"], json!("passed"), "{v}");
     assert_eq!(v["new_status"], json!("verified"), "{v}");
     let d = detail(app, &sem).await;
@@ -602,6 +635,9 @@ async fn golden_dependency_chain() {
     let c1 = create_task(app, "child one", Some("runner-a"), &[]).await;
     let c2 = create_task(app, "child two", Some("runner-b"), &[]).await;
     let c3 = create_task(app, "child three", Some("runner-c"), &[]).await;
+    for child in [&c1, &c2, &c3] {
+        store_command_criterion(app, child, "true").await;
+    }
     let parent = create_task(
         app,
         "parent integration",
@@ -638,7 +674,7 @@ async fn golden_dependency_chain() {
     // satisfies the last dependency.
     for (child, actor) in [(&c1, "runner-a"), (&c2, "runner-b")] {
         drive_to_done(app, child, actor).await;
-        let v = run_verify(app, child, "true", actor).await;
+        let v = run_verify(app, child, 1, "golden-verifier").await;
         assert_eq!(v["verdict"]["kind"], json!("passed"), "{v}");
         rt.tick_once(false).await.unwrap();
         journal.extend(drain(&mut rx));
@@ -648,7 +684,7 @@ async fn golden_dependency_chain() {
         );
     }
     drive_to_done(app, &c3, "runner-c").await;
-    let v = run_verify(app, &c3, "true", "runner-c").await;
+    let v = run_verify(app, &c3, 1, "golden-verifier").await;
     assert_eq!(v["verdict"]["kind"], json!("passed"), "{v}");
 
     // All three children are verified. The CORE planner, given the board the
@@ -777,6 +813,9 @@ async fn golden_no_stall() {
         create_task(app, "pool task two", None, &[]).await,
         create_task(app, "pool task three", None, &[]).await,
     ];
+    for sem in &sems {
+        store_command_criterion(app, sem, "true").await;
+    }
     let tid_to_sem: BTreeMap<String, String> = sems
         .iter()
         .map(|s| (board_store::internal_id(s).to_string(), s.clone()))
@@ -812,7 +851,7 @@ async fn golden_no_stall() {
             let d = detail(app, sem).await;
             if d["status"] == json!("todo") {
                 drive_to_done(app, sem, "golden-runner").await;
-                let v = run_verify(app, sem, "true", "golden-runner").await;
+                let v = run_verify(app, sem, 1, "golden-verifier").await;
                 assert_eq!(v["verdict"]["kind"], json!("passed"), "{v}");
                 expire_lease(&rig.store, &task_id);
                 worked = true;
@@ -869,7 +908,8 @@ async fn golden_no_stall() {
     for call in rig.protocol.calls() {
         if let RecordedCall::SendPrompt { prompt, .. } = call {
             prompts += 1;
-            assert!(prompt.text.contains("board card"), "{}", prompt.text);
+            assert!(prompt.text.contains("AMUX CONTEXT SNAPSHOT"), "{}", prompt.text);
+            assert!(prompt.text.contains("(board task"), "{}", prompt.text);
             let named = tid_to_sem
                 .keys()
                 .find(|t| prompt.text.contains(t.as_str()))
