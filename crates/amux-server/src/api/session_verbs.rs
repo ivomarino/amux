@@ -151,6 +151,34 @@ pub(crate) struct EnvFile {
     dirty: Vec<(String, Option<String>)>,
 }
 
+/// The refusal body for a failed session-env write, WITH THE CAUSE.
+///
+/// `EnvFile::write` returns `io::Result`, and every HTTP call site threw the
+/// error away (`cfg.write(&f).is_err()`), so a 500 said only "could not write
+/// session env". That names the operation and not one fact about why it
+/// failed: no path, no errno, nothing separating a full disk from a bad
+/// permission from a missing parent directory.
+///
+/// TUBES-2497, reported by `tubescience` 2026-09-08: one PATCH
+/// /api/sessions/tubescience/config answered exactly that on 2026-09-07
+/// 15:59:05 and never reproduced. A one-shot 5xx whose body carries no operand
+/// cannot be diagnosed afterwards, and `runtime_jobs::autofix` files a card per
+/// distinct 5xx signature, so the card inherits the same silence and a lane
+/// spends a turn on it.
+///
+/// The docstring on `env_tmp_path` above already quotes the SHAPE this used to
+/// have — `500 could not write session env: No such file or directory (os
+/// error 2)` — so this restores a form the file still documents rather than
+/// inventing one.
+///
+/// The path is included deliberately: these writes go to per-session env files
+/// and the failing one is the operand the reader needs. It is a local path
+/// under ~/.amux, not a credential, and the VALUES in that file are never
+/// touched here.
+fn env_write_error(path: &std::path::Path, e: &std::io::Error) -> String {
+    format!("could not write session env at {}: {e}", path.display())
+}
+
 fn env_write_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
@@ -4137,8 +4165,8 @@ fn mint_capture_card(
     // held ANY open agent card — so only the FIRST task of a work-session reached
     // the board and every later prompt was silent ("none of these have board
     // items"). It applied a STEERING-path guard to genuine new user tasks: this
-    // path is `is_user` only, and a user prompt IS a new task (orchestrator steers
-    // arrive via the delivered path, not here). Manual work cards also counted, so
+    // path is reached only for task-bearing deliveries, and a human, schedule,
+    // or peer command IS a new task. Manual work cards also counted, so
     // being mid-work on ANY card blanked the ledger entirely.
     //
     // Narrowed to the guard's real purpose: don't double-card an IDENTICAL retry.
@@ -4278,6 +4306,43 @@ struct CaptureAssociation {
     created: bool,
 }
 
+fn arm_peer_callback(
+    conn: &rusqlite::Connection,
+    row: &mut crate::db::board_store::IssueRow,
+    requester: &str,
+) -> rusqlite::Result<()> {
+    let requester = requester.trim();
+    if requester.is_empty() {
+        return Ok(());
+    }
+    let mut newly_armed = false;
+    if row.requested_by.as_deref().is_none_or(str::is_empty) {
+        row.requested_by = Some(requester.to_string());
+    }
+    if row.callback_session.as_deref().is_none_or(str::is_empty) {
+        row.callback_session = Some(requester.to_string());
+        newly_armed = true;
+    }
+    if row.callback_prompt.as_deref().is_none_or(str::is_empty) {
+        row.callback_prompt = Some(
+            "Notify the requesting worker with the terminal outcome and every produced asset."
+                .to_string(),
+        );
+    }
+    // An identical transport retry can reuse the open capture card.  Preserve
+    // an already pending/dispatching/queued callback rather than rewinding its
+    // durable outbox state and sending the completion twice.
+    if newly_armed
+        || row
+            .callback_state
+            .as_deref()
+            .is_none_or(|state| matches!(state, "" | "refused"))
+    {
+        row.callback_state = Some("armed".to_string());
+    }
+    crate::db::board_store::save_patched(conn, row).map(|_| ())
+}
+
 /// Distinct semantic board ids named by a delivered owner prompt.
 fn prompt_card_refs(text: &str) -> Vec<String> {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -4328,8 +4393,31 @@ fn associate_capture_card(
             "ledger: substantive prompt named multiple live owned cards; capturing an explicit reconciliation card"
         );
     }
-    Ok(mint_capture_card(conn, session_name, body, now_ms)?
-        .map(|row| CaptureAssociation { row, created: true }))
+    if let Some(row) = mint_capture_card(conn, session_name, body, now_ms)? {
+        return Ok(Some(CaptureAssociation { row, created: true }));
+    }
+
+    // An identical retry is still a message in the source-of-truth ledger.
+    // `mint_capture_card` deliberately suppresses a duplicate card, but the
+    // old caller interpreted that as "this message has no task" and left its
+    // `cmd_history.card_id` null.  Re-associate the message with the exact open
+    // survivor so the message↔task links remain bidirectional and a peer retry
+    // cannot lose its already-armed callback.
+    let redacted = redact_prompt_secrets(body);
+    if amux_core::board::title_from_prompt(&redacted).is_some()
+        && !amux_core::board::is_informational_query(&redacted)
+    {
+        let desc_body: String = redacted.chars().take(300).collect();
+        let captured_desc = format!("**Prompt:** {desc_body}");
+        if let Some(id) =
+            crate::db::board_store::open_capture_with_desc(conn, session_name, &captured_desc)?
+        {
+            if let Some(row) = crate::db::board_store::get_issue(conn, &id)? {
+                return Ok(Some(CaptureAssociation { row, created: false }));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// The most recent row for (session, text) that was actually DELIVERED, newer
@@ -4427,7 +4515,13 @@ pub(crate) async fn cmd_hist_record_full(
     let cap_ctype = ctype.clone();
     let cap_origin = origin.clone();
 
-    let is_user = ctype == "user";
+    // Every producer which can hand substantive work to a worker participates
+    // in the same task ledger.  Treating only `user` as task-bearing made
+    // schedules and worker-to-worker requests invisible on the recipient's
+    // board—the exact opposite of the board-managed callback contract.  The
+    // semantic classifier below still exempts questions and control prompts,
+    // so widening the producer set does not card `/compact`, "status?", etc.
+    let task_bearing = matches!(ctype.as_str(), "user" | "schedule" | "session");
     // Carry the recorded row id out of the write so auto-capture can link the card.
     let msg_row_id = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     // delivered_at IS NOT A COPY OF ts ANY MORE (AMUX-3541).
@@ -4557,12 +4651,13 @@ pub(crate) async fn cmd_hist_record_full(
         .await;
     }
 
-    // NO SILENT WORK (AMUX-3071): associate a HUMAN task prompt with a ledger
+    // NO SILENT WORK (AMUX-3071): associate every task-bearing delivery with a ledger
     // card and link it to the message row. Separate write so a capture failure can never roll
     // back the message record — the message is the durable entity, the card its
     // consequence (CLAUDE.md: hang the consequence off the write that happened).
-    // Gated on ctype=="user": inter-session ("session") and scheduler ("schedule")
-    // messages are not the recipient's task and must not spam the board.
+    // Human, inter-session ("session") and scheduler ("schedule") work all
+    // belong to the recipient.  Questions/control messages still remain
+    // cardless via the semantic predicate, rather than a producer allow-list.
     // ISOLATED DOES NOT MEAN INVISIBLE WORK (AMUX-4159). Isolation controls
     // what amux injects into a worker and whether peers/automation can reach it;
     // it does not change the fact that an owner's delivered prompt is work in
@@ -4578,7 +4673,7 @@ pub(crate) async fn cmd_hist_record_full(
     // keeping; the card is a consequence that did not happen.
     let substantive = amux_core::board::title_from_prompt(&cap_text).is_some()
         && !amux_core::board::is_informational_query(&cap_text);
-    if is_user && landed && substantive {
+    if task_bearing && landed && substantive {
         let row_id = msg_row_id.load(std::sync::atomic::Ordering::SeqCst);
         if row_id > 0 {
             let cap_isolated = session_is_isolated(&cap_session);
@@ -4587,6 +4682,8 @@ pub(crate) async fn cmd_hist_record_full(
                 std::sync::Arc::new(std::sync::Mutex::new(None));
             let associated_w = associated.clone();
             let sess_log = cap_session.clone();
+            let peer_requester = (cap_ctype == "session" && !cap_origin.trim().is_empty())
+                .then(|| cap_origin.clone());
             let res = state
                 .store
                 .write_async(move |conn| match associate_capture_card(
@@ -4595,7 +4692,10 @@ pub(crate) async fn cmd_hist_record_full(
                     &cap_text_for_capture,
                     now_ms,
                 )? {
-                    Some(association) => {
+                    Some(mut association) => {
+                        if let Some(requester) = peer_requester.as_deref() {
+                            arm_peer_callback(conn, &mut association.row, requester)?;
+                        }
                         conn.execute(
                             "UPDATE cmd_history SET card_id = ?1 WHERE id = ?2",
                             rusqlite::params![association.row.id, row_id],
@@ -4707,7 +4807,7 @@ pub(crate) async fn cmd_hist_record_full(
             }
         }
     }
-    if is_user && landed {
+    if task_bearing && landed {
         let cardless_reason = if amux_core::board::is_informational_query(&cap_text) {
             Some("informational-query")
         } else if amux_core::board::title_from_prompt(&cap_text).is_none() {
@@ -8207,14 +8307,58 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
             } else {
                 provider_value(key)
             };
-            let refreshed = match value {
-                Some(value) => tmux(&["set-environment", "-t", &st, key, &value]).await,
+            let refreshed = match value.as_deref() {
+                Some(value) => tmux(&["set-environment", "-t", &st, key, value]).await,
                 None => tmux(&["set-environment", "-u", "-t", &st, key]).await,
             };
-            if !refreshed.map(|out| out.status.success()).unwrap_or(false) {
+            // WHICH failure, not just that one happened (AF-592). `tmux()` is
+            // `Option<Output>` and carries three distinct outcomes that the old
+            // `.map(|o| o.status.success()).unwrap_or(false)` collapsed into
+            // one sentence: the command never ran (spawn failure or the 5s
+            // OP_TIMEOUT), or it ran and refused with a reason on stderr.
+            //
+            // Measured 2026-09-08 11:49:19: one POST /api/sessions/
+            // amux-frustrations/send answered 500 "auto-wake failed: could not
+            // refresh ANTHROPIC_API_KEY for the existing tmux session" after
+            // 27.2s, and nothing distinguished a hung tmux from a refusal. The
+            // server log carried no line for it at all, so the only trace was
+            // the HTTP body, and the body named the operation and no cause.
+            let why = match &refreshed {
+                None => format!(
+                    "tmux did not answer within {}s (spawn failure or timeout)",
+                    OP_TIMEOUT.as_secs()
+                ),
+                Some(out) if !out.status.success() => {
+                    // The VALUE never appears here. `set-environment` takes it
+                    // as an argv element, so a tmux error that echoes its own
+                    // command line could carry a live API key onto stderr and
+                    // into an HTTP body. Scrub it rather than trusting tmux's
+                    // phrasing.
+                    let mut err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    if let Some(v) = value.as_deref() {
+                        if !v.is_empty() {
+                            err = err.replace(v, "<redacted>");
+                        }
+                    }
+                    let code = out.status.code().unwrap_or(-1);
+                    if err.is_empty() {
+                        format!("tmux exited {code}")
+                    } else {
+                        format!("tmux exited {code}: {err}")
+                    }
+                }
+                Some(_) => String::new(),
+            };
+            if !why.is_empty() {
+                tracing::warn!(
+                    target: "session",
+                    verdict = "tmux_env_refresh_failed",
+                    session = name, key, why = %why,
+                    "could not refresh a provider key for an existing tmux session"
+                );
                 return (
                     false,
-                    format!("could not refresh {key} for the existing tmux session"),
+                    format!("could not refresh {key} for the existing tmux session: {why}"),
                 );
             }
         }
@@ -10951,7 +11095,13 @@ fn steer_decide_with_background(
     max_age_s: f64,
     background_working: bool,
 ) -> SteerDelivery {
-    if background_working {
+    // `reported` is already the shared, fully-derived lane verdict. A stale
+    // transcript mtime or child-process sample must not overrule its explicit
+    // idle boundary here, or the dashboard can truthfully show IDLE while the
+    // steering queue silently holds forever. Real live background work is
+    // folded into that verdict by `derive_status_explain`; keep the hard hold
+    // only while the shared verdict still says the lane is not at a boundary.
+    if background_working && reported != Some("idle") && pane_idle != Some(true) {
         SteerDelivery::Hold
     } else {
         steer_decide(reported, pane_idle, age_s, max_age_s)
@@ -11047,7 +11197,7 @@ fn reported_idle_is_boundary(subagents_live: Option<i64>, raw: &str) -> bool {
     !subagents_live.is_some_and(|count| count > 0) && !provider_background_working(raw)
 }
 
-fn warn_background_override_once(name: &str, raw: &str) {
+fn warn_background_override_once(name: &str, raw: &str, authoritative_idle: bool) {
     use std::collections::BTreeSet;
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
@@ -11056,17 +11206,29 @@ fn warn_background_override_once(name: &str, raw: &str) {
     } else {
         "claude_background_agent"
     };
-    let key = format!("{name}:{kind}");
+    let verdict = if authoritative_idle { "ignored_at_idle_boundary" } else { "held" };
+    let key = format!("{name}:{kind}:{verdict}");
     let mut seen = SEEN.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
     if !seen.insert(key) {
         return;
     }
-    tracing::warn!(
-        target: "status_truth",
-        session = name,
-        provider_signal = kind,
-        "provider_background_work_overrode_idle_report: board-drive and steering are held until the provider row clears"
-    );
+    if authoritative_idle {
+        tracing::warn!(
+            target: "status_truth",
+            session = name,
+            provider_signal = kind,
+            verdict,
+            "background activity hint contradicted the shared idle boundary and was ignored for steering delivery"
+        );
+    } else {
+        tracing::warn!(
+            target: "status_truth",
+            session = name,
+            provider_signal = kind,
+            verdict,
+            "provider_background_work_overrode_idle_report: board-drive and steering are held until the provider row clears"
+        );
+    }
 }
 
 /// WARN once per lane per stuck report, so a lane held out of the drive loop by
@@ -11205,7 +11367,9 @@ pub(crate) async fn steer_delivery_for(state: &AppState, name: &str, age_s: f64)
         || explain["provider_background_working"] == true
         || signals.provider_child_activity.contains(name);
     if background_working {
-        if let Some(raw) = signals.panes.get(name) { warn_background_override_once(name, raw); }
+        if let Some(raw) = signals.panes.get(name) {
+            warn_background_override_once(name, raw, status == "idle");
+        }
     }
     steer_decide_with_background(
         Some(&status), None, age_s, steer_max_age_s(), background_working,
@@ -11816,15 +11980,13 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         // items wtf"): its prompts queue while it is mid-turn and drain through
         // HERE, past the one place that cards. Mirror the direct path's predicate:
         //   guard == ""    — not a board-drive nudge / auto-pickup / self-describe
-        //   sender == ""   — a human/dashboard send, not a peer relay (which carries
-        //                    the server-verified origin and is type='session', never
-        //                    the recipient's own task — same split as 9720 vs 9722)
+        //   sender is deliberately NOT a gate: a substantive peer request is
+        //                    recipient work and must be managed by this board too.
         //   title Some     — a real task, not control text / [no-board] / a keypress
         // Separate write so a capture failure can never roll back the delivery, and
         // IDEMPOTENT: skip if this exact prompt was already carded (the enqueue path
         // may have minted at record time), so a queued message is never double-carded.
         if guard.is_empty()
-            && sender.is_empty()
             && amux_core::board::title_from_prompt(&text).is_some()
             && !amux_core::board::is_informational_query(&text)
         {
@@ -11833,6 +11995,7 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
             let associated: std::sync::Arc<std::sync::Mutex<Option<CaptureAssociation>>> =
                 std::sync::Arc::new(std::sync::Mutex::new(None));
             let associated_w = associated.clone();
+            let peer_requester = sender.clone();
             let res = state
                 .store
                 .write_async(move |conn| {
@@ -11855,7 +12018,10 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                         return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
                     }
                     match associate_capture_card(conn, &sess3, &text3, now_ms)? {
-                        Some(association) => {
+                        Some(mut association) => {
+                            if !peer_requester.trim().is_empty() {
+                                arm_peer_callback(conn, &mut association.row, &peer_requester)?;
+                            }
                             // Link the most recent uncarded cmd_history row for this
                             // prompt, if the enqueue recorded one without carding it.
                             conn.execute(
@@ -11945,7 +12111,6 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
             }
         }
         if guard.is_empty()
-            && sender.is_empty()
             && (amux_core::board::title_from_prompt(&text).is_none()
                 || amux_core::board::is_informational_query(&text))
         {
@@ -16353,8 +16518,8 @@ pub(crate) fn commit_guard_patch_verb(name: &str, body: &Value) -> Response {
         None => cfg.remove("AMUX_COMMIT_GUARD_SESSION"),
         Some(b) => cfg.set("AMUX_COMMIT_GUARD_SESSION", if b { "1" } else { "0" }),
     }
-    if cfg.write(&f).is_err() {
-        return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+    if let Err(e) = cfg.write(&f) {
+        return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": env_write_error(&f, &e)}));
     }
     let enabled = override_v.unwrap_or(global);
     j200(json!({
@@ -18964,8 +19129,8 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
         meta.remove("pending_structured_resume_context");
         save_meta(name, &meta);
         cfg.set("CC_DIR", &new_dir);
-        if cfg.write(&f).is_err() {
-            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+        if let Err(e) = cfg.write(&f) {
+            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": env_write_error(&f, &e)}));
         }
         if new_dir != old_dir && is_running(name).await {
             let st2 = state.clone();
@@ -19008,8 +19173,8 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
     // Description (py:76667).
     if let Some(dv) = body.get("desc") {
         cfg.set("CC_DESC", dv.as_str().unwrap_or("").trim());
-        if cfg.write(&f).is_err() {
-            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+        if let Err(e) = cfg.write(&f) {
+            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": env_write_error(&f, &e)}));
         }
         // A description is AUTO-DISCOVERY DATA, not a private label: every other
         // worker's roster names this one. Refresh the fleet so the change is
@@ -19027,8 +19192,8 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
     if body.get("toggle_pin").map(py_truthy).unwrap_or(false) {
         let now_pinned = cfg.get("CC_PINNED") == Some("1");
         cfg.set("CC_PINNED", if now_pinned { "" } else { "1" });
-        if cfg.write(&f).is_err() {
-            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+        if let Err(e) = cfg.write(&f) {
+            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": env_write_error(&f, &e)}));
         }
         return j200(json!({"ok": true, "message": "pin toggled"}));
     }
@@ -19043,8 +19208,8 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
     if let Some(iv) = body.get("isolated") {
         let on = py_truthy(iv);
         cfg.set("CC_ISOLATED", if on { "1" } else { "" });
-        if cfg.write(&f).is_err() {
-            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+        if let Err(e) = cfg.write(&f) {
+            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": env_write_error(&f, &e)}));
         }
         // The roster peers read is fleet-wide data; toggling isolation adds or
         // removes this worker from it, so refresh like desc/tags do.
@@ -19109,10 +19274,10 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
         } else {
             cfg.set(key, if py_truthy(v) { "1" } else { "0" });
         }
-        if cfg.write(&f).is_err() {
+        if let Err(e) = cfg.write(&f) {
             return jresp(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                json!({"error": "could not write session env"}),
+                json!({"error": env_write_error(&f, &e)}),
             );
         }
         let effective = if key == crate::runtime_jobs::board_drive::DISPATCH_BACKLOG_KEY {
@@ -19146,10 +19311,10 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
         } else {
             cfg.set(key, if py_truthy(v) { "1" } else { "0" });
         }
-        if cfg.write(&f).is_err() {
+        if let Err(e) = cfg.write(&f) {
             return jresp(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                json!({"error": "could not write session env"}),
+                json!({"error": env_write_error(&f, &e)}),
             );
         }
         let effective = crate::api::email_approval::external_email_allowed(
@@ -19184,8 +19349,8 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
             String::new()
         };
         cfg.set("CC_SEND_ALLOW", &value);
-        if cfg.write(&f).is_err() {
-            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+        if let Err(e) = cfg.write(&f) {
+            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": env_write_error(&f, &e)}));
         }
         // Resolved AFTER the write, so the answer is what the gate will actually
         // enforce rather than what was just typed — a group or global layer can
@@ -19229,8 +19394,8 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
     // Branch (py:76679).
     if let Some(bv) = body.get("branch") {
         cfg.set("CC_BRANCH", bv.as_str().unwrap_or("").trim());
-        if cfg.write(&f).is_err() {
-            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+        if let Err(e) = cfg.write(&f) {
+            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": env_write_error(&f, &e)}));
         }
         return j200(json!({"ok": true, "message": "branch updated"}));
     }
@@ -19298,8 +19463,8 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
             }
         };
         cfg.set("CC_TAGS", &joined);
-        if cfg.write(&f).is_err() {
-            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+        if let Err(e) = cfg.write(&f) {
+            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": env_write_error(&f, &e)}));
         }
         // Echo what was stored: the caller sent an array and a bare "ok" is what
         // let the silent clear go unnoticed for as long as it did.
@@ -19313,8 +19478,8 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
             return jresp(StatusCode::BAD_REQUEST, json!({"error": "mcp must be 'chrome' or '' (empty)"}));
         }
         cfg.set("CC_MCP", &mcp_val);
-        if cfg.write(&f).is_err() {
-            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+        if let Err(e) = cfg.write(&f) {
+            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": env_write_error(&f, &e)}));
         }
         let msg = if mcp_val.is_empty() { "mcp disabled".to_string() } else { format!("mcp set to {mcp_val}") };
         return j200(json!({"ok": true, "message": format!("{msg} (restart session to apply)")}));
@@ -21719,8 +21884,9 @@ mod tests {
     // AMUX-3071: the send path lost Python's _autotask_from_command at the
     // 792ce1f cutover (2026-08-09), so 330 human prompts recorded card_id=NULL
     // and left no board trace. A real task prompt must now mint a `doing` card
-    // and stamp cmd_history.card_id; informational/control and inter-session
-    // messages must not. `[no-board]` can prevent a duplicate only by reusing
+    // and stamp cmd_history.card_id; informational/control messages must not.
+    // Schedules and inter-session requests use the same recipient-owned task
+    // contract. `[no-board]` can prevent a duplicate only by reusing
     // an exact live card; it cannot erase substantive work attribution.
     #[tokio::test]
     async fn a_human_prompt_auto_captures_and_links_a_ledger_card() {
@@ -21915,16 +22081,94 @@ mod tests {
             "informational turns are the narrow cardless exception"
         );
 
-        // 6. Inter-session ("session") messages are not the recipient's task.
+        // 6. A substantive inter-session request is recipient work and uses
+        //    the same linked board contract as a human or schedule command.
         cmd_hist_record_full(
             &st, "lane-x", "Coordinate the rollout with the other lane and report back",
             "session", "peer-lane", false, DeliveryMeta::direct(),
         )
         .await;
-        assert!(
+        let peer_card = q(
+            "SELECT card_id FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1",
+            "lane-x",
+        )
+        .expect("substantive inter-session requests must be board-managed and linked");
+        let callback: (Option<String>, Option<String>, Option<String>) = st
+            .store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT requested_by, callback_session, callback_state FROM issues \
+                 WHERE id=(SELECT card_id FROM cmd_history WHERE session='lane-x' ORDER BY id DESC LIMIT 1)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(callback.0.as_deref(), Some("peer-lane"));
+        assert_eq!(callback.1.as_deref(), Some("peer-lane"));
+        assert_eq!(callback.2.as_deref(), Some("armed"));
+
+        // A transport retry links to the one surviving task without rewinding
+        // a callback which has already entered the durable outbox.
+        let peer_card_w = peer_card.clone();
+        st.store
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE issues SET callback_state='pending' WHERE id=?1",
+                    [&peer_card_w],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+        cmd_hist_record_full(
+            &st, "lane-x", "Coordinate the rollout with the other lane and report back",
+            "session", "peer-lane", false, DeliveryMeta::direct(),
+        )
+        .await;
+        assert_eq!(
             q("SELECT card_id FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1", "lane-x")
+                .as_deref(),
+            Some(peer_card.as_str()),
+            "the retrying source message must link to the surviving task"
+        );
+        let (peer_tasks, callback_state): (i64, Option<String>) = st
+            .store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*), MAX(callback_state) FROM issues WHERE session='lane-x'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(peer_tasks, 1, "an identical retry must not duplicate its task");
+        assert_eq!(
+            callback_state.as_deref(),
+            Some("pending"),
+            "an identical retry must not re-arm and duplicate a pending callback"
+        );
+
+        // 7. Schedules follow the same rule, while an informational scheduled
+        //    check remains the narrow cardless case.
+        cmd_hist_record_full(
+            &st, "lane-schedule", "Generate the weekly launch report and save its assets",
+            "schedule", "schedule:weekly", false, DeliveryMeta::direct(),
+        )
+        .await;
+        assert!(
+            q("SELECT card_id FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1", "lane-schedule")
+                .is_some(),
+            "substantive scheduled work must create and link its recipient card"
+        );
+        cmd_hist_record_full(
+            &st, "lane-schedule-info", "what is the current status?",
+            "schedule", "schedule:status", false, DeliveryMeta::direct(),
+        )
+        .await;
+        assert!(
+            q("SELECT card_id FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1", "lane-schedule-info")
                 .is_none(),
-            "inter-session messages must not spam the board"
+            "informational scheduled checks must not create board work"
         );
     }
 
@@ -26511,6 +26755,11 @@ mod steer_freeze_tests {
             SteerDelivery::Hold,
             "max age never authorizes interruption while background work is live"
         );
+        assert_eq!(
+            steer_decide_with_background(Some("idle"), None, 86_400.0, 600.0, true),
+            SteerDelivery::AtBoundary,
+            "a weaker background hint cannot contradict the shared idle verdict and starve steering"
+        );
 
         assert!(!provider_background_working(CODEX_BACKGROUND_FINISHED));
         assert!(reported_idle_is_boundary(Some(0), CODEX_BACKGROUND_FINISHED));
@@ -27673,6 +27922,50 @@ mod refusal_status_tests {
     /// This is the check that CAN fail: it is built from the shipped source,
     /// not from a paraphrase of it, so it also fails if someone reworders an
     /// existing literal out from under the classifier.
+    /// A session-env write 500 must name WHICH write and WHY (TUBES-2497).
+    ///
+    /// The reported instance was one PATCH /api/sessions/tubescience/config
+    /// answering `{"error":"could not write session env"}` on 2026-09-07
+    /// 15:59:05, never reproduced. A 5xx that names the operation and no fact
+    /// about the failure cannot be diagnosed after the fact, and the autofix
+    /// files a card per distinct 5xx signature, so the card inherits the same
+    /// silence.
+    #[test]
+    fn a_failed_session_env_write_names_the_path_and_the_cause() {
+        let e = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Permission denied");
+        let msg = env_write_error(std::path::Path::new("/tmp/amux/x.env"), &e);
+        assert!(msg.contains("/tmp/amux/x.env"), "the failing PATH is the operand: {msg}");
+        assert!(msg.contains("Permission denied"), "the CAUSE must survive: {msg}");
+        // Still recognisable as the same failure, so a reader (and the autofix
+        // grouping) does not see an unrelated new error class.
+        assert!(msg.starts_with("could not write session env"), "{msg}");
+
+        // A DIFFERENT cause must read differently. Without this, a helper that
+        // ignored `e` and appended a constant would pass everything above.
+        let other = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
+        let msg2 = env_write_error(std::path::Path::new("/tmp/amux/x.env"), &other);
+        assert_ne!(msg, msg2, "the message must vary with the error, not just mention one");
+        assert!(msg2.contains("No such file or directory"), "{msg2}");
+    }
+
+    /// And no HTTP site may go back to the bare sentence.
+    ///
+    /// The helper above is only worth having if every caller uses it. This
+    /// scans the shipped source rather than a paraphrase, so a NEW site added
+    /// later with the old copy-pasted body fails here (ethos rule 7).
+    #[test]
+    fn no_session_env_500_ships_without_its_cause() {
+        const SRC: &str = include_str!("session_verbs.rs");
+        // Built by concat! so this test's own needle is not a match.
+        let bare = concat!("json!({\"error\": \"could not write session ", "env\"})");
+        let hits = SRC.matches(bare).count();
+        assert_eq!(
+            hits, 0,
+            "{hits} HTTP site(s) still answer a failed session-env write with the bare \
+             sentence and no path or errno — use env_write_error(&path, &e)"
+        );
+    }
+
     #[test]
     fn every_send_failure_literal_is_classified() {
         const SRC: &str = include_str!("session_verbs.rs");

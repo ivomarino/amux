@@ -320,8 +320,29 @@ else
   # the negative is the clear line itself.
   if printf '%s\n' "$out9" | grep -q "DEBUG ARTIFACTS"; then ok
   else bad "(m) the script must REACH the debug decision, not die before it" "$out9"; fi
+  # READ THE REASON, do not infer it from the symptom (AMUX-134 follow-up).
+  # This cell asserted "no DEFERRED at all" and blamed every deferral on the
+  # cargo mention. On a GitHub runner it fired for a different cause entirely:
+  #   {"verdict":"cargo_reclaim_deferred","measured":false,"n_considered":0,
+  #    "reason":"process executable unmeasured: pid 994"}
+  # That is the guard failing CLOSED on a process whose /proc/<pid>/exe it
+  # cannot read, which is deliberate and documented in process_executable's
+  # own docstring ("Truncated/custom names do not resolve and therefore
+  # continue to fail closed"). Correct behaviour, reported as the bug it is
+  # not, and it reddened `checks` on main and on every PR that merged main.
+  #
+  # So: an unmeasured PROBE is an environment limit, reported and not counted
+  # as a pass (ethos rule 4 -- do not read a negative from a probe that could
+  # not run). Any OTHER deferral still fails, which is the property this cell
+  # exists for.
   if printf '%s\n' "$out9" | grep -q "DEFERRED"; then
-    bad "(m) a command line that merely MENTIONS cargo must not read as a build" "$out9"
+    if printf '%s\n' "$out9" | grep -q "process executable unmeasured"; then
+      echo "SKIP (m): the process probe came back UNMEASURED on this host"
+      echo "         ($(printf '%s\n' "$out9" | grep -o 'process executable unmeasured: pid [0-9]*' | head -1)),"
+      echo "         so the cargo-mention property was NOT exercised. Not counted as a pass."
+    else
+      bad "(m) a command line that merely MENTIONS cargo must not read as a build" "$out9"
+    fi
   else ok; fi
 fi
 

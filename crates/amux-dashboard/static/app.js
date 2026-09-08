@@ -9190,7 +9190,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.843';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.845';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -9648,6 +9648,7 @@ function copyPeekContent() {
 }
 
 function closePeek() {
+  _closePeekFilters();
   _peekLeaseStop();   // AMUX-2634: stop holding the worker's pane at our width
   // Reset peek notes
   // Fold the fullscreen composer (if open) back into the input, and close menus,
@@ -11074,8 +11075,8 @@ function applyPeekSearch(keepIndex, doScroll) {
   // spans must not turn one visible phrase into missing or duplicate matches.
   body.innerHTML = lastPeekHTML;
   _peekReclassifyPrompts();
-  const roots = _peekMsgNavKind === 'all' ? [body]
-    : [...body.querySelectorAll('.peek-prompt')].filter(el => el.dataset.msgKind === _peekMsgNavKind);
+  const roots = !_peekFiltersActive() ? [body]
+    : [...body.querySelectorAll('.peek-prompt')].filter(el => _peekPromptMatchesFilters(el));
   _peekMatches = [];
   for (const root of roots) {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
@@ -11145,6 +11146,7 @@ function peekSearchPrev() {
 // ── Peek more-menu ──
 let _peekMoreDismissTimer = 0;
 function togglePeekMoreMenu() {
+  _closePeekFilters();
   const dd = document.getElementById('peek-more-dropdown');
   if (!dd) return;
   const s = (sessions || []).find(row => row.name === peekSession);
@@ -11180,6 +11182,90 @@ function _closePeekMore() {
 // ── Peek message navigation ──
 let _peekMsgIndex = -1;
 let _peekMsgNavKind = 'all';
+let _peekMsgNavContent = 'any';
+const _PEEK_SOURCE_LABELS = {all:'Everyone', human:'Human', session:'Workers', schedule:'Scheduled', amux:'Harness', unstamped:'Unstamped', unknown:'Unclassified'};
+const _PEEK_CONTENT_LABELS = {any:'Any message', board:'Board references', files:'Files', links:'Links'};
+function _peekFiltersActive() { return _peekMsgNavKind !== 'all' || _peekMsgNavContent !== 'any'; }
+function _peekFilterSummary() {
+  const source = _peekMsgNavKind === 'all' ? '' : _PEEK_SOURCE_LABELS[_peekMsgNavKind];
+  const content = _peekMsgNavContent === 'any' ? '' : _PEEK_CONTENT_LABELS[_peekMsgNavContent];
+  return [source, content].filter(Boolean).join(' · ') || 'All messages';
+}
+// Both navigation and Find select message blocks with the same predicate.
+// Content filters inspect actual references, never guesses about task intent.
+function _peekPromptMatchesFilters(el) {
+  if (!el || (_peekMsgNavKind !== 'all' && el.dataset.msgKind !== _peekMsgNavKind)) return false;
+  if (_peekMsgNavContent === 'board') return /\b[A-Z]{2,8}-\d{1,6}\b/.test(el.textContent);
+  if (_peekMsgNavContent === 'files') return !!el.querySelector('.file-link, .md-link');
+  if (_peekMsgNavContent === 'links') return !!el.querySelector('a[href^="https://"], a[href^="http://"]');
+  return true;
+}
+function _peekFilterSync() {
+  const button = document.getElementById('peek-filter-btn');
+  const summary = document.getElementById('peek-filter-summary');
+  if (!button || !summary) return;
+  const label = _peekFilterSummary();
+  summary.textContent = label;
+  button.title = 'Filter messages: ' + label;
+  button.classList.toggle('active', _peekFiltersActive());
+  for (const input of document.querySelectorAll('[name="peek-filter-source"]')) input.checked = input.value === _peekMsgNavKind;
+  for (const input of document.querySelectorAll('[name="peek-filter-content"]')) input.checked = input.value === _peekMsgNavContent;
+  document.getElementById('peek-filter-reset').disabled = !_peekFiltersActive();
+}
+function togglePeekFilters() {
+  const panel = document.getElementById('peek-filter-panel');
+  if (!panel) return;
+  if (!panel.hidden) { _closePeekFilters(true); return; }
+  _closePeekMore();
+  _peekFilterSync();
+  panel.hidden = false;
+  document.getElementById('peek-filter-btn').setAttribute('aria-expanded', 'true');
+  panel.querySelector('input:checked')?.focus({preventScroll:true});
+  document.addEventListener('pointerdown', _peekFiltersOutside);
+  document.addEventListener('focusin', _peekFiltersOutside);
+  document.addEventListener('keydown', _peekFiltersKey, true);
+}
+function _peekFiltersOutside(event) {
+  if (!event.target.closest('.peek-msg-filter')) _closePeekFilters();
+}
+function _peekFiltersKey(event) {
+  if (event.key !== 'Escape') return;
+  event.preventDefault(); event.stopPropagation();
+  _closePeekFilters(true);
+}
+function _closePeekFilters(returnFocus = false) {
+  const panel = document.getElementById('peek-filter-panel');
+  if (!panel) return;
+  panel.hidden = true;
+  const button = document.getElementById('peek-filter-btn');
+  button?.setAttribute('aria-expanded', 'false');
+  document.removeEventListener('pointerdown', _peekFiltersOutside);
+  document.removeEventListener('focusin', _peekFiltersOutside);
+  document.removeEventListener('keydown', _peekFiltersKey, true);
+  if (returnFocus) button?.focus({preventScroll:true});
+}
+function _peekFilterContentSelect(content) {
+  if (!Object.hasOwn(_PEEK_CONTENT_LABELS, content)) return;
+  _peekMsgNavContent = content;
+  _peekFiltersChanged();
+}
+function _peekFiltersReset() {
+  _peekMsgNavKind = 'all'; _peekMsgNavContent = 'any';
+  _peekFiltersChanged();
+}
+function _peekFiltersChanged() {
+  _peekMsgIndex = -1;
+  document.querySelectorAll('#peek-body .peek-msg-current').forEach(p => p.classList.remove('peek-msg-current'));
+  if (peekSearchQuery.trim()) applyPeekSearch(false, true);
+  else _peekReclassifyPrompts();
+  const loaded = [...document.querySelectorAll('#peek-body .peek-prompt')];
+  const matched = loaded.filter(el => _peekPromptMatchesFilters(el)).length;
+  fetch(API + '/api/client-debug', {method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({kind:'peek-message-filter',verdict:matched ? 'matches' : 'no-matches',
+      session:peekSession,measured:true,n_considered:loaded.length,matched_messages:matched,
+      source_filter:_peekMsgNavKind,content_filter:_peekMsgNavContent,
+      searching:!!peekSearchQuery.trim(),search_matches:_peekMatches.length,ver:APP_VER})}).catch(() => {});
+}
 let _peekMsgNavGesture = null;
 function _peekMsgNavArm(e) {
   const body = document.getElementById('peek-body');
@@ -11210,11 +11296,11 @@ function _peekMsgPrompts() {
   if (!body) return [];
   if (peekSearchQuery.trim()) return _peekMatches.filter(el => el.isConnected);
   return Array.from(body.querySelectorAll('.peek-prompt')).filter(el =>
-    _peekMsgNavKind === 'all' || el.dataset.msgKind === _peekMsgNavKind);
+    _peekPromptMatchesFilters(el));
 }
 function _peekMsgCount(prompts) {
   const searching = !!peekSearchQuery.trim();
-  const selectedKind = _peekMsgNavKind === 'all' ? 'All' : (_MSG_KIND[_peekMsgNavKind] || _MSG_KIND.unknown).label;
+  const selectedKind = _peekFilterSummary();
   const label = searching ? selectedKind + ' matches' : selectedKind;
   const count = document.getElementById('peek-msg-count');
   if (count) {
@@ -11223,9 +11309,7 @@ function _peekMsgCount(prompts) {
     if (count.textContent !== value) count.textContent = value;
     count.setAttribute('aria-label', label + ': ' + value + ' in loaded output');
   }
-  const select = document.getElementById('peek-msg-kind');
-  if (select) { select.value = _peekMsgNavKind; select.disabled = false; }
-  document.getElementById('peek-nav-label').textContent = searching ? 'Find' : 'Messages';
+  _peekFilterSync();
   for (const btn of document.querySelectorAll('#peek-msg-nav .peek-nav-btn')) {
     // Zero loaded matches still permits loading earlier output. It is not a
     // disabled action; explain that fallback instead of drawing a dead arrow.
@@ -11243,7 +11327,8 @@ function _peekToolbarCheck() {
     _peekToolbarFrame = 0;
     const toolbar = document.querySelector('.peek-toolbar');
     if (!toolbar || !toolbar.getClientRects().length) return;
-    const controls = [...toolbar.querySelectorAll('button,select')];
+    const controls = [...toolbar.querySelectorAll('button,select')].filter(el =>
+      el.getClientRects().length && !el.closest('.peek-filter-panel, .peek-more-dropdown'));
     const rect = toolbar.getBoundingClientRect();
     // Layout sizes are independent of the user's deliberate UI zoom. Comparing
     // scaled screen rectangles to CSS sizes falsely flagged every 80% control.
@@ -11305,12 +11390,11 @@ function _peekNavBeacon(verdict, prompts, target) {
   const body = document.getElementById('peek-body');
   const geometry = target && _peekJumpGeometry(target);
   const searching = !!peekSearchQuery.trim();
-  if (searching && target && _peekMsgNavKind !== 'all'
-      && target.closest('.peek-prompt')?.dataset.msgKind !== _peekMsgNavKind) verdict = 'filter-mismatch';
+  if (target && _peekFiltersActive() && !_peekPromptMatchesFilters(target.closest('.peek-prompt'))) verdict = 'filter-mismatch';
   try {
     fetch(API + '/api/client-debug', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ kind: 'peek-message-nav', verdict, session: peekSession, ver: APP_VER,
-        measured: true, n_considered: prompts.length, filter: _peekMsgNavKind,
+        measured: true, n_considered: prompts.length, filter: _peekMsgNavKind, content_filter: _peekMsgNavContent,
         mode: searching ? 'search' : 'messages',
         index: searching ? peekSearchIndex : _peekMsgIndex, target_kind: target?.closest('.peek-prompt')?.dataset.msgKind || null,
         target_visible: !!geometry && geometry.visible,
@@ -11374,12 +11458,9 @@ async function _peekMsgMove(direction, event) {
 function peekMsgNext(event) { _peekMsgMove(1, event); }
 function peekMsgPrev(event) { _peekMsgMove(-1, event); }
 function _peekMsgNavSelect(kind) {
-  if (!['all', 'human', 'session', 'schedule', 'amux', 'unstamped', 'unknown'].includes(kind)) return;
+  if (!Object.hasOwn(_PEEK_SOURCE_LABELS, kind)) return;
   _peekMsgNavKind = kind;
-  _peekMsgIndex = -1;
-  document.querySelectorAll('#peek-body .peek-msg-current').forEach(p => p.classList.remove('peek-msg-current'));
-  if (peekSearchQuery.trim()) applyPeekSearch(false, true);
-  else _peekReclassifyPrompts();
+  _peekFiltersChanged();
 }
 
 // ── Peek command bar ──
@@ -35604,17 +35685,33 @@ let _sqlSchemaLoaded = false;
 
 function _sqlInit() { if (!_sqlSchemaLoaded) { _sqlSchemaLoaded = true; _dbLoadSchema(); } }
 
+async function _sqlFetchJson(url, options) {
+  const response = await fetch(url, options);
+  const text = await response.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : {}; }
+  catch (e) {
+    throw new Error('HTTP ' + response.status + ': ' + (text.trim().slice(0, 240) || 'non-JSON response'));
+  }
+  if (!response.ok || data.error) {
+    throw new Error((data && data.error) || ('HTTP ' + response.status));
+  }
+  return data;
+}
+
 async function _dbLoadSchema() {
   const side = document.getElementById('db-tables');
   if (side) side.innerHTML = '<div style="color:var(--dim);font-size:0.74rem;padding:6px;">Loading…</div>';
   try {
-    const d = await fetch(API + '/api/sql/schema').then(r => r.json());
-    if (d.error) { if (side) side.innerHTML = '<div style="color:#f85149;font-size:0.74rem;padding:6px;">' + esc(d.error) + '</div>'; return; }
+    const d = await _sqlFetchJson(API + '/api/sql/schema');
     _dbTables = d.tables || [];
     const f = document.getElementById('db-filter');
     _dbRenderSidebar(f ? f.value : '');
     if (_dbTable) _dbRenderStructure();
-  } catch (e) { if (side) side.innerHTML = '<div style="color:#f85149;font-size:0.74rem;padding:6px;">schema failed</div>'; }
+  } catch (e) {
+    _sqlSchemaLoaded = false;
+    if (side) side.innerHTML = '<div style="color:#f85149;font-size:0.74rem;padding:6px;">Schema failed: ' + esc(e.message) + '<br><button class="btn" style="margin-top:6px;" onclick="_sqlInit()">Retry</button></div>';
+  }
 }
 
 function _dbFilter(q) { _dbRenderSidebar(q); }
@@ -35664,13 +35761,15 @@ async function _dbLoadData() {
   try {
     const q = '?table=' + encodeURIComponent(_dbTable) + '&limit=' + _dbLimit + '&offset=' + _dbOffset +
       (_dbSort ? '&sort=' + encodeURIComponent(_dbSort) + '&dir=' + _dbDir : '');
-    const d = await fetch(API + '/api/sql/rows' + q).then(r => r.json());
-    if (d.error) { status.classList.add('err'); status.textContent = d.error; grid.innerHTML = '<div style="padding:16px;color:#f85149;">' + esc(d.error) + '</div>'; return; }
+    const d = await _sqlFetchJson(API + '/api/sql/rows' + q);
     _dbRenderGrid(grid, d.columns, d.rows, true);
     _dbRenderPager(d);
     const t = _dbTables.find(x => x.name === _dbTable);
     status.textContent = t && t.writable ? 'Read/write · wb_*' : 'Read-only';
-  } catch (e) { status.classList.add('err'); status.textContent = 'load failed'; }
+  } catch (e) {
+    status.classList.add('err'); status.textContent = 'Load failed: ' + e.message;
+    grid.innerHTML = '<div style="padding:16px;color:#f85149;">' + esc(e.message) + '</div>';
+  }
 }
 
 function _dbRenderPager(d) {
@@ -35728,18 +35827,16 @@ async function _sqlRun() {
   const results = document.getElementById('sql-results');
   status.classList.remove('err'); status.textContent = 'Running…';
   try {
-    const d = await fetch(API + '/api/sql', {
+    const d = await _sqlFetchJson(API + '/api/sql', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sql, write }),
-    }).then(r => r.json());
-    if (d.error) {
-      status.classList.add('err'); status.textContent = d.error;
-      results.innerHTML = '<div style="padding:16px;color:#f85149;font-size:0.82rem;font-family:var(--mono);white-space:pre-wrap;">' + esc(d.error) + '</div>';
-      return;
-    }
+    });
     if (d.write) { status.textContent = d.message + ' · ' + d.ms + 'ms'; _dbLoadSchema(); return; }
     _dbRenderGrid(results, d.columns, d.rows, false);
     status.textContent = d.rowcount + (d.truncated ? '+ (capped)' : '') + ' row' + (d.rowcount === 1 ? '' : 's') + ' · ' + d.ms + 'ms';
-  } catch (e) { status.classList.add('err'); status.textContent = 'request failed'; }
+  } catch (e) {
+    status.classList.add('err'); status.textContent = 'Request failed: ' + e.message;
+    results.innerHTML = '<div style="padding:16px;color:#f85149;font-size:0.82rem;font-family:var(--mono);white-space:pre-wrap;">' + esc(e.message) + '</div>';
+  }
 }
 
 // ── Notes tab ─────────────────────────────────────────────────────────────────

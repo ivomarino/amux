@@ -70,7 +70,7 @@
 //! lane that moved the card it was nudged about gets the next one immediately
 //! instead of waiting out a cooldown it already earned its way past.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{OnceLock, RwLock};
 
 use rusqlite::{Connection, OptionalExtension};
@@ -668,6 +668,30 @@ pub struct DriveReport {
 
 static LAST_REPORT: OnceLock<RwLock<Option<DriveReport>>> = OnceLock::new();
 static TICK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+type LaneDriveKey = (usize, String);
+type LaneDriveMutex = std::sync::Arc<tokio::sync::Mutex<()>>;
+static LANE_DRIVE_LOCKS: OnceLock<std::sync::Mutex<HashMap<LaneDriveKey, LaneDriveMutex>>> =
+    OnceLock::new();
+
+/// A periodic fleet sweep and an event-driven wake can reach the same lane at
+/// once. The board claim itself is a CAS, but the losing pass can observe the
+/// winner's fresh `task.claimed` marker and mistake it for restart recovery,
+/// producing a second prompt. Serialize the complete decide→claim→enqueue
+/// operation per store and lane; different workers and test stores still run
+/// independently.
+fn lane_drive_lock(state: &AppState, lane: &str) -> LaneDriveMutex {
+    let key = (
+        std::sync::Arc::as_ptr(&state.store) as usize,
+        lane.to_string(),
+    );
+    LANE_DRIVE_LOCKS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .entry(key)
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
 
 fn report_slot() -> &'static RwLock<Option<DriveReport>> {
     LAST_REPORT.get_or_init(|| RwLock::new(None))
@@ -711,6 +735,11 @@ pub trait Fleet: Send + Sync {
     /// reimplemented: a second copy of "is this lane mid-turn" is the
     /// two-implementations-of-one-rule defect the board keeps producing.
     async fn at_boundary(&self, lane: &str) -> bool;
+    /// The provider has identity-backed child work (a subagent or background
+    /// terminal) alive for this lane.  This is stronger than a generic
+    /// `active` badge: it is the signal that a parent task may have been
+    /// parked in To Do while its delegated work kept running.
+    fn active_child_work(&self, _lane: &str) -> bool { false }
     /// When a session runs out of todo cards but still has blocked/done work,
     /// keep nudging it to re-assess and continue. ON BY DEFAULT since
     /// 2026-08-11 (Ethan: "standing order whenever idle to take care of any
@@ -825,6 +854,16 @@ impl Fleet for LiveFleet {
                 "board-drive boundary uses Workers structured truth");
         }
         status.as_deref() == Some("idle")
+    }
+    fn active_child_work(&self, lane: &str) -> bool {
+        self.signals.as_ref().is_some_and(|signals| {
+            let (_, explain) = signals.derive_status_explain(
+                lane,
+                signals.agent_running(&format!("amux-{lane}")),
+            );
+            explain["subagents_working"] == true
+                || explain["provider_background_working"] == true
+        })
     }
     async fn start_for_dispatch(&self, lane: &str) -> Result<(), String> {
         crate::api::session_verbs::start_for_board_dispatch(&self.state, lane).await
@@ -5449,6 +5488,182 @@ pub async fn drive_session(state: &AppState, lane: &str) -> LaneTrace {
     trace
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChildClaimReconcile {
+    /// One exact parked card was moved back into Doing in the same transaction
+    /// as its replacement causal marker.
+    Restored(String),
+    /// The exact card was already Doing; the child signal merely confirms it.
+    Current(String),
+    /// A newer informational/control turn explicitly owns the cardless state.
+    Cardless,
+    /// There was no exact, safe card to restore.
+    None,
+}
+
+/// Reassert the exact parent card while delegated work is observably alive.
+///
+/// Providers commonly yield their parent composer while a subagent or a
+/// background terminal keeps doing the task.  Some models also "park" that
+/// card back in To Do while they wait.  The status hook correctly reports the
+/// live child, but the old board projection then has to choose between two
+/// lies: WORKING with no card, or an idle-looking To Do card whose work is
+/// running.  Repair the lifecycle at the write boundary instead.
+///
+/// This never guesses from queue order or title similarity.  It considers only
+/// the newest semantic task marker for this lane.  A newer cardless
+/// informational/control marker wins, a Backlog/Review/terminal card stays
+/// where its gate put it, blockers remain blockers, and another Doing card is
+/// a WIP conflict.  Only an exact owned To Do claim can be restored.
+async fn reconcile_child_task_claim(state: &AppState, lane: &str) -> ChildClaimReconcile {
+    let lane = lane.to_string();
+    let lane_w = lane.clone();
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(ChildClaimReconcile::None));
+    let slot_w = slot.clone();
+    let result = state
+        .store
+        .write_async(move |conn| {
+            let mut marker: Option<(String, Option<String>)> = None;
+            let mut statement = conn.prepare(
+                "SELECT type, data FROM session_events WHERE session=?1 \
+                 AND type IN ('task.claimed','task.cardless') ORDER BY ts DESC, id DESC LIMIT 128",
+            )?;
+            let rows = statement.query_map([&lane_w], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            for row in rows.flatten() {
+                let parsed = row
+                    .1
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                if row.0 == "task.cardless" {
+                    if crate::api::sessions_legacy::cardless_event_allowed(&parsed) {
+                        marker = Some((row.0, None));
+                        break;
+                    }
+                    continue;
+                }
+                let card = parsed["issue"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string);
+                if card.is_some() {
+                    marker = Some((row.0, card));
+                    break;
+                }
+            }
+            drop(statement);
+
+            let Some((kind, card)) = marker else {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            };
+            if kind == "task.cardless" {
+                *slot_w.lock().unwrap_or_else(|poison| poison.into_inner()) =
+                    ChildClaimReconcile::Cardless;
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            }
+            let Some(card) = card else {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            };
+            let Some(row) = bs::get_issue(conn, &card)? else {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            };
+            if row.session.as_deref() != Some(lane_w.as_str()) || row.owner_type != "agent" {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            }
+            if row.status == "doing" {
+                *slot_w.lock().unwrap_or_else(|poison| poison.into_inner()) =
+                    ChildClaimReconcile::Current(card);
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            }
+            if row.status != "todo"
+                || row.archived != 0
+                || row.tags.iter().any(|tag| tag.to_ascii_lowercase().starts_with("needs:you"))
+                || row.waiting_on.as_deref().is_some_and(|value| !value.trim().is_empty())
+                || fresh_source_ref_trigger(&row, now_f64() as i64)
+                || matches!(row.item_type.as_str(), "tripwire" | "watch" | "epic")
+                || !deps_blocking(conn, &row).is_empty()
+            {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            }
+            let other_wip: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM issues WHERE session=?1 AND id<>?2 \
+                 AND status='doing' AND deleted IS NULL AND COALESCE(archived,0)=0 \
+                 AND COALESCE(type,'') NOT IN ('tripwire','watch','epic')",
+                rusqlite::params![&lane_w, &card],
+                |row| row.get(0),
+            )?;
+            if other_wip > 0 {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            }
+            let opts = crate::db::advance::AdvanceOpts {
+                expected_from: Some("todo".to_string()),
+                assign_to: Some(lane_w.clone()),
+                log_line: Some(format!(
+                    "Restored to Doing by {lane_w}: an identity-backed child is still working this exact claimed task"
+                )),
+                force: true,
+                skip_continuation: true,
+                ..Default::default()
+            };
+            match crate::db::advance::advance(conn, &card, "doing", &lane_w, &opts)? {
+                Ok(outcome) => {
+                    conn.execute(
+                        "INSERT INTO session_events (ts,session,type,data,source) VALUES (?,?,?,?,?)",
+                        rusqlite::params![
+                            now_f64(),
+                            &lane_w,
+                            "task.claimed",
+                            serde_json::json!({
+                                "issue": &card,
+                                "status": "doing",
+                                "from": "todo",
+                                "reason": "identity-backed-child-work",
+                                "measured": true,
+                                "n_considered": 1,
+                                "verdict": "exact_child_claim_restored",
+                            })
+                            .to_string(),
+                            "board-drive",
+                        ],
+                    )?;
+                    *slot_w.lock().unwrap_or_else(|poison| poison.into_inner()) =
+                        ChildClaimReconcile::Restored(card);
+                    Ok(crate::db::WriteOutcome { applied: true, events: outcome.events })
+                }
+                Err(_) => Ok(crate::db::WriteOutcome { applied: false, events: vec![] }),
+            }
+        })
+        .await;
+    if let Err(error) = result {
+        tracing::warn!(
+            target: "amux::board_drive",
+            session = %lane,
+            %error,
+            measured = false,
+            n_considered = 0,
+            verdict = "child_claim_reconcile_failed",
+            "identity-backed child work could not reconcile its exact board claim"
+        );
+        return ChildClaimReconcile::None;
+    }
+    let result = slot.lock().unwrap_or_else(|poison| poison.into_inner()).clone();
+    if let ChildClaimReconcile::Restored(card) = &result {
+        tracing::warn!(
+            target: "amux::board_drive",
+            session = %lane,
+            %card,
+            measured = true,
+            n_considered = 1,
+            verdict = "exact_child_claim_restored",
+            "live child work restored its exact parked To Do card to Doing"
+        );
+    }
+    result
+}
+
 fn publish_lane(trace: LaneTrace) {
     if let Ok(mut slot) = report_slot().write() {
         let report = slot.get_or_insert_with(|| DriveReport { started_at: now_f64(), ..Default::default() });
@@ -5461,6 +5676,8 @@ fn publish_lane(trace: LaneTrace) {
 }
 
 async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTrace {
+    let lane_lock = lane_drive_lock(state, lane);
+    let _lane_guard = lane_lock.lock().await;
     // COUNT THE BACKLOG BEFORE THE GATES, ALWAYS. Found by reading this
     // instrument's own output during verification: a lane skipped for
     // `not-running` reported `eligible_todos: 0` while a dispatchable card was
@@ -5552,6 +5769,39 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
     // anything not positively known to be idle is left alone. A nudge that waits
     // one more tick costs nothing; a nudge delivered mid-turn is an interruption.
     if !woke_for_dispatch && !fleet.at_boundary(lane).await {
+        // A provider-owned child is positive evidence that the lane is doing
+        // more than merely rendering an active spinner.  Reconcile its exact
+        // parent claim before returning `mid-turn`, otherwise a model which
+        // parked that card in To Do while waiting makes the board look idle
+        // for the entire delegated operation (the live Primis/TubeScience
+        // failure).  The helper refuses cardless turns, blockers and guesses.
+        if fleet.active_child_work(lane) {
+            match reconcile_child_task_claim(state, lane).await {
+                ChildClaimReconcile::Restored(card) => {
+                    return LaneTrace::skip(
+                        lane,
+                        "active-child-claim-restored",
+                        format!(
+                            "identity-backed child work is live; restored exact claimed card {card} from To Do to Doing"
+                        ),
+                    )
+                    .with_card(&card)
+                    .with_counts(eligible, open);
+                }
+                ChildClaimReconcile::Current(card) => {
+                    return LaneTrace::skip(
+                        lane,
+                        "active-child-claim-current",
+                        format!(
+                            "identity-backed child work is live on exact Doing card {card}; no new work was delivered"
+                        ),
+                    )
+                    .with_card(&card)
+                    .with_counts(eligible, open);
+                }
+                ChildClaimReconcile::Cardless | ChildClaimReconcile::None => {}
+            }
+        }
         // NAME THE EVIDENCE, not just the verdict. `mid-turn` read identically
         // for a lane genuinely generating and for one held by a self-report
         // nothing would ever refresh — and the second kind sat here for up to
@@ -8046,6 +8296,7 @@ mod tests {
         resume_disposition: std::sync::Mutex<Option<ResumeDelivery>>,
         running: std::sync::atomic::AtomicBool,
         boundary: std::sync::atomic::AtomicBool,
+        active_child: std::sync::atomic::AtomicBool,
         enabled: std::sync::atomic::AtomicBool,
         isolated: std::sync::atomic::AtomicBool,
         starts: std::sync::atomic::AtomicUsize,
@@ -8059,6 +8310,7 @@ mod tests {
                 resume_disposition: std::sync::Mutex::new(None),
                 running: std::sync::atomic::AtomicBool::new(true),
                 boundary: std::sync::atomic::AtomicBool::new(true),
+                active_child: std::sync::atomic::AtomicBool::new(false),
                 enabled: std::sync::atomic::AtomicBool::new(true),
                 isolated: std::sync::atomic::AtomicBool::new(false),
                 starts: std::sync::atomic::AtomicUsize::new(0),
@@ -8072,6 +8324,9 @@ mod tests {
         fn is_isolated(&self, _: &str) -> bool { self.isolated.load(std::sync::atomic::Ordering::SeqCst) }
         async fn is_running(&self, _: &str) -> bool { self.running.load(std::sync::atomic::Ordering::SeqCst) }
         async fn at_boundary(&self, _: &str) -> bool { self.boundary.load(std::sync::atomic::Ordering::SeqCst) }
+        fn active_child_work(&self, _: &str) -> bool {
+            self.active_child.load(std::sync::atomic::Ordering::SeqCst)
+        }
         fn auto_continue_enabled(&self, _: &str) -> bool { true }
         async fn start_for_dispatch(&self, _: &str) -> Result<(), String> {
             self.starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -8362,6 +8617,56 @@ mod tests {
         assert_eq!(trace.reason, "mid-turn", "{trace:?}");
         assert!(fleet.delivered.lock().unwrap().is_empty());
         assert_eq!(drive_events(&store, "task.resumed"), 0);
+    }
+
+    #[tokio::test]
+    async fn live_child_restores_its_exact_parked_todo_claim_without_redelivery() {
+        let (_dir, state, store) = drive_state();
+        // Exact live specimen: the parent claimed the task, then parked the
+        // row in To Do while a delegated agent kept running.
+        drive_card(&store, "CHILD-1", "todo", "agent", "code");
+        drive_claim(&store, "CHILD-1");
+        let fleet = BoundaryFleet::default();
+        fleet.boundary.store(false, std::sync::atomic::Ordering::SeqCst);
+        fleet.active_child.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let trace = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(trace.reason, "active-child-claim-restored", "{trace:?}");
+        assert_eq!(trace.card.as_deref(), Some("CHILD-1"));
+        assert_eq!(drive_status(&store, "CHILD-1"), "doing");
+        assert_eq!(drive_events(&store, "task.claimed"), 2);
+        assert!(fleet.delivered.lock().unwrap().is_empty());
+
+        // The next tick observes the now-correct Doing state and is a no-op.
+        let repeated = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(repeated.reason, "active-child-claim-current", "{repeated:?}");
+        assert_eq!(drive_events(&store, "task.claimed"), 2);
+    }
+
+    #[tokio::test]
+    async fn live_child_never_revives_a_prior_task_across_a_newer_cardless_turn() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "OLD-1", "todo", "agent", "code");
+        drive_claim(&store, "OLD-1");
+        store.write(|conn| {
+            conn.execute(
+                "INSERT INTO session_events (ts,session,type,data,source) \
+                 VALUES (?1,'lane','task.cardless',?2,'prompt-capture')",
+                rusqlite::params![
+                    now_f64() + 0.001,
+                    json!({"reason": "informational-query"}).to_string(),
+                ],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let fleet = BoundaryFleet::default();
+        fleet.boundary.store(false, std::sync::atomic::Ordering::SeqCst);
+        fleet.active_child.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let trace = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(trace.reason, "mid-turn", "{trace:?}");
+        assert_eq!(drive_status(&store, "OLD-1"), "todo");
+        assert_eq!(drive_events(&store, "task.claimed"), 1);
     }
 
     #[tokio::test]

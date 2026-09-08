@@ -2376,7 +2376,7 @@ type TaskMarker = (f64, Option<String>, bool, String);
 /// A cardless event must carry the semantic classification which licensed it.
 /// Transport intent (`[no-board]`) is not such a classification: a substantive
 /// turn remains work even when its sender asked not to mint a duplicate card.
-fn cardless_event_allowed(data: &serde_json::Value) -> bool {
+pub(crate) fn cardless_event_allowed(data: &serde_json::Value) -> bool {
     matches!(
         data["reason"].as_str(),
         Some("informational-query") | Some("control-prompt")
