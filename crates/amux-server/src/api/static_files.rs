@@ -140,7 +140,15 @@ async fn serve_path(
     match DashboardAssets::get(path) {
         Some(content) => {
             let mime = mime_for(path);
-            ([(header::CONTENT_TYPE, mime)], content.data.into_owned()).into_response()
+            let mut resp =
+                ([(header::CONTENT_TYPE, mime)], content.data.into_owned()).into_response();
+            if path == "sw.js" {
+                resp.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    "no-cache".parse().unwrap(),
+                );
+            }
+            resp
         }
         // SPA fallback: unknown NON-API paths get the shell so client routing
         // works offline-first.
