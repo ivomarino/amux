@@ -6039,10 +6039,6 @@ async function toggleIsolated(session) {
 
 async function clearScrollback(session) {
   closeAllMenus();
-  await apiCall(API + '/api/sessions/' + session + '/keys', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ keys: '' })
-  });
   await apiCall(API + '/api/sessions/' + session + '/clear', { method: 'POST' });
 }
 
