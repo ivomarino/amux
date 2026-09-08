@@ -27736,6 +27736,13 @@ mod refusal_status_tests {
             if j >= bytes.len() {
                 continue;
             }
+            // A match pattern such as `(false, "doing") =>` has the same
+            // prefix as a tuple outcome, but it is an input arm rather than a
+            // returned failure. Do not ask the HTTP classifier to classify a
+            // board status just because it appears beside a boolean pattern.
+            if rest[j + 1..].trim_start().starts_with(") =>") {
+                continue;
+            }
             let raw = &rest[..j];
             // Rust's `\`-at-end-of-line continuation eats the newline and the
             // following indentation; reproduce that so a wrapped literal
