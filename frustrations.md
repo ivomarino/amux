@@ -3846,13 +3846,17 @@ SYMPTOM: Exact-SHA Rust CI passed 354 browser scenarios, then 34 mobile/WebKit
   `task.claimed` identity.
 COST: The required ATE-93 CI gate ran 23 minutes before reporting 37 failures,
   and one absent external prerequisite looked like dozens of terminal regressions.
-FIX: The broad harness now announces and supplies an obvious non-secret provider
-  test value, keeping unrelated specs in their configured-install prerequisite.
+FIX: The broad harness now announces and writes an obvious non-secret provider
+  test value into every isolated project's `server.env`, the durable surface
+  `/api/identity` actually recognizes (it intentionally ignores process-injected
+  keys), keeping unrelated specs in their configured-install prerequisite.
   The settings test restores the text input through fill+blur, and Working-now
   creates its exact owner through the real claim endpoint. Its UI-only runtime
   activation preserves that exact server-produced identity instead of expecting
-  a stopped fixture to project as live. The API-key scenario restores the known
+  a stopped fixture to project as live. Both API-key scenarios restore the known
   harness baseline explicitly because a persisted empty value shadows the
-  process fallback. Missing-key behavior remains product behavior; it is no
-  longer accidental global state for tests whose acceptance has nothing to do
-  with provider setup.
+  process fallback; the slow-refresh scenario also reads the masked value back
+  as its cleanup postcondition, so a future regression fails at the writer
+  instead of poisoning later specs. Missing-key behavior remains product
+  behavior; it is no longer accidental global state for tests whose acceptance
+  has nothing to do with provider setup.

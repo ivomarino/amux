@@ -51,15 +51,27 @@ const TARGETS = [
 // credential. A clean CI home has no key, which makes the product correctly
 // show the self-hosted setup banner. On narrow viewports that banner covers the
 // terminal toolbar, so one missing external prerequisite turns every later
-// click test into a 30s pointer-interception timeout. Seed an obviously
-// non-secret test value at the PROCESS layer: settings_api_key_anthropic still
+// click test into a 30s pointer-interception timeout. `/api/identity`
+// intentionally ignores process-injected keys, so seed an obviously non-secret
+// value in each isolated project's durable server.env: the exact configuration
+// surface the product checks. settings_api_key_anthropic still
 // overwrites/restores it through the real endpoint, while unrelated specs run
 // in the configured-install state they actually assume.
-console.log('[e2e] provider prerequisite: seeded a non-secret test key; missing-key setup UI is outside this broad suite.');
 
 // One temp home per TARGET, created eagerly so each server and its tests agree.
 const homes: Record<string, string> = Object.fromEntries(
   TARGETS.map((t) => [t.name, fs.mkdtempSync(path.join(os.tmpdir(), `amux-e2e-${t.name}-`))]),
+);
+for (const home of Object.values(homes)) {
+  fs.writeFileSync(
+    path.join(home, 'server.env'),
+    `ANTHROPIC_API_KEY=${E2E_ANTHROPIC_KEY}\n`,
+    { mode: 0o600 },
+  );
+}
+console.log(
+  '[e2e] provider prerequisite: seeded each isolated server.env with a non-secret test key; ' +
+    'missing-key setup UI is outside this broad suite.',
 );
 
 // SAY OUT LOUD WHAT EACH TARGET ACTUALLY COVERS, every run.
@@ -191,7 +203,6 @@ export default defineConfig({
     env: {
       AMUX_HOME: homes[t.name],
       AMUX_RS_PORT: String(t.port),
-      ANTHROPIC_API_KEY: E2E_ANTHROPIC_KEY,
       // A browser test necessarily connects over loopback, which the server
       // deliberately auth-bypasses (Python parity). Without this, every
       // "rejects a bad token" assertion is a check that cannot pass — it was

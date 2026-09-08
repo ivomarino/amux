@@ -493,14 +493,23 @@ test('settings_api_key_survives_slow_env_refresh', async ({ page, request }) => 
   ]);
   expect(res.status()).toBe(200);
 
-  // Restore (same route as the sibling test; empty value falls back to
-  // process env).
+  // Restore the exact shared harness baseline. A present-but-empty value in
+  // server.env deliberately means CLEARED and shadows the process env; writing
+  // '' here used to remove the prerequisite for every later spec in this
+  // project's shared server. On a loaded CI runner settings finished before
+  // the terminal files, so one cleanup turned into 22 unrelated pointer-event
+  // timeouts behind the no-key banner. Keep the postcondition explicit so a
+  // future cleanup cannot silently poison the rest of the project again.
   await page.unroute('**/api/settings/env');
   const restore = await request.patch('/api/settings/env', {
     headers: authHeaders(token),
-    data: { ANTHROPIC_API_KEY: '' },
+    data: { ANTHROPIC_API_KEY: E2E_ANTHROPIC_KEY },
   });
   expect(restore.status()).toBe(200);
+  const restored = (await (
+    await request.get('/api/settings/env', { headers: authHeaders(token) })
+  ).json()) as Record<string, string>;
+  expect(restored.ANTHROPIC_API_KEY).toMatch(/cret$/);
 });
 
 test('settings_commit_guard', async ({ page, request }) => {
