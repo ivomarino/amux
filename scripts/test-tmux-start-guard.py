@@ -38,6 +38,26 @@ lsof() {
 cmd_start guard-fixture --detach
 '''
 
+PROBE_TIMEOUT_DRIVER = r'''
+exit() { return "${1:-0}"; }
+source "$1/amux"
+unset -f exit
+set +e
+AMUX_TMUX_PROBE_TIMEOUT_S=1 tmux_has_session_exact "=amux-stuck"
+rc=$?
+set -e
+printf 'rc=%s\n' "$rc"
+exit "$rc"
+'''
+
+START_ALL_TIMEOUT_DRIVER = r'''
+exit() { return "${1:-0}"; }
+source "$1/amux"
+unset -f exit
+cmd_start() { printf 'START %s\n' "$1" >> "$GUARD_FIXTURE/calls"; return 0; }
+AMUX_TMUX_PROBE_TIMEOUT_S=1 cmd_start_all
+'''
+
 
 class TmuxStartGuard(unittest.TestCase):
     def run_case(self, mode):
@@ -77,6 +97,48 @@ class TmuxStartGuard(unittest.TestCase):
                 result, calls, _ = self.run_case(mode)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue(calls.startswith("new-session "), calls)
+
+
+class TmuxProbeTimeouts(unittest.TestCase):
+    def run_driver(self, driver, tmux_stub):
+        with tempfile.TemporaryDirectory(prefix="amux-tmux-timeout-") as tmp:
+            sessions = Path(tmp, "sessions")
+            sessions.mkdir()
+            Path(sessions, "alpha.env").write_text("CC_DIR=/tmp\n")
+            Path(sessions, "beta.env").write_text("CC_DIR=/tmp\n")
+            Path(sessions, "gamma.env").write_text("CC_ARCHIVED=1\n")
+            bindir = Path(tmp, "bin")
+            bindir.mkdir()
+            tmux = Path(bindir, "tmux")
+            tmux.write_text(tmux_stub)
+            tmux.chmod(0o755)
+            env = dict(os.environ, CC_HOME=tmp, GUARD_FIXTURE=tmp,
+                       AMUX_SESSION="guard-fixture", AMUX_API="https://localhost:8824",
+                       PATH=f"{bindir}:{os.environ.get('PATH', '')}")
+            result = subprocess.run(["bash", "-c", driver, "guard-test", str(REPO)],
+                                    env=env, capture_output=True, text=True, timeout=10)
+            calls = Path(tmp, "calls")
+            return result, calls.read_text() if calls.exists() else ""
+
+    def test_tmux_has_session_probe_is_bounded(self):
+        result, _ = self.run_driver(PROBE_TIMEOUT_DRIVER, "#!/usr/bin/env bash\nsleep 5\n")
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertIn("rc=124", result.stdout)
+
+    def test_start_all_records_tmux_probe_timeout_without_starting_ambiguous_worker(self):
+        tmux_stub = """#!/usr/bin/env bash
+if [[ "$1" == "has-session" && "$3" == "=amux-alpha" ]]; then sleep 5; exit 1; fi
+if [[ "$1" == "has-session" && "$3" == "=amux-beta" ]]; then exit 0; fi
+exit 1
+"""
+        result, calls = self.run_driver(START_ALL_TIMEOUT_DRIVER, tmux_stub)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(calls, "")
+        self.assertIn("0 started", result.stdout)
+        self.assertIn("1 already running", result.stdout)
+        self.assertIn("1 failed", result.stdout)
+        self.assertIn("1 archived", result.stdout)
+        self.assertIn("alpha: tmux has-session timed out", result.stderr)
 
 
 if __name__ == "__main__":
