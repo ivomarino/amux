@@ -3305,14 +3305,14 @@ function _runtimeBoardPresentation(s) {
   const status = String(truth.status || truth.verdict || '');
   if (status === 'cardless-allowed') return { syncing: false, cardless: true, cardId: '' };
   const cardId = String(truth.card_id || '').trim();
-  if (status !== 'linked' || !cardId || Number(truth.card_count) !== 1) {
+  if (status !== 'linked' || !cardId) {
     return { syncing: true, cardless: false, cardId: '' };
   }
   return { syncing: false, cardless: false, cardId };
 }
 
 function _runtimeBoardSyncBadge() {
-  return '<span class="status-badge waiting" title="The worker is running; AMUX is still linking this runtime to one exact live task.">card syncing</span>';
+  return '<span class="status-badge active" title="The worker is running; the board link is still being resolved after a restart.">working</span>';
 }
 
 function _runtimeBoardCardlessBadge() {
@@ -3324,15 +3324,18 @@ function _runtimeBoardSplitBadge(s) {
   const truth = s.runtime_board || {};
   const verdict = String(truth.verdict || 'unattributed');
   const observed = truth.observed_card_id ? ' Observed ' + esc(truth.observed_card_id) + '.' : '';
-  // Most unattributed turns are a stale/missing task link, not a stopped or
-  // failed worker. Keep that honest but quiet. Only two competing live claims
-  // need the red operator-attention treatment.
   if (verdict === 'active-conflicting-claims') {
     return '<span class="status-badge rate-limited" title="This running worker has more than one live task claim, so AMUX will not guess.'
       + observed + ' Diagnostic: ' + esc(verdict) + '.">card conflict</span>';
   }
-  return '<span class="status-badge waiting" title="The worker is running; its exact live task link is not available yet.'
-    + observed + ' Diagnostic: ' + esc(verdict) + '.">card syncing</span>';
+  if (verdict === 'active-without-card') {
+    return '<span class="status-badge" title="Running but no board card is assigned.' + observed + '">no card</span>';
+  }
+  if (verdict === 'active-card-invalid') {
+    return '<span class="status-badge" title="The linked card is stale or deleted.' + observed + '">stale card</span>';
+  }
+  return '<span class="status-badge waiting" title="The worker is running; its task link is being resolved.'
+    + observed + ' Diagnostic: ' + esc(verdict) + '.">working</span>';
 }
 
 // Turn the board-drive trace into the smallest useful operator explanation.
@@ -9103,7 +9106,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.837';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.838';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
