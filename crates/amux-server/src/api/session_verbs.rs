@@ -1939,7 +1939,8 @@ pub enum RenameDisposition {
     KeepForAudit(&'static str),
 }
 
-/// EVERY table with a session-name column, and its disposition.
+/// EVERY session-name field, and its disposition. A bare table name means its
+/// `session` column; any differently-named field is written as `table.column`.
 ///
 /// THE LIST USED TO BE THE BUG. The cascade carried two hand-maintained arrays,
 /// and a table added later simply never joined them — no error, no warning, the
@@ -1949,11 +1950,16 @@ pub enum RenameDisposition {
 /// `telegram_mappings` (chat routing, so messages would address a dead name).
 ///
 /// `tests/rename_covers_every_session_table.rs` enumerates the schema BUILT FROM
-/// MIGRATIONS and fails on any table missing here, so the next one cannot join
-/// that gap quietly — the same argument AF-328 made for the issues fixture.
-pub const SESSION_SCOPED_TABLES: &[(&str, RenameDisposition)] = &[
+/// MIGRATIONS and fails on any session-name field missing here, so the next one
+/// cannot join that gap quietly — the same argument AF-328 made for the issues
+/// fixture.
+pub const SESSION_SCOPED_FIELDS: &[(&str, RenameDisposition)] = &[
     // -- the lane's own state: must follow the rename --
     ("issues", RenameDisposition::Migrate),
+    ("issues.reviewer", RenameDisposition::Migrate),
+    ("issues.shepherd", RenameDisposition::Migrate),
+    ("issues.requested_by", RenameDisposition::Migrate),
+    ("issues.callback_session", RenameDisposition::Migrate),
     ("schedules", RenameDisposition::Migrate),
     ("session_gates", RenameDisposition::Migrate),
     ("saved_messages", RenameDisposition::Migrate),
@@ -1965,11 +1971,18 @@ pub const SESSION_SCOPED_TABLES: &[(&str, RenameDisposition)] = &[
     ("tasks", RenameDisposition::Migrate),
     ("task_windows", RenameDisposition::Migrate),
     ("telegram_mappings", RenameDisposition::Migrate),
+    ("telegram_mappings.last_routed_session", RenameDisposition::Migrate),
     ("mdai_runs", RenameDisposition::Migrate),
     ("board_drive_nudge_state", RenameDisposition::Migrate),
     ("dictation_history", RenameDisposition::Migrate),
     ("reclaim_quarantine", RenameDisposition::Migrate),
     ("send_dedup", RenameDisposition::Migrate),
+    // An unresolved overlap is live coordination, not historical attribution:
+    // its owner authorization, completion/deployment guard, and pending
+    // callback must continue to address the renamed worker.
+    ("board_overlap_coordination.owner_session", RenameDisposition::Migrate),
+    ("board_overlap_members", RenameDisposition::Migrate),
+    ("board_overlap_callbacks.target_session", RenameDisposition::Migrate),
     // -- history written under the old name: keeps it, on purpose --
     (
         "session_events",
@@ -1993,21 +2006,34 @@ pub const SESSION_SCOPED_TABLES: &[(&str, RenameDisposition)] = &[
         "reclaim_scans",
         RenameDisposition::KeepForAudit("a scan is a dated observation, not live state"),
     ),
+    (
+        "_amux_request_log.amux_session",
+        RenameDisposition::KeepForAudit("the caller name records who made the request at the time"),
+    ),
+    (
+        "board_overlap_coordination.resolved_by_session",
+        RenameDisposition::KeepForAudit(
+            "the resolver name attributes a completed reconciliation decision at the time",
+        ),
+    ),
 ];
 
 /// The `Migrate` tables a plain `SET session=?1 WHERE session=?2` handles —
 /// everything except the ones [`RENAME_MIGRATIONS`] already covers with custom
 /// SQL (those filter on `deleted IS NULL` or touch a second column).
 pub fn simple_rename_tables() -> Vec<&'static str> {
-    const CUSTOM: [&str; 4] = ["issues", "schedules", "session_gates", "saved_messages"];
-    SESSION_SCOPED_TABLES
+    SESSION_SCOPED_FIELDS
         .iter()
-        .filter(|(t, d)| matches!(d, RenameDisposition::Migrate) && !CUSTOM.contains(t))
+        .filter(|(field, d)| {
+            matches!(d, RenameDisposition::Migrate)
+                && !field.contains('.')
+                && !RENAME_MIGRATIONS.iter().any(|(custom, _)| custom == field)
+        })
         .map(|(t, _)| *t)
         .collect()
 }
 
-pub const RENAME_MIGRATIONS: [(&str, &str); 6] = [
+pub const RENAME_MIGRATIONS: [(&str, &str); 11] = [
     ("issues", "UPDATE issues SET session=?1 WHERE session=?2 AND deleted IS NULL"),
     // BEYOND PYTHON, and the reason AMUX-3749 exists: the cascade
     // migrated a card's OWNER and left the two columns that address
@@ -2024,9 +2050,29 @@ pub const RENAME_MIGRATIONS: [(&str, &str); 6] = [
         "issues.shepherd",
         "UPDATE issues SET shepherd=?1 WHERE shepherd=?2 AND deleted IS NULL",
     ),
+    (
+        "issues.requested_by",
+        "UPDATE issues SET requested_by=?1 WHERE requested_by=?2 AND deleted IS NULL",
+    ),
+    (
+        "issues.callback_session",
+        "UPDATE issues SET callback_session=?1 WHERE callback_session=?2 AND deleted IS NULL",
+    ),
     ("schedules", "UPDATE schedules SET session=?1 WHERE session=?2"),
     ("session_gates", "UPDATE session_gates SET session=?1 WHERE session=?2"),
     ("saved_messages", "UPDATE saved_messages SET session=?1 WHERE session=?2"),
+    (
+        "board_overlap_coordination.owner_session",
+        "UPDATE board_overlap_coordination SET owner_session=?1 WHERE owner_session=?2",
+    ),
+    (
+        "board_overlap_callbacks.target_session",
+        "UPDATE board_overlap_callbacks SET target_session=?1 WHERE target_session=?2",
+    ),
+    (
+        "telegram_mappings.last_routed_session",
+        "UPDATE telegram_mappings SET last_routed_session=?1 WHERE last_routed_session=?2",
+    ),
 ];
 
 /// Does this name resolve to a REGISTERED worker?
@@ -17404,11 +17450,24 @@ async fn rename_session(state: &AppState, name: &str, raw_new: &str) -> Response
     steps.extend(counts.lock().unwrap().iter().cloned());
     // Say WHICH tables kept the old name and WHY, rather than naming one of
     // them and leaving the rest to look like an oversight.
-    for (t, d) in SESSION_SCOPED_TABLES {
+    for (t, d) in SESSION_SCOPED_FIELDS {
         if let RenameDisposition::KeepForAudit(why) = d {
             steps.push(format!("db.{t}: keeps the old name — {why}"));
         }
     }
+    let overlap_outcomes: Vec<&str> = steps
+        .iter()
+        .filter(|step| step.starts_with("db.board_overlap_"))
+        .map(String::as_str)
+        .collect();
+    tracing::info!(
+        marker = "session_rename_overlap_lineage",
+        old_session = name,
+        new_session = %new_name,
+        n_fields = overlap_outcomes.len(),
+        outcomes = ?overlap_outcomes,
+        "session rename reconciled live overlap addresses and retained historical attribution"
+    );
     // 9. Re-export AMUX_SESSION for future panes (py:76416) — best-effort;
     //    the RUNNING shell keeps its env until restart, same as Python.
     if is_running(&new_name).await {
@@ -18818,6 +18877,29 @@ fn getrandom_fill(buf: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
+    #[derive(Clone)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    struct CapturedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter(self.0.clone())
+        }
+    }
+
+    impl std::io::Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     /// AF-578. CONTENT AFTER THE ROSTER, which is the shape this merge will meet
     /// on first run and which none of my other fixtures had.
@@ -23049,6 +23131,14 @@ CLAUDE-POSTFIX-COMPLETE
     /// attached rows, retry-after-partial convergence, target collision.
     #[tokio::test]
     async fn rename_is_convergent_journaled_and_collision_safe() {
+        let captured_logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(CapturedLogs(captured_logs.clone()))
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join("sessions")).unwrap();
         let _home = crate::api::settings::test_env::set_home(home.path());
@@ -23060,10 +23150,29 @@ CLAUDE-POSTFIX-COMPLETE
             .store
             .write_async(|conn| {
                 conn.execute_batch(
-                    "INSERT INTO issues (id, title, session, status, owner_type, created, updated)
-                        VALUES ('I-1', 'card', 'rn-old', 'doing', 'agent', 1, 1);
+                    "INSERT INTO issues
+                        (id, title, session, status, owner_type, created, updated,
+                         requested_by, callback_session)
+                        VALUES ('I-1', 'card', 'rn-old', 'doing', 'agent', 1, 1,
+                                'rn-old', 'rn-old');
                      INSERT INTO schedules (id, title, session, command, created, updated)
-                        VALUES ('S-1', 'sched', 'rn-old', 'noop', 1, 1);",
+                        VALUES ('S-1', 'sched', 'rn-old', 'noop', 1, 1);
+                     INSERT INTO telegram_mappings (chat_id, session, last_routed_session)
+                        VALUES (1, 'rn-old', 'rn-old');
+                     INSERT INTO board_overlap_coordination
+                        (coordination_id, semantic_key, concern, owner_card_id, owner_session,
+                         resolution, resolution_note, resolved_by_card_id, resolved_by_session,
+                         resolved_at, created_at, updated_at)
+                        VALUES ('OVL-rename', 'rename-fixture', 'lineage', 'I-1', 'rn-old',
+                                'scope-split', 'fixture resolution', 'I-1', 'rn-old', 1, 1, 1);
+                     INSERT INTO board_overlap_members
+                        (coordination_id, card_id, session, base_commit, head_commit, worktree,
+                         intent, self_reported, created_at, last_seen_at)
+                        VALUES ('OVL-rename', 'I-1', 'rn-old', 'base', 'head', '/tmp/rn-old',
+                                'rename fixture', 1, 1, 1);
+                     INSERT INTO board_overlap_callbacks
+                        (coordination_id, target_session, message_id, state, updated_at)
+                        VALUES ('OVL-rename', 'rn-old', 'MSG-rename', 'delivered', 1);",
                 )?;
                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
             })
@@ -23107,19 +23216,67 @@ CLAUDE-POSTFIX-COMPLETE
         assert!(meta_path("rn-new").exists() && log_path("rn-new").exists());
         let steps = v["steps"].to_string();
         assert!(steps.contains("db.issues: 1 row(s)"), "{steps}");
+        assert!(steps.contains("db.issues.requested_by: 1 row(s)"), "{steps}");
+        assert!(steps.contains("db.issues.callback_session: 1 row(s)"), "{steps}");
         assert!(steps.contains("db.schedules: 1 row(s)"), "{steps}");
+        assert!(
+            steps.contains("db.telegram_mappings.last_routed_session: 1 row(s)"),
+            "{steps}"
+        );
         assert!(steps.contains("db.steering_queue: 1 row(s)"), "{steps}");
+        assert!(
+            steps.contains("db.board_overlap_coordination.owner_session: 1 row(s)"),
+            "{steps}"
+        );
+        assert!(steps.contains("db.board_overlap_members: 1 row(s)"), "{steps}");
+        assert!(
+            steps.contains("db.board_overlap_callbacks.target_session: 1 row(s)"),
+            "{steps}"
+        );
+        assert!(
+            steps.contains("db.board_overlap_coordination.resolved_by_session: keeps the old name"),
+            "{steps}"
+        );
         assert!(steps.contains("prefs.session_reports: key migrated"), "{steps}");
         {
             let conn = state.store.read().unwrap();
-            let sess: String = conn
-                .query_row("SELECT session FROM issues WHERE id='I-1'", [], |r| r.get(0))
+            let (sess, requester, issue_callback): (String, String, String) = conn
+                .query_row(
+                    "SELECT session, requested_by, callback_session FROM issues WHERE id='I-1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
                 .unwrap();
             assert_eq!(sess, "rn-new");
+            assert_eq!((requester.as_str(), issue_callback.as_str()), ("rn-new", "rn-new"));
             let sched: String = conn
                 .query_row("SELECT session FROM schedules WHERE id='S-1'", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(sched, "rn-new");
+            let (owner, member, callback, resolver): (String, String, String, String) = conn
+                .query_row(
+                    "SELECT c.owner_session, m.session, cb.target_session, c.resolved_by_session
+                       FROM board_overlap_coordination c
+                       JOIN board_overlap_members m USING (coordination_id)
+                       JOIN board_overlap_callbacks cb USING (coordination_id)
+                      WHERE c.coordination_id='OVL-rename'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (owner.as_str(), member.as_str(), callback.as_str()),
+                ("rn-new", "rn-new", "rn-new")
+            );
+            assert_eq!(resolver, "rn-old", "completed reconciliation attribution is historical");
+            let telegram_route: String = conn
+                .query_row(
+                    "SELECT last_routed_session FROM telegram_mappings WHERE chat_id=1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(telegram_route, "rn-new");
             // Journal: started + completed events both present (rule 4).
             let n: i64 = conn
                 .query_row(
@@ -23130,6 +23287,12 @@ CLAUDE-POSTFIX-COMPLETE
                 .unwrap();
             assert!(n >= 2, "rename must journal start+finish, found {n}");
         }
+        let logs = String::from_utf8(captured_logs.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("marker=\"session_rename_overlap_lineage\""),
+            "missing exact sweep marker: {logs}"
+        );
+        assert!(logs.contains("n_fields=4"), "marker must say how much it measured: {logs}");
 
         // 3. Retry-after-partial: simulate a crash that moved ONLY the env
         //    file, leaving meta/log/DB under the old name — the retry of the

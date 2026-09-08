@@ -6216,11 +6216,15 @@ mod tests {
         assert_eq!(before.0["unclaimed"].as_array().unwrap().len(), paths.len());
 
         let now = now_epoch();
+        // Compute this once. Re-evaluating the subtraction at the assertion
+        // site can differ by one f64 ULP across codegen targets even though
+        // the JSON round trip preserved the value exactly.
+        let observed_mtime = now - 10.0;
         let reports: Vec<Value> = paths
             .iter()
             .map(|path| {
                 json!({
-                    "path": repo.join(path), "mtime": now - 10.0,
+                    "path": repo.join(path), "mtime": observed_mtime,
                 })
             })
             .collect();
@@ -6243,7 +6247,11 @@ mod tests {
             .unwrap();
         let legacy_map: HashMap<String, f64> = serde_json::from_str(&saved).unwrap();
         assert_eq!(legacy_map.len(), paths.len());
-        assert_eq!(legacy_map[&realpath(&repo.join(paths[0]))], now - 10.0);
+        assert_eq!(
+            legacy_map[&realpath(&repo.join(paths[0]))],
+            observed_mtime,
+            "the observation timestamp must survive its JSON/SQLite round trip exactly"
+        );
 
         // This is the production loader, not a manually populated GuardInputs.
         let (code, after) = staged_guard_inner(Some(state), headers(&requester), body).await;

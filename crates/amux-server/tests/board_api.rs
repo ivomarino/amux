@@ -2184,6 +2184,36 @@ async fn done_requires_an_asset_link_and_gate_ack_cannot_fake_it() {
     )
     .await;
     assert_eq!(st, StatusCode::CREATED, "artifact registration failed: {artifact}");
+    let artifact_id = artifact["id"].as_str().unwrap();
+    let (st, _, retired) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}/artifacts/{artifact_id}"),
+        Some(json!({ "state": "invalid" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "retiring the artifact failed: {retired}");
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "done", "evidence": EV, "gate_ack": true })),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::CONFLICT,
+        "a retired artifact must not remain valid gate evidence: {v}"
+    );
+    assert_eq!(v["code"], json!("done_requires_asset_link"));
+    let (st, _, restored) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}/artifacts/{artifact_id}"),
+        Some(json!({ "state": "created" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "restoring the artifact failed: {restored}");
     let (st, _, v) = send(
         &app,
         "PATCH",
@@ -4215,6 +4245,67 @@ async fn terminal_transition_records_summary_and_preserves_provenance_for_provid
     }
 }
 
+/// ATE-93 live acceptance: reopening a discarded card must not keep presenting
+/// that old terminal summary as the current run's result. The terminal record
+/// stays in the append-only log, while an explicitly supplied current result
+/// replaces it atomically with the reopening transition.
+#[tokio::test]
+async fn reopening_terminal_card_retires_stale_summary_without_erasing_history() {
+    let (app, _dir) = app();
+    let lane = "reopened-summary-worker";
+    let made = create(
+        &app,
+        json!({
+            "title": "reopened terminal summary",
+            "status": "doing",
+            "type": "chore",
+            "session": lane,
+        }),
+    )
+    .await;
+    let id = made["id"].as_str().unwrap();
+
+    let (st, _, discarded) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({
+            "status": "discarded",
+            "evidence": "none: initial capture classification",
+        })),
+        &[("X-Amux-Worker", lane)],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "discard failed: {discarded}");
+    let (_, _, terminal) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    let old_summary = terminal["last_result"].as_str().unwrap().to_string();
+    assert!(old_summary.starts_with("Final outcome: discarded"), "{terminal}");
+
+    let current_result = "Current reconciliation run has live acceptance in progress.";
+    let (st, _, reopened) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({
+            "status": "todo",
+            "last_result": current_result,
+        })),
+        &[("X-Amux-Worker", lane)],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "reopen failed: {reopened}");
+
+    let (_, _, detail) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(detail["status"], json!("todo"));
+    assert_eq!(detail["last_result"], json!(current_result), "stale Work summary survived: {detail}");
+    let log = detail["log"].as_str().unwrap_or("");
+    assert!(log.contains(&old_summary), "terminal history was erased: {log}");
+    assert!(
+        log.contains("terminal summary retired on reopen"),
+        "reopen did not leave a sweep-visible card marker: {log}"
+    );
+}
+
 /// A refused terminal transition must not manufacture a final summary. This
 /// is the unhappy half of the same four provider-shaped capture inputs.
 #[tokio::test]
@@ -4616,6 +4707,27 @@ async fn artifact_crud_is_exact_and_missing_targets_fail_honestly() {
     .await;
     assert_eq!(st, StatusCode::CREATED, "{made}");
     let aid = made["id"].as_str().unwrap();
+
+    for retired_state in ["invalid", "superseded"] {
+        let (st, _, patched) = send(
+            &app,
+            "PATCH",
+            &format!("/api/board/{a}/artifacts/{aid}"),
+            Some(json!({"state": retired_state})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{retired_state} must be a durable artifact disposition: {patched}");
+        let (_, _, listed) = send(&app, "GET", &format!("/api/board/{a}/artifacts"), None).await;
+        assert_eq!(listed[0]["state"], json!(retired_state));
+    }
+    let (st, _, restored) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{a}/artifacts/{aid}"),
+        Some(json!({"state": "created"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "fixture must restore the active state: {restored}");
 
     let (st, _, wrong_patch) = send(
         &app,

@@ -19,15 +19,20 @@
 use amux_server::api::session_verbs::RENAME_MIGRATIONS;
 
 fn issues_fixture() -> rusqlite::Connection {
-    let c = rusqlite::Connection::open_in_memory().unwrap();
+    // This test exercises the shipped rename SQL, so its table must come from
+    // the shipped migrations too. The former hand-written five-column copy
+    // drifted as soon as issues gained another live routing field and made the
+    // whole workspace suite fail before it reached any rename assertion.
+    let c = amux_server::db::migrate::test_memdb_pub();
     c.execute_batch(
-        "CREATE TABLE issues (
-             id TEXT PRIMARY KEY, session TEXT, reviewer TEXT, shepherd TEXT, deleted INTEGER
-         );
-         INSERT INTO issues VALUES ('A','amux-rust',NULL,NULL,NULL);
-         INSERT INTO issues VALUES ('B','ecology','amux-rust',NULL,NULL);
-         INSERT INTO issues VALUES ('C','ecology',NULL,'amux-rust',NULL);
-         INSERT INTO issues VALUES ('D','ecology','amux-rust',NULL,1);",
+        "INSERT INTO issues (id,title,session,reviewer,shepherd,deleted,created,updated)
+             VALUES ('A','owner','amux-rust',NULL,NULL,NULL,1,1);
+         INSERT INTO issues (id,title,session,reviewer,shepherd,deleted,created,updated)
+             VALUES ('B','reviewer','ecology','amux-rust',NULL,NULL,1,1);
+         INSERT INTO issues (id,title,session,reviewer,shepherd,deleted,created,updated)
+             VALUES ('C','shepherd','ecology',NULL,'amux-rust',NULL,1,1);
+         INSERT INTO issues (id,title,session,reviewer,shepherd,deleted,created,updated)
+             VALUES ('D','deleted','ecology','amux-rust',NULL,1,1,1);",
     )
     .unwrap();
     c

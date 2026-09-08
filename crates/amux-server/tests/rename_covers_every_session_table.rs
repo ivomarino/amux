@@ -19,13 +19,26 @@
 //! the issues fixtures: a fixture that mirrors the schema by hand drifts, and
 //! the drift is invisible until it costs something.
 
-use amux_server::api::session_verbs::{RenameDisposition, SESSION_SCOPED_TABLES};
+use amux_server::api::session_verbs::{RenameDisposition, SESSION_SCOPED_FIELDS};
 
-/// Columns that hold a session NAME. `reviewer` and `shepherd` live on
-/// `issues` and address other lanes; they are covered by their own statements
-/// in `RENAME_MIGRATIONS` and are named here so a new table carrying one is
-/// still caught.
-const SESSION_COLUMNS: [&str; 3] = ["session", "reviewer", "shepherd"];
+/// Columns that hold a session NAME. The suffix catches purpose-specific
+/// fields such as `owner_session`, `target_session`, and `amux_session`; the
+/// two issue routing names predate that convention.
+fn is_session_column(column: &str) -> bool {
+    column == "session"
+        || column == "reviewer"
+        || column == "shepherd"
+        || column == "requested_by"
+        || column.ends_with("_session")
+}
+
+fn field_key(table: &str, column: &str) -> String {
+    if column == "session" {
+        table.to_string()
+    } else {
+        format!("{table}.{column}")
+    }
+}
 
 #[test]
 fn every_session_keyed_table_declares_what_a_rename_does_with_it() {
@@ -39,7 +52,7 @@ fn every_session_keyed_table_declares_what_a_rename_does_with_it() {
         .filter_map(Result::ok)
         .collect();
 
-    let mut session_keyed: Vec<String> = Vec::new();
+    let mut session_fields: Vec<String> = Vec::new();
     for t in &tables {
         let cols: Vec<String> = conn
             .prepare(&format!("PRAGMA table_info({t})"))
@@ -47,38 +60,40 @@ fn every_session_keyed_table_declares_what_a_rename_does_with_it() {
                 st.query_map([], |r| r.get::<_, String>(1)).map(|rows| rows.filter_map(Result::ok).collect())
             })
             .unwrap_or_default();
-        if cols.iter().any(|c| SESSION_COLUMNS.contains(&c.as_str())) {
-            session_keyed.push(t.clone());
+        for column in cols.iter().filter(|c| is_session_column(c)) {
+            session_fields.push(field_key(t, column));
         }
     }
 
     // The fixture must actually have found something, or this passes by
     // measuring nothing — the failure mode this whole file is about.
     assert!(
-        session_keyed.len() >= 10,
-        "expected the schema to have many session-keyed tables, found {}: {session_keyed:?}. \
+        session_fields.len() >= 10,
+        "expected the schema to have many session-name fields, found {}: {session_fields:?}. \
          A near-empty list means the schema did not build, not that the cascade is complete.",
-        session_keyed.len()
+        session_fields.len()
     );
 
-    let declared: Vec<&str> = SESSION_SCOPED_TABLES.iter().map(|(t, _)| *t).collect();
+    let declared: Vec<&str> = SESSION_SCOPED_FIELDS.iter().map(|(t, _)| *t).collect();
     let undeclared: Vec<&String> =
-        session_keyed.iter().filter(|t| !declared.contains(&t.as_str())).collect();
+        session_fields.iter().filter(|field| !declared.contains(&field.as_str())).collect();
     assert!(
         undeclared.is_empty(),
-        "table(s) keyed by a session name with NO declared rename disposition: {undeclared:?}.\n\
+        "session-name field(s) with NO declared rename disposition: {undeclared:?}.\n\
          A rename will silently leave their rows on the old name. Add each to \
-         SESSION_SCOPED_TABLES as Migrate (the lane's own state, must follow it) or \
+         SESSION_SCOPED_FIELDS as Migrate (the lane's own state, must follow it) or \
          KeepForAudit(why) (an append-only record of what happened under that name)."
     );
 
-    // The reverse direction: a declared table that no longer exists is a stale
-    // entry, and it would make the cascade log a per-rename error forever.
-    let stale: Vec<&&str> = declared.iter().filter(|t| !session_keyed.contains(&t.to_string())).collect();
+    // The reverse direction: a declared field that no longer exists is stale.
+    // A Migrate declaration would make the cascade log an error forever; an
+    // audit declaration would falsely claim that a historical field exists.
+    let stale: Vec<&&str> =
+        declared.iter().filter(|field| !session_fields.contains(&field.to_string())).collect();
     assert!(
         stale.is_empty(),
-        "SESSION_SCOPED_TABLES names table(s) the schema does not have: {stale:?}. \
-         Remove them, or the cascade reports a failed UPDATE on every rename."
+        "SESSION_SCOPED_FIELDS names field(s) the schema does not have: {stale:?}. \
+         Remove them, or each rename reports a false migration/audit outcome."
     );
 }
 
@@ -87,7 +102,7 @@ fn every_session_keyed_table_declares_what_a_rename_does_with_it() {
 /// ambiguity that let twelve tables sit uncovered while looking intentional.
 #[test]
 fn every_audit_exemption_gives_a_reason() {
-    for (t, d) in SESSION_SCOPED_TABLES {
+    for (t, d) in SESSION_SCOPED_FIELDS {
         if let RenameDisposition::KeepForAudit(why) = d {
             assert!(
                 why.trim().len() > 20,
@@ -106,10 +121,10 @@ fn every_migrate_table_is_reachable_by_the_cascade() {
     let simple = amux_server::api::session_verbs::simple_rename_tables();
     let custom: Vec<&str> = amux_server::api::session_verbs::RENAME_MIGRATIONS
         .iter()
-        .map(|(name, _)| name.split('.').next().unwrap_or(name))
+        .map(|(name, _)| *name)
         .collect();
 
-    for (t, d) in SESSION_SCOPED_TABLES {
+    for (t, d) in SESSION_SCOPED_FIELDS {
         if matches!(d, RenameDisposition::Migrate) {
             assert!(
                 simple.contains(t) || custom.contains(t),
@@ -119,7 +134,7 @@ fn every_migrate_table_is_reachable_by_the_cascade() {
     }
     // ...and nothing the cascade updates is missing from the declaration, or
     // the schema test above would not see it.
-    let declared: Vec<&str> = SESSION_SCOPED_TABLES.iter().map(|(t, _)| *t).collect();
+    let declared: Vec<&str> = SESSION_SCOPED_FIELDS.iter().map(|(t, _)| *t).collect();
     for t in &simple {
         assert!(declared.contains(t), "the cascade updates {t} but it is not declared");
     }

@@ -530,6 +530,12 @@ say "launchd agent loaded: $LABEL"
 if [[ "${AMUX_NO_BUILDER:-}" != "1" ]]; then
   BUILDER_LABEL="$LABEL-builder"
   BUILDER_PLIST="$PLIST_DIR/$BUILDER_LABEL.plist"
+  # Keep the launchd activation entrypoint outside the mutable checkout. The
+  # wrapper itself selects a clean detached origin/main worktree, so a locally
+  # ahead shared checkout cannot turn the 60s timer into an unreviewed deploy.
+  AUTHORITY_BUILDER="$AMUX_HOME/bin/amux-build-authority"
+  mkdir -p "$(dirname "$AUTHORITY_BUILDER")"
+  install -m 0755 "$SCRIPT_DIR/scripts/rust-auto-build-authority.sh" "$AUTHORITY_BUILDER"
   cat > "$BUILDER_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -537,7 +543,12 @@ if [[ "${AMUX_NO_BUILDER:-}" != "1" ]]; then
 <dict>
   <key>Label</key><string>$BUILDER_LABEL</string>
   <key>ProgramArguments</key>
-  <array><string>$SCRIPT_DIR/scripts/rust-auto-build.sh</string></array>
+  <array><string>$AUTHORITY_BUILDER</string></array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AMUX_AUTHORITY_REPO</key><string>$SCRIPT_DIR</string>
+    <key>AMUX_RS_ACTIVATION_REF</key><string>origin/main</string>
+  </dict>
   <key>StartInterval</key><integer>60</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>$AMUX_HOME/logs/rust-auto-build.log</string>
@@ -546,7 +557,7 @@ if [[ "${AMUX_NO_BUILDER:-}" != "1" ]]; then
 </plist>
 PLIST
   launchctl_reload_agent "$BUILDER_LABEL" "$BUILDER_PLIST"
-  say "launchd agent loaded: $BUILDER_LABEL (rebuilds + redeploys on new commits in $SCRIPT_DIR)"
+  say "launchd agent loaded: $BUILDER_LABEL (activates only detached origin/main)"
 fi
 
 # ── Fleet cold-start ────────────────────────────────────────────────────────

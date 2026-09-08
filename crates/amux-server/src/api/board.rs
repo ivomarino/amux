@@ -32,6 +32,7 @@ use axum::{Json, Router};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 pub fn routes() -> Router<AppState> {
@@ -5336,6 +5337,10 @@ struct OverlapRecord {
     owner_card_id: String,
     owner_session: String,
     resolution: String,
+    resolution_note: Option<String>,
+    resolved_by_card_id: Option<String>,
+    resolved_by_session: Option<String>,
+    resolved_at: Option<i64>,
     role: String,
     relation: String,
     newly_elected: bool,
@@ -5344,10 +5349,12 @@ struct OverlapRecord {
     evidence: Vec<String>,
     assets: Vec<String>,
     callback: Option<OverlapCallback>,
+    callbacks: Vec<OverlapCallback>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct OverlapParticipant {
+    self_reported: bool,
     card_id: String,
     session: String,
     base_commit: String,
@@ -5513,13 +5520,20 @@ fn overlap_row(
     let Some((semantic_key, concern, owner_card_id, owner_session, resolution)) = header else {
         return Ok(None);
     };
+    let (resolution_note, resolved_by_card_id, resolved_by_session, resolved_at) = conn.query_row(
+        "SELECT resolution_note, resolved_by_card_id, resolved_by_session, resolved_at \
+         FROM board_overlap_coordination WHERE coordination_id=?1",
+        [coordination_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
     let mut members = conn.prepare(
-        "SELECT card_id, session, base_commit, head_commit, worktree, intent \
+        "SELECT card_id, session, base_commit, head_commit, worktree, intent, self_reported \
          FROM board_overlap_members WHERE coordination_id=?1 ORDER BY created_at, card_id",
     )?;
     let participants = members
         .query_map([coordination_id], |r| {
             Ok(OverlapParticipant {
+                self_reported: r.get(6)?,
                 card_id: r.get(0)?,
                 session: r.get(1)?,
                 base_commit: r.get(2)?,
@@ -5539,39 +5553,38 @@ fn overlap_row(
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
     })? {
         let (kind, value) = row?;
-        if kind == "evidence" {
-            evidence.push(value);
-        } else {
-            assets.push(value);
+        let values = if kind == "evidence" { &mut evidence } else { &mut assets };
+        if !values.contains(&value) {
+            values.push(value);
         }
     }
-    let callback = match callback_target {
-        Some(target) => conn
-            .query_row(
-                "SELECT target_session, message_id, state, error FROM board_overlap_callbacks \
-                 WHERE coordination_id=?1 AND target_session=?2",
-                rusqlite::params![coordination_id, target],
-                |r| {
-                    Ok(OverlapCallback {
-                        target_session: r.get(0)?,
-                        message_id: r.get(1)?,
-                        state: r.get(2)?,
-                        error: r.get(3)?,
-                    })
-                },
-            )
-            .optional()?,
-        None => None,
-    };
-    let concern_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM board_overlap_coordination WHERE semantic_key=?1",
-        [&semantic_key],
-        |r| r.get(0),
+    // GET must expose the same durable callback lineage as POST. A delivered
+    // steering receipt outranks the enqueue-time cache on the coordination.
+    let mut callback_rows = conn.prepare(
+        "SELECT target_session, message_id, \
+                CASE WHEN EXISTS (SELECT 1 FROM steering_history h WHERE h.id=c.message_id) \
+                     THEN 'delivered' ELSE c.state END, error \
+         FROM board_overlap_callbacks c WHERE coordination_id=?1 ORDER BY target_session",
     )?;
-    let role = if owner_card_id == caller_card_id {
+    let callbacks = callback_rows.query_map([coordination_id], |r| {
+        Ok(OverlapCallback {
+            target_session: r.get(0)?, message_id: r.get(1)?, state: r.get(2)?, error: r.get(3)?,
+        })
+    })?.collect::<Result<Vec<_>, _>>()?;
+    let callback = callbacks.iter()
+        .find(|c| Some(c.target_session.as_str()) == callback_target).cloned();
+    let role = if caller_card_id.is_empty() {
+        "observer"
+    } else if owner_card_id == caller_card_id {
         "owner"
     } else {
         "peer"
+    };
+    // Different concern names are not proof of an agreed scope split.
+    let relation = match resolution.as_str() {
+        "scope-split" | "merged" | "released" => resolution.clone(),
+        _ if role == "owner" => "elected".into(),
+        _ => "duplicate-linked".into(),
     };
     Ok(Some(OverlapRecord {
         coordination_id: coordination_id.to_string(),
@@ -5580,20 +5593,19 @@ fn overlap_row(
         owner_card_id,
         owner_session,
         resolution,
+        resolution_note,
+        resolved_by_card_id,
+        resolved_by_session,
+        resolved_at,
         role: role.to_string(),
-        relation: if concern_count > 1 {
-            "scope-split".to_string()
-        } else if role == "owner" {
-            "elected".to_string()
-        } else {
-            "duplicate-linked".to_string()
-        },
+        relation,
         newly_elected,
         newly_linked,
         participants,
         evidence,
         assets,
         callback,
+        callbacks,
     }))
 }
 
@@ -5779,12 +5791,27 @@ fn record_overlap_on_conn(
         false
     };
 
+    crate::api::session_verbs::ensure_fleet_tables(conn)?;
+    let elected = overlap_row(conn, &coordination_id, &input.card_id,
+        newly_elected, newly_linked, callback_target.as_deref())?
+        .expect("the election was inserted or already existed");
+    let owner_label = format!("elected owner [{}] ({})", elected.owner_card_id, elected.owner_session);
+    let prefix = format!("overlap coordination {coordination_id}:");
+    // Refresh old, misleading lineage on an ordinary retry. Append, never
+    // rewrite history; subsequent retries are idempotent.
+    let mut stale_lineage = false;
+    for id in [&input.card_id, &input.peer_card_id] {
+        let card = bs::get_issue(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        if let Some(line) = card.log.as_deref().unwrap_or("").lines().rev().find(|line| line.contains(&prefix)) {
+            stale_lineage |= !line.contains(&owner_label) || !line.contains("; reporter [");
+        }
+    }
     let mut events = Vec::new();
-    if newly_linked || resolution_changed {
+    if newly_linked || resolution_changed || stale_lineage {
         let line = format!(
-            "overlap coordination {coordination_id}: concern={}; semantic={}; elected owner [{}] ({}) — linked [{}] ({}) — callback={}; base={} head={}; intent: {}; resolution: {}; evidence: {}; assets: {}",
-            input.concern,
-            input.semantic_key,
+            "{prefix} concern={}; semantic={}; {owner_label}; reporter [{}] ({}) — linked [{}] ({}) — callback={}; base={} head={}; intent: {}; resolution: {}; resolution note: {}; evidence: {}; assets: {}",
+            elected.concern,
+            elected.semantic_key,
             input.card_id,
             input.session,
             input.peer_card_id,
@@ -5796,19 +5823,22 @@ fn record_overlap_on_conn(
             input.base_commit,
             input.head_commit,
             input.intent,
-            input.resolution.as_deref().unwrap_or("pending"),
-            if input.evidence.is_empty() { "(none)".into() } else { input.evidence.join(", ") },
-            if input.assets.is_empty() { "(none)".into() } else { input.assets.join(", ") },
+            elected.resolution,
+            elected.resolution_note.as_deref().unwrap_or("(pending)"),
+            if elected.evidence.is_empty() { "(none)".into() } else { elected.evidence.join(", ") },
+            if elected.assets.is_empty() { "(none)".into() } else { elected.assets.join(", ") },
         );
-        append_overlap_log(conn, &input.card_id, &line, &input.assets, now, &mut events)?;
-        append_overlap_log(
-            conn,
-            &input.peer_card_id,
-            &line,
-            &input.assets,
-            now,
-            &mut events,
-        )?;
+        append_overlap_log(conn, &input.card_id, &line, &elected.assets, now, &mut events)?;
+        append_overlap_log(conn, &input.peer_card_id, &line, &elected.assets, now, &mut events)?;
+        tracing::info!(marker = "board_overlap_lineage_recorded", coordination = %coordination_id,
+            owner_card = %elected.owner_card_id, owner_session = %elected.owner_session,
+            reporter_card = %input.card_id, resolution = %elected.resolution,
+            "board overlap lineage records the durable election and the reporting worker separately");
+        if stale_lineage {
+            tracing::warn!(marker = "board_overlap_lineage_refreshed", coordination = %coordination_id,
+                owner_card = %elected.owner_card_id, reporter_card = %input.card_id,
+                "appended corrected overlap lineage; prior history mislabeled the reporter as owner or omitted attribution");
+        }
     }
     crate::api::session_verbs::ensure_fleet_tables(conn)?;
     for (session, card_id) in [
@@ -6355,7 +6385,7 @@ mod overlap_reconciliation_tests {
     }
 
     #[tokio::test]
-    async fn distinct_concerns_are_an_explicit_scope_split_not_file_exclusivity() {
+    async fn distinct_concerns_keep_independent_elections_until_explicit_resolution() {
         let db = store();
         let a = seed_card(&db, "runtime-owner");
         let b = seed_card(&db, "invariant-owner");
@@ -6382,7 +6412,7 @@ mod overlap_reconciliation_tests {
         )
         .await;
         assert_eq!(runtime.relation, "elected");
-        assert_eq!(invariants.relation, "scope-split");
+        assert_eq!(invariants.relation, "elected");
         assert_ne!(runtime.coordination_id, invariants.coordination_id);
     }
 
@@ -6416,6 +6446,83 @@ mod overlap_reconciliation_tests {
         assert!(second.evidence.iter().any(|v| v.contains("merge-base")));
         assert!(second.assets.iter().any(|v| v.ends_with("board_drive.rs")));
         assert!(second.assets.iter().any(|v| v.ends_with("checks.rs")));
+    }
+
+    #[tokio::test]
+    async fn late_peer_log_names_the_elected_owner_not_the_reporting_peer() {
+        let db = store();
+        let owner = seed_card(&db, "first-worker");
+        let peer = seed_card(&db, "second-worker");
+        record(db.clone(), input(owner.clone(), "first-worker", peer.clone(), "second-worker", "same concern")).await;
+        let result = record(db.clone(), input(peer.clone(), "second-worker", owner.clone(), "first-worker", "same concern")).await;
+        assert_eq!(result.owner_card_id, owner);
+        let conn = db.read().unwrap();
+        for card in [&owner, &peer] {
+            let row = bs::get_issue(&conn, card).unwrap().unwrap();
+            let log = row.log.unwrap();
+            let latest = log.lines().last().unwrap();
+            assert!(latest.contains(&format!("elected owner [{owner}] (first-worker)")), "lineage contradicts election: {latest}");
+            assert!(latest.contains(&format!("reporter [{peer}] (second-worker)")), "reporter attribution lost: {latest}");
+        }
+    }
+
+    #[tokio::test]
+    async fn readback_keeps_resolution_provenance_and_both_durable_callbacks() {
+        let db = store();
+        let owner = seed_card(&db, "first-worker");
+        let peer = seed_card(&db, "second-worker");
+        let mut report = input(owner.clone(), "first-worker", peer.clone(), "second-worker", "same concern");
+        let elected = record(db.clone(), report.clone()).await;
+        let consumer = input(peer.clone(), "second-worker", owner.clone(), "first-worker", "same concern");
+        record(db.clone(), consumer.clone()).await;
+        report.resolution = Some("scope-split".into());
+        report.resolution_note = Some("first-worker owns server; second-worker owns dashboard".into());
+        record(db.clone(), report.clone()).await;
+        let app = Router::new().nest("/api/board", routes()).with_state(state(db.clone()));
+        let (status, body) = call(&app, "GET", &format!("/api/board/overlap/{}", elected.coordination_id), "first-worker", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let row = &body["coordination"];
+        assert_eq!(row["resolution_note"], report.resolution_note.unwrap());
+        assert_eq!(row["resolved_by_card_id"], owner);
+        assert_eq!(row["relation"], "scope-split");
+        assert_eq!(row["callbacks"].as_array().unwrap().len(), 2);
+        let refs = row["evidence"].as_array().unwrap();
+        assert_eq!(refs.len(), consumer.evidence.len(), "shared references are a union, with provenance retained in storage");
+        assert_eq!(row["participants"][0]["self_reported"], true);
+        // Independent concern names are not evidence that a split was agreed.
+        let other = record(db.clone(), input(peer, "second-worker", owner, "first-worker", "another concern")).await;
+        assert_eq!(other.resolution, "pending");
+        assert_ne!(other.relation, "scope-split");
+    }
+
+    #[tokio::test]
+    async fn retry_appends_one_correction_to_legacy_lineage_without_rewriting_history() {
+        let db = store();
+        let owner = seed_card(&db, "first-worker");
+        let peer = seed_card(&db, "second-worker");
+        let owner_report = input(owner.clone(), "first-worker", peer.clone(), "second-worker", "same concern");
+        let peer_report = input(peer.clone(), "second-worker", owner.clone(), "first-worker", "same concern");
+        let elected = record(db.clone(), owner_report).await;
+        record(db.clone(), peer_report.clone()).await;
+        let wrong = format!("overlap coordination {}: elected owner [{}] (second-worker)", elected.coordination_id, peer);
+        let wrong_w = wrong.clone();
+        let cards = [owner.clone(), peer.clone()];
+        db.write(move |conn| {
+            for id in cards {
+                conn.execute("UPDATE issues SET log=?1 WHERE id=?2", rusqlite::params![wrong_w, id])?;
+            }
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        record(db.clone(), peer_report.clone()).await;
+        let corrected = bs::get_issue(&db.read().unwrap(), &peer).unwrap().unwrap().log.unwrap();
+        assert!(corrected.starts_with(&wrong), "legacy history must remain intact");
+        assert_eq!(corrected.lines().count(), 2, "retry must append a correction");
+        assert!(corrected.lines().last().unwrap().contains(&format!("elected owner [{owner}] (first-worker)")));
+        record(db.clone(), peer_report).await;
+        for id in [owner, peer] {
+            assert_eq!(bs::get_issue(&db.read().unwrap(), &id).unwrap().unwrap().log.unwrap(), corrected,
+                "replay must correct both cards exactly once");
+        }
     }
 
     async fn call(
@@ -6453,6 +6560,9 @@ mod overlap_reconciliation_tests {
 
     #[tokio::test]
     async fn vanished_peer_and_model_switch_keep_the_handoff_callback_recoverable() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
         let db = store();
         let producer = seed_card(&db, "handoff-producer-0907");
         let consumer = seed_card(&db, "handoff-consumer-0907");
@@ -6478,11 +6588,19 @@ mod overlap_reconciliation_tests {
         assert_eq!(forbidden, StatusCode::FORBIDDEN);
         assert_eq!(rejected["code"], "board_overlap_peer_owner_mismatch");
 
+        // Missing worker state is a durable retry, never a fabricated delivery.
+        let (missing, pending) = post(&app, "handoff-producer-0907", payload.clone()).await;
+        assert_eq!(missing, StatusCode::ACCEPTED);
+        assert_eq!(pending["coordination"]["callback"]["state"], "retryable");
+        assert_eq!(pending["coordination"]["callback"]["error"], "no-env-file");
+        // Supply the fixture's own persisted identity; never depend on a real
+        // worker's env file or whichever AMUX_HOME another test selected.
+        std::fs::write(home.path().join("sessions/handoff-consumer-0907.env"), "CC_TAGS=\"test\"\n").unwrap();
         let (status, reply) = post(&app, "handoff-producer-0907", payload.clone()).await;
         assert_eq!(
             status,
             StatusCode::OK,
-            "a vanished consumer is a durable queued handoff, not a false completion: {reply}"
+            "a recovered consumer is a durable queued handoff: {reply}"
         );
         assert_eq!(reply["delivery"], "queued");
         assert_eq!(
@@ -6520,6 +6638,12 @@ mod overlap_reconciliation_tests {
 
     #[tokio::test]
     async fn linked_peer_cannot_complete_or_deploy_until_owner_scope_splits() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        for worker in ["handoff-producer-0907", "handoff-consumer-0907"] {
+            std::fs::write(home.path().join(format!("sessions/{worker}.env")), "CC_TAGS=\"test\"\n").unwrap();
+        }
         let db = store();
         let producer = seed_card(&db, "handoff-producer-0907");
         let consumer = seed_card(&db, "handoff-consumer-0907");
@@ -7978,7 +8102,16 @@ pub async fn patch_item(
             // with stale prose and turn an idempotent retry into a second
             // applied write. A new terminal entry still flows through the
             // normal setter and save_patched replaces it atomically.
+            let reopening_terminal_card = bs::is_terminal_status(&row.status)
+                && map
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .and_then(bs::parse_status)
+                    .is_some_and(|target| {
+                        !bs::is_terminal_status(bs::db_status_spelling(target))
+                    });
             let terminal_summary_locked = bs::is_terminal_status(&row.status)
+                && !reopening_terminal_card
                 && row
                     .last_result
                     .as_deref()
@@ -8823,23 +8956,37 @@ pub async fn patch_item(
                         // a reproducible command, but a command is not a
                         // produced asset. Keep the documented honest no-asset
                         // escape, and otherwise require an actual pointer.
-                        let evidence_names_artifact = next.evidence.as_deref().is_some_and(|e| {
-                            bs::has_asset_link(e)
-                                || (e.trim().to_ascii_lowercase().starts_with("none:")
-                                    && bs::evidence_verdict(e) == bs::EvidenceVerdict::Ok)
-                        });
                         // The explicit artifact registry is the canonical
                         // structured path. Requiring its ref to be duplicated
                         // in prose made a successful `amux board artifact`
                         // write insufficient to close its own task.
-                        let registered_artifact = crate::db::artifact_store::list_for_task(
-                            conn,
-                            &next.id,
-                        )?
-                        .iter()
-                        .any(|a| !a.ref_value.trim().is_empty());
-                        let has_link = bs::has_asset_link(&next.desc)
-                            || next.log.as_deref().is_some_and(bs::has_asset_link)
+                        let registered_artifacts =
+                            crate::db::artifact_store::list_for_task(conn, &next.id)?;
+                        let retired_refs: HashSet<&str> = registered_artifacts
+                            .iter()
+                            .filter(|a| crate::db::artifact_store::is_retired_state(&a.state))
+                            .map(|a| a.ref_value.as_str())
+                            .collect();
+                        let text_has_active_asset = |text: &str| {
+                            bs::asset_refs(text)
+                                .iter()
+                                .any(|reference| !retired_refs.contains(reference.as_str()))
+                        };
+                        // A durable invalid/superseded disposition must apply
+                        // everywhere evidence is consumed, not only in the UI.
+                        // Otherwise the retired ref can still satisfy this
+                        // gate by being repeated in --evidence.
+                        let evidence_names_artifact = next.evidence.as_deref().is_some_and(|e| {
+                            text_has_active_asset(e)
+                                || (e.trim().to_ascii_lowercase().starts_with("none:")
+                                    && bs::evidence_verdict(e) == bs::EvidenceVerdict::Ok)
+                        });
+                        let registered_artifact = registered_artifacts.iter().any(|a| {
+                            !a.ref_value.trim().is_empty()
+                                && !crate::db::artifact_store::is_retired_state(&a.state)
+                        });
+                        let has_link = text_has_active_asset(&next.desc)
+                            || next.log.as_deref().is_some_and(text_has_active_asset)
                             || evidence_names_artifact
                             || registered_artifact;
                         if !has_link {
@@ -11405,6 +11552,7 @@ async fn create_artifact(
 async fn patch_artifact(
     State(state): State<AppState>,
     Path((id, aid)): Path<(String, String)>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
     let new_state = body.get("state").and_then(|v| v.as_str()).map(|s| s.to_string());
@@ -11426,8 +11574,10 @@ async fn patch_artifact(
         }
     }
     let now = chrono::Utc::now().timestamp();
+    let (_, actor) = actor_from_headers(&headers);
     let task_for_log = id.clone();
     let aid_for_log = aid.clone();
+    let state_for_log = new_state.clone();
     let write = state.store.write_async(move |conn| {
         if bs::get_issue(conn, &id)?.is_none() {
             return Err(rusqlite::Error::QueryReturnedNoRows);
@@ -11457,7 +11607,24 @@ async fn patch_artifact(
         })
     }).await;
     match write {
-        Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
+        Ok(_) => {
+            if let Some(ref disposition) = state_for_log {
+                if crate::db::artifact_store::is_retired_state(disposition) {
+                    tracing::warn!(
+                        target: "amux::board",
+                        marker = "artifact_retired",
+                        task = %task_for_log,
+                        artifact = %aid_for_log,
+                        worker = %actor,
+                        state = %disposition,
+                        measured = true,
+                        n_considered = 1,
+                        "board artifact retained for audit but retired from valid produced assets"
+                    );
+                }
+            }
+            (StatusCode::OK, Json(json!({"ok": true}))).into_response()
+        }
         Err(e) if is_missing_task(&e) => {
             tracing::warn!(
                 marker = "artifact_target_missing",

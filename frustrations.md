@@ -3814,3 +3814,167 @@ CARD: AMUX-4220
 SYMPTOM: mvs-research produced 26 retained status.agrees_with_pane failures from 04:59 to 05:23 EDT. Its actual Codex process held the research rollout open, but nearest-start association selected mvs-pitr's completed rollout for both workers. The failure evidence named a 30-hour-old stop-hook even though status-explain said report.applied=false and decided_by=codex_rollout.
 COST: Roughly 20 minutes tracing the deciding signal through metadata, rollout boundaries, and kernel open-file ownership; the original alert omitted the evidence needed to distinguish a broken hook from a sibling transcript.
 FIX: AMUX-4220 refuses ambiguous startup associations and missing explicit claims, excludes subagent candidates, logs resolution failures with filenames, and retains the actual derivation in invariant evidence. Existing codex_session_id metadata provides the durable recovery using kernel-proven ownership. Regression tests cover the two-worker startup collision, candidates beyond the previous scan cap, and the provider-boundary grace period. Full findings: docs/incidents/2026-09-08-codex-rollout-cross-attribution.md.
+
+---
+## Overlap lineage elected the reporting peer in its log while the durable owner stayed unchanged
+AREA: attribution
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-93
+SYMPTOM: OVL-15a87ecd9d24b055 elected ATE-114/handoff-producer-0907, but ATE-115's self-report appended "elected owner [ATE-115]" to both cards. GET kept the real owner but hid the resolution note, resolving actor and callback list. A second concern name was labeled scope-split even while its resolution remained pending.
+COST: Live acceptance could not be signed off from contradictory ownership evidence; two new regression tests failed on the deployed source (5 passed, 2 failed).
+FIX: Derive lineage from the elected row inside its writer transaction and name the reporter separately. Expose resolution provenance, both callbacks and self-report state; only an explicit resolution can report scope-split. An ordinary retry appends one correction to legacy lineage without rewriting history. board_overlap_lineage_recorded and board_overlap_lineage_refreshed expose the result in amux logs.
+
+---
+## Overlap callback tests passed alone by reading real worker identities
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-93
+SYMPTOM: The overlap suite passed alone but its containing board module failed 54/2: both HTTP fixtures expected queued/200 and received retryable/202 with no-env-file. They used real handoff worker names without isolated session fixtures; other board tests correctly changed AMUX_HOME under the shared test lock.
+COST: The earlier focused green overstated callback coverage and required a containing-suite investigation before deployment.
+FIX: Both HTTP fixtures now own a guarded temporary AMUX_HOME and persisted test worker identities. The vanished-worker test first asserts retryable/no-env-file, then restores its fixture identity and proves one durable queued callback on retry. The production board_overlap_callback_retryable marker already names the exact refusal the old fixtures concealed.
+
+---
+## Deployment overlap preflight stopped offline disk-cleanup diagnostics
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-93
+SYMPTOM: Checks CI for 9e4de512 stopped after provenance 9/0 with no disk-clear result. The disk-only builder path queried the live overlap deployment permit for the checkout's worker trailer, then exited before cleanup on CI without a server. Locally the same test passed 24/0 by reaching the fleet server. A missing grep match then hid the builder's refusal under set -e.
+COST: Exact-commit CI failed after live acceptance passed, requiring an offline reproduction and another deployment before ATE-93 could close.
+FIX: Diagnostic-only builder modes log OVERLAP GUARD NOT APPLICABLE and skip the network permit because they cannot install. Real deployment still logs OVERLAP GUARD UNMEASURED and refuses adoption. Tests exercise both offline modes and the real refusal on one worker-attributed commit, pin disk tests to an unreachable endpoint, and print the missing-cleanup failure rather than exiting silently. Activation authority and launcher suites now run in Checks CI.
+
+---
+## Rename integration tests built a stale hand-written issues schema that production had already migrated
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-93
+SYMPTOM: Fresh Rust CI failed all 3 rename_migrates_reviewer cases with
+  `issues.requested_by: no such column`. The test manually declared five issues
+  columns while the production rename path had correctly grown to migrate more
+  relationship fields, so the fixture—not the implementation—failed on the clean
+  runner after focused overlap and board suites were green.
+COST: Exact-commit CI required a separate log download and another code/test/deploy
+  cycle; the red looked like a rename regression until the missing fixture column
+  was isolated.
+FIX: Build the rename fixture through migrate::test_memdb_pub so every production
+  schema migration is present, then insert only the rows the scenario needs. The
+  clean focused target passes 3/3 and future schema growth can no longer drift this
+  fixture silently.
+
+---
+## Callback e2e still expected the child link that original-task resumption removed
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-93
+SYMPTOM: worker-request-callback.spec.ts expected the terminal callback's hard
+  card_id and a second card-detail message button on the completed child, while
+  the deployed callback contract correctly attaches that message to the original
+  requester task and keeps only the request source on the child.
+COST: Two three-browser working-tree runs failed 3/3 after the backend and card
+  detail suites were green; the first failure looked like a missing callback and
+  the second like missing UI lineage until the retained temp database exposed the
+  exact cmd_history rows.
+FIX: Assert the board request on the child and the callback on the original parent,
+  with the child id retained in callback text. The child UI expects one source
+  message, then proves card→message→card across desktop, 375px Chromium, and iPhone
+  WebKit; the focused matrix passes 3/3 and emits message-card-nav verdicts.
+
+---
+## Overlap routes worked but the canonical route census called them unrouted
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-93
+SYMPTOM: The full integration gate found `/api/board/overlap`, its coordination
+  lookup, and its deployment-permit endpoint mounted and covered by handler tests,
+  but absent from `ROUTE_TABLE`. `/api/debug/routes` and downstream request-log
+  sweeps therefore could not distinguish those working endpoints from dead routes.
+COST: The first otherwise-green full ATE-93 server run failed after more than six
+  minutes and prevented clippy and deployment from starting.
+FIX: Register all three overlap paths with the exact methods mounted by the board
+  router. The bidirectional route-table integration guard now covers the family,
+  and request-log normalization exposes overlap traffic to the existing diagnostic
+  sweeps instead of silently classifying it through a generic card route.
+
+---
+## Overlap timestamps shipped without units in the invariant registry
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-93
+SYMPTOM: The full server gate found all seven numeric `*_at` columns introduced
+  by overlap coordination absent from `TIMESTAMP_COLUMNS`. Their writers use
+  seconds, but the schema and runtime invariant had no durable unit declaration.
+COST: A second broad gate reached its final integration targets before failing,
+  preventing the required clippy and deployment chain from starting.
+FIX: Declare callback updates, coordination create/update/resolve stamps, member
+  create/last-seen stamps, and merged-reference creation as seconds beside the
+  existing board timestamps. The exhaustive timestamp-unit guard now makes any
+  future schema drift fail with the exact missing table and column.
+
+---
+## Clean CI turned one missing provider prerequisite into 34 unrelated pointer timeouts
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-93
+SYMPTOM: Exact-SHA Rust CI passed 354 browser scenarios, then 34 mobile/WebKit
+  terminal cases waited 30 seconds each because the clean test home correctly
+  displayed `#no-apikey-banner` over their controls. Two independent stale
+  fixtures also failed: default-model restoration called `selectOption` on the
+  shipped text input, and Working-now created four Doing rows without one causal
+  `task.claimed` identity.
+COST: The required ATE-93 CI gate ran 23 minutes before reporting 37 failures,
+  and one absent external prerequisite looked like dozens of terminal regressions.
+FIX: The broad harness now announces and writes an obvious non-secret provider
+  test value into every isolated project's `server.env`, the durable surface
+  `/api/identity` actually recognizes (it intentionally ignores process-injected
+  keys), keeping unrelated specs in their configured-install prerequisite.
+  The settings test restores the text input through fill+blur, and Working-now
+  creates its exact owner through the real claim endpoint. Its UI-only runtime
+  activation preserves that exact server-produced identity instead of expecting
+  a stopped fixture to project as live. Both API-key scenarios restore the known
+  harness baseline explicitly because a persisted empty value shadows the
+  process fallback; the slow-refresh scenario also reads the masked value back
+  as its cleanup postcondition, so a future regression fails at the writer
+  instead of poisoning later specs. Missing-key behavior remains product
+  behavior; it is no longer accidental global state for tests whose acceptance
+  has nothing to do with provider setup.
+
+---
+## One repeated timestamp subtraction made the exact-SHA Rust gate nondeterministic
+AREA: gates
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-93
+SYMPTOM: The guarded workspace test passed 2,064 tests and failed only
+  `stored_observations_reach_the_actual_guard_without_naming_the_reader`: its
+  separately evaluated expected timestamp differed from the stored value by one
+  f64 ULP (1788859526.403303 versus 1788859526.4033027).
+COST: Exact-SHA Rust CI ran for over four minutes and blocked ATE-93's terminal
+  gate even though the production observation round trip was correct.
+FIX: Compute the fixture timestamp once and use that same binary value for the
+  report and strict round-trip assertion. The failure now self-announces the
+  JSON/SQLite contract instead of conflating codegen rounding with persistence.

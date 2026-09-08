@@ -209,6 +209,13 @@ fi
 # treating an unmeasured permit as permission.
 overlap_deploy_permitted() {
   local lane api reply code body allowed
+  # These seams exit before compilation/install. Requiring a live permit here
+  # made disk-cleanup diagnostics silently stop on hosts without an amux server.
+  if [ "${AMUX_RS_BUILD_PROVENANCE_ONLY:-}" = "1" ] \
+     || [ "${AMUX_RS_DISK_CLEAR_ONLY:-}" = "1" ]; then
+    echo "== OVERLAP GUARD NOT APPLICABLE $built_sha — diagnostic-only run cannot install a binary (provenance=${AMUX_RS_BUILD_PROVENANCE_ONLY:-0}, disk-clear=${AMUX_RS_DISK_CLEAR_ONLY:-0})" >> "$LOG"
+    return 0
+  fi
   lane=$(git -C "$REPO" log -1 --format='%(trailers:key=Amux-Session,valueonly,separator=)' "$built_sha" 2>/dev/null | head -n1)
   case "$lane" in
     ""|"(human)") return 0 ;;
