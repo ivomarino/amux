@@ -17,15 +17,13 @@
 //! them finish. read_pool_exhausted recurred in bursts for minutes; box load
 //! average hit 62 on 4 cores; amux-server-rs itself sat at 400%+ CPU.
 //!
-//! SECOND FIX: cap the number of concurrent independent builds at a CONSTANT
-//! — 2 (the primary FLIGHT plus exactly one FALLBACK_FLIGHT) — no matter how
-//! many requests arrive or how long they keep arriving. A waiter that cannot
-//! get either lock keeps waiting rather than building a third copy. The wait
-//! is bounded overall (15s) purely as a fail-SAFE: past that bound the
-//! function returns an honest error (-> 500, which the dashboard's existing
-//! degraded-UI banner already renders as "Worker updates are unavailable ...
-//! Retry") instead of piling a third builder onto a pool that is, by
-//! definition, already struggling if the first two haven't finished in 15s.
+//! FINAL FIX: permit exactly ONE builder. A fallback that performs the same
+//! expensive fleet scrape against the same tmux server cannot rescue a slow
+//! primary; it makes the shared substrate slower. Waiters serve the last
+//! structurally safe snapshot, or wait up to the configured deadline on a
+//! truly cold start, then fail safely instead of starting duplicate work.
+//! The builder also uses a dedicated read-only SQLite connection so it cannot
+//! starve cheap board requests of request-pool readers while probing tmux/git.
 //!
 //! Asserted on the SOURCE, matching this file's sibling
 //! `sessions_list_off_runtime.rs`: a timing test for "did the stampede
@@ -58,40 +56,83 @@ fn cold_sessions_cache_waits_for_the_inflight_builder_instead_of_racing_it() {
 }
 
 #[test]
-fn cold_sessions_cache_caps_independent_builders_at_two_not_unbounded() {
+fn cold_sessions_cache_has_exactly_one_builder_and_does_not_lease_the_request_pool() {
     assert!(
         SRC.contains("pub fn legacy_sessions_array"),
         "premise gone: the sync builder is not in this file any more"
     );
     assert!(
-        SRC.contains("static FALLBACK_FLIGHT: std::sync::Mutex<()>"),
-        "the second-generation fix is gone: without a SEPARATE fallback lock, a bounded wait \
-         alone does not bound the builder COUNT under sustained (not just instantaneous) load \
-         — every new wave of waiters can independently miss the same deadline and each start \
-         its own build, which is exactly what recurred live on 2026-09-09 (read_pool_exhausted \
-         for minutes, box load average 62 on 4 cores, amux-server-rs at 400%+ CPU)"
+        !SRC.contains("FALLBACK_FLIGHT"),
+        "a fallback builder duplicates the same slow fleet scrape and recreates the overload loop"
     );
     assert!(
-        SRC.contains("FALLBACK_FLIGHT.try_lock()"),
-        "a waiter that cannot get the PRIMARY flight lock must try the ONE fallback lock, not \
-         build a third independent copy"
+        SRC.contains("let conn = store.dedicated_read()?;"),
+        "the heavyweight projection must not lease a request-pool reader while probing tmux/git"
     );
     assert_eq!(
-        SRC.matches("let conn = store.read()?;").count(),
+        SRC.matches("build_array(&conn)").count(),
         1,
-        "there must be exactly ONE build call site left (the normal post-flight-lock build). \
-         A second copy inside the wait loop is the original unbounded independent-build \
-         fallback creeping back in outside the two-lock cap"
+        "there must be exactly one build call site, protected by the single flight"
     );
     assert!(
         SRC.contains("anyhow::bail!"),
-        "when BOTH the primary and fallback builders are still busy past the overall bound, \
-         the function must FAIL SAFE (an honest error the dashboard already renders as a \
-         retryable banner) rather than start a third builder on an already-struggling pool"
+        "when the single builder is still busy past the overall bound, the function must fail \
+         safely rather than start duplicate work on an already-struggling substrate"
     );
     assert!(
         SRC.contains("sessions_cache_stuck"),
         "the fail-safe bail-out must log a verdict a sweep can grep for — silent failure here \
          is how the first version of this guard regressed unnoticed"
+    );
+    assert!(
+        SRC.contains("sessions_flight_poison_recovered"),
+        "a panicked builder must self-announce when the flight lock recovers"
+    );
+}
+
+#[test]
+fn runtime_updates_preserve_the_last_structurally_safe_snapshot() {
+    let runtime_fn = SRC
+        .split("pub fn invalidate_sessions_runtime_cache()")
+        .nth(1)
+        .and_then(|tail| tail.split("/// Git branch cache").next())
+        .expect("runtime invalidation function moved or disappeared");
+    assert!(runtime_fn.contains("SESSIONS_RUNTIME_EPOCH.fetch_add"));
+    assert!(runtime_fn.contains("c.stamp = 0.0"));
+    assert!(
+        !runtime_fn.contains("c.json.clear()"),
+        "a worker heartbeat must not erase the stale-while-revalidate snapshot"
+    );
+
+    let snapshot = SRC
+        .split("let epoch_start = SESSIONS_EPOCH.load")
+        .nth(1)
+        .and_then(|tail| tail.split("let json = serde_json::to_string").next())
+        .expect("session build epoch snapshot moved or disappeared");
+    assert!(snapshot.contains("let runtime_epoch_start ="));
+    assert!(snapshot.contains("let arr = build_array(&conn)?;"));
+    assert!(
+        snapshot.find("let runtime_epoch_start =") < snapshot.find("let arr = build_array(&conn)?;"),
+        "runtime epoch must be captured before the data it describes is read"
+    );
+    assert!(
+        SRC.contains("runtime_epoch: runtime_epoch_start"),
+        "write-back must not tag pre-report JSON with an epoch loaded after the build"
+    );
+}
+
+#[test]
+fn structural_changes_fail_closed_instead_of_returning_the_raced_snapshot() {
+    let writeback = SRC
+        .split("let json = serde_json::to_string(&arr)?;")
+        .nth(1)
+        .and_then(|tail| tail.split("Ok(json)").next())
+        .expect("sessions cache write-back moved or disappeared");
+    assert!(writeback.contains("registry_fingerprint() == registry_start"));
+    assert!(writeback.contains("SESSIONS_EPOCH.load"));
+    assert!(writeback.contains("anyhow::bail!"));
+    assert!(
+        !writeback.contains("caller still gets"),
+        "a response that raced an isolation/delete/config change must not be returned"
     );
 }

@@ -13639,11 +13639,7 @@ async fn get_dispatch(
     match action {
         "" => {
             // Bare GET → the SAME record the list endpoint serves (py:74892).
-            let conn = match state.store.read() {
-                Ok(c) => c,
-                Err(e) => return jresp(StatusCode::SERVICE_UNAVAILABLE, json!({"error": e.to_string()})),
-            };
-            match crate::api::sessions_legacy::build_array(&conn) {
+            match crate::api::sessions_legacy::legacy_sessions_values(state.store.clone()).await {
                 Ok(arr) => {
                     match arr.into_iter().find(|x| x["name"] == json!(name)) {
                         Some(rec) => j200(rec),
@@ -13653,7 +13649,7 @@ async fn get_dispatch(
                         ),
                     }
                 }
-                Err(e) => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
+                Err(e) => jresp(StatusCode::SERVICE_UNAVAILABLE, json!({"error": e.to_string()})),
             }
         }
         "tasks" => j200(session_cc_tasks(name).await),
@@ -17431,7 +17427,7 @@ async fn subagent_event_post(state: &AppState, name: &str, ev: &str, body: &Valu
                      ON CONFLICT(key) DO UPDATE SET value=?1",
                     [reports.to_string()],
                 )?;
-                crate::api::sessions_legacy::invalidate_sessions_cache();
+                crate::api::sessions_legacy::invalidate_sessions_runtime_cache();
             }
             let events = if applied.status_changed {
                 vec![crate::db::PendingEvent {
@@ -17763,10 +17759,13 @@ pub(crate) async fn report_post(state: &AppState, name: &str, headers: &HeaderMa
                 [reports.to_string()],
             )?;
             // See subagent_event_post: invalidate inside the writer, before its
-            // committed Session event is broadcast, so the reactive GET sees
-            // this exact state rather than the preceding cache entry.
-            crate::api::sessions_legacy::invalidate_sessions_cache();
-            // SNAPPY STATUS (Ethan, 2026-08-16). A self-report is the fast, exact
+            // committed Session event is broadcast, so a reactive reader knows
+            // the projection needs refresh. Under contention it may briefly
+            // receive the preceding structurally safe snapshot while the ONE
+            // builder catches up; runtime status may be stale during that
+            // revalidation, but membership/isolation never is.
+            crate::api::sessions_legacy::invalidate_sessions_runtime_cache();
+            // SNAPPY STATUS (Ethan, 2026-08-16). A self-report is the fast, durable
             // signal for active/idle/needs-input (the D1 exit), but this write used
             // events:vec![], so a hook state change pushed NO SSE and the dashboard
             // only caught it on the next 15s scan or a poll. Emit a Session event on

@@ -507,6 +507,9 @@ struct ListSnapshot {
     json: String,
     /// `SESSIONS_EPOCH` at build start — serving requires it unchanged.
     epoch: u64,
+    /// Runtime/report epoch. Unlike `epoch`, this may be stale-while-
+    /// revalidate because it cannot change who a caller is allowed to see.
+    runtime_epoch: u64,
     /// `registry_fingerprint()` at build start — see that function.
     registry: u64,
 }
@@ -519,6 +522,7 @@ fn build_array_cache() -> &'static std::sync::Mutex<ListSnapshot> {
             stamp: 0.0,
             json: String::new(),
             epoch: 0,
+            runtime_epoch: 0,
             registry: 0,
         })
     })
@@ -531,6 +535,8 @@ fn build_array_cache() -> &'static std::sync::Mutex<ListSnapshot> {
 /// the pre-create list into the cache — resurrecting exactly the staleness
 /// the invalidation was for.
 static SESSIONS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SESSIONS_RUNTIME_EPOCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Order-independent fingerprint of WHICH workers exist: the set of `*.env`
 /// stems in the sessions dir.
@@ -596,6 +602,22 @@ pub fn invalidate_sessions_cache() {
         c.json.clear();
     }
     tracing::debug!(target: "amux::sessions", "sessions list cache invalidated by a config write");
+}
+
+/// Invalidate status/model/token evidence without erasing the last safe fleet
+/// snapshot.
+///
+/// Worker hooks report frequently. Treating every heartbeat like a registry or
+/// access-policy change cleared the cache while a fleet build was still in
+/// progress, so no build could ever publish and every client started another
+/// tmux scrape. Runtime evidence may be briefly stale; fleet membership and
+/// isolation may not. A structural invalidation still uses
+/// [`invalidate_sessions_cache`] and clears the snapshot.
+pub fn invalidate_sessions_runtime_cache() {
+    SESSIONS_RUNTIME_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if let Ok(mut c) = build_array_cache().lock() {
+        c.stamp = 0.0;
+    }
 }
 
 /// Git branch cache: dir -> (branch, epoch). Branches change on the scale of
@@ -2616,8 +2638,13 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
     let ttl = env_secs("AMUX_SESSIONS_CACHE_TTL_S", 2.0);
     let now = chrono::Utc::now().timestamp() as f64;
     let epoch_now = SESSIONS_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
+    let runtime_epoch_now = SESSIONS_RUNTIME_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
     if let Ok(c) = build_array_cache().lock() {
-        if now - c.stamp < ttl && !c.json.is_empty() && c.epoch == epoch_now {
+        if now - c.stamp < ttl
+            && !c.json.is_empty()
+            && c.epoch == epoch_now
+            && c.runtime_epoch == runtime_epoch_now
+        {
             // Substrate guard (AMUX-2960): a fresh-looking snapshot whose
             // worker SET no longer matches the registry on disk means an
             // env file was created/deleted by a path that never called
@@ -2634,9 +2661,9 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
             );
         }
     }
-    // SINGLE-FLIGHT, STALE-WHILE-REVALIDATE (AR-135). The build holds a pooled
-    // read connection across ~100 tmux + git subprocesses (80-950ms), and the
-    // pool is only CPU-count deep. When the 2s TTL expired under a client
+    // SINGLE-FLIGHT, STALE-WHILE-REVALIDATE (AR-135). This build historically
+    // held a pooled read connection across ~100 tmux + git subprocesses
+    // (80-950ms), and the pool is only CPU-count deep. When the 2s TTL expired under a client
     // burst, EVERY concurrent request became a builder, each holding a
     // connection for the better part of a second — and the pool starved.
     // Measured 08-10 13:03-13:05: ten "timed out waiting for connection" 5xxs
@@ -2677,47 +2704,58 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
     // which is the same failure this whole guard exists to prevent, just
     // arriving in waves instead of one instant.
     //
-    // FIX: cap the number of concurrent independent builds at a CONSTANT — 2
-    // (the primary FLIGHT plus exactly one FALLBACK_FLIGHT) — no matter how
-    // many requests arrive or how long they keep arriving. A waiter that
-    // cannot get either lock does not build a third copy; it keeps waiting.
-    // The wait is bounded overall (15s) purely as a fail-SAFE: past that
-    // bound this returns an honest error (-> 500, which the dashboard's
-    // existing degraded-UI banner already renders as "Worker updates are
-    // unavailable ... Retry") instead of adding a third builder to a pool
-    // that is, by definition, already struggling if both of the first two
-    // haven't finished in 15s. Refusing new load under real overload is the
-    // fail-safe; piling on more load is what turned a single restart into a
-    // minutes-long outage.
+    // FINAL SHAPE: exactly ONE builder. The former fallback lock started a
+    // second identical fleet scrape immediately whenever two clients arrived
+    // on a cold cache. On the live 127-lane fleet that doubled hundreds of
+    // tmux captures, made tmux miss its own deadlines, and stretched both
+    // builds long enough that every later caller got the persistent
+    // "Worker updates are unavailable" banner. A fallback doing the same work
+    // against the same substrate cannot rescue a slow primary; it only makes
+    // that substrate slower.
+    //
+    // Runtime reports preserve the last structurally safe snapshot. While one
+    // caller refreshes it, every other caller may serve that snapshot even if
+    // its status epoch is old. Structural/config changes still clear it, so a
+    // peer can never see a worker that was just isolated or deleted.
     static FLIGHT: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    static FALLBACK_FLIGHT: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _flight = if let Ok(g) = FLIGHT.try_lock() {
+    let take_flight = || match FLIGHT.try_lock() {
+        Ok(g) => Some(g),
+        Err(std::sync::TryLockError::Poisoned(p)) => {
+            tracing::error!(
+                target: "amux::sessions",
+                verdict = "sessions_flight_poison_recovered",
+                "the prior sessions builder panicked; recovering its single-flight lock"
+            );
+            FLIGHT.clear_poison();
+            Some(p.into_inner())
+        }
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    };
+    let _flight = if let Some(g) = take_flight() {
         g
     } else {
         if let Ok(c) = build_array_cache().lock() {
-            // Losers may serve a somewhat-stale snapshot (that is the
-            // stale-while-revalidate trade), but never one from before an
-            // invalidation — post-invalidation the json is empty, so they
-            // fall through and wait.
-            if !c.json.is_empty() && c.epoch == epoch_now {
+            if !c.json.is_empty()
+                && c.epoch == epoch_now
+                && c.registry == registry_fingerprint()
+            {
                 return Ok(c.json.clone());
             }
         }
-        let overall_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let wait_s = env_secs("AMUX_SESSIONS_BUILD_WAIT_S", 30.0);
+        let overall_deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs_f64(wait_s);
         let mut acquired = None;
-        let mut used_fallback = false;
         loop {
-            if let Ok(g) = FLIGHT.try_lock() {
+            if let Some(g) = take_flight() {
                 acquired = Some(g);
-                break;
-            }
-            if let Ok(g) = FALLBACK_FLIGHT.try_lock() {
-                acquired = Some(g);
-                used_fallback = true;
                 break;
             }
             if let Ok(c) = build_array_cache().lock() {
-                if !c.json.is_empty() && c.epoch == epoch_now {
+                if !c.json.is_empty()
+                    && c.epoch == epoch_now
+                    && c.registry == registry_fingerprint()
+                {
                     return Ok(c.json.clone());
                 }
             }
@@ -2727,34 +2765,17 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
         match acquired {
-            Some(g) => {
-                if used_fallback {
-                    tracing::warn!(
-                        target: "amux::sessions",
-                        verdict = "sessions_cache_fallback_builder",
-                        "cold sessions cache with the primary builder still busy — using the \
-                         ONE fallback builder rather than waiting forever (AF-301) or piling on \
-                         a third independent build (the 2026-09-09 sustained-load regression). \
-                         A spike in this line means restarts are landing under real concurrent \
-                         load; two builders at once is expected, more would not be."
-                    );
-                }
-                g
-            }
+            Some(g) => g,
             None => {
                 tracing::error!(
                     target: "amux::sessions",
                     verdict = "sessions_cache_stuck",
-                    waited_ms = 15000,
-                    "cold sessions cache with BOTH the primary and fallback builders still busy \
-                     after 15s — refusing a third independent build (that pile-up is exactly what \
-                     caused the sustained read_pool_exhausted outage on 2026-09-09). Failing this \
-                     request so the caller retries instead of adding more load to an already-stuck \
-                     pool; if this recurs, the primary/fallback builders themselves are wedged \
-                     (AF-301's unbounded subprocess calls), not this guard."
+                    waited_ms = (wait_s * 1000.0) as u64,
+                    "the single sessions builder did not publish a structurally safe snapshot \
+                     before the wait deadline; refusing duplicate fleet work"
                 );
                 anyhow::bail!(
-                    "sessions list temporarily unavailable: both builders busy after 15s, refusing to add a third"
+                    "sessions list temporarily unavailable: builder busy after {wait_s:.1}s"
                 );
             }
         }
@@ -2765,6 +2786,7 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
         if now - c.stamp < ttl
             && !c.json.is_empty()
             && c.epoch == epoch_now
+            && c.runtime_epoch == runtime_epoch_now
             && c.registry == registry_fingerprint()
         {
             return Ok(c.json.clone());
@@ -2774,29 +2796,54 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
     // then fails the epoch check (API path) or the fingerprint check on the
     // next read (out-of-band path), instead of hiding inside the snapshot.
     let epoch_start = SESSIONS_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
+    // Snapshot runtime evidence before the SQL read too. If a report lands
+    // during the build, tagging pre-report JSON with the post-report epoch
+    // would make stale status look current until some later report happened.
+    let runtime_epoch_start =
+        SESSIONS_RUNTIME_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
     let registry_start = registry_fingerprint();
-    let conn = store.read()?;
+    // Never reserve one of the request pool's readers while external probes
+    // run. Cheap board/status requests remain independent of fleet discovery.
+    let conn = store.dedicated_read()?;
     let arr = build_array(&conn)?;
     let json = serde_json::to_string(&arr)?;
-    if SESSIONS_EPOCH.load(std::sync::atomic::Ordering::SeqCst) == epoch_start {
+    if SESSIONS_EPOCH.load(std::sync::atomic::Ordering::SeqCst) == epoch_start
+        && registry_fingerprint() == registry_start
+    {
         if let Ok(mut c) = build_array_cache().lock() {
             *c = ListSnapshot {
                 stamp: now,
                 json: json.clone(),
                 epoch: epoch_start,
+                runtime_epoch: runtime_epoch_start,
                 registry: registry_start,
             };
         }
     } else {
-        // The write-back race, caught: this build predates an invalidation.
-        // The caller still gets its (self-built, fresh-enough) answer; the
-        // CACHE must not, or the invalidation is undone.
-        tracing::debug!(
+        // Fail closed as well as refusing the cache write. Returning JSON that
+        // predates an isolation/delete/config change would leak the old fleet
+        // shape to the one request that happened to race the change.
+        tracing::warn!(
             target: "amux::sessions",
-            "session-list build raced an invalidation — snapshot discarded, not cached"
+            "session-list build raced a structural change — refusing the stale response"
         );
+        anyhow::bail!("sessions list changed during discovery; retry")
     }
     Ok(json)
+}
+
+/// Parsed access to the shared sessions projection for sibling APIs.
+///
+/// Keeping this async seam prevents a new endpoint from calling `build_array`
+/// directly, bypassing the fleet-wide single flight, and from running the
+/// synchronous tmux/git projection on a Tokio worker.
+pub(crate) async fn legacy_sessions_values(
+    store: crate::db::SharedStore,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let json = tokio::task::spawn_blocking(move || legacy_sessions_array(&store))
+        .await
+        .map_err(|e| anyhow::anyhow!("sessions build task failed: {e}"))??;
+    Ok(serde_json::from_str(&json)?)
 }
 
 pub async fn list_sessions_legacy(
@@ -3527,7 +3574,7 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
 /// pub(crate): session_verbs' bare GET /api/sessions/{name} serves ONE
 /// record from the SAME array (py:74892 — the natural URL answers the
 /// natural shape).
-pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::Value>> {
+fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::Value>> {
     let mut signals = FleetSignals::load(conn);
     // Before any status is derived: the pane is the only signal that can
     // contradict a self-report, and a report that nothing can contradict is

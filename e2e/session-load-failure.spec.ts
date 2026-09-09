@@ -76,6 +76,56 @@ for (const failure of [
   });
 }
 
+test('a transient worker-list overload heals without making the user click Retry', async ({page}) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('amux_walkthrough_done', '1');
+    // Keep realtime healthy-but-quiet so no SSE reconnect/fallback/focus path
+    // can supply the request this test attributes to the backoff timer.
+    Object.defineProperty(window, 'EventSource', {configurable:true, value:class {
+      onmessage = null; onerror = null;
+      constructor(_url: string) {}
+      close() {}
+    }});
+  });
+  let attempts = 0;
+  await page.route(/\/api\/sessions(?:\?.*)?$/, route => {
+    attempts++;
+    if (attempts === 1) {
+      return route.fulfill({status:503, contentType:'application/json',
+        body:'{"error":"temporarily unavailable"}'});
+    }
+    return route.fulfill({status:200, contentType:'application/json', body:'[]'});
+  });
+  await page.goto('/#view=workers');
+  const notice = page.locator('#session-read-notice');
+  await expect(notice).toContainText('Worker updates are unavailable');
+  await expect.poll(() => attempts).toBe(2);
+  await expect(notice).toBeEmpty();
+  await expect(page.locator('#conn-status').first()).toHaveText(/Live|Polling/);
+});
+
+test('an authorization failure does not start the transient-error retry loop', async ({page}) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('amux_walkthrough_done', '1');
+    Object.defineProperty(window, 'EventSource', {configurable:true, value:class {
+      onmessage = null; onerror = null;
+      constructor(_url: string) {}
+      close() {}
+    }});
+  });
+  let attempts = 0;
+  await page.route(/\?_fresh=auth(?:#.*)?$/, route => route.abort());
+  await page.route(/\/api\/sessions(?:\?.*)?$/, route => {
+    attempts++;
+    return route.fulfill({status:401, contentType:'application/json',
+      body:'{"error":"unauthorized","reason":"invalid_bearer"}'});
+  });
+  await page.goto('/#view=workers');
+  await expect(page.locator('#session-read-notice')).toContainText('Access to this workspace needs to be renewed');
+  await page.waitForTimeout(1500);
+  expect(attempts).toBe(1);
+});
+
 for (const initial of ['', 'obsolete-test-credential']) {
   test(`fresh authorized bootstrap repairs ${initial ? 'stale' : 'missing cached'} bearer and preserves location`, async ({page}) => {
     await page.addInitScript(({ initial }) => {

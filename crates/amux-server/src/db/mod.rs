@@ -39,6 +39,22 @@ use std::sync::Arc;
 
 pub type ReadPool = r2d2::Pool<SqliteConnectionManager>;
 
+pub(crate) enum ProjectionRead {
+    Dedicated(Connection),
+    Pooled(r2d2::PooledConnection<SqliteConnectionManager>),
+}
+
+impl std::ops::Deref for ProjectionRead {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Dedicated(conn) => conn,
+            Self::Pooled(conn) => conn,
+        }
+    }
+}
+
 /// What a write closure reports back: did it change anything, and what
 /// StateEvents should be published if it did. `applied: false` writes do NOT
 /// bump the revision (Invariant 37: no-op mutations must be visible as
@@ -88,6 +104,7 @@ pub struct WriteReply {
 pub struct Store {
     write_tx: mpsc::Sender<WriteRequest>,
     read_pool: ReadPool,
+    db_path: Arc<std::path::PathBuf>,
     pub(crate) health_probe: Arc<tokio::sync::Semaphore>,
     /// Broadcast of committed StateEvents for SSE fan-out.
     events_tx: tokio::sync::broadcast::Sender<StateEvent>,
@@ -155,6 +172,7 @@ impl Store {
         Ok(Store {
             write_tx,
             read_pool,
+            db_path: Arc::new(db_path.to_path_buf()),
             health_probe: Arc::new(tokio::sync::Semaphore::new(1)),
             events_tx,
         })
@@ -240,6 +258,33 @@ impl Store {
     /// Health must report pool exhaustion without waiting behind fleet probes.
     pub fn try_read(&self) -> Option<r2d2::PooledConnection<SqliteConnectionManager>> {
         self.read_pool.try_get()
+    }
+
+    /// Open a read-only connection outside the request pool for a bounded,
+    /// heavyweight projection.
+    ///
+    /// The sessions projection deliberately shells out while it assembles its
+    /// answer. Even with one build in flight, lending that work one of the
+    /// request pool's connections makes unrelated, cheap API reads wait behind
+    /// tmux/git. A dedicated reader keeps the pool available while preserving
+    /// SQLite's WAL snapshot semantics; callers must still single-flight and
+    /// bound their external work.
+    pub(crate) fn dedicated_read(&self) -> anyhow::Result<ProjectionRead> {
+        // SQLite gives each `:memory:` connection an independent database, so
+        // a new connection would silently see an empty store. Preserve the
+        // previous pooled behavior for that test/development configuration.
+        if self.db_path.as_path() == Path::new(":memory:") {
+            return Ok(ProjectionRead::Pooled(self.read()?));
+        }
+        let conn = Connection::open_with_flags(
+            self.db_path.as_ref(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "query_only", "ON")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        Ok(ProjectionRead::Dedicated(conn))
     }
 
     /// Current global revision.

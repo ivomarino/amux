@@ -3007,6 +3007,16 @@ function _sessionReadFailed(status, reason) {
     console.warn('amux: session read failed', incident);
     try { sessionStorage.setItem('amux_session_load_failure', JSON.stringify(incident)); } catch (_) {}
   }
+  // A transient server overload used to leave this banner pinned forever.
+  // HTTP failures do not trip fetch's catch branch, and an otherwise-healthy
+  // SSE stream may never emit another sessions invalidation, so the only
+  // recovery path was the human clicking Retry even after the server was
+  // healthy again. Auth failures require a new credential; every other read
+  // failure retries automatically with bounded backoff.
+  if (status !== 401) _scheduleSessionReadRetry();
+  // Arm recovery before entering the large renderer. Even if an unrelated
+  // view-specific render path throws after painting the banner, the transport
+  // still gets a chance to heal itself.
   updateConnectionStatus();
   render();
 }
@@ -3014,6 +3024,9 @@ function _sessionReadFailed(status, reason) {
 function _sessionReadRecovered() {
   const changed = !!_sessionLoadError;
   _sessionLoadError = null;
+  _sessionRetryAttempt = 0;
+  clearTimeout(_sessionRetryTimer);
+  _sessionRetryTimer = null;
   updateConnectionStatus();
   if (changed) render();
   // A 401 also rejects client-debug, so do not hammer it while unauthorized.
@@ -3033,6 +3046,9 @@ function _sessionReadRecovered() {
 
 function _retrySessionRead() {
   _authRecoveryAttempted = false;
+  _sessionRetryAttempt = 0;
+  clearTimeout(_sessionRetryTimer);
+  _sessionRetryTimer = null;
   fetchSessions();
 }
 
@@ -3052,7 +3068,28 @@ function _sessionReadNotice() {
 }
 
 let _sessEtag = null;
-async function fetchSessions() {
+let _sessionFetchInFlight = null;
+let _sessionRetryTimer = null;
+let _sessionRetryAttempt = 0;
+function _scheduleSessionReadRetry() {
+  if (_sessionRetryTimer) return;
+  const delay = Math.min(1000 * Math.pow(2, _sessionRetryAttempt++), 10000);
+  _sessionRetryTimer = setTimeout(() => {
+    _sessionRetryTimer = null;
+    fetchSessions();
+  }, delay);
+}
+function fetchSessions() {
+  // Focus, SSE invalidation, reconnect and the fallback poll can all ask for
+  // the same list at once. One browser tab should never contribute its own
+  // request stampede during the exact recovery window it is trying to heal.
+  if (_sessionFetchInFlight) return _sessionFetchInFlight;
+  _sessionFetchInFlight = _fetchSessionsOnce().finally(() => {
+    _sessionFetchInFlight = null;
+  });
+  return _sessionFetchInFlight;
+}
+async function _fetchSessionsOnce() {
   const snapshotEpoch = _sessionsSnapshotEpoch;
   try {
     // AMUX-3504: conditional fetch — the server hashes the (now byte-stable)
