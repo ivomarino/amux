@@ -11610,6 +11610,20 @@ function _peekAcceptFrame(data) {
   // Alt-screen peeks return history + live SEPARATELY so a poll can re-render just
   // the live frame. A live=1 poll carries no history (keep what we already have);
   // non-alt/legacy shapes send one `output` blob — treat that as the live part.
+  // WRAP AT THE WORKER'S OWN WIDTH, NOT THE VIEWER'S (Ethan, 2026-09-09:
+  // "fix why this formatting is off"). The pane's text was laid out by a
+  // program running in a terminal of `pane_cols` columns — measured 154 for
+  // that worker. `.overlay-body` is pre-wrap, so on a wide desktop the same
+  // text re-flows to whatever the window allows: measured 224 characters per
+  // line at 1700px. Every paragraph the worker wrote for 154 columns is then
+  // re-broken at 224, which is why the spacing reads as wrong even though no
+  // character was lost. Capping the text flow restores the author's line
+  // breaks. Box blocks are unaffected — wrapBoxBlocks gives them their own
+  // horizontal scroller, and that runs inside these regions.
+  if (data.pane_cols > 0) {
+    const b = document.getElementById('peek-body');
+    if (b) b.style.setProperty('--peek-cols', data.pane_cols);
+  }
   const rawOutput = (data.live != null) ? data.live : (data.output || '(no output)');
   const histRaw = (data.history != null) ? data.history : null;   // null ⇒ live-only poll
   if (typeof rawOutput !== 'string' || (histRaw !== null && typeof histRaw !== 'string')) throw new Error('Malformed terminal frame');

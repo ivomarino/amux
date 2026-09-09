@@ -852,6 +852,12 @@
     opacity: 0.75; white-space: pre-wrap;
     border-left: 2px solid rgba(255,255,255,0.12); padding-left: 6px;
   }
+  /* The peek text flow is capped to the WORKER's pane width (--peek-cols, set
+     per frame from the peek payload's pane_cols). Without it, prose written for
+     a 154-column terminal re-wraps at ~224 characters on a wide desktop and the
+     author's line breaks and spacing stop making sense. Falls back to 220, the
+     spawn width, when a frame carries no pane_cols. */
+  #pk-earlier, #pk-hist, #pk-live { max-width: calc(var(--peek-cols, 220) * 1ch); }
   .peek-rule {
     display: inline-flex; width: 100%; align-items: center; gap: 6px;
     height: 1.15em; vertical-align: middle;
