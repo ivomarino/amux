@@ -6306,3 +6306,981 @@ FIX: Compute the fixture timestamp once and use that same binary value for the
   JSON/SQLite contract instead of conflating codegen rounding with persistence.
 
 ---
+
+## Pending hot-swap recovery outlived its active card
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Saved Some(X) versus a current None or another claim is superseded; a missing obsolete cwd does not block startup and a stale X is not resumed. CI (run 34358221870 @ 04a19c51):
+  test api::session_verbs::tests::terminal_after_hot_switch_and_changed_claim_replace_stale_launch_context ... ok
+AREA: runtime
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-92
+SYMPTOM: A hot config change could retain saved card X after X became terminal or a different exact claim replaced it. The launch validator accepted saved Some(X) against current None, and the old worktree could then prevent startup or reintroduce stale work.
+COST: Model-swap acceptance remained unsafe across task completion, despite passing the same-card restart regression.
+FIX: Compare saved and current claim identities including None. Superseded snapshots derive the current exact card or scoped queue and current runtime/configured cwd; a removed old worktree does not block that replacement. swap_context_superseded names the old/current identities. The explicit terminal_after_hot_switch_and_changed_claim_replace_stale_launch_context regression covers both transitions.
+
+---
+
+## Refused swaps changed config and startup recovery bypassed durable delivery
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Refused live swaps leave env/meta/runtime unchanged. Startup and board-drive share one durable card/generation delivery ID, accept once, and retain pending context for retry after a failure. CI (run 34358221870 @ 04a19c51):
+  test api::session_verbs::tests::refused_live_swap_preserves_env_meta_and_runtime_before_any_write ... ok
+  test runtime_jobs::board_drive::tests::startup_and_board_drive_share_one_durable_resume_per_generation_and_retry_failure ... ok
+AREA: runtime
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-92
+SYMPTOM: Provider/YOLO branches wrote CC_PROVIDER/CC_FLAGS before validating resume identity, so a 409 could leave changed configuration. Startup consumed its pending context before a detached send_after_ready task committed delivery, while board-drive independently enqueued recovery for the same session.started generation.
+COST: Refused swaps could alter the next launch; accepted swaps could lose or duplicate recovery across process failure. Both prevented honest model-swap acceptance.
+FIX: Validate and atomically persist exact resume context before config writes. Startup commits its generation and context before enqueue and shares board-drive's stable card/generation identity and accepted-delivery receipt. Pending tokens clear only after durable queue acceptance; queue/history records deduplicate concurrent producers and process restarts, superseded generations cannot enqueue, and enqueue failures retain context for retry. Diagnostics: swap_context_unresolved, swap_context_persist_failed, swap_resume_enqueue_failed, swap_resume_accepted, swap_resume_superseded. Regression tests exercise the actual config branch ordering and concurrent startup/board enqueue against reopened durable state.
+
+---
+
+## Disk pressure cleanup deleted the shared target during active Rust gates
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). An active lease, native lock or process use blocks Cargo mutation. Guard failures refuse cleanup; idle fixtures reclaim after exit; unrelated Rust filesystem operations bypass the Cargo/Python guard. CI (run 34358221870 @ 04a19c51):
+  test cargo_target_guard::tests::unrelated_reclaim_stays_native_and_cargo_sources_destinations_originals_are_guarded ... ok
+Fresh local script evidence: ate-validation-cargo-guard.log (Cargo guard 10/10), ate-validation-script-1.log.
+AREA: runtime
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-92
+SYMPTOM: The shared debug/deps directory vanished during ATE-92 cargo check/clippy/test runs as free space jumped from roughly 13 GiB to 26 GiB. The builder explicitly bypassed its peer check below the disk floor, and reclaim could quarantine Cargo artifacts without any process or lock check. disk_watch itself only reports.
+COST: Interrupted compilation, missing artifact errors, and a cold rebuild before acceptance could continue. Existing cleanup tests required destruction during a peer build.
+FIX: Remove the low-disk override. safe-cargo holds an inherited lifetime lease outside the target; builder and Cargo-only reclaim mutations share one guard that takes Cargo locks, checks cargo/rustc/direct test processes, and fails closed on unknown probes. Cargo lock files retain their inodes; active builds defer with cargo_reclaim_deferred and idle retries emit cargo_reclaim_result. Ordinary non-Cargo reclaim remains native Rust. Temporary fixture regressions prove active artifact survival and reclaim after exit without depending on unrelated host builds.
+
+---
+
+## Model-swap resume lost the active worktree and requested an unscoped board list
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Reopened durable runtime state preserves the exact active card and existing cwd. The prompt uses the exact card first and worker-scoped --mine, with no raw replay. CI (run 34358221870 @ 04a19c51):
+  test api::session_verbs::tests::provider_resume_uses_structured_state_not_terminal_replay ... ok
+  test api::session_verbs::tests::model_swap_resume_preserves_exact_claim_directory_and_scope_after_reopen ... ok
+AREA: attribution
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-92
+SYMPTOM: The generated swap prompt requested `amux board ls --session amux-testing-e2e`, which this CLI silently ignored and returned unrelated fleet cards. The restarted worker began in the configured shared checkout instead of its active isolated task directory.
+COST: The owner interrupted recovery to prevent touching foreign drafts and had to repeat the exact worktree and active task scope.
+FIX: Persist exact claim, worker and runtime cwd before swapping; the launcher retains that directory or refuses an unresolved/missing context. Resume prompts name the exact card first and use `AMUX_SESSION=<worker> amux board ls --mine`. swap_context_persisted and swap_context_invalid make the identity decision visible. Regression reopens the durable DB and exercises the same launch selector for model/provider/version restarts.
+
+---
+
+## Workers rejected a stale Codex footer while board-drive still trusted it
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Workers and delivery boundaries use the same structured decision. Board-drive reuses one tick snapshot; target steering uses a scoped probe and fails closed on unknown process evidence. CI (run 34358221870 @ 04a19c51):
+  test api::sessions_legacy::status_truth::boundary_and_workers_share_structured_codex_truth_and_fail_closed ... ok
+  test runtime_jobs::board_drive::tests::live_fleet_boundary_reuses_its_tick_snapshot_and_structured_truth ... ok
+  test api::sessions_legacy::status_truth::codex_tool_child_is_resolved_below_provider_not_from_provider_existence ... ok
+AREA: scheduler
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-92
+SYMPTOM: TubeScience and Primis were skipped as mid-turn by board-drive after Workers had refused their stale Codex activity using structured FleetSignals.
+COST: Eligible continuation remained blocked despite the visible runtime correction; another user intervention was required.
+FIX: Board-drive reads one FleetSignals snapshot per tick. General steering and send-time race checks probe only the target worker through the same derivation. An unavailable process probe holds instead of inventing no children. boundary_stale_codex_footer_refused announces the recovered class in amux logs.
+
+---
+
+## Current recovery suppression also suppressed canonical advancement
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Current suppresses recovery only and still reaches continuation; repeated ticks obey the cooldown. CI (run 34358221870 @ 04a19c51):
+  test runtime_jobs::board_drive::tests::current_claim_advances_once_then_obeys_cooldown_across_repeated_ticks ... ok
+AREA: scheduler
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-92
+SYMPTOM: A surviving exact claim returned from drive_lane as Current before select_advance ran. An idle worker could keep its correct highlighted card indefinitely without a cooldown/backoff-gated continuation.
+COST: The live acceptance lane remained stalled after the duplicate-resume fix; implementation could not honestly pass the advancement gate.
+FIX: Suppress only recovery delivery and fall through to canonical advancement. The Current trace now records the advancement refusal reason, and task.resume_suppressed remains an idempotent receipt. Regression: current_claim_advances_once_then_obeys_cooldown_across_repeated_ticks.
+
+---
+
+## Every idle sweep re-delivered the same surviving task claim
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Surviving claims do not authorize repeated resume delivery; durable acceptance and receipt recovery deduplicate on the card/generation identity. CI (run 34358221870 @ 04a19c51):
+  test runtime_jobs::board_drive::tests::active_worker_does_not_receive_a_duplicate_resume_delivery ... ok
+  test runtime_jobs::board_drive::tests::crash_after_durable_enqueue_recovers_receipt_without_redelivery ... ok
+  test runtime_jobs::board_drive::tests::startup_and_board_drive_share_one_durable_resume_per_generation_and_retry_failure ... ok
+AREA: scheduler
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-92
+SYMPTOM: `select_resume` treated a durable surviving `task.claimed` marker as
+  fresh delivery permission on every idle board-drive tick. The live log showed
+  48 ATE-93 resume prompts to amux-testing-e2e, 74 ATE-114 prompts to
+  handoff-producer-0907, and repeated deliveries on several other owners.
+COST: Active workers were repeatedly re-steered onto the card they already
+  owned, the highlighted runtime card looked unstable, and backlog progress was
+  drowned by duplicate recovery prompts across hours of otherwise idle ticks.
+FIX: Separate causal runtime truth from recovery authorization. A running worker
+  keeps its exact claimed card without delivery; one new worker generation gets
+  one stable-id recovery, and a crash between durable enqueue and receipt
+  recovers the receipt without sending again. The board-drive log now emits
+  `active_owner_not_resteered`, `exact_live_claim_resumed`, or
+  `resume_receipt_recovered_without_redelivery` with the card, delivery id,
+  measured population, and causal reason on every branch.
+
+---
+
+## Clean CI turned one missing provider prerequisite into 34 unrelated pointer timeouts
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Each isolated browser server persists the non-secret provider prerequisite; default-model text restoration, both API-key restore paths, the exact causal claim and the narrow terminal controls pass together. Browser (local, 25cffc1c + 0ae16bb6): settings.spec.ts settings_default_model -> desktop, ios-safari PASSED; settings_api_key_anthropic -> desktop, ios-safari PASSED; settings_api_key_survives_slow_env_refresh -> desktop, ios-safari PASSED; terminal-message-navigation.spec.ts both cases -> desktop, ios-safari, mobile PASSED; working-now-accuracy.spec.ts 'one active worker marks exactly its claimed card as Working now' -> desktop, ios-safari, mobile PASSED.
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-93
+SYMPTOM: Exact-SHA Rust CI passed 354 browser scenarios, then 34 mobile/WebKit
+  terminal cases waited 30 seconds each because the clean test home correctly
+  displayed `#no-apikey-banner` over their controls. Two independent stale
+  fixtures also failed: default-model restoration called `selectOption` on the
+  shipped text input, and Working-now created four Doing rows without one causal
+  `task.claimed` identity.
+COST: The required ATE-93 CI gate ran 23 minutes before reporting 37 failures,
+  and one absent external prerequisite looked like dozens of terminal regressions.
+FIX: The broad harness now announces and writes an obvious non-secret provider
+  test value into every isolated project's `server.env`, the durable surface
+  `/api/identity` actually recognizes (it intentionally ignores process-injected
+  keys), keeping unrelated specs in their configured-install prerequisite.
+  The settings test restores the text input through fill+blur, and Working-now
+  creates its exact owner through the real claim endpoint. Its UI-only runtime
+  activation preserves that exact server-produced identity instead of expecting
+  a stopped fixture to project as live. Both API-key scenarios restore the known
+  harness baseline explicitly because a persisted empty value shadows the
+  process fallback; the slow-refresh scenario also reads the masked value back
+  as its cleanup postcondition, so a future regression fails at the writer
+  instead of poisoning later specs. Missing-key behavior remains product
+  behavior; it is no longer accidental global state for tests whose acceptance
+  has nothing to do with provider setup.
+
+---
+
+## Overlap timestamps shipped without units in the invariant registry
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). All seven overlap timestamp columns carry explicit seconds declarations. A separate org_teams.created_at omission was detected by the same unmodified guard and fixed under ATE-128 (pushed 6a1ffd58739f86bd08e1e733f2d186533da894e2); that is outside this entry's seven-column claim. After the fix: scripts/safe-cargo.sh test -p amux-server --test timestamp_units_declared -- --test-threads=1 -> 2 passed (ate-validation-team-timestamp-after.log).
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-93
+SYMPTOM: The full server gate found all seven numeric `*_at` columns introduced
+  by overlap coordination absent from `TIMESTAMP_COLUMNS`. Their writers use
+  seconds, but the schema and runtime invariant had no durable unit declaration.
+COST: A second broad gate reached its final integration targets before failing,
+  preventing the required clippy and deployment chain from starting.
+FIX: Declare callback updates, coordination create/update/resolve stamps, member
+  create/last-seen stamps, and merged-reference creation as seconds beside the
+  existing board timestamps. The exhaustive timestamp-unit guard now makes any
+  future schema drift fail with the exact missing table and column.
+
+---
+
+## Overlap routes worked but the canonical route census called them unrouted
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). All three overlap routes are registered; the real-router bidirectional census and direct path coverage both pass. Command/result: scripts/safe-cargo.sh test -p amux-server --test route_table -- --test-threads=1 -> route_table 2 passed, including the bidirectional actual router. See ate-validation-integration.log.
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-93
+SYMPTOM: The full integration gate found `/api/board/overlap`, its coordination
+  lookup, and its deployment-permit endpoint mounted and covered by handler tests,
+  but absent from `ROUTE_TABLE`. `/api/debug/routes` and downstream request-log
+  sweeps therefore could not distinguish those working endpoints from dead routes.
+COST: The first otherwise-green full ATE-93 server run failed after more than six
+  minutes and prevented clippy and deployment from starting.
+FIX: Register all three overlap paths with the exact methods mounted by the board
+  router. The bidirectional route-table integration guard now covers the family,
+  and request-log normalization exposes overlap traffic to the existing diagnostic
+  sweeps instead of silently classifying it through a generic card route.
+
+---
+
+## Callback e2e still expected the child link that original-task resumption removed
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). The request remains on the child; the terminal callback belongs to the original parent, retains the child ID in its text, and card/message navigation reaches the exact child. Browser (local, 25cffc1c + 0ae16bb6): worker-request-callback.spec.ts 'worker request stays on one card and returns one terminal callback' -> desktop, ios-safari, mobile PASSED.
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-93
+SYMPTOM: worker-request-callback.spec.ts expected the terminal callback's hard
+  card_id and a second card-detail message button on the completed child, while
+  the deployed callback contract correctly attaches that message to the original
+  requester task and keeps only the request source on the child.
+COST: Two three-browser working-tree runs failed 3/3 after the backend and card
+  detail suites were green; the first failure looked like a missing callback and
+  the second like missing UI lineage until the retained temp database exposed the
+  exact cmd_history rows.
+FIX: Assert the board request on the child and the callback on the original parent,
+  with the child id retained in callback text. The child UI expects one source
+  message, then proves card→message→card across desktop, 375px Chromium, and iPhone
+  WebKit; the focused matrix passes 3/3 and emits message-card-nav verdicts.
+
+---
+
+## Rename integration tests built a stale hand-written issues schema that production had already migrated
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). The rename fixture uses the production migration chain and the three current rename cases pass. Command/result: scripts/safe-cargo.sh test -p amux-server --test rename_migrates_reviewer --test route_table --test timestamp_units_declared -- --test-threads=1 -> rename 3 passed, route_table 2 passed (timestamp target separately red on org_teams only, fixed under ATE-128). See ate-validation-integration.log.
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-93
+SYMPTOM: Fresh Rust CI failed all 3 rename_migrates_reviewer cases with
+  `issues.requested_by: no such column`. The test manually declared five issues
+  columns while the production rename path had correctly grown to migrate more
+  relationship fields, so the fixture—not the implementation—failed on the clean
+  runner after focused overlap and board suites were green.
+COST: Exact-commit CI required a separate log download and another code/test/deploy
+  cycle; the red looked like a rename regression until the missing fixture column
+  was isolated.
+FIX: Build the rename fixture through migrate::test_memdb_pub so every production
+  schema migration is present, then insert only the rows the scenario needs. The
+  clean focused target passes 3/3 and future schema growth can no longer drift this
+  fixture silently.
+
+---
+
+## Deployment overlap preflight stopped offline disk-cleanup diagnostics
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Offline diagnostic modes bypass deployment-only overlap permits; actual adoption without a measured permit stays refused. Fresh local script evidence: ate-validation-script-1.log, ate-validation-script-2.log, ate-validation-script-3.log.
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-93
+SYMPTOM: Checks CI for 9e4de512 stopped after provenance 9/0 with no disk-clear result. The disk-only builder path queried the live overlap deployment permit for the checkout's worker trailer, then exited before cleanup on CI without a server. Locally the same test passed 24/0 by reaching the fleet server. A missing grep match then hid the builder's refusal under set -e.
+COST: Exact-commit CI failed after live acceptance passed, requiring an offline reproduction and another deployment before ATE-93 could close.
+FIX: Diagnostic-only builder modes log OVERLAP GUARD NOT APPLICABLE and skip the network permit because they cannot install. Real deployment still logs OVERLAP GUARD UNMEASURED and refuses adoption. Tests exercise both offline modes and the real refusal on one worker-attributed commit, pin disk tests to an unreachable endpoint, and print the missing-cleanup failure rather than exiting silently. Activation authority and launcher suites now run in Checks CI.
+
+---
+
+## Overlap callback tests passed alone by reading real worker identities
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). The callback fixtures own guarded temporary homes and worker identities; the vanished-worker case proves a no-env retry then one durable queue acceptance. CI (run 34358221870 @ 04a19c51):
+  test api::board::overlap_reconciliation_tests::vanished_peer_and_model_switch_keep_the_handoff_callback_recoverable ... ok
+  test api::board::overlap_reconciliation_tests::linked_peer_cannot_complete_or_deploy_until_owner_scope_splits ... ok
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-93
+SYMPTOM: The overlap suite passed alone but its containing board module failed 54/2: both HTTP fixtures expected queued/200 and received retryable/202 with no-env-file. They used real handoff worker names without isolated session fixtures; other board tests correctly changed AMUX_HOME under the shared test lock.
+COST: The earlier focused green overstated callback coverage and required a containing-suite investigation before deployment.
+FIX: Both HTTP fixtures now own a guarded temporary AMUX_HOME and persisted test worker identities. The vanished-worker test first asserts retryable/no-env-file, then restores its fixture identity and proves one durable queued callback on retry. The production board_overlap_callback_retryable marker already names the exact refusal the old fixtures concealed.
+
+---
+
+## Overlap lineage elected the reporting peer in its log while the durable owner stayed unchanged
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). The elected durable owner and the reporter are distinct; readback retains resolution and callbacks, and one corrective lineage append repairs old log text without rewriting history. CI (run 34358221870 @ 04a19c51):
+  test api::board::overlap_reconciliation_tests::late_peer_log_names_the_elected_owner_not_the_reporting_peer ... ok
+  test api::board::overlap_reconciliation_tests::readback_keeps_resolution_provenance_and_both_durable_callbacks ... ok
+  test api::board::overlap_reconciliation_tests::retry_appends_one_correction_to_legacy_lineage_without_rewriting_history ... ok
+  test api::board::overlap_reconciliation_tests::distinct_concerns_keep_independent_elections_until_explicit_resolution ... ok
+AREA: attribution
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-93
+SYMPTOM: OVL-15a87ecd9d24b055 elected ATE-114/handoff-producer-0907, but ATE-115's self-report appended "elected owner [ATE-115]" to both cards. GET kept the real owner but hid the resolution note, resolving actor and callback list. A second concern name was labeled scope-split even while its resolution remained pending.
+COST: Live acceptance could not be signed off from contradictory ownership evidence; two new regression tests failed on the deployed source (5 passed, 2 failed).
+FIX: Derive lineage from the elected row inside its writer transaction and name the reporter separately. Expose resolution provenance, both callbacks and self-report state; only an explicit resolution can report scope-split. An ordinary retry appends one correction to legacy lineage without rewriting history. board_overlap_lineage_recorded and board_overlap_lineage_refreshed expose the result in amux logs.
+
+---
+
+## A stale card detail routed a terminal Refresh to the provider
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Authoritative terminal state replaces stale controls and draft state; late provider prose cannot replace the Final outcome. CI (run 34358221870 @ 04a19c51):
+  test terminal_status_paths_preserve_summary_and_record_audit_for_provider_shapes ... ok
+Browser (local, 25cffc1c + 0ae16bb6): card-details.spec.ts 'authoritative status wins a stale cached detail and old Refresh never asks the provider' -> desktop, ios-safari, mobile PASSED; 'terminal hydration clears a persisted stale status draft and keeps late provider text out of the banner' -> desktop, ios-safari, mobile PASSED.
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux-testing-e2e
+CARD: ATE-84
+SYMPTOM: ATE-75 was Done in the durable board, but a stale client reopened it with In Progress selected. Its old Refresh/status-request path then reached the worker, and the resulting status update replaced the generated Final outcome summary.
+COST: The UI made a terminal card look active and allowed provider prose to overwrite the durable completion record, so Refresh could not restore the evidence reviewers needed.
+FIX: Card-detail hydration now applies the authoritative GET status to the selected controls, and Refresh GETs before deciding whether a provider request is permitted. Terminal status-request calls are refused and logged without delivery; terminal status updates and stale last_result PATCHes preserve Final outcome while appending evidence. Emit terminal_status_request_preserved and terminal_status_update_preserved markers, with Rust provider-shape and desktop/mobile/iOS Playwright regressions.
+
+## A terminal card kept an intermediate status after completion
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Successful terminal transitions persist final evidence with provenance; refused transitions do not. Terminal Refresh reads that record without asking the worker. CI (run 34358221870 @ 04a19c51):
+  test terminal_transition_records_summary_and_preserves_provenance_for_provider_shapes ... ok
+  test refused_terminal_transition_does_not_record_summary_for_provider_shapes ... ok
+Browser (local, 25cffc1c + 0ae16bb6): card-details.spec.ts 'terminal Refresh rehydrates the durable final summary without asking the worker' -> desktop, ios-safari, mobile PASSED.
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux-testing-e2e
+CARD: ATE-84
+SYMPTOM: ATE-75 reached Done with a 12:05 validation note still shown as Latest status; Refresh asked the worker and did not surface the current terminal outcome.
+COST: Reviewers could not tell whether the completed work had actually deployed or passed live acceptance, and the visible worker-action summary omitted the final evidence.
+FIX: The save_patched durable write choke point now atomically records a provider-independent final summary in last_result and a STATUS (board) history line, including outcome, recorded actions, tests/deployment/live evidence, and linked assets. Terminal Refresh rehydrates the authoritative board detail instead of requesting provider text. Legacy terminal rows are repaired on their next durable board write, and terminal_summary_recorded is logged for sweeps.
+
+## An empty composer control was recorded as a confirmed message and failed silently
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). A missing suggestion produces no confirmed send; the UI awaits and names an unverified Enter or a failed fallback. CI (run 34358221870 @ 04a19c51):
+  test api::session_verbs::tests::missing_suggestion_is_no_effect_not_a_confirmed_send ... ok
+Browser (local, 25cffc1c + 0ae16bb6): suggestion-control-verdict.spec.ts 'a missing suggestion names the unverified Enter fallback' -> desktop, ios-safari, mobile PASSED; 'a rejected suggestion fallback names the recovery failure' -> desktop, ios-safari, mobile PASSED.
+AREA: browser
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux-testing-e2e
+CARD: ATE-75
+SYMPTOM: After an interrupted turn, the dashboard accepted `continue`, then recorded a second message.sent event with chars=0 even though the empty suggestion probe found nothing. Its fallback Enter returned no visible effect verdict, and the worker had to be stopped and resumed before the composer/control state was trustworthy again.
+COST: The live acceptance turn was interrupted, a no-op entered the durable audit trail as a confirmed send, and recovery required a worker stop/start.
+FIX: Classify a missing suggestion as submission=no_effect, omit it from send history/last_send, and emit a session.control_noop event plus composer-control WARN. Raw key responses now name effect=unverified, and the dashboard awaits the fallback and displays that verdict or an explicit failure.
+
+## A global cross-group grant was silently narrowed by a worker allow-list
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Explicit global/group/worker grants compose; a more-specific explicit empty layer resets them. Configuration and enforcement share the effective source. CI (run 34358221870 @ 04a19c51):
+  test api::session_verbs::tests::cross_group_allow_lists_compose_while_empty_lower_layers_explicitly_deny ... ok
+  test api::session_verbs::tests::fleet_cross_group_toggle_round_trips_the_persisted_global_layer ... ok
+  test api::workers::tests::both_worker_config_routes_persist_and_explain_cross_group_policy ... ok
+AREA: messages
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux-testing-e2e
+CARD: AMUX-4018
+SYMPTOM: Global Settings showed “Workers may message across groups” ON and the global env persisted CC_SEND_ALLOW=*, but amux-frustrations → amux-testing-e2e still entered per-message approval because the resolver returned the sender worker’s nonempty legacy allow-list and ignored the explicit global grant.
+COST: The visible fleet policy contradicted enforcement, ordinary peer handoffs stalled, and neither the refusal nor worker UI identified which layer actually decided the result.
+FIX: Resolve CC_SEND_ALLOW as a layered allow-list: nonempty explicit global/group/worker values compose additively, while an explicit empty more-specific value is the visible deny/reset. Enforcement, both worker config routes, the worker list, and the UI share the resulting value/source/reason. Emit cross_group_policy_refused and cross_group_policy_persisted verdicts with the effective source.
+
+## Scrolling a worker terminal fired empty message-navigation toasts
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). A moved/scroll-interrupted gesture over an arrow is inert; an explicit empty navigation loads earlier output once and lands on the found message. Browser (local, 25cffc1c + 0ae16bb6): terminal-message-navigation.spec.ts 'a scroll gesture ending over a message arrow is inert' -> desktop, ios-safari, mobile PASSED; 'an explicit empty navigation loads earlier output and lands on its message' -> desktop, ios-safari, mobile PASSED.
+AREA: browser
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux-testing-e2e
+CARD: AMUX-4178
+SYMPTOM: Safari repeatedly displayed “No matching messages in loaded output” while the user was scrolling a worker terminal, even though they had not asked to navigate. Live client-debug beacons recorded repeated no-targets arrow activations during the scroll interaction.
+COST: Ordinary reading produced alarming, irrelevant feedback and made the new message arrows feel unreliable; when a real explicit navigation found no loaded match, it also left the user to locate and press Load earlier manually.
+FIX: Arm message navigation on pointer-down and accept only a trusted keyboard activation or a non-moving pointer gesture with no intervening terminal scroll. Suppressed gestures emit peek-message-nav verdict=suppressed-scroll-gesture and never toast or move. A genuine empty navigation now pages the saved worker log once, reclassifies it, lands on a newly found message, or explains the exact terminal result.
+
+## A provider-failed subagent stayed live forever after its stop hook vanished
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). A newer provider-owned failed terminal envelope reconciles the matching leaked child through durable edges; stale, malformed, quoted and running controls do not. EXPLICIT SCOPE LIMIT from the validator: this does NOT validate the external provider notification defect in ATE-10, which stays open in frustrations.md. CI (run 34358221870 @ 04a19c51):
+  test api::session_verbs::steer_boundary_tests::structured_terminal_notifications_heal_only_the_matching_newer_agent_edges ... ok
+  test api::session_verbs::steer_boundary_tests::terminal_notification_statuses_are_provider_structural_not_model_named ... ok
+AREA: status
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: social-activities showed WORKING + AGENTS twelve hours after its Sonnet turn returned to the prompt. The durable lifecycle set still contained agent add9b6f920fb9ef31 because SubagentStart arrived, the agent immediately failed on HTTP 429, and no SubagentStop hook followed. Its provider-owned parent transcript already contained a newer structured task notification with status=failed, but status derivation never reconciled that terminal fact.
+COST: An idle lane looked actively occupied, its board state contradicted the visible prompt, and the stale child survived reports and server restarts with no age-based bound.
+FIX: Reconcile only provider-owned structured terminal task notifications newer than the stored per-agent start edge, through the same durable ordering/tombstone path as a real stop. Run it immediately at an idle report and from the periodic sweep for already-leaked rows; malformed, missing, stale, quoted, and still-live evidence fails open for the model. Emit subagent_lifecycle WARN verdict terminal_transcript_reconciled with the session, agent id, provider status, event timestamp, and resulting count.
+
+## Codex's worktree suffix revived the false unsubmitted-text badge
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Fully dim worktree/branch suffixes remain chrome; typed and unstyled near-miss controls remain pending and diagnose possible footer drift. CI (run 34358221870 @ 04a19c51):
+  test api::session_verbs::composer_state_tests::a_codex_model_footer_is_chrome_not_unsubmitted_text ... ok
+AREA: status
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux-testing-e2e
+CARD: ATE-36
+SYMPTOM: An empty Codex composer rendered `model · path · Main [default]`, but the footer recognizer required `path` to be the final middle-dot segment and exactly one dim separator. The live session therefore reported `composer_preview=gpt-5.6-solxhigh~/Dev/amux` and retained an UNSUBMITTED TEXT badge overnight.
+COST: The owner had to ask why the worker claimed to hold text, and the status surface asserted a nonexistent pending command for more than ten hours.
+FIX: Parse the stable plain model/path prefix plus any fully dim trailing footer context, preserve the typed-text control, and annotate stuck-composer WARN/event payloads with `possible_codex_footer_chrome` so future TUI drift is sweep-visible.
+
+## An async menu-reachability assertion raced the app's normal rerender
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Menu overflow and final-action reachability are measured in one synchronous render snapshot, so no locator detaches between rerenders. Browser (local, 25cffc1c + 0ae16bb6): worker-action-parity.spec.ts 'worker card and peek share all worker actions, plus both peek-only actions' -> desktop, ios-safari, mobile PASSED.
+AREA: tests
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-44
+SYMPTOM: The full Playwright run passed 300 scenarios, then the ATE-44 iOS
+ Safari parity case failed because `scrollIntoViewIfNeeded` acquired the Focus
+ action before a session poll rerendered the peek menu and detached that node.
+COST: The six-case focused matrix had passed, but the first full descendant CI
+ run stayed red after 16.7 minutes and could not satisfy ATE-44's final gate.
+FIX: The parity test now scrolls and measures the final Focus action inside the
+ same synchronous render snapshot. It still proves overflow, scrollability and
+ viewport reachability while eliminating the cross-rerender locator lifetime.
+
+## A CLI negative control assumed its specimen was globally unique
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). The negative mutation removes only cmd_start's declaration even when another command carries the same declaration; the broken specimen still fails at runtime. Fresh local script evidence: ate-validation-script-0.log (CLI negative-control suite 3 passed / 0 failed).
+AREA: tests
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-44
+SYMPTOM: Fresh descendant CI completed the full Rust workspace suite after the
+ PID-safety fix, then `scripts/test-cli-launch-unbound.sh` refused to build its
+ broken fixture because a second command legitimately gained the same local
+ AMUX_API declaration used by cmd_start.
+COST: The otherwise-valid ATE-44 descendant run stayed red after all 1,947
+ amux-server library tests and every integration binary passed; the failure was
+ attributed from the job log only after the old runner-shutdown defect cleared.
+FIX: The negative control now counts and removes the declaration only within
+ cmd_start, preserving the independent declaration in cmd_open_browser while
+ still proving the broken fixture fails with an unbound variable. Its failure
+ output names the scoped occurrence count.
+
+## An unsigned fake browser PID shut down every Linux CI runner process
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Reserved, unsigned-wrapping and group PID values are refused before kill argument construction; the real reaper regression still uses u32::MAX. CI (run 34358221870 @ 04a19c51):
+  test integrations::browser::cdp_list_failure_tests::process_id_validation_rejects_group_sentinels_and_unsigned_wrap ... ok
+  test runtime_jobs::browser_reaper::tests::a_reap_actually_enqueues_the_notice_for_the_owning_lane ... ok
+AREA: tests
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-44
+SYMPTOM: Ten consecutive Rust check jobs ended around seven minutes with "runner
+ received a shutdown signal" after commit 92044fc8 added a browser-reaper test
+ seeded with PID 4294967295. The test called the real browser stop path, which
+ passed that decimal string to Linux procps `kill -TERM`; procps returned success
+ and treated the unsigned value as the signed process-group sentinel -1.
+COST: Every descendant main run lost the workspace-test process and GitHub runner,
+ blocking ATE-44 and ATE-45 verification while the 25-minute workflow timeout and
+ passing test output falsely suggested external cancellation.
+FIX: ATE-44 validates every browser PID at the signed OS boundary, refuses
+ reserved/group values before constructing arguments or launching external
+ `kill`, and emits `invalid_process_id_refused`. The original
+ 4294967295 fixture remains as an end-to-end regression, with boundary controls
+ for PID 0, PID 1, ordinary positive PIDs, and the signed maximum.
+
+## Codex `turn_aborted` left an interrupted turn structurally active
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Top-level and nested turn_aborted events are terminal idle boundaries for the interrupted prompt specimen. CI (run 34358221870 @ 04a19c51):
+  test api::session_verbs::tests::codex_rollout_boundaries_are_a_structured_live_state ... ok
+  test api::sessions_legacy::status_truth::a_codex_interrupted_turn_is_a_durable_terminal_edge_at_the_prompt ... ok
+AREA: status
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: After Codex displayed `Conversation interrupted` and returned to its
+ empty prompt, both Workers surfaces stayed WORKING. Status-explain chose a
+ fresh `codex_rollout` active vote even though the stop report was idle,
+ `subagents_live=0`, and `provider_background_working=false`. The rollout held
+ the exact missing edge: an `event_msg` whose payload type was `turn_aborted`.
+COST: An already terminal turn suppressed safe Board drive and contradicted the
+ provider UI until a later recognized lifecycle event replaced the stale vote.
+FIX: ATE-45 treats both top-level and nested Codex abort events as durable idle
+ boundaries, surfaces the chosen boundary in status-explain, and emits the
+ `interrupted_turn_is_terminal` status-truth verdict. Exact rollout and pane
+ regressions pin the interrupted-turn prompt frame for Codex and Ollama.
+
+## One capture shell's cooldown hid the next non-work shell forever
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). An exact new non-work capture gets one cleanup opportunity despite an unrelated lane cooldown, then durable card idempotency suppresses repeats. CI (run 34358221870 @ 04a19c51):
+  test runtime_jobs::board_drive::tests::a_new_capture_cleanup_bypasses_an_unrelated_lane_cooldown_once ... ok
+AREA: board
+SEVERITY: stuck
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: PRIMI-204 was explicitly classified by its prompt as "do not create or
+ retain a board task", but a recent nudge for PRIMI-203 activated the lane-wide
+ advance cooldown before PRIMI-204 received its own cleanup prompt. It remained
+ in `doing` after the turn ended with no `decompose:PRIMI-204` event.
+COST: a non-task occupied the Board indefinitely while the drive report called
+ the lane healthy and no model was asked to make the keep/discard decision.
+FIX: ATE-45 lets a newly captured shell rejected by the shared pickup classifier
+ bypass an unrelated lane cooldown exactly once, prioritizes that exact card,
+ and relies on the durable per-card `decompose:<id>` idem to close the exception.
+ The bypass emits `capture_cleanup_bypassed_lane_cooldown`; a focused regression
+ proves both the first nudge and duplicate suppression.
+
+## Claude's stale background-wait scrollback overruled a later completed turn
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). A newer completed Claude frame terminates an older wait; a newer wait can still win. CI (run 34358221870 @ 04a19c51):
+  test backend::adapter::tests::a_completed_turn_after_a_background_wait_is_idle ... ok
+  test api::sessions_legacy::status_truth::a_final_prompt_after_background_wait_does_not_override_idle ... ok
+  test api::session_verbs::tests::detectors_read_real_frames ... ok
+AREA: status
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: Primis visibly returned to its final prompt after
+ `CLAUDE-POSTFIX-COMPLETE`, with zero live subagents and an idle stop report,
+ but status-explain still set `provider_background_working=true` because an
+ older provider-owned "Waiting for 1 background agent to finish" row remained
+ in tmux scrollback.
+COST: Workers stayed WORKING and turn-boundary-safe Board drive remained
+ suppressed for minutes after the real work finished.
+FIX: ATE-45 reads Claude's provider rows as ordered lifecycle edges: a newer
+ completed-turn marker terminates every older wait, while a newer wait still
+ wins. The status path logs `superseded_by_completed_turn`, and exact-frame
+ adapter, detector and status-explain regressions cover the live Primis pane.
+
+## A lost Stop report left a finished Primis turn WORKING for 139 seconds
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). A missing main Stop report replays the latest idle state after an outage without waiting for another hook; a newer state replaces old pending state. Fresh local script evidence: ate-validation-status-hooks.log.
+AREA: hooks
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: Root's live browser saw both Primis subagents finish and Claude return
+ to its prompt at 15:22, but the worker card and input still said WORKING. The
+ status explanation chose a fresh `prompt-hook` active report with zero live
+ subagents; the hook log showed the missing edge exactly: `15:22:22 primis
+ source=stop-hook http=000` during a server rebuild.
+COST: the production UI contradicted the provider for 139 seconds and Board
+ pickup remained suppressed after all work was terminal. It self-cleared only
+ when the active-report trust window expired, not because the final fact landed.
+FIX: ATE-45 makes main-turn state a durable singleton latest-wins queue using
+ the same bounded detached drain as lifecycle events. A newer report atomically
+ replaces an older pending state, so recovery cannot replay idle over a later
+ active turn; successful recovery logs the state, identity, attempt and
+ `replayed_state` verdict. The exact lost-Stop outage replays idle without any
+ later hook and is a shipped regression cell.
+
+## A corrupt lifecycle queue was silently replaced with an empty one
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Malformed JSON and wrong-schema queue bytes are preserved and diagnosed rather than replaced; malformed invocations get distinct identities. Fresh local script evidence: ate-validation-status-hooks.log.
+AREA: hooks
+SEVERITY: data-loss
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: JSON read errors and wrong-schema JSON both became `rows=[]`; the next
+ enqueue atomically overwrote the only bytes that could explain which lifecycle
+ facts were lost. Malformed provider payloads also shared an empty dedupe key.
+COST: a damaged queue erased its own evidence and multiple malformed but real
+ callbacks collapsed into one, making the status error impossible to reconstruct.
+FIX: ATE-45 atomically preserves corrupt bytes/schemas under a timestamped path
+ and logs the queue, preserved path, error and verdict before recovery. Every
+ malformed invocation gets a unique persisted identity; tests cover both corrupt
+ forms and duplicate malformed callbacks.
+
+## The lifecycle drain could strand its bounded tail or lose the final wakeup
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Successful deliveries empty all 128 permitted rows and the drain-lock handoff cannot lose the final wakeup. Fresh local script evidence: ate-validation-status-hooks.log.
+AREA: hooks
+SEVERITY: stuck
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: one drain performed only 90 total loop iterations although the queue
+ admitted 128 rows. At the empty boundary, a producer could enqueue and launch
+ a replacement before the old drain released its nonblocking lock, so both
+ exited with the final row still queued.
+COST: up to 38 healthy events could remain behind an entirely healthy server,
+ and the last SubagentStop could sleep until an unrelated future hook happened.
+FIX: ATE-45 spends the 90-attempt budget only on retryable failures, so successes
+ drain the complete bounded FIFO. The empty read releases drain ownership while
+ holding the queue lock, replacements wait through the bounded handoff, and
+ tests prove one process drains 128 rows plus the lock-race specimen.
+
+## Steering's deadline overrode its live-background safety hold
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). An old message does not bypass a real active background hold (86,400-second control). Canonical idle can reject weaker stale hints; ordinary foreground starvation policy is a separate concern. CI (run 34358221870 @ 04a19c51):
+  test api::session_verbs::steer_freeze_tests::board_drive_and_steering_hold_for_a_codex_background_terminal ... ok
+AREA: messages
+SEVERITY: wrong-action
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: ATE-45 mapped exact provider/background evidence to `active`, then fed
+ it to the ordinary max-age rule, which deliberately turns old active messages
+ into mid-turn delivery. A long agent or background terminal was still
+ interruptible after `AMUX_STEER_MAX_AGE_S`.
+COST: the safety fix postponed the same conversation interruption instead of
+ preventing it, contradicting its own regression name and acceptance contract.
+FIX: ATE-45 carries background work as a separate hard-hold fact into the
+ delivery decision. No message age can bypass it; only the reported final stop
+ or provider terminal frame clears the hold, while ordinary foreground turns
+ retain the existing starvation deadline.
+
+## An older start could resurrect an agent whose stop arrived first
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Stop tombstones survive reordering, event-ID aging and compaction; older starts cannot resurrect the agent. CI (run 34358221870 @ 04a19c51):
+  test api::session_verbs::steer_boundary_tests::subagent_terminal_edges_reject_reordered_and_aged_starts ... ok
+  test api::session_verbs::steer_boundary_tests::subagent_compacted_terminal_tombstones_leave_a_replay_floor ... ok
+AREA: status
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: server lifecycle state remembered only live IDs plus 128 recent event
+ IDs. A stop delivered before its older start was discarded as an orphan; once
+ a start ID aged out, replaying it after the final stop made the agent live again.
+COST: response reordering or a sufficiently delayed retry could leave a worker
+ permanently WORKING after every child had completed, defeating both accurate
+ status and automatic Board pickup.
+FIX: ATE-45 stores monotonic per-agent live/terminal edges. Stop-before-start is
+ a durable tombstone; older/equal resurrecting starts are rejected with named
+ verdicts. Terminal entries compact to a bounded set plus a timestamp floor, so
+ evicted tombstones still reject ancient replay and resets preserve generations.
+
+## Submitted and pasted provider frames impersonated live background work
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Prompt-prefixed, indented, quoted and cross-provider pasted frames do not acquire provider-owned live status. CI (run 34358221870 @ 04a19c51):
+  test api::session_verbs::tests::detectors_read_real_frames ... ok
+  test api::session_verbs::steer_freeze_tests::board_drive_and_steering_hold_for_a_codex_background_terminal ... ok
+AREA: status
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: Claude's broad dingbat range included its own `❯` input glyph, so a
+ prompt containing the exact waiting sentence read active. The provider-agnostic
+ Codex fallback likewise accepted a pasted Codex frame inside Claude output.
+COST: user-authored text could pin a truly idle worker WORKING and suppress its
+ ready queue indefinitely; the original negative tests covered only unprefixed
+ prose and same-line Codex quotation.
+FIX: ATE-45 accepts only measured Claude spinner glyphs at column zero, excluding
+ the prompt and indented pasted rows. Provider-known Codex scans keep partial-
+ frame support, while provider-agnostic status requires the current exact Codex
+ prompt/model-footer structure. Prompt, indented and cross-provider pastes are
+ explicit negative controls and unknown variants remain sweep-visible.
+
+## Durable lifecycle replay posted valid events to the server root
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Every actual hook request uses the exact worker report URL; the fake server refuses every other path. Fresh local script evidence: ate-validation-status-hooks.log.
+AREA: hooks
+SEVERITY: wrong-action
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: commit 483ff0aa queued the base `AMUX_URL`, so its drain POSTed every
+ SubagentStart/Stop to `/` instead of `/api/sessions/<worker>/report`. The live
+ server returned 405 and the new permanent-4xx rule immediately dead-lettered
+ the valid lifecycle facts.
+COST: ATE-45 was committed, deployed and moved to review with a green chaos
+ suite while its central production path delivered zero lifecycle events. A
+ second read-only review and live failure-log inspection were needed to catch it.
+FIX: ATE-45 now constructs one canonical per-session report URL used by queued
+ and immediate delivery. The fake server returns 405 for every other path, every
+ captured request asserts its exact worker route, and the failure log retains
+ URL, HTTP verdict and event identity.
+
+## Board-drive interrupted Codex while its background terminal was running
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Live structured background work holds board/steering delivery; completed or inadmissible stale footer evidence can release it. Scope: NOT an indefinite hold on arbitrary scrollback. CI (run 34358221870 @ 04a19c51):
+  test api::session_verbs::steer_freeze_tests::board_drive_and_steering_hold_for_a_codex_background_terminal ... ok
+  test api::sessions_legacy::status_truth::boundary_and_workers_share_structured_codex_truth_and_fail_closed ... ok
+AREA: board
+SEVERITY: wrong-action
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: this ATE-45 turn visibly showed Codex's `1 background terminal
+ running` provider row, but board-drive sent an Idle nudge and Codex reported
+ `Conversation interrupted`. The status adapter already understood the row;
+ the steering boundary trusted a fresh idle parent report without reading it.
+COST: the harness interrupted its own green test run, forced the model to
+ reconstruct its place, and demonstrated that dashboard truth and delivery
+ safety still disagreed on the same frame.
+FIX: ATE-45 makes the shared structured Codex pane state override an idle
+ parent report for status, board-drive and steering. The hold clears on the
+ completed `Worked for` frame, and quoted copies of the text do not match.
+
+## Subagent lifecycle truth disappeared whenever the server rebuilt
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Durable start/stop FIFO survives outage and response loss, with stable identities and server-side dedupe. CI (run 34358221870 @ 04a19c51):
+  test api::session_verbs::steer_boundary_tests::subagent_lifecycle_is_idempotent_ordered_and_restart_durable ... ok
+Fresh local script evidence: ate-validation-status-hooks.log (status hooks passed every durability cell).
+AREA: hooks
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: Primis SubagentStart and SubagentStop hooks both recorded `http=000`
+ during a server rebuild. The callbacks were one-shot, so the server retained
+ neither the active agent identity nor its final stop after coming back.
+COST: the authoritative live-agent count read zero during real work and could
+ also remain positive after a lost stop; recovery depended on a later process
+ reset rather than replaying the facts that had already happened.
+FIX: ATE-45 gives each lifecycle edge a session/agent/event identity, persists
+ it in a bounded fsynced FIFO, replays oldest-first across outages and response
+ loss, and deduplicates durably in the server. Permanent 4xx poison events
+ dead-letter with full identity; 000/5xx retry; any later hook wakes the queue.
+
+## Claude's background-agent wait row had two conflicting status parsers
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). The exact singular/plural Claude wait rows share the active predicate; quoted text stays inert. CI (run 34358221870 @ 04a19c51):
+  test backend::adapter::tests::blocked_on_background_subagents_is_active_not_idle ... ok
+  test api::session_verbs::tests::detectors_read_real_frames ... ok
+AREA: status
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-45
+SYMPTOM: Primis visibly showed the provider-owned `Waiting for 1 background
+ agent to finish` row and an active Explore agent, while the dashboard header
+ said IDLE. `backend/adapter.rs` classified the row active, but the legacy
+ session projection called a second parser that omitted it.
+COST: the user had to reconcile the terminal, agent panel, session payload and
+ status-explain output to establish that real work was still running.
+FIX: ATE-45 shares one chrome-anchored singular/plural predicate between the
+ adapter and session status path. The exact provider row overrides an idle
+ parent-prompt report; quoted prose remains a negative control.
+
+## Peek and worker-card action menus drifted into different products
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Both worker menus use the same action inventory; all three Files entry points produce the same canonical worker/path route. Browser (local, 25cffc1c + 0ae16bb6): worker-action-parity.spec.ts 'worker card and peek share all worker actions, plus both peek-only actions' -> desktop, ios-safari, mobile PASSED; 'peek file entries produce the exact same canonical Files route state' -> desktop, ios-safari, mobile PASSED.
+AREA: dashboard
+SEVERITY: wrong-action
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-44
+SYMPTOM: the worker card exposed 25 worker actions and configurations, while the
+ peek overflow exposed only File browser and Focus mode. Worse, the peek File
+ browser opened a desktop-only split pane while clicking the displayed directory
+ entered the canonical full Files route for the same worker and path.
+COST: the place where the user was already operating a worker hid almost every
+ control, and two labels for the same file-browsing intent produced different
+ session, navigation, and visible-state outcomes. A duplicated `peek-more-btn`
+ id also made automation and DOM lookup choose whichever button came first.
+FIX: ATE-44 (this commit). Both surfaces render one shared worker-action
+ inventory; peek retains its two additional controls. All three peek file entry
+ controls call one canonical full-route helper, the two overflow buttons have
+ unique semantic IDs, and mismatch/file-entry verdicts reach client-debug logs.
+
+## WIP-capped ready work was labelled STALLED while its holding task progressed
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). A WIP holder produces queued-behind labels carrying both identities; zero holders still produces the stalled control. Browser (local, 25cffc1c + 0ae16bb6): queued-behind-wip.spec.ts 'ready work behind WIP names both cards and links the holding card' -> desktop, ios-safari, mobile PASSED; 'ready but unclaimable work with no holding card still says stalled' -> desktop, ios-safari, mobile PASSED.
+AREA: dashboard
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-43
+SYMPTOM: TubeScience was idle at its main prompt while detached work continued
+ on TUBES-2418 and TUBES-2419 correctly waited behind WIP-1. The worker header
+ rendered the red `STALLED · 1 READY` chip even though `/api/board/ready` named
+ TUBES-2418 as the current WIP holder.
+COST: a healthy, intentionally serialized queue looked like a broken autonomy
+ loop. The label hid both card identities, so the user could neither see what
+ was waiting nor open the task that explained the wait.
+FIX: ATE-43 (this commit). The ready frontier retains card identities and renders
+ TUBES-2419 as queued behind a clickable TUBES-2418 control. Only ready work with
+ zero claimable cards and no holding work keeps the stalled verdict. A one-shot
+ `idle-ready-work` client beacon records which classification rendered.
+
+## An idle Codex worker borrowed a sibling's active rollout and showed WORKING
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). A sibling rollout is not adopted merely because its cwd matches; explicit identity and the worker life window bound the fallback. CI (run 34358221870 @ 04a19c51):
+  test api::session_verbs::tests::codex_rollout_fallback_is_worker_life_scoped_not_newest_cwd ... ok
+  test api::session_verbs::tests::codex_rollout_fallback_refuses_nearest_sibling_even_beyond_the_old_scan_cap ... ok
+AREA: status
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-42
+SYMPTOM: `amux` sat at the empty `Ask Codex to do anything` prompt and its own
+ stop hook reported idle, but the dashboard showed WORKING on stale AMUX-4079.
+ `status-explain` named `codex_rollout`; the chosen rollout actually belonged to
+ active sibling `amux-testing-e2e`, which shares `/Users/ethan/Dev/amux`.
+COST: the worker header and Board highlight asserted current execution where
+ none existed, while two workers' transcripts and lifecycle signals were
+ cross-linked solely because they used the same checkout.
+FIX: ATE-42. An explicit Codex session id still wins. Before one exists, rollout
+ fallback now canonicalizes the cwd and selects only the rollout born within a
+ bounded window around that worker's own `last_started`; outside that window it
+ refuses to guess and lets the exact terminal/provider signals decide.
+
+## Worker progress was recorded while its exact Board card stayed unclaimed
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Owned actionable progress claims the exact task transactionally; refusal and rollback controls stay informational. CI (run 34358221870 @ 04a19c51):
+  test own_status_update_claims_exact_todo_or_backlog_for_every_provider ... ok
+  test status_update_claim_rolls_back_when_its_log_write_fails ... ok
+  test status_update_refuses_cross_worker_blocked_dependency_wip_and_later_states ... ok
+AREA: board
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-41
+SYMPTOM: general-canvas-apps posted four status updates describing active work on
+ GCA-153, but the card remained in To Do and `task_board_id` stayed empty. The
+ status-update endpoint appended the text and artifacts without participating in
+ the Board claim transition.
+COST: the Board showed an actively executing worker without its current card and
+ left the same card eligible for another pickup. The user had to correlate the
+ worker transcript, card log, and session payload to identify the disagreement.
+FIX: ATE-41 (this commit). An owned, actionable To Do/backlog card is now claimed
+ in the same serialized transaction that appends the progress line and artifacts.
+ Cross-worker, blocked, dependency-held, fresh-trigger, WIP-conflicting, waiting,
+ and later-state updates remain informational and return a named refusal verdict;
+ claimed and refused paths emit distinct sweep-visible log markers.
+
+## Evidence hid a real .env file and rendered the 1.93M row count as a file
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Actual hidden files are assets; decimal measurements are not. The browser opens the useful card and asset record. CI (run 34358221870 @ 04a19c51):
+  test evidence_assets_keep_hidden_files_and_reject_decimal_measurements ... ok
+Browser (local, 25cffc1c + ledger-only 0ae16bb6, isolated worktree, no product source edited): card-details.spec.ts old-lineage links open the useful card record and fit every viewport -> ios-safari, mobile PASSED. Desktop rerun passed the produced-file/button/availability assertions through line 85 then failed at an unrelated History-tab click intercepted by the onboarding backdrop (retained as ATE-130, still open). No whole-file desktop green is claimed.
+AREA: board
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-39
+SYMPTOM: TUBES-2426 evidence named `customers/tubescience/.env` but Board details
+ returned no asset link. TUBES-2428 named the same file yet returned only `1.93M`,
+ a decimal measurement, as a clickable missing-file asset. The parser required a
+ non-empty stem before the final dot and accepted alphabetic measurement suffixes.
+COST: the actual customer configuration artifact disappeared from two task records,
+ while one record sent a reviewer toward a manufactured file. The user had to
+ compare the two live payloads to show that the positive and negative parser arms
+ were both backwards.
+FIX: ATE-39 (this commit). Hidden leaf files and hidden path components are
+ accepted, decimal measurement tokens are rejected, and bare/relative dotfiles
+ resolve against the producing worker directory. File rows now render as semantic
+ buttons; local availability and external reachability-not-measured verdicts make
+ missing and unreachable assets explicit.
+
+## A commit naming ATE-38 attached its outputs to the newer ATE-39 card
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). An explicit commit task ID receives the full SHA and changed-file assets instead of the newest Doing card. CI (run 34358221870 @ 04a19c51):
+  test explicit_subject_task_gets_commit_and_file_rows_not_newest_doing_task ... ok
+AREA: attribution
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-39
+SYMPTOM: commit `be87f031` named `(ATE-38)` in its subject, but the post-commit
+ `commit-report` appended the commit activity and derived links for
+ `sessions_legacy.rs` and `be87f031` to the currently-Doing ATE-39. ATE-38 had
+ no durable artifact rows when the report landed. The endpoint ignored the
+ explicit task id and selected the worker's most recently updated in-flight card.
+COST: the board put another task's source and commit on this card and left the
+ producing task without its outputs. The user had to inspect both cards, identify
+ the wrong newest-card guess, and provide a corrective live specimen before the
+ task record could be trusted.
+FIX: ATE-39 (this commit). `commit-report` reads the full subject and changed-file
+ list from the git object, attaches by an explicit body/subject task id, and
+ refuses ambiguity instead of guessing newest. It stores the full SHA and every
+ changed file as durable rows on that exact task and emits
+ `commit_report_task_exact` / `commit_report_task_ambiguous` log markers.
+
+## Codex kept a live turn above its prompt shell and the dashboard called it idle
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Codex Working/Running/background rows adjacent to the prompt shell remain active; newer completed and separated historical frames remain idle. CI (run 34358221870 @ 04a19c51):
+  test api::sessions_legacy::status_truth::a_codex_working_row_above_its_prompt_shell_is_active ... ok
+  test backend::adapter::tests::codex_working_row_above_the_prompt_shell_is_generating ... ok
+  test api::sessions_legacy::status_truth::a_newer_codex_prompt_beats_queued_message_prose_and_recent_churn ... ok
+AREA: instruments
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-38
+SYMPTOM: while `amux-testing-e2e` visibly showed `Waiting for background
+ terminal (... esc to interrupt)` directly above `Ask Codex to do anything`,
+ `/api/status-explain` set `pane.says_working=false` and the Workers UI labelled
+ the session idle. The status parser treated the persistent Codex prompt/model
+ shell as a newer idle boundary even though Codex paints that shell throughout
+ an active turn.
+COST: the worker's current board card lost its working highlight during a real
+ generation. That makes the board contradict the terminal and can also let the
+ driver reason from a false idle state.
+FIX: ATE-38 recognizes the exact adjacent live shapes on both supported Codex
+ layouts: older builds paint `Working` after the submitted prompt, while current
+ builds paint `Working`, `Running`, or `Waiting for background terminal/command`
+ immediately before the disabled prompt shell. A separated historical row still
+ cannot override the newest prompt, and a completed `Worked for` row is an idle
+ control. Adapter and end-to-end status-truth tests cover active, completed,
+ stale-row, queued-message, and prompt-churn cases without matching arbitrary
+ transcript prose.
+
+## One blocked To Do hid an independent backlog from automatic draining
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). A blocked To Do and an older blocked backlog item cannot hide an independent runnable backlog item; dependencies and normal claim gates stay enforced. CI (run 34358221870 @ 04a19c51):
+  test runtime_jobs::board_drive::tests::a_blocked_todo_does_not_hide_actionable_backlog_from_auto_drain ... ok
+  test runtime_jobs::board_drive::tests::blocked_todo_with_eligible_backlog_wakes_exact_backlog_card ... ok
+AREA: coordination
+SEVERITY: stuck
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-37
+SYMPTOM: `mvs-research` could finish its active card and then remain idle with
+ MR-14 in To Do and 18 cards in backlog. MR-14 depends on MR-27, which the lane
+ cannot complete, while MR-150 and other backlog work have no dependency. The
+ pickup selector only tried backlog when its To Do SQL query returned zero rows;
+ one blocked row therefore hid every independent backlog card even though this
+ worker had the default auto-drain configuration enabled.
+COST: the board advertised queued work and the worker advertised idle, but the
+ driver repeatedly returned `all-candidates-refused`. Progress then depended on
+ a person noticing the mismatch and moving a backlog card by hand. A tempting
+ workaround would be to ignore dependencies or claim backlog directly, both of
+ which would weaken the board's gates.
+FIX: ATE-37 makes automatic draining a fallback after every To Do candidate has
+ been evaluated and honestly refused. It still gives runnable To Do priority and
+ still promotes exactly one backlog card through backlog -> todo -> doing. The
+ drainable backlog query now excludes cards with open dependencies, so it cannot
+ merely move the same blockage sideways. The regression reproduces an older
+ blocked backlog card, a blocked To Do, and a newer runnable backlog card and
+ requires the runnable card alone to be selected. All 106 board-driver tests
+ pass, including WIP, needs:you, freshness, capture-shell, irreversible-action,
+ dependency-promotion, and explicit auto-drain opt-out controls.
+
+## An idle Codex prompt was labelled `UNSUBMITTED TEXT` using its model/path footer as the draft
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). Styled model/path footer remains chrome; real typed text remains pending. CI (run 34358221870 @ 04a19c51, workspace cargo test, lib 2162 passed / 0 failed):
+  test api::session_verbs::composer_state_tests::a_codex_model_footer_is_chrome_not_unsubmitted_text ... ok
+AREA: instruments
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-04
+SESSION: amux-testing-e2e
+CARD: ATE-36
+SYMPTOM: the worker's stop hook said idle, Codex's structured rollout said idle,
+ zero subagents were live, and the pane visibly ended at the dim `Ask Codex to do
+ anything` placeholder. `/api/sessions/amux-testing-e2e` nevertheless returned
+ `status: waiting`, `composer_stuck_since > 0`, and
+ `composer_preview: gpt-5.6-solxhigh~/Dev/amux`; the dashboard rendered that
+ override as `UNSUBMITTED TEXT`. The composer reader stopped on Claude's border
+ and status-bar glyphs but Codex puts its model/effort/path footer directly below
+ the prompt with no border, so the footer was concatenated into the input.
+COST: the worker presented a false human-action state for roughly three hours and
+ contradicted both of its structured state sources. A human could have pressed
+ Enter to submit what the UI claimed was pending, although there was no command
+ in the composer.
+FIX: 66818693. `composer_state` now treats Codex's ANSI-styled middle-dot
+ model/path footer as a structural boundary without naming any model or version.
+ It deliberately requires the raw styling and therefore fails toward visible
+ `Typed` if Codex changes its chrome, never toward a false successful send. The
+ live-frame regression first reproduced `Typed("gpt-5.6-solxhigh~/Dev/amux")`,
+ then passed as `Placeholder`; its control keeps real typed text pending. Live
+ build `668186939734` cleared `composer_stuck_since` and `composer_preview`, and
+ the browser changed from the false badge to the worker's actual idle/working
+ state in real time.
+
+## An answer-only prompt still cards when its no-op tail isn't one of ten hardcoded literal strings
+VALIDATED: amux-testing-e2e | VALIDATED by amux-testing-e2e 2026-09-09 (originating session). The named answer-only paraphrase stays message-only; a real task after an answer-only opener still cards. Scope: the tested capture contract, NOT a guarantee over every natural-language paraphrase. Production acceptance recorded 2026-09-04: durable history row 41187, direct/confirmed, card_id=null for a differently phrased information-only question, plus a 2026-09-03T23:59:31.799869Z AMUX-3330 informational-prompt-not-carded log; the deployed function had become is_non_mutating_answer_tail. CI: `bash scripts/test-tree-clean.sh cargo test --workspace` at 04a19c51 (GitHub run 34358221870), amux-server lib 2162 passed / 0 failed / 7 ignored, emitted:
+  test board::capture_tests::informational_questions_are_message_only_but_work_requests_still_card ... ok
+  test api::session_verbs::tests::an_informational_question_records_in_messages_without_a_board_card ... ok
+AREA: harness
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-03
+SESSION: amux-testing-e2e
+CARD: ATE-17
+SYMPTOM: Yesterday's fix (53b3e952, archived from frustrations.md 2026-09-02, validated
+  against the literal specimen "...? Please answer only; do not change anything.") stops
+  carding THAT exact string. A same-session E2E rerun today sent the same question with a
+  differently-worded but equally answer-only tail: "...? Answer only; do not change files
+  or create board work." is_informational_query()'s ANSWER_ONLY_TAILS list in
+  crates/amux-core/src/board.rs matches ~10 hardcoded literal tail strings, not a
+  structural "no imperative here" signal; this tail isn't one of them, so the tail-check
+  fails closed and the question-word branch never fires. Two cards (ATE-15, ATE-16) minted
+  for two paraphrased answer-only questions in one E2E run.
+COST: The exact friction the archived entry described recurred one day later under a
+  paraphrase, consuming two board ids and two WIP-adjacent doing slots for pure Q&A that
+  was already answered inline both times.
+FIX: f999caff replaces the literal ANSWER_ONLY_TAILS list with `tail_is_answer_only()`,
+  which splits the tail on the same connectors `capture_has_task_followup` already uses
+  for the pre-question clause and requires no resulting clause starts a task per the
+  existing `capture_clause_starts_task` verb check — reusing the mechanism already
+  trusted for the rest of the function instead of an enumerable list. Pinned the ATE-17
+  specimen plus a negative control (a real task stacked after an answer-only opener must
+  still card); `scripts/mutate.sh` confirms the negative control can actually fail.
+  NOT YET independently re-validated against the running server build — see AF-433's
+  discipline for what that validation should check before this entry is archived.
