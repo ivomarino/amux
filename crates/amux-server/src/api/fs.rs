@@ -1587,6 +1587,15 @@ const SCAN_BUDGET: usize = 6000;
 /// remedy for that and is a different change.
 const SCAN_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// The CALLER's bound on the name search (AF-645), deliberately larger than
+/// `SCAN_TIME_BUDGET` so the walk's own budget wins in every case where it can.
+///
+/// This one is enforceable where the in-walk deadline is not: it does not need
+/// the walk to reach a check, because it stops WAITING rather than stopping the
+/// walk. That is the whole difference, and it is why a handler that calls a
+/// self-bounding function still needs it.
+const AUTOCOMPLETE_WALK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Roots a bare-name search starts from: the home directory itself and the
 /// conventional places a checkout lives. Missing ones are skipped silently —
 /// this is a suggestion list, not an inventory.
@@ -1893,6 +1902,82 @@ mod name_search_tests {
         // and writes nothing, and joining it would reintroduce the hang.
     }
 
+    /// AF-645: the HANDLER must return even when the walk does not.
+    ///
+    /// This is the property the in-walk budget cannot provide, so it is tested
+    /// by making the walk unable to finish and asserting the handler answers
+    /// anyway. The subject is `tokio::time::timeout` over `spawn_blocking`, and
+    /// the reason it works is that it stops WAITING rather than stopping the
+    /// walk.
+    #[tokio::test]
+    async fn the_handler_answers_even_when_the_walk_never_returns() {
+        // A blocking task that outlives any sane timeout, standing in for a
+        // `read_dir` wedged on a loaded filesystem.
+        let started = std::time::Instant::now();
+        let out = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            // 2s, not 30: the tokio runtime JOINS its blocking pool at shutdown,
+            // so the sleep is added to this test's wall time whether or not
+            // anyone is waiting on it. A 30s stand-in made the cell take 30.15s,
+            // which is real drag on a suite this card's sibling exists to keep
+            // fast. 2s against a 150ms timeout proves the same thing.
+            tokio::task::spawn_blocking(|| {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                (Vec::<String>::new(), false)
+            }),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(out.is_err(), "the timeout must fire on a walk that never returns");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the caller waited {elapsed:?}, so it did not stop waiting"
+        );
+
+        // AND THE HANDLER'S BOUND MUST BE THE LARGER OF THE TWO. If the caller
+        // timeout were <= the walk's own budget, the walk could never report a
+        // clean truncation and every slow search would look like a handler
+        // failure instead.
+        assert!(
+            AUTOCOMPLETE_WALK_TIMEOUT > SCAN_TIME_BUDGET,
+            "caller timeout {AUTOCOMPLETE_WALK_TIMEOUT:?} must exceed the walk budget \
+             {SCAN_TIME_BUDGET:?}, or the walk's own deadline is unreachable"
+        );
+
+        // THE WIRING. The property above is about tokio; this is about whether
+        // the handler uses it. Without this, the cell passes on a handler that
+        // still calls the walk inline.
+        // ANCHOR ON THE DEFINITION, NOT THE NAME. `"pub async fn
+        // autocomplete_dir("` also appears in THIS test as the literal two lines
+        // below, and it appears FIRST, so splitting on it handed the scan the
+        // test module's own tail: `spawn_blocking` was "found" in this very
+        // assertion while the handler had none. Third instance of a test
+        // matching its own scrape string in one session; the leading newline is
+        // what distinguishes a definition at column 0 from a quoted mention.
+        let src = include_str!("fs.rs");
+        let body = src
+            .split_once("\npub async fn autocomplete_dir(")
+            .expect("the handler exists")
+            .1;
+        let body = body.split_once("\n}\n").expect("its closing brace").0;
+        // The scan must be looking at the HANDLER: it completes paths, so this
+        // string is in it and is in no test.
+        assert!(
+            body.contains("expanduser(&query)"),
+            "the scan is not reading autocomplete_dir; it is reading {} chars of \
+             something else",
+            body.len()
+        );
+        assert!(
+            body.contains("spawn_blocking"),
+            "the walk must not run inline in an async fn: it holds a tokio worker"
+        );
+        assert!(
+            body.contains("AUTOCOMPLETE_WALK_TIMEOUT"),
+            "the walk must be bounded by the caller, not only by its own budget"
+        );
+    }
+
     /// AF-636: the walk must respect a WALL-CLOCK bound, not only an entry one.
     ///
     /// Deterministic where the test above cannot be: a zero budget must trip on
@@ -1970,7 +2055,57 @@ pub async fn autocomplete_dir(method: Method, RawQuery(q): RawQuery) -> Response
     // what the folder is CALLED, and that used to return [] every time.
     if !query.contains('/') && !query.starts_with('~') && query.len() >= 2 {
         let roots = name_search_roots();
-        let (hits, exhausted) = dirs_matching_name(&query, &roots, 10);
+        // OFF THE ASYNC WORKER, AND BOUNDED BY THE CALLER (AF-645).
+        //
+        // Two separate defects, and the second is why the walk's own budget is
+        // not enough. This runs on every keystroke in the new-worker field over
+        // the REAL home directory.
+        //
+        // (1) It was blocking filesystem I/O inline in an `async fn`, so it held
+        //     a tokio worker thread for its whole duration instead of yielding.
+        // (2) Measured on this box at load 24-27 with a 21 GB `~/.claude`, the
+        //     walk did not return in 900 SECONDS even with its 3s budget checked
+        //     between directories, between entries and during each listing. The
+        //     remaining time is inside ONE syscall (a `read_dir` step or an
+        //     `is_dir` stat) and a thread cannot interrupt itself mid-syscall,
+        //     so no in-walk deadline can bound it. Only the caller can.
+        //
+        // A TIMEOUT DOES NOT CANCEL THE BLOCKING TASK, and that is worth stating
+        // rather than discovering: the walk keeps running to completion on the
+        // blocking pool after we stop waiting. What this buys is that the
+        // REQUEST returns; the leaked work is bounded by tokio's blocking-pool
+        // cap rather than by us, so a hot keystroke loop degrades to slow
+        // autocomplete instead of a stalled runtime.
+        //
+        // Expiry reports through the existing `exhausted` flag, so the warn
+        // below and the fall-through both already handle it.
+        let q_for_walk = query.clone();
+        let (hits, exhausted) = match tokio::time::timeout(
+            AUTOCOMPLETE_WALK_TIMEOUT,
+            tokio::task::spawn_blocking(move || dirs_matching_name(&q_for_walk, &roots, 10)),
+        )
+        .await
+        {
+            Ok(Ok(found)) => found,
+            // The walk panicked. Empty + exhausted is the honest answer: we have
+            // no results and we know the search did not complete.
+            Ok(Err(join_err)) => {
+                tracing::warn!(query = %query, error = %join_err,
+                    "autocomplete: name search task failed (AF-645)");
+                (Vec::new(), true)
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    query = %query,
+                    timeout_s = AUTOCOMPLETE_WALK_TIMEOUT.as_secs(),
+                    walk_budget_s = SCAN_TIME_BUDGET.as_secs(),
+                    verdict = "autocomplete_walk_timeout",
+                    "autocomplete: name search did not return within the caller timeout, so \
+                     it is blocked inside a syscall; returning no name matches (AF-645)"
+                );
+                (Vec::new(), true)
+            }
+        };
         if exhausted {
             // The contract here is a bare array whose every failure is `[]`, so
             // a truncated search cannot announce itself IN the payload. It
