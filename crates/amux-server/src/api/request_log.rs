@@ -828,8 +828,14 @@ async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String,
     }
     // EXACT match, not a prefix or LIKE. An IP is an identifier, and a prefix
     // match on one silently widens 100.66.26.8 into 100.66.26.84's rows.
+    //
+    // THE COLUMN IS `client_ip`; `ip` is only its name in the RESPONSE JSON.
+    // The first cut of this filter wrote `ip = ?` and every call 500'd with
+    // `no such column: ip`, while its test passed: the test scraped the source
+    // for the clause STRING, which was present and wrong. A filter's column
+    // name cannot be checked against the handler, only against the schema.
     if let Some(ip) = q.get("ip").filter(|s| !s.is_empty()) {
-        clauses.push("ip = ?".into());
+        clauses.push("client_ip = ?".into());
         params.push(ip.clone().into());
     }
     if let Some(ts) = q.get("since").and_then(|v| v.parse::<f64>().ok()) {
@@ -4945,13 +4951,38 @@ mod tests {
             "declared but never read: the filter would be silently inert"
         );
         assert!(
-            body.contains(r#"clauses.push("ip = ?""#),
+            body.contains(r#"clauses.push("client_ip = ?""#),
             "read but no WHERE clause, so every ip returns the whole window"
         );
         // EXACT, not prefix: a LIKE would fold 100.66.26.8 into 100.66.26.84.
         assert!(
-            !body.contains(r#"clauses.push("ip LIKE"#),
+            !body.contains(r#"clauses.push("client_ip LIKE"#),
             "an ip filter must be exact; a prefix match silently widens it"
+        );
+
+        // AND THE COLUMN MUST EXIST. This is the half the first cut lacked and
+        // the reason it shipped broken: the scrape above passed on `ip = ?`,
+        // which is a perfectly well-formed clause naming a column that is not
+        // in the table, so every call 500'd with `no such column: ip`. A source
+        // scrape can only say the clause is THERE; only the schema says it is
+        // RIGHT. `ip` is the response-JSON name, `client_ip` is the column.
+        let mut conn = rusqlite::Connection::open_in_memory().expect("memdb");
+        crate::db::migrate::apply_all(&mut conn).expect("schema");
+        for col in ["client_ip", "amux_session", "family", "status", "ts"] {
+            let n: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM _amux_request_log WHERE {col} IS NOT NULL"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|e| panic!("filter column `{col}` is not queryable: {e}"));
+            let _ = n;
+        }
+        assert!(
+            conn.query_row("SELECT COUNT(*) FROM _amux_request_log WHERE ip IS NOT NULL", [], |r| r
+                .get::<_, i64>(0))
+                .is_err(),
+            "if a bare `ip` column ever exists, this test's whole premise is stale"
         );
     }
 

@@ -40,9 +40,11 @@ fallback when a finding needs row-level inspection.
    `/api/board/{id}`), each with count / first / last / distinct_clients and
    one full sample row incl. `error_body`.
 
-   **`error_body` EXISTS ONLY HERE. Raw `/api/logs` rows do not carry it**
-   (their fields are `action`/`actor`/`detail`/`req`/`resp`/`target`/..., and
-   the path is `target`, not `path`). So grepping the deep-dive rows for a
+   **`error_body` is in the TABLE but not in the raw `/api/logs` RESPONSE.**
+   `_amux_request_log` has an `error_body` column, and `row_to_event` does not
+   emit it: the JSON fields are `action`/`actor`/`detail`/`req`/`resp`/`target`,
+   and the path is `target`, not `path`. So the data exists and the deep-dive
+   endpoint does not hand it to you. So grepping the deep-dive rows for a
    message you just read in `analyze` returns ZERO on a window that certainly
    contains it, and a zero there reads as "not happening" rather than "wrong
    field". Measured 2026-09-09: 26 rows at `min_status=500`, every one of them a
