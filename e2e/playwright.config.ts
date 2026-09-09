@@ -151,6 +151,8 @@ console.log(
 
 export default defineConfig({
   testDir: '.',
+  // Real providers and peer coordination require the dedicated lifecycle lab.
+  testIgnore: ['**/lifecycle/live-*.spec.ts'],
   timeout: 30_000,
   retries: 0,
   use: {

@@ -1,6 +1,9 @@
 {
   "private": true,
   "scripts": {
+    "test:lifecycle": "python3 scripts/lifecycle/run.py full",
+    "test:lifecycle:browser": "python3 scripts/lifecycle/run.py browser",
+    "test:lifecycle:plan": "python3 scripts/lifecycle/run.py plan",
     "lint:spa": "bash scripts/spa-lint.sh"
   },
   "devDependencies": {
