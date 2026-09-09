@@ -127,7 +127,7 @@ try {
     ok(JSON.parse(retained.options.body).msg_id === origMsgId,
        'retained send keeps its original msg_id (exactly-once on eventual replay)');
   }
-  await page.evaluate(() => { offlineQueue = []; saveQueue(); });   // clear intentional leftover
+  await page.evaluate(() => _mutateQueue(current => { current.length = 0; }));   // clear intentional leftover
 
   // ── 6. Passive when connected: online mutation passes straight through ─────
   const onlineResult = await page.evaluate(async (mark) => {
