@@ -65,3 +65,5 @@ Registry source: `https://r.assistant-ui.com/`. The generated component sources 
 ## Verification
 
 Playwright's fixture server contains synthetic records only. Tests cover creation/reload persistence, evidence, revision-aware notes, assistant-to-board capture, approval confirmation and incomplete/expired refusal, connector checks, schedule control, workflow composition, mobile navigation, text resizing and transport restrictions. The separate live test creates one uniquely titled backlog item, verifies its persisted note against the native API and archives that same item in `finally`. It never releases a live approval or changes an existing schedule.
+
+Latest local validation (2026-09-09): 13/13 fixture browser tests; live create/note/archive round trip; 4/4 email approval and 9/9 static-serving Rust tests; TypeScript and both production builds; npm audit: 0 vulnerabilities. The native service worker passes Business and health requests through to the network so the developer shell cache cannot replace the Business page.

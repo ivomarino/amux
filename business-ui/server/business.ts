@@ -115,7 +115,7 @@ export async function handleBusiness(
               ? 'Sign in to your Amux server to continue.'
               : 'This information could not be refreshed. Try again.';
       });
-      // Never pass session environments, terminal contents, connector token URLs or raw preferences to the browser.
+      // Expose selected fields to Business views. The embedded transport uses native API permissions; this projection is not an access boundary.
       const sessions = Array.isArray(values.sessions)
         ? values.sessions.map((s: any) => ({
             name: s.name,
