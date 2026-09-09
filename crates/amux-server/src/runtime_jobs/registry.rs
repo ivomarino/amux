@@ -123,6 +123,7 @@ pub mod ids {
     pub const DISK_WATCH: &str = "disk-watch";
     pub const STATUS_HISTORY: &str = "status-history";
     pub const TOKEN_LEDGER: &str = "token-ledger";
+    pub const BOARD_HYGIENE: &str = "board-hygiene";
 }
 
 /// Every id above, enumerated. `mod ids` is a set of constants and Rust cannot
@@ -164,6 +165,7 @@ pub const ALL_IDS: &[&str] = &[
     ids::DISK_WATCH,
     ids::STATUS_HISTORY,
     ids::TOKEN_LEDGER,
+    ids::BOARD_HYGIENE,
 ];
 
 /// An env var this job reads at startup. It is a READOUT, never a switch: a
@@ -650,6 +652,18 @@ pub const CATALOG: &[Doc] = &[
         env: &[EnvControl {
             var: "AMUX_LEDGER_INDEX_SECS",
             effect: "index interval in seconds; 0 disables the job",
+            off: Some("0"),
+        }],
+        pref: None,
+        detail: None,
+    },
+    Doc {
+        id: ids::BOARD_HYGIENE,
+        name: "Board hygiene",
+        purpose: "Ages needsyou cards (warn at 14d, discard at 30d), discards stale autofix todos (72h), flags stale backlog (30d never promoted), and logs per-session status counts.",
+        env: &[EnvControl {
+            var: "AMUX_BOARD_HYGIENE_SECS",
+            effect: "tick seconds; 0 disables the job",
             off: Some("0"),
         }],
         pref: None,
