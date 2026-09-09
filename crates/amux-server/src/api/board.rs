@@ -2192,7 +2192,7 @@ pub(crate) async fn dispatch_pending_callbacks(
             // them a request they never made was dropped. ts-gke received 19 of
             // these in a night and nearly enumerated all of them before seeing
             // the shape. Nothing about DELIVERY changes here; only the claim.
-            "discarded the capture of a message you sent, which is not a request              and owed you nothing"
+            "discarded the capture of a message you sent, which is not a request and owed you nothing"
         } else {
             "closed the request without resolving the dependency"
         };
@@ -7384,6 +7384,69 @@ mod af413_discarded_tests {
     /// `folded_into` is a control key and must be listed, or a hand-rolled fold
     /// lands in `ignored_fields` and the caller is told nothing changed while
     /// the summary keeps rendering the four not-recorded clauses.
+    /// NO RUN OF SPACES IN ANY CALLBACK SENTENCE. Second instance of this
+    /// class in three cards, which is why the guard is over the REGION and not
+    /// over one literal.
+    ///
+    /// Rust joins a string across lines with a trailing backslash. Drop it and
+    /// the source still compiles, the compiler says nothing, and the sentence
+    /// renders with the indentation baked in. AF-621 shipped
+    /// "the          condition" into a CLI help surface; AF-634 then shipped
+    /// "not a request              and owed you nothing" into the terminal
+    /// callback, and I only saw it because a peer's discard notice came back to
+    /// me with the gap in it. A test scoped to one function did not generalise,
+    /// so this one reads every literal in the block that builds the callback.
+    #[test]
+    fn no_callback_sentence_renders_a_run_of_spaces() {
+        let src = include_str!("board.rs");
+        let start = src
+            .find("let folded = bs::folded_into_detail(")
+            .expect("the callback text block exists");
+        let end = src[start..]
+            .find("let guard = format!(\"task-callback:")
+            .expect("the block ends at the delivery guard")
+            + start;
+        let block = &src[start..end];
+
+        // APPLY RUST'S OWN CONTINUATION RULE FIRST. A backslash at end of line
+        // eats the newline AND the next line's leading whitespace, so the raw
+        // source of a CORRECTLY continued literal is full of spaces that never
+        // reach the reader. Checking the raw text flags every well-formed
+        // multi-line string, which is what the first cut of this test did.
+        let strip_continuations = |lit: &str| -> String {
+            let mut out = String::new();
+            let mut rest = lit;
+            while let Some(i) = rest.find("\\\n") {
+                out.push_str(&rest[..i]);
+                rest = rest[i + 2..].trim_start_matches([' ', '\t']);
+            }
+            out.push_str(rest);
+            out
+        };
+        let mut offenders: Vec<String> = Vec::new();
+        for lit in block.split('"').skip(1).step_by(2) {
+            let rendered = strip_continuations(lit);
+            if rendered.contains("   ") {
+                offenders.push(rendered.chars().take(90).collect());
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a dropped line-continuation leaves the indentation in the rendered \
+             sentence: {offenders:?}"
+        );
+
+        // POSITIVE CONTROL: the scrape must actually be reading literals. Without
+        // it, a `find` that silently matched nothing gives an empty block and an
+        // empty offender list, which is the most reassuring output a dead check
+        // can produce.
+        let lits = block.split('"').skip(1).step_by(2).count();
+        assert!(
+            lits >= 5,
+            "only {lits} literal(s) scanned; the block moved and this check is blind"
+        );
+    }
+
     #[test]
     fn folded_into_is_a_control_key_and_not_a_writable_column() {
         assert!(!PATCH_WRITABLE.contains(&"folded_into"), "it names no column");
