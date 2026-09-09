@@ -5129,10 +5129,51 @@ let peekTabOrder = (function() {
   } catch(e) {}
   return PEEK_TABS.map(t => t.id);
 })();
+let _peekTabPrefsDirty = false;
+let _peekTabPrefsSaveTimer = null;
+const _PEEK_TAB_PREF_KEY = 'peek_tab_layout';
+function _peekTabLayoutValue() {
+  return JSON.stringify({ hidden: [...peekHiddenTabs], tab_order: peekTabOrder });
+}
+function _persistPeekTabPrefs() {
+  clearTimeout(_peekTabPrefsSaveTimer);
+  _peekTabPrefsSaveTimer = setTimeout(() => {
+    fetch(API + '/api/prefs', { method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({key:_PEEK_TAB_PREF_KEY, value:_peekTabLayoutValue()}) }).catch(() => {});
+  }, 80);
+}
+async function _loadPeekTabPrefs() {
+  try {
+    const r = await fetch(API + '/api/prefs?key=' + encodeURIComponent(_PEEK_TAB_PREF_KEY));
+    if (!r.ok) return;
+    const value = (await r.json()).value;
+    // A user action made while this request was in flight wins. Never roll it
+    // back with a late startup response.
+    if (_peekTabPrefsDirty) return;
+    if (!value) { _persistPeekTabPrefs(); return; }
+    const saved = JSON.parse(value);
+    const all = PEEK_TABS.map(t => t.id);
+    if (!saved || !Array.isArray(saved.hidden) || !Array.isArray(saved.tab_order)) return;
+    peekHiddenTabs = new Set(saved.hidden.filter(id => all.includes(id)));
+    peekTabOrder = [...new Set([
+      ...saved.tab_order.filter(id => all.includes(id)),
+      ...all.filter(id => !saved.tab_order.includes(id)),
+    ])];
+    try {
+      localStorage.setItem('amux_peek_hidden_tabs', JSON.stringify([...peekHiddenTabs]));
+      localStorage.setItem('amux_peek_tab_order', JSON.stringify(peekTabOrder));
+    } catch(e) {}
+    _applyPeekTabVisibility();
+  } catch(e) {}
+}
 function _savePeekTabPrefs() {
   peekTabOrder = [...new Set(peekTabOrder)];
-  localStorage.setItem('amux_peek_hidden_tabs', JSON.stringify([...peekHiddenTabs]));
-  localStorage.setItem('amux_peek_tab_order', JSON.stringify(peekTabOrder));
+  _peekTabPrefsDirty = true;
+  try {
+    localStorage.setItem('amux_peek_hidden_tabs', JSON.stringify([...peekHiddenTabs]));
+    localStorage.setItem('amux_peek_tab_order', JSON.stringify(peekTabOrder));
+  } catch(e) {}
+  _persistPeekTabPrefs();
 }
 function _applyPeekTabVisibility() {
   const bar = document.querySelector('.peek-tabs');
@@ -5148,6 +5189,7 @@ function _applyPeekTabVisibility() {
     if (el) el.style.display = peekHiddenTabs.has(t.id) ? 'none' : '';
   });
 }
+_loadPeekTabPrefs();
 // Tab-customizer geometry beacon (AF-45). Ethan reported three times that the
 // tab list does not appear when he taps the box; it renders correctly on
 // desktop Chromium, mobile Chromium at 375px, and WebKit/iPhone-15 under
@@ -6965,7 +7007,7 @@ async function sendFromInput(name) {
   // a waiting session needs the keystroke to land now, not at a turn boundary.
   const _atSel = (sessions.find(s => s.name === name) || {}).status === 'waiting';
   if (_sendMode === 'queue' && !_atSel) {
-    cmdHistoryAdd(text || msg, { type: 'steering' });
+    cmdHistoryAdd(text || msg, { type: 'steering', session: name });
     inp.value = '';
     _draftClear(name);
     inp.style.height = 'auto';
@@ -6982,7 +7024,7 @@ async function sendFromInput(name) {
     if (typeof showToast === 'function') showToast('Queued for ' + name + (cnt > 1 ? ' (' + cnt + ' in queue)' : '') + (_nf ? ' · ' + _nf + ' file' + (_nf === 1 ? '' : 's') : ''));
     return;
   }
-  cmdHistoryAdd(text || msg);
+  cmdHistoryAdd(text || msg, { session: name });
   inp.value = '';
   _draftClear(name);          // it left the composer — a restored copy would be a ghost
   inp.style.height = 'auto';
@@ -9494,7 +9536,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.853';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.854';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -9720,6 +9762,8 @@ function openPeek(name, opts) {
   }
   _lastPeekedSession = name;   // remembered for the Messages view's default filter
   _peekScrollLocked = false;
+  _peekBufferedOutput = false;
+  _hideScrollLockBadge(document.getElementById('peek-body'));
   // Reset the Plan strip so it reloads for the new session (no stale flash).
   _peekPlanLast = 0;
   const _pp = document.getElementById('peek-plan'); if (_pp) _pp.style.display = 'none';
@@ -9859,12 +9903,14 @@ function openPeek(name, opts) {
   // a session now shows the latest immediately instead of waiting on ~120KB of
   // history — and 4 ansiToHtml passes over it — before anything appears.
   _peekLastChangeMs = performance.now();   // snappy first couple seconds after opening a peek
-  // First fetch: live frame with notrim → paints the current terminal (the
-  // LATEST) instantly, without waiting on the ~120KB full-history render. The
-  // full payload follows and fills in scrollback above.
-  refreshPeek(true, true).finally(() => {
-    if (_peekIdentityCurrent(openIdentity)) refreshPeek();
-  });
+  // Race the small live frame and the full transcript. The former is normally
+  // fastest, but it must not be a serial gate: one stuck live request used to
+  // prevent the healthy full response from even starting, leaving "Loading
+  // latest…" on screen indefinitely. Identity + frame coalescing make either
+  // arrival order safe, and the client overlap guard keeps a late raw live
+  // frame from duplicating transcript content.
+  refreshPeek(true, true);
+  refreshPeek();
   _schedulePeekPoll();
   // resize-on-peek + its lease removed (AMUX-2981); the capture is a fixed
   // 220-col pane the reader scrolls, so there is nothing to fit or hold.
@@ -10990,8 +11036,13 @@ function _peekPromptNormalized(text) {
 function _classifyPromptKind(promptText) {
   const clean = _peekPromptNormalized(promptText);
   if (!clean) return 'unknown';
-  const rows = _peekMsgRowsFor === peekSession && Array.isArray(_peekMsgRows)
-    ? _peekMsgRows : (typeof _cmdHistory !== 'undefined' ? _cmdHistory : []);
+  // The Messages tab is a fetched snapshot; cmdHistoryAdd is the immediate
+  // record of a prompt submitted while this terminal is open. Using the
+  // snapshot EXCLUSIVELY made every new prompt "Unclassified" until Messages
+  // happened to reload. Merge both provenance sources, scoped to this worker.
+  const rows = [];
+  if (_peekMsgRowsFor === peekSession && Array.isArray(_peekMsgRows)) rows.push(..._peekMsgRows);
+  if (typeof _cmdHistory !== 'undefined' && Array.isArray(_cmdHistory)) rows.push(..._cmdHistory);
   const kinds = new Set();
   let best = 0;
   for (const row of rows) {
@@ -11110,23 +11161,25 @@ function wrapBoxBlocks(html) {
 
 let peekSelecting = false;
 let _peekScrollLocked = false;
+let _peekBufferedOutput = false;
 
 function _isScrolledToBottom(el, threshold) {
   return el.scrollHeight - el.scrollTop - el.clientHeight < (threshold || 40);
 }
 
 function _scrollLockContainer(scrollEl) {
-  return scrollEl.id === 'peek-body' ? scrollEl.parentElement.querySelector('.peek-output-controls') || scrollEl : scrollEl;
+  return scrollEl;
 }
 function _showScrollLockBadge(scrollEl, onClickResume) {
   const container = _scrollLockContainer(scrollEl);
   let badge = container.querySelector('.scroll-lock-badge');
   if (!badge) {
-    badge = document.createElement(container === scrollEl ? 'div' : 'button');
+    badge = document.createElement('button');
+    badge.type = 'button';
     badge.className = 'scroll-lock-badge';
-    badge.textContent = container === scrollEl ? 'Scrolled up — click to resume' : 'Resume output';
+    badge.textContent = 'New output \u2193';
     badge.title = 'New output is buffered while you read earlier lines';
-    container.prepend(badge);
+    container.append(badge);
   }
   badge.onclick = e => { e.stopPropagation(); onClickResume(); };
   badge.style.display = '';
@@ -11134,6 +11187,42 @@ function _showScrollLockBadge(scrollEl, onClickResume) {
 function _hideScrollLockBadge(scrollEl) {
   const badge = _scrollLockContainer(scrollEl).querySelector('.scroll-lock-badge');
   if (badge) badge.style.display = 'none';
+}
+
+// Defence in depth for the transcript/live seam. Old servers and cached
+// responses can return the viewport beginning inside transcript history. The
+// renderer owns the final composition, so it must never paint a submitted
+// prompt twice even if an upstream trim misses it.
+function _trimPeekLiveOverlap(history, live) {
+  if (!history || !live) return live;
+  const normalize = line => String(line || '').replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, '')
+    .replace(/[\s\u00a0]+/g, ' ').trim().toLowerCase();
+  const histLines = history.split('\n'), liveLines = live.split('\n');
+  const histNorm = histLines.map(normalize), liveNorm = liveLines.map(normalize);
+  const eligible = new Set(histNorm.filter(line => line.length >= 12));
+  const generalMatches = [];
+  liveNorm.forEach((line, index) => { if (eligible.has(line)) generalMatches.push(index); });
+  if (generalMatches.length >= 3) {
+    return liveLines.slice(generalMatches[generalMatches.length - 1] + 1).join('\n').replace(/^\n+/, '');
+  }
+  // A timestamped prompt is an amux-stamped submission identity. One exact
+  // anchor is sufficient and safer than requiring three arbitrary output
+  // lines, which was the server bug when a long answer pushed the other two
+  // matches outside its short transcript tail.
+  const stampedPrompt = line => /^[❯›>]\s*\[\d{1,2}:\d{2}(?:\s*[ap]m)?\]\s+\S/i.test(line);
+  const promptRows = new Map();
+  histNorm.forEach((line, index) => { if (stampedPrompt(line)) promptRows.set(line, index); });
+  let liveAnchor = -1, histAnchor = -1;
+  liveNorm.forEach((line, index) => {
+    if (stampedPrompt(line) && promptRows.has(line)) {
+      liveAnchor = index; histAnchor = promptRows.get(line);
+    }
+  });
+  if (liveAnchor < 0) return live;
+  let matched = 1;
+  while (liveAnchor + matched < liveNorm.length && histAnchor + matched < histNorm.length
+      && liveNorm[liveAnchor + matched] === histNorm[histAnchor + matched]) matched++;
+  return liveLines.slice(liveAnchor + matched).join('\n').replace(/^\n+/, '');
 }
 
 // ── Peek 'Plan' strip: read-only view of the session's Claude Code task list ──
@@ -11457,8 +11546,11 @@ function _peekAcceptFrame(data) {
   // Alt-screen peeks return history + live SEPARATELY so a poll can re-render just
   // the live frame. A live=1 poll carries no history (keep what we already have);
   // non-alt/legacy shapes send one `output` blob — treat that as the live part.
-  const output = (data.live != null) ? data.live : (data.output || '(no output)');
+  const rawOutput = (data.live != null) ? data.live : (data.output || '(no output)');
   const histRaw = (data.history != null) ? data.history : null;   // null ⇒ live-only poll
+  if (typeof rawOutput !== 'string' || (histRaw !== null && typeof histRaw !== 'string')) throw new Error('Malformed terminal frame');
+  const overlapBase = histRaw !== null ? histRaw : _peekHistoryRaw;
+  const output = _trimPeekLiveOverlap(overlapBase, rawOutput);
   // Skip re-render when nothing we'd paint changed — saves ansiToHtml work on every
   // poll tick. This also applies with an active search: the highlights are already in
   // the DOM, so re-running applyPeekSearch would needlessly scroll the view back to
@@ -11467,7 +11559,6 @@ function _peekAcceptFrame(data) {
     if (performance.now() > _peekGeoHold) statusEl.textContent = 'Updated ' + new Date().toLocaleTimeString() + ' · v' + APP_VER;
     return;
   }
-  if (typeof output !== 'string' || (histRaw !== null && typeof histRaw !== 'string')) throw new Error('Malformed terminal frame');
   _lastPeekRaw = output;
   _peekLastChangeMs = performance.now();   // real content change → drives fast adaptive polling
   if (histRaw !== null && histRaw !== _peekHistoryRaw) {   // full fetch → (re)render history once
@@ -11475,7 +11566,10 @@ function _peekAcceptFrame(data) {
     _peekHistoryHTML = _peekChunkHTML(_peekRenderChunks('history', histRaw));
   }
   const atBottom = _isScrolledToBottom(body);
-  if (atBottom && !body.querySelector('.peek-msg-current, .peek-highlight.current')) _peekScrollLocked = false;
+  if (atBottom && !body.querySelector('.peek-msg-current, .peek-highlight.current')) {
+    _peekScrollLocked = false;
+    _peekBufferedOutput = false;
+  }
   const newHTML = _peekChunkHTML(_peekRenderChunks('live', output));
   if (_sendingSnapshot && newHTML !== _sendingSnapshot) clearSendingIndicator();
   // Claude runs on the terminal's ALT SCREEN: tmux holds only the viewport,
@@ -11485,6 +11579,7 @@ function _peekAcceptFrame(data) {
   _lastLiveHTML = newHTML;
   lastPeekHTML = _peekEarlierHTML() + _peekHistoryHTML + _lastLiveHTML;
   const hasSearch = peekSearchQuery.trim().length > 0;
+  if (_peekScrollLocked || hasSearch) _peekBufferedOutput = true;
   // When user has scrolled up, skip DOM update to avoid fidgeting the view.
   // Buffer in lastPeekHTML and flush when they resume.
   if (hasSearch && _peekPendingFindScroll) {
@@ -11509,10 +11604,12 @@ function _peekAcceptFrame(data) {
   }
   if (!_peekScrollLocked && atBottom && !hasSearch) {
     body.scrollTop = body.scrollHeight;
+    _peekBufferedOutput = false;
     _hideScrollLockBadge(body);
-  } else if (_peekScrollLocked || hasSearch) {
+  } else if (_peekBufferedOutput) {
     _showScrollLockBadge(body, () => {
       _peekScrollLocked = false;
+      _peekBufferedOutput = false;
       applyPeekSearch(false, false);
       body.scrollTop = body.scrollHeight;
       _hideScrollLockBadge(body);
@@ -12742,7 +12839,7 @@ async function sendPeekCmd() {
       const refs = files.map(f => '@' + f.path).join(' ');
       queuedMsg = text ? `${text} ${refs}` : refs;
     }
-    cmdHistoryAdd(text || queuedMsg, {type:'steering'});
+    cmdHistoryAdd(text || queuedMsg, {type:'steering', session: peekSession});
     inp.value = '';
     inp.style.height = 'auto';
     _draftClear(peekSession);
@@ -12762,7 +12859,7 @@ async function sendPeekCmd() {
   // "press enter twice" bug. The safe default is 'queue' mode (handled just
   // above), which reliably delivers at the next turn boundary; use the send-mode
   // toggle to switch between queue and send.
-  cmdHistoryAdd(text);
+  cmdHistoryAdd(text, {session: peekSession});
 
   // Build message: inline @path references (no newlines — tmux treats \n as Enter,
   // which would split the message and send the path as a separate submit)
@@ -21340,15 +21437,12 @@ document.getElementById('peek-body').addEventListener('scroll', function() {
   // That scroll event is still navigation, not a request to resume live output.
   if (_isScrolledToBottom(this) && !this.querySelector('.peek-msg-current, .peek-highlight.current')) {
     _peekScrollLocked = false;
+    _peekBufferedOutput = false;
     _hideScrollLockBadge(this);
   } else {
     _peekScrollLocked = true;
-    _showScrollLockBadge(this, () => {
-      _peekScrollLocked = false;
-      applyPeekSearch(false, false);
-      this.scrollTop = this.scrollHeight;
-      _hideScrollLockBadge(this);
-    });
+    // Scrolling up is not itself news. The compact resume affordance appears
+    // only when a later frame is actually buffered.
   }
 }, {passive: true});
 // Force URLs in peek output to open in the system browser (PWA desktop + mobile).
@@ -30626,7 +30720,7 @@ async function sendGridCmd(name) {
     _submitSuggestion(name, false, 'Enter');
     return;
   }
-  cmdHistoryAdd(text);
+  cmdHistoryAdd(text, {session: name});
   inp.value = '';
   autoGrow(inp);
   await doSend(name, text);

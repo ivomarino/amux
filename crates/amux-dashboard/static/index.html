@@ -2263,28 +2263,11 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <div class="peek-output-wrap">
       <div class="peek-output-controls">
       <button class="peek-copy-btn" id="peek-copy-btn" onclick="copyPeekContent()" title="Copy all">&#x2398; Copy</button>
-      <!-- Subagent switcher — appears only when the pane shows Claude's agents panel -->
-      <!-- The pane-driven subagent switcher (⌂/▲/▼, agentNav) was DELETED
-           (ARE-7): it keyed on a "⏺ main" panel row Claude Code no longer
-           renders — measured 0 of 50 sessions, always display:none. Its
-           replacement is #peek-subagents-nav below (AMUX-2635), which reads
-           durable transcripts (50 of 50) and needs no visibility gate.
-           Resurrection, if the TUI ever ships a panel again: git log -S agentNav. -->
-      <!-- Subagent SCROLLER (Ethan 2026-08-13: "make sure i can scroll thru sub
-           agents in the terminal … i dont like the list subagents button").
-           Claude Code renders its agents panel again (● main / ○ general-purpose,
-           opened with ←), so this drives it directly: ← opens the panel, ▲/▼
-           move through the subagents in the pane. It sends raw keys via /keys
-           (peekQuickKeys) and lets Claude's native panel do the navigating —
-           NOT the server-side multi-step key choreography the old agentNav used
-           (ARE-7), which broke the moment the TUI's panel changed. The durable
-           transcript list (openSubagents / GET .../subagents) still exists in the
-           code if it's wanted elsewhere; the button here is the live scroller. -->
-      <div class="peek-agent-nav" id="peek-subagents-nav">
-        <button onclick="peekQuickKeys('Left')" title="Open Claude's agents panel (sends ←)">&#x2190;</button>
-        <button onclick="peekQuickKeys('Up')" title="Previous subagent (sends ↑)">&#x25B2;</button>
-        <button onclick="peekQuickKeys('Down')" title="Next subagent (sends ↓)">&#x25BC;</button>
-      </div>
+      <!-- Terminal chrome must never inject navigation keys. The former
+           Left/Up/Down buttons guessed that Claude's agents panel was open; if
+           it was not, the same keys navigated the composer/slash menu and could
+           submit a command. Subagents remain available through their durable
+           transcript UI, but raw terminal keys belong only in the composer. -->
       </div>
       <div id="peek-body" class="overlay-body"></div>
     </div>

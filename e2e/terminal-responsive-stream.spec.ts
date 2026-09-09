@@ -48,7 +48,7 @@ for (const width of [390, 1280]) {
     });
     expect(geometry.scroll).toBeLessThanOrEqual(geometry.client+1);
     expect(geometry.outer).toBeLessThanOrEqual(geometry.viewport);
-    expect(geometry.top).toBeGreaterThanOrEqual(geometry.controlsBottom);
+    expect(geometry.left.y).toBeGreaterThanOrEqual(geometry.controlsBottom);
     if (width < 600) {
       expect(geometry.right.y).toBeGreaterThanOrEqual(geometry.left.bottom);
       expect(geometry.left.width).toBeGreaterThan(300);

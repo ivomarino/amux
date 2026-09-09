@@ -1035,24 +1035,29 @@ fn trim_live_overlap(transcript: &str, live: &str) -> String {
         let ws = cached_re!(r"\s+");
         ws.replace_all(s.trim(), " ").to_lowercase()
     }
+    // `transcript` is already response-bounded by the caller. Restricting the
+    // overlap search to its final 140 rendered lines lost submitted prompts
+    // whenever one long tool response followed them. The live viewport then
+    // repeated those prompts and the client rendered both copies.
     let tlines: Vec<&str> = transcript.split('\n').collect();
-    let tail_start = tlines.len().saturating_sub(140);
-    let tail_norm: Vec<String> = tlines[tail_start..]
+    let transcript_norm: Vec<String> = tlines
         .iter()
         .map(|x| norm(x))
         .filter(|n| n.chars().count() >= 12)
         .collect();
-    let tail_set: std::collections::BTreeSet<&str> = tail_norm.iter().map(|s| s.as_str()).collect();
-    let long_tail: Vec<&String> = tail_norm.iter().filter(|n| n.chars().count() >= 46).collect();
+    let transcript_set: std::collections::BTreeSet<&str> =
+        transcript_norm.iter().map(|s| s.as_str()).collect();
+    let long_transcript: Vec<&String> =
+        transcript_norm.iter().filter(|n| n.chars().count() >= 46).collect();
     let in_transcript = |n: &str| -> bool {
         if n.chars().count() < 12 {
             return false;
         }
-        if tail_set.contains(n) {
+        if transcript_set.contains(n) {
             return true;
         }
         if n.chars().count() >= 24 {
-            for tv in &long_tail {
+            for tv in &long_transcript {
                 if n.contains(tv.as_str()) || tv.contains(n) {
                     return true;
                 }
@@ -1063,11 +1068,43 @@ fn trim_live_overlap(transcript: &str, live: &str) -> String {
     let ll: Vec<&str> = live.split('\n').collect();
     let matches: Vec<usize> =
         ll.iter().enumerate().filter(|(_, x)| in_transcript(&norm(x))).map(|(i, _)| i).collect();
-    if matches.len() < 3 {
-        return live.to_string();
+    if matches.len() >= 3 {
+        let after = matches[matches.len() - 1] + 1;
+        return ll[after.min(ll.len())..].join("\n").trim_start_matches('\n').to_string();
     }
-    let after = matches[matches.len() - 1] + 1;
-    ll[after.min(ll.len())..].join("\n").trim_start_matches('\n').to_string()
+
+    // A timestamped prompt is an amux-stamped submission identity, so one
+    // exact prompt is a stronger overlap anchor than three generic output
+    // lines. This covers short seams without mistaking an ordinary repeated
+    // status line for overlap.
+    let prompt_re = cached_re!(r"^[❯›>]\s*\[\d{1,2}:\d{2}(?:\s*[AaPp][Mm])?\]\s+\S");
+    let all_transcript_norm: Vec<String> = tlines.iter().map(|line| norm(line)).collect();
+    let live_norm: Vec<String> = ll.iter().map(|line| norm(line)).collect();
+    let mut anchor = None;
+    for (li, raw) in ll.iter().enumerate() {
+        if !prompt_re.is_match(strip_ansi(raw).trim()) {
+            continue;
+        }
+        if let Some(hi) = tlines.iter().rposition(|candidate| {
+            prompt_re.is_match(strip_ansi(candidate).trim()) && norm(candidate) == live_norm[li]
+        }) {
+            anchor = Some((li, hi));
+        }
+    }
+    let Some((live_at, transcript_at)) = anchor else {
+        return live.to_string();
+    };
+    let mut matched = 1;
+    while live_at + matched < live_norm.len()
+        && transcript_at + matched < all_transcript_norm.len()
+        && live_norm[live_at + matched] == all_transcript_norm[transcript_at + matched]
+    {
+        matched += 1;
+    }
+    ll[(live_at + matched).min(ll.len())..]
+        .join("\n")
+        .trim_start_matches('\n')
+        .to_string()
 }
 
 fn chars_truncate(s: &str, n: usize) -> String {
@@ -23595,6 +23632,25 @@ CLAUDE-POSTFIX-COMPLETE
         assert_eq!(trim_live_overlap(transcript, &live), "fresh tail");
         // <3 matches keeps the frame whole.
         assert_eq!(trim_live_overlap("only one line here long enough", "x\ny"), "x\ny");
+
+        // A long answer can push the submitted prompt more than 140 rendered
+        // lines from the transcript tail while the live viewport still begins
+        // there. That seam must not paint a second copy.
+        let prompt = "❯ [05:38 PM] second submitted request";
+        let answer = "Assistant accepted the second submitted request";
+        let filler = (0..200)
+            .map(|i| format!("tool output row {i} long enough"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let transcript = format!("{prompt}\n{answer}\n{filler}");
+        let live = format!("{prompt}\n{answer}\n❯ [05:52 PM] newest submitted request\nWorking now");
+        assert_eq!(trim_live_overlap(&transcript, &live),
+                   "❯ [05:52 PM] newest submitted request\nWorking now");
+
+        // One exact timestamped prompt is an identity anchor; one ordinary
+        // repeated line remains insufficient.
+        assert_eq!(trim_live_overlap(prompt, &format!("{prompt}\nfresh after prompt")),
+                   "fresh after prompt");
     }
 
     #[test]
