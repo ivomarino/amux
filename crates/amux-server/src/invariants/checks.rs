@@ -707,6 +707,8 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     ("org_invites", "expires_at", false),
     ("org_invites", "used_at", false), // UNVERIFIED: no rows yet; seconds is the convention every sibling follows
     ("org_members", "joined_at", false), // UNVERIFIED: no rows yet; seconds is the convention every sibling follows
+    // Both team writers use Utc::now().timestamp(); 0060 uses strftime('%s').
+    ("org_teams", "created_at", false),
     ("owner_alerts", "ts", false),
     ("proxies", "created_at", false),
     ("reclaim_quarantine", "created_at", false),

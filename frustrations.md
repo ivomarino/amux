@@ -4206,3 +4206,23 @@ FIX: The ordering guard now verifies a prior DML actually names the indexed tabl
   after FROM/JOIN and uses the index's leading column, while continuing to exclude
   indexes on the table being written. A planted 0031-shaped late read-side index
   still fails and alternating sibling writes are the positive control.
+
+---
+
+## Team creation timestamps were missing from the unit registry
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-09
+SESSION: amux-testing-e2e
+CARD: ATE-128
+SYMPTOM: The authored-entry audit's isolated timestamp_units_declared target
+  failed on org_teams.created_at. The earlier full CI run stopped at another
+  integration target before reaching this guard, so a green library result
+  did not cover the new migration's timestamp contract.
+COST: A missing declaration from 0060 remained hidden behind an earlier CI
+  failure and required a separate focused audit to identify.
+FIX: Declare org_teams.created_at as seconds, matching both Rust timestamp()
+  writers and migration strftime('%s'). The existing schema.timestamp_units_declared
+  and timestamp-unit runtime invariants expose missing declarations and drift;
+  the migration-chain test supplies the regression and measured scan control.
