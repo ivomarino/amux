@@ -2645,30 +2645,74 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
     // victims were endpoints that never shell out at all — they just could not
     // get a connection because five copies of THIS function held them.
     //
-    // try_lock, never lock: this runs on the async executor, so blocking here
-    // would trade pool starvation for executor starvation. Exactly one caller
-    // rebuilds; everyone else gets the last snapshot, which for a 2s-TTL list
-    // is at worst a couple of seconds staler than they hoped — the same
-    // trade the cache itself already made.
+    // Blocking here is safe: both callers (this handler and graph.rs's
+    // fleet_graph) run this function inside spawn_blocking (AF-300), so a
+    // wait costs one blocking-pool thread, never an executor slot — the
+    // "try_lock, never lock" rule this comment used to state predates that
+    // migration and no longer holds.
+    //
+    // A COLD cache (no snapshot yet — true on every restart) used to bypass
+    // the guard entirely: try_lock's Err arm found `c.json` empty and fell
+    // through to an INDEPENDENT build, one per concurrent caller. That is
+    // the exact N-builders-one-pool failure AR-135 exists to prevent, just
+    // gated on "cache empty" instead of "TTL expired" — and it is the worse
+    // moment to hit it, since a restart is when every dashboard/fleet client
+    // reconnects and hits this endpoint at once. Confirmed live 2026-09-09:
+    // a post-restart reconnect burst held `read_pool_exhausted` for minutes
+    // (152 failures/60s), sessions_legacy.rs's own single-flight guard doing
+    // nothing because it only ever guarded the warm path.
+    //
+    // Fix: a loser now WAITS (bounded) for the in-flight build's result
+    // instead of racing it. Bounded so a genuinely hung builder (a wedged
+    // tmux/git subprocess, AF-301) cannot hang every waiter forever — past
+    // the deadline, fall back to the old independent-build behavior.
     static FLIGHT: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let Ok(_flight) = FLIGHT.try_lock() else {
+    let _flight = if let Ok(g) = FLIGHT.try_lock() {
+        g
+    } else {
         if let Ok(c) = build_array_cache().lock() {
             // Losers may serve a somewhat-stale snapshot (that is the
             // stale-while-revalidate trade), but never one from before an
             // invalidation — post-invalidation the json is empty, so they
-            // fall through and build.
+            // fall through and wait.
             if !c.json.is_empty() && c.epoch == epoch_now {
                 return Ok(c.json.clone());
             }
         }
-        // Cold start with a builder already in flight: fall through and build
-        // anyway — an empty answer would render an empty fleet as truth.
-        return {
-            let conn = store.read()?;
-            let arr = build_array(&conn)?;
-            let json = serde_json::to_string(&arr)?;
-            Ok(json)
-        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut acquired = None;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            if let Ok(c) = build_array_cache().lock() {
+                if !c.json.is_empty() && c.epoch == epoch_now {
+                    return Ok(c.json.clone());
+                }
+            }
+            if let Ok(g) = FLIGHT.try_lock() {
+                acquired = Some(g);
+                break;
+            }
+        }
+        match acquired {
+            Some(g) => g,
+            None => {
+                tracing::warn!(
+                    target: "amux::sessions",
+                    verdict = "sessions_cache_coldstart_stampede",
+                    waited_ms = 3000,
+                    "cold sessions cache with an in-flight builder that did not finish in 3s \
+                     (likely a wedged subprocess, AF-301) — building independently instead of \
+                     waiting forever; a spike in this line means the pool-starvation risk \
+                     AR-135 was meant to prevent is happening anyway"
+                );
+                return {
+                    let conn = store.read()?;
+                    let arr = build_array(&conn)?;
+                    let json = serde_json::to_string(&arr)?;
+                    Ok(json)
+                };
+            }
+        }
     };
     // Double-check under the flight lock: the previous holder may have just
     // refreshed, and rebuilding immediately would waste its work.
