@@ -2662,11 +2662,35 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
     // (152 failures/60s), sessions_legacy.rs's own single-flight guard doing
     // nothing because it only ever guarded the warm path.
     //
-    // Fix: a loser now WAITS (bounded) for the in-flight build's result
-    // instead of racing it. Bounded so a genuinely hung builder (a wedged
-    // tmux/git subprocess, AF-301) cannot hang every waiter forever — past
-    // the deadline, fall back to the old independent-build behavior.
+    // Fix, first attempt (2026-09-09 morning): a loser WAITS (bounded 3s) for
+    // the in-flight build's result instead of racing it, falling back to an
+    // independent build past the deadline. THAT BOUND ALONE DOES NOT BOUND
+    // THE BUILDER COUNT: under a single instantaneous burst it works (one
+    // straggler, at most), but under SUSTAINED reconnect pressure — the real
+    // shape of a restart, where clients keep arriving over many seconds, not
+    // in one instant — every new wave of waiters can independently miss the
+    // same 3s deadline and each spin up its own build. Confirmed live
+    // 2026-09-09 afternoon: read_pool_exhausted recurred in bursts for
+    // minutes AFTER this fix was deployed, box load average at 62 (4 cores),
+    // amux-server-rs itself at 400%+ CPU — N independent builds each
+    // spawning ~100 subprocesses, stacking faster than any of them finished,
+    // which is the same failure this whole guard exists to prevent, just
+    // arriving in waves instead of one instant.
+    //
+    // FIX: cap the number of concurrent independent builds at a CONSTANT — 2
+    // (the primary FLIGHT plus exactly one FALLBACK_FLIGHT) — no matter how
+    // many requests arrive or how long they keep arriving. A waiter that
+    // cannot get either lock does not build a third copy; it keeps waiting.
+    // The wait is bounded overall (15s) purely as a fail-SAFE: past that
+    // bound this returns an honest error (-> 500, which the dashboard's
+    // existing degraded-UI banner already renders as "Worker updates are
+    // unavailable ... Retry") instead of adding a third builder to a pool
+    // that is, by definition, already struggling if both of the first two
+    // haven't finished in 15s. Refusing new load under real overload is the
+    // fail-safe; piling on more load is what turned a single restart into a
+    // minutes-long outage.
     static FLIGHT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static FALLBACK_FLIGHT: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _flight = if let Ok(g) = FLIGHT.try_lock() {
         g
     } else {
@@ -2679,38 +2703,59 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
                 return Ok(c.json.clone());
             }
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let overall_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         let mut acquired = None;
-        while std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(25));
+        let mut used_fallback = false;
+        loop {
+            if let Ok(g) = FLIGHT.try_lock() {
+                acquired = Some(g);
+                break;
+            }
+            if let Ok(g) = FALLBACK_FLIGHT.try_lock() {
+                acquired = Some(g);
+                used_fallback = true;
+                break;
+            }
             if let Ok(c) = build_array_cache().lock() {
                 if !c.json.is_empty() && c.epoch == epoch_now {
                     return Ok(c.json.clone());
                 }
             }
-            if let Ok(g) = FLIGHT.try_lock() {
-                acquired = Some(g);
+            if std::time::Instant::now() >= overall_deadline {
                 break;
             }
+            std::thread::sleep(std::time::Duration::from_millis(25));
         }
         match acquired {
-            Some(g) => g,
+            Some(g) => {
+                if used_fallback {
+                    tracing::warn!(
+                        target: "amux::sessions",
+                        verdict = "sessions_cache_fallback_builder",
+                        "cold sessions cache with the primary builder still busy — using the \
+                         ONE fallback builder rather than waiting forever (AF-301) or piling on \
+                         a third independent build (the 2026-09-09 sustained-load regression). \
+                         A spike in this line means restarts are landing under real concurrent \
+                         load; two builders at once is expected, more would not be."
+                    );
+                }
+                g
+            }
             None => {
-                tracing::warn!(
+                tracing::error!(
                     target: "amux::sessions",
-                    verdict = "sessions_cache_coldstart_stampede",
-                    waited_ms = 3000,
-                    "cold sessions cache with an in-flight builder that did not finish in 3s \
-                     (likely a wedged subprocess, AF-301) — building independently instead of \
-                     waiting forever; a spike in this line means the pool-starvation risk \
-                     AR-135 was meant to prevent is happening anyway"
+                    verdict = "sessions_cache_stuck",
+                    waited_ms = 15000,
+                    "cold sessions cache with BOTH the primary and fallback builders still busy \
+                     after 15s — refusing a third independent build (that pile-up is exactly what \
+                     caused the sustained read_pool_exhausted outage on 2026-09-09). Failing this \
+                     request so the caller retries instead of adding more load to an already-stuck \
+                     pool; if this recurs, the primary/fallback builders themselves are wedged \
+                     (AF-301's unbounded subprocess calls), not this guard."
                 );
-                return {
-                    let conn = store.read()?;
-                    let arr = build_array(&conn)?;
-                    let json = serde_json::to_string(&arr)?;
-                    Ok(json)
-                };
+                anyhow::bail!(
+                    "sessions list temporarily unavailable: both builders busy after 15s, refusing to add a third"
+                );
             }
         }
     };

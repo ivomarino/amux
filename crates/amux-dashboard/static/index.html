@@ -620,6 +620,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <button id="bv-list" class="bv-btn" onclick="setBoardView('list')" title="Dense list grouped by status">&#x2630;</button>
         <button id="bv-session" class="bv-btn" onclick="setBoardView('worker')" title="Group by worker">&#x25A4;</button>
       <button id="bv-status" class="bv-btn" onclick="setBoardView('status')" title="Group by status">&#x2630;</button>
+      <button id="bv-smart" class="bv-btn" onclick="setBoardView('smart')" title="Smart board: derived status from durable facts">&#x2728;</button>
     </div>
     <!-- Export the CURRENT view. Reuses .board-view-toggle so it inherits the
          group styling and the 44px mobile touch targets already tuned for it,

@@ -54,9 +54,16 @@ pub fn routes() -> Router<AppState> {
             get(list_session_gates).patch(patch_session_gates),
         )
         .route("/contract", get(get_contract))
+        // Static /derived outranks /{id}. Computed display status from durable
+        // facts, never stored (AO architecture: display status is derived at
+        // read time).
+        .route("/derived", get(derived_board))
         // Static /ready outranks /{id}. The read side of the dependency graph
         // (AMUX-3948) — READY is a query, never a stored status.
         .route("/ready", get(ready_frontier))
+        // CDC catch-up: lets clients replay missed board mutations after a
+        // reconnect, keyed by the seq cursor from board_change_log.
+        .route("/changes", get(board_changes))
         // Static /bulk-migrate outranks /{id}. Moving a whole column at once
         // (AMUX-4044) — a single write transaction, because backlog alone
         // holds 489 live cards and 489 sequential PATCHes is minutes of load.
@@ -330,6 +337,143 @@ pub const QUEUE_DISPOSITION_CREATOR: &str = "queue-disposition";
 /// How many needsyou cards the owner view shows before hiding the rest.
 const NEEDSYOU_VIEW_CAP: usize = 10;
 
+// ---- GET /api/board/derived -----------------------------------------------
+
+/// Derived display status from durable facts.
+///
+/// The stored `status` is the lifecycle position a worker set. The `display_status`
+/// is what a human triaging the board should see, computed from timestamps, session
+/// liveness, evidence, and dependency state. This endpoint returns the board with
+/// both, so the dashboard can group by either.
+///
+/// Rules (in priority order; first match wins):
+///   1. status=needsyou AND entered_state_at older than 14 days: "aged-needsyou"
+///   2. status=doing AND assigned session is not active for >1h: "stalled"
+///   3. source=capture AND status=todo AND age > 72h AND no log activity: "stale"
+///   4. status=done AND evidence IS NOT NULL: "verified-candidate"
+///   5. depends_on non-empty AND all resolved: "unblocked"
+///   6. otherwise: the stored status itself
+async fn derived_board(State(state): State<AppState>) -> Response {
+    let store = state.store.clone();
+    let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = store.read()?;
+        let rows =
+            bs::list_issues(&conn, &[], &[], ArchivedFilter::ActiveOnly)?;
+        let working =
+            crate::api::sessions_legacy::active_python_sessions(&conn);
+        let now = now_secs();
+
+        let mut items: Vec<Value> = Vec::with_capacity(rows.len());
+        let mut counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+
+        for r in &rows {
+            let display = derive_display_status(r, now, &working, &conn);
+            *counts.entry(display.clone()).or_default() += 1;
+            let mut v = list_body(r, true, is_stale(r, now, &working));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("display_status".into(), json!(display));
+            }
+            items.push(v);
+        }
+
+        Ok((items, counts))
+    })
+    .await;
+    let (items, counts) = match joined {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return internal(e),
+        Err(e) => return internal(e),
+    };
+    Json(crate::api::measured::measured(
+        json!({
+            "items": items,
+            "counts": counts,
+            "total": items.len(),
+            "note": "display_status is computed from durable facts, never stored. \
+                     Rules: aged-needsyou (>14d), stalled (doing + session idle >1h), \
+                     stale (auto-captured todo >72h, no log), verified-candidate \
+                     (done + evidence), unblocked (all deps resolved). Otherwise \
+                     the stored status.",
+        }),
+        items.len(),
+    ))
+    .into_response()
+}
+
+fn derive_display_status(
+    row: &IssueRow,
+    now: i64,
+    working: &std::collections::BTreeSet<String>,
+    conn: &Connection,
+) -> String {
+    let status = row.status.as_str();
+    let age_secs = now - row.created;
+
+    // 1. Aged needsyou: status=needsyou and sitting longer than 14 days.
+    if status == "needsyou" {
+        let in_state_secs = row
+            .entered_state_at
+            .map(|t| now - t)
+            .unwrap_or(age_secs);
+        if in_state_secs > 14 * 86_400 {
+            return "aged-needsyou".into();
+        }
+    }
+
+    // 2. Stalled: status=doing but the assigned session is not active.
+    if status == "doing" {
+        if let Some(sess) = row.session.as_deref().filter(|s| !s.is_empty()) {
+            let idle_secs = now - row.updated;
+            if idle_secs > 3600 && !working.contains(sess) {
+                return "stalled".into();
+            }
+        }
+    }
+
+    // 3. Stale autofix/capture: auto-captured todo older than 72h with no log.
+    if status == "todo" {
+        let is_auto = row
+            .source
+            .as_deref()
+            .is_some_and(|s| s == "capture" || s == "autofix");
+        let no_activity = row
+            .log
+            .as_deref()
+            .map(|l| l.trim().is_empty())
+            .unwrap_or(true);
+        if is_auto && age_secs > 72 * 3600 && no_activity {
+            return "stale".into();
+        }
+    }
+
+    // 4. Verified candidate: done with evidence recorded.
+    if status == "done" && row.evidence.is_some() {
+        return "verified-candidate".into();
+    }
+
+    // 5. Unblocked: has dependencies and all are resolved (done/verified/discarded).
+    if !row.depends_on.is_empty() && matches!(status, "todo" | "backlog" | "doing") {
+        let all_resolved = row.depends_on.iter().all(|dep_id| {
+            bs::get_issue(conn, dep_id)
+                .ok()
+                .flatten()
+                .is_some_and(|dep| {
+                    matches!(
+                        dep.status.as_str(),
+                        "done" | "verified" | "discarded"
+                    )
+                })
+        });
+        if all_resolved {
+            return "unblocked".into();
+        }
+    }
+
+    // 6. Passthrough: the stored status.
+    status.to_string()
+}
+
 /// Why a candidate is NOT on the ready frontier, or `None` if it is ready.
 ///
 /// EXTRACTED so a test can drive it (AMUX-3949). The first version of this logic
@@ -584,6 +728,50 @@ async fn ready_frontier(
         },
     });
     Json(crate::api::measured::measured(body, n_considered)).into_response()
+}
+
+/// CDC catch-up: returns board_change_log rows after a given seq.
+/// Clients call this after an SSE reconnect to replay missed mutations.
+async fn board_changes(
+    State(state): State<AppState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let since_seq: i64 = q
+        .get("since_seq")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let limit: usize = q
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500)
+        .clamp(1, 5000);
+
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "db read failed"})),
+            )
+                .into_response();
+        }
+    };
+
+    match crate::runtime_jobs::cdc_poller::changes_since(&conn, since_seq, limit) {
+        Ok(rows) => {
+            let cursor = crate::runtime_jobs::cdc_poller::last_seq();
+            Json(json!({
+                "changes": rows,
+                "cursor": cursor,
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("query failed: {e}")})),
+        )
+            .into_response(),
+    }
 }
 
 /// (considered, moved, refused) carried out of the bulk-migrate write closure,
