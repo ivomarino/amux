@@ -7418,3 +7418,51 @@ FIX: 271167a3. A 45s window is sized for a transport retry and is being asked to
 NOTE: An earlier draft of this entry blamed a second mint path in orchestrator/runtime.rs. That was wrong and is recorded on AF-568. The orchestrator path stamps `source='orchestrator'`; all 104 sourced cards here read `capture`, which is what sent me back to the log.
 
 ---
+
+## SUPERSEDES the entry above: the consumer guard EXISTED and was correct — `--lib` never ran it
+VALIDATED: amux-frustrations | VALIDATED by amux-frustrations 2026-09-09 (originating session). This entry's specific claim was already closed at cc3b4221; what it left open was the GENERAL SHAPE, in its own words: "a suite-shaped command that silently covers a subset is the same instrument failure as a probe reporting zero when it never ran, and `--lib` is not the only such flag." Both halves are now addressed, at c7911c2d.
+
+THE OTHER FLAGS. scripts/test-contended.sh now announces every selector that narrows a run, not just --lib. The sharpest is --test <name>, which skips the LIB ENTIRELY -- the larger half of this crate -- while printing the smallest number of any selector, so it was the likeliest of all of them to be read as a clean suite. Also --tests, --benches, --examples, and a bare name filter. Read off the ARGUMENTS rather than cargo's output, so a run that dies before printing anything is still describable.
+
+scripts/test-target-clause.sh cell 2 had asserted that the --test case stayed SILENT. That cell encoded the narrower contract and is updated with the reason beside it, rather than deleted.
+
+THE LAYER ABOVE, which is the part worth more than the flag list. This entry's incident was a guard that ALREADY EXISTED, was correct, and did not run. Measured 2026-09-09 one level up: 80 scripts/test-* harnesses in this repo, 48 named by a workflow or a git-hook, 32 named NOWHERE. One of the 32 was scripts/test-target-clause.sh -- the harness written FOR THIS ENTRY, which had never run in CI. The same defect as the entry, with a longer fuse.
+
+scripts/test-harness-wired.sh is the ratchet for it, wired into checks.yml. The 32 are recorded in scripts/fixtures/harness-wired-baseline.txt with a reason each; it fails on an unwired harness that is not recorded, and also on a baseline entry whose file is gone or that is now wired, so the allowlist cannot rot into a rubber stamp. NOT a sweep: wiring 32 never-run checks into a required gate for every lane in one afternoon is deciding other lanes' work, and some of them compile.
+
+EVIDENCE, and two of these are the honest kind because they are failures the new checks caught in my own work:
+  scripts/test-selector-clauses.sh -> 12 passed, 0 failed (new; stubs cargo so no cell costs a build)
+  scripts/test-harness-wired.sh    -> 3 passed, 0 failed; 31 of 81 unwired, 31 recorded
+  Its FIRST run failed, naming my own two new harnesses as unwired.
+  Its SECOND run failed a stale-baseline cell, because the checks.yml comment explaining that test-target-clause.sh is deliberately unwired made it read as WIRED. A mention is not an invocation; comments are stripped before the scan now.
+  Without the runner change, 6 of the 12 new cells fail. Measured, not asserted: an intermediate revert during development ran the suite against the unpatched runner. The 6 that still pass are the controls, which pass trivially when the feature is absent.
+
+NOT CLOSED BY THIS, and named so the next reader does not read it as done: AF-336's class stays live. A trustworthy test run on a contended file still needs a private worktree, and the instrument still only DETECTS the problem. Its own entry remains open in frustrations.md.
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-30
+SESSION: amux-frustrations
+CARD: AF-346
+SYMPTOM: My entry above says the a99955f7 dashboard regression happened because no
+ consumer-side invariant existed and that amux was adding one. Both halves are wrong, and
+ amux established it by checking rather than agreeing with me.
+ `tests/board_api.rs :: list_is_slim_by_default_and_serves_prose_only_on_request` already
+ existed, drives the real HTTP list path, and asserts desc_head starts with the card's
+ first line. Run against a99955f7 in a scratch worktree it fails in 0.16s. The guard was
+ written before either of us got here, was right, and would have blocked the commit.
+ It did not run because I verified with `cargo test -p amux-server --lib`, which reports
+ "1625 passed" and SKIPS every `tests/*.rs` target: 47 integration files, ~339 tests.
+COST: The regression itself is costed in the entry above. The cost of THIS entry is the
+ wrong lesson I nearly left in the ledger: "add consumer-side tests" is useless advice
+ when the consumer-side test is already written, and it would have sent the next reader
+ to write a duplicate of a passing test instead of fixing the command that skipped it.
+ A false mechanism filed as history is the thing archiving rules exist to prevent, and I
+ was ten minutes from it.
+FIX: amux put it in VERIFY.md by name — `--lib` is a partial run whose number reads like a
+ total — and strengthened two assertions in that same test that were weaker than they
+ looked: `desc_len.as_u64().is_some()` is TRUE of 0, so it and the log_n line beside it
+ would BOTH have gone green against the blanked loader. Only desc_head had teeth. Now
+ they assert `> 0`, mutation-checked, at cc3b4221. What remains open is the general shape:
+ a suite-shaped command that silently covers a subset is the same instrument failure as a
+ probe reporting zero when it never ran, and `--lib` is not the only such flag.
