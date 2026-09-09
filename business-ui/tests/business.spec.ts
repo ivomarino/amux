@@ -315,7 +315,8 @@ test('200% text resize remains usable without clipping page', async ({
 });
 test('transport blocks cross-origin writes, arbitrary API paths and unconfirmed approval', async ({
   request,
-}) => {
+}, testInfo) => {
+  test.skip(testInfo.project.name==='embedded', 'This test exercises the development-only gateway; native API authority is covered by Rust tests.');
   expect(
     (
       await request.post('/api/business/tasks', {

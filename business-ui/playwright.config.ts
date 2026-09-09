@@ -21,6 +21,7 @@ export default defineConfig({
       },
       testIgnore: 'live.spec.ts',
     },
+    {name:'embedded',use:{...devices['Desktop Chrome'],baseURL:'http://127.0.0.1:18824',viewport:{width:1440,height:1000}},testIgnore:'live.spec.ts'},
     {
       name: 'live',
       use: {
@@ -32,7 +33,7 @@ export default defineConfig({
       testMatch: 'live.spec.ts',
     },
   ],
-  webServer: [
+  webServer: process.env.AMUX_LIVE_TEST === '1' ? [] : [
     {
       command: 'node tests/fixture-server.mjs',
       url: 'http://127.0.0.1:18824/health',
