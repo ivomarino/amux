@@ -2186,6 +2186,13 @@ pub(crate) async fn dispatch_pending_callbacks(
             folded_note.as_str()
         } else if bs::dependency_is_resolved(&row.status, &row.item_type) {
             "resolved the dependency"
+        } else if bs::is_capture_shell(&row) && row.status == "discarded" {
+            // AF-634. The reader of this sentence is the SENDER of a message,
+            // and "closed the request without resolving the dependency" tells
+            // them a request they never made was dropped. ts-gke received 19 of
+            // these in a night and nearly enumerated all of them before seeing
+            // the shape. Nothing about DELIVERY changes here; only the claim.
+            "discarded the capture of a message you sent, which is not a request              and owed you nothing"
         } else {
             "closed the request without resolving the dependency"
         };
