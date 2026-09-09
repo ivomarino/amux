@@ -1,5 +1,7 @@
 // Synthetic transport fixtures only. Never connected to customer accounts.
 import http from 'node:http';
+import {readFileSync} from 'node:fs';
+import {fileURLToPath} from 'node:url';
 const now = () => Math.floor(Date.now() / 1000);
 let tasks, workflows, schedules, pending, grants, prefs, requests;
 function reset() {
@@ -282,6 +284,12 @@ const server = http.createServer(async (req, res) => {
       return send(t);
     }
     return send(t);
+  }
+  if(req.method==='GET' && (u.pathname==='/' || u.pathname==='/business/' || u.pathname.startsWith('/business/assets/'))){
+    const relative=u.pathname.startsWith('/business/assets/')?u.pathname.slice('/business/'.length):'index.html';
+    const file=new URL('../../crates/amux-dashboard/static/business/'+relative,import.meta.url);
+    const mime=relative.endsWith('.js')?'text/javascript':relative.endsWith('.css')?'text/css':relative.endsWith('.woff2')?'font/woff2':'text/html';
+    res.writeHead(200,{'Content-Type':mime});return res.end(readFileSync(fileURLToPath(file)));
   }
   return send({ error: 'Unimplemented fixture route ' + u.pathname }, 404);
 });

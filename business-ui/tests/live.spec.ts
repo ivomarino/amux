@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+test.skip(process.env.AMUX_LIVE_TEST !== '1', 'Live writes require the explicit test:e2e:live command.');
 test('live Amux browser creates durable work, records a note, then archives only its own test item', async ({
   page,
   request,

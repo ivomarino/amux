@@ -5,7 +5,8 @@ import { fileURLToPath } from 'node:url';
 export default defineConfig({
   base: '/business/',
   plugins: [react()],
-  resolve: { alias: { '@': fileURLToPath(new URL('.', import.meta.url)) } },
+  resolve: {
+    dedupe:["react", "react-dom"], alias: { '@': fileURLToPath(new URL('.', import.meta.url)) } },
   define: { 'import.meta.env.VITE_AMUX_DIRECT': 'true' },
   css: { postcss: { plugins: [tailwindcss()] } },
   build: {
