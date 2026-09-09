@@ -2339,7 +2339,14 @@ Optional:
   --desc <text> | --desc-stdin | --desc-file <path>    card body
   --type <type>                                        the GATE is derived from this
   --depends-on <ISSUE-ID>                              link the new card to one it
-                                                       depends on (repeatable)
+                                                       depends on (repeatable).
+                                                       BLOCKS the claim until the
+                                                       dependency resolves; does NOT
+                                                       push when it does. board-drive
+                                                       picks the card up on a later
+                                                       tick (AF-621). For a wakeup on
+                                                       completion use "board request",
+                                                       which arms a terminal callback.
   --help                                               this text
 
 types: $(_board_valid_types)
@@ -2366,7 +2373,10 @@ Optional:
   --desc <text> | --desc-stdin | --desc-file <path>
   --type <type>
   --for <TASK-ID>                           parent requester task
-  --depends-on <ISSUE-ID>                 repeatable
+  --depends-on <ISSUE-ID>                 repeatable. Blocks the claim; the callback
+                                          armed above is the REQUEST's, not this
+                                          link's. A declared dependency does not push
+                                          on its own when it clears (AF-621).
   --due <YYYY-MM-DD>
   --callback-prompt <text>                what requester should do after return
   --no-callback                           keep the request one-way
