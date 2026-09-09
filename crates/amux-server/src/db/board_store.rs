@@ -2953,6 +2953,39 @@ fn terminal_action_digest(log: Option<&str>) -> (usize, String) {
 /// The discriminator was already IN the payload, on the Actions line. This
 /// reads it instead of printing it beside a contradicting summary.
 pub fn folded_into(log: Option<&str>) -> Option<String> {
+    folded_into_detail(log).map(|(id, _inferred)| id)
+}
+
+/// The marker the SERVER appends when it chose the fold target itself.
+///
+/// AF-616 (mixpeek-frustrations, from a live specimen on this lane's cards):
+/// the auto-fold picks its target by TEMPORAL ADJACENCY. It folds a capture
+/// into whatever card the lane created next, and nothing compares the two. Their
+/// report was captured as AF-613 and folded into AF-615, an unrelated finding
+/// this lane happened to card in the same minute, so the trail from the report
+/// to its fix runs through a card about something else.
+///
+/// Until now BOTH fold paths wrote the identical line, so the summary and the
+/// task callback said "folded this capture into AF-615" whether a lane ASSERTED
+/// the target with `board discard --folded-into` or a SQL query guessed it. That
+/// is a claim whose confidence cannot be read off it, and b3db93fd made it
+/// worse in the useful direction: a wrong target used to be a quiet link and is
+/// now a sentence the reporting lane reads.
+///
+/// This does NOT change when anything folds. Narrowing the window, or requiring
+/// the fold to be asserted, changes every lane's board and is recorded on AF-616
+/// as a decision that is not this lane's to take. Labelling the guess as a guess
+/// is not that change, and it is what lets a reader tell the two apart today.
+pub const FOLD_INFERRED_MARKER: &str = "[inferred]";
+
+/// The card this one was folded into, and whether the SERVER inferred that
+/// target rather than a lane declaring it.
+///
+/// `true` = inferred by adjacency, so the reader should confirm the target
+/// actually addresses the capture. Absence of the marker reads as declared,
+/// which is the safe direction for the entries written before AF-616: they
+/// predate the distinction and most of them were peer folds.
+pub fn folded_into_detail(log: Option<&str>) -> Option<(String, bool)> {
     let marker = "capture folded into ";
     log.unwrap_or_default()
         .lines()
@@ -2988,9 +3021,30 @@ pub fn folded_into(log: Option<&str>) -> Option<String> {
             };
             body.strip_prefix(marker)
         })
-        .filter_map(|rest| rest.split_whitespace().next())
-        .map(|id| id.trim_end_matches(['.', ',', ';', ')', '"', '\'', ']']).to_string())
-        .rfind(|id| !id.is_empty())
+        .filter_map(|rest| {
+            // The marker sits AFTER the id, so the id still parses out of an
+            // older entry that has no marker at all.
+            //
+            // REMOVE IT BEFORE TAKING THE ID, rather than relying on it never
+            // being first. A line with the marker and no target parsed the
+            // MARKER as the target ("[inferred", the `]` eaten by the
+            // punctuation trim below), so a fold naming nothing would have
+            // reported a fold into a card called `[inferred`. That is the same
+            // class as the `AF-615"` bug this parser already carries a test for.
+            let inferred = rest.contains(FOLD_INFERRED_MARKER);
+            let rest = rest.replace(FOLD_INFERRED_MARKER, " ");
+            rest.split_whitespace()
+                .next()
+                .map(|id| (id.to_string(), inferred))
+        })
+        .map(|(id, inferred)| {
+            (
+                id.trim_end_matches(['.', ',', ';', ')', '"', '\'', ']'])
+                    .to_string(),
+                inferred,
+            )
+        })
+        .rfind(|(id, _)| !id.is_empty())
 }
 
 /// Artifact-registry refs are combined with refs in evidence so a proof link
@@ -5346,6 +5400,52 @@ column=silent type:code=outranked(2)"
     /// A fold must be readable as a fold, from the log alone.
     ///
     /// Reported 2026-09-08 by mixpeek-frustrations and, independently, by
+    /// AF-616: a fold the SERVER guessed must not read like one a lane
+    /// DECLARED. Both paths write `capture folded into <ID>`; only the
+    /// adjacency-chosen one carries the marker.
+    #[test]
+    fn an_inferred_fold_target_is_distinguishable_from_a_declared_one() {
+        assert_eq!(
+            folded_into_detail(Some("capture folded into AF-615 [inferred]")),
+            Some(("AF-615".to_string(), true)),
+            "the auto-fold path guessed this target and must say so"
+        );
+        assert_eq!(
+            folded_into_detail(Some("capture folded into AF-615")),
+            Some(("AF-615".to_string(), false)),
+            "a lane naming its own target with --folded-into is an assertion"
+        );
+
+        // THE COMPATIBILITY GUARANTEE. The marker sits after the id, so every
+        // existing caller of `folded_into` parses the same id either way. Without
+        // this, adding provenance would silently retarget every fold to `AF-615`
+        // plus a suffix, which is the AF-615" bug this parser already carries a
+        // regression test for.
+        assert_eq!(
+            folded_into(Some("capture folded into AF-615 [inferred]")),
+            Some("AF-615".to_string()),
+            "the marker must not become part of the id"
+        );
+
+        // ENTRIES WRITTEN BEFORE THIS EXISTED read as declared, which is the safe
+        // direction: they predate the distinction and most were peer folds. An
+        // absent marker must never be reported as an inference.
+        assert_eq!(
+            folded_into_detail(Some("`12:01` amux: capture folded into AF-604")),
+            Some(("AF-604".to_string(), false))
+        );
+
+        // The marker alone is not a fold, and must not BECOME the target. The
+        // first cut parsed this as a fold into a card named `[inferred`, with
+        // the `]` eaten by the punctuation trim.
+        assert_eq!(folded_into_detail(Some("[inferred]")), None);
+        assert_eq!(
+            folded_into_detail(Some("capture folded into  [inferred]")),
+            None,
+            "a fold that names no target names nothing, marker or not"
+        );
+    }
+
     /// mixpeek-cicd: five capture shells across two lanes whose terminal
     /// summary said "discarded ... not supplied ... not recorded ... none
     /// recorded", which is the wording a genuinely dropped request produces.

@@ -1827,7 +1827,17 @@ fn fold_capture_for_worker_card(
         &AdvanceOpts {
             force: true,
             expected_from: Some("doing".into()),
-            log_line: Some(format!("capture folded into {}", new.id)),
+            // AF-616: THIS PATH GUESSED THE TARGET, so say so. The query
+            // below picks the most recent unclaimed capture for the lane, which
+            // means "the first card since the message" and not "this card is
+            // about that message". The declared path (`--folded-into`, where a
+            // lane names its own target) writes the same line WITHOUT this
+            // marker, so a reader can tell an assertion from an inference.
+            log_line: Some(format!(
+                "capture folded into {} {}",
+                new.id,
+                bs::FOLD_INFERRED_MARKER
+            )),
             skip_continuation: true,
             ..AdvanceOpts::default()
         },
@@ -2159,10 +2169,20 @@ pub(crate) async fn dispatch_pending_callbacks(
         // the empty shell. Telling the ROUTING lane that their peer "closed the
         // request without resolving the dependency" puts a false accusation in
         // front of the one party who will act on it.
-        let folded = bs::folded_into(row.log.as_deref());
+        let folded = bs::folded_into_detail(row.log.as_deref());
         let folded_note;
-        let resolution = if let Some(target) = folded.as_deref() {
-            folded_note = format!("folded this capture into {target}");
+        let resolution = if let Some((target, inferred)) = folded.as_ref() {
+            // AF-616: an INFERRED target was chosen by adjacency and nothing
+            // compared it to the capture. Saying so costs one clause and is the
+            // difference between a fact and a guess for the lane reading this.
+            folded_note = if *inferred {
+                format!(
+                    "folded this capture into {target} (target inferred from timing, \
+                     not declared — confirm it is about the capture)"
+                )
+            } else {
+                format!("folded this capture into {target}")
+            };
             folded_note.as_str()
         } else if bs::dependency_is_resolved(&row.status, &row.item_type) {
             "resolved the dependency"
@@ -12975,6 +12995,39 @@ mod slim_tests {
         assert!(
             got.desc.contains(&format!("Folded into {}", worker.id)),
             "the tombstone links to the worker card"
+        );
+    }
+
+    /// AF-616: the auto-fold CHOSE this target by adjacency, so the line it
+    /// writes must carry the inference marker. mixpeek-frustrations' specimen
+    /// is a report captured as AF-613 and folded into AF-615, an unrelated
+    /// finding carded in the same minute; the summary asserted that fold in the
+    /// same words a lane's own `--folded-into` would have produced.
+    ///
+    /// This pins the LABEL, not the choice. Narrowing the window is a change to
+    /// every lane's board and is not made here.
+    #[test]
+    fn an_auto_fold_records_that_it_inferred_the_target() {
+        let conn = fold_db();
+        let cap =
+            bs::create_issue(&conn, &fold_card("amux", "doing", "**Prompt:** do the thing", "lane"), 1000)
+                .unwrap();
+        let worker =
+            bs::create_issue(&conn, &fold_card("lane", "todo", "Fix the thing", "lane"), 1010).unwrap();
+        fold_capture_for_worker_card(&conn, &worker, 600, 1010).unwrap();
+
+        let got = bs::get_issue(&conn, &cap.id).unwrap().unwrap();
+        let log = got.log.as_deref().unwrap_or("");
+        assert!(
+            log.contains(&format!("capture folded into {} {}", worker.id, bs::FOLD_INFERRED_MARKER)),
+            "the adjacency-chosen target must be labelled as inferred; log was: {log}"
+        );
+        // AND IT MUST STILL RESOLVE. A marker that broke the id would turn a
+        // readable fold back into the dropped-request rendering b3db93fd fixed.
+        assert_eq!(
+            bs::folded_into_detail(Some(log)),
+            Some((worker.id.clone(), true)),
+            "the labelled line must still parse to the target"
         );
     }
 
