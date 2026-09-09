@@ -1,6 +1,7 @@
 //! Durable contracts shared by checkpoints, handoffs, sensors and guide rules.
 
 use crate::criteria::Criterion;
+use crate::policy::AgentRole;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -47,11 +48,131 @@ pub struct HandoffPacket {
     pub evidence: Vec<String>,
     pub assumptions: Vec<String>,
     pub unresolved: Vec<String>,
+    #[serde(default)]
+    pub concerns: Vec<String>,
+    #[serde(default)]
+    pub deviations: Vec<String>,
+    #[serde(default)]
+    pub findings: Vec<String>,
+    #[serde(default)]
+    pub requires_replan: bool,
+    #[serde(default)]
+    pub planning_scope_id: Option<String>,
     pub next_action: String,
     pub deadline: Option<String>,
     pub sender: String,
     pub receiver: String,
     pub created_at: DateTime<Utc>,
+}
+
+/// The durable interpretation of a user's goal.  The current row is replaced
+/// as intent becomes clearer; every prior version remains in immutable history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalContract {
+    pub id: String,
+    pub objective: String,
+    #[serde(default)]
+    pub non_goals: Vec<String>,
+    #[serde(default)]
+    pub success_metrics: Vec<String>,
+    #[serde(default)]
+    pub performance_requirements: Vec<String>,
+    #[serde(default)]
+    pub resource_constraints: Vec<String>,
+    pub dependency_policy: String,
+    pub release_policy: String,
+    pub expected_scope_min: u32,
+    pub expected_scope_max: u32,
+    pub version: u32,
+    pub updated_by: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl GoalContract {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.id.trim().is_empty() || self.objective.trim().is_empty() {
+            return Err("goal id and objective are required");
+        }
+        if self.dependency_policy.trim().is_empty() || self.release_policy.trim().is_empty() {
+            return Err("dependency_policy and release_policy are required");
+        }
+        if self.expected_scope_min == 0 || self.expected_scope_min > self.expected_scope_max {
+            return Err("expected scope must be a non-zero ordered range");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanningNodeStatus {
+    Active,
+    Waiting,
+    NeedsReplan,
+    Complete,
+}
+
+/// One recursively-owned slice of a goal.  This is deliberately not named
+/// `Scope`: core's Scope is the configuration-inheritance hierarchy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanningNode {
+    pub id: String,
+    pub goal_id: String,
+    pub parent_id: Option<String>,
+    pub task_id: Option<String>,
+    pub role: AgentRole,
+    pub owner: String,
+    pub title: String,
+    pub objective: String,
+    pub status: PlanningNodeStatus,
+    pub current_plan_version: u32,
+    pub wake_count: u32,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl PlanningNode {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.id.trim().is_empty()
+            || self.goal_id.trim().is_empty()
+            || self.owner.trim().is_empty()
+            || self.title.trim().is_empty()
+            || self.objective.trim().is_empty()
+        {
+            return Err("planning node id, goal, owner, title and objective are required");
+        }
+        if self.parent_id.is_none() && self.role != AgentRole::RootPlanner {
+            return Err("only a root planner may own a root planning node");
+        }
+        if self.parent_id.is_some() && self.role == AgentRole::RootPlanner {
+            return Err("a child planning node cannot be a root planner");
+        }
+        Ok(())
+    }
+}
+
+/// Replaceable plan projection. History is stored separately by the server;
+/// callers always receive the exact version that became current.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanProjection {
+    pub planning_node_id: String,
+    pub version: u32,
+    pub body: String,
+    pub reason: String,
+    pub authored_by: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl PlanProjection {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.planning_node_id.trim().is_empty()
+            || self.body.trim().is_empty()
+            || self.reason.trim().is_empty()
+            || self.authored_by.trim().is_empty()
+        {
+            return Err("planning node, plan body, reason and author are required");
+        }
+        Ok(())
+    }
 }
 
 impl HandoffPacket {

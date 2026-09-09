@@ -495,6 +495,15 @@ pub fn apply_event(
                 MutationKind::Created,
             ));
         }
+        WorkerEvent::TraceObserved(trace) => {
+            let stored = crate::db::trace_store::insert(conn, worker, trace, now)?;
+            events.push(PendingEvent {
+                entity_type: EntityType::Other("turn_trace".into()),
+                entity_id: stored.id,
+                mutation: MutationKind::Created,
+                payload: None,
+            });
+        }
         WorkerEvent::Started | WorkerEvent::TaskUpdated(_) | WorkerEvent::ContextLow(_) => {}
     }
 

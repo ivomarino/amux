@@ -405,13 +405,67 @@ impl Runtime {
             tracing::warn!(error = %e, "redistribute recommendation failed this tick");
         }
 
+        let tasks = self.load_board_tasks(&workers)?;
+        // Measure the queue the runtime actually sees, at the same seam that
+        // feeds the scheduler. Each task contributes once, so repeated ticks
+        // cannot manufacture evidence. Meaningful writer contention is also
+        // recorded from the real wait for this transaction.
+        let metric_tasks = tasks.clone();
+        let metric_wait_started = std::time::Instant::now();
+        self.store.write_async(move |conn| {
+            let lock_wait_ms = metric_wait_started.elapsed().as_millis() as u64;
+            let observed =
+                crate::db::throughput_store::observe_runtime_queue(conn, &metric_tasks, now)?;
+            let lock_metric = if lock_wait_ms >= 100 {
+                Some(crate::db::throughput_store::record_metric(
+                    conn, "lock_wait", "runtime", Some(lock_wait_ms), None,
+                    Some("orchestrator writer queue"), now,
+                )?)
+            } else {
+                None
+            };
+            let before = crate::db::throughput_store::get_wip_state(conn)?;
+            let after = crate::db::throughput_store::evaluate_wip(conn, now)?;
+            let changed = before.current_limit != after.current_limit
+                || before.recommended != after.recommended;
+            let mut events = Vec::new();
+            if observed > 0 {
+                events.push(PendingEvent {
+                    entity_type: EntityType::Other("work_metric".into()),
+                    entity_id: format!("runtime-queue:{observed}"),
+                    mutation: MutationKind::Created,
+                    payload: None,
+                });
+            }
+            if let Some(id) = lock_metric {
+                events.push(PendingEvent {
+                    entity_type: EntityType::Other("work_metric".into()),
+                    entity_id: id,
+                    mutation: MutationKind::Created,
+                    payload: None,
+                });
+            }
+            if changed {
+                events.push(PendingEvent {
+                    entity_type: EntityType::Other("adaptive_wip".into()),
+                    entity_id: "singleton".into(),
+                    mutation: MutationKind::Updated,
+                    payload: serde_json::to_value(&after).ok(),
+                });
+            }
+            Ok(WriteOutcome {
+                applied: observed > 0 || lock_wait_ms >= 100 || changed,
+                events,
+            })
+        }).await?;
+
         // Command delivery pump (Invariant 34): drain each worker's queue
-        // head through the agent protocol, honoring DeliveryTiming.
+        // head through the agent protocol, honoring DeliveryTiming. Queue and
+        // writer-wait measurement happens first so pump writes cannot consume
+        // and hide the contention interval being measured this tick.
         if let Err(e) = self.pump_commands(now, &provider_states).await {
             tracing::warn!(error = %e, "command pump failed this tick");
         }
-
-        let tasks = self.load_board_tasks(&workers)?;
         let hints = BTreeMap::new();
         // The attempt ledger (Invariant 49) feeds BOTH the planner (so
         // attempt N+1's prompt carries why 1..N failed) and enforce_limits
@@ -421,6 +475,10 @@ impl Runtime {
         // arrived with zero prior attempts, so no task could ever exhaust
         // its budget and quarantine never triggered.
         let attempts = self.load_attempts()?;
+        let wip_limit = {
+            let conn = self.store.read()?;
+            crate::db::throughput_store::effective_wip_limit(&conn)?
+        };
 
         let plan = plan_tick(&TickInputs {
             now,
@@ -432,7 +490,7 @@ impl Runtime {
             attempts: &attempts,
             gates: &[],
             lease_secs: 600,
-            wip_limit: 1,
+            wip_limit,
             provider_states: &provider_states,
         });
 
@@ -723,27 +781,43 @@ impl Runtime {
             let task = lease.task.to_string();
             let worker = lease.worker.to_string();
             let generation = lease.generation;
+            let expired_at = lease.expires_at;
             self.store
                 .write_async(move |conn| {
                     let n = conn.execute(
                         "DELETE FROM _amux_leases WHERE task_id = ?1 AND generation = ?2",
                         params![task, generation],
                     )?;
+                    let mut events = Vec::new();
+                    if n > 0 {
+                        let measured_at = Utc::now();
+                        let recovery_ms = measured_at
+                            .signed_duration_since(expired_at)
+                            .num_milliseconds()
+                            .max(0) as u64;
+                        let id = crate::db::throughput_store::record_metric(
+                            conn, "recovery", "runtime", Some(recovery_ms), Some(&task),
+                            Some("expired lease reclaimed"), measured_at,
+                        )?;
+                        events.push(PendingEvent {
+                            entity_type: EntityType::Other("work_metric".into()),
+                            entity_id: id,
+                            mutation: MutationKind::Created,
+                            payload: None,
+                        });
+                        events.push(PendingEvent {
+                            entity_type: EntityType::Other("lease".into()),
+                            entity_id: task.clone(),
+                            mutation: MutationKind::StatusChanged {
+                                from: format!("held:{worker}"),
+                                to: "reclaimed".into(),
+                            },
+                            payload: None,
+                        });
+                    }
                     Ok(WriteOutcome {
                         applied: n > 0,
-                        events: if n > 0 {
-                            vec![PendingEvent {
-                                entity_type: EntityType::Other("lease".into()),
-                                entity_id: task.clone(),
-                                mutation: MutationKind::StatusChanged {
-                                    from: format!("held:{worker}"),
-                                    to: "reclaimed".into(),
-                                },
-                                payload: None,
-                            }]
-                        } else {
-                            vec![]
-                        },
+                        events,
                     })
                 })
                 .await?;
@@ -940,18 +1014,30 @@ impl Runtime {
                                  COALESCE((SELECT generation + 1 FROM _amux_leases WHERE task_id = ?1), 0))",
                         params![task, worker, acquired, expires],
                     )?;
+                    let mut events = Vec::new();
+                    if n > 0 {
+                        events.push(PendingEvent {
+                            entity_type: EntityType::Other("lease".into()),
+                            entity_id: task.clone(),
+                            mutation: MutationKind::Created,
+                            payload: None,
+                        });
+                    } else {
+                        let id = crate::db::throughput_store::record_metric(
+                            conn, "conflict", "runtime", None, Some(&task),
+                            Some("lease claim lost after planning"), Utc::now(),
+                        )?;
+                        let _ = crate::db::throughput_store::evaluate_wip(conn, Utc::now())?;
+                        events.push(PendingEvent {
+                            entity_type: EntityType::Other("work_metric".into()),
+                            entity_id: id,
+                            mutation: MutationKind::Created,
+                            payload: None,
+                        });
+                    }
                     Ok(WriteOutcome {
-                        applied: n > 0,
-                        events: if n > 0 {
-                            vec![PendingEvent {
-                                entity_type: EntityType::Other("lease".into()),
-                                entity_id: task.clone(),
-                                mutation: MutationKind::Created,
-                                payload: None,
-                            }]
-                        } else {
-                            vec![]
-                        },
+                        applied: true,
+                        events,
                     })
                 })
                 .await?;

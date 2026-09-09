@@ -96,6 +96,7 @@ pub mod integrations;
 pub mod invariants;
 pub mod opencode;
 pub mod orchestrator;
+pub mod reconciliation;
 pub mod provider;
 pub mod push;
 pub mod runtime_jobs;

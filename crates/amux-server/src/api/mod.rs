@@ -55,10 +55,12 @@ pub mod messages;
 pub mod org;
 pub mod prefs;
 pub mod policy;
+pub mod planning;
 pub mod proxies;
 pub mod tunnel;
 pub mod py_proxy;
 pub mod reclaim;
+pub mod reconciliation;
 pub mod request_log;
 pub mod review;
 pub mod saved_messages;
@@ -148,7 +150,12 @@ pub fn router(state: AppState) -> Router {
         // lives here so there is one place to be wrong.
         .nest("/api/why", why::routes())
         .nest("/api/verify", verify::routes())
-        .nest("/api/harness", harness::routes())
+        .nest(
+            "/api/harness",
+            harness::routes()
+                .merge(planning::routes())
+                .merge(reconciliation::routes()),
+        )
         .nest("/api/policy", policy::routes())
         .nest("/api/prefs", prefs::routes())
         .nest("/api/criteria", criteria::routes())

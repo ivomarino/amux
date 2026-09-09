@@ -81,6 +81,10 @@ pub enum WorkerEvent {
     Waiting(WaitReason),
     /// A tool was invoked.
     ToolUsed(ToolEvent),
+    /// Redacted, bounded transcript material for durable per-turn replay.
+    /// The runtime applies redaction again at persistence time; producers do
+    /// not get to assert that content is safe merely by constructing this.
+    TraceObserved(TurnTrace),
     /// The worker mutated a task (claimed, advanced, annotated).
     TaskUpdated(TaskId),
     /// A turn ended.
@@ -124,6 +128,22 @@ pub struct ToolEvent {
     pub tool: String,
     /// Short human-readable summary of the call, not the full payload.
     pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnTraceKind {
+    Prompt,
+    ProviderEvent,
+    CommandOutput,
+    SystemAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnTrace {
+    pub turn_id: TurnId,
+    pub kind: TurnTraceKind,
+    pub content: String,
 }
 
 /// How a turn ended.

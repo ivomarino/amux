@@ -95,6 +95,114 @@ pub struct TickPlan {
     pub stalls: Vec<StallViolation>,
 }
 
+/// Measured inputs for the bounded WIP controller. The controller changes by
+/// at most one slot per evaluation and is inert until it has enough evidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdaptiveWipInputs {
+    pub current: usize,
+    pub min: usize,
+    pub max: usize,
+    pub sample_size: u64,
+    pub queue_depth: u64,
+    pub active_workers: u64,
+    pub average_queue_wait_ms: Option<f64>,
+    pub average_lock_wait_ms: Option<f64>,
+    pub conflict_rate: Option<f64>,
+    pub rework_rate: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdaptiveWipDecision {
+    pub recommended: usize,
+    pub reason: String,
+}
+
+pub fn adaptive_wip(inputs: &AdaptiveWipInputs) -> AdaptiveWipDecision {
+    let current = inputs.current.clamp(inputs.min, inputs.max.max(inputs.min));
+    if inputs.sample_size < 5 {
+        return AdaptiveWipDecision {
+            recommended: current,
+            reason: format!("insufficient evidence: {} of 5 samples", inputs.sample_size),
+        };
+    }
+    let contention = inputs.average_lock_wait_ms.is_some_and(|ms| ms > 1_000.0)
+        || inputs.conflict_rate.is_some_and(|rate| rate > 0.15)
+        || inputs.rework_rate.is_some_and(|rate| rate > 0.15);
+    if contention && current > inputs.min {
+        return AdaptiveWipDecision {
+            recommended: current - 1,
+            reason: "contention or rework exceeded the safe band".into(),
+        };
+    }
+    let demand = inputs.queue_depth
+        > inputs
+            .active_workers
+            .max(1)
+            .saturating_mul(current as u64)
+        && inputs.average_queue_wait_ms.is_some_and(|ms| ms > 30_000.0);
+    let safe_to_expand = inputs.average_lock_wait_ms.unwrap_or(0.0) < 1_000.0
+        && inputs.conflict_rate.unwrap_or(0.0) < 0.05
+        && inputs.rework_rate.unwrap_or(0.0) < 0.08;
+    if demand && safe_to_expand && current < inputs.max {
+        return AdaptiveWipDecision {
+            recommended: current + 1,
+            reason: "queued demand is high and contention remains inside the safe band".into(),
+        };
+    }
+    AdaptiveWipDecision {
+        recommended: current,
+        reason: "measurements do not justify a WIP change".into(),
+    }
+}
+
+#[cfg(test)]
+mod adaptive_wip_tests {
+    use super::*;
+
+    fn inputs() -> AdaptiveWipInputs {
+        AdaptiveWipInputs {
+            current: 2,
+            min: 1,
+            max: 4,
+            sample_size: 5,
+            queue_depth: 10,
+            active_workers: 2,
+            average_queue_wait_ms: Some(45_000.0),
+            average_lock_wait_ms: Some(100.0),
+            conflict_rate: Some(0.0),
+            rework_rate: Some(0.0),
+        }
+    }
+
+    #[test]
+    fn waits_for_evidence_and_never_changes_by_more_than_one() {
+        let mut measured = inputs();
+        measured.sample_size = 4;
+        assert_eq!(adaptive_wip(&measured).recommended, 2);
+
+        measured.sample_size = 5;
+        assert_eq!(adaptive_wip(&measured).recommended, 3);
+        measured.average_lock_wait_ms = Some(8_000.0);
+        assert_eq!(adaptive_wip(&measured).recommended, 1);
+    }
+
+    #[test]
+    fn contention_wins_over_demand_and_limits_are_hard_bounds() {
+        let mut measured = inputs();
+        measured.current = 1;
+        measured.conflict_rate = Some(0.5);
+        assert_eq!(adaptive_wip(&measured).recommended, 1);
+
+        measured.current = 4;
+        measured.conflict_rate = Some(0.0);
+        assert_eq!(adaptive_wip(&measured).recommended, 4);
+
+        measured.current = 3;
+        measured.rework_rate = Some(0.20);
+        assert_eq!(adaptive_wip(&measured).recommended, 2);
+    }
+}
+
 /// Age factor: an hour of waiting outranks one explicit priority point, so
 /// starvation self-corrects without a separate aging pass.
 fn score(task: &Task, hints: Option<&PriorityHints>, now: DateTime<Utc>) -> i64 {

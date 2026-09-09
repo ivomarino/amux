@@ -455,6 +455,11 @@ pub fn record_assignment_handoff(
         evidence: row.evidence.clone().into_iter().collect(),
         assumptions: Vec::new(),
         unresolved: row.unresolved.clone().into_iter().collect(),
+        concerns: Vec::new(),
+        deviations: Vec::new(),
+        findings: Vec::new(),
+        requires_replan: false,
+        planning_scope_id: None,
         next_action: row
             .next_action
             .clone()

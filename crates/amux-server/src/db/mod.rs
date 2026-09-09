@@ -18,6 +18,8 @@ pub mod advance;
 pub mod artifact_store;
 pub mod board_store;
 pub mod task_graph_store;
+pub mod trace_store;
+pub mod throughput_store;
 pub mod commands;
 pub mod harness_store;
 pub mod memories;

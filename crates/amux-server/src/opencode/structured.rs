@@ -66,7 +66,9 @@
 
 use super::{events, AgentProtocol, AgentState, Prompt, ProtocolError, Result};
 use amux_core::ids::{MessageId, TurnId, WorkerId};
-use amux_core::protocol::{ExitStatus, Failure, WorkerEvent};
+use amux_core::protocol::{
+    ExitStatus, Failure, TurnTrace, TurnTraceKind, WorkerEvent,
+};
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -467,6 +469,11 @@ impl StructuredCliProtocol {
             (stdout, stderr, turn, resumed_from)
         };
 
+        shared.emit(WorkerEvent::TraceObserved(TurnTrace {
+            turn_id: turn.clone(),
+            kind: TurnTraceKind::Prompt,
+            content: text.to_string(),
+        }));
         tokio::spawn(read_stream(shared, stdout, stderr, turn, resumed_from));
         Ok(())
     }
@@ -507,6 +514,11 @@ async fn read_stream(
     let mut turn_completed = false;
     let mut saw_conversation_ref = false;
     while let Ok(Some(line)) = lines.next_line().await {
+        shared.emit(WorkerEvent::TraceObserved(TurnTrace {
+            turn_id: turn.clone(),
+            kind: TurnTraceKind::ProviderEvent,
+            content: line.clone(),
+        }));
         // Continuity capture, BEFORE translation (an init line is also a
         // Started event; the two concerns stay independent).
         if let Some(cid) = shared.config.provider.conversation_ref(&line) {
@@ -581,6 +593,13 @@ async fn read_stream(
         None => None, // cancel() raced us and the child is being torn down
     };
     let tail = stderr_task.await.unwrap_or_default();
+    if !tail.is_empty() {
+        shared.emit(WorkerEvent::TraceObserved(TurnTrace {
+            turn_id: turn.clone(),
+            kind: TurnTraceKind::CommandOutput,
+            content: tail.clone(),
+        }));
+    }
 
     match status {
         Some(st) if st.success() => {
@@ -868,6 +887,7 @@ mod tests {
             WorkerEvent::Progress(_) => "progress",
             WorkerEvent::Waiting(_) => "waiting",
             WorkerEvent::ToolUsed(_) => "tool_used",
+            WorkerEvent::TraceObserved(_) => "trace_observed",
             WorkerEvent::TaskUpdated(_) => "task_updated",
             WorkerEvent::TurnCompleted(_) => "turn_completed",
             WorkerEvent::RateLimited(_) => "rate_limited",
@@ -875,6 +895,21 @@ mod tests {
             WorkerEvent::Failed(_) => "failed",
             WorkerEvent::Exited(_) => "exited",
         }
+    }
+
+    fn lifecycle_kinds(events: &[WorkerEvent]) -> Vec<&'static str> {
+        events
+            .iter()
+            .filter(|event| !matches!(event, WorkerEvent::TraceObserved(_)))
+            .map(kind)
+            .collect()
+    }
+
+    fn trace_count(events: &[WorkerEvent]) -> usize {
+        events
+            .iter()
+            .filter(|event| matches!(event, WorkerEvent::TraceObserved(_)))
+            .count()
     }
 
     #[test]
@@ -1011,12 +1046,13 @@ mod tests {
         proto.send_prompt(&w, prompt("k1")).await.unwrap();
 
         let evs = collect_until_terminal(&mut rx, Duration::from_secs(10)).await;
-        let kinds: Vec<_> = evs.iter().map(kind).collect();
+        let kinds = lifecycle_kinds(&evs);
         assert_eq!(
             kinds,
             vec!["started", "turn_started", "progress", "turn_completed"],
             "{evs:?}"
         );
+        assert_eq!(trace_count(&evs), 5, "prompt plus every provider line");
         let settled = wait_for_state(&proto, &w, |s| *s == AgentState::Idle).await;
         assert_eq!(settled, AgentState::Idle);
     }
@@ -1052,7 +1088,7 @@ mod tests {
         proto.send_prompt(&w, prompt("k1")).await.unwrap();
 
         let evs = collect_until_terminal(&mut rx, Duration::from_secs(10)).await;
-        let kinds: Vec<_> = evs.iter().map(kind).collect();
+        let kinds = lifecycle_kinds(&evs);
         assert_eq!(
             kinds,
             vec![
@@ -1064,6 +1100,7 @@ mod tests {
             ],
             "{evs:?}"
         );
+        assert_eq!(trace_count(&evs), 4, "prompt plus every provider line");
     }
 
     #[tokio::test]
@@ -1095,12 +1132,13 @@ mod tests {
         proto.send_prompt(&w, prompt("k1")).await.unwrap();
 
         let evs = collect_until_terminal(&mut rx, Duration::from_secs(10)).await;
-        let kinds: Vec<_> = evs.iter().map(kind).collect();
+        let kinds = lifecycle_kinds(&evs);
         assert_eq!(
             kinds,
             vec!["started", "turn_started", "progress", "turn_completed"],
             "{evs:?}"
         );
+        assert_eq!(trace_count(&evs), 4, "prompt plus every provider line");
         match evs.last().unwrap() {
             WorkerEvent::TurnCompleted(r) => assert_eq!(r.outcome, "success: done"),
             other => panic!("expected TurnCompleted, got {other:?}"),
@@ -1176,9 +1214,10 @@ mod tests {
         proto.send_prompt(&w, prompt("k1")).await.unwrap();
 
         let evs = collect_until_terminal(&mut rx, Duration::from_secs(10)).await;
-        let kinds: Vec<_> = evs.iter().map(kind).collect();
+        let kinds = lifecycle_kinds(&evs);
         assert_eq!(kinds, vec!["started", "failed", "exited"], "{evs:?}");
-        match &evs[2] {
+        assert_eq!(trace_count(&evs), 2, "prompt plus the provider line");
+        match evs.last().unwrap() {
             WorkerEvent::Exited(st) => assert_eq!(st.code, Some(3)),
             other => panic!("expected Exited, got {other:?}"),
         }

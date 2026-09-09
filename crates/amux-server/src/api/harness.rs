@@ -43,7 +43,139 @@ pub fn routes() -> Router<AppState> {
         .route("/guides", axum::routing::get(list_guides).put(put_guide))
         .route("/compile", axum::routing::post(compile_harness))
         .route("/ratchet", axum::routing::post(ratchet))
+        .route("/traces/{turn_id}", axum::routing::get(get_turn_traces))
+        .route("/work-metrics", axum::routing::post(post_work_metric))
+        .route(
+            "/adaptive-wip",
+            axum::routing::get(get_adaptive_wip).put(put_adaptive_wip),
+        )
         .route("/health", axum::routing::get(health))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkMetricInput {
+    kind: String,
+    duration_ms: Option<u64>,
+    task_id: Option<String>,
+    detail: Option<String>,
+}
+
+async fn post_work_metric(
+    State(state): State<AppState>,
+    Json(body): Json<WorkMetricInput>,
+) -> Response {
+    let result = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let result_w = result.clone();
+    match state
+        .store
+        .write_async(move |conn| {
+            let id = crate::db::throughput_store::record_metric(
+                conn,
+                &body.kind,
+                "api",
+                body.duration_ms,
+                body.task_id.as_deref(),
+                body.detail.as_deref(),
+                Utc::now(),
+            )?;
+            let wip = crate::db::throughput_store::evaluate_wip(conn, Utc::now())?;
+            *result_w.lock().expect("metric result") = Some((id.clone(), wip));
+            Ok(crate::db::WriteOutcome {
+                applied: true,
+                events: vec![crate::db::PendingEvent {
+                    entity_type: amux_core::revision::EntityType::Other("work_metric".into()),
+                    entity_id: id,
+                    mutation: amux_core::revision::MutationKind::Created,
+                    payload: None,
+                }],
+            })
+        })
+        .await
+    {
+        Ok(_) => match result.lock().expect("metric result").clone() {
+            Some((id, adaptive_wip)) => (
+                StatusCode::CREATED,
+                Json(json!({"id": id, "adaptive_wip": adaptive_wip})),
+            )
+                .into_response(),
+            None => internal("metric write produced no result"),
+        },
+        Err(error) => internal(error),
+    }
+}
+
+async fn get_adaptive_wip(State(state): State<AppState>) -> Response {
+    let conn = match state.store.read() {
+        Ok(conn) => conn,
+        Err(error) => return internal(error),
+    };
+    match crate::db::throughput_store::get_wip_state(&conn) {
+        Ok(wip) => Json(json!({"measured": true, "n_considered": wip.sample_size, "state": wip}))
+            .into_response(),
+        Err(error) => internal(error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WipInput {
+    mode: String,
+    current_limit: usize,
+    min_limit: usize,
+    max_limit: usize,
+}
+
+async fn put_adaptive_wip(State(state): State<AppState>, Json(body): Json<WipInput>) -> Response {
+    let result = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let result_w = result.clone();
+    match state
+        .store
+        .write_async(move |conn| {
+            let wip = crate::db::throughput_store::configure_wip(
+                conn,
+                &body.mode,
+                body.current_limit,
+                body.min_limit,
+                body.max_limit,
+                Utc::now(),
+            )?;
+            *result_w.lock().expect("wip result") = Some(wip.clone());
+            Ok(crate::db::WriteOutcome {
+                applied: true,
+                events: vec![crate::db::PendingEvent {
+                    entity_type: amux_core::revision::EntityType::Other("adaptive_wip".into()),
+                    entity_id: "singleton".into(),
+                    mutation: amux_core::revision::MutationKind::Updated,
+                    payload: serde_json::to_value(&wip).ok(),
+                }],
+            })
+        })
+        .await
+    {
+        Ok(_) => match result.lock().expect("wip result").clone() {
+            Some(wip) => Json(wip).into_response(),
+            None => internal("wip write produced no result"),
+        },
+        Err(error) => internal(error),
+    }
+}
+
+async fn get_turn_traces(State(state): State<AppState>, Path(turn_id): Path<String>) -> Response {
+    let conn = match state.store.read() {
+        Ok(conn) => conn,
+        Err(error) => return internal(error),
+    };
+    match crate::db::trace_store::list_for_turn(&conn, &turn_id) {
+        Ok(items) => Json(json!({
+            "measured": true,
+            "n_considered": items.len(),
+            "turn_id": turn_id,
+            "items": items
+        }))
+        .into_response(),
+        Err(error) => internal(error),
+    }
 }
 
 fn actor(headers: &HeaderMap) -> String {
@@ -175,6 +307,15 @@ struct HandoffInput {
     assumptions: Vec<String>,
     #[serde(default)]
     unresolved: Vec<String>,
+    #[serde(default)]
+    concerns: Vec<String>,
+    #[serde(default)]
+    deviations: Vec<String>,
+    #[serde(default)]
+    findings: Vec<String>,
+    #[serde(default)]
+    requires_replan: bool,
+    planning_scope_id: Option<String>,
     next_action: String,
     deadline: Option<String>,
     receiver: String,
@@ -186,6 +327,51 @@ async fn post_handoff(
     headers: HeaderMap,
     Json(body): Json<HandoffInput>,
 ) -> Response {
+    let sender = actor(&headers);
+    if let Some(node_id) = body.planning_scope_id.as_deref() {
+        let conn = match state.store.read() {
+            Ok(conn) => conn,
+            Err(error) => return internal(error),
+        };
+        let node = match crate::db::harness_store::get_planning_node(&conn, node_id) {
+            Ok(Some(node)) => node,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "unknown planning node"})),
+                )
+                    .into_response()
+            }
+            Err(error) => return internal(error),
+        };
+        if node.owner != sender {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "handoff sender does not own the planning node",
+                    "code": "handoff_sender_not_owner"
+                })),
+            )
+                .into_response();
+        }
+        if let Some(parent_id) = node.parent_id.as_deref() {
+            let parent = match crate::db::harness_store::get_planning_node(&conn, parent_id) {
+                Ok(Some(parent)) => parent,
+                Ok(None) => return internal("planning node parent is missing"),
+                Err(error) => return internal(error),
+            };
+            if parent.owner != body.receiver {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "error": "handoff receiver must own the parent planning node",
+                        "code": "handoff_receiver_not_parent_owner"
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
     let packet = HandoffPacket {
         id: format!("hof_{}", ulid::Ulid::new().to_string().to_lowercase()),
         task_id: id.clone(),
@@ -198,9 +384,14 @@ async fn post_handoff(
         evidence: body.evidence,
         assumptions: body.assumptions,
         unresolved: body.unresolved,
+        concerns: body.concerns,
+        deviations: body.deviations,
+        findings: body.findings,
+        requires_replan: body.requires_replan,
+        planning_scope_id: body.planning_scope_id,
         next_action: body.next_action,
         deadline: body.deadline,
-        sender: actor(&headers),
+        sender,
         receiver: body.receiver,
         created_at: Utc::now(),
     };
@@ -824,6 +1015,8 @@ async fn health(State(state): State<AppState>, Query(query): Query<HealthQuery>)
             conn.query_row("SELECT COUNT(*) FROM _amux_sensor_profiles", [], |row| {
                 row.get(0)
             })?;
+        let throughput =
+            crate::db::throughput_store::health_snapshot(&conn, since, f64::from(days) * 24.0)?;
         Ok(json!({
             "measured": true,
             "n_considered": total_verifications + policy_total + handoffs + tool_calls,
@@ -845,6 +1038,7 @@ async fn health(State(state): State<AppState>, Query(query): Query<HealthQuery>)
                 "cost_usd": (verified_tasks > 0).then(|| cost_usd / verified_tasks as f64),
                 "tool_calls": (verified_tasks > 0).then(|| tool_calls as f64 / verified_tasks as f64)
             },
+            "throughput": throughput,
             "policy_outcomes": {"sample_size": policy_total, "items": policy},
             "versions": {
                 "harness": harness_version,

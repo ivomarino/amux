@@ -44,6 +44,7 @@ fn kind(ev: &WorkerEvent) -> &'static str {
         WorkerEvent::Progress(_) => "progress",
         WorkerEvent::Waiting(_) => "waiting",
         WorkerEvent::ToolUsed(_) => "tool_used",
+        WorkerEvent::TraceObserved(_) => "trace_observed",
         WorkerEvent::TaskUpdated(_) => "task_updated",
         WorkerEvent::TurnCompleted(_) => "turn_completed",
         WorkerEvent::RateLimited(_) => "rate_limited",

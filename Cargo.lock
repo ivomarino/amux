@@ -147,6 +147,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ulid",
+ "wait-timeout",
 ]
 
 [[package]]

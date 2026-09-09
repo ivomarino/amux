@@ -59,6 +59,7 @@ libc.workspace = true
 tempfile.workspace = true
 portable-pty = "0.9.0"
 serde_yaml = "0.9.34"
+wait-timeout = "0.2"
 
 [dev-dependencies]
 proptest.workspace = true

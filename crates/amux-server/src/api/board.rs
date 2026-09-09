@@ -1111,15 +1111,11 @@ async fn get_contract(
             // where no refusal exists to correct you.
             "wrong_type": "If the item has no code, set its type first — the gate is DERIVED                            from the type. CLI: `amux board type <id> <type>`. API: PATCH                            /api/board/<id> with {\"type\": \"investigation\"} — the field is                            `type`, NOT `item_type` (that one is ignored and reported in                            `ignored_fields`). Settable at creation too: POST /api/board with                            {\"title\": ..., \"type\": ...}.",
         },
-        "worker_requests": {
-            "cli": "amux board request <worker> <title> [--for <PARENT-TASK>] [--desc ...] [--callback-prompt ...] [--no-callback]",
-            "api": "POST /api/board with a different session plus optional request_parent and callback:true, a prompt string, or {prompt}; X-Amux-Worker is the verified requester",
-            "lifecycle": "the delegated child is created in backlog and added to the requester task's depends_on; the parent moves doing -> todo so it releases WIP, stays dependency-blocked while the child is open, and becomes ready automatically when the child closes",
-            "parent_resolution": "request_parent/--for is authoritative. Otherwise the latest durable message->task link identifies the current task, with a unique doing task as fallback. No active task creates an intentional standalone request; multiple doing tasks are refused rather than linked incorrectly",
-            "callback": "optional; request CLI arms it by default. It fires when the dependency is resolved: verified for runtime-changing types, done for types without verification. Discarded sends a failure indicator and stays blocking. It queues a durable message to the verified requester",
-            "durability": "requested_by, callback target/prompt/state/message id/fired time/error live on the task. A stable steering id makes restart recovery idempotent; model/provider context is not involved",
-            "visibility": "the initial request links to the dependency; its completion callback links to the original requesting task when unique, with producer origin and both task IDs in history",
-            "security": "a callback can return only to the server-verified requester; isolated raw workers remain outside harness delivery",
+        "worker_board_ownership": {
+            "rule": "an identified worker may create cards only on its own board; `session` must equal the verified X-Amux-Worker/X-Amux-Session identity",
+            "peer_links": "cross-worker collaboration is represented without transferring board ownership: set `reviewer` or `shepherd` to the peer and use `depends_on` for cross-board task dependencies",
+            "cli": "amux board request <worker> <title> creates the card on the caller's board and links <worker> as reviewer",
+            "security": "a worker cannot create an unassigned card or place a new card directly on another worker's board; anonymous/human control-plane callers retain administrative placement",
         },
         "capture_decomposition": {
             "cli": "amux board decompose <capture-id> --stdin",
@@ -3883,6 +3879,23 @@ pub async fn create_item(
     } else {
         hdr_session.chars().take(64).collect()
     };
+    if !hdr_session.is_empty() && session != hdr_session {
+        tracing::warn!(
+            caller = %hdr_session,
+            requested_owner = %(if session.is_empty() { "(unassigned)" } else { session.as_str() }),
+            "cross-board card creation refused"
+        );
+        return err(
+            StatusCode::FORBIDDEN,
+            json!({
+                "error": "workers may create board items only on their own board",
+                "code": "cross_board_create_forbidden",
+                "caller": hdr_session,
+                "requested_owner": if session.is_empty() { Value::Null } else { json!(session) },
+                "how_to_fix": "create the card on your own board and link the peer with reviewer, shepherd, or depends_on",
+            }),
+        );
+    }
 
     let status_in = body_str(&map, "status").unwrap_or_else(|| "todo".into());
     // THE SAME PREDICATE ON THE CREATE DOOR (AMUX-3929). The transition gate
@@ -4009,52 +4022,6 @@ pub async fn create_item(
         None => if session.is_empty() { "human" } else { "agent" }.to_string(),
     };
 
-    // A peer request is a BOARD CONTRACT, not an ordinary pane message. The
-    // requester comes only from the verified worker header; accepting a body
-    // field here would let a worker manufacture somebody else's return path.
-    let is_peer_request = !hdr_session.is_empty() && !session.is_empty() && hdr_session != session;
-    if is_peer_request {
-        if let Err(reason) =
-            crate::api::session_verbs::cross_group_send_ok(&hdr_session, &session)
-        {
-            return err(
-                StatusCode::FORBIDDEN,
-                json!({
-                    "error": reason,
-                    "code": "task_request_not_authorized",
-                    "requester": hdr_session,
-                    "target": session,
-                    "how_to_fix": "put both workers in a group, or enable the existing cross-group worker configuration; the board request and direct-send paths use the same policy",
-                }),
-            );
-        }
-    }
-    let request_parent = match map.get("request_parent") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(id)) if !id.trim().is_empty() => Some(id.trim().to_string()),
-        Some(Value::String(_)) => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                json!({"error": "request_parent must be a non-empty task id"}),
-            )
-        }
-        Some(_) => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                json!({"error": "request_parent must be a task id string"}),
-            )
-        }
-    };
-    if request_parent.is_some() && !is_peer_request {
-        return err(
-            StatusCode::BAD_REQUEST,
-            json!({
-                "error": "request_parent is valid only for a worker-to-worker task request",
-                "code": "task_request_parent_without_peer_request",
-            }),
-        );
-    }
-    let requested_by = is_peer_request.then(|| hdr_session.clone());
     let callback_specified = map.contains_key("callback");
     let (callback_session, callback_prompt) = match map.get("callback") {
         None | Some(Value::Null) | Some(Value::Bool(false)) => (None, None),
@@ -4111,7 +4078,7 @@ pub async fn create_item(
     let known_keys = [
         "title", "desc", "status", "session", "type", "depends_on", "tags", "creator",
         "reviewer", "shepherd", "gate", "owner_type", "due", "due_time", "callback",
-        "ask_actor", "ask_type", "ask_question", "ask_unblocks", "request_parent",
+        "ask_actor", "ask_type", "ask_question", "ask_unblocks",
     ];
     let ignored: Vec<String> = map
         .keys()
@@ -4197,19 +4164,14 @@ pub async fn create_item(
         // AF-367: the HTTP create path — a real POST /api/board from a lane or
         // a human, as opposed to a card a daemon filed.
         source: Some("agent".into()),
-        requested_by,
+        requested_by: None,
         callback_session,
         callback_prompt,
     };
 
-    enum DependencyLink {
-        Standalone,
-        ParentRequeued { parent: String, prior_status: String },
-    }
     enum Out {
         Cycle(Vec<String>),
-        ParentRefused(RequestParentRefusal),
-        Created(Box<IssueRow>, DependencyLink),
+        Created(Box<IssueRow>),
     }
     let slot: Arc<Mutex<Option<Out>>> = Arc::new(Mutex::new(None));
     let slot_w = slot.clone();
@@ -4217,25 +4179,9 @@ pub async fn create_item(
     // response can name it and it can be reported without re-querying.
     let folded: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let folded_w = folded.clone();
-    let requester_for_parent = hdr_session.clone();
     let write = state
         .store
         .write_async(move |conn| {
-            let mut parent = if new.requested_by.is_some() {
-                match resolve_request_parent(
-                    conn,
-                    &requester_for_parent,
-                    request_parent.as_deref(),
-                )? {
-                    RequestParentResolution::Standalone => None,
-                    RequestParentResolution::Linked(row) => Some(row),
-                    RequestParentResolution::Refused(refusal) => {
-                        return finish(&slot_w, Out::ParentRefused(refusal), no_write())
-                    }
-                }
-            } else {
-                None
-            };
             // Acyclicity is validated INSIDE the write so no interleaved
             // create can slip a cycle between check and insert. The new id
             // does not exist yet, so a placeholder self id is fine — only
@@ -4263,93 +4209,10 @@ pub async fn create_item(
                 if let Some(cycle) = bs::depends_on_cycle(conn, NEW_CARD_SELF_ID, &new.depends_on)? {
                     return finish(&slot_w, Out::Cycle(cycle), no_write());
                 }
-                // Adding parent -> new-child at the same time would close a
-                // cycle when any child dependency already reaches the parent.
-                // Validate that hypothetical edge before minting either side
-                // of the relationship; no partial child may survive refusal.
-                if let Some(parent) = parent.as_deref() {
-                    if let Some(path) =
-                        bs::dependency_path(conn, &new.depends_on, &parent.id)?
-                    {
-                        let mut cycle = vec![parent.id.clone(), NEW_CARD_SELF_ID.to_string()];
-                        cycle.extend(path);
-                        return finish(&slot_w, Out::Cycle(cycle), no_write());
-                    }
-                }
             }
             let now = now_secs();
             let row = bs::create_issue(conn, &new, now)?;
             let mut events = vec![ev_snap(&row, MutationKind::Created)];
-            let dependency_link = if let Some(mut parent) = parent.take() {
-                let prior_status = parent.status.clone();
-                if !parent.depends_on.iter().any(|id| id == &row.id) {
-                    parent.depends_on.push(row.id.clone());
-                }
-                // The delegated child is work the parent must wait for. Put
-                // the parent back on the ready queue, where depends_on keeps it
-                // blocked until the child closes, instead of letting `doing`
-                // consume the requester's sole WIP slot while it cannot move.
-                parent.status = "todo".into();
-                parent.updated = now;
-                parent.rev += 1;
-                parent.version += 1;
-                // A trigger got this task into doing; delegation means that
-                // trigger has been consumed. Leaving it fresh would keep the
-                // now-todo parent undispatchable even after its child closes.
-                parent.source_ref = None;
-                parent.last_verified_at = None;
-                parent.log = Some(bs::append_log(
-                    parent.log.as_deref(),
-                    &hhmm(),
-                    &format!(
-                        "{requester_for_parent} delegated dependency {} to {}; parent requeued until it completes",
-                        row.id,
-                        row.session.as_deref().unwrap_or("(unassigned)")
-                    ),
-                ));
-                if bs::save_patched(conn, &mut parent)? != 1 {
-                    return Err(rusqlite::Error::QueryReturnedNoRows);
-                }
-                let mutation = if prior_status == parent.status {
-                    MutationKind::Updated
-                } else {
-                    MutationKind::StatusChanged {
-                        from: prior_status.clone(),
-                        to: parent.status.clone(),
-                    }
-                };
-                events.push(ev_snap(&parent, mutation));
-                DependencyLink::ParentRequeued {
-                    parent: parent.id.clone(),
-                    prior_status,
-                }
-            } else {
-                DependencyLink::Standalone
-            };
-            // The Messages ledger carries the SAME task id. Delivery is
-            // `board`, not `direct` or `queued`: the recipient consumes this
-            // request through board-drive and the card is the source of truth.
-            if let (Some(requester), Some(target)) =
-                (row.requested_by.as_deref(), row.session.as_deref())
-            {
-                let text = format!(
-                    "[board request {}] {} requested work from {}: {}",
-                    row.id, requester, target, row.title
-                );
-                conn.execute(
-                    "INSERT INTO cmd_history \
-                     (text,type,session,ts,origin,card_id,delivery,delivered_at,submit_verdict) \
-                     VALUES (?1,'session',?2,?3,?4,?5,'board',?3,'accepted')",
-                    rusqlite::params![text, target, now_secs() * 1000, requester, row.id],
-                )?;
-                let message_id = conn.last_insert_rowid();
-                events.push(crate::db::PendingEvent {
-                    entity_type: amux_core::revision::EntityType::Message,
-                    entity_id: format!("MSG-{message_id}"),
-                    mutation: MutationKind::Created,
-                    payload: None,
-                });
-            }
             // AMUX-3391: fold the silent auto-capture card into this worker card
             // (see fold_capture_for_worker_card). The window is env-tunable.
             let fold_window: i64 = std::env::var("AMUX_CAPTURE_FOLD_WINDOW_S")
@@ -4364,7 +4227,7 @@ pub async fn create_item(
             }
             finish(
                 &slot_w,
-                Out::Created(Box::new(row), dependency_link),
+                Out::Created(Box::new(row)),
                 WriteOutcome {
                     applied: true,
                     events,
@@ -4379,44 +4242,8 @@ pub async fn create_item(
     let outcome = slot.lock().expect("outcome slot poisoned").take();
     match outcome {
         None => internal("create produced no outcome"),
-        Some(Out::Cycle(cycle)) => {
-            if is_peer_request {
-                tracing::warn!(
-                    target: "amux::task_dependency",
-                    verdict = "dependency_cycle",
-                    requester = %hdr_session,
-                    target = %session,
-                    cycle = %cycle.join(" -> "),
-                    "peer task dependency refused: cycle"
-                );
-            }
-            cycle_response(&cycle)
-        }
-        Some(Out::ParentRefused(refusal)) => {
-            tracing::warn!(
-                target: "amux::task_dependency",
-                verdict = refusal.code,
-                requester = %hdr_session,
-                target = %session,
-                candidates = %refusal.candidates.join(","),
-                "peer task dependency refused: {}",
-                refusal.why
-            );
-            err(
-                StatusCode::CONFLICT,
-                json!({
-                    "error": refusal.why,
-                    "code": refusal.code,
-                    "ok": false,
-                    "blocked": true,
-                    "requester": hdr_session,
-                    "target": session,
-                    "candidates": refusal.candidates,
-                    "how_to_fix": "pass the intended active requester task with `amux board request <worker> --for <TASK-ID> ...` or request_parent in the API body",
-                }),
-            )
-        }
-        Some(Out::Created(row, dependency_link)) => {
+        Some(Out::Cycle(cycle)) => cycle_response(&cycle),
+        Some(Out::Created(row)) => {
             let mut v = detail_body(&row);
             v["rev"] = json!(row.rev);
             v["global_rev"] = json!(reply.rev.0);
@@ -4427,44 +4254,6 @@ pub async fn create_item(
             // so a worker sees the reconcile happened and never hand-discards it.
             if let Some(cap_id) = folded.lock().expect("folded slot poisoned").take() {
                 v["folded_capture"] = json!(cap_id);
-            }
-            match dependency_link {
-                DependencyLink::ParentRequeued { parent, prior_status } => {
-                    v["request_dependency"] = json!({
-                        "verdict": "parent_requeued",
-                        "linked": true,
-                        "parent": parent.clone(),
-                        "child": row.id,
-                        "parent_status": "todo",
-                        "prior_parent_status": prior_status,
-                    });
-                    tracing::info!(
-                        target: "amux::task_dependency",
-                        verdict = "parent_requeued",
-                        parent = %parent,
-                        child = %row.id,
-                        requester = %row.requested_by.as_deref().unwrap_or("(none)"),
-                        delegate = %row.session.as_deref().unwrap_or("(none)"),
-                        "peer task dependency linked; requester WIP released"
-                    );
-                }
-                DependencyLink::Standalone => {
-                    if row.requested_by.is_some() {
-                        v["request_dependency"] = json!({
-                            "verdict": "standalone_no_active_parent",
-                            "linked": false,
-                            "child": row.id,
-                        });
-                        tracing::info!(
-                            target: "amux::task_dependency",
-                            verdict = "standalone_no_active_parent",
-                            child = %row.id,
-                            requester = %row.requested_by.as_deref().unwrap_or("(none)"),
-                            delegate = %row.session.as_deref().unwrap_or("(none)"),
-                            "peer task request created without an active requester task"
-                        );
-                    }
-                }
             }
             // AF-366: RECORD WHO CALLED, not only what the row now says.
             //
@@ -4500,18 +4289,6 @@ pub async fn create_item(
                 owner_session = %row.session.as_deref().unwrap_or("(none)"),
                 "board card created"
             );
-            // A peer request should enter the same durable board-drive path
-            // immediately; waiting for the periodic sweep makes a successful
-            // request look lost for up to a minute.
-            if row.requested_by.is_some() {
-                if let Some(target) = row.session.clone() {
-                    let st = state.clone();
-                    tokio::spawn(async move {
-                        let _ = crate::runtime_jobs::board_drive::drive_session(&st, &target).await;
-                        crate::api::session_verbs::steer_deliver_for_session(&st, &target).await;
-                    });
-                }
-            }
             (StatusCode::CREATED, Json(v)).into_response()
         }
     }
@@ -7959,6 +7736,33 @@ pub async fn patch_item(
             let mut next = row.clone();
             let mut changed: Vec<String> = Vec::new();
             let mut tags_change: Option<Vec<String>> = None;
+
+            // A worker cannot create on its own board and then move the card
+            // onto a peer's board through PATCH. Administrative callers remain
+            // able to reassign, while a verified worker may only name itself as
+            // the destination. Peer collaboration belongs in reviewer,
+            // shepherd, and depends_on links instead of the ownership field.
+            if !caller_lane.is_empty() && map.contains_key("session") {
+                let requested_owner = body_opt_str(&map, "session")
+                    .flatten()
+                    .filter(|owner| !owner.trim().is_empty());
+                if requested_owner.as_deref() != Some(caller_lane.as_str()) {
+                    return finish(
+                        &slot_w,
+                        PatchOut::Refused(
+                            StatusCode::FORBIDDEN,
+                            json!({
+                                "error": "workers may assign board items only to their own board",
+                                "code": "cross_board_reassignment_forbidden",
+                                "caller": caller_lane,
+                                "requested_owner": requested_owner,
+                                "how_to_fix": "keep the card on your own board and link the peer with reviewer, shepherd, or depends_on",
+                            }),
+                        ),
+                        no_write(),
+                    );
+                }
+            }
 
             if let Some(t) = body_str(&map, "title") {
                 if t != next.title {

@@ -1293,13 +1293,10 @@ async fn archive_restore_round_trip_preserves_every_field() {
 
 // ---- circular depends_on -------------------------------------------------
 
-/// Delegation is dependency work on the requester task, not a reason for the
-/// requester lane to sit in `doing` while another worker runs. The create must
-/// atomically mint the child, attach it to the parent, and release the WIP slot;
-/// the existing ready query then proves the parent wakes up when the child
-/// closes without a second promotion mechanism.
+/// A refused cross-board create must stop before either the requested child or
+/// the requester's currently active task can be mutated.
 #[tokio::test]
-async fn peer_request_requeues_its_parent_and_unblocks_it_when_the_child_finishes() {
+async fn cross_board_peer_request_is_refused_before_parent_or_child_mutation() {
     let (app, store, _dir) = app_with_store();
     let requester = "dependency-requester";
     let delegate = "dependency-worker";
@@ -1316,22 +1313,9 @@ async fn peer_request_requeues_its_parent_and_unblocks_it_when_the_child_finishe
     )
     .await;
     let parent_id = parent["id"].as_str().unwrap().to_string();
-    let independent = create(
-        &app,
-        json!({
-            "title": "Independent requester work",
-            "status": "todo",
-            "session": requester,
-            "type": "chore",
-        }),
-    )
-    .await;
-    let independent_id = independent["id"].as_str().unwrap().to_string();
-
-    // A consumed trigger on the active task must not keep the requeued parent
-    // parked after the new dependency closes.
+    // Make mutation visible: the old peer-request path cleared both fields
+    // while attaching the child and requeueing this parent.
     let parent_for_db = parent_id.clone();
-    let independent_for_db = independent_id.clone();
     store
         .write(move |conn| {
             conn.execute(
@@ -1339,11 +1323,6 @@ async fn peer_request_requeues_its_parent_and_unblocks_it_when_the_child_finishe
                     next_action='Integrate the returned dependency into the final result' \
                  WHERE id=?1",
                 [&parent_for_db],
-            )?;
-            conn.execute(
-                "UPDATE issues SET next_action='Run the independent verification while the dependency is open' \
-                 WHERE id=?1",
-                [&independent_for_db],
             )?;
             Ok(amux_server::db::WriteOutcome { applied: true, events: vec![] })
         })
@@ -1364,83 +1343,25 @@ async fn peer_request_requeues_its_parent_and_unblocks_it_when_the_child_finishe
         &[("X-Amux-Worker", requester)],
     )
     .await;
-    assert_eq!(st, StatusCode::CREATED, "peer request failed: {made}");
-    let child_id = made["id"].as_str().unwrap().to_string();
-    assert_eq!(
-        made["request_dependency"],
-        json!({
-            "verdict": "parent_requeued",
-            "linked": true,
-            "parent": parent_id,
-            "child": child_id,
-            "parent_status": "todo",
-            "prior_parent_status": "doing",
-        }),
-        "the response must announce the lifecycle change: {made}"
-    );
+    assert_eq!(st, StatusCode::FORBIDDEN, "cross-board create escaped: {made}");
+    assert_eq!(made["code"], "cross_board_create_forbidden");
 
     let (_, _, parent_after) =
         send(&app, "GET", &format!("/api/board/{parent_id}"), None).await;
-    assert_eq!(parent_after["status"], json!("todo"));
-    assert_eq!(parent_after["depends_on"], json!([child_id.clone()]));
-    assert_eq!(parent_after["source_ref"], Value::Null);
-    assert_eq!(parent_after["last_verified_at"], Value::Null);
+    assert_eq!(parent_after["status"], json!("doing"));
+    assert_eq!(parent_after["depends_on"], json!([]));
+    assert_eq!(parent_after["source_ref"], json!("upstream event arrived"));
+    assert_eq!(parent_after["last_verified_at"], json!(9999999999_i64));
+    assert!(!parent_after["log"].as_str().unwrap_or("").contains("parent requeued"));
+    let (_, _, all) = send(&app, "GET", "/api/board?all=1", None).await;
     assert!(
-        parent_after["log"].as_str().unwrap_or("").contains("parent requeued"),
-        "the card itself must explain why it moved: {parent_after}"
+        !all.as_array().unwrap().iter().any(|row| row["title"] == "Produce the dependency artifact"),
+        "a refused cross-board create leaked its child: {all}"
     );
-
-    let (_, _, waiting) = send(
-        &app,
-        "GET",
-        &format!("/api/board/ready?session={requester}"),
-        None,
-    )
-    .await;
-    assert_eq!(waiting["wip"]["holding"], json!([]), "delegation must release WIP: {waiting}");
-    assert_eq!(waiting["excluded"]["blocked_by_deps"], json!(1), "{waiting}");
-    let ready_while_waiting: Vec<&str> = waiting["ready"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|row| row["id"].as_str())
-        .collect();
-    assert_eq!(ready_while_waiting, vec![independent_id.as_str()], "{waiting}");
-
-    let (st, _, finished) = send_with(
-        &app,
-        "PATCH",
-        &format!("/api/board/{child_id}"),
-        Some(json!({
-            "status": "done",
-            "force": true,
-            "reason": "This test exercises dependency release, not the unrelated type gate.",
-            "evidence": "none: in-memory API lifecycle test",
-        })),
-        &[("X-Amux-Worker", delegate)],
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "closing delegated child failed: {finished}");
-
-    let (_, _, resumed) = send(
-        &app,
-        "GET",
-        &format!("/api/board/ready?session={requester}"),
-        None,
-    )
-    .await;
-    let resumed_ids: Vec<&str> = resumed["ready"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|row| row["id"].as_str())
-        .collect();
-    assert!(resumed_ids.contains(&parent_id.as_str()), "parent did not wake after child: {resumed}");
-    assert_eq!(resumed["excluded"]["blocked_by_deps"], json!(0), "{resumed}");
 }
 
 #[tokio::test]
-async fn peer_request_dependency_cycle_is_refused_without_a_partial_child() {
+async fn cross_board_create_is_refused_before_dependency_cycle_evaluation() {
     let (app, _dir) = app();
     let requester = "cycle-requester";
     let parent = create(
@@ -1465,8 +1386,8 @@ async fn peer_request_dependency_cycle_is_refused_without_a_partial_child() {
         &[("X-Amux-Worker", requester)],
     )
     .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST, "cycle must refuse: {refused}");
-    assert!(refused["error"].as_str().unwrap().contains("circular depends_on"), "{refused}");
+    assert_eq!(st, StatusCode::FORBIDDEN, "ownership must refuse before graph mutation: {refused}");
+    assert_eq!(refused["code"], "cross_board_create_forbidden");
 
     let (_, _, parent_after) =
         send(&app, "GET", &format!("/api/board/{parent_id}"), None).await;
@@ -1480,7 +1401,7 @@ async fn peer_request_dependency_cycle_is_refused_without_a_partial_child() {
 }
 
 #[tokio::test]
-async fn peer_request_prefers_the_durable_message_task_over_other_doing_cards() {
+async fn cross_board_create_cannot_mutate_a_durable_message_linked_task() {
     let (app, store, _dir) = app_with_store();
     let requester = "linked-requester";
     let intended = create(
@@ -1520,16 +1441,53 @@ async fn peer_request_prefers_the_durable_message_task_over_other_doing_cards() 
         &[("X-Amux-Worker", requester)],
     )
     .await;
-    assert_eq!(st, StatusCode::CREATED, "{child}");
-    assert_eq!(child["request_dependency"]["parent"], json!(intended_id));
+    assert_eq!(st, StatusCode::FORBIDDEN, "cross-board create escaped: {child}");
+    assert_eq!(child["code"], "cross_board_create_forbidden");
 
     let (_, _, linked_after) =
         send(&app, "GET", &format!("/api/board/{intended_id}"), None).await;
     let (_, _, stale_after) = send(&app, "GET", &format!("/api/board/{stale_id}"), None).await;
-    assert_eq!(linked_after["status"], json!("todo"));
-    assert_eq!(linked_after["depends_on"], json!([child["id"].clone()]));
+    assert_eq!(linked_after["status"], json!("doing"));
+    assert_eq!(linked_after["depends_on"], json!([]));
     assert_eq!(stale_after["status"], json!("doing"), "an unrelated task was mutated");
     assert_eq!(stale_after["depends_on"], json!([]));
+    let (_, _, all) = send(&app, "GET", "/api/board?all=1", None).await;
+    assert!(
+        !all.as_array().unwrap().iter().any(|row| row["title"] == "delegated from the current prompt"),
+        "a refused cross-board create leaked its child: {all}"
+    );
+}
+
+#[tokio::test]
+async fn worker_cannot_create_locally_then_reassign_to_a_peer_or_unassigned_board() {
+    let (app, _dir) = app();
+    let owner = "patch-owner";
+    let (status, _, card) = send_with(
+        &app,
+        "POST",
+        "/api/board",
+        Some(json!({"title":"ownership stays local", "status":"backlog"})),
+        &[("X-Amux-Worker", owner)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{card}");
+    let id = card["id"].as_str().unwrap();
+
+    for requested in [json!("patch-peer"), Value::Null] {
+        let (status, _, refused) = send_with(
+            &app,
+            "PATCH",
+            &format!("/api/board/{id}"),
+            Some(json!({"session": requested})),
+            &[("X-Amux-Worker", owner)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+        assert_eq!(refused["code"], "cross_board_reassignment_forbidden");
+    }
+
+    let (_, _, after) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(after["session"], owner);
 }
 
 #[tokio::test]
