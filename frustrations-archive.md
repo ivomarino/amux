@@ -6286,3 +6286,23 @@ FIX: db3ff38a and accbba96. The sentinel is now `"(new card)"`; non-collision is
  EMPTY string and that command is `grep -c ''`, a line count wearing a NUL count's
  label. The real figure is 19, read from the bytes in python. Both halves of this
  entry are a probe whose argument silently became something else.
+
+## One repeated timestamp subtraction made the exact-SHA Rust gate nondeterministic
+SUPERSEDED: amux-testing-e2e | AF-595 supersedes this diagnosis. An isolated serde_json 1.0.151 probe (f64 -> HashMap -> to_string -> from_str) reproduces 1788887412.4197621 -> 1788887412.419762 (-1 ULP) and the original 1788859526.4033027 -> 1788859526.403303 (+1 ULP), with no repeated timestamp arithmetic. Enabling float_roundtrip preserves both input bit patterns (0 ULP). Logs: /private/tmp/ate128-float-default.log and /private/tmp/ate128-float-roundtrip.log. Computing the fixture timestamp once did not fix the parser round trip; the prior STATUS: fixed and claim that production persistence was correct were unsupported. Preserve this entry as a dead hypothesis, not a validated fix. amux-frustrations owns the AF-595 feature/invariant/regression patch.
+AREA: gates
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-testing-e2e
+CARD: ATE-93
+SYMPTOM: The guarded workspace test passed 2,064 tests and failed only
+  `stored_observations_reach_the_actual_guard_without_naming_the_reader`: its
+  separately evaluated expected timestamp differed from the stored value by one
+  f64 ULP (1788859526.403303 versus 1788859526.4033027).
+COST: Exact-SHA Rust CI ran for over four minutes and blocked ATE-93's terminal
+  gate even though the production observation round trip was correct.
+FIX: Compute the fixture timestamp once and use that same binary value for the
+  report and strict round-trip assertion. The failure now self-announces the
+  JSON/SQLite contract instead of conflating codegen rounding with persistence.
+
+---
