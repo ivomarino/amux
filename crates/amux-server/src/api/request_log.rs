@@ -728,6 +728,14 @@ const RECOGNISED_LOG_PARAMS: &[&str] = &[
     "min_status",
     "max_status",
     "answered_by",
+    // `ip`, because the sweep's step 4 is "group by client IP" and without a
+    // filter it can only be answered by paging unfiltered rows. Found by the
+    // 2026-09-09 sweep: `?ip=100.66.26.84` came back `ignored_params: ["ip"]`
+    // with `total_matched` 222,564 — the WHOLE log under one address's name,
+    // which is the AF-521 shape the `session=` note below is about. The
+    // question it blocked was "has this client recovered", which needs that
+    // one client's history and nothing else.
+    "ip",
 ];
 
 /// Keys the caller sent that `GET /api/logs` neither consumed nor treats as a
@@ -817,6 +825,12 @@ async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String,
     if let Some(f) = q.get("family").filter(|s| !s.is_empty()) {
         clauses.push("family = ?".into());
         params.push(f.clone().into());
+    }
+    // EXACT match, not a prefix or LIKE. An IP is an identifier, and a prefix
+    // match on one silently widens 100.66.26.8 into 100.66.26.84's rows.
+    if let Some(ip) = q.get("ip").filter(|s| !s.is_empty()) {
+        clauses.push("ip = ?".into());
+        params.push(ip.clone().into());
     }
     if let Some(ts) = q.get("since").and_then(|v| v.parse::<f64>().ok()) {
         clauses.push("ts > ?".into());
@@ -4893,6 +4907,52 @@ mod tests {
         // every polled response and train the reader to ignore the field.
         let busted = get(format!("/api/logs?since={since}&_=12345&cb=x&limit=100")).await;
         assert_eq!(busted["ignored_params"], json!([]), "cache-busters are benign: {busted}");
+    }
+
+    /// `ip` is a REAL filter, in both directions.
+    ///
+    /// The declaration and the SQL are separate edits, and getting only one is
+    /// silent in a different way each time: declared-but-unread means the
+    /// caller is told the filter ran when it did not (the AF-521 shape, which
+    /// returns the whole log under one address's name); read-but-undeclared
+    /// means a working filter is reported as ignored. The sibling test covers
+    /// read-but-undeclared by scraping the handler; this covers the other side
+    /// and the actual clause.
+    #[test]
+    fn ip_is_both_declared_and_actually_filtered() {
+        assert!(
+            RECOGNISED_LOG_PARAMS.contains(&"ip"),
+            "declared: without this `?ip=` reports ignored_params and the caller \
+             holds a superset, not an answer"
+        );
+        assert!(
+            ignored_log_params([String::from("ip")].iter()).is_empty(),
+            "a caller passing ip must not be told it was dropped"
+        );
+        // The SQL half. Scraped from the shipped handler, because a declaration
+        // with no clause is exactly the failure this pair exists to prevent and
+        // it cannot be seen from the constant.
+        let src = include_str!("request_log.rs");
+        let body = src
+            .split("async fn get_logs(")
+            .nth(1)
+            .expect("get_logs is in this file")
+            .split("\n/// One DB row")
+            .next()
+            .expect("get_logs ends before row_to_event");
+        assert!(
+            body.contains(r#"q.get("ip")"#),
+            "declared but never read: the filter would be silently inert"
+        );
+        assert!(
+            body.contains(r#"clauses.push("ip = ?""#),
+            "read but no WHERE clause, so every ip returns the whole window"
+        );
+        // EXACT, not prefix: a LIKE would fold 100.66.26.8 into 100.66.26.84.
+        assert!(
+            !body.contains(r#"clauses.push("ip LIKE"#),
+            "an ip filter must be exact; a prefix match silently widens it"
+        );
     }
 
     /// AF-521 — every key the handler reads must be in `RECOGNISED_LOG_PARAMS`.
