@@ -612,13 +612,14 @@ let _logSearchTimer = null;
 let _logSearchAbort = null;
 // Filters modal facets (session list). Multi-select within a facet.
 let filterProviders = new Set();   // 'claude' | 'codex' | 'gemini' | 'iterm2'
-let filterStatuses = new Set();    // 'working' | 'waiting' | 'idle' | 'stopped'
+let filterStatuses = new Set();    // 'working' | 'blocked' | 'waiting' | 'idle' | 'stopped'
 // Stable status key for filtering: card WORKING = 'active' internally.
 function _sessStatusKey(s) {
   if (!s.running) return 'stopped';
   if (s.status === 'rate_limited') return 'rate_limited';
   if (s.status === 'api_error') return 'api_error';
   if (s.status === 'unattributed') return 'waiting';
+  if (s.status === 'blocked') return 'blocked';
   if (s.status === 'active') return 'working';
   if (s.status === 'waiting') return 'waiting';
   return 'idle';
@@ -2939,7 +2940,10 @@ function _checkSessionTransitions(newData) {
     const statusChanged = s.status !== prev.status;
     const stoppedNow = prev.running && !s.running;
     if (statusChanged) {
-      if (s.status === 'waiting') {
+      if (s.status === 'blocked') {
+        _fireSessionNotif(s.name, s.name + ' blocked on permission', s.task_name || 'Waiting on a permission dialog');
+        amuxTrack('session_blocked', { session: s.name, task: s.task_name || '' });
+      } else if (s.status === 'waiting') {
         _fireSessionNotif(s.name, s.name + ' needs input', s.task_name || 'Waiting for a response');
         amuxTrack('session_waiting', { session: s.name, task: s.task_name || '', auto_continue: !!s.auto_continue });
       } else if (s.status === 'active' && prev.status !== 'active') {
@@ -3275,6 +3279,7 @@ function updatePeekStatus() {
     : '<span class="status-badge active">working</span>' + _agentsChip(s)
       + (runtimeBoard.cardless ? _runtimeBoardCardlessBadge() : '');
   else if (s.status === 'unattributed') badge = _runtimeBoardSplitBadge(s);
+  else if (s.status === 'blocked') badge = '<span class="status-badge blocked" title="Agent is waiting on a permission decision. Do not send automated messages.">blocked</span>';
   else if (s.status === 'waiting') badge = '<span class="status-badge waiting"' + _waitingTitle(s) + '>' + _waitingLabel(s) + '</span>';
   else if (s.status === 'rate_limited') badge = '<span class="status-badge rate-limited">rate limited</span>';
   else if (s.status === 'api_error') badge = `<span class="status-badge rate-limited" title="API Error ${esc(s.api_error_code || '5xx')} — server-side and retryable. Send &quot;continue&quot;.">API ${esc(s.api_error_code || '5xx')}</span>`;
@@ -3921,6 +3926,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
               rate_limited_until is set it is the true state and it supersedes
               the status badge outright (AMUX-2566). */ ''}          ${s.rate_limited_until ? '' : `${s.status === 'rate_limited' ? '<span class="status-badge rate-limited" title="Hit a usage limit (on credits or waiting for reset)">rate limited</span>' : ''}${s.status === 'active' ? (runtimeBoard.syncing ? _runtimeBoardSyncBadge() : '<span class="status-badge active">working</span>' + _agentsChip(s) + (runtimeBoard.cardless ? _runtimeBoardCardlessBadge() : '')) : ''}
           ${s.status === 'unattributed' ? _runtimeBoardSplitBadge(s) : ''}
+          ${s.status === 'blocked' ? '<span class="status-badge blocked" title="Agent is waiting on a permission decision. Do not send automated messages.">blocked</span>' : ''}
           ${s.status === 'waiting' ? `<span class="status-badge waiting"${_waitingTitle(s)}>${_waitingLabel(s)}</span>${_stalledFor(s)}` : ''}
           ${s.status === 'idle' ? '<span class="status-badge idle">idle</span>' : ''}`}
           ${s.rate_limited_until ? `<span class="status-badge rate-limited" title="${s.rate_limit_weekly ? 'Weekly limit' : 'Rate-limited'} — auto-resume at ${_fmtResetTime(s.rate_limited_until)}">${s.rate_limit_weekly ? 'Weekly limit until' : 'Rate-limited until'} ${_fmtResetTime(s.rate_limited_until)}</span>` : ''}
@@ -16184,13 +16190,13 @@ function closeFiltersModal() {
 const _PROVIDER_LABELS = { claude: 'Claude', codex: 'Codex', gemini: 'Gemini', iterm2: 'iTerm2' };
 const _MODEL_LABELS = { opus: 'Opus', sonnet: 'Sonnet', haiku: 'Haiku', fable: 'Fable', gpt: 'GPT', gemini: 'Gemini', 'o-series': 'o-series' };
 function _mLabel(x){ return _MODEL_LABELS[x] || (x.charAt(0).toUpperCase()+x.slice(1)); }
-const _STATUS_LABELS = { working: 'Working', waiting: 'Needs input', rate_limited: 'Rate limited', api_error: 'API error', idle: 'Idle', stopped: 'Stopped' };
+const _STATUS_LABELS = { working: 'Working', blocked: 'Blocked', waiting: 'Needs input', rate_limited: 'Rate limited', api_error: 'API error', idle: 'Idle', stopped: 'Stopped' };
 function renderFilterOptions() {
   const live = sessions.filter(s => !s.archived);
   // Status chips — fixed order, only states that exist (or are selected)
   const sEl = document.getElementById('filter-statuses');
   if (sEl) {
-    const opts = ['working', 'waiting', 'rate_limited', 'api_error', 'idle', 'stopped']
+    const opts = ['working', 'blocked', 'waiting', 'rate_limited', 'api_error', 'idle', 'stopped']
       .filter(k => filterStatuses.has(k) || live.some(x => _sessStatusKey(x) === k));
     sEl.innerHTML = opts.length ? opts.map(k => {
       const on = filterStatuses.has(k);

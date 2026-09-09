@@ -2522,6 +2522,7 @@
     letter-spacing: 0.3px;
   }
   .status-badge.active { background: rgba(63,185,80,0.2); color: var(--green); }
+  .status-badge.blocked { background: rgba(227,134,37,0.22); color: #e38625; }
   .status-badge.waiting { background: rgba(210,153,34,0.2); color: var(--yellow); }
   .status-badge.idle { background: rgba(139,148,158,0.15); color: var(--dim); }
   .status-badge.steering { background: rgba(137,87,229,0.2); color: var(--purple,#8957e5); }
