@@ -172,7 +172,7 @@ export function AssistantPanel({
               setValue={setDraft}
               busy={busy}
               onSubmit={() => void submit(draft)}
-              footer="Saved to Amux. External actions still require approval."
+              footer="Saved to Amux. Existing approval rules apply."
             />
           </ThreadPrimitive.Root>
         </AssistantRuntimeProvider>

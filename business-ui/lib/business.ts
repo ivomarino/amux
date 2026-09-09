@@ -203,3 +203,16 @@ export const advancedUrl = () =>
     .VITE_AMUX_DIRECT
     ? '/'
     : 'https://localhost:8824/';
+
+export function scheduleLabel(expression?:string):string {
+ if(!expression)return 'Scheduled in Amux';
+ if(/^(every|daily|weekly|monthly|once|at )/i.test(expression))return expression;
+ const fields=expression.trim().split(/\s+/);
+ if(fields.length!==5)return 'Custom schedule';
+ const [minute,hour,day,month,weekday]=fields;
+ if(day==='*'&&month==='*'&&weekday==='*'&&hour==='*'&&/^\*\/\d+$/.test(minute))return `Every ${minute.slice(2)} minutes`;
+ if(day==='*'&&month==='*'&&/^\d+$/.test(minute)&&/^\d+$/.test(hour)&&['*','1-5'].includes(weekday)){
+  const h=Number(hour);return `Every ${weekday==='1-5'?'weekday':'day'} at ${h%12||12}:${minute.padStart(2,'0')} ${h<12?'AM':'PM'}`;
+ }
+ return 'Custom schedule';
+}
