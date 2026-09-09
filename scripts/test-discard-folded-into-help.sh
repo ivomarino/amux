@@ -12,7 +12,7 @@
 # backtick or a dropped continuation is invisible in the source (AF-621).
 #
 # Exit 0 = all pass, 1 = a failure.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 AMUX_BIN="${AMUX_BIN:-./amux}"
 PASS=0; FAIL=0

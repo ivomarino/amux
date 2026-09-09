@@ -15,7 +15,7 @@
 #   one command list    80 lines,  0 spliced
 #
 # Exit 0 = all pass, 1 = a failure.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 PASS=0; FAIL=0; SKIP=0
 
