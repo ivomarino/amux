@@ -3307,3 +3307,24 @@ FIX: In progress on AF-640: keep queue entries until exact-card acknowledgment,
   bound requests, retain failed drafts with visible errors, serialize replay,
   and pin editor identity/generation/revision. Tests execute shipped functions
   and real browser flows; combined server/live acceptance remains outstanding.
+
+
+---
+## Numbered terminal output detached its source gutters on phones and reparsed loaded history while streaming
+AREA: browser
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-09
+SESSION: amux-testing-e2e
+CARD: AF-640
+SYMPTOM: Ethan's phone terminal squeezed split diff/tool output into unreadable
+  columns, wrapped code away from its line numbers and overlaid controls on output.
+  The live/history split still reparsed all history on each changed snapshot and
+  replaced its DOM; live ticks also walked all loaded prompt descendants.
+COST: The worker terminal was unusable for reviewing changes at phone widths.
+  Large active transcripts added avoidable parsing and scrolling work while typing.
+FIX: Candidate uses gutter/code cells, unified split rows below 600px, a separate
+  controls row, stable ANSI-aware chunks and one paint per animation-frame burst.
+  Render counters and a slow-update client-debug signal make regressions measurable.
+  Focused synthetic streaming and navigation tests cover the shipped renderer;
+  exact deployment and live phone/desktop acceptance are still outstanding.

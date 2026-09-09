@@ -46,11 +46,18 @@ import { createHash } from 'node:crypto';
 
 // Browser-only checks can use a prebuilt API server and explicitly pin the
 // candidate asset. The digest records exactly which bytes the run exercised.
-const dashboardSource = process.env.AMUX_E2E_DASHBOARD_SOURCE;
-const dashboardBytes = dashboardSource ? readFileSync(dashboardSource) : null;
-if (dashboardBytes) console.log('[e2e] candidate dashboard asset: ' + dashboardSource
-  + ' sha256=' + createHash('sha256').update(dashboardBytes).digest('hex')
-  + '; API binary is unchanged');
+const dashboardAssets = [
+  ['AMUX_E2E_DASHBOARD_SOURCE', '**/app.js', 'text/javascript'],
+  ['AMUX_E2E_DASHBOARD_CSS', '**/app.css', 'text/css'],
+  ['AMUX_E2E_DASHBOARD_HTML', '**/', 'text/html'],
+].flatMap(([env, route, contentType]) => {
+  const source = process.env[env];
+  if (!source) return [];
+  const bytes = readFileSync(source);
+  console.log('[e2e] candidate dashboard asset: ' + source + ' sha256='
+    + createHash('sha256').update(bytes).digest('hex') + '; API binary is unchanged');
+  return [{route, bytes, contentType}];
+});
 
 export { expect };
 export type { Page };
@@ -81,6 +88,25 @@ export function allowUnusedRoute(page: Page, url: string | RegExp): void {
 }
 
 export const test = base.extend<{ page: Page }>({
+  context: async ({ context }, use) => {
+    // A second tab must run the same candidate asset as the first. Page-only
+    // overrides silently mixed the candidate outbox with the installed one.
+    for (const asset of dashboardAssets) {
+      await context.route(asset.route, async route => {
+        if (asset.contentType !== 'text/html') return route.fulfill({body:asset.bytes, contentType:asset.contentType});
+        // The server injects the real isolated home's bootstrap credentials.
+        // Replacing HTML without them tests a refused/auto-reloading shell.
+        if (route.request().resourceType() !== 'document') return route.continue();
+        const response = await route.fetch({timeout:15000});
+        const served = await response.text();
+        const bootstrap = served.match(/<script>window\._AMUX_S3_ICAL_URL=[\s\S]*?<\/script>/);
+        if (!bootstrap) throw new Error('candidate HTML: server bootstrap was not measured');
+        const body = asset.bytes.toString().replace(/<script>window\._AMUX_S3_ICAL_URL=[\s\S]*?<\/script>/, () => bootstrap[0]);
+        await route.fulfill({response, body, contentType:asset.contentType});
+      });
+    }
+    await use(context);
+  },
   page: async ({ page }, use, testInfo) => {
     const st = { stubs: [] as Stub[], allowed: new Set<string>() };
     STATE.set(page, st);
@@ -106,11 +132,6 @@ export const test = base.extend<{ page: Page }>({
       );
     };
 
-    if (dashboardBytes) {
-      await page.route('**/app.js', route => route.fulfill({body:dashboardBytes, contentType:'text/javascript'}));
-      // API-only tests do not load a dashboard; their scope is unchanged.
-      allowUnusedRoute(page, '**/app.js');
-    }
     await use(page);
 
     // THE REAL ERROR WINS. See the header: an unhit stub is usually downstream
