@@ -280,6 +280,7 @@ jobs:
           set -uo pipefail
           ./scripts/test-board-add-flags.sh
           ./scripts/test-amux-url.sh
+          ./scripts/test-send-fallback-atomic.sh
           ./scripts/test-depends-on-help.sh
       # AMUX-3891. The CLI is symlinked straight into the working tree and ~50
       # lanes invoke it while it is being edited, so it MUST be parseable in one
