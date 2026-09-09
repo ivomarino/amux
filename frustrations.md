@@ -4290,3 +4290,44 @@ CARD: AMUX-4246
 SYMPTOM: Owner screenshot shows Connecting/Polling with no workers. The last-hour request log has 777 worker-list 401s and 38 rejected client-debug reports from a remote client. The old error body cannot distinguish missing credentials from an invalid bearer or member cookie; exact screenshot origin remains unconfirmed.
 COST: A blank owner dashboard and roughly 30 minutes tracing a responding server before finding the client ignored authorization error objects.
 FIX: AMUX-4246 adds an explicit access/failure state, a bounded fresh-bootstrap recovery under existing auth rules, structured refusal reasons in request logs, and a deferred browser diagnostic after access recovers. Historical credential presence cannot be reconstructed.
+
+---
+## A CI failure that only reproduces on 12% of clock values was filed as a flake twice
+AREA: gates
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux-frustrations
+CARD: AF-595
+SUPERSEDES: "One repeated timestamp subtraction made the exact-SHA Rust gate
+ nondeterministic" (2026-09-08, amux-testing-e2e, filed under CARD: ATE-93). That
+ entry reads STATUS: fixed and names "codegen rounding" as what it disambiguated.
+ The mechanism is wrong and the failure recurred the same day with a fresh value.
+ Its text stays put: only the session that wrote it can retire it, and the
+ disposition is `--superseded` rather than validated, because archiving it as
+ correct would file a dead mechanism as history. Routed to amux-testing-e2e.
+SYMPTOM: `api::git_guard::tests::stored_observations_reach_the_actual_guard_without_naming_the_reader`
+ reddened `check` on main with `left 1788887412.419762, right 1788887412.4197621`,
+ one f64 ULP apart. It passed locally on the same tree in the same hour. Earlier the
+ SAME morning (61660487, 08:39) the same test failed on a different pair,
+ 1788859526.403303 against 1788859526.4033027. Nothing about the code differed
+ between the runs; only the sampled mtime did.
+COST: `check` red on main, which blocks every PR that inherits it; PR #201 sat behind
+ it. Two lanes independently classified it as a flake. The first remedy, 61660487
+ "capture expected observation timestamp", was applied to a cause the evidence never
+ supported and the test went green again by luck, so nothing detected that the fix
+ was wrong. This card's own opening diagnosis, written by this lane, named the same
+ wrong cause a third time.
+FIX: The cause is serde_json's default float parser, which is not correctly rounded:
+ an f64 written with `to_string` can read back one ULP away. Measured on 1.0.151 over
+ 1,023,542 f64 values sampled across one second at epoch magnitude, 126,027 (12.3%)
+ drifted; with the `float_roundtrip` feature, 0. Enabled that feature workspace-wide,
+ added `serde.f64_survives_json_roundtrip` to the invariant monitor so dropping it
+ announces itself at runtime, and pinned the two real CI values in a test that
+ reddens every run rather than 12% of them.
+ THE GENERAL SHAPE, which is what the next session will hit: a test whose failure
+ depends on the VALUE of a sampled input is indistinguishable from infrastructure
+ flake, and amux has no instrument that separates the two. A remedy aimed at the
+ wrong cause looks confirmed, because the next run is green either way. When a
+ failure is intermittent, the question that separates them is whether the input
+ changed between runs, and a rerun cannot answer it.

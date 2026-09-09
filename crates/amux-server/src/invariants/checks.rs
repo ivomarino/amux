@@ -6441,3 +6441,141 @@ mod archived_terminal_tests {
         assert!(d.contains("archived_non_terminal"), "the pass still publishes its field: {d}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// 12. Does an f64 read back from JSON as the f64 that was written? (AF-595)
+// ---------------------------------------------------------------------------
+
+/// INCIDENT (AF-595, and ATE-93 three days before it): `check` on main went red
+/// on `git_guard`'s `stored_observations_reach_the_actual_guard_without_naming_the_reader`
+/// with a stored mtime one ULP below the reported one, 1788887412.419762
+/// against 1788887412.4197621. Both times it was filed as a flake, and the
+/// first fix (61660487, capture the expected value once instead of recomputing
+/// it) removed nothing, because both sides of that assertion already read one
+/// variable.
+///
+/// The cause is `serde_json`'s DEFAULT float parser, which is not correctly
+/// rounded: it can land one ULP from the nearest f64 to the decimal it reads.
+/// Writing is exact (ryu), so the whole drift is on the read, which is why
+/// "capture the value" could not help. Measured on serde_json 1.0.151 over
+/// 1,023,542 f64 values sampled across one second at current epoch magnitude,
+/// 126,027 (12.3%) came back different from `to_string` -> `from_str`. A test
+/// that trips on 12% of clock samples looks exactly like a flake.
+///
+/// The fix is the `float_roundtrip` feature in the workspace `Cargo.toml`,
+/// which takes those 126,027 to 0. This invariant exists because that fix is
+/// a Cargo feature: invisible at runtime, deleted by a one-line edit, and its
+/// symptom is an intermittent failure in an unrelated module. Every f64 this
+/// server round-trips through JSON rides on it -- observed-edit mtimes,
+/// `elapsed_s`, ages, latencies, anything stored in `prefs` as a float.
+///
+/// `pairs` is (written, read back). The caller does the round trip, so this
+/// stays a pure comparator and its negative control can inject the drift.
+pub fn f64_survives_json_roundtrip(pairs: &[(f64, f64)]) -> Vec<InvariantResult> {
+    const ID: &str = "serde.f64_survives_json_roundtrip";
+    if pairs.is_empty() {
+        return vec![InvariantResult::unknown(
+            ID,
+            "no probe values were round-tripped. The gatherer produced nothing, \
+             so this is not a clean bill of health",
+        )];
+    }
+    let drifted: Vec<&(f64, f64)> = pairs.iter().filter(|(w, r)| w != r).collect();
+    if drifted.is_empty() {
+        return vec![InvariantResult::pass(ID).evidence(json!({
+            "probes": pairs.len(),
+            "drifted": 0,
+        }))];
+    }
+    let (wrote, read) = *drifted[0];
+    vec![InvariantResult::fail(
+        ID,
+        format!("all {} probe f64s read back bit-identical from JSON", pairs.len()),
+        format!(
+            "{} of {} drifted; first wrote {wrote:?} and read {read:?} ({} ulp). \
+             serde_json's `float_roundtrip` feature is missing from the workspace \
+             Cargo.toml, so every f64 this server stores as JSON (observed-edit \
+             mtimes, elapsed_s, ages, latencies) can come back one ULP wrong, and \
+             the only symptom is an intermittent equality failure somewhere else \
+             (AF-595).",
+            drifted.len(),
+            pairs.len(),
+            (read.to_bits() as i64) - (wrote.to_bits() as i64),
+        ),
+    )
+    .evidence(json!({
+        "probes": pairs.len(),
+        "drifted": drifted.len(),
+        "first_wrote": wrote,
+        "first_read_back": read,
+    }))]
+}
+
+#[cfg(test)]
+mod f64_roundtrip_tests {
+    use super::*;
+
+    /// The two values CI ACTUALLY failed on, as real input rather than a
+    /// value picked to break the parser. Without `float_roundtrip` this is
+    /// red deterministically; it is the pin on the Cargo.toml line, which
+    /// nothing else can fail on (the git_guard test that exposed this only
+    /// samples a bad value ~12% of runs).
+    #[test]
+    fn the_epoch_f64s_ci_failed_on_read_back_unchanged() {
+        for probe in [
+            1788887412.4197621_f64, // AF-595, stored as ...419762
+            1788859526.4033027_f64, // ATE-93, stored as ...403303
+        ] {
+            let mut m = std::collections::HashMap::new();
+            m.insert("mtime", probe);
+            let text = serde_json::to_string(&m).unwrap();
+            let back: std::collections::HashMap<String, f64> =
+                serde_json::from_str(&text).unwrap();
+            assert_eq!(
+                back["mtime"].to_bits(),
+                probe.to_bits(),
+                "serde_json's float_roundtrip feature is off: {probe:?} came back \
+                 as {:?} via {text}",
+                back["mtime"],
+            );
+        }
+    }
+
+    /// NEGATIVE CONTROL: inject the exact one-ULP drift and require detection,
+    /// with both sides named. A comparator on floats that never sees a
+    /// mismatch is indistinguishable from one that compares nothing.
+    #[test]
+    fn one_ulp_of_drift_is_a_failure_that_names_both_values() {
+        let wrote = 1788887412.4197621_f64;
+        let read = f64::from_bits(wrote.to_bits() - 1);
+        let v = f64_survives_json_roundtrip(&[(1.0, 1.0), (wrote, read)]);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].status, Status::Fail);
+        let d = format!("{:?}", v[0]);
+        assert!(d.contains("1 of 2 drifted"), "count the population: {d}");
+        assert!(d.contains("-1 ulp"), "name the distance: {d}");
+        assert!(d.contains("float_roundtrip"), "name the remedy: {d}");
+        assert!(d.contains("1788887412.4197621"), "name what was written: {d}");
+    }
+
+    /// THE CONTROL: exact pairs pass, and the pass still publishes its
+    /// denominator so a green cannot be read off an empty probe.
+    #[test]
+    fn exact_pairs_pass_and_publish_the_population() {
+        let v = f64_survives_json_roundtrip(&[(1.5, 1.5), (1788887412.4197621, 1788887412.4197621)]);
+        assert_eq!(v[0].status, Status::Pass);
+        // Read the evidence FIELD, not the Debug string. The first draft of
+        // this line grepped `"probes": 2` out of `{:?}`, which renders as
+        // `Number(2)`, so it failed on a correct pass.
+        assert_eq!(v[0].evidence["probes"], 2, "{:?}", v[0].evidence);
+        assert_eq!(v[0].evidence["drifted"], 0, "{:?}", v[0].evidence);
+    }
+
+    /// An empty probe list is NOT a pass. It means the gatherer did not run,
+    /// and the module's first rule is that Unknown is not Pass.
+    #[test]
+    fn no_probes_is_unknown_not_pass() {
+        let v = f64_survives_json_roundtrip(&[]);
+        assert_eq!(v[0].status, Status::Unknown);
+    }
+}

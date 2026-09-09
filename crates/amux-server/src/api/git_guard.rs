@@ -6216,9 +6216,19 @@ mod tests {
         assert_eq!(before.0["unclaimed"].as_array().unwrap().len(), paths.len());
 
         let now = now_epoch();
-        // Compute this once. Re-evaluating the subtraction at the assertion
-        // site can differ by one f64 ULP across codegen targets even though
-        // the JSON round trip preserved the value exactly.
+        // Compute this once, so both sides of the assertion below read one
+        // value rather than two derivations of it.
+        //
+        // That alone was 61660487's fix and it did NOT stop the failure
+        // (ATE-93, then AF-595). The comment here used to blame codegen and
+        // state that "the JSON round trip preserved the value exactly", which
+        // is backwards and is why the recurrence was read as a flake twice:
+        // serde_json's DEFAULT float parser is not correctly rounded, so
+        // `to_string` -> `from_str` moved this timestamp one ULP on 12.3% of
+        // clock samples. The workspace now enables serde_json's
+        // `float_roundtrip`, which is what makes the assertion below true;
+        // `invariants::checks::f64_survives_json_roundtrip` fails if that
+        // feature is ever dropped.
         let observed_mtime = now - 10.0;
         let reports: Vec<Value> = paths
             .iter()

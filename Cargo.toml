@@ -11,7 +11,17 @@ members = [
 # whole system agrees on one version of each concern (RR-0001).
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# float_roundtrip: serde_json's DEFAULT float parser is not correctly rounded --
+# it can land one ULP from the nearest f64 to the decimal it is reading, so an
+# f64 written with `to_string` does NOT reliably read back with `from_str`.
+# Measured on 1.0.151 over 1,023,542 f64 values sampled across one second at
+# current epoch magnitude: 126,027 (12.3%) drifted; with this feature, 0.
+# That 12% is why AF-595/ATE-93 read as a flake for two rounds (git_guard's
+# stored mtime came back one ULP under the reported one). Writing is exact
+# (ryu); the drift is entirely on the read. Costs ~2x on float parsing only.
+# `invariants::checks::f64_survives_json_roundtrip` fails loudly if this is
+# ever dropped, because a Cargo feature is otherwise invisible at runtime.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["http2"] }
 tracing = "0.1"
