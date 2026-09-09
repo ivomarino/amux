@@ -2260,8 +2260,8 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </button>
       <div class="peek-plan-list" id="peek-plan-list" style="display:none;"></div>
     </div>
-    <div class="peek-output-wrap">
-      <div class="peek-output-controls">
+    <div style="position:relative;flex:1;min-height:0;">
+      <div id="peek-body" class="overlay-body" style="position:absolute;inset:0;"></div>
       <button class="peek-copy-btn" id="peek-copy-btn" onclick="copyPeekContent()" title="Copy all">&#x2398; Copy</button>
       <!-- Subagent switcher — appears only when the pane shows Claude's agents panel -->
       <!-- The pane-driven subagent switcher (⌂/▲/▼, agentNav) was DELETED
@@ -2285,8 +2285,6 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <button onclick="peekQuickKeys('Up')" title="Previous subagent (sends ↑)">&#x25B2;</button>
         <button onclick="peekQuickKeys('Down')" title="Next subagent (sends ↓)">&#x25BC;</button>
       </div>
-      </div>
-      <div id="peek-body" class="overlay-body"></div>
     </div>
     <div id="peek-status" class="overlay-status" onclick="_peekGeoDebug()" title="Tap for layout debug"></div>
     <div class="peek-cmd-bar">
