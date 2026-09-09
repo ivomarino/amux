@@ -3290,7 +3290,7 @@ FIX: Open. Reproduce with explicit onboarding/configured-install controls and
 ## A pool outage erased pending browser writes while the editor reported Saved
 AREA: browser
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-09-09
 SESSION: amux-testing-e2e
 CARD: AF-640
@@ -3303,17 +3303,23 @@ SYMPTOM: During the ENOSPC/pool incident, board PATCHes failed with timed out
 COST: Gate/status edits disappeared after reload and the interface claimed
   durable success while the store was unavailable. The user had to diagnose
   the discrepancy in the live browser and request coordinated recovery.
-FIX: In progress on AF-640: keep queue entries until exact-card acknowledgment,
-  bound requests, retain failed drafts with visible errors, serialize replay,
-  and pin editor identity/generation/revision. Tests execute shipped functions
-  and real browser flows; combined server/live acceptance remains outstanding.
+FIX: b724cdff retains each write until exact-card acknowledgment, bounds
+  requests, preserves failed/newer drafts, serializes replay across tabs, and
+  pins editor identity/generation/revision. 30/30 outage browser cases passed
+  in the final fixture run, including server/device ENOSPC and conflicts.
+  Live on 69490b05/build 9f259f186724b394: an AF-640 note showed Not saved,
+  retained queue id b68ae07c-c4e3-4b93-bfdb-68ee4062bb5b across reload, then
+  acknowledged 1 synced; the durable card contains the note exactly once.
+  Server read failure showed Sync error with SSE connected, then recovered
+  to Live. This validates the browser contract; AF-640 server recovery remains
+  open and the stale-blocker Rust patch is still paused.
 
 
 ---
 ## Numbered terminal output detached its source gutters on phones and reparsed loaded history while streaming
 AREA: browser
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-09-09
 SESSION: amux-testing-e2e
 CARD: AF-640
@@ -3323,8 +3329,41 @@ SYMPTOM: Ethan's phone terminal squeezed split diff/tool output into unreadable
   replaced its DOM; live ticks also walked all loaded prompt descendants.
 COST: The worker terminal was unusable for reviewing changes at phone widths.
   Large active transcripts added avoidable parsing and scrolling work while typing.
-FIX: Candidate uses gutter/code cells, unified split rows below 600px, a separate
-  controls row, stable ANSI-aware chunks and one paint per animation-frame burst.
-  Render counters and a slow-update client-debug signal make regressions measurable.
-  Focused synthetic streaming and navigation tests cover the shipped renderer;
-  exact deployment and live phone/desktop acceptance are still outstanding.
+FIX: 69490b05 uses gutter/code cells, unified split rows below 600px,
+  a separate controls row, stable ANSI-aware chunks and animation-frame burst
+  coalescing. Render counters and slow-update client-debug expose regressions.
+  81/81 browser scenarios and 26/26 Node tests passed; cache and mobile-layout
+  mutations failed named assertions. Exact live build 9f259f186724b394/app
+  0.9.853 was viewed at 390x844 and 1280x844. A 1.038MB/6000-row live synthetic
+  stream kept scrollTop 1800 and chunk identity; eight active updates changed
+  16 chunks, parsed 67,492 characters and preserved typed 01234567 plus focus.
+  Screenshots: /private/tmp/af640-live-mobile-diff.png and
+  /private/tmp/af640-live-desktop-diff.png. No claim of server pool health.
+
+
+---
+## Cross-tab delivery coverage reached an uncounted context route
+AREA: tests
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-09
+SESSION: amux-testing-e2e
+CARD: AF-640
+SYMPTOM: Exact-commit CI for 69490b05 failed e2e_route_stub_guard: the real
+  cross-tab delivery regression used context.route, while the fixture counted
+  only the default page's routes. The behavior test passed, but an unused
+  context stub still had no named failure signal. Additional context.newPage
+  pages likewise bypassed the default-page wrapper.
+COST: A passing browser suite left a gap in whether its response stubs ran,
+  and the Rust import census correctly refused that coverage claim.
+FIX: Keep the census's context-route prohibition and register the shared
+  interception handler on both known pages. Wrap every page the context
+  creates, so second-tab stubs receive the same hit counter and named failure
+  as the default page. The expected absence of a second delivery is explicit
+  at its allowUnusedRoute call; the shared write counter still rejects two
+  deliveries. Matched and dead-stub controls exercise context.newPage through
+  the real fixture. Candidate asset plumbing still applies to the context.
+  Verification: route-stub-guard.spec.ts + outage-recovery.spec.ts across
+  desktop/mobile Chromium and iOS Safari -> 45 passed, 0 unexpected/skipped.
+  JSON receipts confirm every new-page negative control failed by its exact
+  dead-new-page-probe matcher; matched controls and cross-tab delivery pass.

@@ -7,7 +7,7 @@
  * fixture WORKING, and a guard that only checks the import would be green over
  * a wrapper that counted nothing. This file tests the wrapper.
  *
- * All three cells run against the real Playwright runner and the real fixture,
+ * All cells run against the real Playwright runner and the real fixture,
  * because the defect lives in the teardown path and nothing above it flows
  * through that path.
  */
@@ -42,4 +42,20 @@ test('a stub that DOES match does not fail', async ({ page }) => {
   await page.goto('/');
   await page.waitForResponse((r) => r.url().includes('/api/sessions'), { timeout: 20000 });
   expect(hits).toBeGreaterThan(0);
+});
+
+
+test('a page created by context.newPage also rejects a dead stub', async ({ context }) => {
+  test.fail(true, 'new tabs must have the same stub guard as the default page (AF-640)');
+  const second = await context.newPage();
+  await second.route('**/api/dead-new-page-probe', r => r.fulfill({body:'{}'}));
+  await second.close();
+});
+
+test('a page created by context.newPage counts matched stubs', async ({ context }) => {
+  const second = await context.newPage();
+  await second.route('**/api/new-page-probe', r => r.fulfill({body:'new page counted'}));
+  await second.goto('/');
+  expect(await second.evaluate(() => fetch('/api/new-page-probe').then(r => r.text()))).toBe('new page counted');
+  await second.close();
 });

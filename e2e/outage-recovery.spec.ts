@@ -1,4 +1,5 @@
-import { test, expect, Page } from './fixtures';
+import { test, expect, Page, allowUnusedRoute } from './fixtures';
+import type { Route } from '@playwright/test';
 
 async function setup(page: Page) {
   await page.addInitScript(() => {
@@ -186,10 +187,16 @@ test('a second tab cannot replay an edit whose original request is still in flig
   const second = await context.newPage(); await setup(second);
   let release!: () => void; const hold = new Promise<void>(resolve => { release = resolve; });
   let writes = 0;
-  await context.route(`**/api/board/${card.id}`, async route => {
+  const matcher = `**/api/board/${card.id}`;
+  const intercept = async (route: Route) => {
     if (route.request().method() !== 'PATCH') return route.continue();
     writes++; await hold; await route.continue();
-  });
+  };
+  // Each tab uses the existing counted page stub. A second delivery is the
+  // failure under test; no request from that tab is the expected result.
+  await page.route(matcher, intercept);
+  await second.route(matcher, intercept);
+  allowUnusedRoute(second, matcher); // the delivery lock must prevent its PATCH
   await page.locator('#bd-title').fill('One committed delivery'); await save(page);
   await expect.poll(() => writes).toBe(1);
   await second.evaluate(() => { void (window as any).runSyncBanner(); });
