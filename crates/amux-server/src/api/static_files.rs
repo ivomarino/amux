@@ -137,6 +137,9 @@ async fn serve_path(
     if method != axum::http::Method::GET && method != axum::http::Method::HEAD {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
+    if matches!(path, "business" | "business/" | "business/index.html") {
+        return serve_shell(&state, legacy_port_of(legacy), &headers, &uri, peer_ip(peer));
+    }
     match DashboardAssets::get(path) {
         Some(content) => {
             let mime = mime_for(path);
@@ -305,7 +308,12 @@ fn serve_index(
     uri: &Uri,
     peer: Option<IpAddr>,
 ) -> Response {
-    let Some(index) = DashboardAssets::get("index.html") else {
+    let asset = if uri.path() == "/business" || uri.path().starts_with("/business/") {
+        "business/index.html"
+    } else {
+        "index.html"
+    };
+    let Some(index) = DashboardAssets::get(asset) else {
         return (StatusCode::NOT_FOUND, "dashboard not embedded").into_response();
     };
     let html = String::from_utf8_lossy(&index.data).into_owned();
@@ -462,6 +470,27 @@ mod tests {
             build_hash: "test".into(),
             auth_token: token.map(String::from),
         reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+
+    #[tokio::test]
+    async fn business_shell_preserves_the_existing_bootstrap_identity_boundary() {
+        let state = state(Some("business-test-owner-token"));
+        for (host, address, expected) in [
+            ("localhost:8824", "127.0.0.1:12345", true),
+            ("business.example.test", "203.0.113.4:12345", false),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, host.parse().unwrap());
+            let response = serve_path(State(state.clone()), headers,
+                axum::http::Method::GET, "/business/".parse().unwrap(),
+                Some(Extension(ConnectInfo(address.parse().unwrap()))), None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 100_000).await.unwrap();
+            let body = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(body.contains("<title>Amux Business</title>"));
+            assert!(body.contains("/business/assets/"));
+            assert_eq!(body.contains("window._AMUX_AUTH_TOKEN=\"business-test-owner-token\""), expected);
         }
     }
 
