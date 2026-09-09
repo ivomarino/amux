@@ -67,6 +67,11 @@ self.addEventListener('fetch', e => {
   // Only handle http/https (skip chrome-extension:// etc.)
   if (!url.protocol.startsWith('http')) return;
 
+  // Business is a separate shell with its own hashed bundle. Never serve its
+  // authentication bootstrap or connection health from the developer cache.
+  if (url.pathname === '/business' || url.pathname.startsWith('/business/') ||
+      url.pathname === '/health') return;
+
   // API requests: network only (app JS handles offline queue)
   if (url.pathname.startsWith('/api/')) return;
 
