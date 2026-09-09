@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#1e2330">
+  <title>Claude Code Team Setup with amux (2026): Share AI Agents Across Your Engineering Team</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <meta name="description" content="Set up amux so your entire engineering team shares a Claude Code agent fleet. Scoped teams, shared kanban board, and per-team visibility. One amux instance, no seat fees.">
+  <meta name="keywords" content="claude code team setup, share claude code with team, ai coding agents for teams, amux team configuration, multi-user claude code, engineering team ai agents 2026">
+  <link rel="canonical" href="https://amux.io/guides/claude-code-team-setup/">
+  <meta property="og:title" content="Claude Code Team Setup with amux (2026)">
+  <meta property="og:description" content="Set up amux so your entire engineering team shares a Claude Code agent fleet. Scoped teams, shared kanban board, and per-team visibility.">
+  <meta property="og:url" content="https://amux.io/guides/claude-code-team-setup/">
+  <meta property="og:image" content="https://amux.io/og-image.png">
+  <meta property="og:type" content="article">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="alternate" type="application/rss+xml" title="amux Blog" href="https://amux.io/blog/rss.xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/site.js"></script>
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    "itemListElement": [
+      {"@type": "ListItem", "position": 1, "name": "amux", "item": "https://amux.io/"},
+      {"@type": "ListItem", "position": 2, "name": "Guides", "item": "https://amux.io/guides/"},
+      {"@type": "ListItem", "position": 3, "name": "Claude Code Team Setup", "item": "https://amux.io/guides/claude-code-team-setup/"}
+    ]
+  }
+  </script>
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "Article",
+    "headline": "Claude Code Team Setup with amux: Share AI Agents Across Your Engineering Team",
+    "description": "How to configure amux so multiple engineers share one Claude Code agent fleet with scoped team visibility, a shared kanban board, and per-member access control.",
+    "url": "https://amux.io/guides/claude-code-team-setup/",
+    "datePublished": "2026-09-09",
+    "dateModified": "2026-09-09",
+    "author": {"@type": "Organization", "name": "amux", "url": "https://amux.io"},
+    "publisher": {"@type": "Organization", "name": "amux", "url": "https://amux.io"},
+    "image": "https://amux.io/og-image.png",
+    "keywords": ["claude code team setup", "share claude code with team", "ai coding agents for teams", "amux team workflow"]
+  }
+  </script>
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "HowTo",
+    "name": "Set up amux for an engineering team",
+    "description": "Configure one amux instance so multiple engineers can share a Claude Code agent fleet with scoped visibility and a shared task board.",
+    "supply": [{"@type": "HowToSupply", "name": "amux (Homebrew: brew install mixpeek/amux/amux)"}],
+    "tool": [{"@type": "HowToTool", "name": "Claude Code"}, {"@type": "HowToTool", "name": "amux dashboard"}],
+    "step": [
+      {
+        "@type": "HowToStep",
+        "position": 1,
+        "name": "Install amux on a shared server or dev machine",
+        "text": "Run brew install mixpeek/amux/amux on the machine that will host the shared fleet. On Linux, use the install script: curl -sSL https://amux.io/install.sh | bash. The single binary hosts the dashboard and all agent sessions."
+      },
+      {
+        "@type": "HowToStep",
+        "position": 2,
+        "name": "Start the amux server and note the access URL",
+        "text": "Run amux serve. The dashboard is available at https://localhost:8824 by default. For remote team access, use amux tunnel (exposes a public URL) or connect via SSH port forwarding."
+      },
+      {
+        "@type": "HowToStep",
+        "position": 3,
+        "name": "Create scoped teams for each sub-team",
+        "text": "In the Settings tab, create a team for each sub-group (e.g. mobile, backend, infra). Assign workspace members to the appropriate team. Each team sees only their own sessions and board cards by default."
+      },
+      {
+        "@type": "HowToStep",
+        "position": 4,
+        "name": "Register per-engineer agent sessions",
+        "text": "Each engineer registers their own sessions: amux register alice-backend --dir ~/Dev/api and amux start alice-backend. Sessions appear in the shared dashboard under the owner's team view."
+      },
+      {
+        "@type": "HowToStep",
+        "position": 5,
+        "name": "Populate the shared board with tasks",
+        "text": "Add tasks to the shared kanban board: amux board add 'Refactor auth middleware' --session alice-backend or via the dashboard. Agents can auto-drain the board, claiming cards as they become idle. Use auto-drain per team: AMUX_DISPATCH_BACKLOG_WHEN_IDLE=1 in the team's scope."
+      }
+    ]
+  }
+  </script>
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "mainEntity": [
+      {
+        "@type": "Question",
+        "name": "Can multiple engineers share one amux instance?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Yes. amux supports multiple workspace members on a single instance. Each member can manage their own agent sessions while sharing a common kanban board and dashboard. Team scoping (September 2026) lets sub-teams see only their own sessions, so a mobile team and a backend team can coexist on one amux instance without visibility overlap."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "How does amux handle access control for teams?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "amux has two access levels: owner (full admin access, manages all sessions and board) and workspace member (can view and interact with sessions assigned to their team). Members are added through the Settings tab. The owner access link is visible in Settings and can be shared selectively."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Is there a per-seat fee for teams?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "No. amux is open source and self-hosted. There is no per-seat fee regardless of team size. Your cost is the server hosting the amux binary (a $5-10/month cloud VM handles most teams) plus the API tokens consumed by each agent session."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "How do team members access the shared amux dashboard?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "The amux dashboard is a web app served by the amux binary. If amux runs on a shared server, team members access it at the server's IP or hostname on port 8824. For remote teams on different networks, amux cloud tunnel creates an unguessable public URL. The iOS app and PWA support phone access from anywhere."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Can agents from different team members collaborate on the same task?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Yes, through the shared kanban board. A task posted to the board can be claimed by any agent with access to that board. Teams can structure this with group-scoped board cards (visible only to a specific team) or fleet-wide cards that any agent can claim. The auto-drain feature means idle agents automatically pick up the next available card, so no one needs to manually assign work."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "How do I see what every agent on the team accomplished today?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "The amux Trends view groups activity across all sessions by theme, regardless of which team member owns the session. It shows what was done, what's in progress, and what needs attention, across the entire fleet or filtered to a specific team."
+        }
+      }
+    ]
+  }
+  </script>
+</head>
+<body>
+  <header class="site-header">
+    <a class="logo" href="/">amux</a>
+    <nav>
+      <a href="/docs/" class="hide-mobile">docs</a>
+      <a href="/guides/" class="hide-mobile">guides</a>
+      <a href="/compare/" class="hide-mobile">compare</a>
+      <a href="/demos/" class="hide-mobile">demos</a>
+      <a href="/blog/" class="hide-mobile">blog</a>
+      <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener" class="nav-cta-primary nav-cta">iOS app</a>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta">GitHub <span class="gh-stars" id="gh-stars"></span></a>
+    </nav>
+  </header>
+  <main>
+    <div class="breadcrumb"><a href="/">amux</a> <span class="sep">›</span> <a href="/guides/">Guides</a> <span class="sep">›</span> <span>Claude Code Team Setup</span></div>
+
+    <h1>Claude Code Team Setup with amux</h1>
+    <p class="subtitle">Share one AI agent fleet across your engineering team. Scoped visibility, shared board, no per-seat fees. Updated September 2026.</p>
+
+    <!-- EXP-085: claude-code-team-setup top-of-page CTA -->
+    <div style="background:#0d7c42;border-radius:8px;padding:1rem 1.25rem;margin:1.5rem 0;display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap">
+      <span style="color:#fff;font-size:14px;font-weight:500">Run a shared Claude Code fleet for your whole team, free</span>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" onclick="if(window.posthog) posthog.capture('exp085_team_setup_topofpage_cta_click', {page: window.location.pathname})" style="background:#fff;color:#0d7c42;text-decoration:none;padding:0.5rem 1rem;border-radius:6px;font-size:13px;font-weight:700;white-space:nowrap">Get started free</a>
+    </div>
+
+    <div style="background:var(--bg-2,#1a1f2e);border:1px solid var(--line,#2a3040);border-left:3px solid #0d7c42;border-radius:6px;padding:1rem 1.25rem;margin:1.5rem 0">
+      <strong>Quick answer:</strong> Install one amux binary on a shared server. Each engineer registers their own agent sessions. A shared kanban board lets agents claim tasks across the whole team. Team scoping (September 2026) gives each sub-team its own filtered view without running separate instances.
+    </div>
+
+    <h2>Why use one amux instance for your whole team?</h2>
+
+    <p>Each engineer running their own isolated amux install means no shared task board, no cross-team visibility, and duplicated infra. A single shared amux instance gives your engineering team:</p>
+
+    <ul>
+      <li><strong>One kanban board:</strong> agents across the team pull from the same task queue, so no two agents work the same ticket.</li>
+      <li><strong>Fleet-wide observability:</strong> the Trends view and Review dashboard cover all sessions, not just one engineer's laptop.</li>
+      <li><strong>Scoped team views:</strong> mobile, backend, and infra teams each see only their own sessions, but the owner sees everything.</li>
+      <li><strong>Auto-drain across teams:</strong> idle agents auto-claim the next available task, so no manual dispatch is needed even across sub-teams.</li>
+      <li><strong>Single access URL:</strong> one dashboard for the whole team, accessible via browser, iOS app, or PWA from anywhere.</li>
+    </ul>
+
+    <h2>How to set up amux for your team</h2>
+
+    <h3>Step 1: Install amux on a shared machine</h3>
+
+    <p>Pick a machine accessible to your whole team: a cloud VM, a dev server, or a developer's machine on a VPN. Install amux:</p>
+
+    <pre><code># macOS (Homebrew)
+brew install mixpeek/amux/amux
+
+# Linux
+curl -sSL https://amux.io/install.sh | bash</code></pre>
+
+    <p>amux is a single Rust binary. No Docker, no dependencies, no build step.</p>
+
+    <h3>Step 2: Start the server</h3>
+
+    <pre><code>amux serve  # → dashboard at https://localhost:8824</code></pre>
+
+    <p>For remote access, use <a href="/guides/run-ai-agents-remotely/">SSH port forwarding</a> or amux cloud tunnel. The tunnel creates an unguessable public URL; share it with your team. Note: the tunnel URL is public, not authenticated, so treat it like an internal tool URL and share it only within the team.</p>
+
+    <h3>Step 3: Create scoped teams</h3>
+
+    <p>In the amux dashboard, open Settings and create a team for each sub-group:</p>
+
+    <table>
+      <thead>
+        <tr><th>Team</th><th>Members</th><th>Sees</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>mobile</td><td>alice, bob</td><td>Mobile sessions + their board cards</td></tr>
+        <tr><td>backend</td><td>carol, dave</td><td>Backend sessions + their board cards</td></tr>
+        <tr><td>infra</td><td>eve</td><td>Infra sessions + their board cards</td></tr>
+        <tr><td>(owner)</td><td>team lead</td><td>All sessions, all board cards</td></tr>
+      </tbody>
+    </table>
+
+    <p>Team scoping shipped in September 2026. Older amux versions have a flat workspace where every member sees every session.</p>
+
+    <h3>Step 4: Register per-engineer agent sessions</h3>
+
+    <p>Each engineer registers their sessions on the shared machine (or connects their own machine to the shared amux API):</p>
+
+    <pre><code># Alice registers her backend sessions
+amux register alice-api --dir ~/Dev/api
+amux register alice-auth --dir ~/Dev/auth
+amux start alice-api
+amux start alice-auth
+
+# Bob registers his mobile sessions
+amux register bob-ios --dir ~/Dev/ios
+amux start bob-ios</code></pre>
+
+    <p>Sessions appear in the dashboard under the owner's team assignment. The owner can reassign sessions to teams from the Fleet tab.</p>
+
+    <h3>Step 5: Populate the shared board</h3>
+
+    <pre><code># Any team member can add tasks to the shared board
+amux board add "Refactor payment middleware" --session alice-api
+
+# Or target a specific team's scope
+amux board add "Fix login regression" --session bob-ios --group mobile</code></pre>
+
+    <p>With auto-drain enabled, idle agents pick up the next card automatically:</p>
+
+    <pre><code># Enable auto-drain for a session
+AMUX_DISPATCH_BACKLOG_WHEN_IDLE=1 amux start alice-api</code></pre>
+
+    <h2>Shared board: how cross-team task flow works</h2>
+
+    <p>The amux board uses SQLite compare-and-swap for atomic task claiming. Two agents cannot claim the same card simultaneously. This works across team boundaries when cards are posted without a group scope.</p>
+
+    <table>
+      <thead>
+        <tr><th>Board card scope</th><th>Who can claim</th><th>Use case</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>No group (fleet-wide)</td><td>Any idle agent</td><td>Shared sprint backlog, bug queue</td></tr>
+        <tr><td>Group: mobile</td><td>Mobile team agents only</td><td>Mobile-specific feature work</td></tr>
+        <tr><td>Group: backend</td><td>Backend team agents only</td><td>API, database, infra tasks</td></tr>
+        <tr><td>Session: alice-api</td><td>alice-api agent only</td><td>Direct assignment to a specific agent</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Access control overview</h2>
+
+    <p>amux has two access levels:</p>
+
+    <ul>
+      <li><strong>Owner:</strong> Full admin. Manages all sessions, all board cards, team assignments, and settings. The owner access link is visible in Settings and should be held by the team lead or platform team.</li>
+      <li><strong>Workspace member:</strong> Can view and interact with sessions in their assigned team. Can add and claim board cards scoped to their group. Cannot change team assignments or access other teams' sessions.</li>
+    </ul>
+
+    <p>There is no per-seat fee. Add as many workspace members as your team needs.</p>
+
+    <h2>Monitoring your team's fleet</h2>
+
+    <p>The amux dashboard gives the team lead a unified view:</p>
+
+    <ul>
+      <li><strong>Trends view:</strong> What every agent in the fleet accomplished, grouped by theme. Covers all sessions regardless of which team member owns them.</li>
+      <li><strong>Review dashboard:</strong> Blockers-first synthesis across the full fleet. Surfaces what needs attention without reading individual terminal outputs.</li>
+      <li><strong>Fleet org chart:</strong> Visual overview of every session grouped by team. Spot idle agents, see who is working on what, and reassign board cards from a single view.</li>
+      <li><strong>Composable message filters:</strong> Filter the live message stream by team, session name, or keyword. Useful in standups when the team lead wants to see only the mobile team's output.</li>
+    </ul>
+
+    <p>Phone access: the iOS app and PWA give the team lead fleet visibility from anywhere. Approve pull requests, steer stuck sessions, and kick off new tasks without being at a desk.</p>
+
+    <h2>Team setup comparison</h2>
+
+    <table>
+      <thead>
+        <tr><th>Setup</th><th>Shared board</th><th>Team visibility</th><th>Infra cost</th><th>Per-seat fee</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>One amux instance (recommended)</td><td>Yes</td><td>Scoped by team</td><td>1 server</td><td>None</td></tr>
+        <tr><td>One amux per engineer</td><td>No (siloed)</td><td>Individual only</td><td>N servers</td><td>None</td></tr>
+        <tr><td>SaaS agent platforms</td><td>Varies</td><td>Varies</td><td>Managed</td><td>Often per-seat</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Frequently asked questions</h2>
+
+    <details open>
+      <summary>Can multiple engineers share one amux instance?</summary>
+      <p>Yes. amux supports multiple workspace members on one instance. Each member manages their own sessions while sharing a common kanban board. Team scoping (September 2026) lets sub-teams see only their own sessions without running separate instances.</p>
+    </details>
+
+    <details>
+      <summary>How does amux handle access control for teams?</summary>
+      <p>Two levels: owner (full admin, sees all) and workspace member (sees their team's sessions and board cards). Members are added in Settings. The owner access link is visible in Settings and should be held by the team lead.</p>
+    </details>
+
+    <details>
+      <summary>Is there a per-seat fee?</summary>
+      <p>No. amux is open source and self-hosted. No per-seat fee regardless of team size. Your cost is server hosting (a $5-10/month cloud VM handles most teams) plus API tokens consumed by each agent.</p>
+    </details>
+
+    <details>
+      <summary>How do remote team members access the dashboard?</summary>
+      <p>If amux runs on a shared server, team members access it at the server's address on port 8824. For teams on different networks, amux cloud tunnel creates a public URL. The iOS app and PWA support access from anywhere.</p>
+    </details>
+
+    <details>
+      <summary>Can agents from different engineers collaborate on the same task?</summary>
+      <p>Yes, through the shared board. A card posted to the fleet-wide board can be claimed by any agent. Auto-drain means idle agents pick up the next card automatically. Use group scoping to restrict who can claim which cards.</p>
+    </details>
+
+    <details>
+      <summary>How do I see what every agent accomplished today?</summary>
+      <p>The Trends view groups all activity across all sessions by theme, regardless of which team member owns the session. The Review dashboard adds blockers-first synthesis. Both are available to the owner across the full fleet.</p>
+    </details>
+
+    <h2>Related guides</h2>
+    <ul>
+      <li><a href="/guides/running-10-plus-agents/">Running 10+ agents in parallel</a></li>
+      <li><a href="/guides/run-ai-agents-remotely/">Run AI agents on a remote server</a></li>
+      <li><a href="/guides/autonomous-ai-agent-workflow/">Autonomous AI agent workflow</a></li>
+      <li><a href="/guides/ai-agent-telegram-notifications/">AI agent Telegram notifications</a></li>
+      <li><a href="/guides/splitting-work-across-ai-agents/">How to split a project across multiple AI agents</a></li>
+      <li><a href="/use-cases/run-software-company-ai-agents/">Run a software company with AI agents</a></li>
+    </ul>
+
+    <div class="cta-box">
+      <h3>Give your engineering team a shared AI agent fleet</h3>
+      <p>One amux instance. Shared kanban board. Scoped team views. Phone monitoring. Open source, no per-seat fees.</p>
+      <pre><code>brew install mixpeek/amux/amux
+amux serve  # → https://localhost:8824</code></pre>
+      <a class="btn btn-primary" href="https://github.com/mixpeek/amux">⭐ Star on GitHub</a>
+    </div>
+  </main>
+  <footer class="sub-footer">
+    <div class="footer-inner">
+      <div class="footer-top">
+        <div class="footer-brand-col">
+          <a href="/" class="footer-logo">amux</a>
+          <p>Open-source control plane for AI agent teams.</p>
+        </div>
+        <div class="footer-col">
+          <div class="footer-col-label">Resources</div>
+          <ul>
+            <li><a href="/guides/">Guides</a></li>
+            <li><a href="/blog/">Blog</a></li>
+            <li><a href="/demos/">Demos</a></li>
+            <li><a href="/glossary/">Glossary</a></li>
+            <li><a href="/faq/">FAQ</a></li>
+          </ul>
+        </div>
+        <div class="footer-col">
+          <div class="footer-col-label">Guides</div>
+          <ul>
+            <li><a href="/guides/running-10-plus-agents/">Running 10+ agents</a></li>
+            <li><a href="/guides/autonomous-ai-agent-workflow/">Autonomous workflow</a></li>
+            <li><a href="/guides/run-ai-agents-remotely/">Remote agents</a></li>
+            <li><a href="/guides/">All guides</a></li>
+          </ul>
+        </div>
+        <div class="footer-col">
+          <div class="footer-col-label">More</div>
+          <ul>
+            <li><a href="/compare/">Compare</a></li>
+            <li><a href="/for/">For your stack</a></li>
+            <li><a href="/changelog/">Changelog</a></li>
+            <li><a href="/concierge/">Concierge</a></li>
+          </ul>
+        </div>
+      </div>
+      <div class="footer-bottom">
+        <span>MIT License. Built by <a href="https://mixpeek.com">Mixpeek</a></span>
+        <div class="footer-bottom-links">
+          <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS App</a>
+          <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a>
+        </div>
+      </div>
+    </div>
+  </footer>
+  <script>fetch('https://api.github.com/repos/mixpeek/amux').then(function(r){return r.json()}).then(function(d){var el=document.getElementById('gh-stars');if(el&&d.stargazers_count) el.textContent='★ '+d.stargazers_count}).catch(function(){})</script>
+</body>
+</html>
