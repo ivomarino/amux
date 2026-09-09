@@ -618,6 +618,10 @@ pub const AGE_PRUNED_SUBDIRS: &[(&str, &str, u64)] = &[
     // DB snapshots). 7 days is generous: evidence is consumed within hours and
     // the board card carries the conclusion, not the raw capture.
     ("evidence", "AMUX_EVIDENCE_RETAIN_DAYS", 7),
+    // 233 MB on 2026-09-09 across 5 audit workspaces. Each is a self-contained
+    // acceptance test workspace (handoff proofs, scroll accuracy, etc.). 30 days
+    // keeps them around for review but prevents indefinite accumulation.
+    ("audits", "AMUX_AUDITS_RETAIN_DAYS", 30),
 ];
 
 /// Delete subdirectories of `dir` whose mtime is older than `max_age_secs`.
@@ -846,6 +850,67 @@ pub fn prune_temp_browser_dirs(home: &Path) -> (usize, u64) {
     (n, bytes)
 }
 
+/// Cap individual session logs by copy-truncate.
+///
+/// Each of the ~50 sessions writes a `<name>.log` in `logs/`. These grow
+/// without bound: 4.5 GB measured on 2026-09-09, with the largest at 56 MB.
+/// The server-rs.log has its own rotation (above), so this skips it.
+///
+/// Copy-truncate is safe here for the same reason it works on server-rs.log:
+/// tmux's pipe-pane opens the file O_APPEND, and truncating in place just
+/// moves the write offset to 0. The race window (bytes between copy and
+/// truncate) is the standard logrotate copytruncate cost.
+///
+/// `AMUX_SESSION_LOG_MAX_MB` (default 20, 0 disables). Returns (files
+/// rotated, total bytes rolled).
+pub fn rotate_session_logs(logs_dir: &Path) -> (usize, u64) {
+    let max_mb = env_u64("AMUX_SESSION_LOG_MAX_MB", 20);
+    if max_mb == 0 {
+        return (0, 0);
+    }
+    let max_bytes = max_mb * 1024 * 1024;
+    let Ok(rd) = std::fs::read_dir(logs_dir) else { return (0, 0) };
+    let (mut n, mut bytes) = (0usize, 0u64);
+    for e in rd.flatten() {
+        let Ok(md) = e.metadata() else { continue };
+        if !md.is_file() {
+            continue;
+        }
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if !name.ends_with(".log") || name == "server-rs.log" {
+            continue;
+        }
+        if md.len() < max_bytes {
+            continue;
+        }
+        let path = e.path();
+        let prev = path.with_extension("log.1");
+        if std::fs::copy(&path, &prev).is_err() {
+            continue;
+        }
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .is_err()
+        {
+            continue;
+        }
+        n += 1;
+        bytes += md.len();
+    }
+    if n > 0 {
+        tracing::info!(
+            dir = %logs_dir.display(), rotated = n, rolled_bytes = bytes,
+            max_mb = max_mb,
+            knob = "AMUX_SESSION_LOG_MAX_MB",
+            "storage sweep rotated oversized session logs"
+        );
+    }
+    (n, bytes)
+}
+
 // ---------------------------------------------------------------------------
 // Periodic VACUUM
 // ---------------------------------------------------------------------------
@@ -927,6 +992,8 @@ pub struct StorageReport {
     pub at: f64,
     pub tables: Vec<(String, String)>,
     pub rotated_bytes: u64,
+    pub session_logs_rotated: usize,
+    pub session_logs_rolled_bytes: u64,
     pub files_removed: usize,
     pub bytes_freed: u64,
     /// Aged-out uploads NOT deleted because a live card points at them. Reported
@@ -960,6 +1027,9 @@ pub const AGE_PRUNED_DIRS: &[(&str, &str, u64)] = &[
     ("media-cache", "AMUX_MEDIA_CACHE_RETAIN_DAYS", 30),
     ("uploads", "AMUX_UPLOADS_RETAIN_DAYS", 7),
     ("spin-dumps", "AMUX_SPIN_DUMPS_RETAIN_DAYS", 14),
+    ("browser-screenshots", "AMUX_BROWSER_SCREENSHOTS_RETAIN_DAYS", 14),
+    ("email-attachments", "AMUX_EMAIL_ATTACHMENTS_RETAIN_DAYS", 30),
+    ("transcripts", "AMUX_TRANSCRIPTS_RETAIN_DAYS", 30),
 ];
 
 pub async fn storage_tick(state: &AppState, home: &Path) -> StorageReport {
@@ -997,6 +1067,13 @@ pub async fn storage_tick(state: &AppState, home: &Path) -> StorageReport {
 
     let logs = home.join("logs");
     rep.rotated_bytes = rotate_server_log(&logs).unwrap_or(0);
+
+    // Session log capping: each of ~50 sessions writes a .log that grows
+    // without bound. At 20 MB default cap this keeps the logs/ dir under ~1 GB
+    // steady state instead of the 4.5 GB measured on 2026-09-09.
+    let (slr, slb) = rotate_session_logs(&logs);
+    rep.session_logs_rotated = slr;
+    rep.session_logs_rolled_bytes = slb;
 
     // Age-reaped dirs, driven by the AGE_PRUNED_DIRS authority (above) so the
     // prune and settings::is_ephemeral_path read ONE list. media-cache/uploads
@@ -1091,6 +1168,7 @@ pub fn spawn(state: AppState) -> Option<super::PeriodicTask> {
             // a tick whose only action was DECLINING to delete a card's
             // attachment is an action, and it was previously silent.
             let any_work = r.rotated_bytes > 0
+                || r.session_logs_rotated > 0
                 || r.files_removed > 0
                 || r.kept_card_referenced > 0
                 || r.dirs_removed > 0
@@ -1098,6 +1176,8 @@ pub fn spawn(state: AppState) -> Option<super::PeriodicTask> {
             if any_work {
                 tracing::info!(
                     rotated_bytes = r.rotated_bytes,
+                    session_logs_rotated = r.session_logs_rotated,
+                    session_logs_rolled_bytes = r.session_logs_rolled_bytes,
                     files_removed = r.files_removed,
                     bytes_freed = r.bytes_freed,
                     kept_card_referenced = r.kept_card_referenced,
@@ -1128,12 +1208,15 @@ pub async fn debug_storage() -> axum::Json<Value> {
             "ts_col": s.ts_col, "unit": format!("{:?}", s.unit),
         })).collect::<Vec<_>>(),
         "server_log_max_mb": server_log_max_bytes() / 1024 / 1024,
+        "session_log_max_mb": env_u64("AMUX_SESSION_LOG_MAX_MB", 20),
         "sweep_secs": env_u64("AMUX_STORAGE_SWEEP_SECS", STORAGE_TICK_SECS),
         "dir_pruning": AGE_PRUNED_SUBDIRS.iter().map(|(name, env, default)| json!({
             "dir": name, "env": env, "retain_days": env_u64(env, *default),
         })).collect::<Vec<_>>(),
         "last": r.map(|r| json!({
             "at": r.at, "tables": r.tables, "rotated_bytes": r.rotated_bytes,
+            "session_logs_rotated": r.session_logs_rotated,
+            "session_logs_rolled_bytes": r.session_logs_rolled_bytes,
             "files_removed": r.files_removed, "bytes_freed": r.bytes_freed,
             "kept_card_referenced": r.kept_card_referenced,
             "dirs_removed": r.dirs_removed, "dir_bytes_freed": r.dir_bytes_freed,
