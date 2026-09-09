@@ -200,7 +200,6 @@ pub fn router(state: AppState) -> Router {
         // standing proof of the cutover. Matrix:
         // docs/rust-migration/server-boundary.md.
         .nest("/api/browser", browser::routes())
-        .nest("/api/browser/import", browser_import::routes())
         // File VIEWER family — NATIVE (AMUX-2598): payload + raw range
         // streaming + vtt + ffmpeg prepare/transcode with durable job state
         // (api/file_viewer.rs; was PROXIED_FAMILIES' /api/file namespace row).

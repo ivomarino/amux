@@ -93,6 +93,7 @@ pub fn routes() -> Router<AppState> {
         .route("/pw-profiles", get(pw_profiles_list))
         .route("/save-profile", post(save_profile))
         .route("/agent", post(agent))
+        .nest("/import", super::browser_import::routes())
         // Unknown /api/browser paths answer the route CATALOG (ported from
         // Python). EXPLICIT wildcard routes, not `.fallback()`: in the full
         // composition the static SPA catch-all (`/{*path}`) out-competes a
