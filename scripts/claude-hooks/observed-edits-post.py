@@ -323,7 +323,32 @@ def main():
                         # notice on every such commit. The server accepts bare
                         # strings too (older installed copies), stamping those
                         # with its own clock.
-                        hits.append({"path": p, "mtime": mt})
+                        # MC-1627: send the WINDOW this observation sits in,
+                        # not just when the file changed. Attribution here is a
+                        # time-window heuristic, so it names whoever runs the
+                        # LONGEST commands: a 15-minute pytest run observes
+                        # every write any peer made during those 15 minutes.
+                        # It is derivable here and nowhere later: the server
+                        # stores a timestamp, so by the time the notice renders
+                        # the window length is gone.
+                        #
+                        # WINDOW ONLY, NO OFFSET, deliberately. An earlier draft
+                        # also sent `offset_s` (how far into the window the write
+                        # landed). Nothing reads it: parse_observed_reports takes
+                        # named fields and git_guard has no deny_unknown_fields,
+                        # so an unread key is accepted and silently dropped. That
+                        # is exactly the trap MC-1627 documents — a partial
+                        # implementation that ships clean, looks done, and changes
+                        # nothing. The window alone carries the attribution
+                        # signal: the longer it is, the less the observer names
+                        # anyone. An offset would refine that and needs its own
+                        # plumbing through the store, so it belongs in the change
+                        # that adds a reader for it, not this one.
+                        hits.append({
+                            "path": p,
+                            "mtime": mt,
+                            "window_s": round(max(0.0, time.time() - t0), 3),
+                        })
                         if len(hits) >= MAX_PATHS:
                             # MARK IT HERE, not only at the top of the next
                             # directory. Hitting the cap inside the LAST

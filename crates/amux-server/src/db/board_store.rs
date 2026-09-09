@@ -2927,6 +2927,150 @@ fn terminal_action_digest(log: Option<&str>) -> (usize, String) {
 }
 
 /// Build the one terminal summary that both the API and dashboard can render.
+/// The card this one was FOLDED into, if it was.
+///
+/// `api::board` writes `capture folded into <ID>` when an auto-captured prompt
+/// is turned into real work, so this is a server-authored line, not free text
+/// a lane happened to phrase that way.
+///
+/// It exists because a fold and a drop are opposite outcomes that the terminal
+/// summary rendered identically. Reported 2026-09-08 by mixpeek-frustrations
+/// and independently by mixpeek-cicd, five instances across two lanes in one
+/// session. Their specimen:
+///
+///   [task callback MS-1369] ... closed the request without resolving the
+///   dependency. State: discarded. Outcome: Final outcome: discarded (from
+///   doing). Recorded terminal outcome: not supplied. Actions: 2 recorded;
+///   latest: capture folded into MS-1370. Tests/deployment/live evidence: not
+///   recorded. Linked assets: none recorded.
+///
+/// Every clause is true and the sum is false: MS-1369 was a capture shell
+/// folded into MS-1370..MS-1375, six real cards with real content. The reader
+/// has to open the board to tell that from a request dropped on the floor, and
+/// the routing lane is told a peer abandoned their work. Both reporters chased
+/// it; one of them chased it twice.
+///
+/// The discriminator was already IN the payload, on the Actions line. This
+/// reads it instead of printing it beside a contradicting summary.
+pub fn folded_into(log: Option<&str>) -> Option<String> {
+    folded_into_detail(log).map(|(id, _inferred)| id)
+}
+
+/// A CAPTURE SHELL: amux minted this card from an inbound prompt, and nobody
+/// turned it into a unit of work.
+///
+/// The predicate is `creator='amux'` plus the `**Prompt:**` desc marker, which
+/// is the same pair the fold query, the dispatch filters and board-drive already
+/// use inline in four places. Named here because AF-634 needs it in prose rather
+/// than in SQL.
+///
+/// AF-634 (ts-gke, 19 cards and at least 21 notifications in one night): when a
+/// recipient correctly discards one of these, the terminal callback fires AT THE
+/// SENDER saying the recipient "closed the request without resolving the
+/// dependency", with "evidence: not recorded" and "assets: none recorded". Every
+/// clause is true of a capture shell and all of them are misleading about it:
+/// there was no request, no dependency and nothing owed. ts-gke nearly
+/// enumerated all 19 before recognising the shape, and a lane that trusts the
+/// text re-sends its finding or escalates to the owner.
+///
+/// This does NOT silence the callback. Whether a capture should notify its
+/// sender at all is ts-gke's option 1 or 2 and is not one lane's call; this is
+/// their option 3, which changes only what the sentence says.
+pub fn is_capture_shell(row: &IssueRow) -> bool {
+    row.creator == "amux" && row.desc.trim_start().starts_with("**Prompt:**")
+}
+
+/// The marker the SERVER appends when it chose the fold target itself.
+///
+/// AF-616 (mixpeek-frustrations, from a live specimen on this lane's cards):
+/// the auto-fold picks its target by TEMPORAL ADJACENCY. It folds a capture
+/// into whatever card the lane created next, and nothing compares the two. Their
+/// report was captured as AF-613 and folded into AF-615, an unrelated finding
+/// this lane happened to card in the same minute, so the trail from the report
+/// to its fix runs through a card about something else.
+///
+/// Until now BOTH fold paths wrote the identical line, so the summary and the
+/// task callback said "folded this capture into AF-615" whether a lane ASSERTED
+/// the target with `board discard --folded-into` or a SQL query guessed it. That
+/// is a claim whose confidence cannot be read off it, and b3db93fd made it
+/// worse in the useful direction: a wrong target used to be a quiet link and is
+/// now a sentence the reporting lane reads.
+///
+/// This does NOT change when anything folds. Narrowing the window, or requiring
+/// the fold to be asserted, changes every lane's board and is recorded on AF-616
+/// as a decision that is not this lane's to take. Labelling the guess as a guess
+/// is not that change, and it is what lets a reader tell the two apart today.
+pub const FOLD_INFERRED_MARKER: &str = "[inferred]";
+
+/// The card this one was folded into, and whether the SERVER inferred that
+/// target rather than a lane declaring it.
+///
+/// `true` = inferred by adjacency, so the reader should confirm the target
+/// actually addresses the capture. Absence of the marker reads as declared,
+/// which is the safe direction for the entries written before AF-616: they
+/// predate the distinction and most of them were peer folds.
+pub fn folded_into_detail(log: Option<&str>) -> Option<(String, bool)> {
+    let marker = "capture folded into ";
+    log.unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            // THE MARKER MUST BEGIN THE ENTRY, not merely appear in it.
+            //
+            // The first cut used `rfind`, which matched anywhere on the line,
+            // and a live callback caught it within the hour: mixpeek-frustrations
+            // wrote an outcome note DISCUSSING this very fix, containing
+            //   its own Actions line read "capture folded into AF-615", and ...
+            // That note is embedded in the card's STATUS log entry, so the scan
+            // matched the quotation and parsed the target as `AF-615"` — the
+            // trailing quote survived because it is not sentence punctuation.
+            // The callback then read: folded this capture into AF-615". A
+            // positional match landing on prose ABOUT the marker is the same
+            // self-referential trap `every_send_failure_literal_is_classified`
+            // documents against its own docstring.
+            //
+            // The server writes this as a standalone entry, so requiring it at
+            // the start is both tighter and truer to the producer. Entries carry
+            // a `HH:MM` backtick stamp and may carry a `session: ` attribution,
+            // both of which are stripped before the test.
+            let body = line.trim();
+            let body = match body.strip_prefix('`').and_then(|r| r.split_once('`')) {
+                Some((_stamp, rest)) => rest.trim_start(),
+                None => body,
+            };
+            // `<session>: capture folded into X` — only a prefix with no spaces
+            // in it, so a sentence ending in a colon cannot qualify.
+            let body = match body.split_once(": ") {
+                Some((head, rest)) if !head.contains(' ') && rest.starts_with(marker) => rest,
+                _ => body,
+            };
+            body.strip_prefix(marker)
+        })
+        .filter_map(|rest| {
+            // The marker sits AFTER the id, so the id still parses out of an
+            // older entry that has no marker at all.
+            //
+            // REMOVE IT BEFORE TAKING THE ID, rather than relying on it never
+            // being first. A line with the marker and no target parsed the
+            // MARKER as the target ("[inferred", the `]` eaten by the
+            // punctuation trim below), so a fold naming nothing would have
+            // reported a fold into a card called `[inferred`. That is the same
+            // class as the `AF-615"` bug this parser already carries a test for.
+            let inferred = rest.contains(FOLD_INFERRED_MARKER);
+            let rest = rest.replace(FOLD_INFERRED_MARKER, " ");
+            rest.split_whitespace()
+                .next()
+                .map(|id| (id.to_string(), inferred))
+        })
+        .map(|(id, inferred)| {
+            (
+                id.trim_end_matches(['.', ',', ';', ')', '"', '\'', ']'])
+                    .to_string(),
+                inferred,
+            )
+        })
+        .rfind(|(id, _)| !id.is_empty())
+}
+
 /// Artifact-registry refs are combined with refs in evidence so a proof link
 /// cannot disappear merely because an older producer did not register it.
 fn terminal_summary(
@@ -2936,12 +3080,31 @@ fn terminal_summary(
 ) -> rusqlite::Result<(String, usize)> {
     let (action_count, latest_action) = terminal_action_digest(row.log.as_deref());
     let evidence = compact_terminal_text(row.evidence.as_deref().unwrap_or("not recorded"), 1200);
+    // "not supplied" WAS VERY NEARLY A CONSTANT, and a constant cannot disagree
+    // with the run, so it read as a measurement to every reader.
+    //
+    // This clause reads `last_result`, which only `board next --result` writes.
+    // The verb a lane closing a card actually uses is `--outcome`, and that goes
+    // to `desc_append` and `evidence` (amux:2138, amux:2039). `last_result` is
+    // then overwritten by THIS function's own composed summary, which the filter
+    // below correctly rejects. So the clause announced "not supplied" almost
+    // every time, including directly above an evidence line carrying the very
+    // outcome it said was missing.
+    //
+    // Reported by mixpeek-frustrations 2026-09-08 on MS-1388: mixpeek-studio had
+    // done a full prod verification and recorded it, and the callback still led
+    // with "closed the request without resolving the dependency ... not supplied
+    // ... none recorded". They chased it to the board before they could tell it
+    // from a dropped request, for the second time that day.
+    //
+    // So the clause is now OMITTED when there is nothing to report, rather than
+    // asserting a negative the payload contradicts one field over. Saying
+    // nothing is the honest form of having nothing to say.
     let recorded_outcome = row
         .last_result
         .as_deref()
         .filter(|summary| !summary.starts_with("Final outcome:"))
-        .map(|summary| compact_terminal_text(summary, 600))
-        .unwrap_or_else(|| "not supplied".to_string());
+        .map(|summary| compact_terminal_text(summary, 600));
     let mut assets = Vec::new();
     let mut seen = HashSet::new();
     for artifact in crate::db::artifact_store::list_for_task(conn, &row.id)? {
@@ -2967,10 +3130,58 @@ fn terminal_summary(
     } else {
         assets.join(", ")
     };
+    // A FOLD IS NOT A DROP, so it does not get the drop's sentence. The four
+    // "not supplied / not recorded / none recorded" clauses below are all true
+    // of a capture shell and all misleading about it: the work is on the card
+    // it was folded into. Say that, and say where.
+    if let Some(target) = folded_into(row.log.as_deref()) {
+        let tail = if assets.is_empty() {
+            String::new()
+        } else {
+            format!(" Linked assets: {linked_assets}.")
+        };
+        return Ok((
+            format!(
+                "Final outcome: folded into {target} (from {from}, recorded {}). \
+                 This was a capture shell, not a unit of work: its work, evidence and \
+                 assets are on {target}.{tail}",
+                row.status
+            ),
+            assets.len(),
+        ));
+    }
+    // AF-634. A capture shell that was discarded WITHOUT a fold still gets the
+    // clause list below, and "Tests/deployment/live evidence: not recorded" plus
+    // "Linked assets: none recorded" describe a dropped task and a tidied
+    // message equally well. For a message they are true and say nothing, and the
+    // reader is its SENDER, who reads them as a report about work.
+    if is_capture_shell(row) && row.status == "discarded" {
+        let tail = if assets.is_empty() {
+            String::new()
+        } else {
+            format!(" Linked assets: {linked_assets}.")
+        };
+        return Ok((
+            format!(
+                "Final outcome: discarded (from {from}) as a captured message, not a \
+                 unit of work. Nothing was requested of this lane and nothing is \
+                 owed.{}{tail}",
+                match recorded_outcome {
+                    Some(text) => format!(" Recorded reason: {text}."),
+                    None => String::new(),
+                }
+            ),
+            assets.len(),
+        ));
+    }
+    let outcome_clause = match recorded_outcome {
+        Some(text) => format!(" Recorded terminal outcome: {text}."),
+        None => String::new(),
+    };
     Ok((
         format!(
-            "Final outcome: {} (from {}). Recorded terminal outcome: {}. Actions: {} recorded; latest: {}. Tests/deployment/live evidence: {}. Linked assets: {}.",
-            row.status, from, recorded_outcome, action_count, latest_action, evidence, linked_assets
+            "Final outcome: {} (from {}).{} Actions: {} recorded; latest: {}. Tests/deployment/live evidence: {}. Linked assets: {}.",
+            row.status, from, outcome_clause, action_count, latest_action, evidence, linked_assets
         ),
         assets.len(),
     ))
@@ -5186,6 +5397,243 @@ column=silent type:code=outranked(2)"
     /// re-derive, and concluded the override was pinned per-card. Worker and
     /// Group are exactly the rungs that were never asserted.
     ///
+    /// The outcome clause must report, never assert a negative it cannot support.
+    ///
+    /// "Recorded terminal outcome: not supplied" was very nearly a CONSTANT.
+    /// It reads `last_result`, which only `board next --result` writes; a lane
+    /// closing a card uses `--outcome`, which goes to desc_append and evidence,
+    /// and `last_result` is then overwritten by terminal_summary's own output
+    /// and filtered out. So the clause announced "not supplied" almost every
+    /// time, including directly above an evidence line carrying that outcome.
+    ///
+    /// mixpeek-frustrations, MS-1388, 2026-09-08: mixpeek-studio had done a full
+    /// prod verification and recorded it; the callback still said not supplied.
+    #[test]
+    fn the_outcome_clause_is_omitted_rather_than_asserting_not_supplied() {
+        let mut conn = Connection::open_in_memory().expect("memdb");
+        crate::db::migrate::apply_all(&mut conn).expect("schema");
+        let add = |id: &str, last_result: Option<&str>| {
+            conn.execute(
+                "INSERT INTO issues (id, title, status, type, created, updated, last_result)
+                 VALUES (?1, ?2, 'discarded', 'doc', ?3, ?3, ?4)",
+                rusqlite::params![id, format!("t {id}"), 1_760_000_000.0_f64, last_result],
+            ).expect("insert");
+            get_issue(&conn, id).expect("read").expect("row")
+        };
+
+        // A card whose last_result is this function's OWN prior output, which is
+        // the overwhelmingly common real state.
+        let echoed = add("C-ECHO", Some("Final outcome: discarded (from doing). Actions: 1 recorded."));
+        let (text, _) = terminal_summary(&conn, &echoed, "doing").expect("summary");
+        assert!(!text.contains("not supplied"),
+            "must not assert an absence it cannot support: {text}");
+        assert!(!text.contains("Recorded terminal outcome"),
+            "the clause is omitted, not emptied: {text}");
+        assert!(text.starts_with("Final outcome: discarded (from doing)."), "{text}");
+
+        // A card with nothing recorded at all: same, no negative asserted.
+        let bare = add("C-BARE", None);
+        let (bare_text, _) = terminal_summary(&conn, &bare, "doing").expect("summary");
+        assert!(!bare_text.contains("not supplied"), "{bare_text}");
+
+        // THE CONTROL, and it is the one that matters: a REAL recorded outcome
+        // must still be reported. Without this, deleting the clause entirely
+        // would pass everything above.
+        let real = add("C-REAL", Some("Verified the CTA on studio.mixpeek.com; manifest chain checked."));
+        let (real_text, _) = terminal_summary(&conn, &real, "doing").expect("summary");
+        assert!(real_text.contains("Recorded terminal outcome:"), "{real_text}");
+        assert!(real_text.contains("Verified the CTA on studio.mixpeek.com"), "{real_text}");
+    }
+
+    /// AF-634. The rendered summary, not just the predicate. A capture shell
+    /// discarded WITHOUT a fold used to get the generic clause list, whose
+    /// "Tests/deployment/live evidence: not recorded" and "Linked assets: none
+    /// recorded" are true of a message and describe a dropped task.
+    #[test]
+    fn a_discarded_capture_summary_does_not_read_like_a_dropped_task() {
+        let mut conn = Connection::open_in_memory().expect("memdb");
+        crate::db::migrate::apply_all(&mut conn).expect("schema");
+        let add = |id: &str, creator: &str, desc: &str, status: &str| {
+            conn.execute(
+                "INSERT INTO issues (id, title, status, type, created, updated, creator, \"desc\")
+                 VALUES (?1, ?2, ?5, 'doc', ?3, ?3, ?4, ?6)",
+                rusqlite::params![id, format!("t {id}"), 1_760_000_000.0_f64, creator, status, desc],
+            ).expect("insert");
+            get_issue(&conn, id).expect("read").expect("row")
+        };
+
+        let cap = add("C-CAP", "amux", "**Prompt:** here is a finding you should know", "discarded");
+        let (text, _) = terminal_summary(&conn, &cap, "doing").expect("summary");
+        assert!(text.contains("captured message"), "say what it was: {text}");
+        assert!(text.contains("nothing is owed"), "and that nothing is outstanding: {text}");
+        assert!(
+            !text.contains("Tests/deployment/live evidence"),
+            "a message has no test evidence, and saying so reads as a missing one: {text}"
+        );
+        assert!(
+            !text.contains("Linked assets: none recorded"),
+            "nor any assets to have failed to produce: {text}"
+        );
+
+        // THE DISCRIMINATION, and it is the cell that keeps this from silencing
+        // real reports. A genuine discarded card must KEEP the full clause list:
+        // there, "evidence: not recorded" is a fact worth chasing.
+        let real = add("C-REAL2", "some-lane", "Fix the retry loop", "discarded");
+        let (real_text, _) = terminal_summary(&conn, &real, "doing").expect("summary");
+        assert!(
+            real_text.contains("Tests/deployment/live evidence"),
+            "a real discarded task keeps the clause list: {real_text}"
+        );
+        assert!(!real_text.contains("captured message"), "{real_text}");
+
+        // AND A CAPTURE THAT WAS NOT DISCARDED is ordinary work now: a lane
+        // retitled it and did it. It must not be excused as a message.
+        let done_cap = add("C-DONE", "amux", "**Prompt:** do the thing", "done");
+        let (done_text, _) = terminal_summary(&conn, &done_cap, "doing").expect("summary");
+        assert!(!done_text.contains("captured message"), "{done_text}");
+    }
+
+    /// A fold must be readable as a fold, from the log alone.
+    ///
+    /// Reported 2026-09-08 by mixpeek-frustrations and, independently, by
+    /// AF-634 (ts-gke, 19 cards and 21+ notifications in one night). A capture
+    /// shell is amux's record of an inbound MESSAGE. Discarding one is tidying,
+    /// not dropping a request, and the sentence must not read as the latter to
+    /// the person who sent the message.
+    #[test]
+    fn a_discarded_capture_is_not_described_as_a_dropped_request() {
+        let cap = |creator: &str, desc: &str, status: &str| {
+            let mut r = IssueRow {
+                creator: creator.into(),
+                desc: desc.into(),
+                status: status.into(),
+                ..Default::default()
+            };
+            r.id = "X-1".into();
+            r
+        };
+
+        // THE PREDICATE. Both halves are required: amux minted it AND it carries
+        // the prompt marker. Either alone catches real work.
+        assert!(is_capture_shell(&cap("amux", "**Prompt:** hello", "discarded")));
+        assert!(
+            !is_capture_shell(&cap("some-lane", "**Prompt:** hello", "discarded")),
+            "a LANE that happens to paste a prompt marker is carding real work"
+        );
+        assert!(
+            !is_capture_shell(&cap("amux", "Fix the parser", "discarded")),
+            "an amux-minted card with no prompt marker is not a capture"
+        );
+        // Leading whitespace must not defeat it: the marker is written by a
+        // formatter, not by hand.
+        assert!(is_capture_shell(&cap("amux", "\n  **Prompt:** hi", "discarded")));
+    }
+
+    /// AF-616: a fold the SERVER guessed must not read like one a lane
+    /// DECLARED. Both paths write `capture folded into <ID>`; only the
+    /// adjacency-chosen one carries the marker.
+    #[test]
+    fn an_inferred_fold_target_is_distinguishable_from_a_declared_one() {
+        assert_eq!(
+            folded_into_detail(Some("capture folded into AF-615 [inferred]")),
+            Some(("AF-615".to_string(), true)),
+            "the auto-fold path guessed this target and must say so"
+        );
+        assert_eq!(
+            folded_into_detail(Some("capture folded into AF-615")),
+            Some(("AF-615".to_string(), false)),
+            "a lane naming its own target with --folded-into is an assertion"
+        );
+
+        // THE COMPATIBILITY GUARANTEE. The marker sits after the id, so every
+        // existing caller of `folded_into` parses the same id either way. Without
+        // this, adding provenance would silently retarget every fold to `AF-615`
+        // plus a suffix, which is the AF-615" bug this parser already carries a
+        // regression test for.
+        assert_eq!(
+            folded_into(Some("capture folded into AF-615 [inferred]")),
+            Some("AF-615".to_string()),
+            "the marker must not become part of the id"
+        );
+
+        // ENTRIES WRITTEN BEFORE THIS EXISTED read as declared, which is the safe
+        // direction: they predate the distinction and most were peer folds. An
+        // absent marker must never be reported as an inference.
+        assert_eq!(
+            folded_into_detail(Some("`12:01` amux: capture folded into AF-604")),
+            Some(("AF-604".to_string(), false))
+        );
+
+        // The marker alone is not a fold, and must not BECOME the target. The
+        // first cut parsed this as a fold into a card named `[inferred`, with
+        // the `]` eaten by the punctuation trim.
+        assert_eq!(folded_into_detail(Some("[inferred]")), None);
+        assert_eq!(
+            folded_into_detail(Some("capture folded into  [inferred]")),
+            None,
+            "a fold that names no target names nothing, marker or not"
+        );
+    }
+
+    /// mixpeek-cicd: five capture shells across two lanes whose terminal
+    /// summary said "discarded ... not supplied ... not recorded ... none
+    /// recorded", which is the wording a genuinely dropped request produces.
+    /// Each had in fact been folded into real cards, and the fold target was
+    /// printed on the summary's own Actions line while it said so.
+    #[test]
+    fn a_folded_capture_is_distinguishable_from_a_dropped_one() {
+        // The server-authored line (api::board writes exactly this).
+        assert_eq!(
+            folded_into(Some("claimed\ncapture folded into MS-1370\n")),
+            Some("MS-1370".to_string())
+        );
+        // Timestamp/backtick prefixes are how the log actually renders.
+        assert_eq!(
+            folded_into(Some("`12:01` amux: capture folded into AF-604")),
+            Some("AF-604".to_string())
+        );
+        // Trailing punctuation must not become part of the id.
+        assert_eq!(
+            folded_into(Some("capture folded into MS-1370.")),
+            Some("MS-1370".to_string())
+        );
+        // The LAST fold wins, so a re-fold is not reported at its first target.
+        assert_eq!(
+            folded_into(Some("capture folded into A-1\ncapture folded into A-2")),
+            Some("A-2".to_string())
+        );
+
+        // CONTROLS. Without these, a helper returning Some(..) unconditionally
+        // passes everything above, and every discarded card would claim a fold.
+        assert_eq!(folded_into(None), None);
+        assert_eq!(folded_into(Some("")), None);
+        assert_eq!(folded_into(Some("discarded: duplicate of MS-1370")), None,
+            "an ordinary discard is not a fold");
+        assert_eq!(folded_into(Some("capture folded into ")), None,
+            "a fold with no target names nothing");
+
+        // THE LIVE SPECIMEN, caught by a callback within the hour of shipping
+        // the first cut. An outcome note DISCUSSING this fix is embedded in the
+        // card's STATUS entry; matching it produced the target `AF-615"` and a
+        // callback reading `folded this capture into AF-615"`.
+        let quoting = "`17:31` STATUS (board): Final outcome: discarded (from doing). \
+                       Their fix reads a server-authored \"capture folded into <ID>\" line, \
+                       and its own Actions line read \"capture folded into AF-615\", so";
+        assert_eq!(folded_into(Some(quoting)), None,
+            "prose QUOTING the marker is not a fold");
+
+        // And the real entry still matches with that attribution prefix present.
+        assert_eq!(
+            folded_into(Some("`17:31` amux-frustrations: capture folded into AF-615")),
+            Some("AF-615".to_string())
+        );
+        // A stray quote on a REAL fold line must not become part of the id.
+        assert_eq!(
+            folded_into(Some("capture folded into AF-615\"")),
+            Some("AF-615".to_string())
+        );
+    }
+
     /// One test for the whole ladder rather than five, because the property is
     /// a mapping and the interesting failure is two rungs agreeing when they
     /// should differ.

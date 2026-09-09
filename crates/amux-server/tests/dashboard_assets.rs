@@ -506,7 +506,14 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
         "function _runtimeBoardSplitBadge(s)",
         "s.status !== 'unattributed'",
         "active-conflicting-claims",
-        ">card conflict</span>",
+        "automatically reconciles multiple live task claims",
+        // `>card syncing</span>` was pinned here by 03061448 and deliberately
+        // REMOVED from app.js by 9127257d ("remove false 'card syncing'
+        // badges from worker cards"), which named three distinct causes of
+        // the badge being wrong and left this needle behind. The test then
+        // demanded a treatment the dashboard had stopped rendering on
+        // purpose, so it reddened `rust` on main from 9127257d onward while
+        // describing the failure as lost functionality.
         "truth.verdict",
     ] {
         assert!(app.contains(needle), "unattributed runtime lost its server-verdict treatment `{needle}`");
@@ -515,10 +522,12 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
         "normal runtime attribution lag must not manufacture a card-syncing warning");
     assert!(
         app.contains("verdict === 'active-conflicting-claims'")
-            && app.contains("status-badge rate-limited")
+            && app.contains("automatically reconciles multiple live task claims")
             && app.contains("status-badge waiting"),
-        "only competing live claims should receive the red conflict treatment"
+        "competing live claims should stay internal while other unattributed idle states remain visible"
     );
+    assert!(!app.contains(">card conflict</span>"),
+        "claim reconciliation is harness work, not a human-facing status");
     assert!(
         !app.contains(">runtime/board split</span>"),
         "a recoverable task-link lag must not be presented as a red runtime failure"
@@ -973,6 +982,69 @@ fn worker_board_opens_current_work_without_expanding_every_idle_lane() {
 /// is not a check that can fail (ethos rule 7). This scans every global
 /// banner div for its inline z-index and fails if a new one is ever added (or
 /// an old one edited) above the overlay's own 100.
+/// The peek toolbar's message filter is a BUTTON, and a `<select>` must not
+/// come back into that band (AF-591, AMUX-4242).
+///
+/// The old control was `<label class="peek-msg-filter" for="peek-msg-kind">`
+/// wrapping a full-width `<select>`, which spent over half the toolbar's width
+/// on one input and squeezed up, down, find, worker-menu and close to the right
+/// edge. `amux` replaced it in c07923e6 with a funnel button plus a filter
+/// panel, keeping the count badge so the number was not dropped.
+///
+/// This is the half that shipped without a signal. The UI fix is real and there
+/// was nothing to catch it regressing: a later edit could reintroduce a select
+/// into that band and every test would stay green. The two-fix rule asks for the
+/// fix AND the thing that self-announces, and the spec for this change named
+/// exactly this check as the one worth adding.
+///
+/// It slices the BAND rather than the file, because the dashboard has a dozen
+/// legitimate `<select>` elements elsewhere (settings, library facets, proxy
+/// form) and a file-wide assertion would either be false or have to whitelist
+/// them, which is a list that rots.
+#[test]
+fn the_peek_toolbar_filter_is_a_button_and_not_a_select() {
+    let index = asset("index.html");
+    let lines: Vec<&str> = index.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| l.contains(r#"class="peek-toolbar""#))
+        .expect("the peek toolbar band is gone from index.html; did the class change?");
+    let end = lines[start..]
+        .iter()
+        .position(|l| l.contains("peek-find-wrap"))
+        .map(|offset| start + offset)
+        .expect("the find-wrap that closes the toolbar band is gone; re-anchor this test");
+    let band = lines[start..end].join("\n");
+
+    assert!(
+        !band.contains("<select"),
+        "a <select> is back in the peek toolbar band. It is the control this change removed, \
+         because at full width it leaves no room for up/down/find/menu/close:\n{band}"
+    );
+
+    // POSITIVE CONTROLS. Without these, deleting the whole band passes the
+    // assertion above, and so does a button that silently dropped the count.
+    // Matched as the full id ATTRIBUTE, not as a substring. `contains("peek-msg
+    // -count")` still matches `peek-msg-count-gone`, so a rename would have
+    // slipped through: caught by mutating exactly that and watching this cell
+    // stay green.
+    assert!(
+        band.contains(r#"id="peek-filter-btn""#),
+        "the filter BUTTON is missing from the toolbar band:\n{band}"
+    );
+    assert!(
+        band.contains(r#"id="peek-msg-count""#),
+        "the message count badge was dropped; the number the <select> used to show must survive:\n{band}"
+    );
+    // And the band must still hold the actions the select was crowding out.
+    for needle in ["peekMsgPrev", "peekMsgNext", "togglePeekFind", "closePeek"] {
+        assert!(
+            band.contains(needle),
+            "the toolbar lost `{needle}`, which is what the space was reclaimed FOR:\n{band}"
+        );
+    }
+}
+
 #[test]
 fn global_banners_never_outrank_the_peek_overlay() {
     let html = asset("index.html");
@@ -1008,4 +1080,26 @@ fn global_banners_never_outrank_the_peek_overlay() {
              #email-approvals-banner."
         );
     }
+}
+
+#[test]
+fn workspace_invites_and_members_are_assigned_through_scoped_teams() {
+    let app = asset("app.js");
+    let html = asset("index.html");
+    for needle in [
+        "function openTeamEditor",
+        "fetch('/api/org/teams')",
+        "JSON.stringify({email, team_id})",
+        "JSON.stringify({team_id})",
+        "_workspaceTeamScope",
+    ] {
+        assert!(app.contains(needle), "workspace team UI lost `{needle}`");
+    }
+    for needle in ["Workspace access", "settings-teams-list", "+ Team", "+ Invite"] {
+        assert!(html.contains(needle), "workspace access shell lost `{needle}`");
+    }
+    assert!(
+        !app.contains("JSON.stringify({email, scope_level, scope_name})"),
+        "the invite UI regressed to copying a one-off scope onto the user instead of assigning a team"
+    );
 }

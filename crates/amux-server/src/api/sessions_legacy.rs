@@ -10,7 +10,7 @@
 use super::AppState;
 use crate::backend::tmux::pane_target;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
@@ -826,6 +826,15 @@ impl FleetSignals {
         signals
     }
 
+    /// Target the worker's active window for fields such as
+    /// `#{window_activity}` and `#{pane_pid}`. Tmux accepts a bare `=session`
+    /// target for `display-message` but expands those fields to empty strings,
+    /// which made single-worker steering probes see no running lane while the
+    /// fleet-wide status path correctly reported the same worker as IDLE.
+    fn lane_probe_target(name: &str) -> String {
+        pane_target(&format!("amux-{name}"))
+    }
+
     fn load_scoped(conn: &rusqlite::Connection, lane: Option<&str>) -> Self {
         let mut activity = BTreeMap::new();
         let mut created = BTreeMap::new();
@@ -855,8 +864,8 @@ impl FleetSignals {
         let mut lsc = std::process::Command::new("tmux");
         let format = "#{session_name}:#{session_activity}:#{session_created}:#{window_activity}";
         if let Some(name) = lane {
-            let st = crate::backend::tmux::session_target(&format!("amux-{name}"));
-            lsc.args(["display-message", "-p", "-t", &st, format]);
+            let pt = Self::lane_probe_target(name);
+            lsc.args(["display-message", "-p", "-t", &pt, format]);
         } else {
             lsc.args(["list-sessions", "-F", format]);
         }
@@ -903,8 +912,8 @@ impl FleetSignals {
         let all_panes_dead = {
             let mut c = std::process::Command::new("tmux");
             if let Some(name) = lane {
-                let st = crate::backend::tmux::session_target(&format!("amux-{name}"));
-                c.args(["list-panes", "-t", &st, "-F", "#{session_name}:#{pane_dead}"]);
+                let pt = Self::lane_probe_target(name);
+                c.args(["list-panes", "-t", &pt, "-F", "#{session_name}:#{pane_dead}"]);
             } else {
                 c.args(["list-panes", "-a", "-F", "#{session_name}:#{pane_dead}"]);
             }
@@ -952,8 +961,8 @@ impl FleetSignals {
         let panes_probe = {
             let mut c = std::process::Command::new("tmux");
             if let Some(name) = lane {
-                let st = crate::backend::tmux::session_target(&format!("amux-{name}"));
-                c.args(["list-panes", "-t", &st, "-F", "#{session_name}:#{pane_pid}:#{pane_current_command}"]);
+                let pt = Self::lane_probe_target(name);
+                c.args(["list-panes", "-t", &pt, "-F", "#{session_name}:#{pane_pid}:#{pane_current_command}"]);
             } else {
                 c.args(["list-panes", "-a", "-F", "#{session_name}:#{pane_pid}:#{pane_current_command}"]);
             }
@@ -2376,7 +2385,7 @@ type TaskMarker = (f64, Option<String>, bool, String);
 /// A cardless event must carry the semantic classification which licensed it.
 /// Transport intent (`[no-board]`) is not such a classification: a substantive
 /// turn remains work even when its sender asked not to mint a duplicate card.
-fn cardless_event_allowed(data: &serde_json::Value) -> bool {
+pub(crate) fn cardless_event_allowed(data: &serde_json::Value) -> bool {
     matches!(
         data["reason"].as_str(),
         Some("informational-query") | Some("control-prompt")
@@ -2636,30 +2645,119 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
     // victims were endpoints that never shell out at all — they just could not
     // get a connection because five copies of THIS function held them.
     //
-    // try_lock, never lock: this runs on the async executor, so blocking here
-    // would trade pool starvation for executor starvation. Exactly one caller
-    // rebuilds; everyone else gets the last snapshot, which for a 2s-TTL list
-    // is at worst a couple of seconds staler than they hoped — the same
-    // trade the cache itself already made.
+    // Blocking here is safe: both callers (this handler and graph.rs's
+    // fleet_graph) run this function inside spawn_blocking (AF-300), so a
+    // wait costs one blocking-pool thread, never an executor slot — the
+    // "try_lock, never lock" rule this comment used to state predates that
+    // migration and no longer holds.
+    //
+    // A COLD cache (no snapshot yet — true on every restart) used to bypass
+    // the guard entirely: try_lock's Err arm found `c.json` empty and fell
+    // through to an INDEPENDENT build, one per concurrent caller. That is
+    // the exact N-builders-one-pool failure AR-135 exists to prevent, just
+    // gated on "cache empty" instead of "TTL expired" — and it is the worse
+    // moment to hit it, since a restart is when every dashboard/fleet client
+    // reconnects and hits this endpoint at once. Confirmed live 2026-09-09:
+    // a post-restart reconnect burst held `read_pool_exhausted` for minutes
+    // (152 failures/60s), sessions_legacy.rs's own single-flight guard doing
+    // nothing because it only ever guarded the warm path.
+    //
+    // Fix, first attempt (2026-09-09 morning): a loser WAITS (bounded 3s) for
+    // the in-flight build's result instead of racing it, falling back to an
+    // independent build past the deadline. THAT BOUND ALONE DOES NOT BOUND
+    // THE BUILDER COUNT: under a single instantaneous burst it works (one
+    // straggler, at most), but under SUSTAINED reconnect pressure — the real
+    // shape of a restart, where clients keep arriving over many seconds, not
+    // in one instant — every new wave of waiters can independently miss the
+    // same 3s deadline and each spin up its own build. Confirmed live
+    // 2026-09-09 afternoon: read_pool_exhausted recurred in bursts for
+    // minutes AFTER this fix was deployed, box load average at 62 (4 cores),
+    // amux-server-rs itself at 400%+ CPU — N independent builds each
+    // spawning ~100 subprocesses, stacking faster than any of them finished,
+    // which is the same failure this whole guard exists to prevent, just
+    // arriving in waves instead of one instant.
+    //
+    // FIX: cap the number of concurrent independent builds at a CONSTANT — 2
+    // (the primary FLIGHT plus exactly one FALLBACK_FLIGHT) — no matter how
+    // many requests arrive or how long they keep arriving. A waiter that
+    // cannot get either lock does not build a third copy; it keeps waiting.
+    // The wait is bounded overall (15s) purely as a fail-SAFE: past that
+    // bound this returns an honest error (-> 500, which the dashboard's
+    // existing degraded-UI banner already renders as "Worker updates are
+    // unavailable ... Retry") instead of adding a third builder to a pool
+    // that is, by definition, already struggling if both of the first two
+    // haven't finished in 15s. Refusing new load under real overload is the
+    // fail-safe; piling on more load is what turned a single restart into a
+    // minutes-long outage.
     static FLIGHT: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let Ok(_flight) = FLIGHT.try_lock() else {
+    static FALLBACK_FLIGHT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _flight = if let Ok(g) = FLIGHT.try_lock() {
+        g
+    } else {
         if let Ok(c) = build_array_cache().lock() {
             // Losers may serve a somewhat-stale snapshot (that is the
             // stale-while-revalidate trade), but never one from before an
             // invalidation — post-invalidation the json is empty, so they
-            // fall through and build.
+            // fall through and wait.
             if !c.json.is_empty() && c.epoch == epoch_now {
                 return Ok(c.json.clone());
             }
         }
-        // Cold start with a builder already in flight: fall through and build
-        // anyway — an empty answer would render an empty fleet as truth.
-        return {
-            let conn = store.read()?;
-            let arr = build_array(&conn)?;
-            let json = serde_json::to_string(&arr)?;
-            Ok(json)
-        };
+        let overall_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut acquired = None;
+        let mut used_fallback = false;
+        loop {
+            if let Ok(g) = FLIGHT.try_lock() {
+                acquired = Some(g);
+                break;
+            }
+            if let Ok(g) = FALLBACK_FLIGHT.try_lock() {
+                acquired = Some(g);
+                used_fallback = true;
+                break;
+            }
+            if let Ok(c) = build_array_cache().lock() {
+                if !c.json.is_empty() && c.epoch == epoch_now {
+                    return Ok(c.json.clone());
+                }
+            }
+            if std::time::Instant::now() >= overall_deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        match acquired {
+            Some(g) => {
+                if used_fallback {
+                    tracing::warn!(
+                        target: "amux::sessions",
+                        verdict = "sessions_cache_fallback_builder",
+                        "cold sessions cache with the primary builder still busy — using the \
+                         ONE fallback builder rather than waiting forever (AF-301) or piling on \
+                         a third independent build (the 2026-09-09 sustained-load regression). \
+                         A spike in this line means restarts are landing under real concurrent \
+                         load; two builders at once is expected, more would not be."
+                    );
+                }
+                g
+            }
+            None => {
+                tracing::error!(
+                    target: "amux::sessions",
+                    verdict = "sessions_cache_stuck",
+                    waited_ms = 15000,
+                    "cold sessions cache with BOTH the primary and fallback builders still busy \
+                     after 15s — refusing a third independent build (that pile-up is exactly what \
+                     caused the sustained read_pool_exhausted outage on 2026-09-09). Failing this \
+                     request so the caller retries instead of adding more load to an already-stuck \
+                     pool; if this recurs, the primary/fallback builders themselves are wedged \
+                     (AF-301's unbounded subprocess calls), not this guard."
+                );
+                anyhow::bail!(
+                    "sessions list temporarily unavailable: both builders busy after 15s, refusing to add a third"
+                );
+            }
+        }
     };
     // Double-check under the flight lock: the previous holder may have just
     // refreshed, and rebuilding immediately would waste its work.
@@ -2731,6 +2829,7 @@ pub async fn list_sessions_legacy(
     match built.unwrap_or_else(|e| Err(anyhow::anyhow!("sessions build panicked: {e}"))) {
         Ok(json) => {
             let body = filter_isolated_for_peer(&json, &headers);
+            let body = filter_for_local_member(&body, &headers);
             // CONTENT-hash ETag (AMUX-3504), not a store-rev one: this payload
             // is part store, part scrape (pane previews, token counts), so a
             // rev ETag would serve stale 304s when scrape state moved. The
@@ -2775,6 +2874,9 @@ pub async fn list_sessions_legacy(
 /// the owner's dashboard is a browser and sends neither. Same owner-vs-peer
 /// split the send guard uses (empty origin = owner).
 fn caller_is_peer(headers: &axum::http::HeaderMap) -> bool {
+    if crate::api::org::is_verified_local_member(headers) {
+        return false;
+    }
     ["x-amux-worker", "x-amux-session"].iter().any(|k| {
         headers
             .get(*k)
@@ -2782,6 +2884,27 @@ fn caller_is_peer(headers: &axum::http::HeaderMap) -> bool {
             .map(|v| !v.trim().is_empty())
             .unwrap_or(false)
     })
+}
+
+/// A human invited at worker/group scope sees only the fleet slice they were
+/// granted. Filtering happens before the content ETag is computed, so a scope
+/// change cannot reuse a validator for a broader response.
+fn filter_for_local_member(json: &str, headers: &axum::http::HeaderMap) -> String {
+    let Some(scope) = crate::api::org::local_member_scope(headers) else {
+        return json.to_string();
+    };
+    if scope.is_global() {
+        return json.to_string();
+    }
+    let Ok(mut rows) = serde_json::from_str::<Vec<serde_json::Value>>(json) else {
+        return json.to_string();
+    };
+    rows.retain(|row| {
+        row.get("name")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|worker| scope.allows_worker(worker))
+    });
+    serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into())
 }
 
 /// ISOLATED (AMUX-3232): strip isolated (raw-agent) workers from the fleet list
@@ -2932,6 +3055,7 @@ pub(crate) fn worker_model_env(
 
 pub async fn create_session_legacy(
     State(_state): State<AppState>,
+    headers: HeaderMap,
     body: Option<Json<serde_json::Value>>,
 ) -> Response {
     let body = body.map(|Json(v)| v).unwrap_or(serde_json::Value::Null);
@@ -3012,9 +3136,14 @@ pub async fn create_session_legacy(
         &default_model,
     );
     let mut pairs: Vec<(&str, String)> = vec![("CC_DIR", dir.clone())];
-    let creator = s("creator");
+    // An invited human's author comes from the verified member cookie. The
+    // request body and ordinary worker/session headers are caller-controlled,
+    // so neither may decide who appears as the worker's creator.
+    let creator = super::org::local_member_actor(&headers)
+        .map(str::to_string)
+        .unwrap_or_else(|| s("creator"));
     if !creator.is_empty() {
-        pairs.push(("CC_CREATOR", creator));
+        pairs.push(("CC_CREATOR", creator.clone()));
     }
     if provider != "claude" {
         pairs.push(("CC_PROVIDER", provider.clone()));
@@ -3080,6 +3209,7 @@ pub async fn create_session_legacy(
             "name": name,
             "dir": dir,
             "provider": provider,
+            "creator": creator,
             "running": false,
             "archived": false,
             // Echo what was actually stored so a dropped or defaulted field is
@@ -4089,6 +4219,15 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
 pub(crate) mod tests {
     use super::*;
     static PROBE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn single_lane_fleet_probe_targets_the_active_window() {
+        assert_eq!(
+            FleetSignals::lane_probe_target("mixpeek-homepage-claude"),
+            "=amux-mixpeek-homepage-claude:",
+            "a session-only target exits successfully while returning empty pane/window fields"
+        );
+    }
 
     #[test]
     fn bounded_probe_drains_large_stdout_and_stderr_before_waiting() {

@@ -592,6 +592,7 @@ let sessions = [];
 let _sessionsSnapshotEpoch = 0;
 let archivedExpanded = false;
 let gitInfo = {};  // {sessionName: {branch, repo, _conflict}}
+let _sessionLoadError = null; // Last failed worker read; a response is not necessarily data.
 let _initialLoad = true;   // true until first data arrives from server
 let _lastDataTime = null;  // timestamp of last successful data
 // AC-275: when NO data has ever arrived, _lastDataTime stays null and every
@@ -977,7 +978,7 @@ function _connEpisodes() {
       // the first as the second is what would let an old sleep keep posing as
       // an outage with a confident new label on it.
       if (!cur) cur = { start: e.ts, worst: e.to, hid: ('hid' in e) ? !!e.hid : null };
-      else if (e.to === 'offline') cur.worst = 'offline';
+      else if (['offline', 'auth', 'error'].includes(e.to)) cur.worst = e.to;
     } else if (cur) {
       cur.end = e.ts; eps.push(cur); cur = null;
     }
@@ -1000,7 +1001,7 @@ const _CONN_BLIP_MS = 5000;
 function _connEpisodeKind(ep, now) {
   const dur = (ep.end || now) - ep.start;
   if (ep.worst === 'offline' && ep.hid === true) return 'sleep';
-  if (ep.worst !== 'offline' && ep.end && dur < _CONN_BLIP_MS) return 'blip';
+  if (ep.worst === 'polling' && ep.end && dur < _CONN_BLIP_MS) return 'blip';
   return 'outage';
 }
 // _fmtDur lives once, further down. A second copy was declared here; the last
@@ -1074,8 +1075,8 @@ async function _runPing(n) {
 
 function showConnHistory() {
   const eps = _connEpisodes();
-  const stateLabel = { live: '● Live', polling: '● Polling', offline: '● Offline' }[_connState] || '● —';
-  const stateColor = { live: '#3fb950', polling: '#facc15', offline: '#f85149' }[_connState] || 'var(--dim)';
+  const stateLabel = { live: '● Live', polling: '● Polling', offline: '● Offline', auth: '● Access required', error: '● Sync error' }[_connState] || '● —';
+  const stateColor = { live: '#3fb950', polling: '#facc15', offline: '#f85149', auth: '#f85149', error: '#f85149' }[_connState] || 'var(--dim)';
   const _now = Date.now();
   const kinds = eps.map(ep => _connEpisodeKind(ep, _now));
   const blips = eps.filter((_, i) => kinds[i] === 'blip');
@@ -1093,7 +1094,9 @@ function showConnHistory() {
       const isOff = ep.worst === 'offline';
       const sleep = kind === 'sleep';
       const ico = sleep ? '🌙' : isOff ? '🔴' : '🟡';
-      const label = sleep ? 'Device asleep or app backgrounded'
+      const label = ep.worst === 'auth' ? 'Workspace access required'
+                  : ep.worst === 'error' ? 'Worker updates unavailable'
+                  : sleep ? 'Device asleep or app backgrounded'
                   : isOff ? 'Disconnected (offline)'
                   : 'Degraded to polling';
       const when = _fmtClock(ep.start) + ' → ' + (ongoing ? '<span style="color:' + (isOff ? '#f85149' : '#facc15') + '">ongoing</span>' : _fmtClock(ep.end));
@@ -1144,15 +1147,17 @@ function showConnHistory() {
 // ═══════ DEVICE NAME / CLOUD IDENTITY ═══════
 let _cloudEmail = '';
 let _localMemberEmail = '';
+let _localMemberScope = null;
+let _localMemberTeam = null;
 let _gatewayOrgs = [];
 
 async function _initIdentity() {
   try {
     const r = await fetch('/api/identity');
     if (r.status === 401) {
-      // 401 means we're behind the cloud gateway (local server never returns 401 here).
-      // Redirect to login — but not on self-hosted Tailscale/LAN hosts where 401 could
-      // be a transient network issue.
+      // A 401 is an authentication refusal, including on self-hosted remote
+      // browsers. The worker read owns the local access/recovery message; cloud
+      // gateways retain their existing login redirect.
       if (location.hostname.endsWith('.amux.io')) {
         window.location.replace('/api/cloud-logout');
       }
@@ -1162,6 +1167,8 @@ async function _initIdentity() {
     const d = await r.json();
     _cloudEmail = d.is_cloud ? (d.email || '') : '';
     _localMemberEmail = d.is_local_member ? (d.email || '') : '';
+    _localMemberScope = d.is_local_member ? (d.access_scope || {level:'global', name:''}) : null;
+    _localMemberTeam = d.is_local_member ? (d.team || null) : null;
     if (!d.has_api_key) {
       if (d.is_cloud) {
         // Blocking modal for cloud users — must set key before using the app
@@ -1177,6 +1184,12 @@ async function _initIdentity() {
       _showKeyWarning(d.key_error);
     }
     _applyIdentityToSettings();
+    // Settings can open before this async identity request returns. Refresh an
+    // already-open Team section so a scoped member never keeps the owner's
+    // controls from that brief pre-identity render.
+    if (document.getElementById('settings-menu')?.classList.contains('open')) {
+      loadTeamSection();
+    }
     if (_cloudEmail) {
       const lb = document.getElementById('logout-btn');
       if (lb) lb.style.display = '';
@@ -1913,10 +1926,14 @@ function describeOp(item) {
 // Connection status
 function updateConnectionStatus() {
   // Log the state transition (for the click-to-view disconnection history).
-  _recordConnState(!online ? 'offline' : (_liveSSE ? 'live' : 'polling'));
+  const readState = _sessionLoadError ? (_sessionLoadError.status === 401 ? 'auth' : 'error') : null;
+  _recordConnState(readState || (!online ? 'offline' : (_liveSSE ? 'live' : 'polling')));
   // Update all connection status indicators (main + peek)
   document.querySelectorAll('#conn-status').forEach(el => {
-    if (!online) {
+    if (readState) {
+      el.className = 'conn-status offline';
+      el.textContent = readState === 'auth' ? 'Access required' : 'Sync error';
+    } else if (!online) {
       el.className = 'conn-status offline';
       const total = offlineQueue.length + drafts.length;
       el.textContent = total ? total + ' pending' : 'Offline';
@@ -1928,6 +1945,12 @@ function updateConnectionStatus() {
       el.textContent = 'Polling';
     }
   });
+  const notice = document.getElementById('session-read-notice');
+  const noticeHTML = _sessionReadNotice();
+  if (notice && notice._noticeHTML !== noticeHTML) {
+    notice.innerHTML = noticeHTML;
+    notice._noticeHTML = noticeHTML;
+  }
   // Update offline banner
   const banner = document.getElementById('offline-banner');
   const ops = document.getElementById('offline-ops');
@@ -2937,18 +2960,95 @@ function _checkSessionTransitions(newData) {
 // on every API call and can never heal on its own — the fresh token lives in
 // the fresh shell. Nudge the SW and reload ONCE per session (rate-limited like
 // the version-mismatch reload; a broken SW must not cause a storm).
-function _staleShellRecover() {
+let _authRecoveryAttempted = false;
+async function _staleShellRecover() {
+  if (_authRecoveryAttempted) return;
+  _authRecoveryAttempted = true;
+  // A SW update alone reuses the cached anonymous shell within the same app
+  // version. Ask the server for its actual bootstrap, under the existing owner
+  // or member cookie rules. Never evaluate returned HTML or mint credentials.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
   try {
-    const last = parseInt(sessionStorage.getItem('amux_401_reload') || '0');
-    if (Date.now() - last < 600000) return;
+    const r = await fetch('/?_fresh=auth', { cache: 'no-store', signal: controller.signal });
+    if (!r.ok) return;
+    const html = await r.text();
+    const block = html.match(/<!-- AMUX-BOOTSTRAP-BEGIN[\s\S]*?<!-- AMUX-BOOTSTRAP-END -->/);
+    const match = block && block[0].match(/window\._AMUX_AUTH_TOKEN=("(?:\\.|[^"\\])*")/);
+    const token = match ? JSON.parse(match[1]) : '';
+    // Reload only if the server supplied a DIFFERENT owner credential. A
+    // missing/revoked login cannot be repaired by repeated cache clears.
+    if (!token || token === _authToken) return;
+    const last = Number(sessionStorage.getItem('amux_401_reload') || '0');
+    if (Date.now() - last < 60000) return;
     sessionStorage.setItem('amux_401_reload', String(Date.now()));
-    console.warn('amux: API 401 with this shell’s token — refreshing the shell');
-    const upd = (navigator.serviceWorker && navigator.serviceWorker.getRegistration)
-      ? navigator.serviceWorker.getRegistration().then(r => r && r.update()).catch(() => {})
-      : Promise.resolve();
-    upd.finally ? upd.finally(() => setTimeout(() => location.reload(), 1500))
-                : setTimeout(() => location.reload(), 1500);
-  } catch (e) {}
+    // Reload the full bootstrap so its UI guard rotates with the bearer.
+    // _fresh bypasses the SW's canonical '/' cache; preserve the user's view.
+    location.replace('/?_fresh=auth' + location.hash);
+  } catch (_) {
+    // The original 401 remains visible. Failure to fetch recovery HTML is not
+    // evidence that the access problem was repaired.
+  } finally { clearTimeout(timeout); }
+}
+
+function _sessionReadFailed(status, reason) {
+  const allowed = ['missing_credential', 'invalid_bearer', 'unverified_member_cookie',
+    'invalid_owner_session', 'owner_session_requires_bootstrap', 'unauthorized',
+    'http_error', 'invalid_json', 'invalid_payload', 'network_error'];
+  reason = allowed.includes(reason) ? reason : (status === 401 ? 'unauthorized' : 'http_error');
+  const changed = !_sessionLoadError || _sessionLoadError.status !== status || _sessionLoadError.reason !== reason;
+  _sessionLoadError = { status, reason };
+  if (changed) {
+    // No URL query, token, response body, or user content. Keep the latest
+    // failure across a bootstrap reload and deliver it after access recovers.
+    const incident = { kind: 'session-load-failure', measured: true, n_considered: 1,
+      status, reason, app_ver: APP_VER, had_data: !!lastSessionsJSON,
+      bearer_present: !!_authToken, ts: Date.now() };
+    console.warn('amux: session read failed', incident);
+    try { sessionStorage.setItem('amux_session_load_failure', JSON.stringify(incident)); } catch (_) {}
+  }
+  updateConnectionStatus();
+  render();
+}
+
+function _sessionReadRecovered() {
+  const changed = !!_sessionLoadError;
+  _sessionLoadError = null;
+  updateConnectionStatus();
+  if (changed) render();
+  // A 401 also rejects client-debug, so do not hammer it while unauthorized.
+  // The server records each refusal; this delayed beacon adds browser context.
+  try {
+    const saved = sessionStorage.getItem('amux_session_load_failure');
+    if (saved) {
+      sessionStorage.removeItem('amux_session_load_failure');
+      const d = JSON.parse(saved);
+      fetch('/api/client-debug', { method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ ...d, recovered_at: Date.now() }) }).then(r => {
+          if (!r.ok) sessionStorage.setItem('amux_session_load_failure', saved);
+        }).catch(() => { try { sessionStorage.setItem('amux_session_load_failure', saved); } catch (_) {} });
+    }
+  } catch (_) {}
+}
+
+function _retrySessionRead() {
+  _authRecoveryAttempted = false;
+  fetchSessions();
+}
+
+function _sessionReadNotice() {
+  if (!_sessionLoadError) return '';
+  const auth = _sessionLoadError.status === 401;
+  return '<div class="session-read-notice" role="alert"><strong>'
+    + (auth ? 'Access to this workspace needs to be renewed' : 'Worker updates are unavailable')
+    + '</strong><p>' + (auth
+      ? 'Open your owner access link, or ask the workspace owner for a new invite.'
+      : 'The worker list could not be loaded. Please retry in a moment.')
+    + (sessions.length ? ' The workers shown below are the last saved copy.' : '')
+    + '</p><button type="button" class="btn" onclick="_retrySessionRead()">Retry connection</button>'
+    + '<details><summary>Connection details</summary><code>GET /api/sessions · '
+    + (_sessionLoadError.status ? 'HTTP ' + _sessionLoadError.status : 'Network error')
+    + ' · ' + esc(_sessionLoadError.reason) + '</code></details></div>';
 }
 
 let _sessEtag = null;
@@ -2963,24 +3063,35 @@ async function fetchSessions() {
       consecutiveFailures = 0;
       _lastDataTime = Date.now();
       if (!online) setOnline(true);
+      _sessionReadRecovered();
       return;
     }
-    _sessEtag = r.headers.get('ETag') || null;
-    const data = await r.json();
+    if (!r.ok) {
+      const error = await r.json().catch(() => ({}));
+      _sessionReadFailed(r.status, error?.reason || (r.status === 401 ? 'unauthorized' : 'http_error'));
+      if (r.status === 401) _staleShellRecover();
+      return;
+    }
+    let data;
+    try { data = await r.json(); }
+    catch (_) { _sessionReadFailed(r.status, 'invalid_json'); return; }
     // Same guard as fetchBoard (live crash 2026-08-09): a 401 error object
     // must not become `sessions` — every card render maps over it.
     if (!Array.isArray(data)) {
-      if (r.status === 401) _staleShellRecover();
-      console.warn('sessions fetch returned non-array (status ' + r.status + ') — keeping previous set');
+      _sessionReadFailed(r.status, 'invalid_payload');
       return;
     }
     if (snapshotEpoch !== _sessionsSnapshotEpoch) {
       console.info('sessions poll completed behind a newer stream snapshot; discarded');
       return;
     }
+    _sessEtag = r.headers.get('ETag') || null;
     consecutiveFailures = 0;
     _lastDataTime = Date.now();
-    if (_initialLoad) { _initialLoad = false; }
+    const firstLoad = _initialLoad;
+    _initialLoad = false;
+    _sessionReadRecovered();
+    if (firstLoad) render();
     if (!online) setOnline(true);
     const j = JSON.stringify(data);
     if (j !== lastSessionsJSON) {
@@ -3004,7 +3115,7 @@ async function fetchSessions() {
       if (!window._peekEmbed) _fetchGitBranches(sessions);
     }
   } catch(e) {
-    console.error('fetch workers:', e);
+    _sessionReadFailed(0, 'network_error');
     consecutiveFailures++;
     if (consecutiveFailures >= 2 || navigator.onLine === false) {
       setOnline(false);
@@ -3362,8 +3473,11 @@ function _runtimeBoardSplitBadge(s) {
   const observed = truth.observed_card_id ? ' Observed ' + esc(truth.observed_card_id) + '.' : '';
   const isRunning = truth.runtime_status === 'active';
   if (verdict === 'active-conflicting-claims') {
-    return '<span class="status-badge rate-limited" title="This running worker has more than one live task claim, so AMUX will not guess.'
-      + observed + ' Diagnostic: ' + esc(verdict) + '.">card conflict</span>';
+    // Competing claims are harness bookkeeping, not a human decision. The
+    // board driver gives the full set back to the model to reconcile; keep the
+    // operator-facing state about execution instead of inventing a red status.
+    return '<span class="status-badge active" title="Working while AMUX automatically reconciles multiple live task claims.'
+      + observed + ' Diagnostic: ' + esc(verdict) + '.">working</span>';
   }
   if (isRunning) {
     return '<span class="status-badge active" title="Running. Board link: ' + esc(verdict) + '.'
@@ -3675,7 +3789,9 @@ function render() {
   if (stripEl && stripEl.innerHTML) { stripEl.innerHTML = ''; stripEl._want = ''; }
   const _nonArchivedCount = sessions.filter(s => !s.archived).length;
   if (!_nonArchivedCount && !drafts.length) {
-    if (_initialLoad) {
+    if (_sessionLoadError) {
+      el.innerHTML = ''; // The actionable failure is in #session-read-notice.
+    } else if (_initialLoad) {
       // A SPINNER THAT NEVER RESOLVES IS A LIE (amux-cloud, AC-275, 2026-08-06).
       // _initialLoad clears on ANY successful /api/sessions fetch, empty list
       // included — so a spinner still showing means the fetch never COMPLETED,
@@ -3786,7 +3902,7 @@ function render() {
     // time and one consumer read it for one branch.
     const taskIsDesc = !runtimeBoard.cardless && displayTaskSource === 'desc' && !!displayTaskName;
     return `
-    <div class="card ${isExp ? 'expanded' : ''}" data-session="${esc(s.name)}" onclick="event.stopPropagation();toggle('${s.name}')">
+    <div class="card ${isExp ? 'expanded' : ''}" data-session="${esc(s.name)}" data-worker-status="${_sessStatusKey(s)}" onclick="event.stopPropagation();toggle('${s.name}')">
       <div class="card-header" onclick="headerTap('${s.name}', event)" onmousedown="tileMouseDown(event,'${s.name}')">
         <div class="card-header-top">
           <div class="card-drag-handle" title="Drag to reorder"><svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor"><circle cx="3" cy="3" r="1.3"/><circle cx="7" cy="3" r="1.3"/><circle cx="3" cy="8" r="1.3"/><circle cx="7" cy="8" r="1.3"/><circle cx="3" cy="13" r="1.3"/><circle cx="7" cy="13" r="1.3"/></svg></div>
@@ -3921,6 +4037,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
     let sortedFiltered;
     sortedFiltered = [...filtered].sort(_sortFnFor(sortMode));
     el.innerHTML = draftCards + sortedFiltered.map(_renderSessionCard).join('');
+    _checkWorkerStatusOrder();
     for (const [id, d] of Object.entries(savedInputs)) { const inp = document.getElementById(id); if (inp) { inp.value = d.value; autoGrow(inp); } }
     _restoreCardFocus(focusedId, savedInputs);
     _renderArchivedSection();
@@ -3936,21 +4053,9 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
 
   // Group mode: group by session status
   if (layoutMode === 'group' && !activeTag && !q) {
-    const STATUS_GROUPS = [
-      { key: 'active',  label: 'Working',     defaultOpen: true  },
-      { key: 'waiting', label: 'Needs Input', defaultOpen: true  },
-      { key: 'api_error', label: 'API Error', defaultOpen: true  },
-      { key: 'idle',    label: 'Idle',        defaultOpen: true  },
-      { key: 'stopped', label: 'Stopped',     defaultOpen: false },
-    ];
-    const buckets = { active: [], waiting: [], api_error: [], idle: [], stopped: [] };
-    filtered.forEach(s => {
-      if (!s.running)              buckets.stopped.push(s);
-      else if (s.status === 'active')  buckets.active.push(s);
-      else if (s.status === 'waiting') buckets.waiting.push(s);
-      else if (s.status === 'api_error') buckets.api_error.push(s);
-      else                             buckets.idle.push(s);
-    });
+    const STATUS_GROUPS = _WORKER_STATUS_GROUPS;
+    const buckets = Object.fromEntries(STATUS_GROUPS.map(g => [g.key, []]));
+    filtered.forEach(s => buckets[_sessStatusKey(s)].push(s));
     // Sort within each bucket: alpha (pinned → name) or pinned → last activity
     for (const key of Object.keys(buckets)) {
       if (sortMode !== 'natural') {
@@ -3984,7 +4089,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
       });
       el.innerHTML = draftCards + groupHtml;
     } else {
-      el.innerHTML = draftCards + filtered.map(_renderSessionCard).join('');
+      el.innerHTML = draftCards + (nonEmpty.length ? buckets[nonEmpty[0].key] : []).map(_renderSessionCard).join('');
     }
   } else {
     // list mode (flat) or group mode with active filter: flat list
@@ -3992,6 +4097,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
     el.innerHTML = draftCards + flatList.map(_renderSessionCard).join('');
     if (layoutMode === 'list') requestAnimationFrame(initSortable);
   }
+  _checkWorkerStatusOrder();
   _updateResetBtn();
 
   // Restore input values, cursor positions and focus after re-rendering
@@ -9192,7 +9298,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.841';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.851';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -9650,6 +9756,7 @@ function copyPeekContent() {
 }
 
 function closePeek() {
+  _closePeekFilters();
   _peekLeaseStop();   // AMUX-2634: stop holding the worker's pane at our width
   // Reset peek notes
   // Fold the fullscreen composer (if open) back into the input, and close menus,
@@ -11076,8 +11183,8 @@ function applyPeekSearch(keepIndex, doScroll) {
   // spans must not turn one visible phrase into missing or duplicate matches.
   body.innerHTML = lastPeekHTML;
   _peekReclassifyPrompts();
-  const roots = _peekMsgNavKind === 'all' ? [body]
-    : [...body.querySelectorAll('.peek-prompt')].filter(el => el.dataset.msgKind === _peekMsgNavKind);
+  const roots = !_peekFiltersActive() ? [body]
+    : [...body.querySelectorAll('.peek-prompt')].filter(el => _peekPromptMatchesFilters(el));
   _peekMatches = [];
   for (const root of roots) {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
@@ -11147,6 +11254,7 @@ function peekSearchPrev() {
 // ── Peek more-menu ──
 let _peekMoreDismissTimer = 0;
 function togglePeekMoreMenu() {
+  _closePeekFilters();
   const dd = document.getElementById('peek-more-dropdown');
   if (!dd) return;
   const s = (sessions || []).find(row => row.name === peekSession);
@@ -11182,6 +11290,90 @@ function _closePeekMore() {
 // ── Peek message navigation ──
 let _peekMsgIndex = -1;
 let _peekMsgNavKind = 'all';
+let _peekMsgNavContent = 'any';
+const _PEEK_SOURCE_LABELS = {all:'Everyone', human:'Human', session:'Workers', schedule:'Scheduled', amux:'Harness', unstamped:'Unstamped', unknown:'Unclassified'};
+const _PEEK_CONTENT_LABELS = {any:'Any message', board:'Board references', files:'Files', links:'Links'};
+function _peekFiltersActive() { return _peekMsgNavKind !== 'all' || _peekMsgNavContent !== 'any'; }
+function _peekFilterSummary() {
+  const source = _peekMsgNavKind === 'all' ? '' : _PEEK_SOURCE_LABELS[_peekMsgNavKind];
+  const content = _peekMsgNavContent === 'any' ? '' : _PEEK_CONTENT_LABELS[_peekMsgNavContent];
+  return [source, content].filter(Boolean).join(' · ') || 'All messages';
+}
+// Both navigation and Find select message blocks with the same predicate.
+// Content filters inspect actual references, never guesses about task intent.
+function _peekPromptMatchesFilters(el) {
+  if (!el || (_peekMsgNavKind !== 'all' && el.dataset.msgKind !== _peekMsgNavKind)) return false;
+  if (_peekMsgNavContent === 'board') return /\b[A-Z]{2,8}-\d{1,6}\b/.test(el.textContent);
+  if (_peekMsgNavContent === 'files') return !!el.querySelector('.file-link, .md-link');
+  if (_peekMsgNavContent === 'links') return !!el.querySelector('a[href^="https://"], a[href^="http://"]');
+  return true;
+}
+function _peekFilterSync() {
+  const button = document.getElementById('peek-filter-btn');
+  const summary = document.getElementById('peek-filter-summary');
+  if (!button || !summary) return;
+  const label = _peekFilterSummary();
+  summary.textContent = label;
+  button.title = 'Filter messages: ' + label;
+  button.classList.toggle('active', _peekFiltersActive());
+  for (const input of document.querySelectorAll('[name="peek-filter-source"]')) input.checked = input.value === _peekMsgNavKind;
+  for (const input of document.querySelectorAll('[name="peek-filter-content"]')) input.checked = input.value === _peekMsgNavContent;
+  document.getElementById('peek-filter-reset').disabled = !_peekFiltersActive();
+}
+function togglePeekFilters() {
+  const panel = document.getElementById('peek-filter-panel');
+  if (!panel) return;
+  if (!panel.hidden) { _closePeekFilters(true); return; }
+  _closePeekMore();
+  _peekFilterSync();
+  panel.hidden = false;
+  document.getElementById('peek-filter-btn').setAttribute('aria-expanded', 'true');
+  panel.querySelector('input:checked')?.focus({preventScroll:true});
+  document.addEventListener('pointerdown', _peekFiltersOutside);
+  document.addEventListener('focusin', _peekFiltersOutside);
+  document.addEventListener('keydown', _peekFiltersKey, true);
+}
+function _peekFiltersOutside(event) {
+  if (!event.target.closest('.peek-msg-filter')) _closePeekFilters();
+}
+function _peekFiltersKey(event) {
+  if (event.key !== 'Escape') return;
+  event.preventDefault(); event.stopPropagation();
+  _closePeekFilters(true);
+}
+function _closePeekFilters(returnFocus = false) {
+  const panel = document.getElementById('peek-filter-panel');
+  if (!panel) return;
+  panel.hidden = true;
+  const button = document.getElementById('peek-filter-btn');
+  button?.setAttribute('aria-expanded', 'false');
+  document.removeEventListener('pointerdown', _peekFiltersOutside);
+  document.removeEventListener('focusin', _peekFiltersOutside);
+  document.removeEventListener('keydown', _peekFiltersKey, true);
+  if (returnFocus) button?.focus({preventScroll:true});
+}
+function _peekFilterContentSelect(content) {
+  if (!Object.hasOwn(_PEEK_CONTENT_LABELS, content)) return;
+  _peekMsgNavContent = content;
+  _peekFiltersChanged();
+}
+function _peekFiltersReset() {
+  _peekMsgNavKind = 'all'; _peekMsgNavContent = 'any';
+  _peekFiltersChanged();
+}
+function _peekFiltersChanged() {
+  _peekMsgIndex = -1;
+  document.querySelectorAll('#peek-body .peek-msg-current').forEach(p => p.classList.remove('peek-msg-current'));
+  if (peekSearchQuery.trim()) applyPeekSearch(false, true);
+  else _peekReclassifyPrompts();
+  const loaded = [...document.querySelectorAll('#peek-body .peek-prompt')];
+  const matched = loaded.filter(el => _peekPromptMatchesFilters(el)).length;
+  fetch(API + '/api/client-debug', {method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({kind:'peek-message-filter',verdict:matched ? 'matches' : 'no-matches',
+      session:peekSession,measured:true,n_considered:loaded.length,matched_messages:matched,
+      source_filter:_peekMsgNavKind,content_filter:_peekMsgNavContent,
+      searching:!!peekSearchQuery.trim(),search_matches:_peekMatches.length,ver:APP_VER})}).catch(() => {});
+}
 let _peekMsgNavGesture = null;
 function _peekMsgNavArm(e) {
   const body = document.getElementById('peek-body');
@@ -11212,11 +11404,11 @@ function _peekMsgPrompts() {
   if (!body) return [];
   if (peekSearchQuery.trim()) return _peekMatches.filter(el => el.isConnected);
   return Array.from(body.querySelectorAll('.peek-prompt')).filter(el =>
-    _peekMsgNavKind === 'all' || el.dataset.msgKind === _peekMsgNavKind);
+    _peekPromptMatchesFilters(el));
 }
 function _peekMsgCount(prompts) {
   const searching = !!peekSearchQuery.trim();
-  const selectedKind = _peekMsgNavKind === 'all' ? 'All' : (_MSG_KIND[_peekMsgNavKind] || _MSG_KIND.unknown).label;
+  const selectedKind = _peekFilterSummary();
   const label = searching ? selectedKind + ' matches' : selectedKind;
   const count = document.getElementById('peek-msg-count');
   if (count) {
@@ -11225,9 +11417,7 @@ function _peekMsgCount(prompts) {
     if (count.textContent !== value) count.textContent = value;
     count.setAttribute('aria-label', label + ': ' + value + ' in loaded output');
   }
-  const select = document.getElementById('peek-msg-kind');
-  if (select) { select.value = _peekMsgNavKind; select.disabled = false; }
-  document.getElementById('peek-nav-label').textContent = searching ? 'Find' : 'Messages';
+  _peekFilterSync();
   for (const btn of document.querySelectorAll('#peek-msg-nav .peek-nav-btn')) {
     // Zero loaded matches still permits loading earlier output. It is not a
     // disabled action; explain that fallback instead of drawing a dead arrow.
@@ -11245,7 +11435,8 @@ function _peekToolbarCheck() {
     _peekToolbarFrame = 0;
     const toolbar = document.querySelector('.peek-toolbar');
     if (!toolbar || !toolbar.getClientRects().length) return;
-    const controls = [...toolbar.querySelectorAll('button,select')];
+    const controls = [...toolbar.querySelectorAll('button,select')].filter(el =>
+      el.getClientRects().length && !el.closest('.peek-filter-panel, .peek-more-dropdown'));
     const rect = toolbar.getBoundingClientRect();
     // Layout sizes are independent of the user's deliberate UI zoom. Comparing
     // scaled screen rectangles to CSS sizes falsely flagged every 80% control.
@@ -11307,12 +11498,11 @@ function _peekNavBeacon(verdict, prompts, target) {
   const body = document.getElementById('peek-body');
   const geometry = target && _peekJumpGeometry(target);
   const searching = !!peekSearchQuery.trim();
-  if (searching && target && _peekMsgNavKind !== 'all'
-      && target.closest('.peek-prompt')?.dataset.msgKind !== _peekMsgNavKind) verdict = 'filter-mismatch';
+  if (target && _peekFiltersActive() && !_peekPromptMatchesFilters(target.closest('.peek-prompt'))) verdict = 'filter-mismatch';
   try {
     fetch(API + '/api/client-debug', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ kind: 'peek-message-nav', verdict, session: peekSession, ver: APP_VER,
-        measured: true, n_considered: prompts.length, filter: _peekMsgNavKind,
+        measured: true, n_considered: prompts.length, filter: _peekMsgNavKind, content_filter: _peekMsgNavContent,
         mode: searching ? 'search' : 'messages',
         index: searching ? peekSearchIndex : _peekMsgIndex, target_kind: target?.closest('.peek-prompt')?.dataset.msgKind || null,
         target_visible: !!geometry && geometry.visible,
@@ -11376,12 +11566,9 @@ async function _peekMsgMove(direction, event) {
 function peekMsgNext(event) { _peekMsgMove(1, event); }
 function peekMsgPrev(event) { _peekMsgMove(-1, event); }
 function _peekMsgNavSelect(kind) {
-  if (!['all', 'human', 'session', 'schedule', 'amux', 'unstamped', 'unknown'].includes(kind)) return;
+  if (!Object.hasOwn(_PEEK_SOURCE_LABELS, kind)) return;
   _peekMsgNavKind = kind;
-  _peekMsgIndex = -1;
-  document.querySelectorAll('#peek-body .peek-msg-current').forEach(p => p.classList.remove('peek-msg-current'));
-  if (peekSearchQuery.trim()) applyPeekSearch(false, true);
-  else _peekReclassifyPrompts();
+  _peekFiltersChanged();
 }
 
 // ── Peek command bar ──
@@ -21164,10 +21351,10 @@ document.addEventListener('keydown', (e) => {
 
 // ═══════ LAYOUT MODES (list / grid) ═══════
 let layoutMode = localStorage.getItem('amux_layout') || 'grid';
-let sortMode = localStorage.getItem('amux_sort_mode') || 'natural';
+let sortMode = localStorage.getItem('amux_sort_mode') || 'status';
 // A mode persisted by an older build (or hand-edited) must not leave the
 // list sorting by a comparator that no longer exists.
-if (!['natural','human','alpha','status'].includes(sortMode)) sortMode = 'natural';
+if (!['natural','human','alpha','status'].includes(sortMode)) sortMode = 'status';
 if (document.body) setTimeout(() => _sortBtnSync(), 0);
 else document.addEventListener('DOMContentLoaded', () => _sortBtnSync());
 let cardOrder = JSON.parse(localStorage.getItem('amux_card_order') || '[]');
@@ -21179,6 +21366,18 @@ let _tileJustDragged = false; // keep for toggle() guard
 // Sort that matches the server's list_sessions() order:
 // pinned > running > status priority (active/waiting=0, idle/none=1) > last_activity desc
 const _STATUS_PRI = {active: 0, waiting: 0, idle: 1, '': 1};
+// Status sorting and grouping share the same keys as the displayed filters.
+// Pins cannot move an idle worker into the working group (AMUX-4237).
+const _WORKER_STATUS_GROUPS = [
+  { key: 'working', label: 'Working', defaultOpen: true },
+  { key: 'waiting', label: 'Needs Input', defaultOpen: true },
+  { key: 'api_error', label: 'API Error', defaultOpen: true },
+  { key: 'rate_limited', label: 'Rate Limited', defaultOpen: true },
+  { key: 'idle', label: 'Idle', defaultOpen: true },
+  { key: 'stopped', label: 'Stopped', defaultOpen: false },
+];
+const _WORKER_STATUS_PRI = Object.fromEntries(_WORKER_STATUS_GROUPS.map((g, i) => [g.key, i]));
+let _workerStatusOrderVerdict = '';
 function _naturalSortSessions(a, b) {
   if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
   if (a.running !== b.running) return a.running ? -1 : 1;
@@ -21209,11 +21408,31 @@ function _humanSortSessions(a, b) {
 
 // Status order, then recency within each bucket.
 function _statusSortSessions(a, b) {
-  if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
-  if (a.running !== b.running) return a.running ? -1 : 1;
-  const ap = _STATUS_PRI[a.status] ?? 1, bp = _STATUS_PRI[b.status] ?? 1;
+  const ap = _WORKER_STATUS_PRI[_sessStatusKey(a)], bp = _WORKER_STATUS_PRI[_sessStatusKey(b)];
   if (ap !== bp) return ap - bp;
-  return (b.last_activity || 0) - (a.last_activity || 0);
+  if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
+  return (b.last_activity || 0) - (a.last_activity || 0)
+    || (a.name || '').localeCompare(b.name || '');
+}
+
+function _checkWorkerStatusOrder() {
+  if (sortMode !== 'status' || _frozen) return;
+  // Read the rendered snapshot, not a newer SSE payload while a menu/input
+  // intentionally holds the previous cards on screen.
+  const cards = [...document.querySelectorAll('#cards .card[data-worker-status]')];
+  if (!cards.length) return;
+  const keys = cards.map(c => c.dataset.workerStatus);
+  const at = keys.findIndex((key, i) => i > 0 && _WORKER_STATUS_PRI[key] < _WORKER_STATUS_PRI[keys[i - 1]]);
+  const verdict = at < 0 ? 'status-order-ok' : 'status-order-violation';
+  const signature = verdict + ':' + layoutMode + ':' + (at < 0 ? '' : keys[at - 1] + '>' + keys[at]);
+  if (_workerStatusOrderVerdict === signature) return;
+  _workerStatusOrderVerdict = signature;
+  const violation = at < 0 ? null : { before: cards[at - 1].dataset.session, after: cards[at].dataset.session };
+  try {
+    fetch(API + '/api/client-debug', { method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ kind: 'worker-status-order', verdict, measured: true, n_considered: cards.length,
+        layout: layoutMode, mode: sortMode, violation, ver: APP_VER }) }).catch(() => {});
+  } catch (e) {}
 }
 
 function _sortFnFor(mode) {
@@ -21245,16 +21464,11 @@ function toggleFreeze() {
     const visible = sessions.filter(s => !s.archived);
     let ordered;
     if (layoutMode === 'group') {
-      const buckets = {active: [], waiting: [], idle: [], stopped: []};
-      visible.forEach(s => {
-        if (!s.running) buckets.stopped.push(s);
-        else if (s.status === 'active') buckets.active.push(s);
-        else if (s.status === 'waiting') buckets.waiting.push(s);
-        else buckets.idle.push(s);
-      });
+      const buckets = Object.fromEntries(_WORKER_STATUS_GROUPS.map(g => [g.key, []]));
+      visible.forEach(s => buckets[_sessStatusKey(s)].push(s));
       const sortFn = _sortFnFor(sortMode);
       for (const k of Object.keys(buckets)) buckets[k].sort(sortFn);
-      ordered = [...buckets.active, ...buckets.waiting, ...buckets.idle, ...buckets.stopped];
+      ordered = _WORKER_STATUS_GROUPS.flatMap(g => buckets[g.key]);
     } else {
       ordered = [...visible].sort(_sortFnFor(sortMode));
     }
@@ -21292,7 +21506,7 @@ const _SORT_OPTS = [
   { id: 'natural', label: 'Recent activity',     hint: 'Any traffic, including schedules and other workers' },
   { id: 'human',   label: 'Last message from me', hint: 'Ignores schedulers and session-to-session' },
   { id: 'alpha',   label: 'Name (A–Z)',      hint: 'Stable — the order stops shifting under you' },
-  { id: 'status',  label: 'Status',               hint: 'Active, then waiting, then idle, then stopped' },
+  { id: 'status',  label: 'Status',               hint: 'Working, needs input, errors, rate limited, idle, stopped' },
 ];
 const _SORT_GLYPH = { natural: '⇅', human: '●', alpha: 'A↓', status: '☷' };
 
@@ -21328,7 +21542,7 @@ function closeSortMenu() {
   if (m) m.style.display = 'none';
 }
 function setSortMode(mode) {
-  sortMode = _SORT_OPTS.some(o => o.id === mode) ? mode : 'natural';
+  sortMode = _SORT_OPTS.some(o => o.id === mode) ? mode : 'status';
   localStorage.setItem('amux_sort_mode', sortMode);
   closeSortMenu();
   _sortBtnSync();
@@ -22033,6 +22247,9 @@ let _boardDragId = null;
 let boardViewMode = localStorage.getItem('amux_board_view') || 'status';
 if (boardViewMode === 'session') boardViewMode = 'worker';
 let boardOwnerFilter = localStorage.getItem('amux_board_owner') || 'human';
+// Smart Board: derived display-status data, fetched from /api/board/derived.
+let _smartBoardData = null;
+let _smartBoardFetching = false;
 let _sessionGroupCollapsed = JSON.parse(localStorage.getItem('amux_board_collapsed') || '{}');
 let _boardWorkerDensityBeaconSent = false;
 let _tagGroupCollapsed = JSON.parse(localStorage.getItem('amux_status_collapsed') || '{}');
@@ -22090,6 +22307,38 @@ const _CUSTOM_STATUS_PALETTE_LIGHT = [
   {bg:'rgba(5,80,174,0.1)',color:'#0550ae',border:'rgba(5,80,174,0.3)',dot:'#0550ae'},
   {bg:'rgba(180,30,120,0.1)',color:'#99286e',border:'rgba(180,30,120,0.3)',dot:'#99286e'},
 ];
+// Derived display-status styles (Smart Board view). These augment the
+// built-in statuses for the computed categories the /api/board/derived
+// endpoint produces.
+const _DERIVED_STATUS_STYLE = {
+  'aged-needsyou':      {bg:'rgba(248,81,73,0.18)',color:'var(--red)',border:'rgba(248,81,73,0.5)',dot:'var(--red)'},
+  'stalled':            {bg:'rgba(210,153,34,0.22)',color:'var(--yellow)',border:'rgba(210,153,34,0.55)',dot:'var(--yellow)'},
+  'stale':              {bg:'rgba(139,148,158,0.15)',color:'rgba(139,148,158,0.7)',border:'rgba(139,148,158,0.35)',dot:'rgba(139,148,158,0.5)'},
+  'verified-candidate': {bg:'rgba(45,212,191,0.12)',color:'#2dd4bf',border:'rgba(45,212,191,0.35)',dot:'#2dd4bf'},
+  'unblocked':          {bg:'rgba(88,166,255,0.18)',color:'var(--accent)',border:'rgba(88,166,255,0.45)',dot:'var(--accent)'},
+};
+const _DERIVED_STATUS_STYLE_LIGHT = {
+  'aged-needsyou':      {bg:'rgba(207,34,46,0.12)',color:'#cf222e',border:'rgba(207,34,46,0.4)',dot:'#cf222e'},
+  'stalled':            {bg:'rgba(154,103,0,0.15)',color:'#7d4e00',border:'rgba(154,103,0,0.4)',dot:'#7d4e00'},
+  'stale':              {bg:'rgba(101,109,118,0.12)',color:'#57606a',border:'rgba(101,109,118,0.3)',dot:'#57606a'},
+  'verified-candidate': {bg:'rgba(13,148,136,0.12)',color:'#0d9488',border:'rgba(13,148,136,0.35)',dot:'#0d9488'},
+  'unblocked':          {bg:'rgba(9,105,218,0.12)',color:'#0550ae',border:'rgba(9,105,218,0.35)',dot:'#0550ae'},
+};
+const _DERIVED_STATUS_LABELS = {
+  'aged-needsyou': 'Aged Needs-You (>14d)',
+  'stalled': 'Stalled (session idle)',
+  'stale': 'Stale (auto, no activity >72h)',
+  'verified-candidate': 'Verified Candidate (has evidence)',
+  'unblocked': 'Unblocked (deps resolved)',
+};
+
+function derivedStatusStyle(id) {
+  const light = document.body.classList.contains('light');
+  const derived = light ? _DERIVED_STATUS_STYLE_LIGHT[id] : _DERIVED_STATUS_STYLE[id];
+  if (derived) return derived;
+  return statusStyle(id);
+}
+
 function statusStyle(id) {
   const light = document.body.classList.contains('light');
   const builtIn = light ? _BUILT_IN_STATUS_STYLE_LIGHT[id] : _BUILT_IN_STATUS_STYLE[id];
@@ -24682,6 +24931,11 @@ async function fetchBoard() {
       renderBoard();
       _nudgeWorkersOnBoardChange();
     }
+    // Seed CDC cursor so subsequent invalidations can use granular updates
+    try {
+      const cr = await fetch(API + '/api/board/changes?since_seq=0&limit=1');
+      if (cr.ok) { const cd = await cr.json(); if (cd.cursor) _cdcSeq = cd.cursor; }
+    } catch (e2) {}
   } catch(e) {
     console.error('fetch board:', e);
     consecutiveFailures++;
@@ -26206,7 +26460,85 @@ let _prevCardRects = {};
 function setBoardView(mode) {
   boardViewMode = mode;
   localStorage.setItem('amux_board_view', mode);
+  if (mode === 'smart') _smartBoardData = null;
   renderBoard();
+}
+
+async function _fetchSmartBoard() {
+  try {
+    const resp = await fetch('/api/board/derived');
+    if (!resp.ok) throw new Error('derived endpoint returned ' + resp.status);
+    const data = await resp.json();
+    _smartBoardData = data;
+  } catch (e) {
+    console.error('Smart board fetch failed:', e);
+    _smartBoardData = null;
+  }
+}
+
+function _renderSmartBoard(container, visibleStored) {
+  if (!_smartBoardData || !_smartBoardData.items) {
+    container.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">No derived data available.</div>';
+    return;
+  }
+  const visibleIds = new Set(visibleStored.map(i => i.id));
+  const items = _smartBoardData.items.filter(i => visibleIds.has(i.id));
+
+  // Derived status groups in priority display order: attention-needing first
+  const derivedOrder = [
+    'aged-needsyou', 'stalled', 'stale', 'unblocked', 'verified-candidate',
+    'doing', 'review', 'needsyou', 'todo', 'backlog', 'done', 'verified', 'discarded'
+  ];
+  const groups = {};
+  items.forEach(i => {
+    const ds = i.display_status || i.status || 'todo';
+    (groups[ds] = groups[ds] || []).push(i);
+  });
+
+  let html = '';
+  // Show derived-only statuses with a highlight header
+  const derivedSpecial = new Set(['aged-needsyou', 'stalled', 'stale', 'verified-candidate', 'unblocked']);
+  derivedOrder.concat(Object.keys(groups).filter(k => !derivedOrder.includes(k))).forEach(ds => {
+    const g = groups[ds];
+    if (!g || !g.length) return;
+    const isSpecial = derivedSpecial.has(ds);
+    const sty = derivedStatusStyle(ds);
+    const label = _DERIVED_STATUS_LABELS[ds] || ds;
+    const headStyle = isSpecial
+      ? 'display:flex;align-items:center;gap:8px;padding:10px 6px 4px;font-size:0.76rem;font-weight:700;color:' + sty.color + ';text-transform:uppercase;letter-spacing:0.05em;border-left:3px solid ' + sty.dot + ';padding-left:10px;margin-top:6px;'
+      : 'display:flex;align-items:center;gap:8px;padding:10px 6px 4px;font-size:0.74rem;font-weight:600;color:' + sty.color + ';text-transform:uppercase;letter-spacing:0.05em;';
+    html += '<div class="board-list-group-head" style="' + headStyle + '">'
+      + '<span class="board-status-dot" style="background:' + sty.dot + '"></span>' + esc(label)
+      + '<span style="color:var(--dim);font-weight:400;">' + g.length + '</span></div>';
+    html += g.map(i => {
+      let row = _issueRowHTML(i, { showOwner: true });
+      if (isSpecial && i.display_status !== i.status) {
+        const badge = '<span style="font-size:0.65rem;padding:1px 5px;border-radius:3px;background:' + sty.bg + ';color:' + sty.color + ';border:1px solid ' + sty.border + ';margin-left:6px;vertical-align:middle;font-weight:600;">' + esc(i.display_status) + '</span>';
+        row = row.replace('</div>', badge + '</div>');
+      }
+      return row;
+    }).join('');
+  });
+  container.dataset.component = 'board-smart';
+  container.innerHTML = html || '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">Nothing to show.</div>';
+}
+
+function _smartBoardStatsHTML() {
+  if (!_smartBoardData || !_smartBoardData.counts) return '';
+  const c = _smartBoardData.counts;
+  const special = ['aged-needsyou', 'stalled', 'stale', 'verified-candidate', 'unblocked'];
+  let pills = '';
+  for (const key of special) {
+    const n = c[key] || 0;
+    if (n === 0) continue;
+    const sty = derivedStatusStyle(key);
+    const label = _DERIVED_STATUS_LABELS[key] || key;
+    pills += '<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:4px;background:' + sty.bg + ';color:' + sty.color + ';border:1px solid ' + sty.border + ';font-size:0.72rem;font-weight:600;">'
+      + '<span class="board-status-dot" style="background:' + sty.dot + ';width:6px;height:6px;"></span>'
+      + esc(label) + ' <b>' + n + '</b></span>';
+  }
+  if (!pills) return '<div style="padding:6px 8px;font-size:0.75rem;color:var(--dim);">All cards are in their expected status.</div>';
+  return '<div style="display:flex;flex-wrap:wrap;gap:6px;padding:8px 8px 4px;">' + pills + '</div>';
 }
 
 function setBoardOwner(type) {
@@ -26886,9 +27218,11 @@ function renderBoard() {
   var bvS = document.getElementById('bv-session');
   var bvC = document.getElementById('bv-status');
   var bvL = document.getElementById('bv-list');
+  var bvSm = document.getElementById('bv-smart');
   if (bvS) bvS.classList.toggle('active', boardViewMode === 'worker');
   if (bvC) bvC.classList.toggle('active', boardViewMode === 'status');
   if (bvL) bvL.classList.toggle('active', boardViewMode === 'list');
+  if (bvSm) bvSm.classList.toggle('active', boardViewMode === 'smart');
   var boH = document.getElementById('bo-human');
   var boA = document.getElementById('bo-agent');
   if (boH) boH.classList.toggle('active', boardOwnerFilter === 'human');
@@ -26942,6 +27276,26 @@ function renderBoard() {
     container.innerHTML = html || '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">Nothing matches.</div>';
     return;
   }
+
+  if (boardViewMode === 'smart') {
+    container.classList.remove('board-columns');
+    container.classList.add('board-list-mode');
+    if (!_smartBoardData && !_smartBoardFetching) {
+      _smartBoardFetching = true;
+      container.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">Loading derived statuses...</div>';
+      _fetchSmartBoard().then(() => { _smartBoardFetching = false; renderBoard(); }).catch(() => { _smartBoardFetching = false; });
+      return;
+    }
+    if (!_smartBoardData) {
+      container.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">Loading derived statuses...</div>';
+      return;
+    }
+    _renderSmartBoard(container, visible);
+    const _sElSm = document.getElementById('board-stats-mount');
+    if (_sElSm) _sElSm.innerHTML = _smartBoardStatsHTML();
+    return;
+  }
+
   // Mount the progress strip above the columns, over the SAME `visible` set the
   // columns are about to render (AMUX-2506). Fed from `visible` and not from
   // boardItems so it can never describe a different population than the board.
@@ -30228,6 +30582,51 @@ let _pollTimer = null;
 let _invBoardTimer = null;
 let _invSessTimer = null;
 let _invMessagesTimer = null;
+let _cdcSeq = 0;
+async function _cdcBoardUpdate() {
+  if (!_cdcSeq) { fetchBoard(); return; }
+  try {
+    const r = await fetch(API + '/api/board/changes?since_seq=' + _cdcSeq + '&limit=500');
+    if (!r.ok) { fetchBoard(); return; }
+    const data = await r.json();
+    const changes = data.changes || [];
+    if (data.cursor) _cdcSeq = data.cursor;
+    if (!changes.length) return;
+    // For each changed row_id, refetch that single card and patch boardItems
+    const ids = [...new Set(changes.map(c => c.row_id))];
+    let needsFullFetch = false;
+    for (const id of ids) {
+      const op = changes.filter(c => c.row_id === id).pop();
+      if (op && op.operation === 'DELETE') {
+        boardItems = boardItems.filter(item => item.id !== id);
+        _boardSnapshotEpoch++;
+        continue;
+      }
+      try {
+        const cr = await fetch(API + '/api/board/' + encodeURIComponent(id));
+        if (cr.status === 404) {
+          boardItems = boardItems.filter(item => item.id !== id);
+          _boardSnapshotEpoch++;
+          continue;
+        }
+        if (!cr.ok) { needsFullFetch = true; continue; }
+        const card = await cr.json();
+        if (!card || !card.id) { needsFullFetch = true; continue; }
+        const idx = boardItems.findIndex(item => item.id === card.id);
+        if (idx >= 0) { boardItems[idx] = card; }
+        else { boardItems.push(card); }
+        _boardSnapshotEpoch++;
+      } catch (e) { needsFullFetch = true; }
+    }
+    if (needsFullFetch) { fetchBoard(); return; }
+    lastBoardJSON = JSON.stringify(boardItems);
+    _cacheBoardJSON(lastBoardJSON);
+    if (activeView === 'board') renderBoard();
+    else if (activeView === 'calendar') renderCalendar();
+    _nudgeWorkersOnBoardChange();
+  } catch (e) { fetchBoard(); }
+}
+
 function connectSSE() {
   if (_sseFallback || _sse) return;
   _sse = new EventSource(_authUrl(API + '/api/events'));
@@ -30338,7 +30737,7 @@ function connectSSE() {
           // Coalesced per key so an event burst is one fetch.
           if (key === 'board') {
             clearTimeout(_invBoardTimer);
-            _invBoardTimer = setTimeout(fetchBoard, 400);
+            _invBoardTimer = setTimeout(_cdcBoardUpdate, 400);
           }
           if (key === 'sessions') {
             clearTimeout(_invSessTimer);
@@ -30422,6 +30821,10 @@ function enablePollingFallback() {
 //      if we look stale, otherwise just kick a fetch.
 const _SSE_STALE_MS = 18000;     // declared zombie if no data this long
 const _SSE_REFRESH_MS = 4000;    // visibility-resume refresh threshold
+// Nothing at all from the server for this long means offline, however healthy
+// every other signal looks. Above _SSE_STALE_MS plus a reconnect and a poll
+// cycle, so only real silence reaches it.
+const _NO_CONTACT_MS = 35000;
 
 function _sseLooksStale() {
   // Fall back to page load when nothing has arrived yet (AC-275). Without this the
@@ -30503,6 +30906,32 @@ setInterval(() => {
   if (_sseFallback) return;
   if (window._peekEmbed) return;
   if (_sseLooksStale()) _forceSseReconnect('watchdog stale ' + Math.round((Date.now() - _lastDataTime)/1000) + 's');
+  // A HANG MUST EVENTUALLY COUNT AS A FAILURE.
+  //
+  // `consecutiveFailures` only moves when a fetch RETURNS a failure, and the
+  // offline latch needs 2 of them. A dead tunnel returns nothing at all: the
+  // request is accepted by the local stack and never answered, `navigator
+  // .onLine` stays true because the DEVICE still has a network, and the SSE
+  // reconnect above quietly fails the same way. So every input that could say
+  // "stale" reads healthy, and the badge sits on `Polling` — claiming a
+  // fallback that is fetching — while the last render stays on screen.
+  //
+  // Reported by Ethan 2026-09-08 over Tailscale: the client "just stores
+  // everything that's been cached and presents it as if it's new". Measured in
+  // e2e/tunnel-blackhole.spec.ts: with every /api/ request accepted and never
+  // answered and the open stream severed, the indicator read `Polling` for the
+  // full 48s window and never changed.
+  //
+  // Silence is the only evidence a hang produces, so latch on silence. This is
+  // deliberately generous — well past the 18s zombie threshold and a poll cycle
+  // behind it — so an ordinary slow response can never trip it.
+  if (online && (Date.now() - (_lastDataTime || _pageLoadTime)) > _NO_CONTACT_MS) {
+    setOnline(false);
+  }
+  // Repaint every tick. updateConnectionStatus ran on events, and a hung tunnel
+  // produces none of them, so a badge could go stale and keep saying whatever
+  // it last said.
+  updateConnectionStatus();
 }, 5000);
 
 if (window._peekEmbed) {
@@ -31586,6 +32015,17 @@ function toggleSettings() {
     }
     // Render connections
     _renderInstanceSwitcher();
+    // Owner access link — only shown to the owner (who has _authToken)
+    const ownerLinkWrap = document.getElementById('settings-owner-link');
+    if (ownerLinkWrap) {
+      if (_authToken) {
+        ownerLinkWrap.style.display = '';
+        const inp = document.getElementById('settings-owner-link-url');
+        if (inp) inp.value = location.origin + '/?_token=' + _authToken;
+      } else {
+        ownerLinkWrap.style.display = 'none';
+      }
+    }
     // Populate the notes-folder row
     loadCommitGuard();
     loadTaskGuard();
@@ -32191,10 +32631,40 @@ async function saveTaskGuard(enabled) {
 }
 
 // ── Team / Org / Invites ──────────────────────────────────────────────────────
+let _workspaceTeams = [];
+
+function _workspaceTeamScope(team) {
+  if (!team || team.scope_level === 'global') return 'Global · all workers';
+  return (team.scope_level === 'group' ? 'Group · ' : 'Worker · ') + (team.scope_name || 'not set');
+}
+
+function _workspaceTeamOptions(selected) {
+  return _workspaceTeams.map(team => `<option value="${esc(team.id)}"${team.id === selected ? ' selected' : ''}>${esc(team.name)} — ${esc(_workspaceTeamScope(team))}</option>`).join('');
+}
+
 async function loadTeamSection() {
   try {
     const list = document.getElementById('settings-members-list');
-    if (!list) return;
+    const teamsList = document.getElementById('settings-teams-list');
+    if (!list || !teamsList) return;
+
+    const inviteButton = document.getElementById('settings-team-invite');
+    const createButton = document.getElementById('settings-team-create');
+    const orgWrap = document.getElementById('settings-org-name-wrap');
+    if (_localMemberEmail) {
+      if (inviteButton) inviteButton.style.display = 'none';
+      if (createButton) createButton.style.display = 'none';
+      if (orgWrap) orgWrap.style.display = 'none';
+      const scope = _localMemberScope || {level:'global', name:''};
+      const access = scope.level === 'global' ? 'Global workspace access' :
+        (scope.level === 'group' ? 'Group: ' : 'Worker: ') + (scope.name || '—');
+      teamsList.innerHTML = `<div style="padding:5px 7px;border:1px solid var(--border);border-radius:7px;"><div style="color:var(--text);font-weight:600;">${esc(_localMemberTeam?.name || 'Legacy access')}</div><div style="font-size:0.68rem;color:var(--dim);">${esc(access)}</div></div>`;
+      list.innerHTML = `<div style="padding:4px 0;"><div style="color:var(--text);">${esc(_localMemberEmail)}</div><div style="font-size:0.72rem;color:var(--dim);margin-top:3px;">Membership is managed by the server owner</div></div>`;
+      return;
+    }
+    if (inviteButton) inviteButton.style.display = '';
+    if (createButton) createButton.style.display = '';
+    if (orgWrap) orgWrap.style.display = '';
 
     if (_cloudEmail) {
       // Cloud mode: use gateway-level members
@@ -32224,30 +32694,41 @@ async function loadTeamSection() {
             <button onclick="deleteInvite('${esc(inv.token)}')" style="background:none;border:none;color:var(--dim);cursor:pointer;font-size:0.65rem;">revoke</button>
           </div>`).join('');
       }
+      teamsList.innerHTML = '<span>Cloud workspace roles are managed by the gateway.</span>';
       list.innerHTML = html || '<span style="color:var(--dim);font-size:0.75rem;">No members yet — invite someone!</span>';
     } else {
       // Local mode: use container-level org
-      const [orgRes, membersRes, invitesRes] = await Promise.all([
-        fetch('/api/org'), fetch('/api/org/members'), fetch('/api/org/invites')
+      const [orgRes, teamsRes, membersRes, invitesRes] = await Promise.all([
+        fetch('/api/org'), fetch('/api/org/teams'), fetch('/api/org/members'), fetch('/api/org/invites')
       ]);
       const org = await orgRes.json();
+      _workspaceTeams = teamsRes.ok ? await teamsRes.json() : [];
       const members = await membersRes.json();
       const invites = invitesRes.ok ? await invitesRes.json() : [];
       const nameEl = document.getElementById('settings-org-name');
       if (nameEl && nameEl !== document.activeElement) nameEl.value = org.name || '';
+      teamsList.innerHTML = _workspaceTeams.length ? _workspaceTeams.map(team => `
+        <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;padding:5px 7px;border:1px solid var(--border);border-radius:7px;">
+          <div style="min-width:0;"><div style="color:var(--text);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(team.name)}</div>
+            <div style="font-size:0.67rem;color:var(--dim);">${esc(_workspaceTeamScope(team))} · ${Number(team.member_count || 0)} member${Number(team.member_count || 0) === 1 ? '' : 's'}</div></div>
+          ${team.id === 'team_global' ? '' : `<button class="btn" data-team-edit="${esc(team.id)}" onclick="openTeamEditor(this.dataset.teamEdit)" style="font-size:0.65rem;padding:2px 7px;">Edit</button>`}
+        </div>`).join('') : '<span>No teams configured.</span>';
       let html = '';
       if (members.length) {
         html += members.map(m => `
           <div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;border-bottom:1px solid var(--border);">
             <span>${esc(m.name || m.email)}</span>
-            <span style="color:var(--dim);font-size:0.7rem;">${m.role}</span>
+            <span style="display:flex;align-items:center;gap:7px;color:var(--dim);font-size:0.7rem;">
+              ${esc(m.team_name || 'Legacy access')}
+              <button class="btn" data-member-scope="${esc(m.id)}" data-email="${esc(m.email || '')}" data-team="${esc(m.team_id || '')}" onclick="openMemberScope(this.dataset.memberScope,this.dataset.email,this.dataset.team)" style="font-size:0.64rem;padding:1px 6px;">change</button>
+            </span>
           </div>`).join('');
       }
       if (invites.length) {
         html += '<div style="margin-top:4px;font-size:0.68rem;color:var(--dim);">Pending invites:</div>';
         html += invites.map(inv => `
           <div style="display:flex;justify-content:space-between;align-items:center;padding:2px 0;">
-            <span style="font-size:0.72rem;color:var(--dim);">${esc(inv.email || 'Anyone with link')} · expires ${new Date(inv.expires_at*1000).toLocaleDateString()}</span>
+            <span style="font-size:0.72rem;color:var(--dim);">${esc(inv.email || 'Anyone with link')} → ${esc(inv.team_name || 'Legacy access')} · expires ${new Date(inv.expires_at*1000).toLocaleDateString()}</span>
             <button onclick="deleteInvite('${esc(inv.token)}')" style="background:none;border:none;color:var(--dim);cursor:pointer;font-size:0.65rem;">revoke</button>
           </div>`).join('');
       }
@@ -32271,41 +32752,194 @@ async function saveOrgName(val) {
   await fetch('/api/org', {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name: val})});
 }
 
+function _copyOwnerLink() {
+  const inp = document.getElementById('settings-owner-link-url');
+  if (!inp) return;
+  navigator.clipboard.writeText(inp.value).then(
+    () => showToast('Owner link copied'),
+    () => { inp.select(); showToast('Select and copy manually'); }
+  );
+}
+
 async function openTeamInvite() {
   closeSettings();
-  const email = await showPrompt('Invite by email (optional)', 'person@example.com');
-  if (email === null) return;
-  let res;
-  try {
-    res = await fetch('/api/org/invites', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email})});
-  } catch (e) {
-    showAlert('Failed to create invite: network error');
+  if (!_workspaceTeams.length) {
+    const response = await fetch('/api/org/teams').catch(() => null);
+    _workspaceTeams = response?.ok ? await response.json().catch(() => []) : [];
+  }
+  if (!_workspaceTeams.length) {
+    showToast('Teams are still unavailable — reopen Workspace access and try again');
     return;
   }
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) { showAlert('Failed to create invite: ' + (data.error || 'HTTP ' + res.status)); return; }
-  if (!data.url) { showAlert('Failed to create invite: ' + (data.error || 'unknown error')); return; }
-  // Show modal with copyable link
+  const modal = _workspaceAccessModal(`<h3 style="margin:0 0 8px;font-size:1rem;">Invite to workspace</h3>
+    <p style="color:var(--dim);font-size:0.78rem;margin:0 0 14px;">The invite joins one team. That team’s scope controls access.</p>
+    <label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Email (optional)</label>
+    <input id="team-invite-email" type="email" placeholder="person@example.com" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;margin-bottom:13px;">
+    <label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Team</label>
+    <select id="invite-team-id" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;">${_workspaceTeamOptions('team_global')}</select>
+    <div id="team-scope-error" style="color:var(--red,#f66);font-size:0.75rem;margin-top:10px;"></div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:18px;"><button class="btn" data-modal-cancel>Cancel</button><button id="team-scope-submit" class="btn primary">Create invite</button></div>`);
+  const submit = modal.querySelector('#team-scope-submit');
+  submit.addEventListener('click', async () => {
+    const email = (modal.querySelector('#team-invite-email')?.value || '').trim();
+    const team_id = modal.querySelector('#invite-team-id').value;
+    submit.disabled = true;
+    submit.textContent = 'Creating…';
+    let res;
+    try {
+      res = await fetch('/api/org/invites', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email, team_id})});
+    } catch (e) {
+      _teamScopeError(modal, 'Network error');
+      submit.disabled = false;
+      submit.textContent = 'Create invite';
+      return;
+    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.url) {
+      _teamScopeError(modal, data.error || 'HTTP ' + res.status);
+      submit.disabled = false;
+      submit.textContent = 'Create invite';
+      return;
+    }
+    _renderInviteLink(modal, data);
+  });
+}
+
+function _workspaceAccessModal(html) {
   const modal = document.createElement('div');
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;z-index:9999;padding:12px;';
+  modal.innerHTML = `<div style="background:var(--bg2,#1a1a1a);border:1px solid var(--border,#333);border-radius:12px;padding:24px;max-width:500px;width:100%;box-sizing:border-box;max-height:calc(100dvh - 24px);overflow:auto;">${html}</div>`;
+  document.body.appendChild(modal);
+  modal.addEventListener('click', event => { if (event.target === modal) modal.remove(); });
+  modal.querySelector('[data-modal-cancel]')?.addEventListener('click', () => modal.remove());
+  return modal;
+}
+
+function openTeamEditor(teamId) {
+  closeSettings();
+  const team = _workspaceTeams.find(value => value.id === teamId) || null;
+  const modal = _teamScopeDialog(team ? 'Edit team' : 'Create team', '', team ? team.scope_level : 'global', team ? team.scope_name : '', 'Save team', true);
+  const heading = modal.querySelector('h3');
+  if (heading) heading.insertAdjacentHTML('afterend', `<label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Team name</label><input id="team-name" value="${esc(team ? team.name : '')}" placeholder="e.g. TubeScience" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;margin-bottom:13px;">`);
+  if (team) {
+    const actions = modal.querySelector('#team-scope-submit').parentElement;
+    actions.insertAdjacentHTML('afterbegin', '<button id="team-delete" class="btn" style="margin-right:auto;color:var(--red,#f66);">Delete</button>');
+    modal.querySelector('#team-delete').onclick = async () => {
+      const response = await fetch('/api/org/teams/' + encodeURIComponent(team.id), {method:'DELETE'}).catch(() => null);
+      const data = response ? await response.json().catch(() => ({})) : {};
+      if (!response || !response.ok) { _teamScopeError(modal, data.error || 'Could not delete team'); return; }
+      modal.remove(); showToast('Team deleted'); toggleSettings(); loadTeamSection();
+    };
+  }
+  modal.querySelector('#team-scope-submit').onclick = async () => {
+    const scope_level = modal.querySelector('#team-scope-level').value;
+    const scope_name = scope_level === 'global' ? '' : modal.querySelector('#team-scope-name').value;
+    const name = modal.querySelector('#team-name').value.trim();
+    const response = await fetch(team ? '/api/org/teams/' + encodeURIComponent(team.id) : '/api/org/teams', {
+      method:team ? 'PATCH' : 'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name,scope_level,scope_name})
+    }).catch(() => null);
+    const data = response ? await response.json().catch(() => ({})) : {};
+    if (!response || !response.ok) { _teamScopeError(modal, data.error || 'Could not save team'); return; }
+    modal.remove(); showToast(team ? 'Team updated' : 'Team created'); toggleSettings(); loadTeamSection();
+  };
+}
+
+function _teamScopeTargets(level, current) {
+  if (level === 'global') return [];
+  const fleet = (typeof sessions !== 'undefined' && Array.isArray(sessions)) ? sessions : [];
+  let values = level === 'worker'
+    ? fleet.map(s => s.name).filter(Boolean)
+    : fleet.flatMap(s => Array.isArray(s.tags) ? s.tags : []).filter(Boolean);
+  values = [...new Set(values)].sort((a,b) => a.localeCompare(b));
+  if (current && !values.includes(current)) values.unshift(current);
+  return values;
+}
+
+function _teamScopeDialog(title, email, level, name, submitLabel, hideEmail) {
+  const modal = document.createElement('div');
+  modal.id = 'team-scope-modal';
   modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;z-index:9999;';
   modal.innerHTML = `<div style="background:var(--bg2,#1a1a1a);border:1px solid var(--border,#333);border-radius:12px;padding:28px;max-width:480px;width:90%;box-sizing:border-box;max-height:min(90dvh,calc(100dvh - 24px));overflow-y:auto;overscroll-behavior:contain;">
-    <h3 style="margin:0 0 8px;font-size:1rem;">Invite to workspace</h3>
-    <p style="color:var(--dim);font-size:0.82rem;margin:0 0 14px;">Share this link. It expires in 7 days.</p>
-    <div style="display:flex;gap:8px;">
-      <input id="invite-link-input" type="text" value="${esc(data.url)}" readonly
-        style="flex:1;padding:8px 10px;border-radius:6px;border:1px solid var(--border,#333);background:var(--bg,#111);color:inherit;font-size:0.8rem;min-width:0;">
-      <button onclick="(function(){var el=document.getElementById('invite-link-input');el.select();navigator.clipboard.writeText(el.value).then(()=>{this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500)})}).call(this)"
-        style="padding:8px 14px;border-radius:6px;background:var(--accent,#a78bfa);color:#000;border:none;cursor:pointer;font-weight:600;white-space:nowrap;">Copy</button>
-    </div>
-    <div style="margin-top:16px;text-align:right;">
-      <button onclick="this.closest('div[style*=fixed]').remove()"
-        style="padding:6px 18px;border-radius:6px;background:var(--bg3,#222);border:1px solid var(--border,#333);color:#ddd;cursor:pointer;">Done</button>
+    <h3 style="margin:0 0 8px;font-size:1rem;">${esc(title)}</h3>
+    ${hideEmail ? '' : email ? `<p style="color:var(--dim);font-size:0.82rem;margin:0 0 14px;">${esc(email)}</p>` : `<label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Email (optional)</label><input id="team-invite-email" type="email" placeholder="person@example.com" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;margin-bottom:13px;">`}
+    <label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Access level</label>
+    <select id="team-scope-level" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;">
+      <option value="global">Global — every worker and card</option><option value="group">Group — workers tagged in one group</option><option value="worker">Worker — one worker only</option>
+    </select>
+    <div id="team-scope-target-wrap" style="margin-top:13px;display:none;"><label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Target</label><select id="team-scope-name" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;"></select></div>
+    <div id="team-scope-error" style="color:var(--red,#f66);font-size:0.75rem;margin-top:10px;"></div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:18px;">
+      <button id="team-scope-cancel" class="btn">Cancel</button>
+      <button id="team-scope-submit" class="btn primary">${esc(submitLabel)}</button>
     </div>
   </div>`;
   document.body.appendChild(modal);
   modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
+  modal.querySelector('#team-scope-cancel').addEventListener('click', () => modal.remove());
+  const levelEl = modal.querySelector('#team-scope-level');
+  const targetWrap = modal.querySelector('#team-scope-target-wrap');
+  const targetEl = modal.querySelector('#team-scope-name');
+  const refresh = () => {
+    const values = _teamScopeTargets(levelEl.value, name);
+    targetWrap.style.display = levelEl.value === 'global' ? 'none' : '';
+    targetEl.innerHTML = values.map(value => `<option value="${esc(value)}">${esc(value)}</option>`).join('');
+    if (name && values.includes(name)) targetEl.value = name;
+    const submit = modal.querySelector('#team-scope-submit');
+    submit.disabled = levelEl.value !== 'global' && values.length === 0;
+    _teamScopeError(modal, values.length || levelEl.value === 'global' ? '' : 'Create or tag a worker before granting this scope.');
+  };
+  levelEl.value = level || 'global';
+  levelEl.addEventListener('change', () => { name = ''; refresh(); });
+  refresh();
+  setTimeout(() => modal.querySelector('#team-invite-email, #team-scope-level')?.focus(), 0);
+  return modal;
+}
+
+function _teamScopeError(modal, message) {
+  const el = modal.querySelector('#team-scope-error');
+  if (el) el.textContent = message || '';
+}
+
+function _renderInviteLink(modal, data) {
+  modal.firstElementChild.innerHTML = `<h3 style="margin:0 0 8px;font-size:1rem;">Invite ready</h3>
+    <p style="color:var(--dim);font-size:0.82rem;margin:0 0 14px;">${esc(data.team_name || 'Team')} · ${esc(_workspaceTeamScope(data))} · expires in 7 days.</p>
+    <div style="display:flex;gap:8px;"><input id="invite-link-input" type="text" value="${esc(data.url)}" readonly style="flex:1;padding:8px 10px;border-radius:6px;border:1px solid var(--border,#333);background:var(--bg,#111);color:inherit;font-size:0.8rem;min-width:0;"><button id="invite-copy-button" class="btn primary">Copy</button></div>
+    <div style="margin-top:16px;text-align:right;"><button id="invite-done-button" class="btn">Done</button></div>`;
+  modal.querySelector('#invite-copy-button').addEventListener('click', async e => {
+    const input = modal.querySelector('#invite-link-input');
+    input.select();
+    await navigator.clipboard.writeText(input.value).catch(() => {});
+    e.currentTarget.textContent = 'Copied!';
+  });
+  modal.querySelector('#invite-done-button').addEventListener('click', () => modal.remove());
   // Auto-copy
   setTimeout(() => { try { navigator.clipboard.writeText(data.url); } catch(e) {} }, 100);
+}
+
+async function openMemberScope(id, email, teamId) {
+  const modal = _workspaceAccessModal(`<h3 style="margin:0 0 8px;font-size:1rem;">Change member team</h3>
+    <p style="color:var(--dim);font-size:0.82rem;margin:0 0 14px;">${esc(email)}</p>
+    <label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Team</label>
+    <select id="member-team-id" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;">${_workspaceTeamOptions(teamId)}</select>
+    <div id="team-scope-error" style="color:var(--red,#f66);font-size:0.75rem;margin-top:10px;"></div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:18px;"><button class="btn" data-modal-cancel>Cancel</button><button id="team-scope-submit" class="btn primary">Save team</button></div>`);
+  const submit = modal.querySelector('#team-scope-submit');
+  submit.addEventListener('click', async () => {
+    const team_id = modal.querySelector('#member-team-id').value;
+    submit.disabled = true;
+    const response = await fetch('/api/org/members/' + encodeURIComponent(id), {
+      method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({team_id})
+    }).catch(() => null);
+    const data = response ? await response.json().catch(() => ({})) : {};
+    if (!response || !response.ok) {
+      _teamScopeError(modal, data.error || 'Failed to save access');
+      submit.disabled = false;
+      return;
+    }
+    modal.remove();
+    showToast('Member access updated');
+    loadTeamSection();
+  });
 }
 
 // ── Billing ─────────────────────────────────────────────────────────────────
@@ -35475,17 +36109,33 @@ let _sqlSchemaLoaded = false;
 
 function _sqlInit() { if (!_sqlSchemaLoaded) { _sqlSchemaLoaded = true; _dbLoadSchema(); } }
 
+async function _sqlFetchJson(url, options) {
+  const response = await fetch(url, options);
+  const text = await response.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : {}; }
+  catch (e) {
+    throw new Error('HTTP ' + response.status + ': ' + (text.trim().slice(0, 240) || 'non-JSON response'));
+  }
+  if (!response.ok || data.error) {
+    throw new Error((data && data.error) || ('HTTP ' + response.status));
+  }
+  return data;
+}
+
 async function _dbLoadSchema() {
   const side = document.getElementById('db-tables');
   if (side) side.innerHTML = '<div style="color:var(--dim);font-size:0.74rem;padding:6px;">Loading…</div>';
   try {
-    const d = await fetch(API + '/api/sql/schema').then(r => r.json());
-    if (d.error) { if (side) side.innerHTML = '<div style="color:#f85149;font-size:0.74rem;padding:6px;">' + esc(d.error) + '</div>'; return; }
+    const d = await _sqlFetchJson(API + '/api/sql/schema');
     _dbTables = d.tables || [];
     const f = document.getElementById('db-filter');
     _dbRenderSidebar(f ? f.value : '');
     if (_dbTable) _dbRenderStructure();
-  } catch (e) { if (side) side.innerHTML = '<div style="color:#f85149;font-size:0.74rem;padding:6px;">schema failed</div>'; }
+  } catch (e) {
+    _sqlSchemaLoaded = false;
+    if (side) side.innerHTML = '<div style="color:#f85149;font-size:0.74rem;padding:6px;">Schema failed: ' + esc(e.message) + '<br><button class="btn" style="margin-top:6px;" onclick="_sqlInit()">Retry</button></div>';
+  }
 }
 
 function _dbFilter(q) { _dbRenderSidebar(q); }
@@ -35535,13 +36185,15 @@ async function _dbLoadData() {
   try {
     const q = '?table=' + encodeURIComponent(_dbTable) + '&limit=' + _dbLimit + '&offset=' + _dbOffset +
       (_dbSort ? '&sort=' + encodeURIComponent(_dbSort) + '&dir=' + _dbDir : '');
-    const d = await fetch(API + '/api/sql/rows' + q).then(r => r.json());
-    if (d.error) { status.classList.add('err'); status.textContent = d.error; grid.innerHTML = '<div style="padding:16px;color:#f85149;">' + esc(d.error) + '</div>'; return; }
+    const d = await _sqlFetchJson(API + '/api/sql/rows' + q);
     _dbRenderGrid(grid, d.columns, d.rows, true);
     _dbRenderPager(d);
     const t = _dbTables.find(x => x.name === _dbTable);
     status.textContent = t && t.writable ? 'Read/write · wb_*' : 'Read-only';
-  } catch (e) { status.classList.add('err'); status.textContent = 'load failed'; }
+  } catch (e) {
+    status.classList.add('err'); status.textContent = 'Load failed: ' + e.message;
+    grid.innerHTML = '<div style="padding:16px;color:#f85149;">' + esc(e.message) + '</div>';
+  }
 }
 
 function _dbRenderPager(d) {
@@ -35599,18 +36251,16 @@ async function _sqlRun() {
   const results = document.getElementById('sql-results');
   status.classList.remove('err'); status.textContent = 'Running…';
   try {
-    const d = await fetch(API + '/api/sql', {
+    const d = await _sqlFetchJson(API + '/api/sql', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sql, write }),
-    }).then(r => r.json());
-    if (d.error) {
-      status.classList.add('err'); status.textContent = d.error;
-      results.innerHTML = '<div style="padding:16px;color:#f85149;font-size:0.82rem;font-family:var(--mono);white-space:pre-wrap;">' + esc(d.error) + '</div>';
-      return;
-    }
+    });
     if (d.write) { status.textContent = d.message + ' · ' + d.ms + 'ms'; _dbLoadSchema(); return; }
     _dbRenderGrid(results, d.columns, d.rows, false);
     status.textContent = d.rowcount + (d.truncated ? '+ (capped)' : '') + ' row' + (d.rowcount === 1 ? '' : 's') + ' · ' + d.ms + 'ms';
-  } catch (e) { status.classList.add('err'); status.textContent = 'request failed'; }
+  } catch (e) {
+    status.classList.add('err'); status.textContent = 'Request failed: ' + e.message;
+    results.innerHTML = '<div style="padding:16px;color:#f85149;font-size:0.82rem;font-family:var(--mono);white-space:pre-wrap;">' + esc(e.message) + '</div>';
+  }
 }
 
 // ── Notes tab ─────────────────────────────────────────────────────────────────

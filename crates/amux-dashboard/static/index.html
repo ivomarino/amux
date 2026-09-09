@@ -246,14 +246,30 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <div class="settings-sep"></div>
         <div class="settings-section" id="settings-team-section">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
-            <div class="settings-section-label" style="margin:0;">Team</div>
-            <button class="btn" style="font-size:0.7rem;padding:2px 8px;" onclick="openTeamInvite()">+ Invite</button>
+            <div class="settings-section-label" style="margin:0;">Workspace access</div>
+            <div style="display:flex;gap:5px;">
+              <button class="btn" id="settings-team-create" style="font-size:0.7rem;padding:2px 8px;" onclick="openTeamEditor()">+ Team</button>
+              <button class="btn" id="settings-team-invite" style="font-size:0.7rem;padding:2px 8px;" onclick="openTeamInvite()">+ Invite</button>
+            </div>
           </div>
           <div id="settings-org-name-wrap" style="margin-bottom:6px;">
             <input id="settings-org-name" class="search-input" type="text" placeholder="Workspace name"
               style="width:100%;box-sizing:border-box;font-size:0.8rem;"
               onblur="saveOrgName(this.value)" onkeydown="if(event.key==='Enter')this.blur()">
           </div>
+          <div id="settings-owner-link" style="display:none;margin-bottom:8px;">
+            <div style="font-size:0.68rem;color:var(--dim);margin-bottom:4px;">Owner access link</div>
+            <div style="display:flex;gap:6px;align-items:center;">
+              <input id="settings-owner-link-url" type="text" readonly
+                style="flex:1;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:0.72rem;font-family:monospace;min-width:0;"
+                onclick="this.select()">
+              <button class="btn" style="font-size:0.7rem;padding:4px 10px;white-space:nowrap;" onclick="_copyOwnerLink()">Copy</button>
+            </div>
+            <div style="font-size:0.62rem;color:var(--dim);margin-top:3px;">Opens the dashboard with full access from any device on your network</div>
+          </div>
+          <div style="font-size:0.68rem;color:var(--dim);margin:7px 0 3px;">Teams and access scopes</div>
+          <div id="settings-teams-list" style="font-size:0.78rem;color:var(--dim);display:flex;flex-direction:column;gap:4px;"></div>
+          <div style="font-size:0.68rem;color:var(--dim);margin:9px 0 3px;">People</div>
           <div id="settings-members-list" style="font-size:0.78rem;color:var(--dim);"></div>
         </div>
         <!-- Cloud trial/billing card — populated only when the gateway answers
@@ -567,6 +583,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 <div id="active-filters" class="active-filters"></div>
 <div id="tag-filters" class="tag-filters"></div>
 <div id="grp-scope-strip"></div>
+<div id="session-read-notice"></div>
 <div id="offline-banner" class="offline-banner">
   <div class="offline-banner-header">
     <span id="offline-banner-title">&#x26A0; Offline</span>
@@ -603,6 +620,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <button id="bv-list" class="bv-btn" onclick="setBoardView('list')" title="Dense list grouped by status">&#x2630;</button>
         <button id="bv-session" class="bv-btn" onclick="setBoardView('worker')" title="Group by worker">&#x25A4;</button>
       <button id="bv-status" class="bv-btn" onclick="setBoardView('status')" title="Group by status">&#x2630;</button>
+      <button id="bv-smart" class="bv-btn" onclick="setBoardView('smart')" title="Smart board: derived status from durable facts">&#x2728;</button>
     </div>
     <!-- Export the CURRENT view. Reuses .board-view-toggle so it inherits the
          group styling and the 44px mobile touch targets already tuned for it,
@@ -2144,19 +2162,32 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     </div>
     <div class="peek-toolbar">
       <div class="peek-msg-nav" id="peek-msg-nav" role="group" aria-label="Terminal navigation">
-        <label class="peek-msg-filter" for="peek-msg-kind">
-          <span class="peek-msg-label" id="peek-nav-label">Messages</span>
-          <span class="peek-msg-count" id="peek-msg-count" role="status" aria-live="polite">0</span>
-          <select id="peek-msg-kind" aria-label="Message type" onchange="_peekMsgNavSelect(this.value)">
-            <option value="all">All messages</option>
-            <option value="human">Human</option>
-            <option value="session">Worker</option>
-            <option value="schedule">Scheduled</option>
-            <option value="amux">Harness</option>
-            <option value="unstamped">Unstamped</option>
-            <option value="unknown">Unclassified</option>
-          </select>
-        </label>
+        <div class="peek-msg-filter">
+          <button type="button" id="peek-filter-btn" class="peek-filter-btn" onclick="togglePeekFilters()" aria-label="Filter messages" aria-describedby="peek-filter-summary" aria-haspopup="dialog" aria-expanded="false" aria-controls="peek-filter-panel">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16l-6 7v6l-4 2v-8z"/></svg>
+            <span class="peek-filter-caption"><span id="peek-nav-label">Filters</span><span id="peek-filter-summary">All messages</span></span>
+            <span class="peek-msg-count" id="peek-msg-count" role="status" aria-live="polite">0</span>
+          </button>
+          <div id="peek-filter-panel" class="peek-filter-panel" role="dialog" aria-label="Filter worker messages" hidden>
+            <div class="peek-filter-heading"><strong>Filter messages</strong><button type="button" class="btn" id="peek-filter-reset" onclick="_peekFiltersReset()">Reset</button></div>
+            <fieldset><legend>From</legend><div class="peek-filter-options">
+              <label class="peek-filter-option"><input type="radio" name="peek-filter-source" value="all" onchange="_peekMsgNavSelect(this.value)"><span>Everyone</span></label>
+              <label class="peek-filter-option"><input type="radio" name="peek-filter-source" value="human" onchange="_peekMsgNavSelect(this.value)"><span>Human</span></label>
+              <label class="peek-filter-option"><input type="radio" name="peek-filter-source" value="session" onchange="_peekMsgNavSelect(this.value)"><span>Workers</span></label>
+              <label class="peek-filter-option"><input type="radio" name="peek-filter-source" value="schedule" onchange="_peekMsgNavSelect(this.value)"><span>Scheduled</span></label>
+              <label class="peek-filter-option"><input type="radio" name="peek-filter-source" value="amux" onchange="_peekMsgNavSelect(this.value)"><span>Harness</span></label>
+              <label class="peek-filter-option"><input type="radio" name="peek-filter-source" value="unstamped" onchange="_peekMsgNavSelect(this.value)"><span>Unstamped</span></label>
+              <label class="peek-filter-option"><input type="radio" name="peek-filter-source" value="unknown" onchange="_peekMsgNavSelect(this.value)"><span>Unclassified</span></label>
+            </div></fieldset>
+            <fieldset><legend>Contains</legend><div class="peek-filter-options">
+              <label class="peek-filter-option"><input type="radio" name="peek-filter-content" value="any" onchange="_peekFilterContentSelect(this.value)"><span>Any message</span></label>
+              <label class="peek-filter-option"><input type="radio" name="peek-filter-content" value="board" onchange="_peekFilterContentSelect(this.value)"><span>Board references</span></label>
+              <label class="peek-filter-option"><input type="radio" name="peek-filter-content" value="files" onchange="_peekFilterContentSelect(this.value)"><span>Files</span></label>
+              <label class="peek-filter-option"><input type="radio" name="peek-filter-content" value="links" onchange="_peekFilterContentSelect(this.value)"><span>Links</span></label>
+            </div></fieldset>
+            <div class="peek-filter-footer"><span>Applies to Find and ↑ ↓ in loaded output.</span><button type="button" class="btn" onclick="_closePeekFilters(true)">Done</button></div>
+          </div>
+        </div>
         <button class="peek-nav-btn" onpointerdown="_peekMsgNavArm(event)" onclick="peekMsgPrev(event)" title="Previous message" aria-label="Previous message">&#x2191;</button>
         <button class="peek-nav-btn" onpointerdown="_peekMsgNavArm(event)" onclick="peekMsgNext(event)" title="Next message" aria-label="Next message">&#x2193;</button>
       </div>

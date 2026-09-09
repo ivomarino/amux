@@ -62,6 +62,7 @@
 //! | advance (15m, per lane)   | `advance.nudged` / `needsyou.renag` / `capture.decompose_ask` |
 //! | advance budget (3/24h)    | `advance.nudged` per card id           |
 //! | decompose (6h, per lane)  | `pickup.decompose_nudge`               |
+//! | claim reconcile (5m→1h)   | `task.claim_reconcile_requested` per exact card set |
 //! | needs:you re-nag (3d)     | `needsyou.renag` per card id           |
 //!
 //! `advance.nudged` additionally records the card's STATUS at nudge time, which
@@ -70,7 +71,7 @@
 //! lane that moved the card it was nudged about gets the next one immediately
 //! instead of waiting out a cooldown it already earned its way past.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{OnceLock, RwLock};
 
 use rusqlite::{Connection, OptionalExtension};
@@ -127,7 +128,8 @@ pub(crate) fn pickup_fresh_cut(now: f64) -> i64 {
 /// no-stall guarantee (Invariant 10). Five minutes prevents an immediate hot
 /// loop without turning one model lifecycle decision into a lane-wide stall.
 /// A lane that truly cannot do a card moves it
-/// to backlog/review (the honest exits the pickup prompt names), so it never
+/// to backlog-with-a-trigger or review (the honest exits the pickup prompt
+/// names; a BARE backlog is not one on a drain-enabled lane, AF-579), so it never
 /// re-enters this loop; only a card left in `todo` gets another turn.
 fn reclaim_cooldown_s() -> f64 {
     std::env::var("AMUX_RECLAIM_COOLDOWN_S")
@@ -577,7 +579,8 @@ use crate::config::now_f64;
 pub struct LaneTrace {
     pub session: String,
     /// `assigned` | `advance-nudged` | `review-routed` | `decompose-asked` |
-    /// `renag` | `verify-nudge` | `backlog-triage` | `skipped`
+    /// `claim-reconcile` | `renag` | `verify-nudge` | `backlog-triage` |
+    /// `skipped`
     pub outcome: String,
     pub reason: String,
     pub detail: String,
@@ -668,6 +671,30 @@ pub struct DriveReport {
 
 static LAST_REPORT: OnceLock<RwLock<Option<DriveReport>>> = OnceLock::new();
 static TICK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+type LaneDriveKey = (usize, String);
+type LaneDriveMutex = std::sync::Arc<tokio::sync::Mutex<()>>;
+static LANE_DRIVE_LOCKS: OnceLock<std::sync::Mutex<HashMap<LaneDriveKey, LaneDriveMutex>>> =
+    OnceLock::new();
+
+/// A periodic fleet sweep and an event-driven wake can reach the same lane at
+/// once. The board claim itself is a CAS, but the losing pass can observe the
+/// winner's fresh `task.claimed` marker and mistake it for restart recovery,
+/// producing a second prompt. Serialize the complete decide→claim→enqueue
+/// operation per store and lane; different workers and test stores still run
+/// independently.
+fn lane_drive_lock(state: &AppState, lane: &str) -> LaneDriveMutex {
+    let key = (
+        std::sync::Arc::as_ptr(&state.store) as usize,
+        lane.to_string(),
+    );
+    LANE_DRIVE_LOCKS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .entry(key)
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
 
 fn report_slot() -> &'static RwLock<Option<DriveReport>> {
     LAST_REPORT.get_or_init(|| RwLock::new(None))
@@ -711,6 +738,11 @@ pub trait Fleet: Send + Sync {
     /// reimplemented: a second copy of "is this lane mid-turn" is the
     /// two-implementations-of-one-rule defect the board keeps producing.
     async fn at_boundary(&self, lane: &str) -> bool;
+    /// The provider has identity-backed child work (a subagent or background
+    /// terminal) alive for this lane.  This is stronger than a generic
+    /// `active` badge: it is the signal that a parent task may have been
+    /// parked in To Do while its delegated work kept running.
+    fn active_child_work(&self, _lane: &str) -> bool { false }
     /// When a session runs out of todo cards but still has blocked/done work,
     /// keep nudging it to re-assess and continue. ON BY DEFAULT since
     /// 2026-08-11 (Ethan: "standing order whenever idle to take care of any
@@ -825,6 +857,16 @@ impl Fleet for LiveFleet {
                 "board-drive boundary uses Workers structured truth");
         }
         status.as_deref() == Some("idle")
+    }
+    fn active_child_work(&self, lane: &str) -> bool {
+        self.signals.as_ref().is_some_and(|signals| {
+            let (_, explain) = signals.derive_status_explain(
+                lane,
+                signals.agent_running(&format!("amux-{lane}")),
+            );
+            explain["subagents_working"] == true
+                || explain["provider_background_working"] == true
+        })
     }
     async fn start_for_dispatch(&self, lane: &str) -> Result<(), String> {
         crate::api::session_verbs::start_for_board_dispatch(&self.state, lane).await
@@ -1428,7 +1470,8 @@ fn last_advance(conn: &Connection, session: &str) -> Option<(f64, Option<String>
         "SELECT ts, data FROM session_events \
          WHERE session=?1 \
          AND type IN ('advance.nudged','advance.routed','needsyou.renag', \
-                      'capture.decompose_ask','task.claimed') \
+                      'capture.decompose_ask','task.claimed', \
+                      'task.claim_reconcile_requested') \
          ORDER BY ts DESC LIMIT 1",
         rusqlite::params![session],
         |r| Ok((r.get::<_, f64>(0)?, r.get::<_, Option<String>>(1)?)),
@@ -1555,6 +1598,50 @@ pub(crate) fn deps_blocking(conn: &Connection, row: &bs::IssueRow) -> Vec<String
             }
         })
         .cloned().collect()
+}
+
+/// Why each blocking dependency does NOT count, in the operator's own terms.
+///
+/// `deps_blocking` answers WHICH ids block; the auto-park line then said only
+/// "unfinished depends_on=<id>". "Unfinished" is the predicate's name, not the
+/// dependency's state, and the two come apart exactly where this is most
+/// confusing: a dependency that is `done` still blocks when its type completes
+/// at `verified` (`dependency_is_resolved`). So the operator reads "unfinished",
+/// opens the card, sees `done`, and concludes the parker is broken.
+///
+/// Measured 2026-09-08, reported by `primis` (AF-610): PRIMI-220 twice and
+/// PRIMI-221 once were parked within the same second as a satisfied 2/2 gate,
+/// naming PRIMI-219, which had been `done` since that morning. PRIMI-219 has NO
+/// `type`, and `core_item_type("")` falls through to `ItemType::Code`, for which
+/// `verified_is_meaningful` is true. Correct behaviour, unreadable message. The
+/// cost was not the block: the workaround was to CLEAR depends_on on both cards,
+/// which destroyed the dependency graph the parker exists to enforce.
+///
+/// A status with no operand, which is this file's own recurring defect.
+fn dep_block_reasons(conn: &Connection, ids: &[String]) -> Vec<String> {
+    ids.iter()
+        .map(|id| match bs::get_issue(conn, id) {
+            Ok(Some(row)) => {
+                let raw = row.item_type.trim();
+                let shown = if raw.is_empty() { "unset->code" } else { raw };
+                if bs::is_terminal_status(&row.status) {
+                    // Terminal and STILL blocking: name the boundary, because
+                    // this is the case that reads as a bug.
+                    format!("{id}[{}, type {shown}: completes at verified]", row.status)
+                } else {
+                    format!("{id}[{}]", row.status)
+                }
+            }
+            // Absent is not the same as unfinished, and neither is unreadable.
+            Ok(None) => format!("{id}[missing]"),
+            Err(error) => {
+                tracing::warn!(marker = "dependency_reason_unmeasured", dependency = %id,
+                    %error, measured = false, n_considered = 1,
+                    "dependency lookup failed while explaining a park");
+                format!("{id}[unreadable]")
+            }
+        })
+        .collect()
 }
 
 /// Can this `doing` row honestly consume WIP or be advertised as current?
@@ -2646,7 +2733,8 @@ enum Resume {
     /// another prompt at every idle sweep.
     Current { card: String, delivery_id: String, cause: &'static str },
     /// More than one distinct exact claim still survives. Naming either one
-    /// would make the driver invent ownership, so leave both visible instead.
+    /// would make the driver invent ownership, so hand the complete set back
+    /// to the model for reconciliation instead.
     Conflicting { cards: Vec<String> },
     /// There is no surviving exact claim. Ordinary advance/pickup may decide.
     None,
@@ -2693,13 +2781,117 @@ fn resumable_claim_row(conn: &Connection, session: &str, row: &bs::IssueRow, now
 /// again. A running worker receives recovery only when a later
 /// `session.started` proves its process generation changed, or when the prior
 /// recovery attempt explicitly failed. A stopped worker may be woken from any
-/// one exact live claim; the post-start selection then gets a new
-/// `session.started` generation from the canonical launcher.
+/// one exact live claim. Competing claims deliberately produce no *singular*
+/// launch card: board-drive starts the worker in its configured directory and
+/// then sends the complete set through the model-owned reconciliation path.
 pub(crate) fn exact_resume_card(conn: &Connection, session: &str) -> Result<Option<String>, String> {
     match select_resume(conn, session, now_f64(), false) {
         Resume::Claim { card, .. } | Resume::Current { card, .. } => Ok(Some(card)),
         Resume::None => Ok(None),
-        Resume::Conflicting { cards } => Err(format!("conflicting live task claims: {}", cards.join(", "))),
+        Resume::Conflicting { .. } => Ok(None),
+    }
+}
+
+const CLAIM_RECONCILE_BASE_S: f64 = 5.0 * 60.0;
+const CLAIM_RECONCILE_MAX_S: f64 = 60.0 * 60.0;
+
+enum ClaimReconcilePlan {
+    Ready {
+        prompt: String,
+        delivery_id: String,
+        signature: String,
+        attempt: i64,
+    },
+    Cooldown { remaining_s: f64, attempt: i64 },
+}
+
+/// Give an impossible multi-claim state to the worker that created it. This is
+/// contextual judgment the model can improve at: amux keeps the invariant,
+/// supplies every candidate, and never guesses which work is real or parks the
+/// lane on a human-only badge.
+///
+/// The event is both a receipt and the next retry generation. A committed
+/// queue row with a missing event is recovered by the stable delivery id; an
+/// ignored request is retried with bounded backoff at a later idle boundary.
+fn select_claim_reconcile(
+    conn: &Connection,
+    session: &str,
+    cards: &[String],
+    now: f64,
+) -> ClaimReconcilePlan {
+    let signature = cards.join(",");
+    let (mut attempts, mut last_ts, mut last_id): (i64, f64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(MAX(ts),0), COALESCE(MAX(id),0) \
+             FROM session_events WHERE session=?1 \
+             AND type='task.claim_reconcile_requested' \
+             AND json_extract(data,'$.signature')=?2",
+            rusqlite::params![session, &signature],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap_or((0, 0.0, 0));
+    let (claim_ts, claim_id): (f64, i64) = conn
+        .query_row(
+            "SELECT COALESCE(MAX(ts),0), COALESCE(MAX(id),0) \
+             FROM session_events WHERE session=?1 AND type='task.claimed'",
+            [session],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap_or((0.0, 0));
+    // A newer claim creates a new conflict generation even if the same ids
+    // recur, so it must not inherit the old retry wait.
+    if claim_ts > last_ts || (claim_ts == last_ts && claim_id > last_id) {
+        attempts = 0;
+        last_ts = 0.0;
+        last_id = claim_id;
+    }
+    if attempts > 0 {
+        let gap = (CLAIM_RECONCILE_BASE_S * 2f64.powi((attempts - 1).min(8) as i32))
+            .min(CLAIM_RECONCILE_MAX_S);
+        let remaining_s = gap - (now - last_ts);
+        if remaining_s > 0.0 {
+            return ClaimReconcilePlan::Cooldown { remaining_s, attempt: attempts };
+        }
+    }
+
+    let mut rows = Vec::new();
+    for card in cards {
+        match bs::get_issue(conn, card).ok().flatten() {
+            Some(row) => rows.push(format!(
+                "- {} [{}] {} | depends_on={} | reviewer={} | gate={}",
+                row.id,
+                row.status,
+                row.title,
+                if row.depends_on.is_empty() { "none".into() } else { row.depends_on.join(",") },
+                row.reviewer.as_deref().unwrap_or("none"),
+                if row.gate.as_deref().is_some_and(|gate| !gate.trim().is_empty()) {
+                    "card override"
+                } else {
+                    "column default"
+                },
+            )),
+            None => rows.push(format!("- {card} [missing at reconciliation read]")),
+        }
+    }
+    let prompt = format!(
+        "{}claim-reconcile — reconcile this worker's board state now. AMUX measured {} distinct exact task.claimed cards still in Doing:\n{}\n\
+         This is internal worker bookkeeping, not a human decision: do not ask the user which card to keep. \
+         Inspect every card with `amux board show <ID>` and use its source message, epic, dependencies, \
+         priority, gate, work summary and assets. Keep exactly one genuinely active, unblocked task in Doing. \
+         Move every other claim to its honest non-WIP state without losing links or evidence, or to a terminal \
+         state only if its gate is satisfied. Then continue the highest-priority eligible work and keep draining \
+         this worker's Backlog/To Do until no actionable non-terminal task remains. Record which card is active \
+         and why on the affected cards.",
+        PICKUP_ANCHOR,
+        cards.len(),
+        rows.join("\n"),
+    );
+    let generation = last_id.max(claim_id);
+    ClaimReconcilePlan::Ready {
+        prompt,
+        delivery_id: format!("board-drive-claim-reconcile:{session}:{generation}"),
+        signature,
+        attempt: attempts + 1,
     }
 }
 
@@ -4049,6 +4241,45 @@ pub(crate) const PICKUP_ANCHOR: &str = "[amux auto-pickup] Claimed ";
 /// (`[a -> b] ...`), and injected bare, such a quote reads as a live unstamped
 /// inter-session message — the 2026-07-23 phantom, where a replayed desc got
 /// attributed to a session as a fresh send.
+/// The exit for "I genuinely cannot do this, and it is neither another lane's
+/// work nor an Ethan decision" (AF-579).
+///
+/// The pickup prompt named three exits and this was not among them, so a lane in
+/// exactly that state had no sentence to follow. The obvious move, a bare
+/// `backlog`, is the BACKLOG DRAIN'S INPUT on a lane that opted into draining:
+/// `oldest_drainable_backlog` promotes the oldest backlog card the lane could
+/// work, so the card returns and the remedy is the loop. Measured on backend:
+/// six cards round-robinned indefinitely, all six plain backlog cards whose
+/// triggers had aged out past AF-514's 24h ceiling.
+///
+/// The exits that actually survive the drain are the ones its own predicate
+/// excludes: a fresh `--trigger`, and `blocked_on` via `amux board block`
+/// (AF-516). Naming those is ethos rule 6 — walk the documented escape with the
+/// sanctioned tooling and check that it comes out the other side.
+fn decline_exit(session: &str) -> &'static str {
+    decline_exit_text(dispatch_backlog_when_idle(session))
+}
+
+/// PURE, so the sentence is testable without the ambient switch.
+///
+/// The first cut read `dispatch_backlog_when_idle` inside the branch and its test
+/// set the env var to get one lane each way. That does not work: the switch
+/// resolves worker > group > global and read `true` for BOTH lanes here, so the
+/// test fell through to a shape assertion common to both arms and proved nothing
+/// about the choice. Splitting the decision from the lookup is the same
+/// pure-comparator shape `invariants::checks` uses, for the same reason.
+fn decline_exit_text(drains: bool) -> &'static str {
+    if drains {
+        " If you genuinely cannot do it and it is neither of those, park it with the \
+         condition that would make it ready: `amux board backlog <ID> --trigger \
+         \"<condition>\"`. A BARE `backlog` is not an exit on this lane, which drains \
+         untriggered backlog cards straight back into pickup."
+    } else {
+        " If you genuinely cannot do it and it is neither of those, `amux board backlog \
+         <ID>` parks it, and `--trigger \"<condition>\"` records what would make it ready."
+    }
+}
+
 fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String {
     // TELL THE LANE HOW DEEP THE QUEUE IS (py:14669, AMUX-2533). Pickup
     // described ONE card and never the queue, so a lane taking card 1 of 90
@@ -4091,11 +4322,27 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
             // triaged its whole queue into undispatchability in two hours
             // while reading as busy. The instruction and the failure were the
             // same action — the AMUX-2140 class.)
-            qnote.push_str(
+            // AF-579: "move not-ready cards to backlog" is the DRAIN'S INPUT on
+            // a lane that opted into draining, so the remedy and the loop are
+            // the same action. Measured on backend: six cards round-robinned
+            // indefinitely, every one a plain backlog card whose trigger had
+            // aged out, falling straight back into the drainable set.
+            //
+            // The sentence now shares the predicate of the mechanism it
+            // describes (ethos rule 1) rather than giving one lane's exit to a
+            // lane it does not work on.
+            qnote.push_str(if dispatch_backlog_when_idle(session) {
+                " Triage first: park not-ready cards with the condition that would make \
+                 them ready, `amux board backlog <ID> --trigger \"<condition>\"`, and send \
+                 owner-blocked ones to review. A BARE `backlog` is not an exit on this \
+                 lane: it drains untriggered backlog cards, so the card comes straight \
+                 back. Do not bounce ready cards to todo (brief re-claim cooldown). Work \
+                 this card or move it where it honestly belongs."
+            } else {
                 " Triage first: move not-ready cards to `backlog`, owner-blocked to review. \
-                 Do not bounce ready cards to todo (brief re-claim cooldown). Work this card or move it \
-                 where it honestly belongs.",
-            );
+                 Do not bounce ready cards to todo (brief re-claim cooldown). Work this \
+                 card or move it where it honestly belongs."
+            });
         }
     }
     // The delivery boundary parses the card id back out of this template to void
@@ -4117,8 +4364,9 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
          `amux board assign <ID> <lane> && amux board todo <ID>` — it dispatches to THEM, \
          not back to you. If it needs a decision only Ethan can make, `amux board needsyou \
          <ID>` with the question. Do NOT move it to review to park it: the review gate asks \
-         you to attest work you have not done, and will refuse.\n{}{}",
+         you to attest work you have not done, and will refuse.{}\n{}{}",
         row.id,
+        decline_exit(session),
         quoted_card_text(&row.title, &row.id),
         qnote
     );
@@ -5247,12 +5495,13 @@ async fn normalize_blocked_doing(state: &AppState) -> usize {
                     .filter(|reason| !reason.is_empty())
                     .unwrap_or("")
                     .to_string();
+                let detail = dep_block_reasons(conn, &blocking).join(",");
                 let reason = if !blocked_on.is_empty() && !blocking.is_empty() {
-                    format!("blocked_on={blocked_on}; unfinished depends_on={}", blocking.join(","))
+                    format!("blocked_on={blocked_on}; unresolved depends_on={detail}")
                 } else if !blocked_on.is_empty() {
                     format!("blocked_on={blocked_on}")
                 } else {
-                    format!("unfinished depends_on={}", blocking.join(","))
+                    format!("unresolved depends_on={detail}")
                 };
                 let opts = crate::db::advance::AdvanceOpts {
                     expected_from: Some("doing".into()),
@@ -5449,6 +5698,182 @@ pub async fn drive_session(state: &AppState, lane: &str) -> LaneTrace {
     trace
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChildClaimReconcile {
+    /// One exact parked card was moved back into Doing in the same transaction
+    /// as its replacement causal marker.
+    Restored(String),
+    /// The exact card was already Doing; the child signal merely confirms it.
+    Current(String),
+    /// A newer informational/control turn explicitly owns the cardless state.
+    Cardless,
+    /// There was no exact, safe card to restore.
+    None,
+}
+
+/// Reassert the exact parent card while delegated work is observably alive.
+///
+/// Providers commonly yield their parent composer while a subagent or a
+/// background terminal keeps doing the task.  Some models also "park" that
+/// card back in To Do while they wait.  The status hook correctly reports the
+/// live child, but the old board projection then has to choose between two
+/// lies: WORKING with no card, or an idle-looking To Do card whose work is
+/// running.  Repair the lifecycle at the write boundary instead.
+///
+/// This never guesses from queue order or title similarity.  It considers only
+/// the newest semantic task marker for this lane.  A newer cardless
+/// informational/control marker wins, a Backlog/Review/terminal card stays
+/// where its gate put it, blockers remain blockers, and another Doing card is
+/// a WIP conflict.  Only an exact owned To Do claim can be restored.
+async fn reconcile_child_task_claim(state: &AppState, lane: &str) -> ChildClaimReconcile {
+    let lane = lane.to_string();
+    let lane_w = lane.clone();
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(ChildClaimReconcile::None));
+    let slot_w = slot.clone();
+    let result = state
+        .store
+        .write_async(move |conn| {
+            let mut marker: Option<(String, Option<String>)> = None;
+            let mut statement = conn.prepare(
+                "SELECT type, data FROM session_events WHERE session=?1 \
+                 AND type IN ('task.claimed','task.cardless') ORDER BY ts DESC, id DESC LIMIT 128",
+            )?;
+            let rows = statement.query_map([&lane_w], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            for row in rows.flatten() {
+                let parsed = row
+                    .1
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                if row.0 == "task.cardless" {
+                    if crate::api::sessions_legacy::cardless_event_allowed(&parsed) {
+                        marker = Some((row.0, None));
+                        break;
+                    }
+                    continue;
+                }
+                let card = parsed["issue"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string);
+                if card.is_some() {
+                    marker = Some((row.0, card));
+                    break;
+                }
+            }
+            drop(statement);
+
+            let Some((kind, card)) = marker else {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            };
+            if kind == "task.cardless" {
+                *slot_w.lock().unwrap_or_else(|poison| poison.into_inner()) =
+                    ChildClaimReconcile::Cardless;
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            }
+            let Some(card) = card else {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            };
+            let Some(row) = bs::get_issue(conn, &card)? else {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            };
+            if row.session.as_deref() != Some(lane_w.as_str()) || row.owner_type != "agent" {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            }
+            if row.status == "doing" {
+                *slot_w.lock().unwrap_or_else(|poison| poison.into_inner()) =
+                    ChildClaimReconcile::Current(card);
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            }
+            if row.status != "todo"
+                || row.archived != 0
+                || row.tags.iter().any(|tag| tag.to_ascii_lowercase().starts_with("needs:you"))
+                || row.waiting_on.as_deref().is_some_and(|value| !value.trim().is_empty())
+                || fresh_source_ref_trigger(&row, now_f64() as i64)
+                || matches!(row.item_type.as_str(), "tripwire" | "watch" | "epic")
+                || !deps_blocking(conn, &row).is_empty()
+            {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            }
+            let other_wip: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM issues WHERE session=?1 AND id<>?2 \
+                 AND status='doing' AND deleted IS NULL AND COALESCE(archived,0)=0 \
+                 AND COALESCE(type,'') NOT IN ('tripwire','watch','epic')",
+                rusqlite::params![&lane_w, &card],
+                |row| row.get(0),
+            )?;
+            if other_wip > 0 {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            }
+            let opts = crate::db::advance::AdvanceOpts {
+                expected_from: Some("todo".to_string()),
+                assign_to: Some(lane_w.clone()),
+                log_line: Some(format!(
+                    "Restored to Doing by {lane_w}: an identity-backed child is still working this exact claimed task"
+                )),
+                force: true,
+                skip_continuation: true,
+                ..Default::default()
+            };
+            match crate::db::advance::advance(conn, &card, "doing", &lane_w, &opts)? {
+                Ok(outcome) => {
+                    conn.execute(
+                        "INSERT INTO session_events (ts,session,type,data,source) VALUES (?,?,?,?,?)",
+                        rusqlite::params![
+                            now_f64(),
+                            &lane_w,
+                            "task.claimed",
+                            serde_json::json!({
+                                "issue": &card,
+                                "status": "doing",
+                                "from": "todo",
+                                "reason": "identity-backed-child-work",
+                                "measured": true,
+                                "n_considered": 1,
+                                "verdict": "exact_child_claim_restored",
+                            })
+                            .to_string(),
+                            "board-drive",
+                        ],
+                    )?;
+                    *slot_w.lock().unwrap_or_else(|poison| poison.into_inner()) =
+                        ChildClaimReconcile::Restored(card);
+                    Ok(crate::db::WriteOutcome { applied: true, events: outcome.events })
+                }
+                Err(_) => Ok(crate::db::WriteOutcome { applied: false, events: vec![] }),
+            }
+        })
+        .await;
+    if let Err(error) = result {
+        tracing::warn!(
+            target: "amux::board_drive",
+            session = %lane,
+            %error,
+            measured = false,
+            n_considered = 0,
+            verdict = "child_claim_reconcile_failed",
+            "identity-backed child work could not reconcile its exact board claim"
+        );
+        return ChildClaimReconcile::None;
+    }
+    let result = slot.lock().unwrap_or_else(|poison| poison.into_inner()).clone();
+    if let ChildClaimReconcile::Restored(card) = &result {
+        tracing::warn!(
+            target: "amux::board_drive",
+            session = %lane,
+            %card,
+            measured = true,
+            n_considered = 1,
+            verdict = "exact_child_claim_restored",
+            "live child work restored its exact parked To Do card to Doing"
+        );
+    }
+    result
+}
+
 fn publish_lane(trace: LaneTrace) {
     if let Ok(mut slot) = report_slot().write() {
         let report = slot.get_or_insert_with(|| DriveReport { started_at: now_f64(), ..Default::default() });
@@ -5461,6 +5886,8 @@ fn publish_lane(trace: LaneTrace) {
 }
 
 async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTrace {
+    let lane_lock = lane_drive_lock(state, lane);
+    let _lane_guard = lane_lock.lock().await;
     // COUNT THE BACKLOG BEFORE THE GATES, ALWAYS. Found by reading this
     // instrument's own output during verification: a lane skipped for
     // `not-running` reported `eligible_todos: 0` while a dispatchable card was
@@ -5490,32 +5917,21 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
     // mutation. An exact surviving claim comes first: resuming its own Doing
     // work is not a second WIP claim and must not be hidden by the WIP cap.
     let woke_for_dispatch = if !fleet.is_running(lane).await {
-        let preflight = match state.store.read() {
+        let should_wake = match state.store.read() {
             Ok(conn) => match select_resume(&conn, lane, now_f64(), true) {
-                Resume::Claim { .. } => Ok(true),
-                Resume::Conflicting { cards } => Err(cards),
-                Resume::Current { .. } => Ok(true),
-                Resume::None => Ok(matches!(
+                Resume::Claim { .. } => true,
+                // The worker, not a human or a server heuristic, owns this
+                // reconciliation. Wake it without a singular resume card; the
+                // post-start selector sends the complete candidate set.
+                Resume::Conflicting { .. } => true,
+                Resume::Current { .. } => true,
+                Resume::None => matches!(
                     select_pickup(&conn, lane, now_f64()),
                     Pickup::Claim { .. } | Pickup::DrainBacklog { .. }
-                )),
+                ),
             },
             Err(_) => return LaneTrace::skip(lane, "store-unavailable", "could not preflight stopped worker")
                 .with_counts(eligible, open),
-        };
-        let should_wake = match preflight {
-            Ok(should_wake) => should_wake,
-            Err(cards) => {
-                tracing::warn!(target: "amux::board_drive", session = lane, cards = %cards.join(","),
-                    measured = true, n_considered = cards.len(), verdict = "conflicting_live_claims",
-                    "board_drive: stopped worker has conflicting exact live claims; refusing to guess a resume card");
-                return LaneTrace::skip(
-                    lane,
-                    "resume-conflicting-claims",
-                    format!("{} surviving exact task.claimed card(s): {}; worker not started", cards.len(), cards.join(", ")),
-                )
-                .with_counts(eligible, open);
-            }
         };
         if !should_wake {
             return LaneTrace::skip(
@@ -5552,6 +5968,39 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
     // anything not positively known to be idle is left alone. A nudge that waits
     // one more tick costs nothing; a nudge delivered mid-turn is an interruption.
     if !woke_for_dispatch && !fleet.at_boundary(lane).await {
+        // A provider-owned child is positive evidence that the lane is doing
+        // more than merely rendering an active spinner.  Reconcile its exact
+        // parent claim before returning `mid-turn`, otherwise a model which
+        // parked that card in To Do while waiting makes the board look idle
+        // for the entire delegated operation (the live Primis/TubeScience
+        // failure).  The helper refuses cardless turns, blockers and guesses.
+        if fleet.active_child_work(lane) {
+            match reconcile_child_task_claim(state, lane).await {
+                ChildClaimReconcile::Restored(card) => {
+                    return LaneTrace::skip(
+                        lane,
+                        "active-child-claim-restored",
+                        format!(
+                            "identity-backed child work is live; restored exact claimed card {card} from To Do to Doing"
+                        ),
+                    )
+                    .with_card(&card)
+                    .with_counts(eligible, open);
+                }
+                ChildClaimReconcile::Current(card) => {
+                    return LaneTrace::skip(
+                        lane,
+                        "active-child-claim-current",
+                        format!(
+                            "identity-backed child work is live on exact Doing card {card}; no new work was delivered"
+                        ),
+                    )
+                    .with_card(&card)
+                    .with_counts(eligible, open);
+                }
+                ChildClaimReconcile::Cardless | ChildClaimReconcile::None => {}
+            }
+        }
         // NAME THE EVIDENCE, not just the verdict. `mid-turn` read identically
         // for a lane genuinely generating and for one held by a self-report
         // nothing would ever refresh — and the second kind sat here for up to
@@ -5661,15 +6110,93 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 current_claim = Some((card, cause));
             }
             Resume::Conflicting { cards } => {
-                tracing::warn!(target: "amux::board_drive", session = lane, cards = %cards.join(","),
-                    measured = true, n_considered = cards.len(), verdict = "conflicting_live_claims",
-                    "board_drive: worker has conflicting exact live claims; refusing to guess a resume card");
-                return LaneTrace::skip(
-                    lane,
-                    "resume-conflicting-claims",
-                    format!("{} surviving exact task.claimed card(s): {}; no delivery", cards.len(), cards.join(", ")),
-                )
-                .with_counts(eligible, open);
+                let plan = match state.store.read() {
+                    Ok(conn) => select_claim_reconcile(&conn, lane, &cards, now),
+                    Err(_) => return LaneTrace::skip(
+                        lane,
+                        "store-unavailable",
+                        "could not prepare automatic claim reconciliation",
+                    ).with_counts(eligible, open),
+                };
+                let (prompt, delivery_id, signature, attempt) = match plan {
+                    ClaimReconcilePlan::Ready { prompt, delivery_id, signature, attempt } => {
+                        (prompt, delivery_id, signature, attempt)
+                    }
+                    ClaimReconcilePlan::Cooldown { remaining_s, attempt } => {
+                        return LaneTrace::skip(
+                            lane,
+                            "claim-reconcile-cooldown",
+                            format!(
+                                "automatic reconciliation attempt {attempt} already requested; retry in {:.0}s if {} claims still survive: {}",
+                                remaining_s.ceil(), cards.len(), cards.join(", ")
+                            ),
+                        )
+                        .with_counts(eligible, open);
+                    }
+                };
+                match fleet.deliver_resume(lane, &prompt, &delivery_id).await {
+                    Ok(disposition) => {
+                        crate::api::session_verbs::emit_event(
+                            state,
+                            lane,
+                            "task.claim_reconcile_requested",
+                            Some(json!({
+                                "issue": cards.first(),
+                                "cards": &cards,
+                                "signature": &signature,
+                                "delivery_id": &delivery_id,
+                                "attempt": attempt,
+                                "delivery": format!("{disposition:?}"),
+                                "measured": true,
+                                "n_considered": cards.len(),
+                                "verdict": "model_reconciliation_requested",
+                            })),
+                            Some(format!("task-claim-reconcile:{delivery_id}")),
+                            "board-drive",
+                        )
+                        .await;
+                        tracing::warn!(target: "amux::board_drive", session = lane,
+                            cards = %cards.join(","), %delivery_id, attempt,
+                            delivery = ?disposition, measured = true,
+                            n_considered = cards.len(), verdict = "model_reconciliation_requested",
+                            "board_drive: handed every conflicting exact claim to its worker for automatic reconciliation");
+                        return LaneTrace::acted(
+                            lane,
+                            "claim-reconcile",
+                            cards.first().map(String::as_str).unwrap_or(""),
+                            format!(
+                                "automatic attempt {attempt} {disposition:?} for {} claims: {}",
+                                cards.len(), cards.join(", ")
+                            ),
+                        )
+                        .with_counts(eligible, open);
+                    }
+                    Err(error) => {
+                        crate::api::session_verbs::emit_event(
+                            state,
+                            lane,
+                            "task.claim_reconcile_failed",
+                            Some(json!({
+                                "cards": &cards,
+                                "signature": &signature,
+                                "delivery_id": &delivery_id,
+                                "error": &error,
+                                "measured": true,
+                                "n_considered": cards.len(),
+                                "verdict": "claim_reconcile_delivery_failed",
+                            })),
+                            None,
+                            "board-drive",
+                        )
+                        .await;
+                        return LaneTrace::skip(
+                            lane,
+                            "claim-reconcile-delivery-failed",
+                            format!("automatic reconciliation for {} failed: {error}; retry next tick", cards.join(", ")),
+                        )
+                        .with_counts(eligible, open);
+                    }
+                }
             }
             Resume::None => unreachable!("non-empty resume selector was matched above"),
         }
@@ -7342,6 +7869,83 @@ mod tests {
     /// absent measurement as "no movement" would escalate a lane on the
     /// strength of a tick that could not have observed anything (ethos rule 4,
     /// applied to this function's own first run).
+    /// A park must name the dependency's STATE, not just call it unfinished.
+    ///
+    /// AF-610, reported by `primis`. PRIMI-220 (twice) and PRIMI-221 were parked
+    /// within the same second as a satisfied 2/2 gate, naming PRIMI-219 — which
+    /// was `done`. The behaviour is correct: PRIMI-219 has no `type`,
+    /// `core_item_type("")` falls through to ItemType::Code, and
+    /// `verified_is_meaningful(Code)` is true, so it completes at `verified`.
+    /// The MESSAGE said "unfinished depends_on=PRIMI-219", which reads as "not
+    /// done" about a card that is done.
+    ///
+    /// The cost was not the park. The workaround was to CLEAR depends_on on both
+    /// cards, destroying the dependency graph the parker exists to enforce.
+    #[test]
+    fn a_park_names_why_a_done_dependency_still_blocks() {
+        let mut conn = Connection::open_in_memory().expect("memdb");
+        crate::db::migrate::apply_all(&mut conn).expect("schema");
+        let add = |id: &str, status: &str, item_type: &str| {
+            conn.execute(
+                "INSERT INTO issues (id, title, status, type, created, updated)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                rusqlite::params![id, format!("t {id}"), status, item_type, 1_760_000_000.0_f64],
+            )
+            .expect("insert");
+        };
+        // The reported shape: done, and NO type at all.
+        add("DEP-UNTYPED", "done", "");
+        // A type whose completion boundary really is `done`.
+        add("DEP-DOC", "done", "doc");
+        // Terminal but never proof of resolution.
+        add("DEP-DISCARDED", "discarded", "doc");
+
+        let ids: Vec<String> =
+            ["DEP-UNTYPED", "DEP-DOC", "DEP-DISCARDED"].iter().map(|s| s.to_string()).collect();
+        let reasons = dep_block_reasons(&conn, &ids);
+
+        // THE POINT: the untyped `done` card must say it is done AND why that is
+        // not enough. Asserting on "done" alone would pass on the old message.
+        assert!(reasons[0].contains("done"), "must name the real status: {:?}", reasons[0]);
+        assert!(
+            reasons[0].contains("completes at verified"),
+            "must name the boundary that makes a done card still block: {:?}",
+            reasons[0]
+        );
+        assert!(reasons[0].contains("unset->code"), "must say the type defaulted: {:?}", reasons[0]);
+
+        // CONTROLS. Without these, a helper that appends the same clause to
+        // everything passes the block above.
+        assert!(!deps_blocking_contains(&conn, "DEP-DOC"), "a doc card at `done` is resolved");
+        assert!(deps_blocking_contains(&conn, "DEP-UNTYPED"), "untyped defaults to code");
+        assert!(deps_blocking_contains(&conn, "DEP-DISCARDED"), "discarded is not resolution");
+        assert!(reasons[2].contains("discarded"), "names its real status: {:?}", reasons[2]);
+
+        // Absent and unreadable are their own answers, never "unfinished".
+        let missing = dep_block_reasons(&conn, &["NOPE-1".to_string()]);
+        assert!(missing[0].contains("missing"), "{:?}", missing[0]);
+    }
+
+    /// Helper: does this id block, per the shipped predicate?
+    fn deps_blocking_contains(conn: &Connection, id: &str) -> bool {
+        !bs::dependency_resolved(conn, id).expect("dependency lookup")
+    }
+
+    /// And the rule itself, stated where a reader looking for it will find it.
+    #[test]
+    fn done_resolves_a_dependency_only_where_verified_is_not_meaningful() {
+        assert!(bs::dependency_is_resolved("verified", "code"));
+        assert!(bs::dependency_is_resolved("done", "doc"));
+        assert!(bs::dependency_is_resolved("done", "research"));
+        // Ships something, so `done` is not the end.
+        assert!(!bs::dependency_is_resolved("done", "code"));
+        assert!(!bs::dependency_is_resolved("done", "ops"));
+        // THE ONE THAT BIT: no type at all is treated as code.
+        assert!(!bs::dependency_is_resolved("done", ""));
+        // Terminal, and still not resolution.
+        assert!(!bs::dependency_is_resolved("discarded", "doc"));
+    }
+
     #[test]
     fn unheeded_counts_only_when_a_comparison_was_actually_possible() {
         // First sighting: no prior mark. Counts as movement, never as silence.
@@ -8046,6 +8650,7 @@ mod tests {
         resume_disposition: std::sync::Mutex<Option<ResumeDelivery>>,
         running: std::sync::atomic::AtomicBool,
         boundary: std::sync::atomic::AtomicBool,
+        active_child: std::sync::atomic::AtomicBool,
         enabled: std::sync::atomic::AtomicBool,
         isolated: std::sync::atomic::AtomicBool,
         starts: std::sync::atomic::AtomicUsize,
@@ -8059,6 +8664,7 @@ mod tests {
                 resume_disposition: std::sync::Mutex::new(None),
                 running: std::sync::atomic::AtomicBool::new(true),
                 boundary: std::sync::atomic::AtomicBool::new(true),
+                active_child: std::sync::atomic::AtomicBool::new(false),
                 enabled: std::sync::atomic::AtomicBool::new(true),
                 isolated: std::sync::atomic::AtomicBool::new(false),
                 starts: std::sync::atomic::AtomicUsize::new(0),
@@ -8072,6 +8678,9 @@ mod tests {
         fn is_isolated(&self, _: &str) -> bool { self.isolated.load(std::sync::atomic::Ordering::SeqCst) }
         async fn is_running(&self, _: &str) -> bool { self.running.load(std::sync::atomic::Ordering::SeqCst) }
         async fn at_boundary(&self, _: &str) -> bool { self.boundary.load(std::sync::atomic::Ordering::SeqCst) }
+        fn active_child_work(&self, _: &str) -> bool {
+            self.active_child.load(std::sync::atomic::Ordering::SeqCst)
+        }
         fn auto_continue_enabled(&self, _: &str) -> bool { true }
         async fn start_for_dispatch(&self, _: &str) -> Result<(), String> {
             self.starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -8335,7 +8944,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conflicting_exact_claims_are_explicit_and_never_delivered() {
+    async fn conflicting_exact_claims_are_given_to_the_model_not_a_human() {
         let (_dir, state, store) = drive_state();
         drive_card(&store, "FIRST", "doing", "agent", "code");
         drive_card(&store, "SECOND", "doing", "agent", "code");
@@ -8344,10 +8953,79 @@ mod tests {
         let fleet = BoundaryFleet::default();
 
         let trace = drive_lane(&state, &fleet, "lane").await;
-        assert_eq!(trace.reason, "resume-conflicting-claims", "{trace:?}");
+        assert_eq!(trace.outcome, "claim-reconcile", "{trace:?}");
         assert!(trace.detail.contains("FIRST") && trace.detail.contains("SECOND"), "{trace:?}");
-        assert!(fleet.delivered.lock().unwrap().is_empty());
+        {
+            let delivered = fleet.delivered.lock().unwrap();
+            assert_eq!(delivered.len(), 1, "one stable reconciliation request");
+            assert!(delivered[0].1.contains("FIRST") && delivered[0].1.contains("SECOND"));
+            assert!(delivered[0].1.contains("not a human decision"));
+            assert!(delivered[0].1.contains("Keep exactly one"));
+        }
         assert_eq!(drive_events(&store, "task.resumed"), 0);
+        assert_eq!(drive_events(&store, "task.claim_reconcile_requested"), 1);
+
+        let repeated = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(repeated.reason, "claim-reconcile-cooldown", "{repeated:?}");
+        assert_eq!(fleet.delivered.lock().unwrap().len(), 1, "cooldown prevents duplicate queue rows");
+        assert_eq!(drive_events(&store, "task.claim_reconcile_requested"), 1);
+
+        store.write(|conn| {
+            conn.execute(
+                "UPDATE session_events SET ts=ts-?1 WHERE session='lane'",
+                [CLAIM_RECONCILE_BASE_S + 1.0],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let retried = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(retried.outcome, "claim-reconcile", "{retried:?}");
+        assert_eq!(fleet.delivered.lock().unwrap().len(), 2, "an unresolved conflict is retried after its backoff");
+        assert_eq!(drive_events(&store, "task.claim_reconcile_requested"), 2);
+    }
+
+    #[tokio::test]
+    async fn stopped_worker_is_woken_to_reconcile_conflicting_claims() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "FIRST", "doing", "agent", "code");
+        drive_card(&store, "SECOND", "doing", "agent", "code");
+        drive_claim(&store, "FIRST");
+        drive_claim(&store, "SECOND");
+        let fleet = BoundaryFleet::default();
+        fleet.running.store(false, std::sync::atomic::Ordering::SeqCst);
+        fleet.boundary.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(
+            exact_resume_card(&store.read().unwrap(), "lane").unwrap(),
+            None,
+            "a conflict has no singular launch card; it is not a launch error"
+        );
+        let trace = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(trace.outcome, "claim-reconcile", "{trace:?}");
+        assert_eq!(fleet.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(fleet.delivered.lock().unwrap().len(), 1);
+        assert_eq!(drive_events(&store, "task.claim_reconcile_requested"), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_claim_reconciliation_delivery_retries_next_tick() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "FIRST", "doing", "agent", "code");
+        drive_card(&store, "SECOND", "doing", "agent", "code");
+        drive_claim(&store, "FIRST");
+        drive_claim(&store, "SECOND");
+        let fleet = BoundaryFleet::default();
+        *fleet.delivery_error.lock().unwrap() = Some("queue offline".into());
+
+        let failed = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(failed.reason, "claim-reconcile-delivery-failed", "{failed:?}");
+        assert_eq!(drive_events(&store, "task.claim_reconcile_requested"), 0);
+        assert_eq!(drive_events(&store, "task.claim_reconcile_failed"), 1);
+
+        *fleet.delivery_error.lock().unwrap() = None;
+        let retried = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(retried.outcome, "claim-reconcile", "{retried:?}");
+        assert_eq!(fleet.delivered.lock().unwrap().len(), 1);
+        assert_eq!(drive_events(&store, "task.claim_reconcile_requested"), 1);
     }
 
     #[tokio::test]
@@ -8362,6 +9040,56 @@ mod tests {
         assert_eq!(trace.reason, "mid-turn", "{trace:?}");
         assert!(fleet.delivered.lock().unwrap().is_empty());
         assert_eq!(drive_events(&store, "task.resumed"), 0);
+    }
+
+    #[tokio::test]
+    async fn live_child_restores_its_exact_parked_todo_claim_without_redelivery() {
+        let (_dir, state, store) = drive_state();
+        // Exact live specimen: the parent claimed the task, then parked the
+        // row in To Do while a delegated agent kept running.
+        drive_card(&store, "CHILD-1", "todo", "agent", "code");
+        drive_claim(&store, "CHILD-1");
+        let fleet = BoundaryFleet::default();
+        fleet.boundary.store(false, std::sync::atomic::Ordering::SeqCst);
+        fleet.active_child.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let trace = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(trace.reason, "active-child-claim-restored", "{trace:?}");
+        assert_eq!(trace.card.as_deref(), Some("CHILD-1"));
+        assert_eq!(drive_status(&store, "CHILD-1"), "doing");
+        assert_eq!(drive_events(&store, "task.claimed"), 2);
+        assert!(fleet.delivered.lock().unwrap().is_empty());
+
+        // The next tick observes the now-correct Doing state and is a no-op.
+        let repeated = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(repeated.reason, "active-child-claim-current", "{repeated:?}");
+        assert_eq!(drive_events(&store, "task.claimed"), 2);
+    }
+
+    #[tokio::test]
+    async fn live_child_never_revives_a_prior_task_across_a_newer_cardless_turn() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "OLD-1", "todo", "agent", "code");
+        drive_claim(&store, "OLD-1");
+        store.write(|conn| {
+            conn.execute(
+                "INSERT INTO session_events (ts,session,type,data,source) \
+                 VALUES (?1,'lane','task.cardless',?2,'prompt-capture')",
+                rusqlite::params![
+                    now_f64() + 0.001,
+                    json!({"reason": "informational-query"}).to_string(),
+                ],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let fleet = BoundaryFleet::default();
+        fleet.boundary.store(false, std::sync::atomic::Ordering::SeqCst);
+        fleet.active_child.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let trace = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(trace.reason, "mid-turn", "{trace:?}");
+        assert_eq!(drive_status(&store, "OLD-1"), "todo");
+        assert_eq!(drive_events(&store, "task.claimed"), 1);
     }
 
     #[tokio::test]
@@ -11651,4 +12379,77 @@ mod tests {
         assert_cli_verbs_exist("amux board show X, amux board done X, amux board reviewer X y");
     }
 
+}
+
+#[cfg(test)]
+mod af579_decline_exit_tests {
+    use super::*;
+
+    /// AF-579. The pickup prompt named three exits: hand it to another lane, ask
+    /// Ethan, and NOT review. A lane that can do none of those had no sentence to
+    /// follow, and the obvious move is the backlog drain's own input.
+    ///
+    /// PINS BOTH ARMS. Testing only the drain arm would pass on a function that
+    /// ignores its argument and always warns, which would tell a lane with no
+    /// drain that its working exit does not work.
+    #[test]
+    fn the_decline_exit_names_a_trigger_only_where_a_bare_backlog_would_come_back() {
+        let drained = decline_exit_text(true);
+        assert!(
+            drained.contains("--trigger"),
+            "a drain-enabled lane must get the exit that survives the drain: {drained}"
+        );
+        assert!(
+            drained.contains("BARE `backlog` is not an exit"),
+            "and be told WHY the obvious move fails, or it reads as style: {drained}"
+        );
+
+        let plain = decline_exit_text(false);
+        assert!(
+            plain.contains("amux board backlog"),
+            "a lane with no drain still needs an exit named: {plain}"
+        );
+        assert!(
+            !plain.contains("not an exit on this lane"),
+            "and must NOT be told a bare backlog fails where it does not: {plain}"
+        );
+
+        // THE ARMS MUST DIFFER. Without this, one constant satisfies every
+        // assertion above that the two arms happen to share.
+        assert_ne!(drained, plain, "both lanes were given the same sentence");
+    }
+
+    /// NO RUN OF SPACES inside either arm. Rust line-continuations in a string
+    /// literal need a trailing backslash; without it the source still compiles
+    /// and the PROMPT renders "the          condition". I shipped exactly that
+    /// in the first cut of this change, and the compiler cannot see it.
+    #[test]
+    fn neither_arm_renders_a_run_of_spaces() {
+        for text in [decline_exit_text(true), decline_exit_text(false)] {
+            assert!(
+                !text.contains("   "),
+                "a dropped line-continuation leaves a gap in the rendered prompt: {text}"
+            );
+        }
+    }
+
+    /// The live wiring: a sentence no prompt includes is a sentence nobody
+    /// reads, which is the defect one layer up.
+    #[test]
+    fn the_pickup_prompt_carries_the_decline_exit() {
+        let src = include_str!("board_drive.rs");
+        // BOUND IT TO THE FUNCTION. Splitting only on the opening line leaves
+        // `body` as the whole rest of the file, which contains THIS assertion's
+        // own literal, so unwiring the call site left the cell green. A test
+        // matching its own text is the self-referential trap ethos rule 7 names.
+        let body = src
+            .split_once("fn pickup_prompt(")
+            .expect("pickup_prompt exists")
+            .1;
+        let body = body.split_once("\n}\n").expect("its closing brace").0;
+        assert!(
+            body.contains("decline_exit(session)"),
+            "pickup_prompt must call decline_exit, or the exit reaches no lane"
+        );
+    }
 }

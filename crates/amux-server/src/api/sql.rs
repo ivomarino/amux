@@ -20,7 +20,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use rusqlite::types::ValueRef;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::time::Instant;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -30,9 +30,9 @@ pub fn routes() -> Router<AppState> {
 }
 
 fn db_path() -> std::path::PathBuf {
-    std::env::var("AMUX_DB").map(std::path::PathBuf::from).unwrap_or_else(|_| {
-        crate::api::session_verbs::home().join("amux.db")
-    })
+    std::env::var("AMUX_DB")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| crate::api::session_verbs::home().join("amux.db"))
 }
 
 /// Cell -> JSON. NULL stays null rather than becoming "" — a browser that
@@ -48,18 +48,26 @@ fn cell(v: ValueRef<'_>) -> Value {
     }
 }
 
-fn rows_to_json(stmt: &mut rusqlite::Statement<'_>) -> rusqlite::Result<(Vec<String>, Vec<Value>)> {
+const SQL_ROW_CAP: usize = 1000;
+
+fn rows_to_json(
+    stmt: &mut rusqlite::Statement<'_>,
+    cap: usize,
+) -> rusqlite::Result<(Vec<String>, Vec<Vec<Value>>, bool)> {
     let cols: Vec<String> = stmt.column_names().into_iter().map(String::from).collect();
     let mut out = Vec::new();
     let mut q = stmt.query([])?;
     while let Some(r) = q.next()? {
-        let mut obj = serde_json::Map::new();
-        for (i, name) in cols.iter().enumerate() {
-            obj.insert(name.clone(), cell(r.get_ref(i)?));
+        if out.len() == cap {
+            return Ok((cols, out, true));
         }
-        out.push(Value::Object(obj));
+        let mut values = Vec::with_capacity(cols.len());
+        for i in 0..cols.len() {
+            values.push(cell(r.get_ref(i)?));
+        }
+        out.push(values);
     }
-    Ok((cols, out))
+    Ok((cols, out, false))
 }
 
 async fn schema(State(state): State<AppState>) -> Response {
@@ -67,20 +75,24 @@ async fn schema(State(state): State<AppState>) -> Response {
         Ok(c) => c,
         Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
     };
-    let mut tables: BTreeMap<String, Value> = BTreeMap::new();
+    let mut tables = Vec::new();
     let names: Vec<String> = conn
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        .prepare("SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name")
         .and_then(|mut s| s.query_map([], |r| r.get::<_, String>(0)).map(|r| r.flatten().collect()))
         .unwrap_or_default();
     for t in names {
         let cols: Vec<Value> = conn
-            .prepare(&format!("PRAGMA table_info(\"{}\")", t.replace('"', "\"\"")))
+            .prepare(&format!(
+                "PRAGMA table_info(\"{}\")",
+                t.replace('"', "\"\"")
+            ))
             .and_then(|mut s| {
                 s.query_map([], |r| {
                     Ok(json!({
                         "name": r.get::<_, String>(1)?,
                         "type": r.get::<_, String>(2)?,
                         "notnull": r.get::<_, i64>(3)? == 1,
+                        "dflt": r.get::<_, Option<String>>(4)?,
                         "pk": r.get::<_, i64>(5)? > 0,
                     }))
                 })
@@ -88,9 +100,18 @@ async fn schema(State(state): State<AppState>) -> Response {
             })
             .unwrap_or_default();
         let count: i64 = conn
-            .query_row(&format!("SELECT COUNT(*) FROM \"{}\"", t.replace('"', "\"\"")), [], |r| r.get(0))
+            .query_row(
+                &format!("SELECT COUNT(*) FROM \"{}\"", t.replace('"', "\"\"")),
+                [],
+                |r| r.get(0),
+            )
             .unwrap_or(-1);
-        tables.insert(t, json!({ "columns": cols, "rows": count }));
+        tables.push(json!({
+            "name": t,
+            "columns": cols,
+            "rows": if count >= 0 { json!(count) } else { Value::Null },
+            "writable": t.to_ascii_lowercase().starts_with("wb_"),
+        }));
     }
     Json(json!({ "tables": tables, "path": db_path().to_string_lossy() })).into_response()
 }
@@ -100,11 +121,17 @@ pub struct RowsParams {
     table: Option<String>,
     limit: Option<usize>,
     offset: Option<usize>,
+    sort: Option<String>,
+    dir: Option<String>,
 }
 
 async fn rows(State(state): State<AppState>, Query(p): Query<RowsParams>) -> Response {
     let Some(table) = p.table.filter(|t| !t.is_empty()) else {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "table required" }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "table required" })),
+        )
+            .into_response();
     };
     let conn = match state.store.read() {
         Ok(c) => c,
@@ -115,30 +142,97 @@ async fn rows(State(state): State<AppState>, Query(p): Query<RowsParams>) -> Res
     // real table never reaches a query string.
     let known: bool = conn
         .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+            "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name=?1",
             [&table],
             |_| Ok(true),
         )
         .unwrap_or(false);
     if !known {
-        return (StatusCode::NOT_FOUND, Json(json!({ "error": format!("no such table: {table}") })))
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("no such table: {table}") })),
+        )
             .into_response();
     }
     let limit = p.limit.unwrap_or(100).min(1000);
     let offset = p.offset.unwrap_or(0);
-    let sql = format!("SELECT * FROM \"{}\" LIMIT {} OFFSET {}", table.replace('"', "\"\""), limit, offset);
-    match conn.prepare(&sql).and_then(|mut s| rows_to_json(&mut s)) {
-        Ok((columns, rows)) => Json(json!({ "columns": columns, "rows": rows, "table": table })).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))).into_response(),
+    let columns: Vec<String> = conn
+        .prepare(&format!(
+            "PRAGMA table_info(\"{}\")",
+            table.replace('"', "\"\"")
+        ))
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default();
+    let sort = p
+        .sort
+        .filter(|column| columns.iter().any(|known| known == column));
+    let direction = if p.dir.as_deref() == Some("desc") {
+        "DESC"
+    } else {
+        "ASC"
+    };
+    let order = sort
+        .as_deref()
+        .map(|column| format!(" ORDER BY \"{}\" {direction}", column.replace('"', "\"\"")))
+        .unwrap_or_default();
+    let sql = format!(
+        "SELECT * FROM \"{}\"{} LIMIT {} OFFSET {}",
+        table.replace('"', "\"\""),
+        order,
+        limit,
+        offset
+    );
+    let total: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM \"{}\"", table.replace('"', "\"\"")),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    match conn
+        .prepare(&sql)
+        .and_then(|mut s| rows_to_json(&mut s, limit))
+    {
+        Ok((columns, rows, _)) => Json(json!({
+            "columns": columns,
+            "rows": rows,
+            "table": table,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "sort": sort,
+            "dir": direction.to_ascii_lowercase(),
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
     }
 }
 
 async fn run_sql(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
-    let sql = body.get("sql").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let sql = body
+        .get("sql")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if sql.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "sql required" }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "sql required" })),
+        )
+            .into_response();
     }
-    let write = body.get("write").and_then(Value::as_bool).unwrap_or(false);
+    let allow_write = body.get("write").and_then(Value::as_bool).unwrap_or(false);
+    let write = sql_is_write(&sql);
+    let started = Instant::now();
 
     if !write {
         // READ-ONLY BY CONSTRUCTION. Not a keyword check — the engine refuses.
@@ -148,19 +242,51 @@ async fn run_sql(State(state): State<AppState>, Json(body): Json<Value>) -> Resp
         let conn = match rusqlite::Connection::open_with_flags(db_path(), flags) {
             Ok(c) => c,
             Err(e) => {
-                return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": e.to_string() })))
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": e.to_string() })),
+                )
                     .into_response()
             }
         };
-        return match conn.prepare(&sql).and_then(|mut s| rows_to_json(&mut s)) {
-            Ok((columns, rows)) => {
-                Json(json!({ "columns": columns, "rows": rows, "readonly": true })).into_response()
+        return match conn
+            .prepare(&sql)
+            .and_then(|mut s| rows_to_json(&mut s, SQL_ROW_CAP))
+        {
+            Ok((columns, rows, truncated)) => {
+                let rowcount = rows.len();
+                Json(json!({
+                    "columns": columns,
+                    "rows": rows,
+                    "rowcount": rowcount,
+                    "truncated": truncated,
+                    "ms": started.elapsed().as_millis(),
+                    "readonly": true,
+                }))
+                .into_response()
             }
             // SQLITE_READONLY surfaces here with its own message; pass it
             // through rather than rewriting it, so a refused write says it was
             // refused instead of looking like a syntax error.
-            Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))).into_response(),
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response(),
         };
+    }
+
+    if !allow_write {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "Read-only mode — enable ‘Allow writes’ to run this statement."
+            })),
+        )
+            .into_response();
+    }
+    if let Some(error) = sql_write_guard(&sql) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response();
     }
 
     // write: true — the user asked for it explicitly via the UI toggle. Goes
@@ -174,14 +300,112 @@ async fn run_sql(State(state): State<AppState>, Json(body): Json<Value>) -> Resp
         .write_async(move |conn| {
             let n = conn.execute_batch(&sql2).map(|_| conn.changes() as usize)?;
             *cw.lock().expect("slot") = n;
-            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            Ok(crate::db::WriteOutcome {
+                applied: true,
+                events: vec![],
+            })
         })
         .await;
     match res {
         Ok(_) => {
             let n = *changed.lock().expect("slot");
-            Json(json!({ "ok": true, "changed": n, "readonly": false })).into_response()
+            Json(json!({
+                "write": true,
+                "rowcount": n,
+                "changed": n,
+                "ms": started.elapsed().as_millis(),
+                "message": format!("OK — {n} row(s) affected"),
+                "readonly": false,
+            }))
+            .into_response()
         }
-        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+fn sql_is_write(sql: &str) -> bool {
+    let without_comments = regex::Regex::new(r"(?s)--[^\n]*|/\*.*?\*/")
+        .expect("sql comment regex")
+        .replace_all(sql, "");
+    let first = without_comments
+        .trim_start()
+        .split(|ch: char| !ch.is_ascii_alphabetic())
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    !matches!(
+        first.as_str(),
+        "select" | "with" | "pragma" | "explain" | "values"
+    )
+}
+
+/// The workbench is a sandbox, not an alternate mutation API for Amux's own
+/// state.  Writes are opt-in and every identified target must be `wb_*`.
+fn sql_write_guard(sql: &str) -> Option<String> {
+    let target_re = regex::Regex::new(
+        r#"(?ix)\b(?:
+            insert\s+(?:or\s+\w+\s+)?into |
+            replace\s+into |
+            update |
+            delete\s+from |
+            create\s+(?:temp\s+|temporary\s+)?table(?:\s+if\s+not\s+exists)? |
+            drop\s+table(?:\s+if\s+exists)? |
+            alter\s+table |
+            create\s+index(?:\s+if\s+not\s+exists)?\s+\w+\s+on
+        )\s+["'`]?([A-Za-z_][A-Za-z0-9_]*)"#,
+    )
+    .expect("sql write target regex");
+    let targets: Vec<&str> = target_re
+        .captures_iter(sql)
+        .filter_map(|capture| capture.get(1).map(|found| found.as_str()))
+        .collect();
+    let mut bad: Vec<&str> = targets
+        .iter()
+        .copied()
+        .filter(|target| !target.to_ascii_lowercase().starts_with("wb_"))
+        .collect();
+    bad.sort_unstable();
+    bad.dedup();
+    if !bad.is_empty() {
+        return Some(format!(
+            "Write blocked: only tables named wb_* are writable (protects Amux state). Offending: {}",
+            bad.join(", ")
+        ));
+    }
+    if targets.is_empty() {
+        return Some(
+            "Write blocked: could not identify a wb_* target table. Workbench writes must target tables named wb_*."
+                .to_string(),
+        );
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sql_is_write, sql_write_guard};
+
+    #[test]
+    fn query_mode_distinguishes_reads_from_writes_after_comments() {
+        assert!(!sql_is_write("-- inspect\nSELECT * FROM issues"));
+        assert!(!sql_is_write(
+            "/* explain */ WITH x AS (SELECT 1) SELECT * FROM x"
+        ));
+        assert!(sql_is_write("UPDATE wb_notes SET value='x'"));
+    }
+
+    #[test]
+    fn writes_are_confined_to_workbench_tables() {
+        assert!(sql_write_guard("CREATE TABLE wb_notes(id INTEGER)").is_none());
+        assert!(sql_write_guard("INSERT INTO wb_notes VALUES (1)").is_none());
+        let blocked = sql_write_guard("UPDATE issues SET status='done'").unwrap();
+        assert!(blocked.contains("issues"), "{blocked}");
+        assert!(sql_write_guard("VACUUM")
+            .unwrap()
+            .contains("could not identify"));
     }
 }

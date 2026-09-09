@@ -269,6 +269,20 @@ else bad "(l) active debug artifacts must survive severe disk pressure" "$out8";
 # Recorded rather than deleted, because the next reader will be tempted to
 # "fix" this back to an exit-code test.)
 #
+# AMUX-134: "read the output, not the exit code" describes what the IF BELOW
+# does, not what this ASSIGNMENT does. `{ pgrep -x rustc; pgrep -x cargo; }`
+# exits 1 (from the last pgrep, per the note above) on the overwhelmingly
+# common "no real build running" host — under `pipefail` that 1 survives the
+# pipe into `tr`, and under this script's own `set -euo pipefail` a plain
+# assignment statement that ends nonzero kills the WHOLE SCRIPT right here,
+# silently (bash's own errexit trap leaves no trace beyond the EXIT trap
+# firing) — before the `if` below ever gets to read the output at all. Caught
+# 2026-09-07 (CI red, AMUX-134) because CI runners never have a stray cargo/
+# rustc process to accidentally mask it; this dev box does, most of the time,
+# which is exactly backwards from the host-dependence the comment above
+# already worried about. `|| true` makes "nothing found" the unremarkable
+# case it always was semantically, without changing what the `if` reads.
+#
 # The shipped detector consumes the output too, so it is unaffected either way.
 # `|| true` on EACH pgrep, because the STATUS IS IGNORED here: the decision below
 # reads the OUTPUT ($_real_builds being empty or not), never the exit code. On an
@@ -295,6 +309,8 @@ else
   out9=$(HOME="$h" AMUX_RS_BUILD_LOG="$h/build.log" AMUX_BUILD_MIN_FREE_GB=0 \
     AMUX_BUILD_SACRIFICE_CACHE_BELOW_GB=0 AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB=-1 \
     AMUX_CARGO_GUARD_TEST_FIXTURE= AMUX_RS_DISK_CLEAR_ONLY=1 bash "$SCRIPT" >/dev/null 2>&1; cat "$h/build.log" 2>/dev/null)
+  # A successfully killed decoy makes `wait` report its signal status. That is
+  # expected cleanup, not a harness failure under `set -e`.
   kill "$DECOY" 2>/dev/null; wait "$DECOY" 2>/dev/null || true
   # PROVE THE PROBE RAN before believing its negative (ethos rule 4). This cell
   # asserted only the ABSENCE of "DEFERRED", and a script that died before
@@ -304,8 +320,29 @@ else
   # the negative is the clear line itself.
   if printf '%s\n' "$out9" | grep -q "DEBUG ARTIFACTS"; then ok
   else bad "(m) the script must REACH the debug decision, not die before it" "$out9"; fi
+  # READ THE REASON, do not infer it from the symptom (AMUX-134 follow-up).
+  # This cell asserted "no DEFERRED at all" and blamed every deferral on the
+  # cargo mention. On a GitHub runner it fired for a different cause entirely:
+  #   {"verdict":"cargo_reclaim_deferred","measured":false,"n_considered":0,
+  #    "reason":"process executable unmeasured: pid 994"}
+  # That is the guard failing CLOSED on a process whose /proc/<pid>/exe it
+  # cannot read, which is deliberate and documented in process_executable's
+  # own docstring ("Truncated/custom names do not resolve and therefore
+  # continue to fail closed"). Correct behaviour, reported as the bug it is
+  # not, and it reddened `checks` on main and on every PR that merged main.
+  #
+  # So: an unmeasured PROBE is an environment limit, reported and not counted
+  # as a pass (ethos rule 4 -- do not read a negative from a probe that could
+  # not run). Any OTHER deferral still fails, which is the property this cell
+  # exists for.
   if printf '%s\n' "$out9" | grep -q "DEFERRED"; then
-    bad "(m) a command line that merely MENTIONS cargo must not read as a build" "$out9"
+    if printf '%s\n' "$out9" | grep -q "process executable unmeasured"; then
+      echo "SKIP (m): the process probe came back UNMEASURED on this host"
+      echo "         ($(printf '%s\n' "$out9" | grep -o 'process executable unmeasured: pid [0-9]*' | head -1)),"
+      echo "         so the cargo-mention property was NOT exercised. Not counted as a pass."
+    else
+      bad "(m) a command line that merely MENTIONS cargo must not read as a build" "$out9"
+    fi
   else ok; fi
 fi
 

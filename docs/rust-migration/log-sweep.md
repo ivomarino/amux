@@ -38,7 +38,18 @@ fallback when a finding needs row-level inspection.
    Pre-grouped error rows (status >= 400) by (status, method, family,
    normalized target — ids collapsed, `/api/board/AMUX-123` ->
    `/api/board/{id}`), each with count / first / last / distinct_clients and
-   one full sample row incl. `error_body`. 404/405 groups carry
+   one full sample row incl. `error_body`.
+
+   **`error_body` is in the TABLE but not in the raw `/api/logs` RESPONSE.**
+   `_amux_request_log` has an `error_body` column, and `row_to_event` does not
+   emit it: the JSON fields are `action`/`actor`/`detail`/`req`/`resp`/`target`,
+   and the path is `target`, not `path`. So the data exists and the deep-dive
+   endpoint does not hand it to you. So grepping the deep-dive rows for a
+   message you just read in `analyze` returns ZERO on a window that certainly
+   contains it, and a zero there reads as "not happening" rather than "wrong
+   field". Measured 2026-09-09: 26 rows at `min_status=500`, every one of them a
+   pool timeout per `analyze`, and 0 of 26 matching a grep for the body text.
+   Use `analyze` for WHAT the error said and the raw rows for WHEN it happened. 404/405 groups carry
    `routed_methods` (what IS mounted at that path, from the ROUTE_TABLE) and
    404s carry `nearest_routes`; the response ends with `verdicts` — a computed
    one-liner per 405 group that already states the conclusion (not routed /
@@ -175,7 +186,13 @@ fallback when a finding needs row-level inspection.
 
 4. **401/403 spikes by client IP.**
    `GET /api/logs?since=$SINCE&min_status=401&limit=2000`, keep status 401/403,
-   group by `ip`. Finding = any non-loopback IP with a burst (>20/day), or a
+   group by `ip`. **`&ip=<addr>` is now a real filter** (added 2026-09-09) — use
+   it to pull one client's whole history once the grouping names a suspect,
+   which is what answers "has it recovered" rather than "is it failing now".
+   It did not exist during the 2026-09-09 sweep and returned
+   `ignored_params: ["ip"]` with `total_matched` = the whole log (222,564 rows
+   under one address's name), which is the AF-521 shape: check `ignored_params`
+   before believing any per-client number. Finding = any non-loopback IP with a burst (>20/day), or a
    loopback caller failing auth repeatedly (a broken token on a lane).
 
    **403 is not only an auth code here.** amux uses it for POLICY refusals too, so

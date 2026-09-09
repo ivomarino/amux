@@ -900,10 +900,15 @@ async fn identity(headers: axum::http::HeaderMap) -> axum::Json<serde_json::Valu
     // python answers before its first validation — null/"" — rather than
     // inventing a verdict (Invariant 20: never invent state).
     let is_local_member = org::is_verified_local_member(&headers);
+    let access_scope = org::local_member_scope(&headers)
+        .map(|scope| serde_json::json!({"level": scope.level(), "name": scope.name()}));
+    let team = org::local_member_team(&headers);
     axum::Json(serde_json::json!({
         "email": email,
         "is_cloud": !email.is_empty() && !is_local_member,
         "is_local_member": is_local_member,
+        "access_scope": access_scope,
+        "team": team,
         "has_api_key": has_key_in_env || has_oauth || has_proxy,
         "has_oauth": has_oauth,
         "managed_upstream": has_proxy,

@@ -54,9 +54,16 @@ pub fn routes() -> Router<AppState> {
             get(list_session_gates).patch(patch_session_gates),
         )
         .route("/contract", get(get_contract))
+        // Static /derived outranks /{id}. Computed display status from durable
+        // facts, never stored (AO architecture: display status is derived at
+        // read time).
+        .route("/derived", get(derived_board))
         // Static /ready outranks /{id}. The read side of the dependency graph
         // (AMUX-3948) — READY is a query, never a stored status.
         .route("/ready", get(ready_frontier))
+        // CDC catch-up: lets clients replay missed board mutations after a
+        // reconnect, keyed by the seq cursor from board_change_log.
+        .route("/changes", get(board_changes))
         // Static /bulk-migrate outranks /{id}. Moving a whole column at once
         // (AMUX-4044) — a single write transaction, because backlog alone
         // holds 489 live cards and 489 sequential PATCHes is minutes of load.
@@ -330,6 +337,143 @@ pub const QUEUE_DISPOSITION_CREATOR: &str = "queue-disposition";
 /// How many needsyou cards the owner view shows before hiding the rest.
 const NEEDSYOU_VIEW_CAP: usize = 10;
 
+// ---- GET /api/board/derived -----------------------------------------------
+
+/// Derived display status from durable facts.
+///
+/// The stored `status` is the lifecycle position a worker set. The `display_status`
+/// is what a human triaging the board should see, computed from timestamps, session
+/// liveness, evidence, and dependency state. This endpoint returns the board with
+/// both, so the dashboard can group by either.
+///
+/// Rules (in priority order; first match wins):
+///   1. status=needsyou AND entered_state_at older than 14 days: "aged-needsyou"
+///   2. status=doing AND assigned session is not active for >1h: "stalled"
+///   3. source=capture AND status=todo AND age > 72h AND no log activity: "stale"
+///   4. status=done AND evidence IS NOT NULL: "verified-candidate"
+///   5. depends_on non-empty AND all resolved: "unblocked"
+///   6. otherwise: the stored status itself
+async fn derived_board(State(state): State<AppState>) -> Response {
+    let store = state.store.clone();
+    let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = store.read()?;
+        let rows =
+            bs::list_issues(&conn, &[], &[], ArchivedFilter::ActiveOnly)?;
+        let working =
+            crate::api::sessions_legacy::active_python_sessions(&conn);
+        let now = now_secs();
+
+        let mut items: Vec<Value> = Vec::with_capacity(rows.len());
+        let mut counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+
+        for r in &rows {
+            let display = derive_display_status(r, now, &working, &conn);
+            *counts.entry(display.clone()).or_default() += 1;
+            let mut v = list_body(r, true, is_stale(r, now, &working));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("display_status".into(), json!(display));
+            }
+            items.push(v);
+        }
+
+        Ok((items, counts))
+    })
+    .await;
+    let (items, counts) = match joined {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return internal(e),
+        Err(e) => return internal(e),
+    };
+    Json(crate::api::measured::measured(
+        json!({
+            "items": items,
+            "counts": counts,
+            "total": items.len(),
+            "note": "display_status is computed from durable facts, never stored. \
+                     Rules: aged-needsyou (>14d), stalled (doing + session idle >1h), \
+                     stale (auto-captured todo >72h, no log), verified-candidate \
+                     (done + evidence), unblocked (all deps resolved). Otherwise \
+                     the stored status.",
+        }),
+        items.len(),
+    ))
+    .into_response()
+}
+
+fn derive_display_status(
+    row: &IssueRow,
+    now: i64,
+    working: &std::collections::BTreeSet<String>,
+    conn: &Connection,
+) -> String {
+    let status = row.status.as_str();
+    let age_secs = now - row.created;
+
+    // 1. Aged needsyou: status=needsyou and sitting longer than 14 days.
+    if status == "needsyou" {
+        let in_state_secs = row
+            .entered_state_at
+            .map(|t| now - t)
+            .unwrap_or(age_secs);
+        if in_state_secs > 14 * 86_400 {
+            return "aged-needsyou".into();
+        }
+    }
+
+    // 2. Stalled: status=doing but the assigned session is not active.
+    if status == "doing" {
+        if let Some(sess) = row.session.as_deref().filter(|s| !s.is_empty()) {
+            let idle_secs = now - row.updated;
+            if idle_secs > 3600 && !working.contains(sess) {
+                return "stalled".into();
+            }
+        }
+    }
+
+    // 3. Stale autofix/capture: auto-captured todo older than 72h with no log.
+    if status == "todo" {
+        let is_auto = row
+            .source
+            .as_deref()
+            .is_some_and(|s| s == "capture" || s == "autofix");
+        let no_activity = row
+            .log
+            .as_deref()
+            .map(|l| l.trim().is_empty())
+            .unwrap_or(true);
+        if is_auto && age_secs > 72 * 3600 && no_activity {
+            return "stale".into();
+        }
+    }
+
+    // 4. Verified candidate: done with evidence recorded.
+    if status == "done" && row.evidence.is_some() {
+        return "verified-candidate".into();
+    }
+
+    // 5. Unblocked: has dependencies and all are resolved (done/verified/discarded).
+    if !row.depends_on.is_empty() && matches!(status, "todo" | "backlog" | "doing") {
+        let all_resolved = row.depends_on.iter().all(|dep_id| {
+            bs::get_issue(conn, dep_id)
+                .ok()
+                .flatten()
+                .is_some_and(|dep| {
+                    matches!(
+                        dep.status.as_str(),
+                        "done" | "verified" | "discarded"
+                    )
+                })
+        });
+        if all_resolved {
+            return "unblocked".into();
+        }
+    }
+
+    // 6. Passthrough: the stored status.
+    status.to_string()
+}
+
 /// Why a candidate is NOT on the ready frontier, or `None` if it is ready.
 ///
 /// EXTRACTED so a test can drive it (AMUX-3949). The first version of this logic
@@ -584,6 +728,50 @@ async fn ready_frontier(
         },
     });
     Json(crate::api::measured::measured(body, n_considered)).into_response()
+}
+
+/// CDC catch-up: returns board_change_log rows after a given seq.
+/// Clients call this after an SSE reconnect to replay missed mutations.
+async fn board_changes(
+    State(state): State<AppState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let since_seq: i64 = q
+        .get("since_seq")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let limit: usize = q
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500)
+        .clamp(1, 5000);
+
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "db read failed"})),
+            )
+                .into_response();
+        }
+    };
+
+    match crate::runtime_jobs::cdc_poller::changes_since(&conn, since_seq, limit) {
+        Ok(rows) => {
+            let cursor = crate::runtime_jobs::cdc_poller::last_seq();
+            Json(json!({
+                "changes": rows,
+                "cursor": cursor,
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("query failed: {e}")})),
+        )
+            .into_response(),
+    }
 }
 
 /// (considered, moved, refused) carried out of the bulk-migrate write closure,
@@ -1703,6 +1891,18 @@ fn err(status: StatusCode, body: Value) -> Response {
     (status, Json(body)).into_response()
 }
 
+fn scoped_board_forbidden(scope: &super::org::MemberScope, resource: &str) -> Response {
+    err(
+        StatusCode::FORBIDDEN,
+        json!({
+            "error": "outside local member access scope",
+            "scope_level": scope.level(),
+            "scope_name": scope.name(),
+            "resource": resource,
+        }),
+    )
+}
+
 use super::internal;
 
 fn not_found(id: &str) -> Response {
@@ -1811,7 +2011,17 @@ fn fold_capture_for_worker_card(
         &AdvanceOpts {
             force: true,
             expected_from: Some("doing".into()),
-            log_line: Some(format!("capture folded into {}", new.id)),
+            // AF-616: THIS PATH GUESSED THE TARGET, so say so. The query
+            // below picks the most recent unclaimed capture for the lane, which
+            // means "the first card since the message" and not "this card is
+            // about that message". The declared path (`--folded-into`, where a
+            // lane names its own target) writes the same line WITHOUT this
+            // marker, so a reader can tell an assertion from an inference.
+            log_line: Some(format!(
+                "capture folded into {} {}",
+                new.id,
+                bs::FOLD_INFERRED_MARKER
+            )),
             skip_continuation: true,
             ..AdvanceOpts::default()
         },
@@ -1894,7 +2104,9 @@ fn hhmm() -> String {
 /// fixes every already-installed CLI copy at once, and closes both effects
 /// together, whereas patching curl lines fixes only the machines that upgrade.
 fn actor_from_headers(headers: &HeaderMap) -> (Actor, String) {
-    match Some(crate::api::groups::hdr_worker(headers))
+    match super::org::local_member_actor(headers)
+        .map(str::to_string)
+        .or_else(|| Some(crate::api::groups::hdr_worker(headers)))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
     {
@@ -2135,9 +2347,39 @@ pub(crate) async fn dispatch_pending_callbacks(
             .as_deref()
             .or(row.evidence.as_deref())
             .unwrap_or("The complete action log and produced assets are on the task card.");
-        let resolution = if bs::dependency_is_resolved(&row.status, &row.item_type) {
+        // A FOLD IS NOT AN ABANDONMENT. `capture folded into <ID>` means the
+        // lane did the right thing: amux auto-captured an inbound routed
+        // message as a card, they carded the real work properly, and discarded
+        // the empty shell. Telling the ROUTING lane that their peer "closed the
+        // request without resolving the dependency" puts a false accusation in
+        // front of the one party who will act on it.
+        let folded = bs::folded_into_detail(row.log.as_deref());
+        let folded_note;
+        let resolution = if let Some((target, inferred)) = folded.as_ref() {
+            // AF-616: an INFERRED target was chosen by adjacency and nothing
+            // compared it to the capture. Saying so costs one clause and is the
+            // difference between a fact and a guess for the lane reading this.
+            folded_note = if *inferred {
+                format!(
+                    "folded this capture into {target} (target inferred from timing, \
+                     not declared — confirm it is about the capture)"
+                )
+            } else {
+                format!("folded this capture into {target}")
+            };
+            folded_note.as_str()
+        } else if bs::dependency_is_resolved(&row.status, &row.item_type) {
             "resolved the dependency"
-        } else { "closed the request without resolving the dependency" };
+        } else if bs::is_capture_shell(&row) && row.status == "discarded" {
+            // AF-634. The reader of this sentence is the SENDER of a message,
+            // and "closed the request without resolving the dependency" tells
+            // them a request they never made was dropped. ts-gke received 19 of
+            // these in a night and nearly enumerated all of them before seeing
+            // the shape. Nothing about DELIVERY changes here; only the claim.
+            "discarded the capture of a message you sent, which is not a request and owed you nothing"
+        } else {
+            "closed the request without resolving the dependency"
+        };
         let mut prompt = format!(
             "[task callback {}: {}] {} {}. \
              State: {}.\nOutcome: {}\nOpen board card {} for verification evidence, action history, \
@@ -2987,6 +3229,7 @@ pub struct ExportParams {
 
 pub async fn export_board(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(p): Query<ExportParams>,
 ) -> Response {
     let conn = match state.store.read() {
@@ -2998,11 +3241,22 @@ pub async fn export_board(
         .as_deref()
         .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
         .unwrap_or_default();
-    let workers: Vec<String> = p
+    let mut workers: Vec<String> = p
         .worker
         .as_deref()
         .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
         .unwrap_or_default();
+    if let Some(scope) = super::org::local_member_scope(&headers).filter(|scope| !scope.is_global()) {
+        if workers.iter().any(|worker| !scope.allows_worker(worker)) {
+            return scoped_board_forbidden(&scope, "board export");
+        }
+        if workers.is_empty() {
+            workers = super::org::scoped_worker_names(&scope);
+            if workers.is_empty() {
+                workers.push("__amux_no_permitted_worker__".into());
+            }
+        }
+    }
     // Default ActiveOnly: an export is a working document, and silently
     // including archived cards would overstate the board. `archived=all`
     // opts in, and the header below always says which was used.
@@ -3157,7 +3411,18 @@ pub async fn list_board(
     }
     // ETag based on global_rev — saves 3.5MB on unchanged polls.
     let rev = state.store.current_rev().map(|r| r.0).unwrap_or(0);
-    let etag_val = format!("\"board-{}\"", rev);
+    let member_scope = super::org::local_member_scope(&headers);
+    let scope_etag = member_scope
+        .as_ref()
+        .map(|scope| {
+            use sha2::Digest as _;
+            let digest = sha2::Sha256::digest(
+                format!("{}\0{}", scope.level(), scope.name()).as_bytes(),
+            );
+            format!("-{}", &hex::encode(digest)[..12])
+        })
+        .unwrap_or_default();
+    let etag_val = format!("\"board-{}{scope_etag}\"", rev);
     if let Some(inm) = headers.get("if-none-match").and_then(|v| v.to_str().ok()) {
         if inm == etag_val || inm == format!("W/{etag_val}") {
             let mut h = HeaderMap::new();
@@ -3193,7 +3458,20 @@ pub async fn list_board(
             .collect()
     };
     let status_f = split(&p.status);
-    let session_f = split(&p.session);
+    let mut session_f = split(&p.session);
+    if let Some(scope) = member_scope.as_ref().filter(|scope| !scope.is_global()) {
+        if session_f.iter().any(|worker| !scope.allows_worker(worker)) {
+            return scoped_board_forbidden(scope, "board list");
+        }
+        if session_f.is_empty() {
+            session_f = super::org::scoped_worker_names(scope);
+            if session_f.is_empty() {
+                // An empty SQL filter means "all sessions", so use an
+                // impossible sentinel when a group currently has no workers.
+                session_f.push("__amux_no_permitted_worker__".into());
+            }
+        }
+    }
     // `archived` grammar (amux-server.py:68758 + 14025, ported on AMUX-2586 fix #5):
     //   "1"/"true"/"yes"          -> archived-only
     //   any OTHER non-empty value -> non-archived only ("0", "false", "all", "2", ...)
@@ -3868,17 +4146,24 @@ pub async fn create_item(
     // present, the card is for the sender's own lane. An EXPLICIT value —
     // including explicit "" / null for a deliberately unassigned card — is
     // always respected.
-    let (_, hdr_name) = actor_from_headers(&headers);
-    let hdr_session = if hdr_name == "api-anonymous" {
+    let (_, actor_name) = actor_from_headers(&headers);
+    let hdr_session = if actor_name == "api-anonymous"
+        || super::org::is_verified_local_member(&headers)
+    {
         String::new()
     } else {
-        hdr_name.clone()
+        actor_name.clone()
     };
     let session = if map.contains_key("session") {
         body_str(&map, "session").unwrap_or_default().trim().to_string()
     } else {
         hdr_session.chars().take(64).collect()
     };
+    if let Some(scope) = super::org::local_member_scope(&headers).filter(|scope| !scope.is_global()) {
+        if session.is_empty() || !scope.allows_worker(&session) {
+            return scoped_board_forbidden(&scope, if session.is_empty() { "unassigned card" } else { &session });
+        }
+    }
     if !hdr_session.is_empty() && session != hdr_session {
         tracing::warn!(
             caller = %hdr_session,
@@ -4008,11 +4293,17 @@ pub async fn create_item(
     // Creator attribution (AMUX-1812): the body value is a self-reported
     // CLAIM; the verified header wins, and a disagreement is recorded.
     let claimed = body_str(&map, "creator").unwrap_or_default().trim().to_string();
-    let creator = match (&hdr_session.is_empty(), claimed.is_empty()) {
-        (false, false) if hdr_session != claimed => format!("{hdr_session} (claimed {claimed})"),
-        (false, _) => hdr_session.clone(),
-        (true, false) => claimed,
-        (true, true) => String::new(),
+    let verified_creator = (actor_name != "api-anonymous").then_some(actor_name.as_str());
+    let creator = match (verified_creator, claimed.is_empty()) {
+        // A local member's author is derived from the verified invite cookie.
+        // Old dashboard clients still send a device-name `creator`; retaining
+        // that self-reported value would make the same person appear under a
+        // different author on every device and would allow deliberate spoofing.
+        (Some(author), _) if super::org::is_verified_local_member(&headers) => author.to_string(),
+        (Some(author), false) if author != claimed => format!("{author} (claimed {claimed})"),
+        (Some(author), _) => author.to_string(),
+        (None, false) => claimed,
+        (None, true) => String::new(),
     };
 
     let owner_type = match body_str(&map, "owner_type").as_deref() {
@@ -4453,9 +4744,14 @@ mod task_asset_resolution_tests {
     }
 }
 
-pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+pub async fn get_item(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
     let store = state.store.clone();
     let key = id.clone();
+    let member_scope = super::org::local_member_scope(&headers).filter(|scope| !scope.is_global());
     let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = store.read()?;
         let Some(row) = bs::get_issue(&conn, &key)? else {
@@ -4472,6 +4768,14 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
         let children = child_ids
             .iter()
             .filter_map(|child| bs::get_issue(&conn, child).ok().flatten())
+            .filter(|child| {
+                member_scope.as_ref().is_none_or(|scope| {
+                    child
+                        .session
+                        .as_deref()
+                        .is_some_and(|worker| scope.allows_worker(worker))
+                })
+            })
             .map(|child| {
                 json!({
                     "id": child.id,
@@ -4491,7 +4795,14 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
         // A child inherits the source message of its epic for display, while
         // cmd_history.card_id itself remains attached to the root epic. That
         // keeps the Messages chip stable from prompt through completion.
-        let message_root = row.epic.as_deref().unwrap_or(&row.id);
+        // A child normally inherits its epic's prompt. For a scoped member,
+        // crossing that parent boundary could reveal a prompt on a card they
+        // cannot open, so only use the directly-authorized card as the root.
+        let message_root = if member_scope.is_some() {
+            &row.id
+        } else {
+            row.epic.as_deref().unwrap_or(&row.id)
+        };
         let mut messages = Vec::new();
         let mut msg_stmt = conn.prepare(
             "SELECT id,text,type,session,ts,origin,card_id FROM cmd_history \
@@ -6873,7 +7184,11 @@ fn discarded_by_refusal(map: &serde_json::Map<String, Value>) -> Vec<String> {
         .filter(|k| k.as_str() != "status")
         .filter(|k| {
             PATCH_WRITABLE.contains(&k.as_str())
-                || matches!(k.as_str(), "desc_append" | "callback")
+                // `folded_into` joins them: it carries CONTENT (the server
+                // writes a log line from it) and a caller who is told nothing
+                // changed cannot tell a registered fold from an ignored field,
+                // which is the failure this whole thread is about.
+                || matches!(k.as_str(), "desc_append" | "callback" | "folded_into")
         })
         .cloned()
         .collect();
@@ -6980,6 +7295,130 @@ mod af413_discarded_tests {
                             "force": true, "reason": "why"})).is_empty());
     }
 
+    /// A gate refusal must not send the reader after a lever that cannot move.
+    ///
+    /// AF-586, tubescience: four forced closes in one day on a lane whose
+    /// WORKER-scope done gate is ["Implemented and merged", "Tests / lint pass",
+    /// "Peer reviewed"], applied to research and ops cards. One refusal site
+    /// branched on retype_would_help(); the other hardcoded "fix the type" for
+    /// everyone, so the caller retyped, got the identical refusal, and was left
+    /// with --force.
+    #[test]
+    fn a_refusal_only_blames_the_type_when_the_type_is_the_lever() {
+        use crate::db::board_store::GateSource;
+
+        // The one case where retyping IS the fix.
+        let from_type = retype_hint_for(Some(&GateSource::TypeDefault));
+        assert!(from_type.contains("the TYPE is wrong"), "{from_type}");
+
+        // Every scope that IGNORES the type must say so instead, and must not
+        // tell the reader to retype.
+        for src in [
+            GateSource::Worker("tubescience".into()),
+            GateSource::Group("amux".into()),
+            GateSource::Column,
+            GateSource::Card,
+        ] {
+            let hint = retype_hint_for(Some(&src));
+            assert_ne!(hint, from_type, "{src:?} must not get the type-default advice");
+            assert!(
+                !hint.contains("the TYPE is wrong"),
+                "{src:?} names a lever that cannot move: {hint}"
+            );
+        }
+
+        // The three that are scoped ALSO say retyping will not help, in words.
+        for src in [
+            GateSource::Worker("tubescience".into()),
+            GateSource::Group("amux".into()),
+            GateSource::Column,
+        ] {
+            let hint = retype_hint_for(Some(&src));
+            assert!(
+                hint.to_lowercase().contains("retyping will not change it"),
+                "{src:?} should say retyping will not change it: {hint}"
+            );
+        }
+
+        // CONTROL. With no resolved source we cannot claim the type is not the
+        // lever either, so the default advice stands. Without this, returning
+        // the scoped explanation unconditionally would pass everything above.
+        assert_eq!(retype_hint_for(None), from_type);
+    }
+
+    /// `folded_into` is a control key and must be listed, or a hand-rolled fold
+    /// lands in `ignored_fields` and the caller is told nothing changed while
+    /// the summary keeps rendering the four not-recorded clauses.
+    /// NO RUN OF SPACES IN ANY CALLBACK SENTENCE. Second instance of this
+    /// class in three cards, which is why the guard is over the REGION and not
+    /// over one literal.
+    ///
+    /// Rust joins a string across lines with a trailing backslash. Drop it and
+    /// the source still compiles, the compiler says nothing, and the sentence
+    /// renders with the indentation baked in. AF-621 shipped
+    /// "the          condition" into a CLI help surface; AF-634 then shipped
+    /// "not a request              and owed you nothing" into the terminal
+    /// callback, and I only saw it because a peer's discard notice came back to
+    /// me with the gap in it. A test scoped to one function did not generalise,
+    /// so this one reads every literal in the block that builds the callback.
+    #[test]
+    fn no_callback_sentence_renders_a_run_of_spaces() {
+        let src = include_str!("board.rs");
+        let start = src
+            .find("let folded = bs::folded_into_detail(")
+            .expect("the callback text block exists");
+        let end = src[start..]
+            .find("let guard = format!(\"task-callback:")
+            .expect("the block ends at the delivery guard")
+            + start;
+        let block = &src[start..end];
+
+        // APPLY RUST'S OWN CONTINUATION RULE FIRST. A backslash at end of line
+        // eats the newline AND the next line's leading whitespace, so the raw
+        // source of a CORRECTLY continued literal is full of spaces that never
+        // reach the reader. Checking the raw text flags every well-formed
+        // multi-line string, which is what the first cut of this test did.
+        let strip_continuations = |lit: &str| -> String {
+            let mut out = String::new();
+            let mut rest = lit;
+            while let Some(i) = rest.find("\\\n") {
+                out.push_str(&rest[..i]);
+                rest = rest[i + 2..].trim_start_matches([' ', '\t']);
+            }
+            out.push_str(rest);
+            out
+        };
+        let mut offenders: Vec<String> = Vec::new();
+        for lit in block.split('"').skip(1).step_by(2) {
+            let rendered = strip_continuations(lit);
+            if rendered.contains("   ") {
+                offenders.push(rendered.chars().take(90).collect());
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a dropped line-continuation leaves the indentation in the rendered \
+             sentence: {offenders:?}"
+        );
+
+        // POSITIVE CONTROL: the scrape must actually be reading literals. Without
+        // it, a `find` that silently matched nothing gives an empty block and an
+        // empty offender list, which is the most reassuring output a dead check
+        // can produce.
+        let lits = block.split('"').skip(1).step_by(2).count();
+        assert!(
+            lits >= 5,
+            "only {lits} literal(s) scanned; the block moved and this check is blind"
+        );
+    }
+
+    #[test]
+    fn folded_into_is_a_control_key_and_not_a_writable_column() {
+        assert!(!PATCH_WRITABLE.contains(&"folded_into"), "it names no column");
+        assert!(PATCH_CONTROL.contains(&"folded_into"), "and it must not be ignored");
+        assert_eq!(keys(json!({"status": "discarded", "folded_into": "MS-1370"})), ["folded_into"]);
+    }
+
     /// ...except `desc_append`, the one control key that carries CONTENT. It is
     /// the sanctioned way to add to a card someone else is also writing, so
     /// dropping an append silently is the same loss as dropping a desc.
@@ -6997,7 +7436,11 @@ mod af413_discarded_tests {
     }
 }
 
-const PATCH_CONTROL: [&str; 10] = [
+const PATCH_CONTROL: [&str; 11] = [
+    // The lane ASSERTS that this card was folded into another. It is not read
+    // from prose: the caller names the target and the SERVER writes the
+    // canonical `capture folded into <ID>` line that `folded_into()` parses.
+    "folded_into",
     "expect_rev",
     "gate_ack",
     "gate_checked",
@@ -7583,6 +8026,33 @@ pub(crate) fn desc_replace_destroys_peer_prose(
     !lines.any(|l| new.contains(l))
 }
 
+/// The "is the TYPE the lever?" hint for a gate refusal, in ONE place.
+///
+/// Retyping only changes the gate when the gate CAME from the type. A worker-,
+/// group-, column- or card-scoped gate ignores the type entirely, so telling
+/// that caller to fix the type names a lever that cannot move: they retype, get
+/// the identical refusal, and are left with --force.
+///
+/// It lives here because two refusal sites answered this question differently.
+/// One branched on `GateSource::retype_would_help()`; the other hardcoded "the
+/// TYPE is wrong, fix the type" for every caller. tubescience hit the second on
+/// 2026-09-08, four forced closes in one day on a lane whose WORKER-scope done
+/// gate is ["Implemented and merged", "Tests / lint pass", "Peer reviewed"],
+/// applied to research and ops cards (AF-586). Two copies of one rule is how
+/// they came apart, so there is one copy now.
+///
+/// Whether those criteria SHOULD apply to a research card is a separate and
+/// still-open decision. This only stops a refusal sending the reader after a fix
+/// that cannot work.
+pub(crate) fn retype_hint_for(gate_source: Option<&bs::GateSource>) -> String {
+    match gate_source {
+        Some(src) if !src.retype_would_help() => src.explain(),
+        _ => "If these criteria don't fit the work, the TYPE is wrong, so fix the type \
+              rather than the truth."
+            .to_string(),
+    }
+}
+
 pub async fn patch_item(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -7595,6 +8065,17 @@ pub async fn patch_item(
             json!({ "error": "body must be a JSON object" }),
         );
     };
+    if let Some(scope) = super::org::local_member_scope(&headers).filter(|scope| !scope.is_global()) {
+        if map.contains_key("session") {
+            let target = body_str(&map, "session").unwrap_or_default();
+            if target.is_empty() || !scope.allows_worker(&target) {
+                return scoped_board_forbidden(
+                    &scope,
+                    if target.is_empty() { "unassigned card" } else { &target },
+                );
+            }
+        }
+    }
     // AF-413: computed HERE, before `map` moves into the write closure, because
     // the refusal that needs it is built inside that closure and answered after
     // it. Cheap (a key scan) and unconditional: a value only read on the refusal
@@ -7665,7 +8146,9 @@ pub async fn patch_item(
     let force_actor = actor_name.clone();
     // Python `_hdr_worker`: "" when the header is absent — the cross-lane
     // archive guard only fires for a NAMED caller (AMUX-2492).
-    let caller_lane = if actor_name == "api-anonymous" {
+    let caller_lane = if actor_name == "api-anonymous"
+        || super::org::is_verified_local_member(&headers)
+    {
         String::new()
     } else {
         actor_name.clone()
@@ -7808,6 +8291,46 @@ pub async fn patch_item(
                     }
                 }
             };
+            // A HAND-ROLLED FOLD MUST BE AS READABLE AS A PEER-DRIVEN ONE.
+            //
+            // b3db93fd taught the terminal summary and the task callback to
+            // recognise a fold, by reading the `capture folded into <ID>` line
+            // that the peer-fold path writes. mixpeek-frustrations then measured
+            // the gap that leaves, on their own cards:
+            //
+            //   MS-1369  discarded   server fold line present: True
+            //   SP-713   discarded   present: True
+            //   MF-888   discarded   present: FALSE
+            //   MF-890   discarded   present: FALSE
+            //   MF-893   discarded   present: FALSE
+            //
+            // The last three were folded BY HAND (`board progress` then `board
+            // discard`), which authors no such line, so they still rendered with
+            // the four not-recorded clauses this fix exists to remove. The
+            // predicate was right and its input was not always written.
+            //
+            // So the caller names the target and the server writes the line.
+            // That is an assertion a lane makes about its OWN action, which is
+            // categorically different from inferring a fold out of a free-text
+            // progress note — the classifier both reporters explicitly ruled
+            // out, because guessing intent from prose fails open in the
+            // expensive direction.
+            if let Some(target) = body_str(&map, "folded_into")
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+            {
+                // A card folded into ITSELF is nonsense and would make the
+                // summary point at the shell the reader is already looking at.
+                if target != next.id {
+                    let old_log = next.log.as_deref().unwrap_or("").trim_end().to_string();
+                    let line = format!("capture folded into {target}");
+                    next.log = Some(if old_log.is_empty() {
+                        line
+                    } else {
+                        format!("{old_log}\n{line}")
+                    });
+                }
+            }
             // Nullable epoch seconds. An explicit null CLEARS (re-arming a
             // trigger for re-verification); absent leaves it alone.
             if let Some(v) = map.get("last_verified_at") {
@@ -8737,6 +9260,80 @@ pub async fn patch_item(
                     };
                     let force = map.get("force").and_then(Value::as_bool).unwrap_or(false);
                     let reason = body_str(&map, "reason").unwrap_or_default();
+                    // A CAPTURE IS AN ENVELOPE, NOT A PARKABLE UNIT OF WORK
+                    // (MR-174, mvs-research, 2026-09-09).
+                    //
+                    // The server already has exactly three honest exits for an
+                    // auto-captured prompt: discard it when it is not work,
+                    // reshape its body into one self-contained task, or
+                    // decompose it atomically into an epic and ordered children.
+                    // The board-drive nudge teaches those exits and exempts the
+                    // untouched envelope from WIP for the same reason. The PATCH
+                    // transition path nevertheless allowed a fourth exit:
+                    // `doing -> backlog` (or `todo`) while the body was still
+                    // the captured prompt.
+                    //
+                    // MR-174 walked that hole exactly. `status-update` claimed
+                    // the direct human command as doing, the worker recorded a
+                    // material status and an artifact, then the same command
+                    // envelope moved back to backlog with a 14-day revisit and
+                    // a prose trigger. The Messages link and history were all
+                    // correct; the current board still erased the active-work
+                    // disposition and the drive loop quite correctly treated
+                    // the fresh trigger as parked. That is a state-machine
+                    // contradiction, not a polling problem.
+                    //
+                    // Refuse only the retreat of an UNRESHAPED capture. A real
+                    // task whose author rewrites `desc` in this same atomic
+                    // PATCH no longer matches `is_capture_shell` and may be
+                    // parked normally. New captures may still start in backlog,
+                    // terminal dispositions still work, and an attributed,
+                    // reasoned force remains the audited escape. This improves
+                    // with the model: it requires the model to make the semantic
+                    // judgment the harness cannot make, then preserves it.
+                    if from == TaskStatus::Doing
+                        && matches!(target, TaskStatus::Backlog | TaskStatus::Todo)
+                        && bs::is_capture_shell(&next)
+                        && !force
+                    {
+                        tracing::warn!(
+                            target: "amux::board",
+                            marker = "capture_requeue_refused",
+                            card = %next.id,
+                            worker = %next.session.as_deref().unwrap_or("-"),
+                            actor = %actor_name,
+                            from = %next.status,
+                            to = %bs::db_status_spelling(target),
+                            measured = true,
+                            "worked capture envelope refused requeue without a semantic disposition"
+                        );
+                        return finish(
+                            &slot_w,
+                            PatchOut::Refused(
+                                StatusCode::CONFLICT,
+                                json!({
+                                    "error": "captured command requires a disposition before requeue",
+                                    "code": "capture_requeue_requires_disposition",
+                                    "ok": false,
+                                    "blocked": true,
+                                    "measured": true,
+                                    "item": next.id,
+                                    "attempted_status": bs::db_status_spelling(target),
+                                    "preserved_status": next.status,
+                                    "why": "This card is still the auto-captured human command envelope. It was already claimed as active work; putting the unchanged envelope back in a queue loses the command's disposition and makes completed, delegated, and blocked work indistinguishable.",
+                                    "how_to_fix": {
+                                        "not_work": format!("amux board discard {} --outcome-stdin", next.id),
+                                        "one_task": format!("amux board retitle {} \"<standalone task title>\" --desc-stdin", next.id),
+                                        "several_tasks": format!("amux board decompose {} --stdin", next.id),
+                                        "work_finished": "move the envelope to review/done with its outcome and evidence",
+                                        "still_actively_working": "leave it in doing and post status/next_action/unresolved",
+                                        "audited_escape": format!("amux board {} {} --force \"<why the capture itself must be requeued>\"", bs::db_status_spelling(target), next.id),
+                                    },
+                                }),
+                            ),
+                            no_write(),
+                        );
+                    }
                     // ONE-DOING-PER-SESSION (AMUX-1707 parity). Python's WIP
                     // filters verbatim: archived cards and dormant types
                     // (tripwire/watch) do not hold WIP — both were real
@@ -9480,6 +10077,29 @@ pub async fn patch_item(
                                 })
                                 .collect();
                             if !missing.is_empty() {
+                                // ASK THE SAME QUESTION THE SIBLING SITE ASKS (AF-586).
+                                //
+                                // This refusal told every caller "the TYPE is wrong, fix the
+                                // type" unconditionally, which is only true when the gate came
+                                // FROM the type. A worker-, group- or column-scoped gate ignores
+                                // the type, so the advice names a lever that cannot move: the
+                                // caller retypes, gets the identical refusal, and is left with
+                                // --force.
+                                //
+                                // Reported by tubescience 2026-09-08, four forced closes in one
+                                // day on a lane whose WORKER-scope done gate is ["Implemented and
+                                // merged", "Tests / lint pass", "Peer reviewed"], applied to
+                                // research and ops cards. GateSource::retype_would_help() exists
+                                // for exactly this question and the other refusal site already
+                                // calls it; this one never did.
+                                //
+                                // Whether those criteria SHOULD apply to a research card is a
+                                // separate decision and still open. This only stops the refusal
+                                // sending the reader after a fix that cannot work.
+                                //
+                                // Bound before the json! because a `match` used as a macro value
+                                // breaks its delimiter parsing.
+                                let retype_hint = retype_hint_for(gate_src.as_ref());
                                 return finish(
                                     &slot_w,
                                     PatchOut::Refused(
@@ -9499,7 +10119,7 @@ pub async fn patch_item(
                                                 "or_gate_ack": true,
                                                 "or_force": "true (explicit bypass; logged)",
                                                 "contract": format!("GET /api/board/contract?card={} (the RESOLVED gate for this card — the bare contract lists only type defaults, AF-112)", next.id),
-                                                "wrong_type?": "If these criteria don't fit the work, the TYPE is wrong — fix the type, not the truth.",
+                                                "wrong_type?": retype_hint,
                                             },
                                         }),
                                     ),
@@ -10653,6 +11273,172 @@ pub async fn patch_item(
             }
             (StatusCode::OK, Json(body)).into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod capture_requeue_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::HeaderValue;
+
+    fn fixture() -> (AppState, crate::db::SharedStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            crate::db::Store::open(&dir.path().join("capture-requeue.db"))
+                .expect("open store"),
+        );
+        // Store owns live SQLite handles after this helper returns.
+        std::mem::forget(dir);
+        let state = AppState {
+            store: store.clone(),
+            started: std::time::Instant::now(),
+            build_hash: "capture-requeue-test".into(),
+            auth_token: None,
+            reconciled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        (state, store)
+    }
+
+    fn seed_capture(store: &crate::db::SharedStore) -> String {
+        let slot = Arc::new(Mutex::new(None));
+        let slot_w = slot.clone();
+        store
+            .write(move |conn| {
+                let row = bs::create_issue(
+                    conn,
+                    &bs::NewIssue {
+                        title: "Clear out this worker's board then grind it all out".into(),
+                        desc: "**Prompt:** clear out this worker's board then grind it all out"
+                            .into(),
+                        status: "doing".into(),
+                        session: Some("mvs-research".into()),
+                        item_type: "chore".into(),
+                        creator: "amux".into(),
+                        owner_type: "agent".into(),
+                        due: None,
+                        due_time: None,
+                        reviewer: None,
+                        shepherd: None,
+                        gate: vec![],
+                        depends_on: vec![],
+                        tags: vec![],
+                        ask_type: None,
+                        ask_question: None,
+                        ask_unblocks: None,
+                        ask_actor: None,
+                        source: Some("capture".into()),
+                        requested_by: None,
+                        callback_session: None,
+                        callback_prompt: None,
+                    },
+                    1_788_955_507,
+                )?;
+                *slot_w.lock().expect("slot") = Some(row.id);
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
+            })
+            .expect("seed capture");
+        let id = slot.lock().expect("slot").clone().expect("capture id");
+        id
+    }
+
+    fn worker_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amux-session", HeaderValue::from_static("mvs-research"));
+        headers
+    }
+
+    async fn patch(state: &AppState, id: &str, body: Value) -> (StatusCode, Value) {
+        let response = patch_item(
+            State(state.clone()),
+            Path(id.to_string()),
+            worker_headers(),
+            Json(body),
+        )
+        .await;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response");
+        (status, serde_json::from_slice(&bytes).expect("json response"))
+    }
+
+    /// MR-174 is the production specimen: status-update claimed the captured
+    /// command, the lane registered its report asset, then PATCH moved the same
+    /// untouched envelope doing -> backlog. The board faithfully rendered that
+    /// last mutation, so it looked as though no work had happened and the fresh
+    /// trigger parked it outside the drain loop.
+    #[tokio::test]
+    async fn a_worked_capture_envelope_cannot_disappear_back_into_a_queue() {
+        let (state, store) = fixture();
+        let id = seed_capture(&store);
+
+        for target in ["backlog", "todo"] {
+            let (status, body) = patch(&state, &id, json!({"status": target})).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{target}: {body}");
+            assert_eq!(body["code"], "capture_requeue_requires_disposition");
+            assert_eq!(body["preserved_status"], "doing");
+            assert_eq!(body["attempted_status"], target);
+            assert_eq!(
+                bs::get_issue(&store.read().expect("read"), &id)
+                    .expect("query")
+                    .expect("card")
+                    .status,
+                "doing",
+                "a refusal must not mutate the card"
+            );
+        }
+    }
+
+    /// The guard requires the model to make the semantic decision; it does not
+    /// ban parking. Once the same atomic PATCH replaces the prompt envelope with
+    /// a standalone task, the normal transition is available again.
+    #[tokio::test]
+    async fn reshaping_one_real_task_preserves_the_normal_backlog_exit() {
+        let (state, store) = fixture();
+        let id = seed_capture(&store);
+        let desc = "Re-run every MVS verification job whose named prerequisite has cleared; record each result and produced artifact.";
+        let (status, body) = patch(
+            &state,
+            &id,
+            json!({
+                "desc": desc,
+                "status": "backlog",
+                "source_ref": "Resume when MR-157 supplies the staging experiment path"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["applied"], true);
+        assert_eq!(body["status"], "backlog");
+        assert_eq!(body["desc"], desc);
+    }
+
+    /// The existing audited escape stays real. This is intentionally a
+    /// positive control: deleting force support would make the primary refusal
+    /// test pass while creating a state with no truthful exit.
+    #[tokio::test]
+    async fn an_attributed_reasoned_force_can_requeue_the_envelope() {
+        let (state, store) = fixture();
+        let id = seed_capture(&store);
+        let (status, body) = patch(
+            &state,
+            &id,
+            json!({
+                "status": "backlog",
+                "force": true,
+                "reason": "the source message was revoked before its semantic disposition could be recorded"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "backlog");
+        let log = body["log"].as_str().unwrap_or_default();
+        assert!(log.contains("force by mvs-research: doing->backlog reason="), "{log}");
+        assert!(log.contains("source message was revoked"), "{log}");
     }
 }
 
@@ -12513,6 +13299,39 @@ mod slim_tests {
         assert!(
             got.desc.contains(&format!("Folded into {}", worker.id)),
             "the tombstone links to the worker card"
+        );
+    }
+
+    /// AF-616: the auto-fold CHOSE this target by adjacency, so the line it
+    /// writes must carry the inference marker. mixpeek-frustrations' specimen
+    /// is a report captured as AF-613 and folded into AF-615, an unrelated
+    /// finding carded in the same minute; the summary asserted that fold in the
+    /// same words a lane's own `--folded-into` would have produced.
+    ///
+    /// This pins the LABEL, not the choice. Narrowing the window is a change to
+    /// every lane's board and is not made here.
+    #[test]
+    fn an_auto_fold_records_that_it_inferred_the_target() {
+        let conn = fold_db();
+        let cap =
+            bs::create_issue(&conn, &fold_card("amux", "doing", "**Prompt:** do the thing", "lane"), 1000)
+                .unwrap();
+        let worker =
+            bs::create_issue(&conn, &fold_card("lane", "todo", "Fix the thing", "lane"), 1010).unwrap();
+        fold_capture_for_worker_card(&conn, &worker, 600, 1010).unwrap();
+
+        let got = bs::get_issue(&conn, &cap.id).unwrap().unwrap();
+        let log = got.log.as_deref().unwrap_or("");
+        assert!(
+            log.contains(&format!("capture folded into {} {}", worker.id, bs::FOLD_INFERRED_MARKER)),
+            "the adjacency-chosen target must be labelled as inferred; log was: {log}"
+        );
+        // AND IT MUST STILL RESOLVE. A marker that broke the id would turn a
+        // readable fold back into the dropped-request rendering b3db93fd fixed.
+        assert_eq!(
+            bs::folded_into_detail(Some(log)),
+            Some((worker.id.clone(), true)),
+            "the labelled line must still parse to the target"
         );
     }
 

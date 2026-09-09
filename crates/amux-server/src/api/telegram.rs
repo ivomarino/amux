@@ -52,6 +52,7 @@ async fn status(State(state): State<AppState>) -> Response {
             "last_error": report.last_error,
             "messages_routed": report.messages_routed,
             "messages_unlinked": report.messages_unlinked,
+            "messages_group_ignored": report.messages_group_ignored,
         })),
     )
         .into_response()

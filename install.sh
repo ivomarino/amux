@@ -235,9 +235,68 @@ fi
 # file, loudly, because there refusing would be worse than installing.
 install_hook_from_head() {
   local rel="$1" dest="$2"
-  local head_bytes=""
-  if head_bytes="$(git -C "$SCRIPT_DIR" show "HEAD:$rel" 2>/dev/null)" && [[ -n "$head_bytes" ]]; then
-    printf '%s\n' "$head_bytes" > "$dest"
+  local head_bytes="" src_ref=""
+  # ORIGIN/MAIN FIRST, NOT HEAD. Installing committed bytes is right; taking
+  # them from HEAD is not. graft-push never advances local HEAD, so on a shared
+  # checkout HEAD lags origin by an unbounded amount and LOOKS authoritative
+  # while doing it (~/.claude/CLAUDE.md says this outright: "HEAD: IS THE SAME
+  # HAZARD AS THE WORKTREE AND HIDES IT BETTER").
+  #
+  # Measured 2026-09-08: ~/.amux/hooks/git-shared-guard.py had an mtime of
+  # 12:01 THAT DAY and was 145 lines behind the repo, missing two shipped
+  # fixes — 09c26abb (`\b` after a literal verb matches a hyphen, so
+  # `commit-tree` read as `commit`) and a391c1c6 (AF-577, refuse a `git config`
+  # write from a linked worktree). The first blocked the out-of-tree graft that
+  # mixpeek's own CLAUDE.md prescribes as THE safe pattern on a shared
+  # checkout, for every lane on this box; the second exists because
+  # `core.bare=true` took the mixpeek fleet down for ~30 minutes. Both were
+  # committed, both were installed-from-HEAD while HEAD lagged, and nothing
+  # anywhere said the running hook was old.
+  for src_ref in "origin/main" "HEAD"; do
+    if head_bytes="$(git -C "$SCRIPT_DIR" show "$src_ref:$rel" 2>/dev/null)" && [[ -n "$head_bytes" ]]; then
+      break
+    fi
+    head_bytes=""
+  done
+  if [[ -n "$head_bytes" ]]; then
+    # ATOMIC, because $dest is a hook every lane on this box executes on every
+    # Bash call, and this runs while they are running. A plain `> "$dest"` opens
+    # the destination with O_TRUNC and REUSES the inode, so a hook that fires
+    # mid-write reads a truncated file. `scripts/atomic-replace.sh` is rename(2):
+    # a new inode and an atomic directory-entry swap, so anything already reading
+    # finishes on the bytes it started with (AF-597; the rule is in the fleet
+    # CLAUDE.md and this call site was the counter-example to it).
+    local _stage
+    # Stage in the DESTINATION's own directory. rename(2) is only atomic within
+    # one filesystem, and a cross-device `mv` degrades to open(O_TRUNC)+copy,
+    # which is the very write this is avoiding.
+    mkdir -p "$(dirname "$dest")"
+    _stage="$(mktemp "$(dirname "$dest")/.install-hook.XXXXXX")"
+    printf '%s\n' "$head_bytes" > "$_stage"
+    if [[ -f "$dest" && -x "$SCRIPT_DIR/scripts/atomic-replace.sh" ]]; then
+      "$SCRIPT_DIR/scripts/atomic-replace.sh" "$_stage" "$dest" >/dev/null
+      rm -f "$_stage"
+    else
+      # FIRST INSTALL, or a checkout predating the helper. Nothing can be
+      # executing a file that does not exist yet, and `mv` within one
+      # filesystem is the same rename(2) the helper performs.
+      #
+      # mktemp gives 0600 where the old `> "$dest"` gave 0644, and every call
+      # site chmods +x afterwards, so without this line a first install lands
+      # 0700 instead of 0755. Same result as before, stated rather than
+      # inherited from a umask.
+      chmod 0755 "$_stage"
+      mv -f "$_stage" "$dest"
+    fi
+    echo "  installed $rel from $src_ref"
+    if [[ "$src_ref" == "HEAD" ]]; then
+      echo "  NOTE: origin/main has no $rel (or no origin) — installed from HEAD,"
+      echo "        which on a graft-push checkout can lag origin by any amount."
+    elif ! git -C "$SCRIPT_DIR" diff --quiet "origin/main" "HEAD" -- "$rel" 2>/dev/null; then
+      echo "  NOTE: your HEAD's $rel differs from origin/main. Installed ORIGIN's"
+      echo "        bytes, which is what the rest of the fleet runs. If your local"
+      echo "        commit is the newer one, push it and re-run."
+    fi
     if ! git -C "$SCRIPT_DIR" diff --quiet HEAD -- "$rel" 2>/dev/null; then
       echo "  NOTE: $rel differs from HEAD in your worktree. Installed the COMMITTED"
       echo "        bytes; your uncommitted edit is NOT live. Commit it and re-run."

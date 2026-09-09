@@ -204,6 +204,27 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-harness-guard.sh
+      # AF-346, ONE LEVEL UP. The ratchet above pins that a harness cannot report
+      # PASS for a cell that never ran. It says nothing about a harness that is
+      # never RUN, which is the same defect with a longer fuse: measured today,
+      # 32 of 80 scripts/test-* files were named by no workflow and no git-hook,
+      # and one of them was scripts/test-target-clause.sh — the harness written
+      # for AF-346, whose whole incident was a correct guard that did not run.
+      # A ratchet against a recorded baseline, so the 32 stay their owners'
+      # decision and number 33 cannot arrive quietly.
+      - name: no harness is written and then never invoked (AF-346)
+        run: |
+          set -uo pipefail
+          ./scripts/test-harness-wired.sh
+      # AF-346 second pass + AF-336. `--test <name>` skips the LIB ENTIRELY and
+      # prints the smallest number of any selector, so it is the likeliest to be
+      # read as a clean suite; and the worktree clause listed every dirty file
+      # without saying how many were in the crate actually compiled. Stubs cargo,
+      # so it costs no build time here.
+      - name: the runner names what a selector skipped, and scopes a dirty tree (AF-346/AF-336)
+        run: |
+          set -uo pipefail
+          ./scripts/test-selector-clauses.sh
       # AF-356. The contention wrapper measured ONE of the two ways a peer
       # reddens your suite. Its clean verdict ("NOT build contention") read as
       # "therefore your bug", while a peer's uncommitted source in the shared
@@ -280,6 +301,9 @@ jobs:
           set -uo pipefail
           ./scripts/test-board-add-flags.sh
           ./scripts/test-amux-url.sh
+          ./scripts/test-discard-folded-into-help.sh
+          ./scripts/test-send-fallback-atomic.sh
+          ./scripts/test-depends-on-help.sh
       # AMUX-3891. The CLI is symlinked straight into the working tree and ~50
       # lanes invoke it while it is being edited, so it MUST be parseable in one
       # read: bash holds a byte offset, and a rewrite mid-invocation resumes it

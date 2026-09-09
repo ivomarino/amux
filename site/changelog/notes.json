@@ -1,5 +1,59 @@
 [
   {
+    "hash": "f6a0edbf",
+    "short": "f6a0edbf",
+    "title": "Board captures require a disposition before requeuing",
+    "date": "2026-09-09",
+    "type": "fix",
+    "tags": ["board", "capture", "reliability"],
+    "description": "Fixed a gap where a captured message could be requeued without a recorded disposition, leaving the audit trail incomplete. The board now requires an explicit outcome (fold, discard, or forward) before the capture is released back to the queue."
+  },
+  {
+    "hash": "526f1ea6",
+    "short": "526f1ea6",
+    "title": "Lanes can declare a card fold directly from the CLI",
+    "date": "2026-09-08",
+    "type": "feat",
+    "tags": ["board", "cli", "audit"],
+    "description": "Previously, a card fold required constructing a hand-rolled log entry. Now any lane can declare a fold with a single CLI command: amux board fold <card-id> --into <target-id>. The server records it identically to a system-generated fold, so the audit trail is consistent regardless of how the fold happened. Useful when a task absorbs another mid-sprint and the board should reflect that without manual cleanup."
+  },
+  {
+    "hash": "4b8ee664",
+    "short": "4b8ee664",
+    "title": "Workspace members can be assigned to scoped teams",
+    "date": "2026-09-08",
+    "type": "feat",
+    "tags": ["org", "teams", "permissions"],
+    "description": "Engineering organizations using amux can now partition their workspace into named teams. Each team has its own scoped membership, so a mobile team and a backend team can share one amux instance while seeing only their own sessions, board cards, and logs. Team assignment is managed through the Settings tab."
+  },
+  {
+    "hash": "c07923e6",
+    "short": "c07923e6",
+    "title": "Worker message view now has composable filters",
+    "date": "2026-09-08",
+    "type": "feat",
+    "tags": ["dashboard", "workers", "filtering"],
+    "description": "The worker message panel now supports composable filters: filter by session name, runtime type, or message keyword in any combination. Previously you had to scroll through all messages across all workers to find what you were looking for. With composable filters, watching 10 mixed Claude Code and Codex CLI sessions simultaneously is manageable at a glance. (AMUX-4242)"
+  },
+  {
+    "hash": "06270da7",
+    "short": "06270da7",
+    "title": "Owner access link is now visible in Settings",
+    "date": "2026-09-08",
+    "type": "feat",
+    "tags": ["dashboard", "settings", "auth"],
+    "description": "The dashboard Settings tab now shows the owner access link directly, so you can copy it without running a CLI command. Previously, finding the access URL required running amux url or checking server.env. This is especially useful when setting up remote access from a new device."
+  },
+  {
+    "hash": "4b428256",
+    "short": "4b428256",
+    "title": "Server logs can be filtered by IP address",
+    "date": "2026-09-08",
+    "type": "feat",
+    "tags": ["logs", "observability", "filtering"],
+    "description": "The log analysis endpoint now accepts an IP filter. Pass ?ip=192.168.1.x to isolate requests from a specific client. Previously, the only way to narrow down log noise from a shared amux instance was to grep the raw log file. The filter is now a first-class query parameter with proper column indexing."
+  },
+  {
     "hash": "0096077c",
     "short": "0096077c",
     "title": "Repeated card re-assignment to the same lane is now flagged",
