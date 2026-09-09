@@ -9298,7 +9298,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.850';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.851';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -22247,6 +22247,9 @@ let _boardDragId = null;
 let boardViewMode = localStorage.getItem('amux_board_view') || 'status';
 if (boardViewMode === 'session') boardViewMode = 'worker';
 let boardOwnerFilter = localStorage.getItem('amux_board_owner') || 'human';
+// Smart Board: derived display-status data, fetched from /api/board/derived.
+let _smartBoardData = null;
+let _smartBoardFetching = false;
 let _sessionGroupCollapsed = JSON.parse(localStorage.getItem('amux_board_collapsed') || '{}');
 let _boardWorkerDensityBeaconSent = false;
 let _tagGroupCollapsed = JSON.parse(localStorage.getItem('amux_status_collapsed') || '{}');
@@ -22304,6 +22307,38 @@ const _CUSTOM_STATUS_PALETTE_LIGHT = [
   {bg:'rgba(5,80,174,0.1)',color:'#0550ae',border:'rgba(5,80,174,0.3)',dot:'#0550ae'},
   {bg:'rgba(180,30,120,0.1)',color:'#99286e',border:'rgba(180,30,120,0.3)',dot:'#99286e'},
 ];
+// Derived display-status styles (Smart Board view). These augment the
+// built-in statuses for the computed categories the /api/board/derived
+// endpoint produces.
+const _DERIVED_STATUS_STYLE = {
+  'aged-needsyou':      {bg:'rgba(248,81,73,0.18)',color:'var(--red)',border:'rgba(248,81,73,0.5)',dot:'var(--red)'},
+  'stalled':            {bg:'rgba(210,153,34,0.22)',color:'var(--yellow)',border:'rgba(210,153,34,0.55)',dot:'var(--yellow)'},
+  'stale':              {bg:'rgba(139,148,158,0.15)',color:'rgba(139,148,158,0.7)',border:'rgba(139,148,158,0.35)',dot:'rgba(139,148,158,0.5)'},
+  'verified-candidate': {bg:'rgba(45,212,191,0.12)',color:'#2dd4bf',border:'rgba(45,212,191,0.35)',dot:'#2dd4bf'},
+  'unblocked':          {bg:'rgba(88,166,255,0.18)',color:'var(--accent)',border:'rgba(88,166,255,0.45)',dot:'var(--accent)'},
+};
+const _DERIVED_STATUS_STYLE_LIGHT = {
+  'aged-needsyou':      {bg:'rgba(207,34,46,0.12)',color:'#cf222e',border:'rgba(207,34,46,0.4)',dot:'#cf222e'},
+  'stalled':            {bg:'rgba(154,103,0,0.15)',color:'#7d4e00',border:'rgba(154,103,0,0.4)',dot:'#7d4e00'},
+  'stale':              {bg:'rgba(101,109,118,0.12)',color:'#57606a',border:'rgba(101,109,118,0.3)',dot:'#57606a'},
+  'verified-candidate': {bg:'rgba(13,148,136,0.12)',color:'#0d9488',border:'rgba(13,148,136,0.35)',dot:'#0d9488'},
+  'unblocked':          {bg:'rgba(9,105,218,0.12)',color:'#0550ae',border:'rgba(9,105,218,0.35)',dot:'#0550ae'},
+};
+const _DERIVED_STATUS_LABELS = {
+  'aged-needsyou': 'Aged Needs-You (>14d)',
+  'stalled': 'Stalled (session idle)',
+  'stale': 'Stale (auto, no activity >72h)',
+  'verified-candidate': 'Verified Candidate (has evidence)',
+  'unblocked': 'Unblocked (deps resolved)',
+};
+
+function derivedStatusStyle(id) {
+  const light = document.body.classList.contains('light');
+  const derived = light ? _DERIVED_STATUS_STYLE_LIGHT[id] : _DERIVED_STATUS_STYLE[id];
+  if (derived) return derived;
+  return statusStyle(id);
+}
+
 function statusStyle(id) {
   const light = document.body.classList.contains('light');
   const builtIn = light ? _BUILT_IN_STATUS_STYLE_LIGHT[id] : _BUILT_IN_STATUS_STYLE[id];
@@ -26420,7 +26455,85 @@ let _prevCardRects = {};
 function setBoardView(mode) {
   boardViewMode = mode;
   localStorage.setItem('amux_board_view', mode);
+  if (mode === 'smart') _smartBoardData = null;
   renderBoard();
+}
+
+async function _fetchSmartBoard() {
+  try {
+    const resp = await fetch('/api/board/derived');
+    if (!resp.ok) throw new Error('derived endpoint returned ' + resp.status);
+    const data = await resp.json();
+    _smartBoardData = data;
+  } catch (e) {
+    console.error('Smart board fetch failed:', e);
+    _smartBoardData = null;
+  }
+}
+
+function _renderSmartBoard(container, visibleStored) {
+  if (!_smartBoardData || !_smartBoardData.items) {
+    container.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">No derived data available.</div>';
+    return;
+  }
+  const visibleIds = new Set(visibleStored.map(i => i.id));
+  const items = _smartBoardData.items.filter(i => visibleIds.has(i.id));
+
+  // Derived status groups in priority display order: attention-needing first
+  const derivedOrder = [
+    'aged-needsyou', 'stalled', 'stale', 'unblocked', 'verified-candidate',
+    'doing', 'review', 'needsyou', 'todo', 'backlog', 'done', 'verified', 'discarded'
+  ];
+  const groups = {};
+  items.forEach(i => {
+    const ds = i.display_status || i.status || 'todo';
+    (groups[ds] = groups[ds] || []).push(i);
+  });
+
+  let html = '';
+  // Show derived-only statuses with a highlight header
+  const derivedSpecial = new Set(['aged-needsyou', 'stalled', 'stale', 'verified-candidate', 'unblocked']);
+  derivedOrder.concat(Object.keys(groups).filter(k => !derivedOrder.includes(k))).forEach(ds => {
+    const g = groups[ds];
+    if (!g || !g.length) return;
+    const isSpecial = derivedSpecial.has(ds);
+    const sty = derivedStatusStyle(ds);
+    const label = _DERIVED_STATUS_LABELS[ds] || ds;
+    const headStyle = isSpecial
+      ? 'display:flex;align-items:center;gap:8px;padding:10px 6px 4px;font-size:0.76rem;font-weight:700;color:' + sty.color + ';text-transform:uppercase;letter-spacing:0.05em;border-left:3px solid ' + sty.dot + ';padding-left:10px;margin-top:6px;'
+      : 'display:flex;align-items:center;gap:8px;padding:10px 6px 4px;font-size:0.74rem;font-weight:600;color:' + sty.color + ';text-transform:uppercase;letter-spacing:0.05em;';
+    html += '<div class="board-list-group-head" style="' + headStyle + '">'
+      + '<span class="board-status-dot" style="background:' + sty.dot + '"></span>' + esc(label)
+      + '<span style="color:var(--dim);font-weight:400;">' + g.length + '</span></div>';
+    html += g.map(i => {
+      let row = _issueRowHTML(i, { showOwner: true });
+      if (isSpecial && i.display_status !== i.status) {
+        const badge = '<span style="font-size:0.65rem;padding:1px 5px;border-radius:3px;background:' + sty.bg + ';color:' + sty.color + ';border:1px solid ' + sty.border + ';margin-left:6px;vertical-align:middle;font-weight:600;">' + esc(i.display_status) + '</span>';
+        row = row.replace('</div>', badge + '</div>');
+      }
+      return row;
+    }).join('');
+  });
+  container.dataset.component = 'board-smart';
+  container.innerHTML = html || '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">Nothing to show.</div>';
+}
+
+function _smartBoardStatsHTML() {
+  if (!_smartBoardData || !_smartBoardData.counts) return '';
+  const c = _smartBoardData.counts;
+  const special = ['aged-needsyou', 'stalled', 'stale', 'verified-candidate', 'unblocked'];
+  let pills = '';
+  for (const key of special) {
+    const n = c[key] || 0;
+    if (n === 0) continue;
+    const sty = derivedStatusStyle(key);
+    const label = _DERIVED_STATUS_LABELS[key] || key;
+    pills += '<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:4px;background:' + sty.bg + ';color:' + sty.color + ';border:1px solid ' + sty.border + ';font-size:0.72rem;font-weight:600;">'
+      + '<span class="board-status-dot" style="background:' + sty.dot + ';width:6px;height:6px;"></span>'
+      + esc(label) + ' <b>' + n + '</b></span>';
+  }
+  if (!pills) return '<div style="padding:6px 8px;font-size:0.75rem;color:var(--dim);">All cards are in their expected status.</div>';
+  return '<div style="display:flex;flex-wrap:wrap;gap:6px;padding:8px 8px 4px;">' + pills + '</div>';
 }
 
 function setBoardOwner(type) {
@@ -27100,9 +27213,11 @@ function renderBoard() {
   var bvS = document.getElementById('bv-session');
   var bvC = document.getElementById('bv-status');
   var bvL = document.getElementById('bv-list');
+  var bvSm = document.getElementById('bv-smart');
   if (bvS) bvS.classList.toggle('active', boardViewMode === 'worker');
   if (bvC) bvC.classList.toggle('active', boardViewMode === 'status');
   if (bvL) bvL.classList.toggle('active', boardViewMode === 'list');
+  if (bvSm) bvSm.classList.toggle('active', boardViewMode === 'smart');
   var boH = document.getElementById('bo-human');
   var boA = document.getElementById('bo-agent');
   if (boH) boH.classList.toggle('active', boardOwnerFilter === 'human');
@@ -27156,6 +27271,26 @@ function renderBoard() {
     container.innerHTML = html || '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">Nothing matches.</div>';
     return;
   }
+
+  if (boardViewMode === 'smart') {
+    container.classList.remove('board-columns');
+    container.classList.add('board-list-mode');
+    if (!_smartBoardData && !_smartBoardFetching) {
+      _smartBoardFetching = true;
+      container.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">Loading derived statuses...</div>';
+      _fetchSmartBoard().then(() => { _smartBoardFetching = false; renderBoard(); }).catch(() => { _smartBoardFetching = false; });
+      return;
+    }
+    if (!_smartBoardData) {
+      container.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">Loading derived statuses...</div>';
+      return;
+    }
+    _renderSmartBoard(container, visible);
+    const _sElSm = document.getElementById('board-stats-mount');
+    if (_sElSm) _sElSm.innerHTML = _smartBoardStatsHTML();
+    return;
+  }
+
   // Mount the progress strip above the columns, over the SAME `visible` set the
   // columns are about to render (AMUX-2506). Fed from `visible` and not from
   // boardItems so it can never describe a different population than the board.
