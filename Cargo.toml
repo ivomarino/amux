@@ -87,6 +87,10 @@ libc = "0.2"
 p256 = { version = "0.13", features = ["ecdsa", "ecdh", "pem"] }
 hkdf = "0.12"
 aes-gcm = "0.10"
+aes = "0.8"
+cbc = "0.1"
+pbkdf2 = { version = "0.12", features = ["hmac"] }
+hmac = "0.12"
 base64 = "0.22"
 toml = "0.8"
 futures = "0.3"

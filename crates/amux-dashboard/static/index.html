@@ -1486,6 +1486,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="bw-btn" onclick="_bwScreenshot()" title="Snapshot">&#128247;</button>
     <button class="bw-btn" onclick="_bwIdentify()" title="AF-496 — amux opens a SECOND Chrome beside your own and they look identical. This raises the amux one and draws a blue bar across it naming its profile.">&#128269; Which window?</button>
     <button class="bw-btn" onclick="_bwNewProfile()" title="Create a profile and sign in to it">&#43; Profile</button>
+    <button class="bw-btn" onclick="_bwImportProfile()" title="Import cookies from Chrome, Firefox, etc.">&#8615; Import</button>
     <button class="bw-btn" onclick="_bwSaveProfile()" title="Register current site to a profile">&#128190; Save</button>
   </div>
   <!-- Status / logged-in indicator -->
@@ -2259,8 +2260,8 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </button>
       <div class="peek-plan-list" id="peek-plan-list" style="display:none;"></div>
     </div>
-    <div style="position:relative;flex:1;min-height:0;">
-      <div id="peek-body" class="overlay-body" style="position:absolute;inset:0;"></div>
+    <div class="peek-output-wrap">
+      <div class="peek-output-controls">
       <button class="peek-copy-btn" id="peek-copy-btn" onclick="copyPeekContent()" title="Copy all">&#x2398; Copy</button>
       <!-- Subagent switcher — appears only when the pane shows Claude's agents panel -->
       <!-- The pane-driven subagent switcher (⌂/▲/▼, agentNav) was DELETED
@@ -2284,6 +2285,8 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <button onclick="peekQuickKeys('Up')" title="Previous subagent (sends ↑)">&#x25B2;</button>
         <button onclick="peekQuickKeys('Down')" title="Next subagent (sends ↓)">&#x25BC;</button>
       </div>
+      </div>
+      <div id="peek-body" class="overlay-body"></div>
     </div>
     <div id="peek-status" class="overlay-status" onclick="_peekGeoDebug()" title="Tap for layout debug"></div>
     <div class="peek-cmd-bar">

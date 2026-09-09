@@ -673,6 +673,8 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     ("board_overlap_members", "created_at", false),
     ("board_overlap_members", "last_seen_at", false),
     ("board_overlap_refs", "created_at", false),
+    // SECONDS: DEFAULT (unixepoch('subsec')) in migration 0061.
+    ("board_change_log", "changed_at", false),
     ("cmd_history", "delivered_at", true),
     ("cmd_history", "queued_at", true),
     ("cmd_history", "ts", true),

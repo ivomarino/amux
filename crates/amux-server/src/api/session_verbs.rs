@@ -6796,6 +6796,15 @@ pub(crate) async fn deliver_automated(
     if parse_env(name).get("CC_ARCHIVED") == Some("1") {
         return refuse(format!("target '{name}' is archived — not delivered, not woken"));
     }
+    // A blocked session is on a permission/approval dialog. Delivering input
+    // could accidentally answer that dialog. The message stays queued (via the
+    // steering hold below) and delivers when the block clears.
+    if lane_is_blocked(state, name) {
+        return refuse(format!(
+            "target '{name}' is blocked on a permission dialog — not delivered. \
+             Answer the dialog in the terminal; queued messages deliver when it clears."
+        ));
+    }
     // A stopped (but not archived) lane is `send_text`'s auto-wake path, exactly
     // as under Python. It must NOT be queued: `steer_deliver_loop` skips lanes
     // that are not running and leaves the row pending, so a queued command for a
@@ -11065,6 +11074,13 @@ pub(crate) fn reason_is_reapable(reason: &str) -> bool {
 /// minutes ago that has never been seen is strictly worse than one that arrives
 /// a turn early.
 pub(crate) fn steer_decide(reported: Option<&str>, pane_idle: Option<bool>, age_s: f64, max_age_s: f64) -> SteerDelivery {
+    // A blocked session is on a permission/approval dialog. Sending input
+    // could accidentally answer the dialog, so delivery is held unconditionally
+    // with no overdue escape. The agent must clear the block (by reporting idle
+    // or active) before any queued message is delivered.
+    if reported == Some("blocked") {
+        return SteerDelivery::Hold;
+    }
     let idle = match reported {
         // The lane's own report wins (D1): the harness knows its boundaries.
         Some(st) => st == "idle",
@@ -11159,6 +11175,14 @@ pub(crate) fn lane_report(state: &AppState, name: &str) -> Option<LaneReport> {
         applies,
         subagents_live,
     })
+}
+
+/// Whether a lane's trusted self-report says it is blocked on a permission or
+/// approval dialog. Sending input to a blocked session could accidentally
+/// answer the dialog, so all automated delivery paths refuse.
+pub(crate) fn lane_is_blocked(state: &AppState, name: &str) -> bool {
+    lane_report(state, name)
+        .is_some_and(|r| r.applies && r.state == "blocked")
 }
 
 /// Exact provider-owned evidence that work continues behind an idle-looking
@@ -12544,6 +12568,10 @@ pub async fn steer_deliver_for_session(state: &AppState, session: &str) -> bool 
     }
     if !is_running(session).await {
         skip(session, "", "not-running");
+        return false;
+    }
+    if lane_is_blocked(state, session) {
+        skip(session, "", "blocked-on-permission-dialog");
         return false;
     }
     let mut id = String::new();
@@ -15490,6 +15518,22 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     // mediation, which is what "raw LLM pass through" excludes.
     let send_origin =
         if origin.is_empty() { SendOrigin::Owner } else { SendOrigin::Automation };
+    // A blocked session is on a permission/approval dialog. Automated sends
+    // could accidentally answer it, so peer/automation sends are refused.
+    // Owner sends (dashboard, human) pass through so the human can answer the
+    // dialog directly.
+    if matches!(send_origin, SendOrigin::Automation) && lane_is_blocked(state, name) {
+        return jresp(
+            StatusCode::CONFLICT,
+            json!({
+                "ok": false,
+                "error": format!("Session '{name}' is blocked on a permission dialog. \
+                    Use the terminal to answer it directly."),
+                "blocked": "permission_dialog",
+                "code": "session_blocked",
+            }),
+        );
+    }
     let (ok, msg) = send_text(state, name, &text, defer_busy, send_origin).await;
     let no_effect = ok && msg == "no suggestion found";
     if no_effect {
@@ -17606,14 +17650,13 @@ pub(crate) async fn report_post(state: &AppState, name: &str, headers: &HeaderMa
     let st = match st_raw.as_str() {
         "working" | "busy" => "active",
         "done" => "idle",
-        "blocked" => "waiting",
         other => other,
     }
     .to_string();
-    if !matches!(st.as_str(), "active" | "idle" | "waiting" | "error") {
+    if !matches!(st.as_str(), "active" | "idle" | "waiting" | "blocked" | "error") {
         return jresp(
             StatusCode::BAD_REQUEST,
-            json!({"error": format!("state must be one of active|idle|waiting|error (got '{st_raw}')")}),
+            json!({"error": format!("state must be one of active|idle|waiting|blocked|error (got '{st_raw}')")}),
         );
     }
     // A normal Stop report is the prompt terminal edge. Reconcile a provider
@@ -26869,6 +26912,22 @@ mod steer_max_age_tests {
         // path refuses a selector even when overdue — answering a pending tool
         // is the user's, not amux's.)
         assert_eq!(steer_decide(Some("waiting"), None, 10.0, MAX), SteerDelivery::Hold);
+    }
+
+    #[test]
+    fn a_blocked_session_is_never_delivered_to() {
+        // A blocked session is on a permission/approval dialog. Delivering
+        // input could accidentally answer it. The hold must survive past the
+        // max-age deadline: the overdue escape is for busy-but-safe lanes, and
+        // a dialog is neither.
+        assert_eq!(steer_decide(Some("blocked"), None, 0.0, MAX), SteerDelivery::Hold);
+        assert_eq!(steer_decide(Some("blocked"), None, MAX + 1.0, MAX), SteerDelivery::Hold);
+        assert_eq!(steer_decide(Some("blocked"), None, 86_400.0, MAX), SteerDelivery::Hold);
+        assert_eq!(
+            steer_decide(Some("blocked"), Some(true), MAX + 1.0, MAX),
+            SteerDelivery::Hold,
+            "pane saying idle must not override a blocked report"
+        );
     }
 
     #[test]

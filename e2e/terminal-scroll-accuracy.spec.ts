@@ -73,7 +73,9 @@ for (const zoom of [1, 0.8, 1.25]) {
       expect(b.target_visible).toBe(true);
       expect(Math.abs(b.scroll_error_px)).toBeLessThan(2);
       expect(b.zoom).toBeCloseTo(zoom, 2);
-      expect(b.desired_inset).toBeGreaterThanOrEqual(39.95);
+      // Controls now occupy a sibling row. The landing still clears them
+      // (readable() above) with a 12px reading margin inside the scroller.
+      expect(b.desired_inset).toBeGreaterThanOrEqual(11.95);
     }
   });
 }

@@ -14,6 +14,7 @@ pub mod auth;
 pub mod board;
 pub mod criteria;
 pub mod browser;
+pub mod browser_import;
 pub mod calendar;
 pub mod connectors;
 pub mod dictation;

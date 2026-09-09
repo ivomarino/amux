@@ -1243,6 +1243,8 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/board/statuses/{sid}", methods: &["PATCH", "DELETE"] },
     RouteEntry { path: "/api/board/session-gates", methods: &["GET", "PATCH"] },
     RouteEntry { path: "/api/board/nudges", methods: &["GET", "PATCH"] },
+    RouteEntry { path: "/api/board/changes", methods: &["GET"] },
+    RouteEntry { path: "/api/board/derived", methods: &["GET"] },
     RouteEntry { path: "/api/board/clear-done", methods: &["POST"] },
     RouteEntry { path: "/api/board/overlap", methods: &["POST"] },
     RouteEntry { path: "/api/board/overlap/deployment-permit", methods: &["GET"] },
@@ -1418,6 +1420,8 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/browser/pw-profiles", methods: &["GET"] },
     RouteEntry { path: "/api/browser/save-profile", methods: &["POST"] },
     RouteEntry { path: "/api/browser/agent", methods: &["POST"] },
+    RouteEntry { path: "/api/browser/import/discover", methods: &["GET"] },
+    RouteEntry { path: "/api/browser/import", methods: &["POST"] },
     // -- file viewer / files / fs
     RouteEntry { path: "/api/file", methods: ANY },
     RouteEntry { path: "/api/file/raw", methods: ANY },

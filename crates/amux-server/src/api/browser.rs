@@ -56,6 +56,8 @@
 //! - `GET  /pw-profiles`                — playwright profile dirs
 //! - `POST /save-profile`               — register profile↔domain
 //! - `POST /agent`                      — 501 (see above)
+//! - `GET  /import/discover`            — scan for installed browsers+profiles
+//! - `POST /import`                     — import cookies into an amux profile
 //! - anything else                      — the route CATALOG as a 404 (ported:
 //!   two sessions guessed /status for /state and read a bare "not found" as
 //!   "the browser API is down")
@@ -93,6 +95,7 @@ pub fn routes() -> Router<AppState> {
         .route("/pw-profiles", get(pw_profiles_list))
         .route("/save-profile", post(save_profile))
         .route("/agent", post(agent))
+        .nest("/import", super::browser_import::routes())
         // Unknown /api/browser paths answer the route CATALOG (ported from
         // Python). EXPLICIT wildcard routes, not `.fallback()`: in the full
         // composition the static SPA catch-all (`/{*path}`) out-competes a
@@ -3127,6 +3130,8 @@ fn catalog_body(path: &str) -> Response {
                 "POST /api/browser/save-profile", "POST /api/browser/profile/create",
                 "DELETE /api/browser/profile/{name}",
                 "POST /api/browser/agent (answers 501 — the session's model drives the native verbs)",
+                "GET /api/browser/import/discover (scan for installed browsers and their profiles)",
+                "POST /api/browser/import (import cookies from a browser profile)",
             ],
             "actions": ["click (selector|index|x,y)", "type", "input", "key",
                         "scroll", "eval", "wait", "extract", "back",

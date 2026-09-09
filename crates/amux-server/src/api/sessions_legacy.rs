@@ -137,9 +137,10 @@ pub fn report_applies(state: &str, ts: f64, started: f64, now: f64) -> bool {
     // flight paints. Silence past the heartbeat means the claim outlived its
     // evidence — a Stop hook that never fired, a crashed turn, an interrupt.
     let stale_active = state == "active" && age > env_secs("AMUX_ACTIVE_HEARTBEAT_S", 120.0);
-    // `idle` survives silence (an idle lane has nothing to report until its
-    // next prompt); every other state has a much shorter trust window.
-    let trust_window = if state == "idle" {
+    // `idle` and `blocked` survive silence (an idle lane has nothing to report
+    // until its next prompt; a blocked lane is parked on a dialog until a human
+    // answers it); every other state has a much shorter trust window.
+    let trust_window = if state == "idle" || state == "blocked" {
         env_secs("AMUX_HOOKS_LIVE_IDLE_S", 86400.0)
     } else {
         env_secs("AMUX_HOOKS_LIVE_S", 1800.0)
@@ -147,7 +148,7 @@ pub fn report_applies(state: &str, ts: f64, started: f64, now: f64) -> bool {
     from_this_life
         && !stale_active
         && age < trust_window
-        && matches!(state, "active" | "idle" | "waiting")
+        && matches!(state, "active" | "idle" | "waiting" | "blocked")
 }
 
 /// Pane captures abandoned on a deadline, and the lanes they were for.
@@ -1262,7 +1263,7 @@ impl FleetSignals {
                 let ts = rep["ts"].as_f64().unwrap_or(0.0);
                 let from_this_life = self.started.get(name).copied().unwrap_or(0.0) <= ts;
                 let live = self.now - ts < env_secs("AMUX_HOOKS_LIVE_S", 1800.0);
-                if from_this_life && live && (st == "active" || st == "waiting") {
+                if from_this_life && live && (st == "active" || st == "waiting" || st == "blocked") {
                     return true;
                 }
             }
@@ -4244,7 +4245,7 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
     // active/waiting before idle/blank, then most-recent human activity.
     let status_rank = |s: &str| -> i64 {
         match s {
-            "active" | "waiting" => 0,
+            "active" | "waiting" | "blocked" => 0,
             _ => 1,
         }
     };
@@ -5801,6 +5802,9 @@ CLAUDE-POSTFIX-COMPLETE
             ("idle", 40_000.0, true, "idle survives silence inside its 24h window"),
             ("idle", 90_000.0, false, "past the 24h idle window"),
             ("waiting", 60.0, true, "a fresh selector report"),
+            ("blocked", 50.0, true, "a fresh blocked report — permission dialog"),
+            ("blocked", 40_000.0, true, "blocked survives silence inside its 24h window"),
+            ("blocked", 90_000.0, false, "past the 24h blocked window"),
             ("compacting", 5.0, false, "a state no rule knows is not evidence"),
         ];
         for (st, age, want, why) in cells {
