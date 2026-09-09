@@ -9536,7 +9536,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.858';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.859';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -10844,7 +10844,29 @@ function _linkifyPaths(safeHtml) {
     // break out of the inline onclick below, so such a path is simply not linked
     // rather than linked unsafely.
     const RE = /(^|[\s(\[>"'`,;=])((?:\.?\/)?(?:[\w.@-]+\/)+[\w.@-]+\.[A-Za-z0-9]{1,8})(:\d+)?(?![^<]*>)/gm;
-    return String(safeHtml).replace(RE, (m, pre, path, line) => {
+    return String(safeHtml).replace(RE, (m, pre, path, line, offset, whole) => {
+      // A HARD WRAP IS NOT A PATH BOUNDARY (Ethan, 2026-09-09: "these links
+      // dont work"). tmux breaks a long line at the pane width mid-token, so
+      // `/private/tmp/claude-501/…/_lt.txt` arrives as `/private/tmp/c` +
+      // newline + `laude-501/…/_lt.txt`. The head has no extension and is not
+      // linked. The TAIL matches the relative-path shape perfectly, so it was
+      // linked and resolved against the worker's cwd — a blue span pointing at
+      // /Users/ethan/Dev/mixpeek/laude-501/… , which cannot exist. Dead links
+      // are worse than plain text: they invite the click.
+      //
+      // The discriminator is the previous line's last token. If it starts a
+      // path and does not finish one (no extension), this fragment is its
+      // continuation rather than a path of its own. Scoped to matches at
+      // start-of-line, which is the only place a wrap can put one.
+      // `pre` is the CONSUMED boundary char, so at a line start it is the
+      // newline itself and only an at-offset-0 match gives ''. Testing for ''
+      // alone silently never fires.
+      if ((pre === '' || pre === '\n') && offset >= 0) {
+        const before = String(whole).slice(0, offset + pre.length);
+        const lastLine = before.slice(before.lastIndexOf('\n', offset - 1) + 1).replace(/<[^>]*>/g, '');
+        const lastTok = (lastLine.trim().split(/[\s(\[>"'`,;=]+/).pop() || '');
+        if (/^\.?\//.test(lastTok) && !/\.[A-Za-z0-9]{1,8}$/.test(lastTok)) return m;
+      }
       // Trailing sentence punctuation is prose, not filename: "…prospects.csv."
       let p = path, tail = line || '';
       const dot = p.match(/\.$/);
