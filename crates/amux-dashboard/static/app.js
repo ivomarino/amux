@@ -5255,7 +5255,6 @@ function togglePeekTabCustomizer() {
   if (!menu) return;
   if (_peekTabCustomizerOpen) {
     _renderPeekTabCustomizer();
-    const btn = document.getElementById('peek-tab-customize');
     // DISPLAY FIRST, THEN MEASURE, THEN PLACE. The old order positioned the menu
     // while it was still display:none, so it could not measure itself and clamped
     // against a HARDCODED 230px assumed width. The menu is not 230px — it measured
@@ -5264,7 +5263,53 @@ function togglePeekTabCustomizer() {
     // A guessed width is the bug; offsetWidth is the fix.
     menu.style.visibility = 'hidden';
     menu.style.display = '';
+    _placePeekTabCustomizer();
+    menu.style.visibility = '';
+    _watchPeekTabAnchor(true);
+    _tabCustBeacon(menu, 'peek');
+    setTimeout(() => document.addEventListener('click', _peekCustOutside, true), 0);
+  } else {
+    menu.style.display = 'none';
+    _watchPeekTabAnchor(false);
+    document.removeEventListener('click', _peekCustOutside, true);
+  }
+}
+
+// PLACEMENT IS NOT A ONE-SHOT (Ethan, 2026-09-09: "this is way off" — the menu
+// hung ~145px below its button, over the terminal). Measured: placement is
+// correct at open, and ~3s later the peek header finishes loading its task
+// line and filters, which pushes the tab strip DOWN. The menu is
+// position:fixed against coordinates taken before that, so it stays where the
+// button used to be. A ResizeObserver does not help: the button changes
+// POSITION, not size, and that fires nothing. So while the menu is open we
+// re-read the anchor each frame and move only when it actually shifted. The
+// cost is one getBoundingClientRect per frame, bounded by the menu being open.
+let _peekTabAnchorRAF = null;
+let _peekTabAnchorLast = '';
+function _watchPeekTabAnchor(on) {
+  if (!on) {
+    if (_peekTabAnchorRAF) cancelAnimationFrame(_peekTabAnchorRAF);
+    _peekTabAnchorRAF = null; _peekTabAnchorLast = '';
+    return;
+  }
+  const tick = () => {
+    if (!_peekTabCustomizerOpen) { _peekTabAnchorRAF = null; return; }
+    const btn = document.getElementById('peek-tab-customize');
     if (btn) {
+      const r = btn.getBoundingClientRect();
+      const key = Math.round(r.left) + ':' + Math.round(r.bottom);
+      if (key !== _peekTabAnchorLast) { _peekTabAnchorLast = key; _placePeekTabCustomizer(); }
+    }
+    _peekTabAnchorRAF = requestAnimationFrame(tick);
+  };
+  _peekTabAnchorRAF = requestAnimationFrame(tick);
+}
+
+function _placePeekTabCustomizer() {
+  const menu = document.getElementById('peek-tab-customizer-menu');
+  const btn = document.getElementById('peek-tab-customize');
+  if (menu && btn) {
+    {
       const r = btn.getBoundingClientRect();
       const vw = document.documentElement.clientWidth || window.innerWidth;
       const vh = document.documentElement.clientHeight || window.innerHeight;
@@ -5292,10 +5337,7 @@ function togglePeekTabCustomizer() {
       menu.style.maxHeight = Math.max(120, vh - top - PAD) + 'px';
       menu.style.overflowY = 'auto';
     }
-    menu.style.visibility = '';
-    _tabCustBeacon(menu, 'peek');
-    setTimeout(() => document.addEventListener('click', _peekCustOutside, true), 0);
-  } else { menu.style.display = 'none'; document.removeEventListener('click', _peekCustOutside, true); }
+  }
 }
 function _renderPeekTabCustomizer() {
   const menu = document.getElementById('peek-tab-customizer-menu');
@@ -9536,7 +9578,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.858';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.860';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -10857,7 +10899,29 @@ function _linkifyPaths(safeHtml) {
     // break out of the inline onclick below, so such a path is simply not linked
     // rather than linked unsafely.
     const RE = /(^|[\s(\[>"'`,;=])((?:\.?\/)?(?:[\w.@-]+\/)+[\w.@-]+\.[A-Za-z0-9]{1,8})(:\d+)?(?![^<]*>)/gm;
-    return String(safeHtml).replace(RE, (m, pre, path, line) => {
+    return String(safeHtml).replace(RE, (m, pre, path, line, offset, whole) => {
+      // A HARD WRAP IS NOT A PATH BOUNDARY (Ethan, 2026-09-09: "these links
+      // dont work"). tmux breaks a long line at the pane width mid-token, so
+      // `/private/tmp/claude-501/…/_lt.txt` arrives as `/private/tmp/c` +
+      // newline + `laude-501/…/_lt.txt`. The head has no extension and is not
+      // linked. The TAIL matches the relative-path shape perfectly, so it was
+      // linked and resolved against the worker's cwd — a blue span pointing at
+      // /Users/ethan/Dev/mixpeek/laude-501/… , which cannot exist. Dead links
+      // are worse than plain text: they invite the click.
+      //
+      // The discriminator is the previous line's last token. If it starts a
+      // path and does not finish one (no extension), this fragment is its
+      // continuation rather than a path of its own. Scoped to matches at
+      // start-of-line, which is the only place a wrap can put one.
+      // `pre` is the CONSUMED boundary char, so at a line start it is the
+      // newline itself and only an at-offset-0 match gives ''. Testing for ''
+      // alone silently never fires.
+      if ((pre === '' || pre === '\n') && offset >= 0) {
+        const before = String(whole).slice(0, offset + pre.length);
+        const lastLine = before.slice(before.lastIndexOf('\n', offset - 1) + 1).replace(/<[^>]*>/g, '');
+        const lastTok = (lastLine.trim().split(/[\s(\[>"'`,;=]+/).pop() || '');
+        if (/^\.?\//.test(lastTok) && !/\.[A-Za-z0-9]{1,8}$/.test(lastTok)) return m;
+      }
       // Trailing sentence punctuation is prose, not filename: "…prospects.csv."
       let p = path, tail = line || '';
       const dot = p.match(/\.$/);
