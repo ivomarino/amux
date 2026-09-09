@@ -40,6 +40,13 @@ export async function handleBusiness(
     const body = await response
       .json()
       .catch(() => ({ error: 'Amux returned an unreadable response.' }));
+    // /health deliberately returns 503 for a reachable but degraded server.
+    // Preserve that state; it is not an authentication or connection failure.
+    if (p === '/health' && response.status === 503 && body !== null &&
+        typeof body === 'object' && 'status' in body && body.status === 'degraded') {
+      console.warn('[amux-business] verdict=backend_degraded status=503');
+      return body;
+    }
     if (!response.ok) throw new UpstreamError(response.status, body);
     return body;
   };

@@ -3,8 +3,9 @@ import http from 'node:http';
 import {readFileSync} from 'node:fs';
 import {fileURLToPath} from 'node:url';
 const now = () => Math.floor(Date.now() / 1000);
-let tasks, workflows, schedules, pending, grants, prefs, requests;
+let tasks, workflows, schedules, pending, grants, prefs, requests, health;
 function reset() {
+  health = 'ok';
   tasks = [
     {
       id: 'TEST-1',
@@ -152,6 +153,10 @@ const server = http.createServer(async (req, res) => {
     return send({ ok: true });
   }
   if (u.pathname === '/test/requests') return send(requests);
+  if (u.pathname === '/test/health') {
+    health = b.status;
+    return send({ ok: true });
+  }
   requests.push({
     path: u.pathname,
     method: req.method,
@@ -167,7 +172,7 @@ const server = http.createServer(async (req, res) => {
     return send({ ok: true });
   }
   if (u.pathname === '/health')
-    return send({ status: 'ok', commit: 'fixture', build: 'fixture' });
+    return send({ status: health, commit: 'fixture', build: 'fixture' }, health === 'ok' ? 200 : 503);
   if (u.pathname === '/api/org')
     return send({ name: 'Northstar Business', id: 'fixture' });
   if (u.pathname === '/api/prefs') {

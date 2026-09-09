@@ -14,6 +14,18 @@ async function nav(page: any, name: string) {
     .getByRole('button', { name, exact: true })
     .click();
 }
+test('degraded server stays connected with an explicit warning; unknown failures stay unavailable', async ({page, request}) => {
+  await request.post('http://127.0.0.1:18824/test/health', {data:{status:'degraded'}});
+  await home(page);
+  await expect(page.getByText('Amux needs attention.', {exact:false})).toBeVisible();
+  await expect(page.getByRole('button', {name:'Create work', exact:true}).first()).toBeEnabled();
+  await page.reload();
+  await expect(page.getByText('Live connection', {exact:true})).toBeVisible();
+  await request.post('http://127.0.0.1:18824/test/health', {data:{status:'unavailable'}});
+  await page.getByRole('button', {name:'Refresh workspace'}).click();
+  await expect(page.getByText('Connection unavailable', {exact:true})).toBeVisible();
+  await expect(page.getByRole('button', {name:'Create work', exact:true}).first()).toBeDisabled();
+});
 test('home shows source-derived business state and restrained design', async ({
   page,
 }) => {
@@ -196,11 +208,16 @@ test('operator review note persists to Amux with revision check', async ({
   page,
   request,
 }) => {
+  await page.route(/\/(tasks|board)\/TEST-1$/, async route => {
+    if (route.request().method() === 'GET') await new Promise(resolve => setTimeout(resolve, 800));
+    await route.continue();
+  });
   await home(page);
   await page
     .getByRole('button', { name: /Northwind Supply — payment needs matching/ })
     .first()
     .click();
+  await expect(page.getByLabel('Reviewer name')).toBeDisabled();
   await page
     .getByLabel('Add a note')
     .fill('Confirmed invoice INV-1004 with the remittance advice.');

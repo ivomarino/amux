@@ -1,6 +1,6 @@
 # Amux Business
 
-A Business surface in the Amux repository, served by the same Amux server at `/business/`. Home, Work, Approvals, Automations, Apps, Settings and Help use the existing core state and permissions. The original dashboard remains at `/`.
+A standalone Business frontend in the Amux repository, running locally at `http://127.0.0.1:3100/` and connected to the existing Amux server. Home, Work, Approvals, Automations, Apps, Settings and Help use the existing core state and permissions. An embedded build is also available at `/business/`; the original developer dashboard remains at `/`.
 
 ## Run and build
 
@@ -25,7 +25,7 @@ Build the frontend before compiling Amux: RustEmbed packages the generated asset
 AMUX_LIVE_URL=https://localhost:8824 AMUX_LIVE_PATH=/business/ npm run test:e2e:live
 ```
 
-The optional Sites/Vinext build (`npm run build`) can use an authenticated reachable `AMUX_SERVER_URL`; a hosted site cannot reach a customer's localhost. The embedded Amux build is the intended deployment for this installation.
+The optional Sites/Vinext build (`npm run build`) can use an authenticated reachable `AMUX_SERVER_URL`; a hosted site cannot reach a customer's localhost. Use `npm run dev` for this installation's standalone local frontend.
 
 ## Same engine, different surface
 
@@ -56,6 +56,7 @@ The server exposes full body review metadata while retaining the legacy short pr
 - Business defaults to all workspace work until reusable workflows are configured. It never injects sample customers into the live workspace.
 - Trigger installation, shadow evaluation, new connector action catalogs, durable business memory and deterministic business verification remain roadmap work.
 - Connection failures and partial data are explicit. Existing rows stay visible during transient refresh failures.
+- A reachable server reporting HTTP 503 with health status `degraded` stays connected, with an explicit warning about unavailable or delayed operations. It does not ask the operator to reconnect or disable all work merely because a health probe failed. Unknown health errors and transport failures remain unavailable; core permissions still govern every action.
 - The UI is responsive and keyboard accessible; automated text-resize and layout checks are not a full accessibility certification.
 
 ## UI sources

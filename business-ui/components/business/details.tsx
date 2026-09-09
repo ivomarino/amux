@@ -220,6 +220,7 @@ export function TaskDetail({
             </section>
             <section className="detail-section">
               <h3>Review & assign</h3>
+              {!loaded && <p className="small muted">Loading the latest work details before editing.</p>}
               <label htmlFor="reviewer" className="small muted">
                 Reviewer name
               </label>
@@ -227,6 +228,7 @@ export function TaskDetail({
                 id="reviewer"
                 placeholder="Name of the person reviewing"
                 value={assignee}
+                disabled={!loaded || busy}
                 onChange={(e) => setAssignee(e.target.value)}
               />
               <label htmlFor="operator-note" className="small muted">
@@ -236,6 +238,7 @@ export function TaskDetail({
                 id="operator-note"
                 placeholder="Add a decision, context, or instructions for the next step."
                 value={note}
+                disabled={!loaded || busy}
                 onChange={(e) => setNote(e.target.value)}
               />
               <Button

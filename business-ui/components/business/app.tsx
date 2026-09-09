@@ -539,7 +539,7 @@ export default function BusinessApp() {
                   ? 'Connecting'
                   : live
                     ? 'Live connection'
-                    : 'Needs reconnecting'}
+                    : 'Connection unavailable'}
               </span>
             </span>
             <Button
@@ -556,6 +556,15 @@ export default function BusinessApp() {
           </div>
         </header>
         <main id="main-content" className="business-main" tabIndex={-1}>
+          {data?.health?.status === 'degraded' && (
+            <div className="mb-5">
+              <Notice>
+                Amux needs attention. You’re still connected, but some information
+                or actions may take longer or be unavailable. Check the result
+                before trying an action again.
+              </Notice>
+            </div>
+          )}
           {error && (
             <div className="mb-5">
               <Notice tone="danger">
