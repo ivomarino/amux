@@ -5972,7 +5972,6 @@ pub(crate) fn send_failure_status(msg: &str) -> (StatusCode, Option<&'static str
         ("saved resume context", "reconcile the worker identity and active card before restarting"),
         ("active task directory", "restore the recorded task directory or explicitly change the worker directory"),
         ("durable worker directory", "record an absolute directory for this worker before restarting"),
-        ("conflicting live task claims", "reconcile the worker's exact active claim before restarting"),
         ("session is blocked", "remove the lane from ~/.amux/blocked-sessions.txt"),
         ("session is archived", "POST /api/sessions/<name>/wake first"),
         ("terminal client attached", "a terminal client owns the size — detach it, or resize there"),

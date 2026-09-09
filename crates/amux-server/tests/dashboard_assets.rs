@@ -506,7 +506,7 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
         "function _runtimeBoardSplitBadge(s)",
         "s.status !== 'unattributed'",
         "active-conflicting-claims",
-        ">card conflict</span>",
+        "automatically reconciles multiple live task claims",
         // `>card syncing</span>` was pinned here by 03061448 and deliberately
         // REMOVED from app.js by 9127257d ("remove false 'card syncing'
         // badges from worker cards"), which named three distinct causes of
@@ -522,10 +522,12 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
         "normal runtime attribution lag must not manufacture a card-syncing warning");
     assert!(
         app.contains("verdict === 'active-conflicting-claims'")
-            && app.contains("status-badge rate-limited")
+            && app.contains("automatically reconciles multiple live task claims")
             && app.contains("status-badge waiting"),
-        "only competing live claims should receive the red conflict treatment"
+        "competing live claims should stay internal while other unattributed idle states remain visible"
     );
+    assert!(!app.contains(">card conflict</span>"),
+        "claim reconciliation is harness work, not a human-facing status");
     assert!(
         !app.contains(">runtime/board split</span>"),
         "a recoverable task-link lag must not be presented as a red runtime failure"

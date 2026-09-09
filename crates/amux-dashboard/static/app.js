@@ -3473,8 +3473,11 @@ function _runtimeBoardSplitBadge(s) {
   const observed = truth.observed_card_id ? ' Observed ' + esc(truth.observed_card_id) + '.' : '';
   const isRunning = truth.runtime_status === 'active';
   if (verdict === 'active-conflicting-claims') {
-    return '<span class="status-badge rate-limited" title="This running worker has more than one live task claim, so AMUX will not guess.'
-      + observed + ' Diagnostic: ' + esc(verdict) + '.">card conflict</span>';
+    // Competing claims are harness bookkeeping, not a human decision. The
+    // board driver gives the full set back to the model to reconcile; keep the
+    // operator-facing state about execution instead of inventing a red status.
+    return '<span class="status-badge active" title="Working while AMUX automatically reconciles multiple live task claims.'
+      + observed + ' Diagnostic: ' + esc(verdict) + '.">working</span>';
   }
   if (isRunning) {
     return '<span class="status-badge active" title="Running. Board link: ' + esc(verdict) + '.'
@@ -9295,7 +9298,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.849';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.850';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
