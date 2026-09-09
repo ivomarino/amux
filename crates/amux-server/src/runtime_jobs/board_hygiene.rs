@@ -424,40 +424,30 @@ mod tests {
 
     #[test]
     fn find_needsyou_uses_correct_cutoff() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE issues (
-                id TEXT PRIMARY KEY, title TEXT NOT NULL, \"desc\" TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL, session TEXT, creator TEXT NOT NULL DEFAULT '',
-                created INTEGER NOT NULL, updated INTEGER NOT NULL, deleted INTEGER,
-                archived INTEGER NOT NULL DEFAULT 0, log TEXT,
-                owner_type TEXT NOT NULL DEFAULT 'human', type TEXT NOT NULL DEFAULT 'code'
-            )",
-        )
-        .unwrap();
+        let conn = crate::db::migrate::test_memdb();
 
         let now = 1_000_000i64;
         // Card at 15 days: should be found (>= 14 day cutoff)
         conn.execute(
-            "INSERT INTO issues (id, title, status, created, updated) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO issues (id, title, status, created, updated, owner_type) VALUES (?1, ?2, ?3, ?4, ?5, 'agent')",
             rusqlite::params!["NY-1", "old needsyou", "needsyou", now - 15 * 86_400, now],
         )
         .unwrap();
         // Card at 5 days: should NOT be found
         conn.execute(
-            "INSERT INTO issues (id, title, status, created, updated) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO issues (id, title, status, created, updated, owner_type) VALUES (?1, ?2, ?3, ?4, ?5, 'agent')",
             rusqlite::params!["NY-2", "fresh needsyou", "needsyou", now - 5 * 86_400, now],
         )
         .unwrap();
         // Card at 35 days: should be found (and will be discarded)
         conn.execute(
-            "INSERT INTO issues (id, title, status, created, updated) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO issues (id, title, status, created, updated, owner_type) VALUES (?1, ?2, ?3, ?4, ?5, 'agent')",
             rusqlite::params!["NY-3", "ancient needsyou", "needsyou", now - 35 * 86_400, now],
         )
         .unwrap();
         // Deleted card at 20 days: should NOT be found
         conn.execute(
-            "INSERT INTO issues (id, title, status, created, updated, deleted) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO issues (id, title, status, created, updated, deleted, owner_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'agent')",
             rusqlite::params!["NY-4", "deleted needsyou", "needsyou", now - 20 * 86_400, now, 1],
         )
         .unwrap();
@@ -472,34 +462,24 @@ mod tests {
 
     #[test]
     fn find_stale_autofix_uses_correct_cutoff() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE issues (
-                id TEXT PRIMARY KEY, title TEXT NOT NULL, \"desc\" TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL, session TEXT, creator TEXT NOT NULL DEFAULT '',
-                created INTEGER NOT NULL, updated INTEGER NOT NULL, deleted INTEGER,
-                archived INTEGER NOT NULL DEFAULT 0, log TEXT,
-                owner_type TEXT NOT NULL DEFAULT 'human', type TEXT NOT NULL DEFAULT 'code'
-            )",
-        )
-        .unwrap();
+        let conn = crate::db::migrate::test_memdb();
 
         let now = 1_000_000i64;
         // Autofix card at 80h: should be found
         conn.execute(
-            "INSERT INTO issues (id, title, status, creator, created, updated) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO issues (id, title, status, creator, created, updated, owner_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'agent')",
             rusqlite::params!["AF-1", "old autofix", "todo", "autofix", now - 80 * 3600, now],
         )
         .unwrap();
         // Autofix card at 24h: should NOT be found
         conn.execute(
-            "INSERT INTO issues (id, title, status, creator, created, updated) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO issues (id, title, status, creator, created, updated, owner_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'agent')",
             rusqlite::params!["AF-2", "fresh autofix", "todo", "autofix", now - 24 * 3600, now],
         )
         .unwrap();
         // Non-autofix card at 80h: should NOT be found
         conn.execute(
-            "INSERT INTO issues (id, title, status, creator, created, updated) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO issues (id, title, status, creator, created, updated, owner_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'agent')",
             rusqlite::params!["AF-3", "old human card", "todo", "human", now - 80 * 3600, now],
         )
         .unwrap();
@@ -512,34 +492,24 @@ mod tests {
 
     #[test]
     fn find_stale_backlog_excludes_promoted_cards() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE issues (
-                id TEXT PRIMARY KEY, title TEXT NOT NULL, \"desc\" TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL, session TEXT, creator TEXT NOT NULL DEFAULT '',
-                created INTEGER NOT NULL, updated INTEGER NOT NULL, deleted INTEGER,
-                archived INTEGER NOT NULL DEFAULT 0, log TEXT,
-                owner_type TEXT NOT NULL DEFAULT 'human', type TEXT NOT NULL DEFAULT 'code'
-            )",
-        )
-        .unwrap();
+        let conn = crate::db::migrate::test_memdb();
 
         let now = 1_000_000i64;
         // Old backlog card, never promoted: should be found
         conn.execute(
-            "INSERT INTO issues (id, title, status, created, updated) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO issues (id, title, status, created, updated, owner_type) VALUES (?1, ?2, ?3, ?4, ?5, 'agent')",
             rusqlite::params!["BL-1", "stale backlog", "backlog", now - 35 * 86_400, now],
         )
         .unwrap();
         // Old backlog card with "doing" in log: should NOT be found
         conn.execute(
-            "INSERT INTO issues (id, title, status, created, updated, log) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO issues (id, title, status, created, updated, log, owner_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'agent')",
             rusqlite::params!["BL-2", "promoted backlog", "backlog", now - 35 * 86_400, now, "`12:00` moved to doing"],
         )
         .unwrap();
         // Young backlog card: should NOT be found
         conn.execute(
-            "INSERT INTO issues (id, title, status, created, updated) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO issues (id, title, status, created, updated, owner_type) VALUES (?1, ?2, ?3, ?4, ?5, 'agent')",
             rusqlite::params!["BL-3", "fresh backlog", "backlog", now - 5 * 86_400, now],
         )
         .unwrap();
