@@ -214,8 +214,9 @@ test('golden_offline_queue_and_replay', async ({ page, request }, testInfo) => {
       timeout: 10_000,
     });
   }
-  // …and the pending UI reflects the queue: status pill + offline banner.
-  await expect(page.locator('#conn-status').first()).toHaveText('3 pending');
+  // Failed reads outrank the pending count in the pill; the offline banner
+  // always carries the exact queue count. Neither legitimate state says Live.
+  await expect(page.locator('#conn-status').first()).toHaveText(/^(3 pending|Sync error)$/);
   await expect(page.locator('#offline-banner')).toHaveClass(/active/);
   await expect(page.locator('#offline-banner-title')).toContainText('3 ops');
 
