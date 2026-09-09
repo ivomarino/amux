@@ -9298,7 +9298,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.850';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.851';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -37985,6 +37985,87 @@ async function _bwNewProfile() {
     const sel = document.getElementById('bw-profile');
     if (sel) sel.value = d.profile;
   } catch(e) { showToast('Could not create profile'); }
+}
+
+async function _bwImportProfile() {
+  _bwStatus('Scanning for browsers...');
+  let sources;
+  try {
+    const r = await fetch('/api/browser/import/discover');
+    const d = await r.json();
+    sources = d.sources || [];
+  } catch(e) { _bwStatus('Import scan failed: ' + e); return; }
+
+  if (!sources.length) {
+    showToast('No browsers with importable profiles found on this machine');
+    _bwStatus('');
+    return;
+  }
+  _bwStatus('');
+
+  // Build the dialog HTML
+  var html = '<div style="max-height:340px;overflow-y:auto;margin-bottom:12px;">';
+  html += '<div style="font-size:0.78rem;color:var(--dim);margin-bottom:10px;">Select a browser profile to import cookies from.</div>';
+
+  // Radio list: one selection
+  var idx = 0;
+  for (var i = 0; i < sources.length; i++) {
+    var src = sources[i];
+    html += '<div style="margin-bottom:8px;"><div style="font-weight:600;font-size:0.85rem;margin-bottom:4px;">' + esc(src.name);
+    if (src.cookie_support === 'partial') html += ' <span style="color:var(--warn);font-size:0.72rem;">(partial support)</span>';
+    html += '</div>';
+    for (var j = 0; j < src.profiles.length; j++) {
+      var p = src.profiles[j];
+      var rid = 'bwi-radio-' + idx;
+      html += '<label for="' + rid + '" style="display:flex;align-items:center;gap:6px;padding:3px 8px;font-size:0.82rem;cursor:pointer;border-radius:4px;" onmouseover="this.style.background=\'rgba(255,255,255,0.06)\'" onmouseout="this.style.background=\'\'">';
+      html += '<input type="radio" name="bwi-source" id="' + rid + '" value="' + esc(src.id) + '|' + esc(p.name) + '"' + (p.default && idx < 2 ? ' checked' : '') + '>';
+      html += '<span>' + esc(p.display_name);
+      if (p.display_name !== p.name) html += ' <span style="color:var(--dim);font-size:0.72rem;">(' + esc(p.name) + ')</span>';
+      html += '</span></label>';
+      idx++;
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+  html += '<div style="margin-top:4px;"><label style="font-size:0.82rem;font-weight:500;">Destination profile name</label>';
+  html += '<input id="bwi-dest" class="bw-in" style="width:100%;box-sizing:border-box;margin-top:4px;" placeholder="e.g. chrome-default" value="imported-chrome"></div>';
+
+  var ok = await showFormModal('Import browser profile', html, 'Import');
+  if (!ok) return;
+
+  var sel = document.querySelector('input[name="bwi-source"]:checked');
+  if (!sel) { showToast('No source profile selected'); return; }
+  var parts = sel.value.split('|');
+  var browserId = parts[0];
+  var profileName = parts[1];
+  var dest = (document.getElementById('bwi-dest') || {}).value || '';
+  dest = dest.trim();
+  if (!dest) { showToast('Destination name is required'); return; }
+
+  _bwStatus('Importing cookies...');
+  try {
+    var r = await fetch('/api/browser/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ browser_id: browserId, profile_name: profileName, destination: dest })
+    });
+    var d = await r.json();
+    if (d.error) {
+      showToast('Import failed: ' + d.error, 'error');
+      _bwStatus('Import failed');
+      return;
+    }
+    var msg = 'Imported ' + d.imported_cookies + ' cookies into profile "' + esc(d.profile) + '"';
+    if (d.skipped_cookies) msg += ' (' + d.skipped_cookies + ' skipped)';
+    showToast(msg);
+    _bwStatus(msg);
+    await _bwLoadProfiles();
+    var profileSel = document.getElementById('bw-profile');
+    if (profileSel) profileSel.value = d.profile;
+  } catch(e) {
+    showToast('Import failed: ' + e.message, 'error');
+    _bwStatus('Import failed');
+  }
 }
 
 async function _bwSaveProfile() {
