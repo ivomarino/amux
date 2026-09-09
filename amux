@@ -2779,6 +2779,13 @@ if "ask_type" in ign or "ask_actor" in ign:
       case "$id" in
         --help|-h|help) _board_usage 2>/dev/null || true
                         echo "Usage: amux board $status <ISSUE-ID> [--checked \"crit\" ...] [--ack] [--type T] [--reviewer W] [--override-doing] [--trigger \"cond\"] [--force \"reason\"]" >&2
+                        # PER-VERB, because this is the surface a lane reads
+                        # while already running the verb (gtm-engine, AF-635).
+                        # The verb list and the unknown-flag usage both name
+                        # --folded-into now; this one did not, and it is the one
+                        # someone mid-discard actually opens.
+                        [[ "$status" == "discarded" ]] && \
+                          echo "       amux board discard <ISSUE-ID> --folded-into <TARGET-ID>   when its work moved to another card, so the terminal callback names that card instead of telling the sender their request was dropped" >&2
                         return 0 ;;
         -*) die "amux board $status: '$id' looks like a flag, not an ISSUE-ID. Usage: amux board $status <ISSUE-ID> [--checked \"crit\" ...] [--ack] [--type T]" ;;
       esac
