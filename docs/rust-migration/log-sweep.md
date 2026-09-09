@@ -32,6 +32,15 @@ Ethos rule 2: spend the model on JUDGING the numbers, never on producing them.
 The raw `/api/logs` queries in steps 3-5 and below remain the deep-dive
 fallback when a finding needs row-level inspection.
 
+**CLI publication failures do not make an HTTP request (ATE-136).** Also inspect
+`~/.amux/logs/cli-install.log` for the current window: `cli_install_refused`
+names the validation reason, `cli_install_failed` names the failed stage,
+`cli_install_published` records each destination and checksum, and
+`cli_install_complete` confirms the entire payload. Use `rg -a` when searching
+the file. A missing file means no recorded installation, not a successful check.
+If disk pressure prevents writing this audit, the installer reports
+`cli_install_audit_unavailable` on stderr alongside the original verdict.
+
 ## The six sweeps, in order
 
 1. **Errors: one call.** `GET /api/logs/analyze?since_h=24`

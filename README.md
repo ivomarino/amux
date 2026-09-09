@@ -214,6 +214,12 @@ On top of it sits a **daily log sweep**: a scheduler entry that prompts a sessio
 
 ## CLI
 
+`install.sh` also installs the Bash `amux` client. To update just that client
+from a resolved, reviewed checkout, run `make install-cli` (optionally
+`BIN_DIR=/usr/local/bin`). It checks a private snapshot before atomic publication;
+invalid source leaves the installed client intact. Do not point the installed
+client at a mutable checkout with a symlink.
+
 `amux-rs` finds the server via `--url`, then `$AMUX_RS_URL`, then `$AMUX_URL` (every running amux session has it), falling back to `https://localhost:8824` — the port `./install.sh` configures. So a bare invocation just works:
 
 ```bash

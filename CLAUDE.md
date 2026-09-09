@@ -33,10 +33,10 @@ owes two things: the fix, and a log signal so the next instance self-announces
 - `crates/amux-server` -- axum server: `src/api/`, `src/db/`, `migrations/`, `src/runtime_jobs/`
 - `crates/amux-dashboard` -- SPA: `static/` (`index.html`, `app.js`, `app.css`, `sw.js`)
 - `crates/amux-core` / `crates/amux-cli` -- shared types; Rust CLI
-- `amux` -- bash CLI. This file IS the fleet's CLI: `~/.local/bin/amux` is a
-  symlink pointing HERE, not the other way round. Live on save, not on commit —
-  and so also live on `git checkout`, `stash`, or a branch switch, which swap it
-  for all lanes with no save involved.
+- `amux` -- Bash CLI source. Publish a resolved, reviewed checkout with
+  `make install-cli` (`BIN_DIR=/usr/local/bin` for that additional installation).
+  The installer validates a private snapshot and atomically replaces the client.
+  Never symlink the installed client into a mutable worktree or copy it by hand.
 - `e2e/` -- Playwright; `crates/amux-server/tests/` -- integration tests
 - `cloud/` -- cloud.amux.io (read `cloud/README.md` first)
 
@@ -49,7 +49,8 @@ Verify a hook by what it WROTE, not by the settings file.
 
 - **No auto-pull.** Shared checkout; the freshness hook reports staleness, the human decides.
 - **Commit after every completed task.** Committing deploys locally (builder adopts within ~60s).
-- **Bash CLI ships on SAVE** (symlink). `check-and-commit.sh` runs `bash -n` on every save.
+- **Bash CLI ships via `make install-cli`** (also part of `install.sh`).
+  `check-and-commit.sh` checks saves; installation validates the exact published bytes.
   Server ships on COMMIT via the auto-builder.
 - **`CARGO_TARGET_DIR=~/.amux/rust-build-target`** -- one shared build dir, never per-session.
 - **Bracket measurements with `/health`'s `build`** -- the builder swaps the binary on any commit.

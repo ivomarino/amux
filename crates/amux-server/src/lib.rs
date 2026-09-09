@@ -537,6 +537,7 @@ async fn async_main() {
     // cutover and this was not, so /api/stats/daily served a confident
     // total_tokens: 0 for 36 hours (AMUX-2892).
     drop(runtime_jobs::token_ledger::spawn(state.clone()));
+    drop(runtime_jobs::board_hygiene::spawn(state.clone()));
 
     // THE SCHEDULE FIRING LOOP (AMUX-2647). `run_scheduler` existed, was
     // documented, was gated behind `AMUX_RS_SCHEDULER=1` — and had ZERO call

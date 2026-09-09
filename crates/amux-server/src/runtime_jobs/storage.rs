@@ -480,6 +480,60 @@ pub fn rotate_server_log(logs_dir: &Path) -> Option<u64> {
     Some(size)
 }
 
+/// Delete `.log.1` rotated session logs older than `AMUX_ROTATED_LOG_RETAIN_DAYS`
+/// (default 3). Each session's pane log rolls to `.1` at 32MB, but nothing ever
+/// cleaned the `.1` files. With ~50 sessions that is ~1.6GB of stale rotations
+/// accumulating indefinitely (disk cleanup 2026-09-09).
+pub fn prune_rotated_logs(logs_dir: &Path) -> (usize, u64) {
+    let retain_secs = env_u64("AMUX_ROTATED_LOG_RETAIN_DAYS", 3) * 86_400;
+    if retain_secs == 0 {
+        return (0, 0);
+    }
+    let now = std::time::SystemTime::now();
+    let cutoff = std::time::Duration::from_secs(retain_secs);
+    let (mut removed, mut freed) = (0usize, 0u64);
+    let entries = match std::fs::read_dir(logs_dir) {
+        Ok(e) => e,
+        Err(_) => return (0, 0),
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.ends_with(".log.1") {
+            continue;
+        }
+        // Never touch server-rs.log.1 here; rotate_server_log owns that.
+        if name_str == "server-rs.log.1" {
+            continue;
+        }
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let age = now.duration_since(meta.modified().unwrap_or(now)).unwrap_or_default();
+        if age > cutoff {
+            let size = meta.len();
+            if std::fs::remove_file(entry.path()).is_ok() {
+                removed += 1;
+                freed += size;
+            }
+        }
+    }
+    if removed > 0 {
+        tracing::info!(
+            removed,
+            freed_bytes = freed,
+            retain_days = retain_secs / 86_400,
+            knob = "AMUX_ROTATED_LOG_RETAIN_DAYS",
+            "pruned stale .log.1 rotated session logs"
+        );
+    }
+    (removed, freed)
+}
+
 /// Delete files in `dir` whose mtime is older than `max_age_secs`. Returns
 /// (files removed, bytes freed). Non-recursive and never removes directories:
 /// a holding area's SHAPE is somebody's, only its age is ours.
@@ -619,6 +673,8 @@ pub struct StorageReport {
     /// beside `files_removed` so "deleted nothing" and "deleted nothing because
     /// everything was still referenced" are different readings (ethos rule 4).
     pub kept_card_referenced: usize,
+    pub rotated_logs_removed: usize,
+    pub rotated_logs_freed: u64,
     pub free_bytes: Option<u64>,
     pub took_ms: f64,
 }
@@ -680,6 +736,9 @@ pub async fn storage_tick(state: &AppState, home: &Path) -> StorageReport {
 
     let logs = home.join("logs");
     rep.rotated_bytes = rotate_server_log(&logs).unwrap_or(0);
+    let (rl_n, rl_b) = prune_rotated_logs(&logs);
+    rep.rotated_logs_removed = rl_n;
+    rep.rotated_logs_freed = rl_b;
 
     // Age-reaped dirs, driven by the AGE_PRUNED_DIRS authority (above) so the
     // prune and settings::is_ephemeral_path read ONE list. media-cache/uploads
@@ -735,12 +794,14 @@ pub fn spawn(state: AppState) -> Option<super::PeriodicTask> {
             // `kept_card_referenced` is in the guard as well as the payload:
             // a tick whose only action was DECLINING to delete a card's
             // attachment is an action, and it was previously silent.
-            if r.rotated_bytes > 0 || r.files_removed > 0 || r.kept_card_referenced > 0 {
+            if r.rotated_bytes > 0 || r.files_removed > 0 || r.kept_card_referenced > 0 || r.rotated_logs_removed > 0 {
                 tracing::info!(
                     rotated_bytes = r.rotated_bytes,
                     files_removed = r.files_removed,
                     bytes_freed = r.bytes_freed,
                     kept_card_referenced = r.kept_card_referenced,
+                    rotated_logs_removed = r.rotated_logs_removed,
+                    rotated_logs_freed = r.rotated_logs_freed,
                     "storage sweep tick"
                 );
             }
@@ -765,6 +826,7 @@ pub async fn debug_storage() -> axum::Json<Value> {
             "ts_col": s.ts_col, "unit": format!("{:?}", s.unit),
         })).collect::<Vec<_>>(),
         "server_log_max_mb": server_log_max_bytes() / 1024 / 1024,
+        "rotated_log_retain_days": env_u64("AMUX_ROTATED_LOG_RETAIN_DAYS", 3),
         "sweep_secs": env_u64("AMUX_STORAGE_SWEEP_SECS", STORAGE_TICK_SECS),
         "last": r.map(|r| json!({
             "at": r.at, "tables": r.tables, "rotated_bytes": r.rotated_bytes,
@@ -773,6 +835,8 @@ pub async fn debug_storage() -> axum::Json<Value> {
             // "freed nothing because a live card still points at all of it" are
             // different answers and the endpoint has to be able to say which.
             "kept_card_referenced": r.kept_card_referenced,
+            "rotated_logs_removed": r.rotated_logs_removed,
+            "rotated_logs_freed": r.rotated_logs_freed,
             "took_ms": r.took_ms,
         })),
     });
@@ -1091,6 +1155,26 @@ mod tests {
         fd.write_all(b"after\n").unwrap();
         assert!(std::fs::read_to_string(&log).unwrap().contains("after"));
         std::env::remove_var("AMUX_SERVER_LOG_MAX_MB");
+    }
+
+    #[test]
+    fn prune_rotated_logs_skips_fresh_and_server_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path();
+        // Fresh .log.1 should survive
+        std::fs::write(logs.join("session-a.log.1"), b"recent").unwrap();
+        // server-rs.log.1 should always survive (owned by rotate_server_log)
+        std::fs::write(logs.join("server-rs.log.1"), b"server").unwrap();
+        // Non-.log.1 files should survive
+        std::fs::write(logs.join("session-b.log"), b"active").unwrap();
+
+        std::env::set_var("AMUX_ROTATED_LOG_RETAIN_DAYS", "3");
+        let (n, _) = prune_rotated_logs(logs);
+        assert_eq!(n, 0, "nothing is old enough to prune");
+        assert!(logs.join("session-a.log.1").exists());
+        assert!(logs.join("server-rs.log.1").exists());
+        assert!(logs.join("session-b.log").exists());
+        std::env::remove_var("AMUX_ROTATED_LOG_RETAIN_DAYS");
     }
 
     #[test]

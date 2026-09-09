@@ -9536,7 +9536,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.854';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.858';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -11008,7 +11008,6 @@ function _peekPatchChunks(root, chunks) {
   while (root.children.length > chunks.length) root.lastElementChild.remove();
 }
 
-
 // The MARKERS amux stamps on everything it injects into a pane. Structural, not
 // heuristic: each one is a literal prefix the server writes, so matching it is
 // reading amux's own label rather than guessing at prose.
@@ -11184,6 +11183,7 @@ function _showScrollLockBadge(scrollEl, onClickResume) {
   badge.onclick = e => { e.stopPropagation(); onClickResume(); };
   badge.style.display = '';
 }
+
 function _hideScrollLockBadge(scrollEl) {
   const badge = _scrollLockContainer(scrollEl).querySelector('.scroll-lock-badge');
   if (badge) badge.style.display = 'none';
@@ -11659,7 +11659,6 @@ function _paintPeekRegions(body) {
   }
   _peekMsgCount(_peekMsgPrompts());
 }
-
 function applyPeekSearch(keepIndex, doScroll) {
   const body = document.getElementById('peek-body');
   const countEl = document.getElementById('peek-search-count');

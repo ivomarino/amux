@@ -12,9 +12,10 @@
 # processes — see crates/amux-server/src/legacy_port.rs. Do not point anything
 # new at it. Override with AMUX_API for a non-default server.
 #
-# This file is symlinked from ~/.local/bin/amux and re-read on every invocation,
-# so editing the default here moves the whole fleet's bash-CLI traffic at once,
-# with no restart — which is why it is the cheapest lever in the migration.
+# Publish this Bash client with `make install-cli` (ATE-136): the installed
+# copy is a validated snapshot, not a symlink into a mutable checkout. The
+# historical incident below predates that installer; retain the read-once
+# wrapper for direct checkout invocations and older symlink installations.
 
 set -euo pipefail
 
