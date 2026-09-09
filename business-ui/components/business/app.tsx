@@ -64,6 +64,7 @@ import { Toaster, toast } from 'sonner';
 import { Timeline } from '@/components/assistant-ui/elements/timeline';
 import { AgentStatus } from '@/components/assistant-ui/elements/agent-status';
 import {
+  scheduleLabel,
   advancedUrl,
   api,
   attention,
@@ -333,7 +334,7 @@ export default function BusinessApp() {
         <div className="small muted flex gap-2 items-center">
           <CalendarDays size={15} />
           {schedules.length === 1
-            ? schedules[0].schedule_expr || 'Scheduled in Amux'
+            ? scheduleLabel(schedules[0].schedule_expr)
             : schedules.length
               ? `${schedules.length} linked schedules`
               : 'Runs when work is assigned'}

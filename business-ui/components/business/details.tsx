@@ -25,6 +25,7 @@ import { ApprovalCard } from '@/components/assistant-ui/elements/approval-card';
 import { ArtifactCard } from '@/components/assistant-ui/elements/artifact-card';
 import { Timeline } from '@/components/assistant-ui/elements/timeline';
 import {
+  scheduleLabel,
   api,
   collection,
   safeLink,
@@ -541,7 +542,7 @@ export function WorkflowDetail({
                       <div>
                         <h3>{s.title}</h3>
                         <p className="small muted mt-2">
-                          {s.schedule_expr || 'Scheduled in Amux'}
+                          {scheduleLabel(s.schedule_expr)}
                         </p>
                         <p className="meta mt-1">
                           {s.next_run
