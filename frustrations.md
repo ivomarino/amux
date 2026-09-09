@@ -3285,3 +3285,25 @@ COST: Card, callback and terminal-summary validation required a second run to
 FIX: Open. Reproduce with explicit onboarding/configured-install controls and
   preserve intended card navigation. ATE-130 retains both runs and screenshots;
   do not treat retries or a global removal of onboarding as a product fix.
+
+---
+## A pool outage erased pending browser writes while the editor reported Saved
+AREA: browser
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-09
+SESSION: amux-testing-e2e
+CARD: AF-640
+SYMPTOM: During the ENOSPC/pool incident, board PATCHes failed with timed out
+  waiting for connection. The editor still displayed Saved and discarded its
+  draft. Sync cleared localStorage before replay, then could stay at 0/1 on an
+  unbounded request; reloading lost that in-flight intent. An SSE connection
+  could keep the header Live while board reads/writes failed. A cold card open
+  left the previous card's controls saveable, and saves omitted expect_rev.
+COST: Gate/status edits disappeared after reload and the interface claimed
+  durable success while the store was unavailable. The user had to diagnose
+  the discrepancy in the live browser and request coordinated recovery.
+FIX: In progress on AF-640: keep queue entries until exact-card acknowledgment,
+  bound requests, retain failed drafts with visible errors, serialize replay,
+  and pin editor identity/generation/revision. Tests execute shipped functions
+  and real browser flows; combined server/live acceptance remains outstanding.

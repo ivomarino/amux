@@ -41,6 +41,16 @@
  */
 import { test as base, expect } from '@playwright/test';
 import type { Page } from '@playwright/test';
+import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+
+// Browser-only checks can use a prebuilt API server and explicitly pin the
+// candidate asset. The digest records exactly which bytes the run exercised.
+const dashboardSource = process.env.AMUX_E2E_DASHBOARD_SOURCE;
+const dashboardBytes = dashboardSource ? readFileSync(dashboardSource) : null;
+if (dashboardBytes) console.log('[e2e] candidate dashboard asset: ' + dashboardSource
+  + ' sha256=' + createHash('sha256').update(dashboardBytes).digest('hex')
+  + '; API binary is unchanged');
 
 export { expect };
 export type { Page };
@@ -96,6 +106,11 @@ export const test = base.extend<{ page: Page }>({
       );
     };
 
+    if (dashboardBytes) {
+      await page.route('**/app.js', route => route.fulfill({body:dashboardBytes, contentType:'text/javascript'}));
+      // API-only tests do not load a dashboard; their scope is unchanged.
+      allowUnusedRoute(page, '**/app.js');
+    }
     await use(page);
 
     // THE REAL ERROR WINS. See the header: an unhit stub is usually downstream

@@ -923,6 +923,12 @@ document.addEventListener('keydown', function(e) {
 
 // Connection & offline state
 let online = true;
+let _writeError = '';
+let _boardReadError = '';
+let _syncReadError = '';
+let _syncFlight = null;
+let _syncRetryTimer = null;
+const _outboxActive = new Set();
 window.addEventListener('offline', () => setOnline(false));
 window.addEventListener('online', () => { consecutiveFailures = 0; setOnline(true); });
 // Migrate localStorage keys from cc_ to amux_
@@ -933,14 +939,38 @@ window.addEventListener('online', () => { consecutiveFailures = 0; setOnline(tru
     localStorage.removeItem('cc_' + k);
   }
 });
-let offlineQueue = JSON.parse(localStorage.getItem('amux_offline_queue') || '[]');
-function saveQueue() {
-  localStorage.setItem('amux_offline_queue', JSON.stringify(offlineQueue));
-  if (typeof _idb !== 'undefined') _idb.set('offline_queue', offlineQueue);
-  // Keep pending-message visibility live (Messages tab badge + composer pill)
-  try { if (typeof _peekMessagesBadge === 'function') _peekMessagesBadge(); } catch(e) {}
-  try { if (typeof _peekTab !== 'undefined' && _peekTab === 'messages') _peekMessagesRender(); } catch(e) {}
+let offlineQueue = [];
+try { offlineQueue = _readQueue(); } catch (error) { _writeError = error.message; }
+// Queue changes use a short storage lock. Delivery has a separate lock so a
+// slow server never holds up a new local edit. Always reread under the lock:
+// a tab's in-memory queue is a view, not authority to overwrite another tab.
+function _readQueue() {
+  const value = JSON.parse(localStorage.getItem('amux_offline_queue') || '[]');
+  if (!Array.isArray(value)) throw new Error('Pending changes need recovery: invalid queue');
+  return value;
 }
+function _outboxLock(name, work) {
+  if (!navigator.locks) return Promise.reject(new Error('Safe pending-change storage is unavailable in this browser; keep your draft and use a secure connection'));
+  return navigator.locks.request(name, work);
+}
+async function _mutateQueue(change) {
+  return _outboxLock('amux-outbox-storage', () => {
+    const current = _readQueue();
+    for (const entry of current) if (!entry.id) entry.id = crypto.randomUUID();
+    const result = change(current);
+    localStorage.setItem('amux_offline_queue', JSON.stringify(current));
+    offlineQueue = current;
+    if (typeof _idb !== 'undefined') _idb.set('offline_queue', current);
+    try { _peekMessagesBadge(); } catch (_) {}
+    try { if (_peekTab === 'messages') _peekMessagesRender(); } catch (_) {}
+    return result;
+  });
+}
+window.addEventListener('storage', event => {
+  if (event.key !== 'amux_offline_queue') return;
+  try { offlineQueue = _readQueue(); updateConnectionStatus(); _scheduleSyncRetry(); }
+  catch (error) { _writeError = error.message; updateConnectionStatus(); }
+});
 
 // ═══════ CONNECTION HISTORY ═══════
 // Log every connection-state transition (live ↔ polling ↔ offline) with a
@@ -1927,7 +1957,8 @@ function describeOp(item) {
 // Connection status
 function updateConnectionStatus() {
   // Log the state transition (for the click-to-view disconnection history).
-  const readState = _sessionLoadError ? (_sessionLoadError.status === 401 ? 'auth' : 'error') : null;
+  const readState = _sessionLoadError ? (_sessionLoadError.status === 401 ? 'auth' : 'error')
+    : (_writeError || _boardReadError || _syncReadError ? 'error' : null);
   _recordConnState(readState || (!online ? 'offline' : (_liveSSE ? 'live' : 'polling')));
   // Update all connection status indicators (main + peek)
   document.querySelectorAll('#conn-status').forEach(el => {
@@ -1938,6 +1969,9 @@ function updateConnectionStatus() {
       el.className = 'conn-status offline';
       const total = offlineQueue.length + drafts.length;
       el.textContent = total ? total + ' pending' : 'Offline';
+    } else if (offlineQueue.length) {
+      el.className = 'conn-status polling';
+      el.textContent = offlineQueue.length + ' pending';
     } else if (_liveSSE) {
       el.className = 'conn-status online';
       el.textContent = 'Live';
@@ -1958,7 +1992,7 @@ function updateConnectionStatus() {
   const title = document.getElementById('offline-banner-title');
   if (!banner) return;
   const hasPending = offlineQueue.length || drafts.length;
-  if (online || !hasPending) {
+  if (!hasPending) {
     banner.classList.remove('active');
     return;
   }
@@ -1966,7 +2000,7 @@ function updateConnectionStatus() {
   const parts = [];
   if (drafts.length) parts.push(drafts.length + ' draft' + (drafts.length === 1 ? '' : 's'));
   if (offlineQueue.length) parts.push(offlineQueue.length + ' op' + (offlineQueue.length === 1 ? '' : 's'));
-  title.innerHTML = '&#x26A0; Offline &mdash; ' + parts.join(', ') + ' pending';
+  title.innerHTML = '&#x26A0; ' + (online ? 'Unsaved changes' : 'Offline') + ' &mdash; ' + parts.join(', ') + ' pending';
   const rows = [];
   drafts.forEach(d => {
     rows.push('<div class="offline-op">' +
@@ -1978,7 +2012,7 @@ function updateConnectionStatus() {
     const age = Math.floor((Date.now() - item.timestamp) / 60000);
     const timeStr = age < 1 ? 'just now' : age + 'm ago';
     rows.push('<div class="offline-op">' +
-      '<span class="op-action">' + esc(describeOp(item)) + '</span>' +
+      '<span class="op-action">' + esc(describeOp(item)) + (item.error ? ' — ' + esc(item.error) : '') + '</span>' +
       '<span class="op-time">' + timeStr + '</span>' +
     '</div>');
   });
@@ -2156,33 +2190,30 @@ function setOnline(val) {
 }
 
 // ═══════ SYNC BANNER ORCHESTRATOR ═══════
-async function runSyncBanner() {
+function _scheduleSyncRetry() {
+  clearTimeout(_syncRetryTimer);
+  if (offlineQueue.some(q => q.state !== 'blocked') || drafts.length) {
+    _syncRetryTimer = setTimeout(() => { if (online) runSyncBanner(); else _scheduleSyncRetry(); }, 15000);
+  }
+}
+function runSyncBanner() {
+  if (_syncFlight) return _syncFlight;
+  const run = async () => { await _mutateQueue(() => {}); return _runSyncBanner(); };
+  _syncFlight = (navigator.locks
+    ? navigator.locks.request('amux-outbox-replay', run) : run())
+    .catch(e => { _writeError = String(e.message || e); showToast('Sync failed: ' + _writeError); })
+    .finally(() => { _syncFlight = null; updateConnectionStatus(); _scheduleSyncRetry(); });
+  return _syncFlight;
+}
+async function _runSyncBanner() {
   const banner = document.getElementById('sync-banner');
   const itemsEl = document.getElementById('sync-items');
   const titleEl = document.getElementById('sync-title-text');
   const draftCount = drafts.length;
-  const rawQueue = [...offlineQueue];
-  offlineQueue = [];
-  saveQueue();
-  let queue = reconcileQueue(rawQueue);
-  // Drop anything unreplayable that a PREVIOUS client version persisted — the
-  // pre-2026-08-11 apiCall queued GETs (and FormData bodies) that no replay
-  // can honestly re-issue. This is the half of the fix that reaches users who
-  // already have a poisoned localStorage: the enqueue guard stops new ones,
-  // this clears the ones already on disk. Beacons from HERE are the reliable
-  // signal, because replay only ever runs while online.
-  const unreplayable = queue.filter(q => !_outboxQueueable(q.url, q.options || {}));
-  if (unreplayable.length) {
-    queue = queue.filter(q => _outboxQueueable(q.url, q.options || {}));
-    try {
-      amuxTrack('outbox_unreplayable_dropped', {
-        n: unreplayable.length,
-        sample: unreplayable.slice(0, 5).map(q =>
-          ((q.options && q.options.method) || 'GET') + ' ' + String(q.url).split('?')[0]).join(', '),
-      });
-    } catch (e) {}
-  }
-  const skipped = rawQueue.length - queue.length;
+  // Keep every operation durable until its individual acknowledgement. A
+  // reload, timeout, or second replay must never erase an in-flight write.
+  const queue = offlineQueue.filter(q => q.state !== 'blocked' && !_outboxActive.has(q.id));
+  const skipped = 0;
   const totalOps = draftCount + queue.length;
   if (!totalOps) return;
 
@@ -2204,33 +2235,21 @@ async function runSyncBanner() {
   renderBanner();
   banner.classList.add('active');
 
-  // Sync drafts first
+  // A draft is a sequence of accepted writes. Keep its completed steps and
+  // prompt identity across failure/reload; never call a failed start "synced".
   for (const item of items.filter(i => i.type === 'draft')) {
-    item.status = 'running';
-    renderBanner();
+    item.status = 'running'; renderBanner();
     try {
-      const draft = item.draft;
-      draft.syncing = true; saveDrafts(); render();
-      const createResp = await _origFetch(API + '/api/sessions', {
-        method: 'POST', headers: _authHeaders({'Content-Type':'application/json'}),
-        body: JSON.stringify({ name: draft.name, dir: draft.dir })
-      });
-      if (!createResp.ok && createResp.status !== 409) {
-        item.status = 'failed'; draft.syncing = false; saveDrafts(); renderBanner(); continue;
-      }
-      await _applyYoloDefault(draft.name);   // YOLO-by-default applies to synced drafts too
-      const startResp = await _origFetch(API + '/api/sessions/' + encodeURIComponent(draft.name) + '/start', { method: 'POST', headers: _authHeaders() });
-      if (draft.prompt && startResp.ok) {
-        await new Promise(r => setTimeout(r, 5000));
-        await _origFetch(API + '/api/sessions/' + encodeURIComponent(draft.name) + '/send', {
-          method: 'POST', headers: _authHeaders({'Content-Type':'application/json'}),
-          body: JSON.stringify({ text: draft.prompt })
-        });
-      }
-      removeDraft(draft.name); render();
+      await _syncOneDraft(item.draft);
+      removeDraft(item.draft.name); render();
       item.status = 'done';
-    } catch(e) {
-      item.status = 'failed'; item.draft.syncing = false; saveDrafts();
+    } catch (error) {
+      item.status = 'failed'; item.draft.syncing = false;
+      item.draft.error = String(error.message || error);
+      item.label += ' — ' + item.draft.error;
+      _writeError = item.draft.error;
+      saveDrafts();
+      try { amuxTrack('outbox_draft_failed', {session:item.draft.name, error:item.draft.error}); } catch (_) {}
     }
     renderBanner();
   }
@@ -2238,26 +2257,51 @@ async function runSyncBanner() {
   // Then replay queue items — via _origFetch so the outbox interceptor can't
   // re-capture its own replay (double-queue), with auth headers applied FRESH
   // (they were not stamped at queue time, and a stale token would 401).
+  const failedResources = new Set();
   for (const item of items.filter(i => i.type === 'queue')) {
+    const q = item.item;
+    if (failedResources.has(q.url)) { item.status = 'failed'; continue; }
     item.status = 'running';
     renderBanner();
+    await _outboxLock('amux-outbox-delivery:' + q.id, async () => {
+    const fresh = _readQueue().find(entry => entry.id === q.id);
+    if (!fresh) { offlineQueue = _readQueue(); item.status = 'done'; return; }
+    Object.assign(q, fresh);
+    if (q.state === 'blocked') { item.status = 'failed'; return; }
     try {
-      const opts = { ...item.item.options, headers: _authHeaders(item.item.options.headers) };
-      const r = await _origFetch(item.item.url, opts);
-      if (r.status >= 500 || r.status === 401 || r.status === 408 || r.status === 429) {
-        offlineQueue.push(item.item); item.status = 'failed';   // transient — keep for next sync
-      } else if (!r.ok) {
-        item.status = 'failed';   // permanent 4xx — surface it, but don't retry forever
-      } else {
-        item.status = 'done';
+      if (!_outboxQueueable(q.url, q.options || {}) || (q.timestamp && Date.now() - (q.reviewed_at || q.timestamp) > 7 * 86400000)) {
+        q.state = 'blocked';
+        throw new Error('Needs review before retry: expired or unsupported operation');
       }
+      const opts = { ...q.options, headers: _authHeaders(q.options.headers) };
+      const r = await _boundedMutationFetch(q.url, opts);
+      if (!r.ok) {
+        if (!(r.status >= 500 || [401, 408, 429].includes(r.status))) q.state = 'blocked';
+        throw new Error(await _apiErrText(r));
+      }
+      if (/\/api\/board\/[^/?]+$/.test(q.url) && (q.options.method || '').toUpperCase() === 'PATCH') {
+        const acknowledged = await r.clone().json();
+        _validateBoardAcknowledgement(acknowledged, q.url);
+        _outboxBoardAcknowledged(acknowledged);
+      }
+      await _mutateQueue(current => { const at = current.findIndex(entry => entry.id === q.id); if (at >= 0) current.splice(at, 1); });
+      item.status = 'done';
     } catch(e) {
-      offlineQueue.push(item.item); item.status = 'failed';
+      if (e.outboxBlocked) q.state = 'blocked';
+      q.error = String(e.message || e);
+      q.attempts = (q.attempts || 0) + 1;
+      _writeError = q.error;
+      await _mutateQueue(current => { const saved = current.find(entry => entry.id === q.id); if (saved) Object.assign(saved, {state: q.state, error: q.error, attempts: q.attempts}); });
+      failedResources.add(q.url);
+      item.status = 'failed';
+      item.label += ' — ' + q.error;
+      try { amuxTrack('outbox_retry_failed', {id: q.id, status: q.state || 'pending', error: q.error}); } catch (_) {}
     }
+    });
     renderBanner();
   }
+  if (!offlineQueue.length && !drafts.length) _writeError = '';
 
-  if (offlineQueue.length) saveQueue();
   const doneCount = items.filter(i => i.status === 'done').length;
   const failCount = items.filter(i => i.status === 'failed').length;
   titleEl.textContent = doneCount + ' synced' + (failCount ? ', ' + failCount + ' failed' : '') + (skipped ? ', ' + skipped + ' skipped' : '');
@@ -2272,6 +2316,39 @@ async function runSyncBanner() {
   if (!failCount) setTimeout(() => banner.classList.remove('active'), 4000);
 }
 
+async function _syncOneDraft(draft) {
+  draft.syncing = true; saveDrafts(); render();
+  const root = API + '/api/sessions/' + encodeURIComponent(draft.name);
+  if (!draft.synced_create) {
+    const created = await _boundedMutationFetch(API + '/api/sessions', {
+      method:'POST', headers:_authHeaders({'Content-Type':'application/json'}),
+      body:JSON.stringify({name:draft.name, dir:draft.dir}),
+    });
+    if (!created.ok) throw new Error('Create worker: ' + await _apiErrText(created));
+    draft.synced_create = true; saveDrafts();
+    await _applyYoloDefault(draft.name);
+  }
+  if (!draft.synced_start) {
+    const started = await _boundedMutationFetch(root + '/start', {method:'POST', headers:_authHeaders()});
+    if (!started.ok) throw new Error('Start worker: ' + await _apiErrText(started));
+    draft.synced_start = true; saveDrafts();
+  }
+  if (draft.prompt) {
+    if (!draft.msg_id) { draft.msg_id = crypto.randomUUID(); saveDrafts(); }
+    const sent = await _boundedMutationFetch(root + '/send', {
+      method:'POST', headers:_authHeaders({'Content-Type':'application/json'}),
+      body:JSON.stringify({text:draft.prompt, msg_id:draft.msg_id}),
+    });
+    if (!sent.ok) throw new Error('Send prompt: ' + await _apiErrText(sent));
+  }
+}
+
+async function _removeQueuedOperation(id) {
+  await _mutateQueue(current => { const at = current.findIndex(q => q.id === id); if (at >= 0) current.splice(at, 1); });
+  if (!offlineQueue.length && !drafts.length) _writeError = '';
+  updateConnectionStatus(); showQueueModal();
+}
+
 // Queue modal
 function showQueueModal() {
   const el = document.getElementById('queue-list');
@@ -2282,6 +2359,8 @@ function showQueueModal() {
       '<div class="queue-item">' +
         esc(describeOp(item)) +
         '<br><span class="queue-time">' + new Date(item.timestamp).toLocaleTimeString() + '</span>' +
+        (item.error ? '<div class="queue-error">' + esc(item.error) + '</div>' : '') +
+        '<button class="btn" onclick="_removeQueuedOperation(\'' + escJs(item.id) + '\')">Discard this queued change</button>' +
       '</div>'
     ).join('');
   }
@@ -2290,9 +2369,9 @@ function showQueueModal() {
 function closeQueueModal() {
   document.getElementById('queue-overlay').classList.remove('active');
 }
-function clearQueue() {
-  offlineQueue = [];
-  saveQueue();
+async function clearQueue() {
+  await _mutateQueue(current => { current.length = 0; });
+  _writeError = '';
   updateConnectionStatus();
   closeQueueModal();
   showToast('Queue cleared');
@@ -2300,6 +2379,7 @@ function clearQueue() {
 async function forceRetry() {
   closeQueueModal();
   if (!offlineQueue.length && !drafts.length) return;
+  await _mutateQueue(current => current.forEach(q => { q.state = 'pending'; q.reviewed_at = Date.now(); }));
   if (online) { runSyncBanner(); } else { setOnline(true); }
 }
 
@@ -2373,7 +2453,7 @@ function _warnIgnoredFields(r, url, options) {
 
 async function apiCall(url, options) {
   if (!online) {
-    _queueOp(url, options);
+    await _queueOp(url, options);
     return null;
   }
   try {
@@ -2405,7 +2485,8 @@ async function apiCall(url, options) {
     // The GET paths (fetchSessions, the status poll) reset unconditionally and
     // correctly: the outbox only intercepts POST/PATCH/PUT/DELETE, so a
     // successful GET really did reach the server.
-    if (!_isLocallyQueued(r)) consecutiveFailures = 0;
+    if (_isLocallyQueued(r)) return null;
+    consecutiveFailures = 0;
     // No _warnIgnoredFields call here: apiCall goes through fetch, which the
     // watch at the top of this file already wraps. Calling it here too would
     // toast twice for every apiCall mutation.
@@ -2416,11 +2497,11 @@ async function apiCall(url, options) {
     consecutiveFailures++;
     if (consecutiveFailures >= 2) setOnline(false);
     amuxTrack('api_unreachable', { url: url.split('?')[0], err: String(e).slice(0, 200) });
-    _queueOp(url, options);
+    await _queueOp(url, options);
     return null;
   }
 }
-function _queueOp(url, options) {
+async function _queueOp(url, options) {
   // THE SINGLE ENFORCEMENT POINT for what may enter the outbox.
   //
   // There are two independent queuing paths — apiCall's `!online` branch and
@@ -2449,11 +2530,6 @@ function _queueOp(url, options) {
     } catch (e) {}
     return false;
   }
-  // Cap the outbox so localStorage can't overflow — oldest ops drop first
-  if (offlineQueue.length >= 200) {
-    offlineQueue.shift();
-    showToast('Offline queue full — oldest operation dropped');
-  }
   let body = options.body;
   // Sends/steers dedup server-side on msg_id — make sure every queued one has
   // it, so a replay after a lost response can't deliver the message twice.
@@ -2466,22 +2542,30 @@ function _queueOp(url, options) {
       }
     } catch (e) {}
   }
-  offlineQueue.push({ url, options: { method: options.method, headers: options.headers, body }, timestamp: Date.now() });
-  saveQueue();
+  const entry = { id: options._outboxId || crypto.randomUUID(), url, options: { method: options.method, headers: options.headers, body }, timestamp: Date.now(), state: 'pending' };
+  try {
+    await _mutateQueue(current => {
+      if (current.some(q => q.id === entry.id)) return;
+      if (current.length >= 200) throw new Error('Queue full — this change was not queued; keep the draft');
+      current.push(entry);
+    });
+  } catch (e) {
+    _writeError = e.name === 'QuotaExceededError'
+      ? 'Device storage full — change is not safely queued; keep the draft' : e.message;
+    showToast(_writeError); updateConnectionStatus();
+    try { amuxTrack('outbox_storage_failed', {error: _writeError}); } catch (_) {}
+    return false;
+  }
+  _scheduleSyncRetry();
   updateConnectionStatus();
-  showToast('Queued (' + offlineQueue.length + ' pending)');
+  if (!options._outboxId) showToast('Queued (' + offlineQueue.length + ' pending)');
   return true;
 }
 
 // ═══════ GLOBAL OFFLINE OUTBOX — fetch interceptor ═══════
-// Dozens of call sites issue raw fetch() mutations; offline they used to just
-// throw and the command was LOST. This wrapper implements the outbox pattern
-// at the fetch boundary so every API command flows through offline sync
-// without touching call sites. PASSIVE by design: while online it delegates
-// straight to the native fetch (zero behavioral change); only a request that
-// would otherwise fail (offline, or the network throws) gets captured into
-// the queue, and the caller receives a synthetic 202 {queued:true} so UI
-// code treats it as accepted rather than crashed.
+// Board edits persist before transmission. Transient failures keep the same
+// intent for retry; only a real acknowledgement removes it. A marked local
+// 202 means queued, and callers must not present it as saved or delivered.
 const _origFetch = window.fetch.bind(window);
 // Never queue interactive/ephemeral endpoints: telemetry, speed tests, live
 // terminal keystrokes, uploads (bodies too big for localStorage), login and
@@ -2531,14 +2615,80 @@ function _isLocallyQueued(r) {
   try { return !!(r && r.status === 202 && r.headers && r.headers.get('X-Amux-Outbox') === 'queued'); }
   catch (e) { return false; }
 }
-window.fetch = function(input, init) {
+function _outboxRequestOptions(url, init) {
+  // Assign the server's deduplication key before the FIRST attempt. Creating
+  // it only after a lost response makes the retry a second message.
+  if (typeof init?.body !== 'string' || !/\/(send|steer)$/.test(url.split('?')[0])) return init;
+  try {
+    const body = JSON.parse(init.body);
+    if (body.msg_id) return init;
+    return { ...init, body: JSON.stringify({ ...body, msg_id: crypto.randomUUID() }) };
+  } catch (_) { return init; }
+}
+function _validateBoardAcknowledgement(card, url) {
+  if (card?.id !== decodeURIComponent(url.split('/').pop())) throw Object.assign(new Error('Server did not acknowledge the exact card'), {outboxBlocked:true});
+  if (card.ignored_fields?.length) throw Object.assign(new Error('Not saved: server ignored ' + card.ignored_fields.join(', ')), {outboxBlocked:true});
+}
+function _outboxBoardAcknowledged(card) {
+  const draft = _boardDrafts[card.id];
+  if (draft && !_bdDraftHasActiveEdits(draft, card) && (!draft.status || draft.status === card.status)) {
+    delete _boardDrafts[card.id];
+    _boardDraftsPersist();
+  }
+}
+async function _boundedMutationFetch(input, init) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  const signal = init && init.signal
+    ? AbortSignal.any([init.signal, controller.signal]) : controller.signal;
+  try {
+    const response = await _origFetch(input, { ...init, signal });
+    const bytes = await response.arrayBuffer();
+    return new Response([204, 205, 304].includes(response.status) ? null : bytes, {status: response.status, statusText: response.statusText, headers: response.headers});
+  } finally { clearTimeout(timer); }
+}
+window.fetch = async function(input, init) {
   const url = typeof input === 'string' ? input : (input && input.url) || '';
   if (!_outboxQueueable(url, init)) return _origFetch(input, init);
+  init = _outboxRequestOptions(url, init);
   if (!online) {
-    _queueOp(url, init || {});
-    return Promise.resolve(_outboxAccepted());
+    return Promise.resolve(await _queueOp(url, init || {}) ? _outboxAccepted() : new Response('Queue unavailable', {status: 507}));
   }
-  return _origFetch(input, init).catch(e => {
+  const durableId = /\/api\/board\/[^/?]+$/.test(url) && (init?.method || '').toUpperCase() === 'PATCH' ? crypto.randomUUID() : null;
+  const deliver = async () => {
+  if (durableId) {
+    init = { ...init, _outboxId: durableId };
+    if (!await _queueOp(url, init)) return Promise.resolve(new Response('Queue unavailable', {status: 507}));
+    _outboxActive.add(durableId);
+  }
+  return _boundedMutationFetch(input, init).then(async r => {
+    if (r.status >= 500 || [401, 408, 429].includes(r.status)) {
+      _writeError = 'Server did not save the change (' + r.status + ')';
+      if (await _queueOp(url, init || {})) return _outboxAccepted();
+    }
+    if (durableId) {
+      const q = offlineQueue.find(q => q.id === durableId);
+      if (r.ok) {
+        const acknowledged = await r.clone().json();
+        _validateBoardAcknowledgement(acknowledged, url);
+        await _mutateQueue(current => { const at = current.findIndex(q => q.id === durableId); if (at >= 0) current.splice(at, 1); });
+        if (!offlineQueue.length && !drafts.length) _writeError = '';
+      } else if (q) {
+        q.state = 'blocked'; q.error = 'Not saved (' + r.status + ') — review this change before retry';
+        _writeError = q.error;
+        await _mutateQueue(current => { const saved = current.find(q => q.id === durableId); if (saved) Object.assign(saved, {state: q.state, error: q.error}); });
+      }
+      updateConnectionStatus();
+    }
+    return r;
+  }).catch(async e => {
+    if (durableId && e.outboxBlocked) {
+      _writeError = e.message;
+      await _mutateQueue(current => { const q = current.find(q => q.id === durableId); if (q) Object.assign(q, {state:'blocked', error:e.message}); });
+      updateConnectionStatus();
+      try { amuxTrack('outbox_acknowledgement_refused', {id:durableId, error:e.message}); } catch (_) {}
+      return new Response(e.message, {status:409});
+    }
     consecutiveFailures++;
     if (consecutiveFailures >= 2) setOnline(false);
     // BEACON — this path queues the op and returns a synthetic 202, so the
@@ -2556,9 +2706,11 @@ window.fetch = function(input, init) {
         err: String(e).slice(0, 200),
       });
     } catch (_) {}
-    _queueOp(url, init || {});
-    return _outboxAccepted();
-  });
+    _writeError = 'Server unreachable; changes are pending';
+    return await _queueOp(url, init || {}) ? _outboxAccepted() : new Response('Queue unavailable', {status: 507});
+  }).finally(() => { if (durableId) _outboxActive.delete(durableId); });
+  };
+  return durableId ? _outboxLock('amux-outbox-delivery:' + durableId, deliver) : deliver();
 };
 
 // Reconcile queue: remove contradictory/stale operations before replay
@@ -6569,6 +6721,7 @@ async function doSend(name, text) {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: sendBody
     });
+    if (_isLocallyQueued(r)) return 'queued';
     if (r.ok) return 'sent';
     if (r.status === 409) {
       const d = await r.json().catch(() => ({}));
@@ -6594,11 +6747,11 @@ async function doSend(name, text) {
   } catch(e) {
     // Offline — queue it (same body, same msg_id → server-side dedup if the
     // original request actually landed before the connection died)
-    _queueOp(API + '/api/sessions/' + encodeURIComponent(name) + '/send', {
+    const queued = await _queueOp(API + '/api/sessions/' + encodeURIComponent(name) + '/send', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: sendBody
     });
-    return 'queued';
+    return queued ? 'queued' : 'failed';
   }
 }
 
@@ -15106,10 +15259,10 @@ function _pendingSendsFor(session) {
   });
   return out;
 }
-function _pendingCancel(idx) {
+async function _pendingCancel(idx) {
   if (idx < 0 || idx >= offlineQueue.length) return;
-  offlineQueue.splice(idx, 1);
-  saveQueue();
+  const id = offlineQueue[idx].id;
+  await _mutateQueue(current => { const at = current.findIndex(q => q.id === id); if (at >= 0) current.splice(at, 1); });
   updateConnectionStatus();
   _peekMessagesRender();
   showToast('Removed from queue');
@@ -24861,7 +25014,13 @@ async function fetchBoard() {
       fetch(API + '/api/board/statuses'),
       fetch(API + '/api/board/session-gates'),
     ]);
+    for (const response of [r, rs, rsg]) {
+      if (!response.ok && response.status !== 304) throw new Error(await _apiErrText(response));
+    }
     const statusData = await rs.json();
+    if (!Array.isArray(statusData)) throw new Error('Board statuses response is invalid');
+    _boardReadError = '';
+    updateConnectionStatus();
     // r.ok FIRST: a 404 body {"error":"not found"} IS an object, so the typeof
     // guard below happily assigned it and sessionGates became {error:"not found"} —
     // not merely empty, POISONED with a bogus scope key, while this endpoint 404'd
@@ -24897,8 +25056,7 @@ async function fetchBoard() {
     // the SHELL (and its injected token) is stale, so refresh it once.
     if (!Array.isArray(data)) {
       if (r.status === 401) _staleShellRecover();
-      console.warn('board fetch returned non-array (status ' + r.status + ') — keeping previous set');
-      return;
+      throw new Error('Board response is invalid');
     }
     if (snapshotEpoch !== _boardSnapshotEpoch) {
       console.info('board poll completed behind a newer stream snapshot; discarded');
@@ -24943,6 +25101,8 @@ async function fetchBoard() {
       if (cr.ok) { const cd = await cr.json(); if (cd.cursor) _cdcSeq = cd.cursor; }
     } catch (e2) {}
   } catch(e) {
+    _boardReadError = String(e.message || e);
+    updateConnectionStatus();
     console.error('fetch board:', e);
     consecutiveFailures++;
     if (consecutiveFailures >= 2 || navigator.onLine === false) {
@@ -27843,6 +28003,7 @@ document.addEventListener('change', e => {
 // The SAVE path refuses to write a desc while this is false and the card is
 // known to have one — see the guard in the save handler (AMUX-2840).
 let _bdHydrated = false;
+let _bdLoadedIdentity = null;
 
 function _bdConfigureGo(item) {
   const goBtn = document.getElementById('bd-goto-session');
@@ -28096,13 +28257,16 @@ function _bdRenderMeta(item) {
 /// saving would BLANK the description. This makes the modal read from the one
 /// place that always has it.
 async function _bdHydrate(id) {
+  const generation = _boardDetailOpenGeneration;
+  // Compare controls with the snapshot used when hydration began. A board
+  // poll may update the cache during this GET without changing the editor.
+  const cached = { ...(boardItems.find(item => item.id === id) || {}) };
   try {
     const r = await apiCall(API + '/api/board/' + id);
     if (!r || !r.ok) return false;
     const full = await r.json();
-    if (!full || full.id !== id || boardDetailId !== id) return false;  // modal moved on
+    if (!full || full.id !== id || boardDetailId !== id || generation !== _boardDetailOpenGeneration) return false;  // modal moved on
     const idx = boardItems.findIndex(i => i.id === id);
-    const cached = idx >= 0 ? { ...boardItems[idx] } : {};
     if (idx >= 0) boardItems[idx] = Object.assign({}, boardItems[idx], full);
     const merged = idx >= 0 ? boardItems[idx] : full;
     let draft = _boardDrafts[id];
@@ -28164,6 +28328,7 @@ async function _bdHydrate(id) {
       _tagState['bd'] = [...(full.tags || [])]; _beTagRenderChips('bd'); _beTagInputUpdate('bd');
     }
     _bdHydrated = true;
+    _bdLoadedIdentity = { id, generation, rev: keepLocalDraft ? (draft?.expect_rev ?? cached.rev) : full.rev };
     return true;
   } catch (e) { /* leave unhydrated; the save guard covers it */ return false; }
 }
@@ -28171,6 +28336,8 @@ async function _bdHydrate(id) {
 async function openBoardDetail(id) {
   const detailGeneration = ++_boardDetailOpenGeneration;
   const detailIdentityCurrent = () => detailGeneration === _boardDetailOpenGeneration;
+  _bdHydrated = false;
+  _bdLoadedIdentity = null;
   let item = boardItems.find(i => i.id === id);
   if (!item) {
     // Message history, lineage, and deep links can point at an older terminal
@@ -28208,7 +28375,7 @@ async function openBoardDetail(id) {
   const draft = _boardDrafts[id];
   _bdActiveDirty = false;
   boardDetailStatus = draft ? draft.status : (item.status || 'todo');
-  _bdHydrated = (item.desc !== undefined);
+  _bdHydrated = false;
   _bdHydrate(id);
   const titleEl = document.getElementById('bd-title');
   titleEl.value = _bdDraftField(draft, 'title', item.title);
@@ -28233,9 +28400,9 @@ async function openBoardDetail(id) {
   const dueTimeEl = document.getElementById('bd-due-time');
   if (dueTimeEl) dueTimeEl.value = _bdDraftField(draft, 'due_time', item.due_time || '') || '';
   const gateEl = document.getElementById('bd-gate');
-  if (gateEl) gateEl.value = (Array.isArray(item.gate) ? item.gate : []).join('\n');
+  if (gateEl) gateEl.value = _bdDraftField(draft, 'gate', item.gate || []).join('\n');
   boardDetailTab('preview');
-  _tagState['bd'] = [...(item.tags || [])];
+  _tagState['bd'] = [..._bdDraftField(draft, 'tags', item.tags || [])];
   _beTagRenderChips('bd');
   _beTagInputUpdate('bd');
   _bdRenderMeta(item);
@@ -28401,7 +28568,7 @@ function boardDetailSetStatus(st) {
 
 function closeBoardDetail() {
   // Save unsaved edits as draft
-  if (boardDetailId) {
+  if (boardDetailId && _bdLoadedIdentity?.generation === _boardDetailOpenGeneration) {
     const item = boardItems.find(i => i.id === boardDetailId);
     if (item) {
       const t = (document.getElementById('bd-title').value || '').trim();
@@ -28414,8 +28581,8 @@ function closeBoardDetail() {
       const dueTimeEl2 = document.getElementById('bd-due-time');
       const due_time = dueTimeEl2 ? dueTimeEl2.value : (item.due_time || '');
       // Only save draft if something actually differs from saved state
-      if (t !== (item.title || '') || d !== (item.desc || '') || s !== (item.session || '') || st !== (item.status || 'todo') || due !== (item.due || '') || due_time !== (item.due_time || '')) {
-        _boardDrafts[boardDetailId] = { title: t, desc: d, worker: s, status: st, due, due_time };
+      if (t !== (item.title || '') || d !== (item.desc || '') || s !== (item.session || '') || st !== (item.status || 'todo') || due !== (item.due || '') || due_time !== (item.due_time || '') || _bdActiveDirty) {
+        _boardDrafts[boardDetailId] = { title: t, desc: d, worker: s, status: st, due, due_time, tags: [..._tagState['bd']], gate: (document.getElementById('bd-gate')?.value || '').split('\n').map(v => v.trim()).filter(Boolean), expect_rev: _bdLoadedIdentity.rev };
         _boardDraftsPersist();
       } else {
         delete _boardDrafts[boardDetailId];
@@ -28464,74 +28631,61 @@ function closeBoardDetail() {
   }, {passive: true});
 })();
 
+const _bdSaveRequests = new Set();
 async function boardDetailSave() {
-  if (!boardDetailId) return;
-  const title = document.getElementById('bd-title').value.trim();
-  if (!title) return;
-  const desc = document.getElementById('bd-desc').value.trim();
-
-  // NEVER WRITE AN EMPTY DESC OVER A CARD THAT HAS ONE (AMUX-2840).
-  //
-  // The modal used to fill this textarea from the LIST item. Once the poll
-  // moves to `slim=1` the list carries no desc, so the box would open empty and
-  // this save would blank the card — silently, irreversibly, and it would look
-  // like the board eating people's notes. _bdHydrate normally beats the user to
-  // it, but a slow or failed fetch must not turn into data loss.
-  //
-  // BOTH TERMS BELOW ARE LOAD-BEARING, one per mode, and neither alone is
-  // enough. Measured 2026-08-11: `desc_len` is served ONLY under slim=1, and
-  // `desc` only WITHOUT it — this comment previously claimed desc_len was in
-  // both, which would invite someone to simplify the test down to desc_len and
-  // silently disarm it in full mode, today's default. The failure that follows
-  // is not a crash, it is a blanked description.
-  //
-  // If either says the card has a description and we are about to send an empty
-  // one without having hydrated, refuse and retry the fetch.
-  {
-    const cur = boardItems.find(i => i.id === boardDetailId);
-    const hadDesc = cur && ((cur.desc_len || 0) > 0 || (cur.desc || '').length > 0);
-    if (!_bdHydrated && !desc && hadDesc) {
-      showToast && showToast('Still loading this card — not saving yet');
-      _bdHydrate(boardDetailId);
-      return;
-    }
+  const id = boardDetailId;
+  const generation = _boardDetailOpenGeneration;
+  const identity = _bdLoadedIdentity;
+  if (!id || !_bdHydrated || !identity || identity.id !== id || identity.generation !== generation || !Number.isInteger(identity.rev)) {
+    try { _bdAudit('card-save-refused', {id, generation, loaded_id:identity?.id, loaded_generation:identity?.generation, hydrated:_bdHydrated, verdict:'card_identity_unloaded', measured:true, n_considered:1}); } catch (_) {}
+    showToast('Still loading this card — not saving yet');
+    return false;
   }
-  const sel = document.getElementById('bd-session');
-  const worker = sel ? sel.value : undefined;
-  const gateEl = document.getElementById('bd-gate');
-  const gate = gateEl ? gateEl.value.split('\n').map(s => s.trim()).filter(Boolean) : [];
-  const _cur = boardItems.find(i => i.id === boardDetailId);
-  // Gate: if the status changed to a different status with an effective gate
-  // (using the possibly-just-edited override), confirm before saving.
-  let _gateAck = null;
-  if (_cur && boardDetailStatus !== (_cur.status || 'todo')) {
-    const ok = await _gateConfirm({ ..._cur, gate }, boardDetailStatus);
-    if (!ok) { const el = document.getElementById('bd-save-status'); if (el) el.textContent = ''; return; }
-    _gateAck = ok;
+  const value = key => (document.getElementById(key)?.value || '').trim();
+  const title = value('bd-title');
+  if (!title) return false;
+  if (_bdSaveRequests.has(id)) { showToast('Save already in progress'); return false; }
+  const readForm = () => ({ title: value('bd-title'), desc: value('bd-desc'), status: boardDetailStatus,
+    due: value('bd-due'), due_time: value('bd-due-time'), session: value('bd-session'),
+    tags: [..._tagState['bd']], gate: value('bd-gate').split('\n').map(v => v.trim()).filter(Boolean),
+    expect_rev: identity.rev });
+  const changes = readForm();
+  const submittedForm = JSON.stringify(changes);
+  const submittedDraft = { ...changes };
+  _boardDrafts[id] = submittedDraft;
+  _boardDraftsPersist();
+  _bdSaveRequests.add(id);
+  try {
+  const current = boardItems.find(i => i.id === id);
+  if (current && changes.status !== current.status) {
+    const ack = await _gateConfirm({ ...current, gate: changes.gate }, changes.status);
+    if (!ack) return false;
+    changes.gate_ack = true;
+    if (Array.isArray(ack)) changes.gate_checked = ack;
+  }
+  if (id !== boardDetailId || generation !== _boardDetailOpenGeneration) {
+    _boardDetailIdentityDiscard(id, generation, boardDetailId);
+    return false;
   }
   document.getElementById('bd-save-status').textContent = 'Saving...';
-  const dueInput = document.getElementById('bd-due');
-  const dueTimeInput = document.getElementById('bd-due-time');
-  const changes = { title, desc, status: boardDetailStatus, due: dueInput ? dueInput.value : '', due_time: dueTimeInput ? dueTimeInput.value : '', tags: [..._tagState['bd']], gate };
-  if (worker !== undefined) changes.session = worker;
-  // The server enforces status gates: forward acknowledgement from _gateConfirm.
-  if (_gateAck) { changes.gate_ack = true; if (Array.isArray(_gateAck)) changes.gate_checked = _gateAck; }
-  await updateBoardItem(boardDetailId, changes);
-  delete _boardDrafts[boardDetailId];
-  document.getElementById('bd-save-status').textContent = 'Saved';
-  setTimeout(() => {
-    const el = document.getElementById('bd-save-status');
-    if (el) el.textContent = '';
-  }, 1500);
-  const item = boardItems.find(i => i.id === boardDetailId);
-  if (item) {
-    const meta = document.getElementById('bd-meta');
-    const parts = [];
-    if (item.creator) parts.push('From ' + esc(item.creator));
-    if (item.created) parts.push('Created ' + timeAgo(item.created));
-    if (item.updated && item.updated !== item.created) parts.push('Updated ' + timeAgo(item.updated));
-    if (meta) meta.innerHTML = parts.map(p => '<div class="board-detail-meta-row">' + p + '</div>').join('');
+  const saved = await updateBoardItem(id, changes);
+  if (saved && _boardDrafts[id] === submittedDraft) { delete _boardDrafts[id]; _boardDraftsPersist(); }
+  if (id !== boardDetailId || generation !== _boardDetailOpenGeneration) return saved;
+  const laterForm = readForm();
+  const newerEdits = JSON.stringify(laterForm) !== submittedForm;
+  document.getElementById('bd-save-status').textContent = saved
+    ? (newerEdits ? 'Earlier edit saved — newer changes not saved' : 'Saved')
+    : 'Not saved — draft retained; check Sync';
+  if (saved) {
+    _bdActiveDirty = newerEdits;
+    _bdLoadedIdentity = { id, generation, rev: saved.rev };
   }
+  if (newerEdits) {
+    _boardDrafts[id] = { ...laterForm, expect_rev: saved ? saved.rev : identity.rev };
+    _boardDraftsPersist();
+  }
+  return saved;
+  } finally { _bdSaveRequests.delete(id); }
 }
 
 async function boardDetailDelete() {
@@ -28582,16 +28736,19 @@ async function updateBoardItem(id, changes) {
   if (idx >= 0) { boardItems[idx] = { ...boardItems[idx], ...changes, updated: Math.floor(Date.now() / 1000) }; }
   saveBoardCache();
   renderBoard();
+  if (prev && changes.expect_rev === undefined) changes = { ...changes, expect_rev: prev.rev };
   const r = await apiCall(API + '/api/board/' + id, {
     method: 'PATCH', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(changes)
   });
-  if (r) {
+  if (r && !_isLocallyQueued(r)) {
     const updated = await r.json();
+    if (!updated || updated.id !== id) { _writeError = 'Server returned the wrong card'; updateConnectionStatus(); return false; }
     const idx2 = boardItems.findIndex(i => i.id === id);
     if (idx2 >= 0) boardItems[idx2] = updated;
     saveBoardCache();
     renderBoard();
+    return updated;
   } else if (prev) {
     // Refused (apiCall has already shown the server's own words). Undo the
     // optimistic paint NOW rather than leaving a lie on screen until the next
@@ -28601,6 +28758,7 @@ async function updateBoardItem(id, changes) {
     saveBoardCache();
     renderBoard();
   }
+  return false;
 }
 
 async function deleteBoardItem(id) {
@@ -30540,8 +30698,10 @@ async function _runDeltaSync() {
   try {
     const since = (await _idb.get('last_sync_ts')) || 0;
     const r = await fetch(API + '/api/sync?since=' + since);
-    if (!r.ok) return;
+    if (!r.ok) throw new Error(await _apiErrText(r));
     const data = await r.json();
+    _syncReadError = '';
+    updateConnectionStatus();
     if (data.issues && data.issues.length) {
       // Apply delta to in-memory boardItems
       data.issues.forEach(item => {
@@ -30571,6 +30731,8 @@ async function _runDeltaSync() {
     else if (activeView === 'calendar') renderCalendar();
     _dbgLog('Delta sync: +' + (data.issues || []).length + ' issue changes');
   } catch(e) {
+    _syncReadError = String(e.message || e);
+    updateConnectionStatus();
     _dbgLog('Delta sync failed: ' + e.message);
   }
 }
@@ -31128,9 +31290,8 @@ if ('serviceWorker' in navigator) {
 // Dual-write drafts and queue to both localStorage and IndexedDB
 function persistOfflineData() {
   localStorage.setItem('amux_drafts', JSON.stringify(drafts));
-  saveQueue();
   _idb.set('drafts', drafts);
-  _idb.set('offline_queue', offlineQueue);
+  _idb.set('offline_queue', _readQueue());
 }
 
 // On startup, restore from IndexedDB if localStorage is empty (iOS purge recovery)
@@ -31150,10 +31311,11 @@ _peekIndexLoad().then(() => {
 setInterval(() => { try { _offlinePrefetch(false); } catch(e) {} }, 10 * 60 * 1000);
 window.addEventListener('online', () => setTimeout(() => { try { _offlinePrefetch(false); } catch(e) {} }, 4000));
 
-_idb.get('offline_queue').then(val => {
-  if (val && !offlineQueue.length && val.length) {
-    offlineQueue = val;
-    saveQueue();
+_idb.get('offline_queue').then(async val => {
+  if (val && localStorage.getItem('amux_offline_queue') === null && val.length) {
+    await _mutateQueue(current => {
+      if (localStorage.getItem('amux_offline_queue') === null) current.push(...val);
+    });
     updateConnectionStatus();
   }
   // Auto-retry queued ops on startup if online (single replayer: page-side only)
