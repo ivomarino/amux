@@ -4226,3 +4226,23 @@ FIX: Declare org_teams.created_at as seconds, matching both Rust timestamp()
   writers and migration strftime('%s'). The existing schema.timestamp_units_declared
   and timestamp-unit runtime invariants expose missing declarations and drift;
   the migration-chain test supplies the regression and measured scan control.
+
+---
+
+## Cold card acceptance can be intercepted by the onboarding tour
+AREA: tests
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-09
+SESSION: amux-testing-e2e
+CARD: ATE-130
+SYMPTOM: An isolated 54-case browser audit had five cold #issue navigation
+  timeouts. A focused unchanged-source rerun passed 8/9; the remaining desktop
+  card-details case reached its asset assertions, then the onboarding backdrop
+  intercepted the History click. Screenshots confirm that last cause; the
+  initial missing-overlay failures are not yet attributed to the same cause.
+COST: Card, callback and terminal-summary validation required a second run to
+  distinguish their actual contracts from unrelated first-run setup behavior.
+FIX: Open. Reproduce with explicit onboarding/configured-install controls and
+  preserve intended card navigation. ATE-130 retains both runs and screenshots;
+  do not treat retries or a global removal of onboarding as a product fix.
