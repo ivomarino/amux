@@ -4331,3 +4331,47 @@ FIX: The cause is serde_json's default float parser, which is not correctly roun
  wrong cause looks confirmed, because the next run is green either way. When a
  failure is intermittent, the question that separates them is whether the input
  changed between runs, and a rerun cannot answer it.
+
+---
+## A worked human command disappeared from Doing back into Backlog
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-09
+SESSION: mvs-research
+CARD: MR-174
+SYMPTOM: MSG-50976 correctly linked to MR-174, status-update correctly claimed the
+  card as doing, and the worker registered its board-drain report asset. At 08:12
+  the unchanged captured-prompt envelope nevertheless accepted `doing -> backlog`,
+  gained a 14-day revisit plus a prose trigger, and the board then truthfully showed
+  no active task while the original command had no terminal or decomposed disposition.
+COST: The user had to compare Messages, card history, artifact links, the worker
+  terminal, and `/api/debug/board-drive` to determine whether work happened. The
+  drive loop then held all 15 backlog cards as trigger-parked, so an orchestration
+  command to grind out the board became indistinguishable from future blocked work.
+FIX: Refuse an unreshaped capture envelope retreating from doing to backlog or todo,
+  with the named `capture_requeue_refused` log marker and a structured response that
+  requires the model to discard, reshape one task, decompose into ordered children,
+  or record a terminal disposition. A same-PATCH desc rewrite preserves ordinary
+  parking, and attributed reasoned force remains as the audited escape. The production
+  MR-174 shape plus positive controls run through the real PATCH handler in tests.
+
+---
+## Migration cost guard called a sibling write an unindexed read
+AREA: tests
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-09
+SESSION: amux
+CARD: ATE-79
+SYMPTOM: The full server library gate failed four times on 0060_org_teams, claiming
+  its post-backfill team_id indexes appeared after statements that read org_members
+  or org_invites. The cited statements were UPDATEs of the opposite sibling table;
+  neither statement read the indexed table at all.
+COST: One false red in a 2,159-test, 292-second run, and the first apparent remedy
+  was to move write-side indexes before their backfills—the opposite of the cost
+  rule documented by the test itself.
+FIX: The ordering guard now verifies a prior DML actually names the indexed table
+  after FROM/JOIN and uses the index's leading column, while continuing to exclude
+  indexes on the table being written. A planted 0031-shaped late read-side index
+  still fails and alternating sibling writes are the positive control.

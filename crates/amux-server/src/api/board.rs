@@ -9266,6 +9266,80 @@ pub async fn patch_item(
                     };
                     let force = map.get("force").and_then(Value::as_bool).unwrap_or(false);
                     let reason = body_str(&map, "reason").unwrap_or_default();
+                    // A CAPTURE IS AN ENVELOPE, NOT A PARKABLE UNIT OF WORK
+                    // (MR-174, mvs-research, 2026-09-09).
+                    //
+                    // The server already has exactly three honest exits for an
+                    // auto-captured prompt: discard it when it is not work,
+                    // reshape its body into one self-contained task, or
+                    // decompose it atomically into an epic and ordered children.
+                    // The board-drive nudge teaches those exits and exempts the
+                    // untouched envelope from WIP for the same reason. The PATCH
+                    // transition path nevertheless allowed a fourth exit:
+                    // `doing -> backlog` (or `todo`) while the body was still
+                    // the captured prompt.
+                    //
+                    // MR-174 walked that hole exactly. `status-update` claimed
+                    // the direct human command as doing, the worker recorded a
+                    // material status and an artifact, then the same command
+                    // envelope moved back to backlog with a 14-day revisit and
+                    // a prose trigger. The Messages link and history were all
+                    // correct; the current board still erased the active-work
+                    // disposition and the drive loop quite correctly treated
+                    // the fresh trigger as parked. That is a state-machine
+                    // contradiction, not a polling problem.
+                    //
+                    // Refuse only the retreat of an UNRESHAPED capture. A real
+                    // task whose author rewrites `desc` in this same atomic
+                    // PATCH no longer matches `is_capture_shell` and may be
+                    // parked normally. New captures may still start in backlog,
+                    // terminal dispositions still work, and an attributed,
+                    // reasoned force remains the audited escape. This improves
+                    // with the model: it requires the model to make the semantic
+                    // judgment the harness cannot make, then preserves it.
+                    if from == TaskStatus::Doing
+                        && matches!(target, TaskStatus::Backlog | TaskStatus::Todo)
+                        && bs::is_capture_shell(&next)
+                        && !force
+                    {
+                        tracing::warn!(
+                            target: "amux::board",
+                            marker = "capture_requeue_refused",
+                            card = %next.id,
+                            worker = %next.session.as_deref().unwrap_or("-"),
+                            actor = %actor_name,
+                            from = %next.status,
+                            to = %bs::db_status_spelling(target),
+                            measured = true,
+                            "worked capture envelope refused requeue without a semantic disposition"
+                        );
+                        return finish(
+                            &slot_w,
+                            PatchOut::Refused(
+                                StatusCode::CONFLICT,
+                                json!({
+                                    "error": "captured command requires a disposition before requeue",
+                                    "code": "capture_requeue_requires_disposition",
+                                    "ok": false,
+                                    "blocked": true,
+                                    "measured": true,
+                                    "item": next.id,
+                                    "attempted_status": bs::db_status_spelling(target),
+                                    "preserved_status": next.status,
+                                    "why": "This card is still the auto-captured human command envelope. It was already claimed as active work; putting the unchanged envelope back in a queue loses the command's disposition and makes completed, delegated, and blocked work indistinguishable.",
+                                    "how_to_fix": {
+                                        "not_work": format!("amux board discard {} --outcome-stdin", next.id),
+                                        "one_task": format!("amux board retitle {} \"<standalone task title>\" --desc-stdin", next.id),
+                                        "several_tasks": format!("amux board decompose {} --stdin", next.id),
+                                        "work_finished": "move the envelope to review/done with its outcome and evidence",
+                                        "still_actively_working": "leave it in doing and post status/next_action/unresolved",
+                                        "audited_escape": format!("amux board {} {} --force \"<why the capture itself must be requeued>\"", bs::db_status_spelling(target), next.id),
+                                    },
+                                }),
+                            ),
+                            no_write(),
+                        );
+                    }
                     // ONE-DOING-PER-SESSION (AMUX-1707 parity). Python's WIP
                     // filters verbatim: archived cards and dormant types
                     // (tripwire/watch) do not hold WIP — both were real
@@ -11205,6 +11279,172 @@ pub async fn patch_item(
             }
             (StatusCode::OK, Json(body)).into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod capture_requeue_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::HeaderValue;
+
+    fn fixture() -> (AppState, crate::db::SharedStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            crate::db::Store::open(&dir.path().join("capture-requeue.db"))
+                .expect("open store"),
+        );
+        // Store owns live SQLite handles after this helper returns.
+        std::mem::forget(dir);
+        let state = AppState {
+            store: store.clone(),
+            started: std::time::Instant::now(),
+            build_hash: "capture-requeue-test".into(),
+            auth_token: None,
+            reconciled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        (state, store)
+    }
+
+    fn seed_capture(store: &crate::db::SharedStore) -> String {
+        let slot = Arc::new(Mutex::new(None));
+        let slot_w = slot.clone();
+        store
+            .write(move |conn| {
+                let row = bs::create_issue(
+                    conn,
+                    &bs::NewIssue {
+                        title: "Clear out this worker's board then grind it all out".into(),
+                        desc: "**Prompt:** clear out this worker's board then grind it all out"
+                            .into(),
+                        status: "doing".into(),
+                        session: Some("mvs-research".into()),
+                        item_type: "chore".into(),
+                        creator: "amux".into(),
+                        owner_type: "agent".into(),
+                        due: None,
+                        due_time: None,
+                        reviewer: None,
+                        shepherd: None,
+                        gate: vec![],
+                        depends_on: vec![],
+                        tags: vec![],
+                        ask_type: None,
+                        ask_question: None,
+                        ask_unblocks: None,
+                        ask_actor: None,
+                        source: Some("capture".into()),
+                        requested_by: None,
+                        callback_session: None,
+                        callback_prompt: None,
+                    },
+                    1_788_955_507,
+                )?;
+                *slot_w.lock().expect("slot") = Some(row.id);
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
+            })
+            .expect("seed capture");
+        let id = slot.lock().expect("slot").clone().expect("capture id");
+        id
+    }
+
+    fn worker_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amux-session", HeaderValue::from_static("mvs-research"));
+        headers
+    }
+
+    async fn patch(state: &AppState, id: &str, body: Value) -> (StatusCode, Value) {
+        let response = patch_item(
+            State(state.clone()),
+            Path(id.to_string()),
+            worker_headers(),
+            Json(body),
+        )
+        .await;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response");
+        (status, serde_json::from_slice(&bytes).expect("json response"))
+    }
+
+    /// MR-174 is the production specimen: status-update claimed the captured
+    /// command, the lane registered its report asset, then PATCH moved the same
+    /// untouched envelope doing -> backlog. The board faithfully rendered that
+    /// last mutation, so it looked as though no work had happened and the fresh
+    /// trigger parked it outside the drain loop.
+    #[tokio::test]
+    async fn a_worked_capture_envelope_cannot_disappear_back_into_a_queue() {
+        let (state, store) = fixture();
+        let id = seed_capture(&store);
+
+        for target in ["backlog", "todo"] {
+            let (status, body) = patch(&state, &id, json!({"status": target})).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{target}: {body}");
+            assert_eq!(body["code"], "capture_requeue_requires_disposition");
+            assert_eq!(body["preserved_status"], "doing");
+            assert_eq!(body["attempted_status"], target);
+            assert_eq!(
+                bs::get_issue(&store.read().expect("read"), &id)
+                    .expect("query")
+                    .expect("card")
+                    .status,
+                "doing",
+                "a refusal must not mutate the card"
+            );
+        }
+    }
+
+    /// The guard requires the model to make the semantic decision; it does not
+    /// ban parking. Once the same atomic PATCH replaces the prompt envelope with
+    /// a standalone task, the normal transition is available again.
+    #[tokio::test]
+    async fn reshaping_one_real_task_preserves_the_normal_backlog_exit() {
+        let (state, store) = fixture();
+        let id = seed_capture(&store);
+        let desc = "Re-run every MVS verification job whose named prerequisite has cleared; record each result and produced artifact.";
+        let (status, body) = patch(
+            &state,
+            &id,
+            json!({
+                "desc": desc,
+                "status": "backlog",
+                "source_ref": "Resume when MR-157 supplies the staging experiment path"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["applied"], true);
+        assert_eq!(body["status"], "backlog");
+        assert_eq!(body["desc"], desc);
+    }
+
+    /// The existing audited escape stays real. This is intentionally a
+    /// positive control: deleting force support would make the primary refusal
+    /// test pass while creating a state with no truthful exit.
+    #[tokio::test]
+    async fn an_attributed_reasoned_force_can_requeue_the_envelope() {
+        let (state, store) = fixture();
+        let id = seed_capture(&store);
+        let (status, body) = patch(
+            &state,
+            &id,
+            json!({
+                "status": "backlog",
+                "force": true,
+                "reason": "the source message was revoked before its semantic disposition could be recorded"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "backlog");
+        let log = body["log"].as_str().unwrap_or_default();
+        assert!(log.contains("force by mvs-research: doing->backlog reason="), "{log}");
+        assert!(log.contains("source message was revoked"), "{log}");
     }
 }
 
