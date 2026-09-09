@@ -5,7 +5,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 const require=createRequire(import.meta.url);
 const {parse}=require('espree');
-const source=readFileSync(new URL('../crates/amux-dashboard/static/app.js',import.meta.url),'utf8');
+// The override runs this same contract against a committed pre-fix specimen.
+const source=readFileSync(process.env.AMUX_TERMINAL_RENDER_SOURCE || new URL('../crates/amux-dashboard/static/app.js',import.meta.url),'utf8');
 const ast=parse(source,{ecmaVersion:'latest',range:true});
 function fixture() {
   const context=vm.createContext({console, performance, Map, Promise, JSON, _peekRenderCache:new Map(),
@@ -15,25 +16,31 @@ function fixture() {
     esc:s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'),
     document:{createElement:()=>({innerHTML:'',get value(){return this.innerHTML.replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&');}})},
   });
-  for (const name of ['ansiToHtml','_osc8Resolve','_peekHtml','_peekHtmlSlice','_peekCodeRows','_peekPromptNormalized','highlightPrompts','wrapBoxBlocks','_fitRules','_peekRenderChunks','_peekChunkHTML','_queuePeekFrame']) {
+  for (const name of ['ansiToHtml','_osc8Resolve','_peekHtml','_peekPromptNormalized','highlightPrompts','wrapBoxBlocks','_fitRules','_peekRenderChunks','_peekChunkHTML','_queuePeekFrame']) {
     const node=ast.body.find(n=>n.type==='FunctionDeclaration' && n.id.name===name);
     assert.ok(node,name+' must be shipped'); vm.runInContext(source.slice(...node.range),context);
+  }
+  // Only historical specimens contain these dependencies. Load them when
+  // present so a red counterexample tests their behavior, not a missing name.
+  for (const name of ['_peekHtmlSlice','_peekCodeRows']) {
+    const node=ast.body.find(n=>n.type==='FunctionDeclaration' && n.id.name===name);
+    if (node) vm.runInContext(source.slice(...node.range),context);
   }
   return context;
 }
 const rows=n=>Array.from({length:n},(_,i)=>` ${String(i+1).padStart(5)}- old source   │ ${String(i+1).padStart(5)}+ new source\n`).join('');
-test('numbered split rows become two intact source cells without treating prose as a diff',()=>{
-  const c=fixture(), html=c._peekHtml(rows(2));
-  assert.equal((html.match(/peek-code-split/g)||[]).length,2);
-  assert.equal((html.match(/class="peek-code-number"/g)||[]).length,4);
-  assert.match(html,/peek-code-del/); assert.match(html,/peek-code-add/);
-  assert.doesNotMatch(c._peekHtml('1. first choice\n2. second choice\nA normal paragraph'),/peek-code-row/);
+test('grep context prefixes remain literal text without inferred deleted rows',()=>{
+  const c=fixture();
+  const raw='38-    background: #1c2128;\n39-    color: #fff;\n40:    margin: 0;\n';
+  assert.equal(c._peekHtml(raw),raw);
+  assert.equal(c._peekChunkHTML(c._peekRenderChunks('history',raw)).replace(/<[^>]*>/g,''),raw);
 });
-test('escaped source and balanced ANSI spans survive gutter slicing',()=>{
+test('source escaping preserves its actual ANSI color without inferring change styling',()=>{
   const c=fixture(), html=c._peekHtml('\x1b[32m  12+ <tag> & contents\n  13+ const value = 1;\x1b[0m');
   assert.match(html,/&lt;tag&gt; &amp; contents/);
   assert.equal((html.match(/<span[ >]/g)||[]).length,(html.match(/<\/span>/g)||[]).length);
-  assert.match(html,/peek-code-text"><span style="color:#4e9a06"/);
+  assert.match(html,/<span style="color:#4e9a06">  12\+ /);
+  assert.doesNotMatch(html,/peek-code-|background:/);
 });
 test('appending to a megabyte transcript parses only the final block and keeps prior identities',()=>{
   const c=fixture(), raw=rows(16000), first=c._peekRenderChunks('history',raw);
@@ -67,12 +74,13 @@ test('chunk boundaries never turn a continued human prompt into separate message
   assert.ok(html.indexOf('continued paragraph')>html.indexOf('data-msg-kind='));
 });
 
-test('single changed rows and aligned space-separated split output stay attached',()=>{
+test('numbers, aligned gaps, and a column divider are not sufficient diff evidence',()=>{
   const c=fixture();
-  assert.match(c._peekHtml('  9+ one changed source line'),/peek-code-number/);
-  const html=c._peekHtml('  1- old        1+ new\n  2- old        2+ new\n');
-  assert.equal((html.match(/peek-code-split/g)||[]).length,2);
-  assert.doesNotMatch(c._peekHtml('  1+ "literal    7+ inside"\n  2+ other source\n'),/peek-code-split/);
+  for (const raw of ['  9+ ordinary command output',
+    '  1- old        1+ new\n  2- old        2+ new\n',
+    '  1+ "literal    7+ inside"\n  2+ other output\n', rows(2)]) {
+    assert.equal(c._peekHtml(raw),raw);
+  }
 });
 
 test('coalesced frame failures reject callers, announce themselves, and allow retry',async()=>{

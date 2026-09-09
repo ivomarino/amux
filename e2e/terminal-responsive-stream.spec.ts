@@ -26,10 +26,66 @@ async function frame(page: Page, history: string | null, live = 'Working…\n') 
   }, {history, live});
 }
 
-// The numbered split-diff renderer that used to be asserted here was removed
-// (2026-09-09): its heuristic fired on ordinary grep -A output, so `38-  foo`
-// rendered as a red deleted row in a right-hand column. The chunk reuse and
-// coalescing below are the parts of that change that stayed.
+for (const width of [390, 1280]) {
+  test(`plain grep output keeps its text and columns at ${width}px`, async ({page}) => {
+    await page.setViewportSize({width,height:844});
+    await setup(page);
+    const raw='38-    background: #1c2128;\n39-    color: #fff;\n40:    margin: 0;\n'
+      +'  1- old        1+ new\n  2- old        2+ new\n'
+      +'  3- literal <tag> & text   │  3+ another command column\n';
+    await frame(page,raw);
+    expect(await page.locator('#pk-hist').textContent()).toBe(raw);
+    const rendered=await page.locator('#pk-hist').evaluate(el => ({
+      splits:[...el.querySelectorAll('*')].filter(node => getComputedStyle(node).display==='grid').length,
+      tints:[...el.querySelectorAll('*')].filter(node => !['transparent','rgba(0, 0, 0, 0)'].includes(getComputedStyle(node).backgroundColor)).length,
+    }));
+    expect(rendered).toEqual({splits:0,tints:0});
+    await page.screenshot({path:test.info().outputPath(`plain-grep-${width}.png`)});
+  });
+
+  test(`scroll-lock transitions do not move terminal controls or content at ${width}px`, async ({page}) => {
+    await page.setViewportSize({width,height:844});
+    await setup(page);
+    await frame(page,'ordinary terminal row\n'.repeat(300));
+    const samples=await page.evaluate(async () => {
+      const w=window as any, body=document.getElementById('peek-body')!;
+      const controls=document.querySelector('.peek-output-controls')!;
+      body.scrollTop=500;
+      const measure=() => {
+        const badge=controls.querySelector('.scroll-lock-badge');
+        const style=badge ? getComputedStyle(badge) : null;
+        return {top:body.getBoundingClientRect().top,height:body.getBoundingClientRect().height,
+          controls:controls.getBoundingClientRect().height,scroll:body.scrollTop,
+          // A short English label can fit without changing height today. It
+          // must still never participate in toolbar flow: wrapping/zoom turns
+          // that placement into a resize on every show/hide transition.
+          badgeInToolbarFlow:!!style && style.display!=='none' && !['absolute','fixed'].includes(style.position)};
+      };
+      const observed=[measure()];
+      for (let i=0;i<12;i++) {
+        eval('_peekScrollLocked = ' + (i%2===0));
+        if (i%2===0) w._showScrollLockBadge(body,()=>{}); else w._hideScrollLockBadge(body);
+        await new Promise<void>(resolve => requestAnimationFrame(()=>requestAnimationFrame(()=>resolve())));
+        observed.push(measure());
+      }
+      return observed;
+    });
+    for (const sample of samples) {
+      expect(sample.badgeInToolbarFlow).toBe(false);
+      for (const key of ['top','height','controls','scroll'] as const) {
+        expect(Math.abs(sample[key]-samples[0][key]),key).toBeLessThan(1);
+      }
+    }
+    console.log('[scroll-lock geometry]',JSON.stringify({width,samples}));
+  });
+}
+
+test('composer chips retain horizontal-only touch handling', async ({page}) => {
+  await page.setViewportSize({width:390,height:844});
+  await setup(page);
+  await expect(page.locator('#peek-chips')).toHaveCSS('touch-action','pan-x');
+});
+
 test('large streaming history reuses DOM, coalesces bursts, and preserves typing and scroll', async ({page}) => {
   await page.setViewportSize({width:390,height:844});
   await setup(page);
@@ -72,7 +128,7 @@ test('large streaming history reuses DOM, coalesces bursts, and preserves typing
   expect(resume.same).toBe(true);
   expect(resume.work.dom_chunks-resume.before.dom_chunks).toBeLessThanOrEqual(3);
   expect(resume.nodes-initial.nodes).toBeLessThan(40);
-  expect(resume.nodes).toBeLessThan(6000*9+300); // fixed row/gutter/cell markup, no duplicate transcript
+  expect(resume.nodes).toBeLessThan(6000*9+300); // retain the original work bound; no duplicate transcript
   console.log('[terminal render measurement]', JSON.stringify({initial,after,resume}));
 });
 

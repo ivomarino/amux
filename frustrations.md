@@ -3319,7 +3319,7 @@ FIX: b724cdff retains each write until exact-card acknowledgment, bounds
 ## Numbered terminal output detached its source gutters on phones and reparsed loaded history while streaming
 AREA: browser
 SEVERITY: blocks
-STATUS: fixed
+STATUS: open
 DATE: 2026-09-09
 SESSION: amux-testing-e2e
 CARD: AF-640
@@ -3329,7 +3329,7 @@ SYMPTOM: Ethan's phone terminal squeezed split diff/tool output into unreadable
   replaced its DOM; live ticks also walked all loaded prompt descendants.
 COST: The worker terminal was unusable for reviewing changes at phone widths.
   Large active transcripts added avoidable parsing and scrolling work while typing.
-FIX: 69490b05 uses gutter/code cells, unified split rows below 600px,
+FIX: Initial attempt 69490b05 introduced gutter/code cells, unified split rows below 600px,
   a separate controls row, stable ANSI-aware chunks and animation-frame burst
   coalescing. Render counters and slow-update client-debug expose regressions.
   81/81 browser scenarios and 26/26 Node tests passed; cache and mobile-layout
@@ -3339,6 +3339,20 @@ FIX: 69490b05 uses gutter/code cells, unified split rows below 600px,
   16 chunks, parsed 67,492 characters and preserved typed 01234567 plus focus.
   Screenshots: /private/tmp/af640-live-mobile-diff.png and
   /private/tmp/af640-live-desktop-diff.png. No claim of server pool health.
+  CORRECTION 2026-09-09, originating session amux-testing-e2e: the rendering
+  acceptance above was too narrow. Plain grep context such as 38- background
+  matched the numbered-row heuristic, including its space-only split fallback.
+  A scroll-lock badge in the toolbar flow moved the terminal each time it toggled.
+  The unrelated chips pan-x pan-y change was also reverted. Authoritative amux
+  commits cd8c7bfc and 91091e28 remove those parts and retain the chunk cache,
+  ANSI/OSC-8 carry and frame coalescing. Do not restore the removed renderer from
+  the old fixture proof. Mobile diff presentation remains unvalidated; the
+  performance measurements only support the retained incremental-render path.
+  The Node suite still required the removed helpers (8/8 failed before repair).
+  Corrected coverage preserves literal grep/column text, measures geometry across
+  repeated lock transitions at 390px and 1280px, and tests horizontal chip touch
+  policy. Against the committed pre-revert source, the three text contracts fail
+  for rendered-output mismatches while the five cache/coalescing tests pass.
 
 
 ---
