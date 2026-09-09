@@ -1530,6 +1530,54 @@ fn is_non_mutating_answer_tail(tail: &str) -> bool {
     saw_clause
 }
 
+/// Short conversational acks that should not become board cards. These are
+/// inter-session coordination messages (acknowledgements, status phrases,
+/// corrections) that are not work items. The prompt still lands in
+/// `cmd_history`, so the Messages ledger keeps every prompt; it just does not
+/// mint a board card.
+///
+/// Deliberately conservative: only short messages (<50 chars) whose opening
+/// matches a known ack pattern are suppressed. Unknown shapes fail open to a
+/// card so the filter cannot silently lose work.
+pub fn is_conversational_ack(text: &str) -> bool {
+    let mut t = text.trim();
+    while t.starts_with('[') {
+        match t.find(']') {
+            Some(i) => t = t[i + 1..].trim_start(),
+            None => break,
+        }
+    }
+    let collapsed: String = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() >= 50 {
+        return false;
+    }
+    let lower = collapsed.to_lowercase();
+    const ACK_PREFIXES: &[&str] = &[
+        "continue",
+        "standing by",
+        "read,",
+        "read.",
+        "read ",
+        "all clear",
+        "correction to",
+        "thanks",
+        "thank you",
+        "acknowledged",
+        "ack,",
+        "ack.",
+        "ack ",
+        "noted",
+        "got it",
+        "roger",
+        "copy that",
+        "understood",
+        "will do",
+        "on it",
+        "sounds good",
+    ];
+    ACK_PREFIXES.iter().any(|p| lower.starts_with(p))
+}
+
 /// Bare demonstratives/pronouns: words whose referent lives OUTSIDE the title.
 const DEICTIC: [&str; 9] = ["this", "that", "these", "those", "it", "they", "them", "here", "there"];
 
@@ -2620,5 +2668,27 @@ mod self_description_tests {
 
         let t2 = title_from_prompt("please add a route for /api/board/clear-done").unwrap();
         assert_eq!(title_needs_self_description(&t2), None, "{t2:?}");
+    }
+
+    #[test]
+    fn conversational_acks_are_detected() {
+        assert!(is_conversational_ack("continue"));
+        assert!(is_conversational_ack("Continue working"));
+        assert!(is_conversational_ack("standing by"));
+        assert!(is_conversational_ack("read, will review"));
+        assert!(is_conversational_ack("all clear"));
+        assert!(is_conversational_ack("correction to the above"));
+        assert!(is_conversational_ack("thanks for the update"));
+        assert!(is_conversational_ack("acknowledged"));
+        assert!(is_conversational_ack("got it"));
+        assert!(is_conversational_ack("noted"));
+        assert!(is_conversational_ack("[15:42 PM] standing by"));
+    }
+
+    #[test]
+    fn real_work_is_not_an_ack() {
+        assert!(!is_conversational_ack("fix the auth middleware to handle expired tokens correctly and add a test"));
+        assert!(!is_conversational_ack("add a new endpoint for /api/board/clear-done"));
+        assert!(!is_conversational_ack("continue refactoring the entire session management layer to use the new connection pool and update all tests"));
     }
 }

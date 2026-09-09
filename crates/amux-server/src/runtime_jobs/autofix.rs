@@ -6066,6 +6066,19 @@ fn already_filed(conn: &Connection, signature: &str) -> bool {
 /// stops being a set of tasks and becomes a log, and a queue that cannot be read
 /// is one nobody reads, including for the cards that DO discriminate.
 fn fault_identity(signature: &str) -> Option<&str> {
+    // INVARIANT DEDUP: an invariant's identity is `invariant|<name>`, not the
+    // per-entity or per-episode variant. Measured 2026-09-09: 15,222 board
+    // cards, with invariant violations filing one card per entity per episode
+    // because this function returned None for them, so `open_card_for_fault`
+    // never suppressed. An invariant failing on three entities is one fault
+    // ("the invariant is broken"), not three cards.
+    if signature.starts_with("invariant|") {
+        // `invariant|<name>|<entity>|<epoch>` -- identity is `invariant|<name>`.
+        return signature
+            .get("invariant|".len()..)
+            .and_then(|rest| rest.find('|'))
+            .map(|i| &signature[..("invariant|".len() + i)]);
+    }
     if !(signature.starts_with("5xx|") || signature.starts_with("latency|outlier|")) {
         return None;
     }
@@ -7394,6 +7407,83 @@ async fn note_quiet_signatures(
 }
 
 // ---------------------------------------------------------------------------
+// Auto-expire stale autofix cards (transient operational alerts).
+// ---------------------------------------------------------------------------
+
+fn autofix_expire_hours() -> i64 {
+    std::env::var("AMUX_AUTOFIX_EXPIRE_HOURS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(72)
+}
+
+/// Discard autofix-created cards in todo/backlog that are older than the TTL.
+/// These are transient operational alerts; if the condition persists, the next
+/// autofix tick will re-file. Returns the number of cards expired.
+async fn expire_stale_autofix_cards(state: &AppState) -> anyhow::Result<usize> {
+    let ttl_h = autofix_expire_hours();
+    if ttl_h <= 0 {
+        return Ok(0);
+    }
+    let cutoff = crate::api::reclaim::now_secs() - (ttl_h * 3600);
+    let expired: Vec<(String, String)> = {
+        let conn = state.store.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, title FROM issues \
+             WHERE creator = 'autofix' \
+               AND status IN ('todo', 'backlog') \
+               AND COALESCE(archived, 0) = 0 \
+               AND deleted IS NULL \
+               AND COALESCE(updated_at, created_at) < ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![cutoff], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        rows.flatten().collect()
+    };
+    if expired.is_empty() {
+        return Ok(0);
+    }
+    let now = crate::api::reclaim::now_secs();
+    let count = expired.len();
+    let ids = expired.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+    state
+        .store
+        .write_async(move |conn| {
+            for id in &ids {
+                conn.execute(
+                    "UPDATE issues SET status = 'discarded', \
+                        updated_at = ?2, \
+                        log = COALESCE(log, '') || ?3 \
+                     WHERE id = ?1",
+                    rusqlite::params![
+                        id,
+                        now,
+                        format!(
+                            "\n[autofix-expire] discarded after {}h with no action",
+                            ttl_h
+                        )
+                    ],
+                )?;
+            }
+            Ok(crate::db::WriteOutcome {
+                applied: true,
+                events: vec![],
+            })
+        })
+        .await?;
+    for (id, title) in &expired {
+        tracing::info!(
+            card = %id,
+            title = %title,
+            ttl_hours = ttl_h,
+            "autofix_expire: discarded stale autofix card (no action within TTL)"
+        );
+    }
+    Ok(count)
+}
+
+// ---------------------------------------------------------------------------
 // Spawn + debug surface.
 // ---------------------------------------------------------------------------
 
@@ -7436,6 +7526,11 @@ pub fn spawn(state: AppState) -> Option<super::PeriodicTask> {
                     errors = ?r.errors,
                     "autofix tick"
                 );
+            }
+            match expire_stale_autofix_cards(&state).await {
+                Ok(n) if n > 0 => tracing::info!(expired = n, "autofix tick: expired stale cards"),
+                Err(e) => tracing::warn!(err = %e, "autofix tick: expire sweep failed"),
+                _ => {}
             }
         }
     }))
@@ -8728,12 +8823,21 @@ mod tests {
             "a rollup and a single-endpoint outlier are different faults"
         );
 
-        // CONTROL 3: only the two timestamped families have a fault identity at
-        // all. Stripping a trailing field from an arbitrary signature would
-        // merge unrelated faults.
+        // Invariant signatures dedup by invariant name: all violations of the
+        // same invariant (different entities, different episodes) are one fault.
         assert_eq!(
             fault_identity("invariant|hooks.guard|fleet|1787223065"),
-            None
+            Some("invariant|hooks.guard")
+        );
+        assert_eq!(
+            fault_identity("invariant|hooks.guard|fleet"),
+            Some("invariant|hooks.guard"),
+            "an invariant signature without an epoch still has a fault identity"
+        );
+        assert_eq!(
+            fault_identity("invariant|hooks.guard|fleet|1787223065"),
+            fault_identity("invariant|hooks.guard|other-entity|1787224000"),
+            "same invariant, different entity = same fault"
         );
         assert_eq!(
             fault_identity("5xx|502|POST|/api/x|/api/x|nota-number"),

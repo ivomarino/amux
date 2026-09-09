@@ -4144,6 +4144,13 @@ fn mint_capture_card(
     if session_name.trim().is_empty() {
         return Ok(None);
     }
+    if amux_core::board::is_conversational_ack(body) {
+        tracing::info!(
+            session = %session_name,
+            "ledger: conversational ack not carded (recorded in cmd_history only)"
+        );
+        return Ok(None);
+    }
     // A pure status / info query ("status on MSG-29602?", "any update on X?") is
     // answered inline and produces no deliverable, so it is NOT a board work card:
     // the old capture minted it type=code/doing, which a question can never take
