@@ -1703,6 +1703,26 @@ fn is_restore_only_command(cmd: &str) -> bool {
 /// Matches the guard's default window; observed rows older than this are
 /// pruned at write.
 const OBSERVED_WINDOW_S: f64 = 21_600.0;
+
+/// One reported observation: `(realpath, mtime, the Bash window it sat in)`.
+///
+/// MC-1627 (mixpeek-cicd): attribution here is a time-window heuristic, so it
+/// names whoever runs the LONGEST commands. A 15-minute pytest run observes
+/// every write any peer made during those 15 minutes and reports them all as
+/// its own observations. The window is the discriminator, it exists only in the
+/// hook, and until now nothing carried it: the store held a timestamp, so by the
+/// time the notice rendered there was nowhere for "14 minutes into a 15-minute
+/// command" to have come from.
+pub(crate) type ObservedReport = (String, f64, Option<f64>);
+
+/// Windows are kept in a SEPARATE pref key rather than widening the value of
+/// the existing one. `observed_edits:<session>` stays `path -> f64` exactly as
+/// written today, so every existing row, reader and merge rule is untouched and
+/// nothing migrates. A missing entry here reads as "not measured", which is the
+/// honest state for every row written before this shipped.
+fn observed_window_key(session: &str) -> String {
+    format!("observed_windows:{session}")
+}
 const OBSERVED_MAX_ROWS: usize = 500;
 
 fn observed_key(session: &str) -> String {
@@ -1721,13 +1741,17 @@ fn observed_key(session: &str) -> String {
 /// string row (an older installed hook copy) keeps hook-time — coverage
 /// degrades toward over-warning, never toward silence. A future mtime clamps
 /// to `now` so a skewed clock cannot mint a record that outlives the window.
-pub(crate) fn parse_observed_reports(body: &Value, now: f64) -> Vec<(String, f64)> {
+pub(crate) fn parse_observed_reports(body: &Value, now: f64) -> Vec<ObservedReport> {
     body.get("paths")
         .and_then(Value::as_array)
         .map(|a| {
             a.iter()
                 .filter_map(|v| match v {
-                    Value::String(p) => Some((p.clone(), now)),
+                    // A BARE STRING is an older installed hook copy. It carries
+                    // no window, and `None` must stay distinguishable from a
+                    // window of zero: the first says nobody measured, the
+                    // second says the command was instantaneous.
+                    Value::String(p) => Some((p.clone(), now, None)),
                     Value::Object(_) => {
                         let p = v.get("path").and_then(Value::as_str)?.to_string();
                         let ts = v
@@ -1735,13 +1759,19 @@ pub(crate) fn parse_observed_reports(body: &Value, now: f64) -> Vec<(String, f64
                             .and_then(Value::as_f64)
                             .map(|m| m.min(now))
                             .unwrap_or(now);
-                        Some((p, ts))
+                        // MC-1627. Absent on every hook copy older than this,
+                        // which is why it is Option rather than defaulted to 0.
+                        let window = v
+                            .get("window_s")
+                            .and_then(Value::as_f64)
+                            .filter(|w| w.is_finite() && *w >= 0.0);
+                        Some((p, ts, window))
                     }
                     _ => None,
                 })
-                .filter(|(p, _)| !p.trim().is_empty())
+                .filter(|(p, _, _)| !p.trim().is_empty())
                 .take(OBSERVED_MAX_ROWS)
-                .map(|(p, ts)| (realpath(Path::new(&p)), ts))
+                .map(|(p, ts, w)| (realpath(Path::new(&p)), ts, w))
                 .collect()
         })
         .unwrap_or_default()
@@ -1781,12 +1811,37 @@ pub async fn observed_edits(
             .ok()
             .and_then(|v| serde_json::from_str(&v).ok())
             .unwrap_or_default();
+        let wkey = observed_window_key(&session);
+        let prior_windows: HashMap<String, f64> = conn
+            .query_row("SELECT value FROM prefs WHERE key=?1", [&wkey], |r| {
+                r.get::<_, String>(0)
+            })
+            .ok()
+            .and_then(|v| serde_json::from_str(&v).ok())
+            .unwrap_or_default();
         let mut merged = prior;
         merged.retain(|_, ts| now - *ts <= OBSERVED_WINDOW_S);
-        for (p, ts) in paths {
-            let slot = merged.entry(p).or_insert(0.0);
+        // MC-1627: the window rides in a parallel map keyed the same way, so
+        // the timestamp map above keeps its exact shape and semantics. Only a
+        // row whose timestamp actually WINS records its window, or a stale
+        // long-window report could relabel a fresh observation as suspect.
+        let mut windows: HashMap<String, f64> = prior_windows;
+        for (p, ts, w) in paths {
+            let slot = merged.entry(p.clone()).or_insert(0.0);
             if ts > *slot {
                 *slot = ts;
+                match w {
+                    Some(w) => {
+                        windows.insert(p, w);
+                    }
+                    // An older hook copy sent no window. REMOVE any stale entry
+                    // rather than leaving the previous one attached to a newer
+                    // timestamp, which would report a measurement that was
+                    // never taken for this observation.
+                    None => {
+                        windows.remove(&p);
+                    }
+                }
             }
         }
         // Row cap: drop OLDEST first, never newest — the newest observation
@@ -1797,10 +1852,19 @@ pub async fn observed_edits(
             rows.truncate(OBSERVED_MAX_ROWS);
             merged = rows.into_iter().collect();
         }
+        // The window map can only ever describe rows the timestamp map still
+        // holds. Pruning to the surviving key set is what keeps it from
+        // outliving its subject after a window expiry or a row-cap drop.
+        windows.retain(|p, _| merged.contains_key(p));
         conn.execute(
             "INSERT INTO prefs (key, value) VALUES (?1, ?2) \
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             rusqlite::params![key, serde_json::to_string(&merged).unwrap_or_default()],
+        )?;
+        conn.execute(
+            "INSERT INTO prefs (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            rusqlite::params![wkey, serde_json::to_string(&windows).unwrap_or_default()],
         )?;
         Ok(crate::db::WriteOutcome {
             applied: true,
@@ -1814,6 +1878,22 @@ pub async fn observed_edits(
             axum::Json(json!({"error": e.to_string()})),
         ),
     }
+}
+
+/// The Bash-window length each of a session's observations sat in (MC-1627).
+///
+/// Not filtered by age: it is keyed by the same paths as `load_observed`, and
+/// the writer already prunes it to that key set. An entry with no counterpart
+/// there is simply never looked up.
+fn load_observed_windows(conn: &rusqlite::Connection, session: &str) -> HashMap<String, f64> {
+    conn.query_row(
+        "SELECT value FROM prefs WHERE key=?1",
+        [observed_window_key(session)],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|v| serde_json::from_str::<HashMap<String, f64>>(&v).ok())
+    .unwrap_or_default()
 }
 
 /// Load a session's observed records inside the window.
@@ -1853,9 +1933,11 @@ pub(crate) fn apply_observed(
     inputs: &mut GuardInputs,
     mine_obs: &HashMap<String, f64>,
     theirs_obs: &[(String, HashMap<String, f64>)],
+    theirs_windows: &[(String, HashMap<String, f64>)],
 ) {
     inputs.observed_mine.clone_from(mine_obs);
     inputs.observed_peers.clear();
+    inputs.observed_windows.clear();
     for (observer, paths) in theirs_obs {
         for (path, ts) in paths {
             inputs
@@ -1863,6 +1945,24 @@ pub(crate) fn apply_observed(
                 .entry(path.clone())
                 .or_default()
                 .insert(observer.clone(), *ts);
+        }
+    }
+    // MC-1627. Keyed exactly like the map above, and deliberately NOT defaulted:
+    // a path absent here was reported by a hook copy that sends no window, and
+    // rendering that as 0 would claim an instantaneous command was measured.
+    for (observer, paths) in theirs_windows {
+        for (path, w) in paths {
+            if inputs
+                .observed_peers
+                .get(path)
+                .is_some_and(|m| m.contains_key(observer))
+            {
+                inputs
+                    .observed_windows
+                    .entry(path.clone())
+                    .or_default()
+                    .insert(observer.clone(), *w);
+            }
         }
     }
     for (path, ts) in mine_obs {
@@ -2542,6 +2642,11 @@ pub(crate) struct GuardInputs {
     /// observations that coincide with (or postdate) a recorded writer.
     pub observed_mine: HashMap<String, f64>,
     pub observed_peers: HashMap<String, BTreeMap<String, f64>>,
+    /// path -> observer -> the Bash window that observation sat in (MC-1627).
+    /// A path missing here was reported by a hook copy that sends no window,
+    /// which is why this is a separate map rather than a widened value: absent
+    /// must stay distinguishable from zero.
+    pub observed_windows: HashMap<String, BTreeMap<String, f64>>,
     /// abs realpath whose WINNING owner's latest record is a restore
     /// (MG-1484): an edit record without authored content. Drives the
     /// `provenance` field on foreign verdicts so the victim notice never
@@ -2613,10 +2718,30 @@ pub(crate) fn classify(
                 .into_iter()
                 .flat_map(|rows| rows.iter())
                 .map(|(session, ts)| {
-                    json!({
+                    // MC-1627: the window this observation sat in, so a reader
+                    // can tell "saw the write as it happened" from "ran a
+                    // 15-minute command and saw everything anyone did in it".
+                    // OMITTED when unmeasured rather than rendered as 0: an
+                    // absent measurement and an instantaneous command are
+                    // different facts, and only one of them is evidence.
+                    let win = inp
+                        .observed_windows
+                        .get(ap)
+                        .and_then(|m| m.get(session.as_str()));
+                    let mut row = json!({
                         "session": session,
                         "age_secs": (now - ts).max(0.0) as i64,
-                    })
+                    });
+                    if let (Some(w), Some(obj)) = (win, row.as_object_mut()) {
+                        obj.insert("window_s".into(), json!(*w as i64));
+                        obj.insert(
+                            "why_window".into(),
+                            json!("this observer's Bash command ran this long; a long \
+                                   window sees every concurrent writer, so the longer \
+                                   it is the less this names anyone"),
+                        );
+                    }
+                    row
                 })
                 .collect();
             v.observations.push(json!({
@@ -3534,6 +3659,7 @@ pub async fn staged_guard_inner(
         mine_observed_only: HashSet::new(),
         observed_mine: HashMap::new(),
         observed_peers: HashMap::new(),
+        observed_windows: HashMap::new(),
         theirs,
         // Content-accounting and ownership both retain recorded edits only.
         theirs_transcript: theirs_fh.clone(),
@@ -3566,7 +3692,12 @@ pub async fn staged_guard_inner(
                 .map(|c| (c.clone(), load_observed(&conn, c, window)))
                 .filter(|(_, m)| !m.is_empty())
                 .collect();
-            apply_observed(&mut inputs, &mine_obs, &theirs_obs);
+            let theirs_windows: Vec<(String, HashMap<String, f64>)> = theirs_obs
+                .iter()
+                .map(|(c, _)| (c.clone(), load_observed_windows(&conn, c)))
+                .filter(|(_, m)| !m.is_empty())
+                .collect();
+            apply_observed(&mut inputs, &mine_obs, &theirs_obs, &theirs_windows);
         }
     }
     let v = classify(&pairs, now, window, &inputs);
@@ -4800,7 +4931,9 @@ mod tests {
 
     #[test]
     fn no_paths_is_not_a_possessive_claim() {
-        let (all_settled, all_mine) = victim_flags(&[], &[]);
+        let (all_settled, all_mine) = victim_flags(&[],
+        &[],
+    );
         assert!(all_settled, "nothing listed is nothing at risk");
         assert!(
             !all_mine,
@@ -5230,7 +5363,7 @@ mod tests {
                 HashMap::from([(format!("/repo/{rel}"), 1500.0)]),
             )];
             let mut inputs = GuardInputs::default();
-            apply_observed(&mut inputs, &HashMap::new(), &observations);
+            apply_observed(&mut inputs, &HashMap::new(), &observations, &[]);
             let verdict = classify(&[pair(rel)], 2000.0, 3600.0, &inputs);
             assert!(
                 verdict.foreign.is_empty(),
@@ -5249,7 +5382,7 @@ mod tests {
             // The same later observation must not erase a real writer's
             // recorded edit or turn their protected work into unclaimed work.
             let mut authored = peer_wrote(rel, "writer-lane", 1000.0);
-            apply_observed(&mut authored, &HashMap::new(), &observations);
+            apply_observed(&mut authored, &HashMap::new(), &observations, &[]);
             let protected = classify(&[pair(rel)], 2000.0, 3600.0, &authored);
             assert_eq!(protected.foreign.len(), 1);
             assert_eq!(protected.foreign[0]["owner"], "writer-lane");
@@ -5578,6 +5711,100 @@ mod tests {
         );
     }
 
+    /// MC-1627 (mixpeek-cicd): mtime attribution is a time-window heuristic, so
+    /// it names whoever runs the LONGEST commands. A 15-minute pytest run
+    /// observes every write any peer made during those 15 minutes and reports
+    /// them all as its own observations, and until now the notice could not say
+    /// so, because the window existed only in the hook and the store held a
+    /// timestamp.
+    ///
+    /// THE WINDOW IS RENDERED WHEN KNOWN AND OMITTED WHEN NOT. Absent and zero
+    /// are different facts: absent means an older hook copy sent no measurement,
+    /// zero would claim an instantaneous command was measured. Rendering the
+    /// first as the second is the shape this whole file keeps cataloguing.
+    #[test]
+    fn an_observers_window_is_rendered_when_measured_and_omitted_when_not() {
+        let path = "/repo/board_store.rs".to_string();
+        let mk = |windows: &[(String, HashMap<String, f64>)]| {
+            let mut g = GuardInputs::default();
+            g.mine.insert(path.clone(), 1000.0);
+            g.mine_firsthand.insert(path.clone());
+            apply_observed(
+                &mut g,
+                &HashMap::new(),
+                &[(
+                    "amux-cloud".to_string(),
+                    HashMap::from([(path.clone(), 1900.0)]),
+                )],
+                windows,
+            );
+            classify(&[pair("board_store.rs")], 2000.0, 3600.0, &g)
+        };
+
+        // MEASURED: a 900s command. The observer saw the write 15 minutes into
+        // its own window, so it names almost nobody.
+        let v = mk(&[(
+            "amux-cloud".to_string(),
+            HashMap::from([(path.clone(), 900.0)]),
+        )]);
+        let row = &v.observations[0]["observers"][0];
+        assert_eq!(row["session"], "amux-cloud");
+        assert_eq!(row["window_s"], 900, "the measured window must reach the notice");
+        assert!(
+            row["why_window"].as_str().unwrap_or("").contains("less this names anyone"),
+            "the window must arrive with what it MEANS, or a reader takes a big \
+             number as strong evidence rather than weak: {row}"
+        );
+
+        // UNMEASURED: an older hook copy. The key must be ABSENT, not 0.
+        let v = mk(&[]);
+        let row = &v.observations[0]["observers"][0];
+        assert_eq!(row["session"], "amux-cloud");
+        assert!(
+            row.get("window_s").is_none(),
+            "an unmeasured window must be omitted, never rendered as 0: {row}"
+        );
+        assert!(row.get("why_window").is_none(), "and its explanation with it: {row}");
+
+        // A WINDOW FOR AN OBSERVER THAT HAS NO OBSERVATION HERE IS DISCARDED.
+        // The two maps are loaded independently and only the timestamp one is
+        // age-filtered, so a window can outlive its observation.
+        //
+        // ASSERTED ON THE MAP, NOT THE RENDER. The first draft checked the
+        // rendered observers list, which cannot see this: the render only walks
+        // paths that HAVE observations and looks up the window by the observing
+        // session, so deleting the guard entirely left that assertion green. A
+        // check pinning the wrong layer is exactly as green as one pinning the
+        // right layer.
+        let mut g = GuardInputs::default();
+        apply_observed(
+            &mut g,
+            &HashMap::new(),
+            &[(
+                "amux-cloud".to_string(),
+                HashMap::from([(path.clone(), 1900.0)]),
+            )],
+            &[
+                (
+                    "amux-cloud".to_string(),
+                    HashMap::from([(path.clone(), 900.0)]),
+                ),
+                (
+                    "some-other-lane".to_string(),
+                    HashMap::from([(path.clone(), 4242.0)]),
+                ),
+            ],
+        );
+        let attached = g.observed_windows.get(&path).expect("the real observer's window");
+        assert_eq!(attached.get("amux-cloud"), Some(&900.0));
+        assert_eq!(
+            attached.get("some-other-lane"),
+            None,
+            "a window from a lane with no observation on this path describes \
+             nothing and must not be carried: {attached:?}"
+        );
+    }
+
     #[test]
     fn an_observed_echo_of_a_transcript_edit_attributes_nothing() {
         // The incident's echo and a much later sample are equally unable to
@@ -5594,6 +5821,7 @@ mod tests {
                     "amux-cloud".to_string(),
                     HashMap::from([("/repo/board_store.rs".to_string(), observed_at)]),
                 )],
+                &[],
             );
             let v = classify(&[pair("board_store.rs")], 2000.0, 3600.0, &g);
             assert!(v.foreign.is_empty());
@@ -5623,6 +5851,7 @@ mod tests {
                 &mut g,
                 &HashMap::from([("/repo/theirs.rs".to_string(), observed_at)]),
                 &[],
+                &[],
             );
             let v = classify(&[pair("theirs.rs")], 2000.0, 3600.0, &g);
             assert_eq!(v.foreign.len(), 1);
@@ -5641,6 +5870,7 @@ mod tests {
                 "bob".to_string(),
                 HashMap::from([("/repo/both.rs".to_string(), 1501.0)]),
             )],
+            &[],
         );
         let v = classify(&[pair("both.rs")], 2000.0, 3600.0, &g);
         assert!(v.foreign.is_empty());
@@ -5673,6 +5903,7 @@ mod tests {
             &mut g,
             &HashMap::from([("/repo/board.rs".to_string(), 1600.0)]),
             &[],
+            &[],
         );
         let v = classify(&[pair("board.rs")], 2000.0, 3600.0, &g);
         assert_eq!(v.foreign.len(), 1);
@@ -5692,6 +5923,7 @@ mod tests {
                 "reader".to_string(),
                 HashMap::from([("/repo/board.rs".to_string(), 1900.0)]),
             )],
+            &[],
         );
         let v = classify(&[pair("board.rs")], 2000.0, 3600.0, &g);
         assert_eq!(v.shared.len(), 1);
@@ -5737,6 +5969,7 @@ mod tests {
                     "amux-frustrations".to_string(),
                     HashMap::from([("/repo/token-baseline.py".to_string(), 2010.0)]),
                 )],
+                &[],
             );
             let v = classify(&[pair("token-baseline.py")], 3100.0, 3600.0, &g);
             assert!(v.shared.is_empty());
@@ -5896,6 +6129,7 @@ mod tests {
             &mut own,
             &HashMap::from([("/repo/f.rs".to_string(), 1900.0)]),
             &[],
+            &[],
         );
         let v = classify(&[pair("f.rs")], 2000.0, 3600.0, &own);
         assert!(v.foreign.is_empty());
@@ -5910,6 +6144,7 @@ mod tests {
             apply_observed(
                 &mut g,
                 &HashMap::from([("/repo/f.rs".to_string(), observed_at)]),
+                &[],
                 &[],
             );
             let v = classify(&[pair("f.rs")], 2000.0, 3600.0, &g);
@@ -5931,6 +6166,7 @@ mod tests {
                 "bob".to_string(),
                 HashMap::from([("/repo/g.rs".to_string(), 500.0)]),
             )],
+            &[],
         );
         let v = classify(&[pair("g.rs")], 2000.0, 3600.0, &g);
         assert_eq!(v.foreign[0]["provenance"], "restore");
@@ -5951,6 +6187,7 @@ mod tests {
                 "reader".to_string(),
                 HashMap::from([("/repo/unknown.rs".to_string(), 1501.0)]),
             )],
+            &[],
         );
         let v = classify(&[pair("unknown.rs")], 2000.0, 3600.0, &blind);
         assert_eq!(v.foreign.len(), 1);
@@ -5966,6 +6203,41 @@ mod tests {
     /// correctly-committed work, on every edit-then-commit-in-one-Bash-call,
     /// which is the dominant bypass-permissions shape. The fix is stamping
     /// the REPORTED mtime; these cells pin the parse.
+    /// MC-1627: the hook's window must survive the parse, and an ABSENT one
+    /// must stay absent. `None` says nobody measured; `Some(0.0)` says the
+    /// command was instantaneous. Collapsing the first into the second would
+    /// report a measurement that was never taken.
+    #[test]
+    fn a_reported_window_survives_the_parse_and_an_absent_one_stays_absent() {
+        let now = 2000.0;
+        let body = json!({"paths": [
+            {"path": "/repo/measured.rs", "mtime": 1500.0, "window_s": 900.0},
+            {"path": "/repo/unmeasured.rs", "mtime": 1500.0},
+            "/repo/bare.rs",
+        ]});
+        let rows = parse_observed_reports(&body, now);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].2, Some(900.0), "a measured window must reach the store");
+        assert_eq!(rows[1].2, None, "an object with no window_s measured nothing");
+        assert_eq!(rows[2].2, None, "a bare string is an older hook copy");
+        // The timestamp is untouched by any of this.
+        assert_eq!(rows[0].1, 1500.0);
+        assert_eq!(rows[2].1, now, "a bare string still stamps with the server clock");
+
+        // JUNK IS REJECTED, NOT DEFAULTED. A negative or non-finite window is
+        // not a measurement, and passing it through would render as evidence.
+        for junk in [json!(-1.0), json!("900"), json!(null), json!(f64::MAX * 2.0)] {
+            let b = json!({"paths": [
+                {"path": "/repo/j.rs", "mtime": 1500.0, "window_s": junk},
+            ]});
+            assert_eq!(
+                parse_observed_reports(&b, now)[0].2,
+                None,
+                "a window of {junk} is not a measurement"
+            );
+        }
+    }
+
     #[test]
     fn observed_report_stamps_the_file_mtime_not_the_hook_time() {
         let now = 2000.0;
@@ -5975,7 +6247,7 @@ mod tests {
         let rows = parse_observed_reports(&body, now);
         assert_eq!(
             rows,
-            vec![("/repo/x.rs".to_string(), 1500.0)],
+            vec![("/repo/x.rs".to_string(), 1500.0, None)],
             "a reported mtime must survive as the record's timestamp — hook-run \
              time postdates the commit in the one-Bash-call shape and manufactures \
              false AtRisk notices"
@@ -5985,14 +6257,14 @@ mod tests {
         let body = serde_json::json!({"paths": ["/repo/y.rs"]});
         assert_eq!(
             parse_observed_reports(&body, now),
-            vec![("/repo/y.rs".to_string(), now)]
+            vec![("/repo/y.rs".to_string(), now, None)]
         );
         // A future mtime clamps to now: a skewed clock must not mint a record
         // that outlives the pruning window.
         let body = serde_json::json!({"paths": [{"path": "/repo/z.rs", "mtime": 99999.0}]});
         assert_eq!(
             parse_observed_reports(&body, now),
-            vec![("/repo/z.rs".to_string(), now)]
+            vec![("/repo/z.rs".to_string(), now, None)]
         );
         // Junk rows (no path, wrong types, empty) are skipped, not defaulted.
         let body = serde_json::json!({"paths": [{"mtime": 1.0}, 42, "", {"path": "  "}]});
@@ -6017,6 +6289,82 @@ mod tests {
     /// semantics next to it had nothing — deleting the window prune, reversing
     /// the cap sort, or removing the cap entirely each passed all 1171 tests.
     /// All three through the real handler against a real store.
+    /// MC-1627: the window map is stored beside the timestamp map, so the two
+    /// can drift. This pins the three ways they must not.
+    #[tokio::test]
+    async fn a_stored_window_tracks_its_timestamp_and_never_outlives_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::db::Store::open(&dir.path().join("w.db")).unwrap());
+        let post = |body: Value| {
+            let st = crate::api::AppState {
+                store: store.clone(),
+                started: std::time::Instant::now(),
+                build_hash: "test".into(),
+                auth_token: None,
+                reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            };
+            let mut h = HeaderMap::new();
+            h.insert("x-amux-session", "win-pin".parse().unwrap());
+            async move { observed_edits(axum::extract::State(st), h, axum::Json(body)).await }
+        };
+        let read = |key: &str| -> HashMap<String, f64> {
+            store
+                .read()
+                .unwrap()
+                .query_row("SELECT value FROM prefs WHERE key=?1", [key], |r| {
+                    r.get::<_, String>(0)
+                })
+                .ok()
+                .and_then(|v| serde_json::from_str(&v).ok())
+                .unwrap_or_default()
+        };
+        let now = now_epoch();
+
+        // 1. A measured window is persisted next to its path.
+        let _ = post(json!({"paths": [
+            {"path": "/tmp/a.txt", "mtime": now - 5.0, "window_s": 900.0},
+        ]}))
+        .await;
+        // KEY-AGNOSTIC: the store realpaths the reported path, and on this
+        // platform /tmp is a symlink to /private/tmp, so a literal key here
+        // asserts the wrong thing and fails on a correct store.
+        let only = |key: &str| -> Vec<f64> { read(key).into_values().collect() };
+        assert_eq!(only("observed_windows:win-pin"), vec![900.0]);
+
+        // 2. A NEWER report from an older hook copy (no window) must REMOVE the
+        // stale one, not leave it attached to a timestamp it never described.
+        // Without this the window silently becomes a claim about a different
+        // observation than the one it was measured for.
+        let _ = post(json!({"paths": [
+            {"path": "/tmp/a.txt", "mtime": now - 1.0},
+        ]}))
+        .await;
+        assert!(
+            only("observed_windows:win-pin").is_empty(),
+            "a window must not survive a newer observation that measured none"
+        );
+
+        // 3. An OLDER report loses the merge, so it must not install its window
+        // over the winning timestamp either.
+        let _ = post(json!({"paths": [
+            {"path": "/tmp/a.txt", "mtime": now - 600.0, "window_s": 42.0},
+        ]}))
+        .await;
+        assert!(
+            only("observed_windows:win-pin").is_empty(),
+            "only the observation that WINS the merge records its window"
+        );
+
+        // 4. The window map may only describe paths the timestamp map holds.
+        let ts = read("observed_edits:win-pin");
+        for path in read("observed_windows:win-pin").keys() {
+            assert!(
+                ts.contains_key(path),
+                "{path} has a window but no timestamp, so it describes nothing"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn observed_store_prunes_the_window_and_the_cap_drops_oldest_first() {
         let dir = tempfile::tempdir().unwrap();
@@ -6637,6 +6985,7 @@ mod tests {
             &mut inputs,
             &HashMap::new(),
             &[("peer".to_string(), HashMap::from([(path.clone(), 100.0)]))],
+            &[],
         );
         assert!(
             !peer_authored_content(&inputs, &path),
@@ -6673,7 +7022,7 @@ mod tests {
         let path = "/repo/shared.rs".to_string();
         let mut inputs = GuardInputs::default();
         let theirs_obs = vec![("peer".to_string(), HashMap::from([(path.clone(), 100.0)]))];
-        apply_observed(&mut inputs, &HashMap::new(), &theirs_obs);
+        apply_observed(&mut inputs, &HashMap::new(), &theirs_obs, &[]);
         let v = classify(&[pair("shared.rs")], 2000.0, 3600.0, &inputs);
         assert!(v.foreign.is_empty());
         assert_eq!(v.unclaimed.len(), 1);
@@ -6769,6 +7118,7 @@ mod tests {
             &mut inp,
             &HashMap::new(),
             &[("reader".to_string(), HashMap::from([(p.clone(), 1000.0)]))],
+            &[],
         );
         let v = classify(
             &[("s04_faces.py".to_string(), p.clone())],
@@ -7346,6 +7696,7 @@ mod tests {
                         ("/repo/unclaimed.rs".to_string(), 1500.0),
                     ]),
                 )],
+                &[],
             );
             let v = Envelope {
                 verdict: classify(
