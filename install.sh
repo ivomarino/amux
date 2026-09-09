@@ -7,7 +7,7 @@
 #   1. checks prerequisites (rust toolchain, tmux; herdr is optional) —
 #      prompts before installing anything, never silently
 #   2. cargo build --release the workspace
-#   3. installs the server (amux-server-rs) + CLI (amux-rs) into ~/.local/bin
+#   3. installs the server, Rust CLI and validated Bash CLI into ~/.local/bin
 #   4. writes + loads the launchd agents (macOS): com.amux.server-rs on
 #      port 8824, and com.amux.server-rs-builder (auto-rebuild on new
 #      commits). On other platforms it installs the binaries and prints an
@@ -187,6 +187,7 @@ install -m 0755 "$TARGET_DIR/release/amux-server" "$BIN_DIR/amux-server-rs"
 install -m 0755 "$TARGET_DIR/release/amux-rs" "$BIN_DIR/amux-rs"
 say "installed $BIN_DIR/amux-server-rs"
 say "installed $BIN_DIR/amux-rs"
+"$SCRIPT_DIR/scripts/install-cli.sh" "$BIN_DIR"
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) warn "$BIN_DIR is not on your PATH — add it to use amux-rs directly" ;;

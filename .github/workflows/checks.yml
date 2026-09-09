@@ -317,6 +317,7 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-cli-offset-safe.sh
+          ./scripts/test-cli-install.sh
       # AEAB-22. Lives here, not in rust.yml, for the same reason as the other
       # CLI/asset gates: rust.yml is path-filtered to `crates/**` + `Cargo.*` +
       # `e2e/**`, and while app.js IS under crates/, this test also guards

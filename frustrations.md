@@ -3394,3 +3394,14 @@ FIX: Assert that the message lands near the scroller start and below the actual
   controls included the run was 59/60; its mobile snapshot poll exceeded 5s
   after the config write was logged successful. Exact fresh-home rerun ->
   1 passed (20.9s), no source change. This is not a green full-browser-CI claim.
+
+## An unresolved merge was published as the fleet's Bash CLI
+AREA: cli
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-09
+SESSION: amux-testing-e2e
+CARD: ATE-136
+SYMPTOM: mixpeek-general measured conflict markers in ~/.local/bin/amux at lines 1527/1535/1563; every subcommand failed parsing. The shared checkout was mid-merge. install.sh installed only the Rust binaries, leaving no supported Bash publication path, while the freshness hook prescribed a worktree symlink. The exact manual copier is not established; this lane did not start or change the shared merge.
+COST: Fleet-wide CLI outage requiring a peer to restore the committed origin/main script; the installer recommendation initially pointed at a path that did not exist. Incident evidence is retained on MG-1716.
+FIX: make install-cli and install.sh now use one publisher: snapshot beside the destination, reject unmerged source/conflict markers/invalid Bash, then atomic rename of those validated bytes. Refusals and publication failures preserve the installed client and emit stage/reason to stderr and logs/cli-install.log. The grid helper is included and validated before either file is published, so replacing a symlink preserves that command. Freshness guidance uses the guarded publisher. Sixteen temporary-fixture tests cover ENOSPC, publication failure, open readers, source races, concurrent installs and installed grid dispatch; syntax and in-place-copy mutations fail named tests. This retires the publication mechanism only; resolving the separate shared merge remains its owner's work.
