@@ -1,0 +1,5 @@
+'use client';
+import BusinessApp from '@/components/business/app';
+export default function Page() {
+  return <BusinessApp />;
+}

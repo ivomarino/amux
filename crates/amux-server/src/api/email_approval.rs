@@ -335,9 +335,28 @@ pub fn list_pending(home: &Path) -> Vec<Value> {
             if let Some(obj) = doc.as_object_mut() {
                 obj.insert("age_s".into(), json!(age as i64));
                 obj.insert("expires_in_s".into(), json!((APPROVAL_TTL_S - age) as i64));
-                // The frozen payload stays server-side until approval; the
-                // list serves the preview, which already carries to/cc/
-                // subject/body for the human's decision.
+                // Business review must distinguish a truncated summary from the
+                // frozen message. Never expose raw attachment data or file paths.
+                // Existing dashboard previews retain their compatible shape.
+                if let Some(payload) = obj.get("payload").cloned() {
+                    let body = payload.get("body").and_then(Value::as_str).unwrap_or("");
+                    let attachment_count = payload.get("attachments")
+                        .and_then(Value::as_array).map_or(0, Vec::len);
+                    let complete = !body.is_empty() && body.len() <= 100_000
+                        && attachment_count == 0;
+                    obj.insert("review".into(), json!({
+                        "body": if body.len() <= 100_000 { Some(body) } else { None },
+                        "body_complete": !body.is_empty() && body.len() <= 100_000,
+                        "attachment_count": attachment_count,
+                        "includes_signature": payload.get("signature")
+                            .and_then(Value::as_bool).unwrap_or(true),
+                        "complete": complete,
+                    }));
+                    if !complete {
+                        tracing::debug!(approval_id = %id, attachment_count,
+                            body_bytes = body.len(), "email_approval_review_incomplete");
+                    }
+                }
                 obj.remove("payload");
             }
             out.push(doc);
@@ -354,6 +373,29 @@ pub fn list_pending(home: &Path) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_business_review_uses_full_body_and_announces_unreviewed_attachments() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = "A".repeat(3000);
+        let id = create_approval(dir.path(), "business-test", "send",
+            json!({"body": body, "attachments": [], "signature": false}),
+            json!({"body": "short preview", "to": "recipient@example.test"})).unwrap();
+        let rows = list_pending(dir.path());
+        let row = rows.iter().find(|r| r["id"] == id).unwrap();
+        assert_eq!(row["review"]["body"], body);
+        assert_eq!(row["review"]["complete"], true);
+        assert_eq!(row["review"]["includes_signature"], false);
+        assert!(row.get("payload").is_none());
+        create_approval(dir.path(), "business-test", "send",
+            json!({"body": "Attached", "attachments": [{"filename":"evidence.pdf", "data":"private"}]}),
+            json!({"body": "Attached"})).unwrap();
+        let rows = list_pending(dir.path());
+        let attached = rows.iter().find(|r| r["id"] != id).unwrap();
+        assert_eq!(attached["review"]["complete"], false);
+        assert_eq!(attached["review"]["attachment_count"], 1);
+        assert!(!attached.to_string().contains("private"));
+    }
 
     #[test]
     fn classifier_external_is_external_and_every_internal_shape_is_not() {
