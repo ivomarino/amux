@@ -105,6 +105,12 @@
 })();
 // ── Auth token injection (must be first — before any fetch calls) ──
 const _authToken = window._AMUX_AUTH_TOKEN || '';
+// AF-639. An empty _authToken has two causes with opposite consequences, and
+// the empty string cannot tell them apart: auth is off entirely (nothing will
+// 401, say nothing) or the server withheld the bearer from this browser
+// because it is remote (EVERY /api call will 401, for the life of this
+// window, and no reload can change it). The server answers which one.
+const _authWithheld = !!window._AMUX_AUTH_WITHHELD;
 function _authHeaders(headers) {
   const h = headers ? { ...headers } : {};
   if (_authToken) h['Authorization'] = 'Bearer ' + _authToken;
@@ -2938,6 +2944,14 @@ function _checkSessionTransitions(newData) {
 // the fresh shell. Nudge the SW and reload ONCE per session (rate-limited like
 // the version-mismatch reload; a broken SW must not cause a storm).
 function _staleShellRecover() {
+  // AF-639: a reload heals only the case this function was written for, a
+  // SW-cached shell carrying a rotated-away token, where the fresh shell does
+  // bring a fresh one. When the server withheld the bearer deliberately the
+  // fresh shell is identical, so the reload is a no-op that repeats every ten
+  // minutes forever and tells the person at the keyboard nothing. Measured
+  // 2026-09-09: one laptop sat in this state for 22.5 hours and 28,355 401s,
+  // showing a dashboard that looked fine because it was rendering its cache.
+  if (_authWithheld) { _amuxAuthWithheldBanner(); return; }
   try {
     const last = parseInt(sessionStorage.getItem('amux_401_reload') || '0');
     if (Date.now() - last < 600000) return;
@@ -2949,6 +2963,54 @@ function _staleShellRecover() {
     upd.finally ? upd.finally(() => setTimeout(() => location.reload(), 1500))
                 : setTimeout(() => location.reload(), 1500);
   } catch (e) {}
+}
+
+// AF-639. The honest end state for a browser the server will not bootstrap:
+// say so, and hand over the one action that fixes it. One visit carrying
+// ?_token= is enough — the server swaps it for an HttpOnly owner session and
+// strips it back out of the address bar (static_files.rs::serve_shell), so
+// this survives reloads and does not leave the bearer in history.
+function _amuxAuthWithheldBanner() {
+  if (!document.body || document.getElementById('amux-auth-withheld')) return;
+  const bar = document.createElement('div');
+  bar.id = 'amux-auth-withheld';
+  // Inline styles, same reasoning as the legacy-origin banner above: this has
+  // to render even when app.css never loaded, and every /api fetch on this
+  // page is failing, so it cannot depend on anything fetched.
+  bar.style.cssText = 'position:fixed;left:0;right:0;top:0;z-index:100000;' +
+    'padding:calc(env(safe-area-inset-top,0px) + 10px) 14px 12px;' +
+    'background:#7c2d12;color:#fff;font:500 13px/1.45 -apple-system,system-ui,sans-serif;' +
+    'box-shadow:0 2px 12px rgba(0,0,0,.4);';
+  bar.innerHTML = '<div style="max-width:720px;margin:0 auto;">' +
+    '<b>Not signed in to this server.</b> Everything below is cached and will not update: ' +
+    'this browser is remote, so the server did not give this page a token and every request ' +
+    'is being refused. Paste the token from <code>~/.amux/auth_token</code> on the server ' +
+    'machine to sign in for good.</div>';
+  const row = document.createElement('div');
+  row.style.cssText = 'max-width:720px;margin:8px auto 0;display:flex;gap:8px;flex-wrap:wrap;';
+  const input = document.createElement('input');
+  input.type = 'password';
+  input.autocomplete = 'off';
+  input.placeholder = 'auth token';
+  input.style.cssText = 'flex:1;min-width:180px;min-height:44px;padding:0 12px;border-radius:8px;' +
+    'border:1px solid rgba(255,255,255,.4);background:rgba(0,0,0,.25);color:#fff;font-size:13px;';
+  const go = document.createElement('button');
+  go.textContent = 'Sign in';
+  go.style.cssText = 'min-height:44px;padding:0 16px;border-radius:8px;border:0;' +
+    'background:#fff;color:#7c2d12;font-weight:600;font-size:13px;cursor:pointer;';
+  const submit = () => {
+    const t = input.value.trim();
+    if (!t) { input.focus(); return; }
+    location.href = location.pathname + '?_token=' + encodeURIComponent(t);
+  };
+  go.onclick = submit;
+  input.onkeydown = (e) => { if (e.key === 'Enter') submit(); };
+  row.appendChild(input);
+  row.appendChild(go);
+  bar.appendChild(row);
+  document.body.appendChild(bar);
+  // Deliberately NOT dismissable. The whole failure is that the page looks
+  // fine, and a banner the user can close reproduces that within a minute.
 }
 
 let _sessEtag = null;
@@ -9182,7 +9244,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.843';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.844';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
