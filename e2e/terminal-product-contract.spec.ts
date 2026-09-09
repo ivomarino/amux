@@ -10,6 +10,7 @@ async function boot(page: Page, options?: {
   liveDelayMs?: number;
   willSend?: boolean;
   waitForBothFrames?: boolean;
+  paneCols?: number;
 }) {
   let live = options?.live || 'Idle terminal\n';
   let peekResponses = 0;
@@ -48,8 +49,8 @@ async function boot(page: Page, options?: {
     const liveOnly = new URL(route.request().url()).searchParams.has('live');
     if (liveOnly && options?.liveDelayMs) await new Promise(resolve => setTimeout(resolve, options.liveDelayMs));
     await route.fulfill({ json: liveOnly
-      ? { name: worker, live, output: live, live_only: true }
-      : { name: worker, history: transcript, live, output: live, output_is_viewport_only: true } });
+      ? { name: worker, live, output: live, live_only: true, pane_cols: options?.paneCols }
+      : { name: worker, history: transcript, live, output: live, output_is_viewport_only: true, pane_cols: options?.paneCols } });
     peekResponses += 1;
   });
 
@@ -60,6 +61,7 @@ async function boot(page: Page, options?: {
     (window as any).openPeek(name);
   }, worker);
   await expect(page.locator('#peek-overlay')).toHaveClass(/active/);
+  await page.waitForFunction(() => getComputedStyle(document.getElementById('peek-overlay')!).transform === 'none');
   await expect(page.locator('#peek-body')).not.toContainText('Loading latest');
   // openPeek intentionally starts the fast live frame and the complete frame
   // concurrently. Wait for both so a slower engine cannot race a synthetic
@@ -107,7 +109,7 @@ test('a prompt sent while terminal is open is immediately attributed to the huma
 test('terminal controls are compact and new-output affordance appears only after buffering', async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 1280, height: 800 });
   const transcript = Array.from({ length: 220 }, (_, i) => `terminal output row ${i}`).join('\n');
-  await boot(page, { transcript, live: 'latest output\n' });
+  const state = await boot(page, { transcript, live: 'latest output\n' });
 
   const layout = await page.evaluate(() => {
     const controls = document.querySelector('.peek-output-controls')!.getBoundingClientRect();
@@ -124,12 +126,8 @@ test('terminal controls are compact and new-output affordance appears only after
   });
   await expect(page.locator('.scroll-lock-badge')).toBeHidden();
 
-  await page.evaluate(async () => {
-    const w = window as any;
-    await w._queuePeekFrame(w._peekIdentity(), {
-      name: 'terminal-contract', history: null, live: 'new buffered output\n',
-    });
-  });
+  state.setLive('new buffered output\n');
+  await page.evaluate(() => (window as any).refreshPeek(true));
   const notice = page.locator('.scroll-lock-badge');
   await expect(notice).toBeVisible();
   await expect(notice).toHaveText('New output \u2193');
@@ -182,27 +180,64 @@ test('worker tab choices restore from the server after browser storage is lost a
 
 test('terminal scroll geometry remains stable through repeated live frames', async ({ page }) => {
   const transcript = Array.from({ length: 900 }, (_, i) => `stable terminal row ${i}`).join('\n');
-  await boot(page, { transcript, live: 'live frame zero\n' });
+  const state = await boot(page, { transcript, live: 'live frame zero\n' });
   const before = await page.evaluate(() => {
     const body = document.getElementById('peek-body')!;
     body.scrollTop = Math.floor((body.scrollHeight - body.clientHeight) * 0.45);
-    const chunk = body.querySelector('.peek-render-chunk')!;
-    return { top: body.scrollTop, contentVisibility: getComputedStyle(chunk).contentVisibility };
+    const history = body.querySelector('#pk-hist')!;
+    return { top: body.scrollTop, contentVisibility: getComputedStyle(history).contentVisibility };
   });
   expect(before.contentVisibility).toBe('visible');
 
-  await page.evaluate(async () => {
-    const w = window as any;
-    for (let i = 1; i <= 8; i++) {
-      await w._queuePeekFrame(w._peekIdentity(), {
-        name: 'terminal-contract', history: null, live: `live frame ${i}\n`,
-      });
+  for (let i = 1; i <= 8; i++) {
+    state.setLive(`live frame ${i}\n`);
+    await page.evaluate(async () => {
+      await (window as any).refreshPeek(true);
       await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-    }
-  });
+    });
+  }
   const after = await page.locator('#peek-body').evaluate(body => (body as HTMLElement).scrollTop);
   expect(Math.abs(after - before.top)).toBeLessThanOrEqual(1);
 });
+
+for (const width of [390, 1280]) {
+  test(`terminal documents retain markup boundaries and literal output at ${width}px`, async ({ page }, testInfo) => {
+    await page.setViewportSize({ width, height: 844 });
+    const rendererSignals: unknown[] = [];
+    page.on('request', request => {
+      if (request.url().endsWith('/api/client-debug') && request.method() === 'POST') {
+        const data = request.postDataJSON();
+        if (data?.kind === 'peek-poll') rendererSignals.push(data.input_chunk_parser_present);
+      }
+    });
+    const numbered = '38-    background: #1c2128;\n39-    color: white;';
+    const history = [
+      ...Array.from({ length: 63 }, (_, i) => `ordinary output ${i}`),
+      '\u276f a submitted prompt at the old chunk boundary',
+      '  its indented continuation',
+      'OUTSIDE_PROMPT first answer',
+      '\u001b[38;2;144;200;240m' + Array.from({ length: 140 }, (_, i) => `colored answer ${i}`).join('\n') + '\u001b[0m',
+      numbered,
+      '\u001b]8;;https://example.com/reference\u0007reference\u001b]8;;\u0007',
+      'OUTSIDE_PROMPT final answer',
+    ].join('\n');
+    await boot(page, { transcript: history, live: 'current output\n' });
+    const body = page.locator('#peek-body');
+    await expect(body).toContainText('OUTSIDE_PROMPT final answer');
+    await expect(body.locator('.peek-render-chunk, .peek-code-row, .peek-code-split')).toHaveCount(0);
+    await expect.poll(() => rendererSignals.length).toBeGreaterThan(0);
+    expect(rendererSignals.every(value => value === false)).toBe(true);
+    await expect(body.locator('.peek-prompt')).toHaveCount(1);
+    await expect(body.locator('.peek-prompt')).not.toContainText('OUTSIDE_PROMPT');
+    await expect(body.locator('.peek-prompt .peek-prompt')).toHaveCount(0);
+    await expect(body).toContainText(numbered);
+    await expect(body.locator('a[href="https://example.com/reference"]')).toHaveText('reference');
+    const bounds = await body.boundingBox();
+    expect(bounds!.width).toBeLessThanOrEqual(width);
+    await body.evaluate(el => { el.scrollTop = el.scrollHeight; });
+    await page.screenshot({ path: testInfo.outputPath(`document-boundaries-${width}.png`) });
+  });
+}
 
 test('a delayed live-frame request cannot hold the terminal loading screen open', async ({ page }) => {
   const started = Date.now();
@@ -215,4 +250,20 @@ test('a delayed live-frame request cannot hold the terminal loading screen open'
   await expect(page.locator('#peek-body')).toContainText('current terminal frame', { timeout: 700 });
   expect(Date.now() - started).toBeLessThan(2500);
   await expect(page.locator('#peek-body .peek-loading')).toHaveCount(0);
+});
+
+test('the HTTP frame retains the worker column cap after renderer reconciliation', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 844 });
+  await boot(page, { paneCols: 80, transcript: 'Ordinary prose in the worker terminal. '.repeat(160) });
+  const size = await page.evaluate(() => {
+    const body = document.getElementById('peek-body')!;
+    const history = document.getElementById('pk-hist')!;
+    return { cols: body.style.getPropertyValue('--peek-cols'), body: body.clientWidth,
+      history: history.getBoundingClientRect().width, max: parseFloat(getComputedStyle(history).maxWidth),
+      overflow: history.scrollWidth - history.clientWidth };
+  });
+  expect(size.cols).toBe('80');
+  expect(size.history).toBeCloseTo(size.max, 0);
+  expect(size.history).toBeLessThan(size.body);
+  expect(size.overflow).toBeLessThanOrEqual(1);
 });

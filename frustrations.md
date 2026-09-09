@@ -3353,6 +3353,37 @@ FIX: Initial attempt 69490b05 introduced gutter/code cells, unified split rows b
   repeated lock transitions at 390px and 1280px, and tests horizontal chip touch
   policy. Against the committed pre-revert source, the three text contracts fail
   for rendered-output mismatches while the five cache/coalescing tests pass.
+  FURTHER CORRECTION 2026-09-09, originating session amux-testing-e2e:
+  c3183a27 supersedes those partial reverts and removes the entire renderer
+  rewrite, including the cache, ANSI/OSC-8 carry and frame coalescing. The amux
+  worker reports a live prompt-highlight wrapper covering 44.2% of a
+  106,680-character pane. Parsing input fragments let document constructs cross
+  parser boundaries; the earlier passing fixtures did not establish structural
+  correctness. All renderer/performance acceptance above is withdrawn, not
+  evidence for re-landing that implementation. The deleted renderer suites stay
+  deleted. e2e1e643 adds worker lifecycle coverage; a future renderer must also
+  prove markup boundaries and visible layout, beyond preserving textContent.
+  The independent 5abadb51 session-read recovery and horizontal chip gesture
+  remain. The original mobile/readability and performance request stays open.
+  Integration then found merges 9461039b/a29882d1 had resurrected the parser,
+  inferred diff markup and deleted suites. Reconcile the authoritative revert
+  with 22d1561f's tab persistence, compact controls, prompt attribution and
+  history/live overlap protection; retain the later menu/path fixes and move
+  314fd8b6's pane-width cap into the restored HTTP refresh path. The
+  existing peek-poll client-debug beacon now reports whether the input chunk
+  parser is present. Product/lifecycle tests assert the removed wrappers stay
+  absent, and product checks deliver updates through refreshPeek's HTTP path.
+  CI's terminal-render.mjs argument goes with the removed suite. Before the
+  merge, Node 22 silently ignored that missing file and both commands passed
+  the 18 surviving outage-recovery tests; that was stale wiring, not a failing
+  gate. Lifecycle fixture failures also exposed a 250ms entrance-animation
+  measurement, column-default rather than exact-card acknowledgements, an
+  artifact refusal masking the acknowledgement checks, and a bare API DELETE
+  that correctly lacked the dashboard UI token. The fixture now waits for the
+  named entrance transition, distinguishes those gates, and confirms deletion
+  through the dashboard. It imports the shared candidate-asset fixture so the
+  installed API binary cannot silently substitute its embedded dashboard.
+  No server code changes or renewed mobile/performance acceptance.
 
 
 ---

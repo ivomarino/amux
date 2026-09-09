@@ -16,7 +16,10 @@
 //
 // Self-cleaning: the worker and card are uniquely named and removed in
 // `finally`, so a failed run does not leave a lane or a card behind.
-import { test, expect, Page } from '@playwright/test';
+import type { Page } from '@playwright/test';
+// Use the shared fixture so isolated runs exercise the candidate dashboard
+// assets, not whichever bundle the installed API binary happens to contain.
+import { test, expect } from './fixtures';
 
 async function appToken(page: Page): Promise<string> {
   await page.goto('/');
@@ -26,6 +29,7 @@ async function appToken(page: Page): Promise<string> {
 }
 
 test('a worker goes create → run → prompt → peek → delete, and the board gates hold', async ({ page, request }, testInfo) => {
+  test.setTimeout(60_000); // creation and deletion each have their own bounded 30s poll
   const token = await appToken(page);
   const auth = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
   const worker = `e2e-life-${testInfo.project.name}-${Date.now()}`;
@@ -48,7 +52,11 @@ test('a worker goes create → run → prompt → peek → delete, and the board
     await page.fill('#create-name', worker);
     await page.fill('#create-dir', process.env.AMUX_E2E_DIR || '/tmp');
     await page.selectOption('#create-model', sonnet);
-    await page.locator('#create-overlay button.primary:has-text("Create")').click();
+    const [created] = await Promise.all([
+      page.waitForResponse(r => new URL(r.url()).pathname === '/api/sessions' && r.request().method() === 'POST'),
+      page.locator('#create-overlay button.primary:has-text("Create")').click(),
+    ]);
+    expect(created.ok(), `worker creation must succeed (HTTP ${created.status()})`).toBe(true);
 
     // The chosen model reaches the PROCESS as a launch flag. Assert the flag,
     // not the `model` field: that one reflects the live harness report and is
@@ -72,8 +80,12 @@ test('a worker goes create → run → prompt → peek → delete, and the board
     await expect.poll(async () => page.evaluate(
       () => (document.getElementById('peek-body') as HTMLElement).textContent!.length),
       { timeout: 30_000 }).toBeGreaterThan(0);
-    expect(await page.locator('.peek-code-row, .peek-code-split').count(),
-      'plain terminal output must not be re-rendered as a split diff').toBe(0);
+    // The overlay deliberately enters with a 250ms translateY(12px). Starting
+    // the streaming measurement during that transition reports the entrance
+    // as terminal bounce. Wait for that named transition, not an arbitrary nap.
+    await page.waitForFunction(() => getComputedStyle(document.getElementById('peek-overlay')!).transform === 'none');
+    expect(await page.locator('.peek-render-chunk, .peek-code-row, .peek-code-split').count(),
+      'the reverted input-chunk parser and inferred split diff must remain absent').toBe(0);
     expect(await page.locator('.peek-output-controls .scroll-lock-badge').count(),
       'the scroll-lock badge must not sit in the toolbar layout flow — it resizes the row and the view jumps').toBe(0);
 
@@ -81,10 +93,23 @@ test('a worker goes create → run → prompt → peek → delete, and the board
     // in the toolbar's flow is exactly what made the view bounce.
     const geom = async () => page.evaluate(() => {
       const r = document.getElementById('peek-body')!.getBoundingClientRect();
-      return `${Math.round(r.top)}x${Math.round(r.height)}`;
+      return {
+        box: `${Math.round(r.top)}x${Math.round(r.height)}`,
+        layout: [...document.querySelectorAll('#peek-overlay *')]
+          .filter(el => el.id || el.classList.contains('overlay-header'))
+          .map(el => ({ name: el.id || el.className, top: Math.round(el.getBoundingClientRect().top),
+            height: Math.round(el.getBoundingClientRect().height) }))
+          .filter(el => el.height > 0 && el.top <= r.top),
+      };
     });
     const seen = new Set<string>();
-    for (let i = 0; i < 8; i++) { seen.add(await geom()); await page.waitForTimeout(400); }
+    const samples = [];
+    for (let i = 0; i < 8; i++) {
+      const sample = await geom(); samples.push(sample); seen.add(sample.box);
+      await page.waitForTimeout(400);
+    }
+    await testInfo.attach('terminal-layout-samples', { body: JSON.stringify(samples), contentType: 'application/json' });
+    if (seen.size > 1) console.log('TERMINAL_LAYOUT_SAMPLES', JSON.stringify(samples));
     expect([...seen], 'the terminal box must hold still while output streams').toHaveLength(1);
     await page.evaluate(() => (window as any).closePeek());
 
@@ -97,14 +122,35 @@ test('a worker goes create → run → prompt → peek → delete, and the board
     card = (await made.json()).id;
 
     const statuses = await (await request.get('/api/board/statuses', { headers: auth })).json();
+    const contract = await (await request.get(`/api/board/contract?card=${card}`, { headers: auth })).json();
+    expect(contract.card_effective_gates?.card).toBe(card);
+    const gates = contract.card_effective_gates.gates as Record<string, string[]>;
+    expect(gates.review?.length).toBeGreaterThan(0);
+    expect(gates.done?.length).toBeGreaterThan(0);
     const move = (data: object) => request.patch(`/api/board/${card}`, { headers: auth, data });
     const statusOf = async () => (await (await request.get(`/api/board/${card}`, { headers: auth })).json()).status;
 
-    for (const col of statuses.filter((s: any) => (s.gate || []).length > 0)) {
+    // Prove the artifact refusal separately, then satisfy that prerequisite
+    // with this test's actual fixture file. Otherwise every done probe returns
+    // the same missing-asset 409 before acknowledgement validation even runs.
+    const noAsset = await move({ status: 'done', gate_checked: gates.done });
+    expect(noAsset.status(), 'done must refuse a card that names no artifact').toBe(409);
+    expect((await noAsset.json()).code).toBe('done_requires_asset_link');
+    const fixture = await move({
+      desc: 'Synthetic gate fixture. Its artifact is e2e/worker-lifecycle.spec.ts.',
+      evidence: 'Fixture only: e2e/worker-lifecycle.spec.ts exercises these transitions; this is not a production completion claim.',
+    });
+    expect(fixture.ok()).toBe(true);
+
+    for (const col of statuses.filter((s: any) => (gates[s.id] || []).length > 0)) {
+      // Column defaults omit type/worker/group overrides. The exact card's
+      // resolved contract is the same gate enforcement will actually require.
+      const gate = gates[col.id];
       // 1. A bare move is refused, and the refusal names the way through.
       const bare = await move({ status: col.id });
       expect(bare.status(), `${col.id} must refuse a move that acknowledges nothing`).toBe(409);
       const why = await bare.json();
+      expect(why.gate, `${col.id}'s contract and refusal must agree`).toEqual(gate);
       expect(JSON.stringify(why), `${col.id}'s refusal must tell the caller how to comply`)
         .toMatch(/cli|how_to_ack|how_to_fix/);
       expect(await statusOf(), `${col.id} must not have moved`).not.toBe(col.id);
@@ -114,9 +160,11 @@ test('a worker goes create → run → prompt → peek → delete, and the board
       //    by sending an array of the right shape.
       const fake = await move({ status: col.id, gate_checked: ['not a real criterion'] });
       expect(fake.status(), `${col.id} must refuse a fabricated acknowledgement`).toBe(409);
-      if (col.gate.length > 1) {
-        const partial = await move({ status: col.id, gate_checked: [col.gate[0]] });
+      expect((await fake.json()).gate, `${col.id} must refuse for its acknowledgement gate`).toEqual(gate);
+      if (gate.length > 1) {
+        const partial = await move({ status: col.id, gate_checked: [gate[0]] });
         expect(partial.status(), `${col.id} must refuse a partial acknowledgement`).toBe(409);
+        expect((await partial.json()).gate).toEqual(gate);
       }
       expect(await statusOf(), `${col.id} must still not have moved`).not.toBe(col.id);
     }
@@ -124,20 +172,21 @@ test('a worker goes create → run → prompt → peek → delete, and the board
     // 3. The honest path works. `review` is the check: `done` additionally
     //    demands an asset link and `verified` is owner-gated, so neither can
     //    stand for "a complete acknowledgement is accepted".
-    const review = statuses.find((s: any) => s.id === 'review');
-    const ack = await move({ status: 'review', gate_checked: review.gate });
-    expect(ack.ok(), 'a complete, exact acknowledgement must be accepted').toBeTruthy();
+    const ack = await move({ status: 'review', gate_checked: gates.review });
+    expect(ack.ok(), `a complete, exact acknowledgement must be accepted: ${ack.status()} ${await ack.text()}`).toBeTruthy();
     expect(await statusOf()).toBe('review');
 
-    // `done` refuses even a complete gate ack with no artifact to point at.
-    const done = statuses.find((s: any) => s.id === 'done');
-    const noAsset = await move({ status: 'done', gate_checked: done.gate });
-    expect(noAsset.status(), 'done must refuse a card that names no artifact').toBe(409);
-    expect((await noAsset.json()).code).toBe('done_requires_asset_link');
-
     // ── DELETE, and no operation strands in the outbox ────────────────────
-    const del = await request.delete(`/api/sessions/${worker}`, { headers: auth });
-    expect(del.ok(), 'DELETE must be accepted').toBeTruthy();
+    const bareDelete = await request.delete(`/api/sessions/${worker}`, { headers: auth });
+    expect(bareDelete.status(), 'API calls without the dashboard UI token cannot delete workers').toBe(403);
+    const deletion = page.evaluate(n => (window as any).deleteSession(n), worker);
+    await expect(page.locator('#modal-msg')).toHaveText(`Delete worker "${worker}"?`);
+    const [del] = await Promise.all([
+      page.waitForResponse(r => new URL(r.url()).pathname === `/api/sessions/${worker}/delete` && r.request().method() === 'POST'),
+      page.locator('#modal-btns button.danger').click(),
+    ]);
+    expect(del.ok(), `confirmed dashboard deletion must succeed (HTTP ${del.status()})`).toBeTruthy();
+    await deletion;
     await expect.poll(async () => (await request.get(`/api/sessions/${worker}`, { headers: auth })).status(),
       { timeout: 30_000 }).toBe(404);
 
@@ -146,6 +195,11 @@ test('a worker goes create → run → prompt → peek → delete, and the board
     await expect(page.locator('text=/Unsaved changes/')).toHaveCount(0);
   } finally {
     if (card) await request.delete(`/api/board/${card}`, { headers: auth }).catch(() => {});
-    await request.delete(`/api/sessions/${worker}`, { headers: auth }).catch(() => {});
+    // The same UI token protects fixture cleanup; a bare API DELETE is
+    // intentionally refused and used to leave every failed probe registered.
+    await page.evaluate(async n => {
+      await fetch(`/api/sessions/${n}/delete`, { method: 'POST',
+        headers: { 'X-Amux-UI-Token': (window as any)._AMUX_UI_TOKEN || '' } });
+    }, worker).catch(() => {});
   }
 });
