@@ -2037,7 +2037,9 @@ _board_transition() {
       --rev) rev="${2:-}"; shift 2 ;;
       --force) force_reason="${2:-}"; [[ -n "$force_reason" ]] || die "--force requires a reason (why you are bypassing the gate)"; shift 2 ;;
       *) die "amux board: unknown flag '$1'
-Usage: amux board <status> <ID> [--checked \"crit\" ...] [--ack] [--type T] [--reviewer W] [--override-doing] [--trigger \"cond\"] [--evidence-stdin] [--force \"reason\"]" ;;
+Usage: amux board <status> <ID> [--checked \"crit\" ...] [--ack] [--type T] [--reviewer W] [--override-doing] [--trigger \"cond\"] [--evidence-stdin] [--force \"reason\"]
+  discard only: [--folded-into <ID>]  the card whose work absorbed this one, so the
+                                      callback names it instead of reading as a drop" ;;
     esac
   done
   # Now that argv is known-good, drain stdin. See --outcome-stdin above: doing
@@ -3921,7 +3923,10 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
   amux board ask <ID> [question]   Ask the owning worker to post a status update
   amux board status-update <ID> …  (for the owning worker) post status to the board
                                    (prose, --stdin or --file <path>; NOT the gate flags below)
-  amux board discard <ID>          Retire a card that is not a unit of work (ungated)
+  amux board discard <ID>          Retire a card that is not a unit of work (ungated).
+                                   --folded-into <ID> when its work moved to another
+                                   card: the terminal callback names that card instead
+                                   of telling the sender their request was dropped
   amux board done <ID>             Move issue to done
   amux board verified <ID>         Confirmed working in prod — needs --checked per criterion
   amux board doing <ID>            Move issue to doing (in progress)
