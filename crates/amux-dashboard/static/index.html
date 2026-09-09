@@ -257,6 +257,16 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
               style="width:100%;box-sizing:border-box;font-size:0.8rem;"
               onblur="saveOrgName(this.value)" onkeydown="if(event.key==='Enter')this.blur()">
           </div>
+          <div id="settings-owner-link" style="display:none;margin-bottom:8px;">
+            <div style="font-size:0.68rem;color:var(--dim);margin-bottom:4px;">Owner access link</div>
+            <div style="display:flex;gap:6px;align-items:center;">
+              <input id="settings-owner-link-url" type="text" readonly
+                style="flex:1;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:0.72rem;font-family:monospace;min-width:0;"
+                onclick="this.select()">
+              <button class="btn" style="font-size:0.7rem;padding:4px 10px;white-space:nowrap;" onclick="_copyOwnerLink()">Copy</button>
+            </div>
+            <div style="font-size:0.62rem;color:var(--dim);margin-top:3px;">Opens the dashboard with full access from any device on your network</div>
+          </div>
           <div style="font-size:0.68rem;color:var(--dim);margin:7px 0 3px;">Teams and access scopes</div>
           <div id="settings-teams-list" style="font-size:0.78rem;color:var(--dim);display:flex;flex-direction:column;gap:4px;"></div>
           <div style="font-size:0.68rem;color:var(--dim);margin:9px 0 3px;">People</div>

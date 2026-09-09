@@ -9295,7 +9295,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.848';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.849';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -31827,6 +31827,17 @@ function toggleSettings() {
     }
     // Render connections
     _renderInstanceSwitcher();
+    // Owner access link — only shown to the owner (who has _authToken)
+    const ownerLinkWrap = document.getElementById('settings-owner-link');
+    if (ownerLinkWrap) {
+      if (_authToken) {
+        ownerLinkWrap.style.display = '';
+        const inp = document.getElementById('settings-owner-link-url');
+        if (inp) inp.value = location.origin + '/?_token=' + _authToken;
+      } else {
+        ownerLinkWrap.style.display = 'none';
+      }
+    }
     // Populate the notes-folder row
     loadCommitGuard();
     loadTaskGuard();
@@ -32551,6 +32562,15 @@ async function saveOrgName(val) {
   val = val.trim();
   if (!val) return;
   await fetch('/api/org', {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name: val})});
+}
+
+function _copyOwnerLink() {
+  const inp = document.getElementById('settings-owner-link-url');
+  if (!inp) return;
+  navigator.clipboard.writeText(inp.value).then(
+    () => showToast('Owner link copied'),
+    () => { inp.select(); showToast('Select and copy manually'); }
+  );
 }
 
 async function openTeamInvite() {
