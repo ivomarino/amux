@@ -26,40 +26,10 @@ async function frame(page: Page, history: string | null, live = 'Working…\n') 
   }, {history, live});
 }
 
-for (const width of [390, 1280]) {
-  test(`numbered split output is readable and controls clear the scroller at ${width}px`, async ({page}) => {
-    await page.setViewportSize({width, height:844});
-    await setup(page);
-    await frame(page, diff(160));
-    await page.evaluate(() => { document.getElementById('peek-body')!.scrollTop = 0; });
-    const rows = page.locator('.peek-code-split');
-    await expect(rows).toHaveCount(160);
-    const row = rows.first();
-    await expect(row.locator('.peek-code-number')).toHaveText(['1-', '1+']);
-    await expect(row).toContainText('<tags> & a path');
-    const geometry = await row.evaluate(el => {
-      const [left, right] = [...el.children].map(e => e.getBoundingClientRect());
-      const scroller = document.getElementById('peek-body')!;
-      const bounds = scroller.getBoundingClientRect();
-      const controls = document.querySelector('.peek-output-controls')!.getBoundingClientRect();
-      return {left: {x:left.x,y:left.y,width:left.width,bottom:left.bottom}, right:{x:right.x,y:right.y,width:right.width},
-        client:scroller.clientWidth, scroll:scroller.scrollWidth, top:bounds.top, controlsBottom:controls.bottom,
-        outer:document.documentElement.scrollWidth, viewport:innerWidth};
-    });
-    expect(geometry.scroll).toBeLessThanOrEqual(geometry.client+1);
-    expect(geometry.outer).toBeLessThanOrEqual(geometry.viewport);
-    expect(geometry.top).toBeGreaterThanOrEqual(geometry.controlsBottom);
-    if (width < 600) {
-      expect(geometry.right.y).toBeGreaterThanOrEqual(geometry.left.bottom);
-      expect(geometry.left.width).toBeGreaterThan(300);
-    } else {
-      expect(geometry.right.y).toBe(geometry.left.y);
-      expect(geometry.right.x).toBeGreaterThan(geometry.left.x);
-    }
-    await page.screenshot({path:test.info().outputPath(`terminal-${width}.png`)});
-  });
-}
-
+// The numbered split-diff renderer that used to be asserted here was removed
+// (2026-09-09): its heuristic fired on ordinary grep -A output, so `38-  foo`
+// rendered as a red deleted row in a right-hand column. The chunk reuse and
+// coalescing below are the parts of that change that stayed.
 test('large streaming history reuses DOM, coalesces bursts, and preserves typing and scroll', async ({page}) => {
   await page.setViewportSize({width:390,height:844});
   await setup(page);

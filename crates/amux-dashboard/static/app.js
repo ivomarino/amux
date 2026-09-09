@@ -9494,7 +9494,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.853';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.855';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -10836,67 +10836,7 @@ function _linkifyPaths(safeHtml) {
 // adding a stage meant finding all of them — which is how the path linkifier
 // would have been half-wired.
 function _peekHtml(raw, state) {
-  return wrapBoxBlocks(_fitRules(highlightPrompts(_peekCodeRows(_linkifyPaths(ansiToHtml(raw, state))))));
-}
-
-// Slice visible text while retaining the balanced, trusted markup produced by
-// ansiToHtml/linkify. In particular, a gutter must not inherit the code's wrap.
-function _peekHtmlSlice(html, start, end) {
-  const tags = [], out = [];
-  let pos = 0, opened = false;
-  for (const token of html.match(/<[^>]*>|&(?:#\d+|#x[\da-f]+|\w+);|[^<&]+|[<&]/gi) || []) {
-    if (token[0] === '<') {
-      if (token.startsWith('</')) { if (opened) out.push(token); tags.pop(); }
-      else { tags.push(token); if (opened) out.push(token); }
-      continue;
-    }
-    const size = token[0] === '&' && token.endsWith(';') ? 1 : token.length;
-    if (pos + size > start && pos < end) {
-      if (!opened) { out.push(...tags); opened = true; }
-      out.push(size === 1 ? token : token.slice(Math.max(0, start - pos), end - pos));
-    }
-    pos += size;
-    if (pos >= end) break;
-  }
-  if (opened) out.push(...tags.reverse().map(tag => '</' + tag.match(/^<([\w-]+)/)[1] + '>'));
-  return out.join('');
-}
-function _peekCodeRows(html) {
-  const lines = html.split('\n');
-  const plain = lines.map(line => line.replace(/<[^>]*>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&'));
-  const numbered = line => /^(\s{0,8})(\d{1,7})([ +\-│|])(?:\s|[+\-])/.test(line);
-  const cell = (line, text) => {
-    const match = text.match(/^(\s*)(\d{1,7})([ +\-│|]?)/);
-    if (!match) return '<span class="peek-code-cell"><span class="peek-code-text">' + line + '</span></span>';
-    const mark = match[3] === '+' ? 'add' : match[3] === '-' ? 'del' : 'context';
-    return '<span class="peek-code-cell peek-code-' + mark + '"><span class="peek-code-number">'
-      + esc(match[2] + (mark === 'context' ? '' : match[3])) + '</span><span class="peek-code-text">'
-      + _peekHtmlSlice(line, match[0].length, text.length) + '</span></span>';
-  };
-  return lines.map((line, i) => {
-    const text = plain[i];
-    if (!numbered(text) || !(/^[ \t]*\d{1,7}[+-]\s/.test(text) || numbered(plain[i-1] || '') || numbered(plain[i+1] || ''))) return line;
-    // A structural column divider followed by another numbered source row.
-    // Never split on arbitrary spaces within source strings or indentation.
-    let split = /[│┃]\s*\d{1,7}[ +\-│|](?:\s|[+\-])/.exec(text);
-    let rightOffset = split ? split.index+1 : 0;
-    if (!split) {
-      const gap = / {4,}(?=\d{1,7}[+-]\s)/.exec(text);
-      // Space-only split layouts have a fixed right gutter across adjacent
-      // rows. A number inside an arbitrary source string is not a divider.
-      const right = gap ? gap.index+gap[0].length : 0;
-      if (right && [plain[i-1] || '', plain[i+1] || ''].some(row => {
-        const other = / {4,}(?=\d{1,7}[+-]\s)/.exec(row);
-        return other && other.index+other[0].length === right;
-      })) { split = gap; rightOffset = right; }
-    }
-    if (split) {
-      const at = split.index;
-      return '<span class="peek-code-row peek-code-split">' + cell(_peekHtmlSlice(line, 0, at), text.slice(0, at))
-        + cell(_peekHtmlSlice(line, rightOffset, text.length), text.slice(rightOffset)) + '</span>';
-    }
-    return '<span class="peek-code-row">' + cell(line, text) + '</span>';
-  }).join('\n');
+  return wrapBoxBlocks(_fitRules(highlightPrompts(_linkifyPaths(ansiToHtml(raw, state)))));
 }
 
 // Stable chunks bound parsing and DOM replacement to the changed suffix.
@@ -11082,7 +11022,6 @@ function wrapBoxBlocks(html) {
   const stripTags = s => s.replace(/<[^>]*>/g, '');
   const isBoxLine = raw => {
     const t = stripTags(raw);
-    if (raw.includes('class="peek-code-row')) return false;
     if (!BOX.test(t)) return false;
     if (HRULE.test(t)) return true;                 // a border/rule line
     return (t.match(VERT) || []).length >= 2;       // a content row: │ a │ b │
@@ -11115,24 +11054,25 @@ function _isScrolledToBottom(el, threshold) {
   return el.scrollHeight - el.scrollTop - el.clientHeight < (threshold || 40);
 }
 
-function _scrollLockContainer(scrollEl) {
-  return scrollEl.id === 'peek-body' ? scrollEl.parentElement.querySelector('.peek-output-controls') || scrollEl : scrollEl;
-}
+// The badge is a sticky overlay INSIDE the scroller. It was briefly moved into
+// .peek-output-controls as a full-width "Resume output" button; that put a
+// show/hide element in the toolbar's layout flow, so every scroll-lock flip
+// resized the row above the terminal and the whole view jumped (Ethan,
+// 2026-09-09: "now its bouncing up and down"). An overlay costs no layout.
 function _showScrollLockBadge(scrollEl, onClickResume) {
-  const container = _scrollLockContainer(scrollEl);
-  let badge = container.querySelector('.scroll-lock-badge');
+  let badge = scrollEl.querySelector('.scroll-lock-badge');
   if (!badge) {
-    badge = document.createElement(container === scrollEl ? 'div' : 'button');
+    badge = document.createElement('div');
     badge.className = 'scroll-lock-badge';
-    badge.textContent = container === scrollEl ? 'Scrolled up — click to resume' : 'Resume output';
-    badge.title = 'New output is buffered while you read earlier lines';
-    container.prepend(badge);
+    badge.textContent = 'Scrolled up — click to resume';
+    badge.onclick = (e) => { e.stopPropagation(); onClickResume(); };
+    scrollEl.appendChild(badge);
   }
-  badge.onclick = e => { e.stopPropagation(); onClickResume(); };
   badge.style.display = '';
 }
+
 function _hideScrollLockBadge(scrollEl) {
-  const badge = _scrollLockContainer(scrollEl).querySelector('.scroll-lock-badge');
+  const badge = scrollEl.querySelector('.scroll-lock-badge');
   if (badge) badge.style.display = 'none';
 }
 

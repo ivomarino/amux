@@ -786,9 +786,6 @@
   .peek-output-wrap { display:flex; flex-direction:column; flex:1; min-height:0; min-width:0; }
   .peek-output-controls { display:flex; align-items:center; justify-content:flex-end; gap:8px;
     flex-shrink:0; padding:4px 6px; background:#0d1117; border-radius:8px 8px 0 0; }
-  .peek-output-controls .scroll-lock-badge { position:static; flex:1; min-width:0; margin-right:auto;
-    padding:4px; background:none; border:1px solid var(--border); border-radius:6px;
-    font:inherit; font-size:0.75rem; color:var(--accent); cursor:pointer; white-space:normal; }
   #peek-body { touch-action:pan-x pan-y pinch-zoom; min-width:0; width:100%; box-sizing:border-box; border-radius:0 0 8px 8px; }
   .overlay-body {
     flex: 1; min-height: 0; overflow-x: hidden; overflow-y: auto;
@@ -800,18 +797,10 @@
     -webkit-touch-callout: default; cursor: text;
     touch-action: pan-y;
   }
-  /* Prose wraps. Numbered source rows retain their gutter; structural tables
-     own a horizontal scroller. Controls are outside that scroller at every width. */
+  /* Prose wraps; structural tables own a horizontal scroller. Controls sit
+     outside that scroller at every width. */
   .peek-render-chunk { min-width:0; content-visibility:auto; contain-intrinsic-size:auto 1100px; }
-  .peek-code-row { display:block; white-space:normal; }
-  .peek-code-cell { display:grid; grid-template-columns:minmax(3ch, max-content) minmax(0, 1fr); gap:1ch; min-width:0; }
-  .peek-code-number { white-space:pre; text-align:right; color:#9da7b3; user-select:none; }
-  .peek-code-text { white-space:pre-wrap; overflow-wrap:anywhere; min-width:0; }
-  .peek-code-add { background:rgba(63,185,80,0.10); }
-  .peek-code-del { background:rgba(248,81,73,0.10); }
-  .peek-code-split { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:12px; }
   @media (max-width:600px) {
-    .peek-code-split { grid-template-columns:minmax(0,1fr); gap:0; }
     .peek-output-controls button { min-width:44px; min-height:44px; }
     .peek-split-wrap.split-active { flex-direction:column; }
     .peek-split-wrap.split-active > .peek-split-files { border-left:0; border-top:1px solid var(--border); }
