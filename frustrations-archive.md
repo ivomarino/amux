@@ -7284,3 +7284,137 @@ FIX: f999caff replaces the literal ANSWER_ONLY_TAILS list with `tail_is_answer_o
   still card); `scripts/mutate.sh` confirms the negative control can actually fail.
   NOT YET independently re-validated against the running server build — see AF-433's
   discipline for what that validation should check before this entry is archived.
+
+## MEMORY.md is rebuilt from the server's sources, so the pointer the memory instruction tells you to write is deleted on the next compose
+VALIDATED: amux-frustrations | VALIDATED by amux-frustrations 2026-09-09 (originating session), probed live against the running server at commit 60143873 / build 33dba7a5eef6cd94, with a positive AND a negative arm.
+Setup: appended two pointer lines directly to ~/.claude/projects/-Users-ethan-Dev-amux/memory/MEMORY.md, the volatile half the memory instruction tells a session to write. One targeted every-fix-needs-a-log-signal.md, which EXISTS; the other targeted af578-no-such-file.md, which does not.
+Trigger: POST /api/workers/amux-frustrations/memory with the source file's own bytes (sha 4204d2832e2d9c99 before and after, so the source was not altered), which is the write_claude_memory compose path.
+Result, read back from the file: the existing-target pointer SURVIVED at line 62, under a preserved-pointer header, with the auto-generated fleet roster starting at line 64. Preserved BEFORE the roster, which is the load-bearing ordering. The missing-target pointer was DROPPED, grep count 0, as the fix intends since the memory rules tell sessions to delete memories that turn out to be wrong.
+The warn published both counts separately, exactly as the entry promised:
+  WARN amux_server::api::session_verbs: memory: compose dropped session-written content it could not carry (AF-578); only `- [Title](file.md)` lines are preserved dir=/Users/ethan/.claude/projects/-Users-ethan-Dev-amux/memory preserved=3 dropped_deleted_target=1 unrecognised_lines=0
+KNOWN LIMIT restated, not resolved: a lane whose memory source is prose rather than pointer lines preserves nothing and the warn is its only signal.
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux-frustrations
+CARD: AF-578
+SYMPTOM: Routed up by ts-gke (TG-3374) as index truncation: their MEMORY.md exceeded the read ceiling, so 9 entries never loaded, with an auto-generated fleet roster eating 6.1 KB (22%) of a capped file. All confirmed. The cause underneath is worse. Measured: 44 memory files on disk in the amux project dir, MEMORY.md indexing 5 of them, and the server source ~/.amux/memory/amux-frustrations.md carrying ~25 pointers with ZERO overlap with those 5. Two indexes, not two views of one list. session_verbs.rs composes MEMORY.md as a full rebuild from its own sources and fs::write's it wholesale, so anything a session appended directly is destroyed on the next compose. ts-gke measured the same shape at mixpeek scale: 1,080 memory files against 125 index pointers.
+COST: The memory FILES survive, so every write returns success and every .md persists; only the index line that makes them findable dies. 39 of 44 in this lane were already content with no pointer, which is a failure with no symptom until someone counts. Three of mine were at risk including one written in the session that found this. The direct cause is a contradiction between two instructions: the session prompt says "add a one-line pointer in MEMORY.md", and session_verbs.rs:9365 says the durable path is ~/.amux/memory/<worker>.md. A session following its own instructions writes the volatile half.
+FIX: `preserved_agent_pointers` turns the destructive rebuild into a merge: any `- [Title](file.md)` line in the existing MEMORY.md whose target file EXISTS and which the sources do not already carry is re-emitted, placed BEFORE the roster so the roster stays last (ts-gke's option 3, free). A pointer whose file is gone is NOT preserved, because the memory rules tell sessions to delete memories that turn out to be wrong and resurrecting one would make deletion impossible. Per ts-gke, the composer now WARNS with what it dropped and could not carry, split into deleted-target and unrecognised-line counts: a destructive rebuild that cannot name what it removed is the same class as a guard that reads green while skipped. KNOWN LIMIT, named in the code because ts-gke found it: lane memory sources are not all pointer-shaped (ts-gke.md is headings and prose with zero pointer lines), so for a lane in that style this preserves nothing and the warn is the only signal.
+
+## A bare `git config` inside a linked worktree rewrites the SHARED repo config, and our own push-gate advice creates the exposure
+VALIDATED: amux-frustrations | VALIDATED by amux-frustrations 2026-09-09 (originating session), by running the INSTALLED hook every lane's Bash passes through (/Users/ethan/.amux/hooks/git-shared-guard.py), not the committed copy, with two negative controls.
+A. `git config user.email t@t.t` with cwd inside a linked worktree -> rc=2, BLOCKED: "in a LINKED WORKTREE writes the config SHARED with /Users/ethan/Dev/amux and every other worktree of it, because a linked worktree has no config of its own", followed by "EXITS, and --local is NOT one of them (in a linked worktree \"local\" IS the shared file, which is the whole defect)". The main checkout in that message was computed from the worktree, not assumed.
+B. CONTROL, same command with cwd = the main checkout -> rc=0, no verdict. The guard distinguishes the two cwds rather than blocking every git config.
+C. CONTROL, `git config --get user.email` (a READ) inside the linked worktree -> rc=0, no verdict. It guards WRITES only.
+Both the committed hook at origin/main and the installed hook carry _worktree_config_verdict, so the fix is not stranded in one copy.
+AREA: gates
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux-frustrations
+CARD: AF-577
+SYMPTOM: A linked worktree SHARES .git/config with the main checkout, so any `git config` run inside one, without --worktree, rewrites the file every sibling worktree and the main checkout read. No GIT_DIR, no inherited environment, no hook. Reproduced here in a fresh repo: BEFORE main user.email=<real>, core.bare=false; after `(cd linked && git config user.email t@t.t && git config core.bare true)`, main reads t@t.t and core.bare=true. On the mixpeek checkout this took every work-tree operation down for every lane for ~30 minutes (MG-1648) and authored 9 commits on their origin/main as `t <t@t.t>`. Found by mixpeek-general (132a2b8a) after they retracted their own GIT_DIR hypothesis, which mixpeek-cicd had falsified.
+COST: amux's config is intact, so this is exposure rather than damage: 22 registered worktrees on the shared checkout and `extensions.worktreeConfig` UNSET, which means none of them can hold private config and all 22 can only write shared. Our own CLAUDE.md:185 tells every lane to run `git worktree add --detach /tmp/push-check main` before pushing, which is why 17 of the 22 are push-check-shaped. The rule that protects a push gate manufactures this exposure. mixpeek-general's counter-case is the sharper argument for a guard over a doc fix: mixpeek/CLAUDE.md:399 says the OPPOSITE ("do NOT create git worktrees"), and they still accumulated 8, so a doc only binds the lanes that read it.
+FIX: a `_worktree_config_verdict` check in scripts/git-hooks/git-shared-guard.py, the PreToolUse hook every lane's Bash already passes through. It refuses a `git config` WRITE when the cwd resolves to a linked worktree, and names --global / --system / --worktree / the main checkout as exits while explicitly ruling OUT --local (in a linked worktree "local" IS the shared file, so recommending it would name the defect as its own cure). 14 new cells, ALL 179 PASS. THE PLACEMENT IS THE WHOLE FIX: the first draft sat after the AMUX_SHARED_CHECKOUTS scope gate and returned 0 for all eight probe cells including `core.bare true`, because a linked worktree is never inside the checkout it belongs to. An inert guard that reads as installed is worse than none. The test now passes a deliberately-unrelated shared_root so it cannot drift back behind that gate.
+
+---
+
+## The group verified gate demands "functionality change is live" from card types that produce no functionality change
+VALIDATED: amux-frustrations | VALIDATED by amux-frustrations 2026-09-09 (originating session). This entry set its own closing condition -- "STATUS stays open until the opt-in lands, because the friction is live until then" -- and the opt-in has landed. Measured live, not inferred.
+GET /api/board/session-gates now returns group:amux verified as ["@additive", "Peer-reviewed by a DIFFERENT worker in group `amux` (name them), and the card's type fits the work", "That peer verified it themselves rather than taking the author's word"]. The marker is present, where at ship time 6 scoped gates carried it 0 times.
+The criterion this entry is about, "Functionality change is live and exercised, not just merged", is GONE from the group gate.
+The union resolves per type, checked on three real cards via GET /api/board/contract?card=<id>:
+  AF-513 (investigation) -> ["Outcome confirmed to still hold", + the 2 group criteria]
+  AF-601 (epic)          -> ["Outcome confirmed to still hold", + the 2 group criteria]
+  AH-126 (code)          -> ["CI/CD green ...", "Deployed to prod", "Confirmed working in prod", "Zero regressions", + the 2 group criteria]
+The code case is the one that matters and it is the trap amux-cloud identified: first-tier-wins REPLACEMENT would have silently dropped "Confirmed working in prod" from every code card while still passing a naive "is AF-513 unblocked now" check. It is present. So the mechanism unions rather than replaces, and a finished investigation can now leave done truthfully without anyone acking a falsehood.
+All three cards report gate_sources.verified.retype_would_change_it=false with source=group, which is the same field AF-571 made the CLI read.
+AREA: gates
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux-frustrations
+CARD: AF-570
+SYMPTOM: The `verified` gate for group `amux` resolves from the GROUP scope, so it is the same four criteria for every item type, and the first is "Functionality change is live and exercised, not just merged". Measured across group amux's done cards: 324 of 770 (42%) are types that cannot have a functionality change at all (investigation 169, doc 48, ops 32, blocker 24, chore 21, epic 9, escalation 6, decision 5, watch 5, research 5). AF-513 is a complete, correct investigation whose finding is that GET /api/board omits desc; it shipped no code, so criterion 1 has no true answer and criterion 4 ("no regression in what it touched") has no referent. amux-gtm independently hit the same wall from a different population: AG-39's output is a provisioned trial, imported seed data and a 6/6 chain run.
+COST: Finished work cannot leave `done` truthfully, so it either sits there forever or someone acks a falsehood. 324 cards in group amux alone. The board's documented escape (correct the TYPE) is inert here because a group-scoped gate overrides the type default, and until AF-571 the refusal recommended it anyway.
+FIX: Shipped the MECHANISM, not the policy: an opt-in `@additive` marker on a scoped gate, so a gate can UNION with the type default instead of replacing it. Measured no-op at ship time — 6 scoped gates configured fleet-wide, 0 carry the marker. amux-cloud found the trap that made this necessary: precedence in effective_gate_trail is first-tier-wins with REPLACEMENT, so simply editing the group gate down to the two peer criteria would have silently removed "Confirmed working in prod" and the other three from every `code` card while passing a naive "is AF-513 unblocked now" check. The group:amux OPT-IN is the policy half and is NOT shipped: amux-gtm and amux-cloud agreed, amux-homepage has not replied, and `amux` is isolated and cannot be asked. STATUS stays open until the opt-in lands, because the friction is live until then.
+
+---
+
+## Adding `set -e` to a harness made it abort silently on an idle host, and the fix could not fail on the box that shipped it
+VALIDATED: amux-frustrations | VALIDATED by amux-frustrations 2026-09-09 (originating session), with the mutation run in BOTH directions, which is what makes this more than a green suite.
+Baseline: scripts/test-build-disk-clear.sh at origin/main -> 23 passed, 0 failed. Cell (m) printed its SKIP, because a real cargo/rustc is running on this box, so the entire population of cells that could have caught the original abort is unreachable here. That is the entry's own lesson reproducing itself during its own validation.
+MUTATION 1, cell (n)'s `|| true` removed: 22 passed, 1 FAILED, "(n) the no-match probe must REACH its decision under set -euo pipefail", got: <empty>. So cell (n) can fail, host-independently, which is the property the fix was added for.
+MUTATION 2, the SHIPPED line 300 reverted to its pre-fix `{ pgrep -x rustc; pgrep -x cargo; }`: 23 passed, 0 failed. Still green here.
+That second result is recorded because it is NOT a pass. Cell (n) reproduces the CONDITION with names that can never match; it does not pin the shipped line, so on a box with a live builder a regression of that exact line is invisible to this suite. On an idle CI runner it still reddens the whole step, which is how the original outage was caught, and the harness announces an abort only by the ABSENCE of its computed summary line. Filed separately rather than held against this entry.
+Both mutations were applied in a private detached worktree and reverted, never in the shared checkout.
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux-frustrations
+CARD: AF-564
+SYMPTOM: main's `checks` workflow went red at 327c470e (18:44) after e1032a2a (16:38) was green, and stayed red for six consecutive commits. The failing step logged `test-build-provenance: 9 passed, 0 failed` and then `##[error]Process completed with exit code 1` with nothing in between: no verdict line, no failure, no output at all from the next harness. Cause is my own 39ac1877, whose entire diff to that file is `set -uo pipefail` -> `set -euo pipefail`. The harness reads `_real_builds="$( { pgrep -x rustc; pgrep -x cargo; } 2>/dev/null | tr -d '[:space:]')"`; on an idle host both pgreps exit 1, pipefail carries that through the substitution into the assignment, and set -e aborts before the first echo. Confirmed in isolation: with set -e and no match, exit 1 and no output; without it, `REACHED, x=[]` and exit 0.
+COST: main red for six commits across ~6 hours, which held amux-cloud's cloud-freshness track behind red CI and made every lane's push gate meaningless. The card filed against it named the wrong range (c6876cf1..8a70187, all of whose runs are green), so anyone bisecting from the card would have searched commits that were never involved.
+FIX: `|| true` on that assignment, because the decision reads the OUTPUT and never the status, which is the exact distinction AF-560's own convention names and which I got wrong here. Plus a new host-independent cell (n) running the same construct with names that can never match. Cell (n) is the load-bearing half: every existing cell that could have caught this lives inside the branch that only runs when nothing is building, so on this box that whole population is unreachable and the suite reported PASS through the entire outage. THE REAL LESSON: a harness whose precondition is "nothing else is running" can never fail on a machine that always has a builder running, so the environment that ships the change is the one environment guaranteed not to test it.
+
+---
+
+## A gate refusal printed "correct the TYPE" while its own field in the same response said retyping would not change it
+VALIDATED: amux-frustrations | VALIDATED by amux-frustrations 2026-09-09 (originating session), by running the installed CLI against the live server, plus a mutation control that reproduces the defect on demand.
+ARM A, the real path: `amux board verified AF-513` (investigation, group amux) -> rc=3, card unchanged at done. The response ends with:
+  RETYPING WILL NOT CHANGE THIS GATE.
+  this gate comes from the GROUP scope (amux), not from the item type - retyping will NOT change it.
+  What would change it: satisfy the criteria above; or hand the card to the lane the criterion is about ... or change the gate at the scope that owns it.
+No "correct the TYPE" sentence and no `amux board type` command appear anywhere in the output.
+ARM B, the mutation control: the same command, same card, same server, run from a mktemp snapshot of origin/main's CLI with `if _gsrc:` replaced by `if False:`. The pre-fix output returns verbatim: "If a criterion does not apply because the card is mistyped (item_type=investigation), correct the TYPE rather than acking something untrue:" followed by `amux board type AF-513 <code|escalation|...>`. So the condition is load-bearing rather than redundant with something else. The card stayed at done in both arms.
+Mutated on a COPY, never in place: ~50 lanes execute that file continuously.
+AREA: gates
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux-frustrations
+CARD: AF-571
+SYMPTOM: `amux board verified AF-513` returned, in one response, `how_to_ack.gate_source` saying "this gate comes from the GROUP scope (amux), not from the item type - retyping will NOT change it", and then a closing line reading "If a criterion does not apply because the card is mistyped (item_type=investigation), correct the TYPE rather than acking something untrue", followed by the `amux board type` command. The reader acts on the closing line: it is last, it is prose rather than a nested JSON field, and it is the only one carrying a runnable command. Following it costs a retype and leaves the card mistyped, because a group-scoped gate resolves identically for every type.
+COST: More than the wasted command. That closing line is what makes an author believe the gate has an honest exit, and for this gate it does not. An author who retypes and sees the same four criteria return has been sent to the one remedy that provably cannot work, which pushes them toward acking something untrue - exactly what the line exists to prevent. It sits over a real population: 324 of group amux's 770 done cards are types that cannot satisfy criterion 1 at all (AF-570).
+FIX: The condition was already computed and transmitted. The server emits `how_to_ack.gate_source` exactly when the gate came from a non-type scope. The CLI now prints the retype advice only when that field is ABSENT, and when present prints what would actually change it: satisfy the criteria, hand the card to the lane the criterion is about, or change the gate at its own scope. Verified on the installed CLI in both directions (group-scoped gate gets the new text, type-scoped gate is byte-identical to before), and mutation-checked on a COPY rather than in place, because ~50 lanes execute this file continuously: disabling the condition makes the group-scoped refusal print the retype advice again.
+
+---
+
+## The junk classifier brands any card that MENTIONS the capture marker, so a card cannot describe the capture mechanism
+VALIDATED: amux-frustrations | VALIDATED by amux-frustrations 2026-09-09 (originating session), measured on the REAL card rather than a fixture, so the discriminator is tested against live data.
+AF-568's card is still in the state that triggered the bug: desc 10483 chars, source=agent, session=amux-frustrations, and it still CONTAINS the string `capture: session prompt` inside its explanation of the bug. Measured live: contains=True, desc.trim_start().starts_with(marker)=False. So the old predicate would brand it junk TODAY and the shipped anchored predicate does not. The two predicates disagree on this card, which is what makes it a test rather than a coincidence.
+The STRUCTURE VETO evidence the substring match was short-circuiting is still present too: 3 ALLCAPS section heads, above its 2+ threshold.
+Junk nudges naming AF-568 in the live server log since the fix: 0.
+Shipped line confirmed at origin/main crates/amux-server/src/runtime_jobs/board_drive.rs:1036 as `desc.trim_start().starts_with("capture: session prompt") && folds < 2`.
+AREA: notices
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux-frustrations
+CARD: AF-569
+SYMPTOM: AF-568, the card ABOUT duplicate capture cards, was nudged "captured chat prompt, not a unit of work" while it sat in `doing` with a shipped fix and a 4000-char write-up. It is not a capture by any structural test: source='agent', creator='amux-frustrations', desc begins "MEASURED, 2026-09-07", no `capture: session prompt` marker in its log. The brand at board_drive.rs:880 was `desc.contains("capture: session prompt")`, and AF-568's desc contains that string once, inside backticks, in the sentence explaining the bug. Measured: contains=True, starts_with=False, folds=0.
+COST: A live card with a shipped fix was told it was not a unit of work and offered discard/retitle/decompose. Small in minutes, and it is the shape that matters: the classifier cannot tell a MENTION from a USE, so any card documenting the capture mechanism is misfiled as its output. It also fired BEFORE the STRUCTURE VETO at :907, which returns "not junk" on 2+ ALLCAPS section heads; AF-568 had three, so a substring match short-circuited the evidence that existed to prevent exactly this.
+FIX: 271167a3's follow-up. Anchor it to the intent the code already states three lines above ("a card literally defined as the capture marker"): `desc.trim_start().starts_with(...)`. Every real capture is still caught by the anchored PROMPT check below, on the `**Prompt:** ` prefix session_verbs.rs actually mints. Line 880's positive case had NO test before this, which is why changing it broke nothing: the existing tests around it cover the PROMPT check and the log-only case. Two new cells, mutation-checked in both directions.
+
+---
+
+## One broadcast prompt minted 105 capture cards across 56 lanes: the capture dedupe window is 45s, the delivery it guards waits for a turn boundary
+VALIDATED: amux-frustrations | VALIDATED by amux-frustrations 2026-09-09 (originating session), measured against the live board, ~43 hours after 271167a3 shipped at 2026-09-07 19:56:18.
+Population: 974 capture cards minted SINCE the fix. Duplicate groups among them, using open_capture_with_desc's exact predicate (source='capture' AND deleted IS NULL AND status NOT IN (done,verified,discarded), grouped by session and byte-identical desc): 0.
+The probe CAN produce a positive, which is why the zero means something: the same query still finds 3 duplicate groups fleet-wide (desktop, photo-analysis, self), and every one of them has its FIRST card timestamped 2026-09-07 18:09-18:28, the original incident window, before the fix. Duplicate groups whose first card postdates the fix: 0.
+The two-fix log signal is live and names the survivor rather than going silent: 9 occurrences of "ledger: capture duplicates an open card for the same prompt; not minting a second (AF-568)" in ~/.amux/logs/server-rs.log, most recent three at 13:21:28 session=mvs-infra open_card=MI-5422, 13:50:55 session=mixpeek-cicd open_card=MC-1808, 14:21:16 session=mvs-infra open_card=MI-5464.
+AREA: board
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-07
+SESSION: amux-frustrations
+CARD: AF-568
+SYMPTOM: The 5:59 PM recovery broadcast produced 56 identical cmd_history rows (one per lane, 503 chars, enqueued 18:09-18:10) and 105 board cards. 46 of 56 lanes hold more than one card for that single prompt and two hold three. Every duplicate was minted by the steering-delivery path (session_verbs.rs:10893, "ledger: auto-captured board card from STEERING-delivered prompt (AMUX-3148)"), whose id encodes the ENQUEUE time: AF-567 is `id=steer-1788818960752`, enqueued 18:09:20 and minted 18:26:15. Its "already carded" guard is `cmd_history ... AND card_id IS NOT NULL AND ts > now - AMUX_CAPTURE_DEDUP_WINDOW_S` with a 45s default, so at 17 minutes it saw nothing and minted again. The duplicates then have no cmd_history row of their own, because the linking UPDATE looks for the most recent UNCARDED row for that text and there is none.
+COST: 49 junk cards across 46 lanes, each needing a manual disposition by whoever owns it. gainz is parked on a permission prompt clearing GAINZ-52/53 with `curl -X DELETE`, which also destroys the audit trail `amux board discard` keeps. My own lane spent the recovery turn deciding what two identical `doing` cards meant before any work started.
+FIX: 271167a3. A 45s window is sized for a transport retry and is being asked to guard a path whose entire purpose is to WAIT for a turn boundary, which took 17 to 25 minutes for every duplicate here. Dedupe against `issues` instead, the table the mint itself writes, with no time box while the card is non-terminal: refuse the mint when the session already holds a non-terminal `source='capture'` card whose desc is byte-identical. Log the refusal with the surviving card id so a wrongly suppressed distinct prompt is findable rather than silent.
+NOTE: An earlier draft of this entry blamed a second mint path in orchestrator/runtime.rs. That was wrong and is recorded on AF-568. The orchestrator path stamps `source='orchestrator'`; all 104 sourced cards here read `capture`, which is what sent me back to the log.
+
+---
