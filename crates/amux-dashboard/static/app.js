@@ -5213,7 +5213,6 @@ function togglePeekTabCustomizer() {
   if (!menu) return;
   if (_peekTabCustomizerOpen) {
     _renderPeekTabCustomizer();
-    const btn = document.getElementById('peek-tab-customize');
     // DISPLAY FIRST, THEN MEASURE, THEN PLACE. The old order positioned the menu
     // while it was still display:none, so it could not measure itself and clamped
     // against a HARDCODED 230px assumed width. The menu is not 230px — it measured
@@ -5222,7 +5221,53 @@ function togglePeekTabCustomizer() {
     // A guessed width is the bug; offsetWidth is the fix.
     menu.style.visibility = 'hidden';
     menu.style.display = '';
+    _placePeekTabCustomizer();
+    menu.style.visibility = '';
+    _watchPeekTabAnchor(true);
+    _tabCustBeacon(menu, 'peek');
+    setTimeout(() => document.addEventListener('click', _peekCustOutside, true), 0);
+  } else {
+    menu.style.display = 'none';
+    _watchPeekTabAnchor(false);
+    document.removeEventListener('click', _peekCustOutside, true);
+  }
+}
+
+// PLACEMENT IS NOT A ONE-SHOT (Ethan, 2026-09-09: "this is way off" — the menu
+// hung ~145px below its button, over the terminal). Measured: placement is
+// correct at open, and ~3s later the peek header finishes loading its task
+// line and filters, which pushes the tab strip DOWN. The menu is
+// position:fixed against coordinates taken before that, so it stays where the
+// button used to be. A ResizeObserver does not help: the button changes
+// POSITION, not size, and that fires nothing. So while the menu is open we
+// re-read the anchor each frame and move only when it actually shifted. The
+// cost is one getBoundingClientRect per frame, bounded by the menu being open.
+let _peekTabAnchorRAF = null;
+let _peekTabAnchorLast = '';
+function _watchPeekTabAnchor(on) {
+  if (!on) {
+    if (_peekTabAnchorRAF) cancelAnimationFrame(_peekTabAnchorRAF);
+    _peekTabAnchorRAF = null; _peekTabAnchorLast = '';
+    return;
+  }
+  const tick = () => {
+    if (!_peekTabCustomizerOpen) { _peekTabAnchorRAF = null; return; }
+    const btn = document.getElementById('peek-tab-customize');
     if (btn) {
+      const r = btn.getBoundingClientRect();
+      const key = Math.round(r.left) + ':' + Math.round(r.bottom);
+      if (key !== _peekTabAnchorLast) { _peekTabAnchorLast = key; _placePeekTabCustomizer(); }
+    }
+    _peekTabAnchorRAF = requestAnimationFrame(tick);
+  };
+  _peekTabAnchorRAF = requestAnimationFrame(tick);
+}
+
+function _placePeekTabCustomizer() {
+  const menu = document.getElementById('peek-tab-customizer-menu');
+  const btn = document.getElementById('peek-tab-customize');
+  if (menu && btn) {
+    {
       const r = btn.getBoundingClientRect();
       const vw = document.documentElement.clientWidth || window.innerWidth;
       const vh = document.documentElement.clientHeight || window.innerHeight;
@@ -5250,10 +5295,7 @@ function togglePeekTabCustomizer() {
       menu.style.maxHeight = Math.max(120, vh - top - PAD) + 'px';
       menu.style.overflowY = 'auto';
     }
-    menu.style.visibility = '';
-    _tabCustBeacon(menu, 'peek');
-    setTimeout(() => document.addEventListener('click', _peekCustOutside, true), 0);
-  } else { menu.style.display = 'none'; document.removeEventListener('click', _peekCustOutside, true); }
+  }
 }
 function _renderPeekTabCustomizer() {
   const menu = document.getElementById('peek-tab-customizer-menu');
@@ -9494,7 +9536,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.857';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.858';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
