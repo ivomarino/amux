@@ -259,7 +259,35 @@ install_hook_from_head() {
     head_bytes=""
   done
   if [[ -n "$head_bytes" ]]; then
-    printf '%s\n' "$head_bytes" > "$dest"
+    # ATOMIC, because $dest is a hook every lane on this box executes on every
+    # Bash call, and this runs while they are running. A plain `> "$dest"` opens
+    # the destination with O_TRUNC and REUSES the inode, so a hook that fires
+    # mid-write reads a truncated file. `scripts/atomic-replace.sh` is rename(2):
+    # a new inode and an atomic directory-entry swap, so anything already reading
+    # finishes on the bytes it started with (AF-597; the rule is in the fleet
+    # CLAUDE.md and this call site was the counter-example to it).
+    local _stage
+    # Stage in the DESTINATION's own directory. rename(2) is only atomic within
+    # one filesystem, and a cross-device `mv` degrades to open(O_TRUNC)+copy,
+    # which is the very write this is avoiding.
+    mkdir -p "$(dirname "$dest")"
+    _stage="$(mktemp "$(dirname "$dest")/.install-hook.XXXXXX")"
+    printf '%s\n' "$head_bytes" > "$_stage"
+    if [[ -f "$dest" && -x "$SCRIPT_DIR/scripts/atomic-replace.sh" ]]; then
+      "$SCRIPT_DIR/scripts/atomic-replace.sh" "$_stage" "$dest" >/dev/null
+      rm -f "$_stage"
+    else
+      # FIRST INSTALL, or a checkout predating the helper. Nothing can be
+      # executing a file that does not exist yet, and `mv` within one
+      # filesystem is the same rename(2) the helper performs.
+      #
+      # mktemp gives 0600 where the old `> "$dest"` gave 0644, and every call
+      # site chmods +x afterwards, so without this line a first install lands
+      # 0700 instead of 0755. Same result as before, stated rather than
+      # inherited from a umask.
+      chmod 0755 "$_stage"
+      mv -f "$_stage" "$dest"
+    fi
     echo "  installed $rel from $src_ref"
     if [[ "$src_ref" == "HEAD" ]]; then
       echo "  NOTE: origin/main has no $rel (or no origin) — installed from HEAD,"
