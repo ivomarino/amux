@@ -14,8 +14,9 @@ async function cachedWorker(page: import('@playwright/test').Page) {
   }, { worker, message });
   await page.route('**/api/sessions', r => r.fulfill({ json: [worker] }));
   await page.route('**/api/history?*', r => r.fulfill({ json: [message] }));
+  // The real endpoint names its worker; anonymous frames are correctly refused.
   await page.route('**/api/sessions/' + NAME + '/peek?*', r => r.fulfill({
-    json: { output: '› ' + TEXT + '\nAssistant response\n', history: '' },
+    json: { name: NAME, output: '› ' + TEXT + '\nAssistant response\n', history: '' },
   }));
 }
 
@@ -30,7 +31,9 @@ test('a cached worker deep link loads scoped history after all selection state i
   await expect.poll(() => page.evaluate(() => eval('_peekMsgRows?.length'))).toBe(1);
   await expect(page.locator('#peek-overlay')).toBeVisible();
   await expect(page.locator('#peek-body .peek-prompt-human')).toContainText(TEXT);
-  await page.getByRole('combobox', { name: 'Message type' }).selectOption('human');
+  await page.getByRole('button', {name:'Filter messages',exact:true}).click();
+  await page.locator('[name="peek-filter-source"][value="human"]').check();
+  await page.getByRole('dialog', {name:'Filter worker messages'}).getByRole('button', {name:'Done',exact:true}).click();
   await expect(page.locator('#peek-msg-count')).toHaveText('1');
   expect(errors.filter(e => e.includes('before initialization'))).toEqual([]);
 });

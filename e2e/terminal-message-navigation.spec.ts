@@ -59,12 +59,16 @@ test('header arrows land at the start of a long message and hold through refresh
     const body = document.getElementById('peek-body')!;
     const target = body.querySelector('.peek-msg-current')!;
     return { offset: target.getBoundingClientRect().top - body.getBoundingClientRect().top,
-      top: body.scrollTop, locked: eval('_peekScrollLocked'), height: target.getBoundingClientRect().height };
+      top: body.scrollTop, locked: eval('_peekScrollLocked'), height: target.getBoundingClientRect().height,
+      targetTop: target.getBoundingClientRect().top,
+      controlsBottom: document.querySelector('.peek-output-controls')!.getBoundingClientRect().bottom };
   });
   expect(landing.height).toBeGreaterThan(400);
   expect(landing.offset).toBeGreaterThanOrEqual(0);
-  expect(landing.offset).toBeGreaterThanOrEqual(39);
-  expect(landing.offset).toBeLessThan(42);
+  // Controls now occupy a sibling row instead of covering the first 40px.
+  // The message must land near the scroller start and below the real controls.
+  expect(landing.offset).toBeLessThan(20);
+  expect(landing.targetTop).toBeGreaterThanOrEqual(landing.controlsBottom);
   expect(landing.top).toBeGreaterThan(100);
   expect(landing.locked).toBe(true);
   await page.evaluate(() => (window as any)._peekReclassifyPrompts());

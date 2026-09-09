@@ -3367,3 +3367,30 @@ FIX: Keep the census's context-route prohibition and register the shared
   desktop/mobile Chromium and iOS Safari -> 45 passed, 0 unexpected/skipped.
   JSON receipts confirm every new-page negative control failed by its exact
   dead-new-page-probe matcher; matched controls and cross-tab delivery pass.
+
+
+---
+## Broad terminal and offline checks retained obsolete UI and response contracts
+AREA: tests
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-09
+SESSION: amux-testing-e2e
+CARD: AF-640
+SYMPTOM: Full browser CI still required a 40px navigation inset for controls
+  that now occupy a sibling row, and required a pending-count pill while a
+  failed read correctly had priority as Sync error. A pre-existing cold-worker
+  fixture returned peek data without its required worker name, so the identity
+  guard rejected it; the same test still selected a retired filter combobox.
+COST: Valid new terminal geometry and honest outage state read as regressions,
+  while the old anonymous peek specimen never exercised cold-start rendering.
+FIX: Assert that the message lands near the scroller start and below the actual
+  controls. Keep the exact three-operation banner and durable replay checks
+  while accepting Sync error in the pill. Supply the real worker identity and
+  exercise the current source-filter dialog. The existing identity-discard
+  beacon and named geometry/state assertions expose the next contract drift.
+  terminal-message-navigation + worker-toolbar-boot + golden -> 57/57 passed
+  across desktop/mobile Chromium and iOS Safari. With unchanged worker-config
+  controls included the run was 59/60; its mobile snapshot poll exceeded 5s
+  after the config write was logged successful. Exact fresh-home rerun ->
+  1 passed (20.9s), no source change. This is not a green full-browser-CI claim.
