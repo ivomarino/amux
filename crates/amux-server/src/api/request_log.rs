@@ -1472,7 +1472,9 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // completeness test learned to follow .nest() (AMUX-2917); it previously
     // scanned only api/mod.rs's own .route() calls.
     RouteEntry { path: "/api/board/contract", methods: &["GET"] },
+    RouteEntry { path: "/api/board/derived", methods: &["GET"] },
     RouteEntry { path: "/api/board/ready", methods: &["GET"] },
+    RouteEntry { path: "/api/board/changes", methods: &["GET"] },
     RouteEntry { path: "/api/board/bulk-migrate", methods: &["POST"] },
     RouteEntry { path: "/api/board/{id}/decompose", methods: &["POST"] },
     RouteEntry { path: "/api/board/needsyou", methods: &["GET"] },
