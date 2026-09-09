@@ -16,6 +16,12 @@
 //! the shared-checkout protections that git cannot express: never move files
 //! under an uncommitted edit or a half-finished operation.
 //!
+//! A refused LOCAL pull must not also prevent the isolated activation authority
+//! from seeing a remote update. When the shared checkout is dirty or mid-git
+//! operation, the button fetches only its upstream remote-tracking ref. Fetching
+//! does not move HEAD, the index, or any worktree file; the clean detached
+//! activation worktree can then adopt that measured ref on its normal pass.
+//!
 //! What this endpoint must never become: a scheduled or background pull. It is
 //! a button a human presses, and every refusal below names what the human has
 //! to decide.
@@ -58,6 +64,78 @@ fn out_of(o: &std::process::Output) -> String {
     )
     .trim()
     .to_string()
+}
+
+/// Fetch the current branch's upstream without touching HEAD, the index, or a
+/// worktree file. This is the safe meaning of "Pull from remote" while another
+/// worker owns uncommitted bytes in the shared checkout.
+async fn fetch_upstream_for_activation(dir: &Path) -> Result<String, String> {
+    let upstream = git(
+        dir,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+        GIT_TIMEOUT,
+    )
+    .await
+    .map(|o| out_of(&o))
+    .filter(|s| !s.is_empty())
+    .ok_or_else(|| "cannot resolve this branch's upstream".to_string())?;
+    let (remote, branch) = upstream
+        .split_once('/')
+        .filter(|(remote, branch)| !remote.is_empty() && !branch.is_empty())
+        .ok_or_else(|| format!("upstream {upstream:?} is not <remote>/<branch>"))?;
+    let refspec = format!("refs/heads/{branch}:refs/remotes/{remote}/{branch}");
+
+    let Some(first) = git(dir, &["fetch", "--", remote, &refspec], GIT_TIMEOUT).await else {
+        return Err(format!("git fetch {upstream} timed out after 30s"));
+    };
+    let first_output = out_of(&first);
+    if first.status.success() {
+        let target = git(dir, &["rev-parse", &upstream], GIT_TIMEOUT)
+            .await
+            .map(|o| out_of(&o))
+            .unwrap_or_else(|| "unknown revision".to_string());
+        return Ok(format!(
+            "Fetched {upstream} at {target} for the isolated activation authority.\n\
+             The shared checkout was left unchanged."
+        ));
+    }
+
+    let lower = first_output.to_lowercase();
+    let auth_failed = ["permission denied", "authentication failed", "could not read from remote",
+                       "publickey", "terminal prompts disabled"]
+        .iter()
+        .any(|needle| lower.contains(needle));
+    if auth_failed {
+        let url = git(dir, &["remote", "get-url", remote], GIT_TIMEOUT)
+            .await
+            .map(|o| out_of(&o))
+            .unwrap_or_default();
+        if let Some(https) = https_equiv(&url) {
+            if let Some(second) = git(
+                dir,
+                &["-c", "credential.helper=", "fetch", "--", &https, &refspec],
+                GIT_TIMEOUT,
+            )
+            .await
+            {
+                if second.status.success() {
+                    let target = git(dir, &["rev-parse", &upstream], GIT_TIMEOUT)
+                        .await
+                        .map(|o| out_of(&o))
+                        .unwrap_or_else(|| "unknown revision".to_string());
+                    return Ok(format!(
+                        "Fetched {upstream} anonymously at {target} for the isolated activation authority.\n\
+                         The shared checkout was left unchanged."
+                    ));
+                }
+                return Err(format!(
+                    "{first_output}\n[https fallback also failed] {}",
+                    out_of(&second)
+                ));
+            }
+        }
+    }
+    Err(first_output)
 }
 
 /// py:6093 — how this copy was installed. Package-managed copies must never
@@ -181,7 +259,26 @@ async fn pull() -> Response {
     };
 
     if let Some(refusal) = preflight(&dir).await {
-        return Json(refusal).into_response();
+        // A local checkout refusal protects peer bytes, but fetch updates only
+        // the remote-tracking ref consumed by the clean activation authority.
+        // Treat that as the successful, non-destructive form of this button.
+        return match fetch_upstream_for_activation(&dir).await {
+            Ok(output) => Json(json!({
+                "ok": true,
+                "deferred": true,
+                "mode": "fetch_only",
+                "local_blocked": refusal["blocked"],
+                "output": output,
+            })).into_response(),
+            Err(fetch_error) => Json(json!({
+                "ok": false,
+                "blocked": refusal["blocked"],
+                "output": format!(
+                    "{}\n\nThe safe fetch-only fallback also failed: {fetch_error}",
+                    refusal["output"].as_str().unwrap_or("Local pull was refused.")
+                ),
+            })).into_response(),
+        };
     }
 
     // ---- the pull itself ---------------------------------------------------
@@ -298,6 +395,42 @@ mod tests {
         assert_eq!(r["blocked"], "dirty_tree");
         // The FILE, not just a count — "1 file" tells nobody what to look at.
         assert_eq!(r["files"][0].as_str().unwrap().trim(), "M a.txt");
+    }
+
+    #[tokio::test]
+    async fn a_dirty_shared_checkout_can_fetch_for_activation_without_moving_peer_bytes() {
+        let d = repo();
+        let work = d.path().join("work");
+        let remote = d.path().join("remote.git");
+        let peer = d.path().join("peer");
+        let run = |args: &[&str], cwd: &Path| {
+            std::process::Command::new("git")
+                .args(args).current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+                .output().unwrap()
+        };
+
+        run(&["clone", remote.to_str().unwrap(), peer.to_str().unwrap()], d.path());
+        std::fs::write(peer.join("remote.txt"), "new remote bytes\n").unwrap();
+        run(&["add", "."], &peer);
+        run(&["commit", "-m", "remote advance"], &peer);
+        run(&["push", "origin", "main"], &peer);
+        let remote_head = String::from_utf8_lossy(&run(&["rev-parse", "HEAD"], &peer).stdout)
+            .trim().to_string();
+
+        std::fs::write(work.join("a.txt"), "peer's uncommitted edit\n").unwrap();
+        let before_head = String::from_utf8_lossy(&run(&["rev-parse", "HEAD"], &work).stdout)
+            .trim().to_string();
+        let output = fetch_upstream_for_activation(&work).await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(work.join("a.txt")).unwrap(),
+                   "peer's uncommitted edit\n");
+        assert_eq!(String::from_utf8_lossy(&run(&["rev-parse", "HEAD"], &work).stdout).trim(),
+                   before_head, "fetch-only must not move the shared checkout");
+        assert_eq!(String::from_utf8_lossy(&run(&["rev-parse", "origin/main"], &work).stdout).trim(),
+                   remote_head, "the activation authority must see the fetched revision");
+        assert!(output.contains("shared checkout was left unchanged"), "{output}");
     }
 
     #[tokio::test]

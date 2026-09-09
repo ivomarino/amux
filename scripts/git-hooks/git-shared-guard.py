@@ -716,23 +716,110 @@ def _sweep_commit_verdict(cmd, scrubbed, run_dir):
         return None
     pin = os.environ.get("AMUX_ALLOW_SWEEP_COMMIT", "").strip()
     if pin:
-        # A PIN, NOT A FLAG, for the same reason AMUX_AMEND_EXPECT is one: the
-        # number can only be supplied by someone who ran the count, so the
-        # escape requires having LOOKED. A bare on/off switch would be set once
-        # in a shell profile and never read again.
-        if pin == str(len(drift)):
-            return None
-        return (f"AMUX_ALLOW_SWEEP_COMMIT={pin} does not match the {len(drift)} drift file(s) "
-                f"this commit would sweep — re-read the count and pin THAT, or the escape is "
-                f"authorizing a commit you have not looked at")
-    return (
+        return _sweep_pin_verdict(pin, drift)
+    consent = _write_sweep_consent(drift)
+    head = (
         f"bare `git commit` would sweep {len(drift)} file(s) of index-vs-HEAD DRIFT "
         f"({len(staged)} staged against HEAD, and {len(drift)} of them already match {base}). "
         f"Those are not your work: HEAD lags {base} on this checkout, so the index carries "
         f"the whole gap and a no-pathspec commit takes all of it under YOUR message. "
-        f"Commit your own paths instead: `git commit <your files> -m ...`. "
+        f"Commit your own paths instead: `git commit <your files> -m ...`. ")
+    if consent:
+        return head + (
+            f"If you really mean to commit all {len(drift)}, consent to the exact SET you "
+            f"just looked at: AMUX_ALLOW_SWEEP_COMMIT=@{consent} git commit ... . That file "
+            f"lists the {len(drift)} path(s); the guard re-reads it and refuses any drift "
+            f"path that is NOT in it, naming the additions.")
+    # Could not write the consent file. Fall back to the count rather than
+    # leave the operator with no escape at all, and say which form this is.
+    return head + (
         f"If you really mean to commit all {len(drift)}, pin the count you just read: "
-        f"AMUX_ALLOW_SWEEP_COMMIT={len(drift)} git commit ...")
+        f"AMUX_ALLOW_SWEEP_COMMIT={len(drift)} git commit ... (the path-set consent file "
+        f"could not be written, so this is the count form, which fails if the drift moves "
+        f"between reading it and re-running).")
+
+
+# AF-597 defect 2 (mixpeek-frustrations, 2026-09-08): the escape hatch used to
+# be `AMUX_ALLOW_SWEEP_COMMIT=<count>`, and the count is recomputed live from
+# index-vs-HEAD across every lane sharing one index, so it moves every few
+# seconds. Measured: a lane read "would sweep 36 file(s)", re-ran with 36, and
+# was refused with a demand for 40. Pin-the-number-you-just-read is
+# unsatisfiable by construction on a busy checkout, which makes the documented
+# escape a path nobody can walk truthfully (ethos rules 3 and 6).
+#
+# WHY A PATH SET AND NOT A TOKEN OR A TTL (the reporting lane's argument, and
+# the reason this shape was chosen): a count and a token are both unfalsifiable
+# at the moment of use. Satisfying either proves only that the operator saw a
+# refusal. A path set is a CLAIM ABOUT THE COMMIT, so the guard can compare it
+# to the drift it actually finds and refuse the difference. That is ethos rule 7
+# applied to the escape hatch itself.
+#
+# SUBSET, NOT EQUALITY, and that is what fixes the race. If the drift GROWS
+# between reading and re-running, the extra paths are exactly what was never
+# consented to, so refusing THOSE by name is the correct answer rather than an
+# arithmetic mismatch. If it SHRINKS, every remaining path is still consented,
+# so the commit proceeds.
+_SWEEP_CONSENT_SHOWN = 8
+
+
+def _write_sweep_consent(drift):
+    """Write the drift paths for the operator to pin. Returns the path, or ''.
+
+    A UNIQUE name via mkstemp, never a fixed one: every lane on this box shares
+    one /tmp under one uid, so a fixed path is two lanes writing one inode
+    (~/.claude/CLAUDE.md). Not deleted here on purpose, because the whole point
+    is that it outlives this process and is read by the retry.
+    """
+    import tempfile
+    try:
+        fd, path = tempfile.mkstemp(prefix="amux-sweep-consent-", suffix=".txt")
+        with os.fdopen(fd, "w") as fh:
+            fh.write("\n".join(sorted(drift)) + "\n")
+        return path
+    except Exception:
+        return ""
+
+
+def _sweep_pin_verdict(pin, drift):
+    """None to allow, or a block-reason string. `pin` is already stripped."""
+    if pin.startswith("@"):
+        path = pin[1:]
+        try:
+            with open(path) as fh:
+                consented = {l.strip() for l in fh if l.strip()}
+        except Exception as e:
+            return (f"AMUX_ALLOW_SWEEP_COMMIT=@{path} could not be read ({e.__class__.__name__}), "
+                    f"so there is nothing to check this commit against. Re-run the bare "
+                    f"`git commit` to get a fresh consent file.")
+        if not consented:
+            return (f"AMUX_ALLOW_SWEEP_COMMIT=@{path} is empty, which consents to nothing "
+                    f"while reading like consent to everything. Re-run the bare `git commit` "
+                    f"to get a fresh consent file.")
+        unconsented = sorted(drift - consented)
+        if not unconsented:
+            return None
+        shown = ", ".join(unconsented[:_SWEEP_CONSENT_SHOWN])
+        more = ("" if len(unconsented) <= _SWEEP_CONSENT_SHOWN
+                else f" (and {len(unconsented) - _SWEEP_CONSENT_SHOWN} more)")
+        return (f"{len(unconsented)} of the {len(drift)} drift file(s) are NOT in "
+                f"{path}: {shown}{more}. The drift grew after you read it, which is normal "
+                f"on a shared index. Those paths are the ones you have not looked at; re-run "
+                f"the bare `git commit` for a consent file that covers them.")
+    if pin.isdigit():
+        # The legacy count form. Still honoured when it matches exactly, so a
+        # call already in flight is not broken by this change, and no longer
+        # advertised, because on a busy checkout it usually will not match.
+        if pin == str(len(drift)):
+            return None
+        return (f"AMUX_ALLOW_SWEEP_COMMIT={pin} does not match the {len(drift)} drift file(s) "
+                f"this commit would sweep. A count cannot survive the gap between reading it "
+                f"and using it: the drift is recomputed live across every lane sharing this "
+                f"index. Re-run the bare `git commit` and pin the consent FILE it names "
+                f"(AMUX_ALLOW_SWEEP_COMMIT=@<file>), which is checked as a set and tells you "
+                f"which paths are new.")
+    return (f"AMUX_ALLOW_SWEEP_COMMIT={pin!r} is neither a consent file (@<path>) nor a "
+            f"count. Re-run the bare `git commit` to get a consent file naming the "
+            f"{len(drift)} drift path(s).")
 
 
 def _amend_verdict(cmd, scrubbed, run_dir):
@@ -1520,9 +1607,10 @@ def _skipped_half_note(cmd):
     raw_segments = [seg.strip() for seg in _SHELL_JOINERS.split(cmd)]
     raw_segments = [seg for seg in raw_segments if seg and seg not in delims]
     idx, scrubbed_seg = others[0]
-    display = raw_segments[idx] if len(raw_segments) == len(segments) else scrubbed_seg
+    aligned = len(raw_segments) == len(segments)
+    display = raw_segments[idx] if aligned else scrubbed_seg
     shown = display[:80] + ("..." if len(display) > 80 else "")
-    return (
+    note = (
         "NOTE: the rest of this command did not run either — the block stops the whole "
         f"Bash call, not just the git verb. Skipped {len(others)} non-git segment(s), "
         f"first: `{shown}`.\n"
@@ -1530,6 +1618,53 @@ def _skipped_half_note(cmd):
         "the WHOLE command after fixing the complaint above; do not re-run only the git "
         "half against stale state.\n"
     )
+    unwritten = _unwritten_targets(
+        [(raw_segments[i] if aligned else seg) for i, seg in others])
+    if unwritten:
+        listed = ", ".join(unwritten[:_UNWRITTEN_SHOWN])
+        more = ("" if len(unwritten) <= _UNWRITTEN_SHOWN
+                else f", and {len(unwritten) - _UNWRITTEN_SHOWN} more")
+        note += (
+            f"      NOT WRITTEN: {listed}{more}. A retry that reads any of these gets "
+            f"whatever was there before, with rc=0 and nothing to notice.\n")
+    return note
+
+
+# AF-597 defect 3 (mixpeek-frustrations, 2026-09-08): the note above tells the
+# operator that a skipped half exists, and the operator still has to work out
+# what it was going to do. Measured cost on mixpeek main: a heredoc wrote a
+# commit-message file, the git verb was blocked, the retry fixed only the git
+# half, and the commit landed under the PREVIOUS DAY's message. Content right,
+# subject line false (b354b3d1f8, corrected by e222baefb5).
+#
+# Naming the files the skipped segments were going to WRITE turns a silent
+# stale read into a visible one, and it costs one pass over segments this
+# function has already split. It is the only component positioned to say it:
+# by the time the retry reads the stale file, nothing knows it is stale.
+_UNWRITTEN_SHOWN = 5
+_REDIRECT = re.compile(r"(?:^|\s)\d?>>?\s*([^\s|;&<>()]+)")
+_TEE = re.compile(r"\btee\s+(?:-\w+\s+)*([^\s|;&<>()]+)")
+# /dev/null is written by design and read by nobody, so naming it as an
+# unwritten file would be noise on the common case.
+#
+# `2>&1` and `>&2` need no entry here: `&` is excluded from the target class
+# above, so a descriptor duplication produces no match at all. There was a
+# `target.startswith("&")` check here and it could never fire, which is the
+# shape ethos rule 7 is about — a guard that reads like protection and is not.
+_NOT_A_FILE = {"/dev/null", "/dev/stdout", "/dev/stderr"}
+
+
+def _unwritten_targets(segments):
+    """Paths the skipped segments would have written, in order, deduped."""
+    seen = []
+    for seg in segments:
+        for pat in (_REDIRECT, _TEE):
+            for target in pat.findall(seg):
+                if target in _NOT_A_FILE:
+                    continue
+                if target not in seen:
+                    seen.append(target)
+    return seen
 
 def main():
     data = json.load(sys.stdin)

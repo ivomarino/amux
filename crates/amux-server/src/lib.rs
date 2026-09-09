@@ -96,6 +96,7 @@ pub mod integrations;
 pub mod invariants;
 pub mod opencode;
 pub mod orchestrator;
+pub mod reconciliation;
 pub mod provider;
 pub mod push;
 pub mod runtime_jobs;
@@ -529,10 +530,14 @@ async fn async_main() {
     // AMUX-3761: a durable record of WHICH RULE decided each lane's status,
     // so "was that badge accurate?" is answerable after the screenshot arrives.
     drop(runtime_jobs::status_history::spawn(state.clone()));
+    // CDC poller (migration 0061): tails board_change_log so the catch-up
+    // endpoint (/api/board/changes) stays current.
+    drop(runtime_jobs::cdc_poller::spawn(state.clone()));
     // The token_ledger WRITER. Every reader of that table was ported at the
     // cutover and this was not, so /api/stats/daily served a confident
     // total_tokens: 0 for 36 hours (AMUX-2892).
     drop(runtime_jobs::token_ledger::spawn(state.clone()));
+    drop(runtime_jobs::board_hygiene::spawn(state.clone()));
 
     // THE SCHEDULE FIRING LOOP (AMUX-2647). `run_scheduler` existed, was
     // documented, was gated behind `AMUX_RS_SCHEDULER=1` — and had ZERO call

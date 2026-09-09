@@ -54,9 +54,16 @@ pub fn routes() -> Router<AppState> {
             get(list_session_gates).patch(patch_session_gates),
         )
         .route("/contract", get(get_contract))
+        // Static /derived outranks /{id}. Computed display status from durable
+        // facts, never stored (AO architecture: display status is derived at
+        // read time).
+        .route("/derived", get(derived_board))
         // Static /ready outranks /{id}. The read side of the dependency graph
         // (AMUX-3948) — READY is a query, never a stored status.
         .route("/ready", get(ready_frontier))
+        // CDC catch-up: lets clients replay missed board mutations after a
+        // reconnect, keyed by the seq cursor from board_change_log.
+        .route("/changes", get(board_changes))
         // Static /bulk-migrate outranks /{id}. Moving a whole column at once
         // (AMUX-4044) — a single write transaction, because backlog alone
         // holds 489 live cards and 489 sequential PATCHes is minutes of load.
@@ -330,6 +337,143 @@ pub const QUEUE_DISPOSITION_CREATOR: &str = "queue-disposition";
 /// How many needsyou cards the owner view shows before hiding the rest.
 const NEEDSYOU_VIEW_CAP: usize = 10;
 
+// ---- GET /api/board/derived -----------------------------------------------
+
+/// Derived display status from durable facts.
+///
+/// The stored `status` is the lifecycle position a worker set. The `display_status`
+/// is what a human triaging the board should see, computed from timestamps, session
+/// liveness, evidence, and dependency state. This endpoint returns the board with
+/// both, so the dashboard can group by either.
+///
+/// Rules (in priority order; first match wins):
+///   1. status=needsyou AND entered_state_at older than 14 days: "aged-needsyou"
+///   2. status=doing AND assigned session is not active for >1h: "stalled"
+///   3. source=capture AND status=todo AND age > 72h AND no log activity: "stale"
+///   4. status=done AND evidence IS NOT NULL: "verified-candidate"
+///   5. depends_on non-empty AND all resolved: "unblocked"
+///   6. otherwise: the stored status itself
+async fn derived_board(State(state): State<AppState>) -> Response {
+    let store = state.store.clone();
+    let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = store.read()?;
+        let rows =
+            bs::list_issues(&conn, &[], &[], ArchivedFilter::ActiveOnly)?;
+        let working =
+            crate::api::sessions_legacy::active_python_sessions(&conn);
+        let now = now_secs();
+
+        let mut items: Vec<Value> = Vec::with_capacity(rows.len());
+        let mut counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+
+        for r in &rows {
+            let display = derive_display_status(r, now, &working, &conn);
+            *counts.entry(display.clone()).or_default() += 1;
+            let mut v = list_body(r, true, is_stale(r, now, &working));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("display_status".into(), json!(display));
+            }
+            items.push(v);
+        }
+
+        Ok((items, counts))
+    })
+    .await;
+    let (items, counts) = match joined {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return internal(e),
+        Err(e) => return internal(e),
+    };
+    Json(crate::api::measured::measured(
+        json!({
+            "items": items,
+            "counts": counts,
+            "total": items.len(),
+            "note": "display_status is computed from durable facts, never stored. \
+                     Rules: aged-needsyou (>14d), stalled (doing + session idle >1h), \
+                     stale (auto-captured todo >72h, no log), verified-candidate \
+                     (done + evidence), unblocked (all deps resolved). Otherwise \
+                     the stored status.",
+        }),
+        items.len(),
+    ))
+    .into_response()
+}
+
+fn derive_display_status(
+    row: &IssueRow,
+    now: i64,
+    working: &std::collections::BTreeSet<String>,
+    conn: &Connection,
+) -> String {
+    let status = row.status.as_str();
+    let age_secs = now - row.created;
+
+    // 1. Aged needsyou: status=needsyou and sitting longer than 14 days.
+    if status == "needsyou" {
+        let in_state_secs = row
+            .entered_state_at
+            .map(|t| now - t)
+            .unwrap_or(age_secs);
+        if in_state_secs > 14 * 86_400 {
+            return "aged-needsyou".into();
+        }
+    }
+
+    // 2. Stalled: status=doing but the assigned session is not active.
+    if status == "doing" {
+        if let Some(sess) = row.session.as_deref().filter(|s| !s.is_empty()) {
+            let idle_secs = now - row.updated;
+            if idle_secs > 3600 && !working.contains(sess) {
+                return "stalled".into();
+            }
+        }
+    }
+
+    // 3. Stale autofix/capture: auto-captured todo older than 72h with no log.
+    if status == "todo" {
+        let is_auto = row
+            .source
+            .as_deref()
+            .is_some_and(|s| s == "capture" || s == "autofix");
+        let no_activity = row
+            .log
+            .as_deref()
+            .map(|l| l.trim().is_empty())
+            .unwrap_or(true);
+        if is_auto && age_secs > 72 * 3600 && no_activity {
+            return "stale".into();
+        }
+    }
+
+    // 4. Verified candidate: done with evidence recorded.
+    if status == "done" && row.evidence.is_some() {
+        return "verified-candidate".into();
+    }
+
+    // 5. Unblocked: has dependencies and all are resolved (done/verified/discarded).
+    if !row.depends_on.is_empty() && matches!(status, "todo" | "backlog" | "doing") {
+        let all_resolved = row.depends_on.iter().all(|dep_id| {
+            bs::get_issue(conn, dep_id)
+                .ok()
+                .flatten()
+                .is_some_and(|dep| {
+                    matches!(
+                        dep.status.as_str(),
+                        "done" | "verified" | "discarded"
+                    )
+                })
+        });
+        if all_resolved {
+            return "unblocked".into();
+        }
+    }
+
+    // 6. Passthrough: the stored status.
+    status.to_string()
+}
+
 /// Why a candidate is NOT on the ready frontier, or `None` if it is ready.
 ///
 /// EXTRACTED so a test can drive it (AMUX-3949). The first version of this logic
@@ -584,6 +728,50 @@ async fn ready_frontier(
         },
     });
     Json(crate::api::measured::measured(body, n_considered)).into_response()
+}
+
+/// CDC catch-up: returns board_change_log rows after a given seq.
+/// Clients call this after an SSE reconnect to replay missed mutations.
+async fn board_changes(
+    State(state): State<AppState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let since_seq: i64 = q
+        .get("since_seq")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let limit: usize = q
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500)
+        .clamp(1, 5000);
+
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "db read failed"})),
+            )
+                .into_response();
+        }
+    };
+
+    match crate::runtime_jobs::cdc_poller::changes_since(&conn, since_seq, limit) {
+        Ok(rows) => {
+            let cursor = crate::runtime_jobs::cdc_poller::last_seq();
+            Json(json!({
+                "changes": rows,
+                "cursor": cursor,
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("query failed: {e}")})),
+        )
+            .into_response(),
+    }
 }
 
 /// (considered, moved, refused) carried out of the bulk-migrate write closure,
@@ -1111,15 +1299,11 @@ async fn get_contract(
             // where no refusal exists to correct you.
             "wrong_type": "If the item has no code, set its type first — the gate is DERIVED                            from the type. CLI: `amux board type <id> <type>`. API: PATCH                            /api/board/<id> with {\"type\": \"investigation\"} — the field is                            `type`, NOT `item_type` (that one is ignored and reported in                            `ignored_fields`). Settable at creation too: POST /api/board with                            {\"title\": ..., \"type\": ...}.",
         },
-        "worker_requests": {
-            "cli": "amux board request <worker> <title> [--for <PARENT-TASK>] [--desc ...] [--callback-prompt ...] [--no-callback]",
-            "api": "POST /api/board with a different session plus optional request_parent and callback:true, a prompt string, or {prompt}; X-Amux-Worker is the verified requester",
-            "lifecycle": "the delegated child is created in backlog and added to the requester task's depends_on; the parent moves doing -> todo so it releases WIP, stays dependency-blocked while the child is open, and becomes ready automatically when the child closes",
-            "parent_resolution": "request_parent/--for is authoritative. Otherwise the latest durable message->task link identifies the current task, with a unique doing task as fallback. No active task creates an intentional standalone request; multiple doing tasks are refused rather than linked incorrectly",
-            "callback": "optional; request CLI arms it by default. It fires when the dependency is resolved: verified for runtime-changing types, done for types without verification. Discarded sends a failure indicator and stays blocking. It queues a durable message to the verified requester",
-            "durability": "requested_by, callback target/prompt/state/message id/fired time/error live on the task. A stable steering id makes restart recovery idempotent; model/provider context is not involved",
-            "visibility": "the initial request links to the dependency; its completion callback links to the original requesting task when unique, with producer origin and both task IDs in history",
-            "security": "a callback can return only to the server-verified requester; isolated raw workers remain outside harness delivery",
+        "worker_board_ownership": {
+            "rule": "an identified worker may create cards only on its own board; `session` must equal the verified X-Amux-Worker/X-Amux-Session identity",
+            "peer_links": "cross-worker collaboration is represented without transferring board ownership: set `reviewer` or `shepherd` to the peer and use `depends_on` for cross-board task dependencies",
+            "cli": "amux board request <worker> <title> creates the card on the caller's board and links <worker> as reviewer",
+            "security": "a worker cannot create an unassigned card or place a new card directly on another worker's board; anonymous/human control-plane callers retain administrative placement",
         },
         "capture_decomposition": {
             "cli": "amux board decompose <capture-id> --stdin",
@@ -1707,6 +1891,18 @@ fn err(status: StatusCode, body: Value) -> Response {
     (status, Json(body)).into_response()
 }
 
+fn scoped_board_forbidden(scope: &super::org::MemberScope, resource: &str) -> Response {
+    err(
+        StatusCode::FORBIDDEN,
+        json!({
+            "error": "outside local member access scope",
+            "scope_level": scope.level(),
+            "scope_name": scope.name(),
+            "resource": resource,
+        }),
+    )
+}
+
 use super::internal;
 
 fn not_found(id: &str) -> Response {
@@ -1815,7 +2011,17 @@ fn fold_capture_for_worker_card(
         &AdvanceOpts {
             force: true,
             expected_from: Some("doing".into()),
-            log_line: Some(format!("capture folded into {}", new.id)),
+            // AF-616: THIS PATH GUESSED THE TARGET, so say so. The query
+            // below picks the most recent unclaimed capture for the lane, which
+            // means "the first card since the message" and not "this card is
+            // about that message". The declared path (`--folded-into`, where a
+            // lane names its own target) writes the same line WITHOUT this
+            // marker, so a reader can tell an assertion from an inference.
+            log_line: Some(format!(
+                "capture folded into {} {}",
+                new.id,
+                bs::FOLD_INFERRED_MARKER
+            )),
             skip_continuation: true,
             ..AdvanceOpts::default()
         },
@@ -1898,7 +2104,9 @@ fn hhmm() -> String {
 /// fixes every already-installed CLI copy at once, and closes both effects
 /// together, whereas patching curl lines fixes only the machines that upgrade.
 fn actor_from_headers(headers: &HeaderMap) -> (Actor, String) {
-    match Some(crate::api::groups::hdr_worker(headers))
+    match super::org::local_member_actor(headers)
+        .map(str::to_string)
+        .or_else(|| Some(crate::api::groups::hdr_worker(headers)))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
     {
@@ -2145,13 +2353,30 @@ pub(crate) async fn dispatch_pending_callbacks(
         // the empty shell. Telling the ROUTING lane that their peer "closed the
         // request without resolving the dependency" puts a false accusation in
         // front of the one party who will act on it.
-        let folded = bs::folded_into(row.log.as_deref());
+        let folded = bs::folded_into_detail(row.log.as_deref());
         let folded_note;
-        let resolution = if let Some(target) = folded.as_deref() {
-            folded_note = format!("folded this capture into {target}");
+        let resolution = if let Some((target, inferred)) = folded.as_ref() {
+            // AF-616: an INFERRED target was chosen by adjacency and nothing
+            // compared it to the capture. Saying so costs one clause and is the
+            // difference between a fact and a guess for the lane reading this.
+            folded_note = if *inferred {
+                format!(
+                    "folded this capture into {target} (target inferred from timing, \
+                     not declared -- confirm it is about the capture)"
+                )
+            } else {
+                format!("folded this capture into {target}")
+            };
             folded_note.as_str()
         } else if bs::dependency_is_resolved(&row.status, &row.item_type) {
             "resolved the dependency"
+        } else if bs::is_capture_shell(&row) && row.status == "discarded" {
+            // AF-634. The reader of this sentence is the SENDER of a message,
+            // and "closed the request without resolving the dependency" tells
+            // them a request they never made was dropped. ts-gke received 19 of
+            // these in a night and nearly enumerated all of them before seeing
+            // the shape. Nothing about DELIVERY changes here; only the claim.
+            "discarded the capture of a message you sent, which is not a request and owed you nothing"
         } else {
             "closed the request without resolving the dependency"
         };
@@ -3004,6 +3229,7 @@ pub struct ExportParams {
 
 pub async fn export_board(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(p): Query<ExportParams>,
 ) -> Response {
     let conn = match state.store.read() {
@@ -3015,11 +3241,22 @@ pub async fn export_board(
         .as_deref()
         .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
         .unwrap_or_default();
-    let workers: Vec<String> = p
+    let mut workers: Vec<String> = p
         .worker
         .as_deref()
         .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
         .unwrap_or_default();
+    if let Some(scope) = super::org::local_member_scope(&headers).filter(|scope| !scope.is_global()) {
+        if workers.iter().any(|worker| !scope.allows_worker(worker)) {
+            return scoped_board_forbidden(&scope, "board export");
+        }
+        if workers.is_empty() {
+            workers = super::org::scoped_worker_names(&scope);
+            if workers.is_empty() {
+                workers.push("__amux_no_permitted_worker__".into());
+            }
+        }
+    }
     // Default ActiveOnly: an export is a working document, and silently
     // including archived cards would overstate the board. `archived=all`
     // opts in, and the header below always says which was used.
@@ -3174,7 +3411,18 @@ pub async fn list_board(
     }
     // ETag based on global_rev — saves 3.5MB on unchanged polls.
     let rev = state.store.current_rev().map(|r| r.0).unwrap_or(0);
-    let etag_val = format!("\"board-{}\"", rev);
+    let member_scope = super::org::local_member_scope(&headers);
+    let scope_etag = member_scope
+        .as_ref()
+        .map(|scope| {
+            use sha2::Digest as _;
+            let digest = sha2::Sha256::digest(
+                format!("{}\0{}", scope.level(), scope.name()).as_bytes(),
+            );
+            format!("-{}", &hex::encode(digest)[..12])
+        })
+        .unwrap_or_default();
+    let etag_val = format!("\"board-{}{scope_etag}\"", rev);
     if let Some(inm) = headers.get("if-none-match").and_then(|v| v.to_str().ok()) {
         if inm == etag_val || inm == format!("W/{etag_val}") {
             let mut h = HeaderMap::new();
@@ -3210,7 +3458,20 @@ pub async fn list_board(
             .collect()
     };
     let status_f = split(&p.status);
-    let session_f = split(&p.session);
+    let mut session_f = split(&p.session);
+    if let Some(scope) = member_scope.as_ref().filter(|scope| !scope.is_global()) {
+        if session_f.iter().any(|worker| !scope.allows_worker(worker)) {
+            return scoped_board_forbidden(scope, "board list");
+        }
+        if session_f.is_empty() {
+            session_f = super::org::scoped_worker_names(scope);
+            if session_f.is_empty() {
+                // An empty SQL filter means "all sessions", so use an
+                // impossible sentinel when a group currently has no workers.
+                session_f.push("__amux_no_permitted_worker__".into());
+            }
+        }
+    }
     // `archived` grammar (amux-server.py:68758 + 14025, ported on AMUX-2586 fix #5):
     //   "1"/"true"/"yes"          -> archived-only
     //   any OTHER non-empty value -> non-archived only ("0", "false", "all", "2", ...)
@@ -3885,17 +4146,41 @@ pub async fn create_item(
     // present, the card is for the sender's own lane. An EXPLICIT value —
     // including explicit "" / null for a deliberately unassigned card — is
     // always respected.
-    let (_, hdr_name) = actor_from_headers(&headers);
-    let hdr_session = if hdr_name == "api-anonymous" {
+    let (_, actor_name) = actor_from_headers(&headers);
+    let hdr_session = if actor_name == "api-anonymous"
+        || super::org::is_verified_local_member(&headers)
+    {
         String::new()
     } else {
-        hdr_name.clone()
+        actor_name.clone()
     };
     let session = if map.contains_key("session") {
         body_str(&map, "session").unwrap_or_default().trim().to_string()
     } else {
         hdr_session.chars().take(64).collect()
     };
+    if let Some(scope) = super::org::local_member_scope(&headers).filter(|scope| !scope.is_global()) {
+        if session.is_empty() || !scope.allows_worker(&session) {
+            return scoped_board_forbidden(&scope, if session.is_empty() { "unassigned card" } else { &session });
+        }
+    }
+    if !hdr_session.is_empty() && session != hdr_session {
+        tracing::warn!(
+            caller = %hdr_session,
+            requested_owner = %(if session.is_empty() { "(unassigned)" } else { session.as_str() }),
+            "cross-board card creation refused"
+        );
+        return err(
+            StatusCode::FORBIDDEN,
+            json!({
+                "error": "workers may create board items only on their own board",
+                "code": "cross_board_create_forbidden",
+                "caller": hdr_session,
+                "requested_owner": if session.is_empty() { Value::Null } else { json!(session) },
+                "how_to_fix": "create the card on your own board and link the peer with reviewer, shepherd, or depends_on",
+            }),
+        );
+    }
 
     let status_in = body_str(&map, "status").unwrap_or_else(|| "todo".into());
     // THE SAME PREDICATE ON THE CREATE DOOR (AMUX-3929). The transition gate
@@ -4008,11 +4293,17 @@ pub async fn create_item(
     // Creator attribution (AMUX-1812): the body value is a self-reported
     // CLAIM; the verified header wins, and a disagreement is recorded.
     let claimed = body_str(&map, "creator").unwrap_or_default().trim().to_string();
-    let creator = match (&hdr_session.is_empty(), claimed.is_empty()) {
-        (false, false) if hdr_session != claimed => format!("{hdr_session} (claimed {claimed})"),
-        (false, _) => hdr_session.clone(),
-        (true, false) => claimed,
-        (true, true) => String::new(),
+    let verified_creator = (actor_name != "api-anonymous").then_some(actor_name.as_str());
+    let creator = match (verified_creator, claimed.is_empty()) {
+        // A local member's author is derived from the verified invite cookie.
+        // Old dashboard clients still send a device-name `creator`; retaining
+        // that self-reported value would make the same person appear under a
+        // different author on every device and would allow deliberate spoofing.
+        (Some(author), _) if super::org::is_verified_local_member(&headers) => author.to_string(),
+        (Some(author), false) if author != claimed => format!("{author} (claimed {claimed})"),
+        (Some(author), _) => author.to_string(),
+        (None, false) => claimed,
+        (None, true) => String::new(),
     };
 
     let owner_type = match body_str(&map, "owner_type").as_deref() {
@@ -4022,52 +4313,6 @@ pub async fn create_item(
         None => if session.is_empty() { "human" } else { "agent" }.to_string(),
     };
 
-    // A peer request is a BOARD CONTRACT, not an ordinary pane message. The
-    // requester comes only from the verified worker header; accepting a body
-    // field here would let a worker manufacture somebody else's return path.
-    let is_peer_request = !hdr_session.is_empty() && !session.is_empty() && hdr_session != session;
-    if is_peer_request {
-        if let Err(reason) =
-            crate::api::session_verbs::cross_group_send_ok(&hdr_session, &session)
-        {
-            return err(
-                StatusCode::FORBIDDEN,
-                json!({
-                    "error": reason,
-                    "code": "task_request_not_authorized",
-                    "requester": hdr_session,
-                    "target": session,
-                    "how_to_fix": "put both workers in a group, or enable the existing cross-group worker configuration; the board request and direct-send paths use the same policy",
-                }),
-            );
-        }
-    }
-    let request_parent = match map.get("request_parent") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(id)) if !id.trim().is_empty() => Some(id.trim().to_string()),
-        Some(Value::String(_)) => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                json!({"error": "request_parent must be a non-empty task id"}),
-            )
-        }
-        Some(_) => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                json!({"error": "request_parent must be a task id string"}),
-            )
-        }
-    };
-    if request_parent.is_some() && !is_peer_request {
-        return err(
-            StatusCode::BAD_REQUEST,
-            json!({
-                "error": "request_parent is valid only for a worker-to-worker task request",
-                "code": "task_request_parent_without_peer_request",
-            }),
-        );
-    }
-    let requested_by = is_peer_request.then(|| hdr_session.clone());
     let callback_specified = map.contains_key("callback");
     let (callback_session, callback_prompt) = match map.get("callback") {
         None | Some(Value::Null) | Some(Value::Bool(false)) => (None, None),
@@ -4124,7 +4369,7 @@ pub async fn create_item(
     let known_keys = [
         "title", "desc", "status", "session", "type", "depends_on", "tags", "creator",
         "reviewer", "shepherd", "gate", "owner_type", "due", "due_time", "callback",
-        "ask_actor", "ask_type", "ask_question", "ask_unblocks", "request_parent",
+        "ask_actor", "ask_type", "ask_question", "ask_unblocks",
     ];
     let ignored: Vec<String> = map
         .keys()
@@ -4210,19 +4455,14 @@ pub async fn create_item(
         // AF-367: the HTTP create path — a real POST /api/board from a lane or
         // a human, as opposed to a card a daemon filed.
         source: Some("agent".into()),
-        requested_by,
+        requested_by: None,
         callback_session,
         callback_prompt,
     };
 
-    enum DependencyLink {
-        Standalone,
-        ParentRequeued { parent: String, prior_status: String },
-    }
     enum Out {
         Cycle(Vec<String>),
-        ParentRefused(RequestParentRefusal),
-        Created(Box<IssueRow>, DependencyLink),
+        Created(Box<IssueRow>),
     }
     let slot: Arc<Mutex<Option<Out>>> = Arc::new(Mutex::new(None));
     let slot_w = slot.clone();
@@ -4230,25 +4470,9 @@ pub async fn create_item(
     // response can name it and it can be reported without re-querying.
     let folded: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let folded_w = folded.clone();
-    let requester_for_parent = hdr_session.clone();
     let write = state
         .store
         .write_async(move |conn| {
-            let mut parent = if new.requested_by.is_some() {
-                match resolve_request_parent(
-                    conn,
-                    &requester_for_parent,
-                    request_parent.as_deref(),
-                )? {
-                    RequestParentResolution::Standalone => None,
-                    RequestParentResolution::Linked(row) => Some(row),
-                    RequestParentResolution::Refused(refusal) => {
-                        return finish(&slot_w, Out::ParentRefused(refusal), no_write())
-                    }
-                }
-            } else {
-                None
-            };
             // Acyclicity is validated INSIDE the write so no interleaved
             // create can slip a cycle between check and insert. The new id
             // does not exist yet, so a placeholder self id is fine — only
@@ -4276,93 +4500,10 @@ pub async fn create_item(
                 if let Some(cycle) = bs::depends_on_cycle(conn, NEW_CARD_SELF_ID, &new.depends_on)? {
                     return finish(&slot_w, Out::Cycle(cycle), no_write());
                 }
-                // Adding parent -> new-child at the same time would close a
-                // cycle when any child dependency already reaches the parent.
-                // Validate that hypothetical edge before minting either side
-                // of the relationship; no partial child may survive refusal.
-                if let Some(parent) = parent.as_deref() {
-                    if let Some(path) =
-                        bs::dependency_path(conn, &new.depends_on, &parent.id)?
-                    {
-                        let mut cycle = vec![parent.id.clone(), NEW_CARD_SELF_ID.to_string()];
-                        cycle.extend(path);
-                        return finish(&slot_w, Out::Cycle(cycle), no_write());
-                    }
-                }
             }
             let now = now_secs();
             let row = bs::create_issue(conn, &new, now)?;
             let mut events = vec![ev_snap(&row, MutationKind::Created)];
-            let dependency_link = if let Some(mut parent) = parent.take() {
-                let prior_status = parent.status.clone();
-                if !parent.depends_on.iter().any(|id| id == &row.id) {
-                    parent.depends_on.push(row.id.clone());
-                }
-                // The delegated child is work the parent must wait for. Put
-                // the parent back on the ready queue, where depends_on keeps it
-                // blocked until the child closes, instead of letting `doing`
-                // consume the requester's sole WIP slot while it cannot move.
-                parent.status = "todo".into();
-                parent.updated = now;
-                parent.rev += 1;
-                parent.version += 1;
-                // A trigger got this task into doing; delegation means that
-                // trigger has been consumed. Leaving it fresh would keep the
-                // now-todo parent undispatchable even after its child closes.
-                parent.source_ref = None;
-                parent.last_verified_at = None;
-                parent.log = Some(bs::append_log(
-                    parent.log.as_deref(),
-                    &hhmm(),
-                    &format!(
-                        "{requester_for_parent} delegated dependency {} to {}; parent requeued until it completes",
-                        row.id,
-                        row.session.as_deref().unwrap_or("(unassigned)")
-                    ),
-                ));
-                if bs::save_patched(conn, &mut parent)? != 1 {
-                    return Err(rusqlite::Error::QueryReturnedNoRows);
-                }
-                let mutation = if prior_status == parent.status {
-                    MutationKind::Updated
-                } else {
-                    MutationKind::StatusChanged {
-                        from: prior_status.clone(),
-                        to: parent.status.clone(),
-                    }
-                };
-                events.push(ev_snap(&parent, mutation));
-                DependencyLink::ParentRequeued {
-                    parent: parent.id.clone(),
-                    prior_status,
-                }
-            } else {
-                DependencyLink::Standalone
-            };
-            // The Messages ledger carries the SAME task id. Delivery is
-            // `board`, not `direct` or `queued`: the recipient consumes this
-            // request through board-drive and the card is the source of truth.
-            if let (Some(requester), Some(target)) =
-                (row.requested_by.as_deref(), row.session.as_deref())
-            {
-                let text = format!(
-                    "[board request {}] {} requested work from {}: {}",
-                    row.id, requester, target, row.title
-                );
-                conn.execute(
-                    "INSERT INTO cmd_history \
-                     (text,type,session,ts,origin,card_id,delivery,delivered_at,submit_verdict) \
-                     VALUES (?1,'session',?2,?3,?4,?5,'board',?3,'accepted')",
-                    rusqlite::params![text, target, now_secs() * 1000, requester, row.id],
-                )?;
-                let message_id = conn.last_insert_rowid();
-                events.push(crate::db::PendingEvent {
-                    entity_type: amux_core::revision::EntityType::Message,
-                    entity_id: format!("MSG-{message_id}"),
-                    mutation: MutationKind::Created,
-                    payload: None,
-                });
-            }
             // AMUX-3391: fold the silent auto-capture card into this worker card
             // (see fold_capture_for_worker_card). The window is env-tunable.
             let fold_window: i64 = std::env::var("AMUX_CAPTURE_FOLD_WINDOW_S")
@@ -4377,7 +4518,7 @@ pub async fn create_item(
             }
             finish(
                 &slot_w,
-                Out::Created(Box::new(row), dependency_link),
+                Out::Created(Box::new(row)),
                 WriteOutcome {
                     applied: true,
                     events,
@@ -4392,44 +4533,8 @@ pub async fn create_item(
     let outcome = slot.lock().expect("outcome slot poisoned").take();
     match outcome {
         None => internal("create produced no outcome"),
-        Some(Out::Cycle(cycle)) => {
-            if is_peer_request {
-                tracing::warn!(
-                    target: "amux::task_dependency",
-                    verdict = "dependency_cycle",
-                    requester = %hdr_session,
-                    target = %session,
-                    cycle = %cycle.join(" -> "),
-                    "peer task dependency refused: cycle"
-                );
-            }
-            cycle_response(&cycle)
-        }
-        Some(Out::ParentRefused(refusal)) => {
-            tracing::warn!(
-                target: "amux::task_dependency",
-                verdict = refusal.code,
-                requester = %hdr_session,
-                target = %session,
-                candidates = %refusal.candidates.join(","),
-                "peer task dependency refused: {}",
-                refusal.why
-            );
-            err(
-                StatusCode::CONFLICT,
-                json!({
-                    "error": refusal.why,
-                    "code": refusal.code,
-                    "ok": false,
-                    "blocked": true,
-                    "requester": hdr_session,
-                    "target": session,
-                    "candidates": refusal.candidates,
-                    "how_to_fix": "pass the intended active requester task with `amux board request <worker> --for <TASK-ID> ...` or request_parent in the API body",
-                }),
-            )
-        }
-        Some(Out::Created(row, dependency_link)) => {
+        Some(Out::Cycle(cycle)) => cycle_response(&cycle),
+        Some(Out::Created(row)) => {
             let mut v = detail_body(&row);
             v["rev"] = json!(row.rev);
             v["global_rev"] = json!(reply.rev.0);
@@ -4440,44 +4545,6 @@ pub async fn create_item(
             // so a worker sees the reconcile happened and never hand-discards it.
             if let Some(cap_id) = folded.lock().expect("folded slot poisoned").take() {
                 v["folded_capture"] = json!(cap_id);
-            }
-            match dependency_link {
-                DependencyLink::ParentRequeued { parent, prior_status } => {
-                    v["request_dependency"] = json!({
-                        "verdict": "parent_requeued",
-                        "linked": true,
-                        "parent": parent.clone(),
-                        "child": row.id,
-                        "parent_status": "todo",
-                        "prior_parent_status": prior_status,
-                    });
-                    tracing::info!(
-                        target: "amux::task_dependency",
-                        verdict = "parent_requeued",
-                        parent = %parent,
-                        child = %row.id,
-                        requester = %row.requested_by.as_deref().unwrap_or("(none)"),
-                        delegate = %row.session.as_deref().unwrap_or("(none)"),
-                        "peer task dependency linked; requester WIP released"
-                    );
-                }
-                DependencyLink::Standalone => {
-                    if row.requested_by.is_some() {
-                        v["request_dependency"] = json!({
-                            "verdict": "standalone_no_active_parent",
-                            "linked": false,
-                            "child": row.id,
-                        });
-                        tracing::info!(
-                            target: "amux::task_dependency",
-                            verdict = "standalone_no_active_parent",
-                            child = %row.id,
-                            requester = %row.requested_by.as_deref().unwrap_or("(none)"),
-                            delegate = %row.session.as_deref().unwrap_or("(none)"),
-                            "peer task request created without an active requester task"
-                        );
-                    }
-                }
             }
             // AF-366: RECORD WHO CALLED, not only what the row now says.
             //
@@ -4513,18 +4580,6 @@ pub async fn create_item(
                 owner_session = %row.session.as_deref().unwrap_or("(none)"),
                 "board card created"
             );
-            // A peer request should enter the same durable board-drive path
-            // immediately; waiting for the periodic sweep makes a successful
-            // request look lost for up to a minute.
-            if row.requested_by.is_some() {
-                if let Some(target) = row.session.clone() {
-                    let st = state.clone();
-                    tokio::spawn(async move {
-                        let _ = crate::runtime_jobs::board_drive::drive_session(&st, &target).await;
-                        crate::api::session_verbs::steer_deliver_for_session(&st, &target).await;
-                    });
-                }
-            }
             (StatusCode::CREATED, Json(v)).into_response()
         }
     }
@@ -4689,9 +4744,14 @@ mod task_asset_resolution_tests {
     }
 }
 
-pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+pub async fn get_item(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
     let store = state.store.clone();
     let key = id.clone();
+    let member_scope = super::org::local_member_scope(&headers).filter(|scope| !scope.is_global());
     let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = store.read()?;
         let Some(row) = bs::get_issue(&conn, &key)? else {
@@ -4708,6 +4768,14 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
         let children = child_ids
             .iter()
             .filter_map(|child| bs::get_issue(&conn, child).ok().flatten())
+            .filter(|child| {
+                member_scope.as_ref().is_none_or(|scope| {
+                    child
+                        .session
+                        .as_deref()
+                        .is_some_and(|worker| scope.allows_worker(worker))
+                })
+            })
             .map(|child| {
                 json!({
                     "id": child.id,
@@ -4727,7 +4795,14 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
         // A child inherits the source message of its epic for display, while
         // cmd_history.card_id itself remains attached to the root epic. That
         // keeps the Messages chip stable from prompt through completion.
-        let message_root = row.epic.as_deref().unwrap_or(&row.id);
+        // A child normally inherits its epic's prompt. For a scoped member,
+        // crossing that parent boundary could reveal a prompt on a card they
+        // cannot open, so only use the directly-authorized card as the root.
+        let message_root = if member_scope.is_some() {
+            &row.id
+        } else {
+            row.epic.as_deref().unwrap_or(&row.id)
+        };
         let mut messages = Vec::new();
         let mut msg_stmt = conn.prepare(
             "SELECT id,text,type,session,ts,origin,card_id FROM cmd_history \
@@ -7274,6 +7349,69 @@ mod af413_discarded_tests {
     /// `folded_into` is a control key and must be listed, or a hand-rolled fold
     /// lands in `ignored_fields` and the caller is told nothing changed while
     /// the summary keeps rendering the four not-recorded clauses.
+    /// NO RUN OF SPACES IN ANY CALLBACK SENTENCE. Second instance of this
+    /// class in three cards, which is why the guard is over the REGION and not
+    /// over one literal.
+    ///
+    /// Rust joins a string across lines with a trailing backslash. Drop it and
+    /// the source still compiles, the compiler says nothing, and the sentence
+    /// renders with the indentation baked in. AF-621 shipped
+    /// "the          condition" into a CLI help surface; AF-634 then shipped
+    /// "not a request              and owed you nothing" into the terminal
+    /// callback, and I only saw it because a peer's discard notice came back to
+    /// me with the gap in it. A test scoped to one function did not generalise,
+    /// so this one reads every literal in the block that builds the callback.
+    #[test]
+    fn no_callback_sentence_renders_a_run_of_spaces() {
+        let src = include_str!("board.rs");
+        let start = src
+            .find("let folded = bs::folded_into_detail(")
+            .expect("the callback text block exists");
+        let end = src[start..]
+            .find("let guard = format!(\"task-callback:")
+            .expect("the block ends at the delivery guard")
+            + start;
+        let block = &src[start..end];
+
+        // APPLY RUST'S OWN CONTINUATION RULE FIRST. A backslash at end of line
+        // eats the newline AND the next line's leading whitespace, so the raw
+        // source of a CORRECTLY continued literal is full of spaces that never
+        // reach the reader. Checking the raw text flags every well-formed
+        // multi-line string, which is what the first cut of this test did.
+        let strip_continuations = |lit: &str| -> String {
+            let mut out = String::new();
+            let mut rest = lit;
+            while let Some(i) = rest.find("\\\n") {
+                out.push_str(&rest[..i]);
+                rest = rest[i + 2..].trim_start_matches([' ', '\t']);
+            }
+            out.push_str(rest);
+            out
+        };
+        let mut offenders: Vec<String> = Vec::new();
+        for lit in block.split('"').skip(1).step_by(2) {
+            let rendered = strip_continuations(lit);
+            if rendered.contains("   ") {
+                offenders.push(rendered.chars().take(90).collect());
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a dropped line-continuation leaves the indentation in the rendered \
+             sentence: {offenders:?}"
+        );
+
+        // POSITIVE CONTROL: the scrape must actually be reading literals. Without
+        // it, a `find` that silently matched nothing gives an empty block and an
+        // empty offender list, which is the most reassuring output a dead check
+        // can produce.
+        let lits = block.split('"').skip(1).step_by(2).count();
+        assert!(
+            lits >= 5,
+            "only {lits} literal(s) scanned; the block moved and this check is blind"
+        );
+    }
+
     #[test]
     fn folded_into_is_a_control_key_and_not_a_writable_column() {
         assert!(!PATCH_WRITABLE.contains(&"folded_into"), "it names no column");
@@ -7927,6 +8065,17 @@ pub async fn patch_item(
             json!({ "error": "body must be a JSON object" }),
         );
     };
+    if let Some(scope) = super::org::local_member_scope(&headers).filter(|scope| !scope.is_global()) {
+        if map.contains_key("session") {
+            let target = body_str(&map, "session").unwrap_or_default();
+            if target.is_empty() || !scope.allows_worker(&target) {
+                return scoped_board_forbidden(
+                    &scope,
+                    if target.is_empty() { "unassigned card" } else { &target },
+                );
+            }
+        }
+    }
     // AF-413: computed HERE, before `map` moves into the write closure, because
     // the refusal that needs it is built inside that closure and answered after
     // it. Cheap (a key scan) and unconditional: a value only read on the refusal
@@ -7997,7 +8146,9 @@ pub async fn patch_item(
     let force_actor = actor_name.clone();
     // Python `_hdr_worker`: "" when the header is absent — the cross-lane
     // archive guard only fires for a NAMED caller (AMUX-2492).
-    let caller_lane = if actor_name == "api-anonymous" {
+    let caller_lane = if actor_name == "api-anonymous"
+        || super::org::is_verified_local_member(&headers)
+    {
         String::new()
     } else {
         actor_name.clone()
@@ -8068,6 +8219,33 @@ pub async fn patch_item(
             let mut next = row.clone();
             let mut changed: Vec<String> = Vec::new();
             let mut tags_change: Option<Vec<String>> = None;
+
+            // A worker cannot create on its own board and then move the card
+            // onto a peer's board through PATCH. Administrative callers remain
+            // able to reassign, while a verified worker may only name itself as
+            // the destination. Peer collaboration belongs in reviewer,
+            // shepherd, and depends_on links instead of the ownership field.
+            if !caller_lane.is_empty() && map.contains_key("session") {
+                let requested_owner = body_opt_str(&map, "session")
+                    .flatten()
+                    .filter(|owner| !owner.trim().is_empty());
+                if requested_owner.as_deref() != Some(caller_lane.as_str()) {
+                    return finish(
+                        &slot_w,
+                        PatchOut::Refused(
+                            StatusCode::FORBIDDEN,
+                            json!({
+                                "error": "workers may assign board items only to their own board",
+                                "code": "cross_board_reassignment_forbidden",
+                                "caller": caller_lane,
+                                "requested_owner": requested_owner,
+                                "how_to_fix": "keep the card on your own board and link the peer with reviewer, shepherd, or depends_on",
+                            }),
+                        ),
+                        no_write(),
+                    );
+                }
+            }
 
             if let Some(t) = body_str(&map, "title") {
                 if t != next.title {
@@ -9082,6 +9260,80 @@ pub async fn patch_item(
                     };
                     let force = map.get("force").and_then(Value::as_bool).unwrap_or(false);
                     let reason = body_str(&map, "reason").unwrap_or_default();
+                    // A CAPTURE IS AN ENVELOPE, NOT A PARKABLE UNIT OF WORK
+                    // (MR-174, mvs-research, 2026-09-09).
+                    //
+                    // The server already has exactly three honest exits for an
+                    // auto-captured prompt: discard it when it is not work,
+                    // reshape its body into one self-contained task, or
+                    // decompose it atomically into an epic and ordered children.
+                    // The board-drive nudge teaches those exits and exempts the
+                    // untouched envelope from WIP for the same reason. The PATCH
+                    // transition path nevertheless allowed a fourth exit:
+                    // `doing -> backlog` (or `todo`) while the body was still
+                    // the captured prompt.
+                    //
+                    // MR-174 walked that hole exactly. `status-update` claimed
+                    // the direct human command as doing, the worker recorded a
+                    // material status and an artifact, then the same command
+                    // envelope moved back to backlog with a 14-day revisit and
+                    // a prose trigger. The Messages link and history were all
+                    // correct; the current board still erased the active-work
+                    // disposition and the drive loop quite correctly treated
+                    // the fresh trigger as parked. That is a state-machine
+                    // contradiction, not a polling problem.
+                    //
+                    // Refuse only the retreat of an UNRESHAPED capture. A real
+                    // task whose author rewrites `desc` in this same atomic
+                    // PATCH no longer matches `is_capture_shell` and may be
+                    // parked normally. New captures may still start in backlog,
+                    // terminal dispositions still work, and an attributed,
+                    // reasoned force remains the audited escape. This improves
+                    // with the model: it requires the model to make the semantic
+                    // judgment the harness cannot make, then preserves it.
+                    if from == TaskStatus::Doing
+                        && matches!(target, TaskStatus::Backlog | TaskStatus::Todo)
+                        && bs::is_capture_shell(&next)
+                        && !force
+                    {
+                        tracing::warn!(
+                            target: "amux::board",
+                            marker = "capture_requeue_refused",
+                            card = %next.id,
+                            worker = %next.session.as_deref().unwrap_or("-"),
+                            actor = %actor_name,
+                            from = %next.status,
+                            to = %bs::db_status_spelling(target),
+                            measured = true,
+                            "worked capture envelope refused requeue without a semantic disposition"
+                        );
+                        return finish(
+                            &slot_w,
+                            PatchOut::Refused(
+                                StatusCode::CONFLICT,
+                                json!({
+                                    "error": "captured command requires a disposition before requeue",
+                                    "code": "capture_requeue_requires_disposition",
+                                    "ok": false,
+                                    "blocked": true,
+                                    "measured": true,
+                                    "item": next.id,
+                                    "attempted_status": bs::db_status_spelling(target),
+                                    "preserved_status": next.status,
+                                    "why": "This card is still the auto-captured human command envelope. It was already claimed as active work; putting the unchanged envelope back in a queue loses the command's disposition and makes completed, delegated, and blocked work indistinguishable.",
+                                    "how_to_fix": {
+                                        "not_work": format!("amux board discard {} --outcome-stdin", next.id),
+                                        "one_task": format!("amux board retitle {} \"<standalone task title>\" --desc-stdin", next.id),
+                                        "several_tasks": format!("amux board decompose {} --stdin", next.id),
+                                        "work_finished": "move the envelope to review/done with its outcome and evidence",
+                                        "still_actively_working": "leave it in doing and post status/next_action/unresolved",
+                                        "audited_escape": format!("amux board {} {} --force \"<why the capture itself must be requeued>\"", bs::db_status_spelling(target), next.id),
+                                    },
+                                }),
+                            ),
+                            no_write(),
+                        );
+                    }
                     // ONE-DOING-PER-SESSION (AMUX-1707 parity). Python's WIP
                     // filters verbatim: archived cards and dormant types
                     // (tripwire/watch) do not hold WIP — both were real
@@ -11024,6 +11276,172 @@ pub async fn patch_item(
     }
 }
 
+#[cfg(test)]
+mod capture_requeue_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::HeaderValue;
+
+    fn fixture() -> (AppState, crate::db::SharedStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            crate::db::Store::open(&dir.path().join("capture-requeue.db"))
+                .expect("open store"),
+        );
+        // Store owns live SQLite handles after this helper returns.
+        std::mem::forget(dir);
+        let state = AppState {
+            store: store.clone(),
+            started: std::time::Instant::now(),
+            build_hash: "capture-requeue-test".into(),
+            auth_token: None,
+            reconciled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        (state, store)
+    }
+
+    fn seed_capture(store: &crate::db::SharedStore) -> String {
+        let slot = Arc::new(Mutex::new(None));
+        let slot_w = slot.clone();
+        store
+            .write(move |conn| {
+                let row = bs::create_issue(
+                    conn,
+                    &bs::NewIssue {
+                        title: "Clear out this worker's board then grind it all out".into(),
+                        desc: "**Prompt:** clear out this worker's board then grind it all out"
+                            .into(),
+                        status: "doing".into(),
+                        session: Some("mvs-research".into()),
+                        item_type: "chore".into(),
+                        creator: "amux".into(),
+                        owner_type: "agent".into(),
+                        due: None,
+                        due_time: None,
+                        reviewer: None,
+                        shepherd: None,
+                        gate: vec![],
+                        depends_on: vec![],
+                        tags: vec![],
+                        ask_type: None,
+                        ask_question: None,
+                        ask_unblocks: None,
+                        ask_actor: None,
+                        source: Some("capture".into()),
+                        requested_by: None,
+                        callback_session: None,
+                        callback_prompt: None,
+                    },
+                    1_788_955_507,
+                )?;
+                *slot_w.lock().expect("slot") = Some(row.id);
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
+            })
+            .expect("seed capture");
+        let id = slot.lock().expect("slot").clone().expect("capture id");
+        id
+    }
+
+    fn worker_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amux-session", HeaderValue::from_static("mvs-research"));
+        headers
+    }
+
+    async fn patch(state: &AppState, id: &str, body: Value) -> (StatusCode, Value) {
+        let response = patch_item(
+            State(state.clone()),
+            Path(id.to_string()),
+            worker_headers(),
+            Json(body),
+        )
+        .await;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response");
+        (status, serde_json::from_slice(&bytes).expect("json response"))
+    }
+
+    /// MR-174 is the production specimen: status-update claimed the captured
+    /// command, the lane registered its report asset, then PATCH moved the same
+    /// untouched envelope doing -> backlog. The board faithfully rendered that
+    /// last mutation, so it looked as though no work had happened and the fresh
+    /// trigger parked it outside the drain loop.
+    #[tokio::test]
+    async fn a_worked_capture_envelope_cannot_disappear_back_into_a_queue() {
+        let (state, store) = fixture();
+        let id = seed_capture(&store);
+
+        for target in ["backlog", "todo"] {
+            let (status, body) = patch(&state, &id, json!({"status": target})).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{target}: {body}");
+            assert_eq!(body["code"], "capture_requeue_requires_disposition");
+            assert_eq!(body["preserved_status"], "doing");
+            assert_eq!(body["attempted_status"], target);
+            assert_eq!(
+                bs::get_issue(&store.read().expect("read"), &id)
+                    .expect("query")
+                    .expect("card")
+                    .status,
+                "doing",
+                "a refusal must not mutate the card"
+            );
+        }
+    }
+
+    /// The guard requires the model to make the semantic decision; it does not
+    /// ban parking. Once the same atomic PATCH replaces the prompt envelope with
+    /// a standalone task, the normal transition is available again.
+    #[tokio::test]
+    async fn reshaping_one_real_task_preserves_the_normal_backlog_exit() {
+        let (state, store) = fixture();
+        let id = seed_capture(&store);
+        let desc = "Re-run every MVS verification job whose named prerequisite has cleared; record each result and produced artifact.";
+        let (status, body) = patch(
+            &state,
+            &id,
+            json!({
+                "desc": desc,
+                "status": "backlog",
+                "source_ref": "Resume when MR-157 supplies the staging experiment path"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["applied"], true);
+        assert_eq!(body["status"], "backlog");
+        assert_eq!(body["desc"], desc);
+    }
+
+    /// The existing audited escape stays real. This is intentionally a
+    /// positive control: deleting force support would make the primary refusal
+    /// test pass while creating a state with no truthful exit.
+    #[tokio::test]
+    async fn an_attributed_reasoned_force_can_requeue_the_envelope() {
+        let (state, store) = fixture();
+        let id = seed_capture(&store);
+        let (status, body) = patch(
+            &state,
+            &id,
+            json!({
+                "status": "backlog",
+                "force": true,
+                "reason": "the source message was revoked before its semantic disposition could be recorded"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "backlog");
+        let log = body["log"].as_str().unwrap_or_default();
+        assert!(log.contains("force by mvs-research: doing->backlog reason="), "{log}");
+        assert!(log.contains("source message was revoked"), "{log}");
+    }
+}
+
 // ---- POST /api/board/{id}/archive + /restore (RR-0055) -------------------
 
 async fn archive_restore(
@@ -12881,6 +13299,39 @@ mod slim_tests {
         assert!(
             got.desc.contains(&format!("Folded into {}", worker.id)),
             "the tombstone links to the worker card"
+        );
+    }
+
+    /// AF-616: the auto-fold CHOSE this target by adjacency, so the line it
+    /// writes must carry the inference marker. mixpeek-frustrations' specimen
+    /// is a report captured as AF-613 and folded into AF-615, an unrelated
+    /// finding carded in the same minute; the summary asserted that fold in the
+    /// same words a lane's own `--folded-into` would have produced.
+    ///
+    /// This pins the LABEL, not the choice. Narrowing the window is a change to
+    /// every lane's board and is not made here.
+    #[test]
+    fn an_auto_fold_records_that_it_inferred_the_target() {
+        let conn = fold_db();
+        let cap =
+            bs::create_issue(&conn, &fold_card("amux", "doing", "**Prompt:** do the thing", "lane"), 1000)
+                .unwrap();
+        let worker =
+            bs::create_issue(&conn, &fold_card("lane", "todo", "Fix the thing", "lane"), 1010).unwrap();
+        fold_capture_for_worker_card(&conn, &worker, 600, 1010).unwrap();
+
+        let got = bs::get_issue(&conn, &cap.id).unwrap().unwrap();
+        let log = got.log.as_deref().unwrap_or("");
+        assert!(
+            log.contains(&format!("capture folded into {} {}", worker.id, bs::FOLD_INFERRED_MARKER)),
+            "the adjacency-chosen target must be labelled as inferred; log was: {log}"
+        );
+        // AND IT MUST STILL RESOLVE. A marker that broke the id would turn a
+        // readable fold back into the dropped-request rendering b3db93fd fixed.
+        assert_eq!(
+            bs::folded_into_detail(Some(log)),
+            Some((worker.id.clone(), true)),
+            "the labelled line must still parse to the target"
         );
     }
 

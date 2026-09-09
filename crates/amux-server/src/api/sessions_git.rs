@@ -207,22 +207,19 @@ fn ok(v: Value, disposition: &str) -> Response {
 /// reader cannot accidentally make the background path re-enter it.
 async fn recompute(state: &AppState) -> Result<Value, String> {
     // (name, dir, branch) from the SAME source the session list renders.
-    let rows: Vec<(String, String, String)> = {
-        let conn = state.store.read().map_err(|e| format!("store unreadable: {e}"))?;
-        match super::sessions_legacy::build_array(&conn) {
-            Ok(arr) => arr
-                .iter()
-                .filter_map(|v| {
-                    let name = v["name"].as_str()?.to_string();
-                    let dir = v["dir"].as_str().unwrap_or("").to_string();
-                    let branch = v["branch"].as_str().unwrap_or("").to_string();
-                    (!name.is_empty() && !dir.is_empty() && !branch.is_empty())
-                        .then_some((name, dir, branch))
-                })
-                .collect(),
-            Err(e) => return Err(format!("session list unavailable: {e}")),
-        }
-    };
+    let arr = super::sessions_legacy::legacy_sessions_values(state.store.clone())
+        .await
+        .map_err(|e| format!("session list unavailable: {e}"))?;
+    let rows: Vec<(String, String, String)> = arr
+        .iter()
+        .filter_map(|v| {
+            let name = v["name"].as_str()?.to_string();
+            let dir = v["dir"].as_str().unwrap_or("").to_string();
+            let branch = v["branch"].as_str().unwrap_or("").to_string();
+            (!name.is_empty() && !dir.is_empty() && !branch.is_empty())
+                .then_some((name, dir, branch))
+        })
+        .collect();
 
     // One git call per DISTINCT directory, then fan the answer out to every
     // session sharing it (many sessions share one checkout).

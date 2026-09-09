@@ -4144,6 +4144,13 @@ fn mint_capture_card(
     if session_name.trim().is_empty() {
         return Ok(None);
     }
+    if amux_core::board::is_conversational_ack(body) {
+        tracing::info!(
+            session = %session_name,
+            "ledger: conversational ack not carded (recorded in cmd_history only)"
+        );
+        return Ok(None);
+    }
     // A pure status / info query ("status on MSG-29602?", "any update on X?") is
     // answered inline and produces no deliverable, so it is NOT a board work card:
     // the old capture minted it type=code/doing, which a question can never take
@@ -5972,7 +5979,6 @@ pub(crate) fn send_failure_status(msg: &str) -> (StatusCode, Option<&'static str
         ("saved resume context", "reconcile the worker identity and active card before restarting"),
         ("active task directory", "restore the recorded task directory or explicitly change the worker directory"),
         ("durable worker directory", "record an absolute directory for this worker before restarting"),
-        ("conflicting live task claims", "reconcile the worker's exact active claim before restarting"),
         ("session is blocked", "remove the lane from ~/.amux/blocked-sessions.txt"),
         ("session is archived", "POST /api/sessions/<name>/wake first"),
         ("terminal client attached", "a terminal client owns the size — detach it, or resize there"),
@@ -6796,6 +6802,15 @@ pub(crate) async fn deliver_automated(
     // forever. Unarchiving is a human's call (ethos rule 8).
     if parse_env(name).get("CC_ARCHIVED") == Some("1") {
         return refuse(format!("target '{name}' is archived — not delivered, not woken"));
+    }
+    // A blocked session is on a permission/approval dialog. Delivering input
+    // could accidentally answer that dialog. The message stays queued (via the
+    // steering hold below) and delivers when the block clears.
+    if lane_is_blocked(state, name) {
+        return refuse(format!(
+            "target '{name}' is blocked on a permission dialog — not delivered. \
+             Answer the dialog in the terminal; queued messages deliver when it clears."
+        ));
     }
     // A stopped (but not archived) lane is `send_text`'s auto-wake path, exactly
     // as under Python. It must NOT be queued: `steer_deliver_loop` skips lanes
@@ -11066,6 +11081,13 @@ pub(crate) fn reason_is_reapable(reason: &str) -> bool {
 /// minutes ago that has never been seen is strictly worse than one that arrives
 /// a turn early.
 pub(crate) fn steer_decide(reported: Option<&str>, pane_idle: Option<bool>, age_s: f64, max_age_s: f64) -> SteerDelivery {
+    // A blocked session is on a permission/approval dialog. Sending input
+    // could accidentally answer the dialog, so delivery is held unconditionally
+    // with no overdue escape. The agent must clear the block (by reporting idle
+    // or active) before any queued message is delivered.
+    if reported == Some("blocked") {
+        return SteerDelivery::Hold;
+    }
     let idle = match reported {
         // The lane's own report wins (D1): the harness knows its boundaries.
         Some(st) => st == "idle",
@@ -11095,7 +11117,13 @@ fn steer_decide_with_background(
     max_age_s: f64,
     background_working: bool,
 ) -> SteerDelivery {
-    if background_working {
+    // `reported` is already the shared, fully-derived lane verdict. A stale
+    // transcript mtime or child-process sample must not overrule its explicit
+    // idle boundary here, or the dashboard can truthfully show IDLE while the
+    // steering queue silently holds forever. Real live background work is
+    // folded into that verdict by `derive_status_explain`; keep the hard hold
+    // only while the shared verdict still says the lane is not at a boundary.
+    if background_working && reported != Some("idle") && pane_idle != Some(true) {
         SteerDelivery::Hold
     } else {
         steer_decide(reported, pane_idle, age_s, max_age_s)
@@ -11156,6 +11184,14 @@ pub(crate) fn lane_report(state: &AppState, name: &str) -> Option<LaneReport> {
     })
 }
 
+/// Whether a lane's trusted self-report says it is blocked on a permission or
+/// approval dialog. Sending input to a blocked session could accidentally
+/// answer the dialog, so all automated delivery paths refuse.
+pub(crate) fn lane_is_blocked(state: &AppState, name: &str) -> bool {
+    lane_report(state, name)
+        .is_some_and(|r| r.applies && r.state == "blocked")
+}
+
 /// Exact provider-owned evidence that work continues behind an idle-looking
 /// composer. This is intentionally narrower than generic pane activity: the
 /// Claude row is spinner-chrome anchored, and the Codex row is structurally
@@ -11191,7 +11227,7 @@ fn reported_idle_is_boundary(subagents_live: Option<i64>, raw: &str) -> bool {
     !subagents_live.is_some_and(|count| count > 0) && !provider_background_working(raw)
 }
 
-fn warn_background_override_once(name: &str, raw: &str) {
+fn warn_background_override_once(name: &str, raw: &str, authoritative_idle: bool) {
     use std::collections::BTreeSet;
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
@@ -11200,17 +11236,29 @@ fn warn_background_override_once(name: &str, raw: &str) {
     } else {
         "claude_background_agent"
     };
-    let key = format!("{name}:{kind}");
+    let verdict = if authoritative_idle { "ignored_at_idle_boundary" } else { "held" };
+    let key = format!("{name}:{kind}:{verdict}");
     let mut seen = SEEN.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
     if !seen.insert(key) {
         return;
     }
-    tracing::warn!(
-        target: "status_truth",
-        session = name,
-        provider_signal = kind,
-        "provider_background_work_overrode_idle_report: board-drive and steering are held until the provider row clears"
-    );
+    if authoritative_idle {
+        tracing::warn!(
+            target: "status_truth",
+            session = name,
+            provider_signal = kind,
+            verdict,
+            "background activity hint contradicted the shared idle boundary and was ignored for steering delivery"
+        );
+    } else {
+        tracing::warn!(
+            target: "status_truth",
+            session = name,
+            provider_signal = kind,
+            verdict,
+            "provider_background_work_overrode_idle_report: board-drive and steering are held until the provider row clears"
+        );
+    }
 }
 
 /// WARN once per lane per stuck report, so a lane held out of the drive loop by
@@ -11349,7 +11397,9 @@ pub(crate) async fn steer_delivery_for(state: &AppState, name: &str, age_s: f64)
         || explain["provider_background_working"] == true
         || signals.provider_child_activity.contains(name);
     if background_working {
-        if let Some(raw) = signals.panes.get(name) { warn_background_override_once(name, raw); }
+        if let Some(raw) = signals.panes.get(name) {
+            warn_background_override_once(name, raw, status == "idle");
+        }
     }
     steer_decide_with_background(
         Some(&status), None, age_s, steer_max_age_s(), background_working,
@@ -12527,6 +12577,10 @@ pub async fn steer_deliver_for_session(state: &AppState, session: &str) -> bool 
         skip(session, "", "not-running");
         return false;
     }
+    if lane_is_blocked(state, session) {
+        skip(session, "", "blocked-on-permission-dialog");
+        return false;
+    }
     let mut id = String::new();
     let mut text = String::new();
     let mut sent = None;
@@ -13620,11 +13674,7 @@ async fn get_dispatch(
     match action {
         "" => {
             // Bare GET → the SAME record the list endpoint serves (py:74892).
-            let conn = match state.store.read() {
-                Ok(c) => c,
-                Err(e) => return jresp(StatusCode::SERVICE_UNAVAILABLE, json!({"error": e.to_string()})),
-            };
-            match crate::api::sessions_legacy::build_array(&conn) {
+            match crate::api::sessions_legacy::legacy_sessions_values(state.store.clone()).await {
                 Ok(arr) => {
                     match arr.into_iter().find(|x| x["name"] == json!(name)) {
                         Some(rec) => j200(rec),
@@ -13634,7 +13684,7 @@ async fn get_dispatch(
                         ),
                     }
                 }
-                Err(e) => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
+                Err(e) => jresp(StatusCode::SERVICE_UNAVAILABLE, json!({"error": e.to_string()})),
             }
         }
         "tasks" => j200(session_cc_tasks(name).await),
@@ -15290,7 +15340,18 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     // GROUP SCOPING, before anything is delivered or recorded. The origin is the
     // SERVER-VERIFIED stamp (AMUX-1768), never a body-supplied claim, so a lane
     // cannot talk its way across a group boundary.
-    let send_origin: String = hdr_worker(headers).trim().chars().take(64).collect();
+    //
+    // An invited member is a human operating the scoped dashboard, not a peer
+    // worker. Their resource permission was already checked by the member
+    // scope guard; feeding `member:<email>` into the worker-to-worker group
+    // gate would refuse legitimate sends to the very worker they were granted.
+    // Keep the authenticated human actor separately for the message ledger.
+    let member_actor = super::org::local_member_actor(headers).map(str::to_string);
+    let send_origin: String = if member_actor.is_some() {
+        String::new()
+    } else {
+        hdr_worker(headers).trim().chars().take(64).collect()
+    };
     if std::env::var("AMUX_GROUP_SEND_ENFORCE")
         .map(|v| !matches!(v.trim(), "0" | "false" | "no"))
         .unwrap_or(true)
@@ -15441,7 +15502,11 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     let orig_text = text.clone();
     let mut origin = String::new();
     if defer_busy {
-        origin = {
+        origin = if member_actor.is_some() {
+            // A member cannot turn a human send into a peer relay by claiming
+            // source_session in the JSON body.
+            String::new()
+        } else {
             let h = hdr_worker(headers);
             if h.is_empty() { body_str(body, "source_session") } else { h }
         };
@@ -15460,6 +15525,22 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     // mediation, which is what "raw LLM pass through" excludes.
     let send_origin =
         if origin.is_empty() { SendOrigin::Owner } else { SendOrigin::Automation };
+    // A blocked session is on a permission/approval dialog. Automated sends
+    // could accidentally answer it, so peer/automation sends are refused.
+    // Owner sends (dashboard, human) pass through so the human can answer the
+    // dialog directly.
+    if matches!(send_origin, SendOrigin::Automation) && lane_is_blocked(state, name) {
+        return jresp(
+            StatusCode::CONFLICT,
+            json!({
+                "ok": false,
+                "error": format!("Session '{name}' is blocked on a permission dialog. \
+                    Use the terminal to answer it directly."),
+                "blocked": "permission_dialog",
+                "code": "session_blocked",
+            }),
+        );
+    }
     let (ok, msg) = send_text(state, name, &text, defer_busy, send_origin).await;
     let no_effect = ok && msg == "no suggestion found";
     if no_effect {
@@ -15536,7 +15617,8 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
         };
         if record_history {
             let email = headers.get("x-amux-user-email").and_then(|v| v.to_str().ok()).unwrap_or("");
-            cmd_hist_record_full(state, name, &orig_text, "user", email, skip_board, meta).await;
+            let author = member_actor.as_deref().unwrap_or(email);
+            cmd_hist_record_full(state, name, &orig_text, "user", author, skip_board, meta).await;
         } else if !origin.is_empty() && origin != name {
             cmd_hist_record_full(state, name, &orig_text, "session", &origin, false, meta).await;
         }
@@ -15584,7 +15666,8 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
             if record_history {
                 let email =
                     headers.get("x-amux-user-email").and_then(|v| v.to_str().ok()).unwrap_or("");
-                cmd_hist_record_full(state, name, &orig_text, "user", email, skip_board, meta).await;
+                let author = member_actor.as_deref().unwrap_or(email);
+                cmd_hist_record_full(state, name, &orig_text, "user", author, skip_board, meta).await;
             } else if !origin.is_empty() && origin != name {
                 cmd_hist_record_full(state, name, &orig_text, "session", &origin, false, meta).await;
             }
@@ -15605,6 +15688,9 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     };
     let send_id = send_response_id(name, &msg_id);
     let mut resp = json!({"ok": ok, "message": msg, "id": send_id});
+    if let Some(author) = member_actor {
+        resp["authored_by"] = json!(author);
+    }
     if let Some(fix) = fix {
         resp["fix"] = json!(fix);
     }
@@ -17392,7 +17478,7 @@ async fn subagent_event_post(state: &AppState, name: &str, ev: &str, body: &Valu
                      ON CONFLICT(key) DO UPDATE SET value=?1",
                     [reports.to_string()],
                 )?;
-                crate::api::sessions_legacy::invalidate_sessions_cache();
+                crate::api::sessions_legacy::invalidate_sessions_runtime_cache();
             }
             let events = if applied.status_changed {
                 vec![crate::db::PendingEvent {
@@ -17571,14 +17657,13 @@ pub(crate) async fn report_post(state: &AppState, name: &str, headers: &HeaderMa
     let st = match st_raw.as_str() {
         "working" | "busy" => "active",
         "done" => "idle",
-        "blocked" => "waiting",
         other => other,
     }
     .to_string();
-    if !matches!(st.as_str(), "active" | "idle" | "waiting" | "error") {
+    if !matches!(st.as_str(), "active" | "idle" | "waiting" | "blocked" | "error") {
         return jresp(
             StatusCode::BAD_REQUEST,
-            json!({"error": format!("state must be one of active|idle|waiting|error (got '{st_raw}')")}),
+            json!({"error": format!("state must be one of active|idle|waiting|blocked|error (got '{st_raw}')")}),
         );
     }
     // A normal Stop report is the prompt terminal edge. Reconcile a provider
@@ -17724,10 +17809,13 @@ pub(crate) async fn report_post(state: &AppState, name: &str, headers: &HeaderMa
                 [reports.to_string()],
             )?;
             // See subagent_event_post: invalidate inside the writer, before its
-            // committed Session event is broadcast, so the reactive GET sees
-            // this exact state rather than the preceding cache entry.
-            crate::api::sessions_legacy::invalidate_sessions_cache();
-            // SNAPPY STATUS (Ethan, 2026-08-16). A self-report is the fast, exact
+            // committed Session event is broadcast, so a reactive reader knows
+            // the projection needs refresh. Under contention it may briefly
+            // receive the preceding structurally safe snapshot while the ONE
+            // builder catches up; runtime status may be stale during that
+            // revalidation, but membership/isolation never is.
+            crate::api::sessions_legacy::invalidate_sessions_runtime_cache();
+            // SNAPPY STATUS (Ethan, 2026-08-16). A self-report is the fast, durable
             // signal for active/idle/needs-input (the D1 exit), but this write used
             // events:vec![], so a hook state change pushed NO SSE and the dashboard
             // only caught it on the next 15s scan or a poll. Emit a Session event on
@@ -26715,6 +26803,11 @@ mod steer_freeze_tests {
             SteerDelivery::Hold,
             "max age never authorizes interruption while background work is live"
         );
+        assert_eq!(
+            steer_decide_with_background(Some("idle"), None, 86_400.0, 600.0, true),
+            SteerDelivery::AtBoundary,
+            "a weaker background hint cannot contradict the shared idle verdict and starve steering"
+        );
 
         assert!(!provider_background_working(CODEX_BACKGROUND_FINISHED));
         assert!(reported_idle_is_boundary(Some(0), CODEX_BACKGROUND_FINISHED));
@@ -26826,6 +26919,22 @@ mod steer_max_age_tests {
         // path refuses a selector even when overdue — answering a pending tool
         // is the user's, not amux's.)
         assert_eq!(steer_decide(Some("waiting"), None, 10.0, MAX), SteerDelivery::Hold);
+    }
+
+    #[test]
+    fn a_blocked_session_is_never_delivered_to() {
+        // A blocked session is on a permission/approval dialog. Delivering
+        // input could accidentally answer it. The hold must survive past the
+        // max-age deadline: the overdue escape is for busy-but-safe lanes, and
+        // a dialog is neither.
+        assert_eq!(steer_decide(Some("blocked"), None, 0.0, MAX), SteerDelivery::Hold);
+        assert_eq!(steer_decide(Some("blocked"), None, MAX + 1.0, MAX), SteerDelivery::Hold);
+        assert_eq!(steer_decide(Some("blocked"), None, 86_400.0, MAX), SteerDelivery::Hold);
+        assert_eq!(
+            steer_decide(Some("blocked"), Some(true), MAX + 1.0, MAX),
+            SteerDelivery::Hold,
+            "pane saying idle must not override a blocked report"
+        );
     }
 
     #[test]

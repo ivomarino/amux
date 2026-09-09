@@ -1,4 +1,11 @@
-import { test, expect } from './fixtures';
+import { test, expect, Page } from './fixtures';
+
+async function sourceFilter(page: Page, kind: string) {
+  await page.getByRole('button', {name:'Filter messages', exact:true}).click();
+  await page.locator(`[name="peek-filter-source"][value="${kind}"]`).check();
+  await page.getByRole('dialog', {name:'Filter worker messages'}).getByRole('button', {name:'Done', exact:true}).click();
+}
+
 
 // Exercise the shipped renderer and actual header buttons, including ANSI spans
 // that used to cross block boundaries and Codex's different prompt glyph.
@@ -52,12 +59,16 @@ test('header arrows land at the start of a long message and hold through refresh
     const body = document.getElementById('peek-body')!;
     const target = body.querySelector('.peek-msg-current')!;
     return { offset: target.getBoundingClientRect().top - body.getBoundingClientRect().top,
-      top: body.scrollTop, locked: eval('_peekScrollLocked'), height: target.getBoundingClientRect().height };
+      top: body.scrollTop, locked: eval('_peekScrollLocked'), height: target.getBoundingClientRect().height,
+      targetTop: target.getBoundingClientRect().top,
+      controlsBottom: document.querySelector('.peek-output-controls')!.getBoundingClientRect().bottom };
   });
   expect(landing.height).toBeGreaterThan(400);
   expect(landing.offset).toBeGreaterThanOrEqual(0);
-  expect(landing.offset).toBeGreaterThanOrEqual(39);
-  expect(landing.offset).toBeLessThan(42);
+  // Controls now occupy a sibling row instead of covering the first 40px.
+  // The message must land near the scroller start and below the real controls.
+  expect(landing.offset).toBeLessThan(20);
+  expect(landing.targetTop).toBeGreaterThanOrEqual(landing.controlsBottom);
   expect(landing.top).toBeGreaterThan(100);
   expect(landing.locked).toBe(true);
   await page.evaluate(() => (window as any)._peekReclassifyPrompts());
@@ -82,8 +93,8 @@ test('search navigation shares real matches and reports an empty filter', async 
   });
   await page.getByRole('button', { name: 'Find in terminal', exact: true }).click();
   await page.getByRole('searchbox', { name: 'Find in terminal', exact: true }).fill('needle');
-  await expect(page.locator('#peek-msg-kind')).toHaveValue('all');
-  await expect(page.locator('#peek-msg-kind')).toBeEnabled();
+  await expect(page.locator('[name="peek-filter-source"][value="all"]')).toBeChecked();
+  await expect(page.getByRole('button', {name:'Filter messages', exact:true})).toBeEnabled();
   await page.getByRole('button', { name: 'Next message', exact: true }).click();
   await expect(page.locator('#peek-msg-count')).toHaveText('2/2');
   await expect.poll(() => beacons.filter(b => b.verdict === 'landed').length).toBe(1);
@@ -94,8 +105,8 @@ test('search navigation shares real matches and reports an empty filter', async 
   await page.locator('#peek-search').press('Escape');
   await expect(page.locator('#peek-search-wrap')).toBeHidden();
   await expect(page.locator('#peek-overlay')).toBeVisible();
-  await expect(page.locator('#peek-msg-kind')).toBeEnabled();
-  await page.locator('#peek-msg-kind').selectOption('human');
+  await expect(page.getByRole('button', {name:'Filter messages', exact:true})).toBeEnabled();
+  await sourceFilter(page, 'human');
   await page.evaluate(() => {
     document.getElementById('peek-body')!.innerHTML = '';
   });
@@ -113,22 +124,22 @@ test('search retains the selected message type and filters matches when it chang
     eval('lastPeekHTML = _peekHtml(' + JSON.stringify(raw) + '); _lastLiveHTML=lastPeekHTML; _peekHistoryHTML="";');
     (window as any).applyPeekSearch(false, false);
   });
-  await page.locator('#peek-msg-kind').selectOption('human');
+  await sourceFilter(page, 'human');
   await page.getByRole('button', { name: 'Find in terminal', exact: true }).click();
   await page.locator('#peek-search').fill('needle');
-  await expect(page.locator('#peek-msg-kind')).toHaveValue('human');
-  await expect(page.locator('#peek-msg-kind')).toBeEnabled();
+  await expect(page.locator('[name="peek-filter-source"][value="human"]')).toBeChecked();
+  await expect(page.getByRole('button', {name:'Filter messages', exact:true})).toBeEnabled();
   await expect(page.locator('#peek-msg-count')).toHaveText('1/2');
   expect(await page.locator('.peek-highlight').evaluateAll(nodes => nodes.map(n => (n.closest('.peek-prompt') as HTMLElement)?.dataset.msgKind))).toEqual(['human', 'human']);
   await page.getByRole('button', { name: 'Next message', exact: true }).click();
   await expect(page.locator('#peek-msg-count')).toHaveText('2/2');
   await page.screenshot({ path: testInfo.outputPath('human-search-filter.png') });
-  await page.locator('#peek-msg-kind').selectOption('session');
+  await sourceFilter(page, 'session');
   await expect(page.locator('#peek-search')).toHaveValue('needle');
   await expect(page.locator('#peek-msg-count')).toHaveText('1/1');
   await expect(page.locator('.peek-highlight')).toHaveCount(1);
   expect(await page.locator('.peek-highlight').evaluate(el => (el.closest('.peek-prompt') as HTMLElement)?.dataset.msgKind)).toBe('session');
-  await page.locator('#peek-msg-kind').selectOption('all');
+  await sourceFilter(page, 'all');
   await expect(page.locator('#peek-msg-count')).toHaveText('1/5');
 });
 
@@ -159,7 +170,7 @@ test('toolbar has one horizontal row, explicit filters and reachable named actio
   const geometry = await page.locator('.peek-toolbar').evaluate(el => ({
     height: el.getBoundingClientRect().height,
     overflow: el.scrollWidth > el.clientWidth + 1,
-    controls: [...el.querySelectorAll('button,select')].map(c => {
+    controls: [...el.querySelectorAll('button,select')].filter(c => c.getClientRects().length && !c.closest('.peek-filter-panel')).map(c => {
       const r = c.getBoundingClientRect();
       // WebKit may return 43.999996 for a 44px control. Keep subpixel precision.
       return { width: Number(r.width.toFixed(3)), height: Number(r.height.toFixed(3)), visible: c.contains(document.elementFromPoint(r.x + r.width/2, r.y + r.height/2)) };
@@ -172,7 +183,7 @@ test('toolbar has one horizontal row, explicit filters and reachable named actio
     expect(c.height).toBeGreaterThanOrEqual(44);
     expect(c.visible).toBe(true);
   }
-  await page.getByRole('combobox', { name: 'Message type' }).selectOption('session');
+  await sourceFilter(page, 'session');
   expect(await page.evaluate(() => eval('_peekMsgNavKind'))).toBe('session');
   await expect(page.locator('#peek-msg-count')).toHaveText('0');
   // Empty loaded output may still have earlier messages; these remain actions.
@@ -419,4 +430,99 @@ test('a worker menu that loses its opening announces the failure', async ({ page
   const signal = beacons.find(b => b.kind === 'worker-action-menu');
   expect(signal).toMatchObject({ verdict: 'open-lost', measured: true, session: 'nav-probe' });
   expect(signal.n_considered).toBeGreaterThan(20);
+});
+
+
+async function filterSpecimen(page: Page) {
+  await page.evaluate(() => {
+    eval("peekSessionDir='/tmp/toolbar-probe'; _peekMsgRows=[{session:'nav-probe',type:'direct',text:'Review AMUX-4242 needle in docs/result.md'}, {session:'nav-probe',type:'direct',text:'Check needle at https://example.com/report'}, {session:'nav-probe',type:'direct',text:'Plain needle request'}];");
+    const raw = '› Review AMUX-4242 needle in docs/result.md\nAssistant needle reply\n'
+      + '❯ [amux-origin:peer] Check AMUX-4242 needle in docs/worker.md\nAssistant\n'
+      + '› Check needle at https://example.com/report\nAssistant\n'
+      + '› Plain needle request\nAssistant\n'
+      + '❯ [Scheduled] needle routine\nAssistant\n';
+    eval('lastPeekHTML = _peekHtml(' + JSON.stringify(raw) + '); _lastLiveHTML=lastPeekHTML; _peekHistoryHTML="";');
+    (window as any).applyPeekSearch(false, false);
+  });
+}
+
+test('filter button combines source and content with Find, then resets both without losing the query', async ({page}) => {
+  await filterSpecimen(page);
+  await page.getByRole('button', {name:'Filter messages', exact:true}).click();
+  const panel=page.getByRole('dialog', {name:'Filter worker messages'});
+  await panel.getByRole('radio', {name:'Human', exact:true}).check();
+  await panel.getByRole('radio', {name:'Board references', exact:true}).check();
+  await expect(page.locator('#peek-filter-summary')).toHaveText('Human · Board references');
+  await expect(page.locator('#peek-msg-count')).toHaveText('1');
+  await panel.getByRole('button', {name:'Done',exact:true}).click();
+  await page.getByRole('button', {name:'Next message',exact:true}).click();
+  await expect(page.locator('.peek-msg-current')).toContainText('Review AMUX-4242');
+  await page.getByRole('button', {name:'Find in terminal',exact:true}).click();
+  await page.locator('#peek-search').fill('needle');
+  await expect(page.locator('.peek-highlight')).toHaveCount(1);
+  await expect(page.locator('#peek-msg-count')).toHaveText('1/1');
+  await page.getByRole('button', {name:'Filter messages',exact:true}).click();
+  await panel.getByRole('radio', {name:'Workers',exact:true}).check();
+  await expect(page.locator('#peek-filter-summary')).toHaveText('Workers · Board references');
+  await expect(page.locator('.peek-highlight')).toHaveCount(1);
+  await expect(page.locator('.peek-highlight')).toHaveJSProperty('textContent','needle');
+  expect(await page.locator('.peek-highlight').evaluate(el => (el.closest('.peek-prompt') as HTMLElement).dataset.msgKind)).toBe('session');
+  await panel.getByRole('button', {name:'Reset',exact:true}).click();
+  await expect(page.locator('#peek-search')).toHaveValue('needle');
+  await expect(page.locator('.peek-highlight')).toHaveCount(6);
+  await expect(page.locator('#peek-filter-summary')).toHaveText('All messages');
+  await expect(page.locator('#peek-filter-btn')).not.toHaveClass(/active/);
+  await expect(panel.getByRole('button',{name:'Reset',exact:true})).toBeDisabled();
+});
+
+test('file and link filters use rendered references, and empty combinations emit measured evidence', async ({page}) => {
+  const signals:any[]=[];
+  await page.route('**/api/client-debug',async route => {signals.push(route.request().postDataJSON());await route.fulfill({json:{ok:true}});});
+  await filterSpecimen(page);
+  await page.getByRole('button',{name:'Filter messages',exact:true}).click();
+  const panel=page.getByRole('dialog',{name:'Filter worker messages'});
+  await panel.getByRole('radio',{name:'Files',exact:true}).check();
+  await expect(page.locator('#peek-msg-count')).toHaveText('2');
+  await panel.getByRole('radio',{name:'Human',exact:true}).check();
+  await expect(page.locator('#peek-msg-count')).toHaveText('1');
+  await panel.getByRole('radio',{name:'Links',exact:true}).check();
+  await expect(page.locator('#peek-msg-count')).toHaveText('1');
+  await panel.getByRole('radio',{name:'Workers',exact:true}).check();
+  await expect(page.locator('#peek-msg-count')).toHaveText('0');
+  await expect.poll(() => signals.find(s=>s.kind==='peek-message-filter' && s.source_filter==='session' && s.content_filter==='links')).toMatchObject({verdict:'no-matches',measured:true,n_considered:5,matched_messages:0});
+  // A repaint must keep the combination; a zero is scoped, not the full history.
+  await page.evaluate(()=>(window as any).applyPeekSearch(false,false));
+  await expect(panel.getByRole('radio',{name:'Workers',exact:true})).toBeChecked();
+  await expect(panel.getByRole('radio',{name:'Links',exact:true})).toBeChecked();
+  await expect(page.locator('#peek-msg-count')).toHaveText('0');
+});
+
+test('filter popover stays within the phone and supports Escape, outside click and reopening',async ({page},testInfo)=>{
+  await filterSpecimen(page);
+  await page.evaluate(()=>(window as any)._applyTheme(true));
+  const button=page.getByRole('button',{name:'Filter messages',exact:true});
+  const panel=page.getByRole('dialog',{name:'Filter worker messages'});
+  await button.click();
+  await expect(button).toHaveAttribute('aria-expanded','true');
+  await panel.getByRole('radio',{name:'Human',exact:true}).check();
+  await panel.getByRole('radio',{name:'Files',exact:true}).check();
+  await page.screenshot({path:testInfo.outputPath('worker-message-filters.png')});
+  const bounds=await panel.boundingBox();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x+bounds!.width).toBeLessThanOrEqual(page.viewportSize()!.width);
+  expect(bounds!.y+bounds!.height).toBeLessThanOrEqual(page.viewportSize()!.height);
+  expect(await panel.locator('.peek-filter-option').evaluateAll(els=>els.every(el=>el.getBoundingClientRect().height>=43.9))).toBe(true);
+  await panel.getByRole('radio',{name:'Files',exact:true}).press('Escape');
+  await expect(panel).toBeHidden();
+  await expect(button).toBeFocused();
+  await expect(page.locator('#peek-overlay')).toBeVisible();
+  await button.click();
+  await page.locator('#peek-title').click();
+  await expect(panel).toBeHidden();
+  await button.click();
+  await expect(panel).toBeVisible();
+  await expect(panel.getByRole('radio',{name:'Human',exact:true})).toBeChecked();
+  await expect(panel.getByRole('radio',{name:'Files',exact:true})).toBeChecked();
+  await panel.getByRole('button',{name:'Done',exact:true}).click();
+  await page.screenshot({path:testInfo.outputPath('worker-message-filter-button.png')});
 });

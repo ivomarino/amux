@@ -108,6 +108,7 @@ pub mod ids {
     // can name them without a bare literal.
     pub const AUTOFIX: &str = "autofix";
     pub const BOARD_DRIVE: &str = "board-drive";
+    pub const CDC_POLLER: &str = "cdc-poller";
     pub const GHOST_RESCUE: &str = "ghost-rescue";
     pub const PANE_SIZE: &str = "pane_size";
     pub const STORAGE: &str = "storage";
@@ -122,6 +123,7 @@ pub mod ids {
     pub const DISK_WATCH: &str = "disk-watch";
     pub const STATUS_HISTORY: &str = "status-history";
     pub const TOKEN_LEDGER: &str = "token-ledger";
+    pub const BOARD_HYGIENE: &str = "board-hygiene";
 }
 
 /// Every id above, enumerated. `mod ids` is a set of constants and Rust cannot
@@ -148,6 +150,7 @@ pub const ALL_IDS: &[&str] = &[
     ids::BROWSER_REAPER,
     ids::AUTOFIX,
     ids::BOARD_DRIVE,
+    ids::CDC_POLLER,
     ids::GHOST_RESCUE,
     ids::PANE_SIZE,
     ids::STORAGE,
@@ -162,6 +165,7 @@ pub const ALL_IDS: &[&str] = &[
     ids::DISK_WATCH,
     ids::STATUS_HISTORY,
     ids::TOKEN_LEDGER,
+    ids::BOARD_HYGIENE,
 ];
 
 /// An env var this job reads at startup. It is a READOUT, never a switch: a
@@ -259,6 +263,18 @@ pub const CATALOG: &[Doc] = &[
         }],
         pref: None,
         detail: Some("/api/debug/board-drive"),
+    },
+    Doc {
+        id: ids::CDC_POLLER,
+        name: "Board CDC poller",
+        purpose: "Tails board_change_log every 200ms so the /api/board/changes catch-up endpoint stays current; the SSE invalidate itself comes from write_async, not from here.",
+        env: &[EnvControl {
+            var: "AMUX_CDC_POLLER_SECS",
+            effect: "tick seconds; 0 disables the loop (fleet-isolation opt-out)",
+            off: Some("0"),
+        }],
+        pref: None,
+        detail: None,
     },
     Doc {
         id: ids::AUTOFIX,
@@ -636,6 +652,18 @@ pub const CATALOG: &[Doc] = &[
         env: &[EnvControl {
             var: "AMUX_LEDGER_INDEX_SECS",
             effect: "index interval in seconds; 0 disables the job",
+            off: Some("0"),
+        }],
+        pref: None,
+        detail: None,
+    },
+    Doc {
+        id: ids::BOARD_HYGIENE,
+        name: "Board hygiene",
+        purpose: "Ages needsyou cards (warn at 14d, discard at 30d), discards stale autofix todos (72h), flags stale backlog (30d never promoted), and logs per-session status counts.",
+        env: &[EnvControl {
+            var: "AMUX_BOARD_HYGIENE_SECS",
+            effect: "tick seconds; 0 disables the job",
             off: Some("0"),
         }],
         pref: None,

@@ -598,6 +598,7 @@ let sessions = [];
 let _sessionsSnapshotEpoch = 0;
 let archivedExpanded = false;
 let gitInfo = {};  // {sessionName: {branch, repo, _conflict}}
+let _sessionLoadError = null; // Last failed worker read; a response is not necessarily data.
 let _initialLoad = true;   // true until first data arrives from server
 let _lastDataTime = null;  // timestamp of last successful data
 // AC-275: when NO data has ever arrived, _lastDataTime stays null and every
@@ -617,13 +618,14 @@ let _logSearchTimer = null;
 let _logSearchAbort = null;
 // Filters modal facets (session list). Multi-select within a facet.
 let filterProviders = new Set();   // 'claude' | 'codex' | 'gemini' | 'iterm2'
-let filterStatuses = new Set();    // 'working' | 'waiting' | 'idle' | 'stopped'
+let filterStatuses = new Set();    // 'working' | 'blocked' | 'waiting' | 'idle' | 'stopped'
 // Stable status key for filtering: card WORKING = 'active' internally.
 function _sessStatusKey(s) {
   if (!s.running) return 'stopped';
   if (s.status === 'rate_limited') return 'rate_limited';
   if (s.status === 'api_error') return 'api_error';
   if (s.status === 'unattributed') return 'waiting';
+  if (s.status === 'blocked') return 'blocked';
   if (s.status === 'active') return 'working';
   if (s.status === 'waiting') return 'waiting';
   return 'idle';
@@ -927,6 +929,12 @@ document.addEventListener('keydown', function(e) {
 
 // Connection & offline state
 let online = true;
+let _writeError = '';
+let _boardReadError = '';
+let _syncReadError = '';
+let _syncFlight = null;
+let _syncRetryTimer = null;
+const _outboxActive = new Set();
 window.addEventListener('offline', () => setOnline(false));
 window.addEventListener('online', () => { consecutiveFailures = 0; setOnline(true); });
 // Migrate localStorage keys from cc_ to amux_
@@ -937,14 +945,38 @@ window.addEventListener('online', () => { consecutiveFailures = 0; setOnline(tru
     localStorage.removeItem('cc_' + k);
   }
 });
-let offlineQueue = JSON.parse(localStorage.getItem('amux_offline_queue') || '[]');
-function saveQueue() {
-  localStorage.setItem('amux_offline_queue', JSON.stringify(offlineQueue));
-  if (typeof _idb !== 'undefined') _idb.set('offline_queue', offlineQueue);
-  // Keep pending-message visibility live (Messages tab badge + composer pill)
-  try { if (typeof _peekMessagesBadge === 'function') _peekMessagesBadge(); } catch(e) {}
-  try { if (typeof _peekTab !== 'undefined' && _peekTab === 'messages') _peekMessagesRender(); } catch(e) {}
+let offlineQueue = [];
+try { offlineQueue = _readQueue(); } catch (error) { _writeError = error.message; }
+// Queue changes use a short storage lock. Delivery has a separate lock so a
+// slow server never holds up a new local edit. Always reread under the lock:
+// a tab's in-memory queue is a view, not authority to overwrite another tab.
+function _readQueue() {
+  const value = JSON.parse(localStorage.getItem('amux_offline_queue') || '[]');
+  if (!Array.isArray(value)) throw new Error('Pending changes need recovery: invalid queue');
+  return value;
 }
+function _outboxLock(name, work) {
+  if (!navigator.locks) return Promise.reject(new Error('Safe pending-change storage is unavailable in this browser; keep your draft and use a secure connection'));
+  return navigator.locks.request(name, work);
+}
+async function _mutateQueue(change) {
+  return _outboxLock('amux-outbox-storage', () => {
+    const current = _readQueue();
+    for (const entry of current) if (!entry.id) entry.id = crypto.randomUUID();
+    const result = change(current);
+    localStorage.setItem('amux_offline_queue', JSON.stringify(current));
+    offlineQueue = current;
+    if (typeof _idb !== 'undefined') _idb.set('offline_queue', current);
+    try { _peekMessagesBadge(); } catch (_) {}
+    try { if (_peekTab === 'messages') _peekMessagesRender(); } catch (_) {}
+    return result;
+  });
+}
+window.addEventListener('storage', event => {
+  if (event.key !== 'amux_offline_queue') return;
+  try { offlineQueue = _readQueue(); updateConnectionStatus(); _scheduleSyncRetry(); }
+  catch (error) { _writeError = error.message; updateConnectionStatus(); }
+});
 
 // ═══════ CONNECTION HISTORY ═══════
 // Log every connection-state transition (live ↔ polling ↔ offline) with a
@@ -983,7 +1015,7 @@ function _connEpisodes() {
       // the first as the second is what would let an old sleep keep posing as
       // an outage with a confident new label on it.
       if (!cur) cur = { start: e.ts, worst: e.to, hid: ('hid' in e) ? !!e.hid : null };
-      else if (e.to === 'offline') cur.worst = 'offline';
+      else if (['offline', 'auth', 'error'].includes(e.to)) cur.worst = e.to;
     } else if (cur) {
       cur.end = e.ts; eps.push(cur); cur = null;
     }
@@ -1006,7 +1038,7 @@ const _CONN_BLIP_MS = 5000;
 function _connEpisodeKind(ep, now) {
   const dur = (ep.end || now) - ep.start;
   if (ep.worst === 'offline' && ep.hid === true) return 'sleep';
-  if (ep.worst !== 'offline' && ep.end && dur < _CONN_BLIP_MS) return 'blip';
+  if (ep.worst === 'polling' && ep.end && dur < _CONN_BLIP_MS) return 'blip';
   return 'outage';
 }
 // _fmtDur lives once, further down. A second copy was declared here; the last
@@ -1080,8 +1112,8 @@ async function _runPing(n) {
 
 function showConnHistory() {
   const eps = _connEpisodes();
-  const stateLabel = { live: '● Live', polling: '● Polling', offline: '● Offline' }[_connState] || '● —';
-  const stateColor = { live: '#3fb950', polling: '#facc15', offline: '#f85149' }[_connState] || 'var(--dim)';
+  const stateLabel = { live: '● Live', polling: '● Polling', offline: '● Offline', auth: '● Access required', error: '● Sync error' }[_connState] || '● —';
+  const stateColor = { live: '#3fb950', polling: '#facc15', offline: '#f85149', auth: '#f85149', error: '#f85149' }[_connState] || 'var(--dim)';
   const _now = Date.now();
   const kinds = eps.map(ep => _connEpisodeKind(ep, _now));
   const blips = eps.filter((_, i) => kinds[i] === 'blip');
@@ -1099,7 +1131,9 @@ function showConnHistory() {
       const isOff = ep.worst === 'offline';
       const sleep = kind === 'sleep';
       const ico = sleep ? '🌙' : isOff ? '🔴' : '🟡';
-      const label = sleep ? 'Device asleep or app backgrounded'
+      const label = ep.worst === 'auth' ? 'Workspace access required'
+                  : ep.worst === 'error' ? 'Worker updates unavailable'
+                  : sleep ? 'Device asleep or app backgrounded'
                   : isOff ? 'Disconnected (offline)'
                   : 'Degraded to polling';
       const when = _fmtClock(ep.start) + ' → ' + (ongoing ? '<span style="color:' + (isOff ? '#f85149' : '#facc15') + '">ongoing</span>' : _fmtClock(ep.end));
@@ -1150,15 +1184,17 @@ function showConnHistory() {
 // ═══════ DEVICE NAME / CLOUD IDENTITY ═══════
 let _cloudEmail = '';
 let _localMemberEmail = '';
+let _localMemberScope = null;
+let _localMemberTeam = null;
 let _gatewayOrgs = [];
 
 async function _initIdentity() {
   try {
     const r = await fetch('/api/identity');
     if (r.status === 401) {
-      // 401 means we're behind the cloud gateway (local server never returns 401 here).
-      // Redirect to login — but not on self-hosted Tailscale/LAN hosts where 401 could
-      // be a transient network issue.
+      // A 401 is an authentication refusal, including on self-hosted remote
+      // browsers. The worker read owns the local access/recovery message; cloud
+      // gateways retain their existing login redirect.
       if (location.hostname.endsWith('.amux.io')) {
         window.location.replace('/api/cloud-logout');
       }
@@ -1168,6 +1204,8 @@ async function _initIdentity() {
     const d = await r.json();
     _cloudEmail = d.is_cloud ? (d.email || '') : '';
     _localMemberEmail = d.is_local_member ? (d.email || '') : '';
+    _localMemberScope = d.is_local_member ? (d.access_scope || {level:'global', name:''}) : null;
+    _localMemberTeam = d.is_local_member ? (d.team || null) : null;
     if (!d.has_api_key) {
       if (d.is_cloud) {
         // Blocking modal for cloud users — must set key before using the app
@@ -1183,6 +1221,12 @@ async function _initIdentity() {
       _showKeyWarning(d.key_error);
     }
     _applyIdentityToSettings();
+    // Settings can open before this async identity request returns. Refresh an
+    // already-open Team section so a scoped member never keeps the owner's
+    // controls from that brief pre-identity render.
+    if (document.getElementById('settings-menu')?.classList.contains('open')) {
+      loadTeamSection();
+    }
     if (_cloudEmail) {
       const lb = document.getElementById('logout-btn');
       if (lb) lb.style.display = '';
@@ -1919,13 +1963,21 @@ function describeOp(item) {
 // Connection status
 function updateConnectionStatus() {
   // Log the state transition (for the click-to-view disconnection history).
-  _recordConnState(!online ? 'offline' : (_liveSSE ? 'live' : 'polling'));
+  const readState = _sessionLoadError ? (_sessionLoadError.status === 401 ? 'auth' : 'error')
+    : (_writeError || _boardReadError || _syncReadError ? 'error' : null);
+  _recordConnState(readState || (!online ? 'offline' : (_liveSSE ? 'live' : 'polling')));
   // Update all connection status indicators (main + peek)
   document.querySelectorAll('#conn-status').forEach(el => {
-    if (!online) {
+    if (readState) {
+      el.className = 'conn-status offline';
+      el.textContent = readState === 'auth' ? 'Access required' : 'Sync error';
+    } else if (!online) {
       el.className = 'conn-status offline';
       const total = offlineQueue.length + drafts.length;
       el.textContent = total ? total + ' pending' : 'Offline';
+    } else if (offlineQueue.length) {
+      el.className = 'conn-status polling';
+      el.textContent = offlineQueue.length + ' pending';
     } else if (_liveSSE) {
       el.className = 'conn-status online';
       el.textContent = 'Live';
@@ -1934,13 +1986,19 @@ function updateConnectionStatus() {
       el.textContent = 'Polling';
     }
   });
+  const notice = document.getElementById('session-read-notice');
+  const noticeHTML = _sessionReadNotice();
+  if (notice && notice._noticeHTML !== noticeHTML) {
+    notice.innerHTML = noticeHTML;
+    notice._noticeHTML = noticeHTML;
+  }
   // Update offline banner
   const banner = document.getElementById('offline-banner');
   const ops = document.getElementById('offline-ops');
   const title = document.getElementById('offline-banner-title');
   if (!banner) return;
   const hasPending = offlineQueue.length || drafts.length;
-  if (online || !hasPending) {
+  if (!hasPending) {
     banner.classList.remove('active');
     return;
   }
@@ -1948,7 +2006,7 @@ function updateConnectionStatus() {
   const parts = [];
   if (drafts.length) parts.push(drafts.length + ' draft' + (drafts.length === 1 ? '' : 's'));
   if (offlineQueue.length) parts.push(offlineQueue.length + ' op' + (offlineQueue.length === 1 ? '' : 's'));
-  title.innerHTML = '&#x26A0; Offline &mdash; ' + parts.join(', ') + ' pending';
+  title.innerHTML = '&#x26A0; ' + (online ? 'Unsaved changes' : 'Offline') + ' &mdash; ' + parts.join(', ') + ' pending';
   const rows = [];
   drafts.forEach(d => {
     rows.push('<div class="offline-op">' +
@@ -1960,7 +2018,7 @@ function updateConnectionStatus() {
     const age = Math.floor((Date.now() - item.timestamp) / 60000);
     const timeStr = age < 1 ? 'just now' : age + 'm ago';
     rows.push('<div class="offline-op">' +
-      '<span class="op-action">' + esc(describeOp(item)) + '</span>' +
+      '<span class="op-action">' + esc(describeOp(item)) + (item.error ? ' — ' + esc(item.error) : '') + '</span>' +
       '<span class="op-time">' + timeStr + '</span>' +
     '</div>');
   });
@@ -2138,33 +2196,30 @@ function setOnline(val) {
 }
 
 // ═══════ SYNC BANNER ORCHESTRATOR ═══════
-async function runSyncBanner() {
+function _scheduleSyncRetry() {
+  clearTimeout(_syncRetryTimer);
+  if (offlineQueue.some(q => q.state !== 'blocked') || drafts.length) {
+    _syncRetryTimer = setTimeout(() => { if (online) runSyncBanner(); else _scheduleSyncRetry(); }, 15000);
+  }
+}
+function runSyncBanner() {
+  if (_syncFlight) return _syncFlight;
+  const run = async () => { await _mutateQueue(() => {}); return _runSyncBanner(); };
+  _syncFlight = (navigator.locks
+    ? navigator.locks.request('amux-outbox-replay', run) : run())
+    .catch(e => { _writeError = String(e.message || e); showToast('Sync failed: ' + _writeError); })
+    .finally(() => { _syncFlight = null; updateConnectionStatus(); _scheduleSyncRetry(); });
+  return _syncFlight;
+}
+async function _runSyncBanner() {
   const banner = document.getElementById('sync-banner');
   const itemsEl = document.getElementById('sync-items');
   const titleEl = document.getElementById('sync-title-text');
   const draftCount = drafts.length;
-  const rawQueue = [...offlineQueue];
-  offlineQueue = [];
-  saveQueue();
-  let queue = reconcileQueue(rawQueue);
-  // Drop anything unreplayable that a PREVIOUS client version persisted — the
-  // pre-2026-08-11 apiCall queued GETs (and FormData bodies) that no replay
-  // can honestly re-issue. This is the half of the fix that reaches users who
-  // already have a poisoned localStorage: the enqueue guard stops new ones,
-  // this clears the ones already on disk. Beacons from HERE are the reliable
-  // signal, because replay only ever runs while online.
-  const unreplayable = queue.filter(q => !_outboxQueueable(q.url, q.options || {}));
-  if (unreplayable.length) {
-    queue = queue.filter(q => _outboxQueueable(q.url, q.options || {}));
-    try {
-      amuxTrack('outbox_unreplayable_dropped', {
-        n: unreplayable.length,
-        sample: unreplayable.slice(0, 5).map(q =>
-          ((q.options && q.options.method) || 'GET') + ' ' + String(q.url).split('?')[0]).join(', '),
-      });
-    } catch (e) {}
-  }
-  const skipped = rawQueue.length - queue.length;
+  // Keep every operation durable until its individual acknowledgement. A
+  // reload, timeout, or second replay must never erase an in-flight write.
+  const queue = offlineQueue.filter(q => q.state !== 'blocked' && !_outboxActive.has(q.id));
+  const skipped = 0;
   const totalOps = draftCount + queue.length;
   if (!totalOps) return;
 
@@ -2186,33 +2241,21 @@ async function runSyncBanner() {
   renderBanner();
   banner.classList.add('active');
 
-  // Sync drafts first
+  // A draft is a sequence of accepted writes. Keep its completed steps and
+  // prompt identity across failure/reload; never call a failed start "synced".
   for (const item of items.filter(i => i.type === 'draft')) {
-    item.status = 'running';
-    renderBanner();
+    item.status = 'running'; renderBanner();
     try {
-      const draft = item.draft;
-      draft.syncing = true; saveDrafts(); render();
-      const createResp = await _origFetch(API + '/api/sessions', {
-        method: 'POST', headers: _authHeaders({'Content-Type':'application/json'}),
-        body: JSON.stringify({ name: draft.name, dir: draft.dir })
-      });
-      if (!createResp.ok && createResp.status !== 409) {
-        item.status = 'failed'; draft.syncing = false; saveDrafts(); renderBanner(); continue;
-      }
-      await _applyYoloDefault(draft.name);   // YOLO-by-default applies to synced drafts too
-      const startResp = await _origFetch(API + '/api/sessions/' + encodeURIComponent(draft.name) + '/start', { method: 'POST', headers: _authHeaders() });
-      if (draft.prompt && startResp.ok) {
-        await new Promise(r => setTimeout(r, 5000));
-        await _origFetch(API + '/api/sessions/' + encodeURIComponent(draft.name) + '/send', {
-          method: 'POST', headers: _authHeaders({'Content-Type':'application/json'}),
-          body: JSON.stringify({ text: draft.prompt })
-        });
-      }
-      removeDraft(draft.name); render();
+      await _syncOneDraft(item.draft);
+      removeDraft(item.draft.name); render();
       item.status = 'done';
-    } catch(e) {
-      item.status = 'failed'; item.draft.syncing = false; saveDrafts();
+    } catch (error) {
+      item.status = 'failed'; item.draft.syncing = false;
+      item.draft.error = String(error.message || error);
+      item.label += ' — ' + item.draft.error;
+      _writeError = item.draft.error;
+      saveDrafts();
+      try { amuxTrack('outbox_draft_failed', {session:item.draft.name, error:item.draft.error}); } catch (_) {}
     }
     renderBanner();
   }
@@ -2220,26 +2263,51 @@ async function runSyncBanner() {
   // Then replay queue items — via _origFetch so the outbox interceptor can't
   // re-capture its own replay (double-queue), with auth headers applied FRESH
   // (they were not stamped at queue time, and a stale token would 401).
+  const failedResources = new Set();
   for (const item of items.filter(i => i.type === 'queue')) {
+    const q = item.item;
+    if (failedResources.has(q.url)) { item.status = 'failed'; continue; }
     item.status = 'running';
     renderBanner();
+    await _outboxLock('amux-outbox-delivery:' + q.id, async () => {
+    const fresh = _readQueue().find(entry => entry.id === q.id);
+    if (!fresh) { offlineQueue = _readQueue(); item.status = 'done'; return; }
+    Object.assign(q, fresh);
+    if (q.state === 'blocked') { item.status = 'failed'; return; }
     try {
-      const opts = { ...item.item.options, headers: _authHeaders(item.item.options.headers) };
-      const r = await _origFetch(item.item.url, opts);
-      if (r.status >= 500 || r.status === 401 || r.status === 408 || r.status === 429) {
-        offlineQueue.push(item.item); item.status = 'failed';   // transient — keep for next sync
-      } else if (!r.ok) {
-        item.status = 'failed';   // permanent 4xx — surface it, but don't retry forever
-      } else {
-        item.status = 'done';
+      if (!_outboxQueueable(q.url, q.options || {}) || (q.timestamp && Date.now() - (q.reviewed_at || q.timestamp) > 7 * 86400000)) {
+        q.state = 'blocked';
+        throw new Error('Needs review before retry: expired or unsupported operation');
       }
+      const opts = { ...q.options, headers: _authHeaders(q.options.headers) };
+      const r = await _boundedMutationFetch(q.url, opts);
+      if (!r.ok) {
+        if (!(r.status >= 500 || [401, 408, 429].includes(r.status))) q.state = 'blocked';
+        throw new Error(await _apiErrText(r));
+      }
+      if (/\/api\/board\/[^/?]+$/.test(q.url) && (q.options.method || '').toUpperCase() === 'PATCH') {
+        const acknowledged = await r.clone().json();
+        _validateBoardAcknowledgement(acknowledged, q.url);
+        _outboxBoardAcknowledged(acknowledged);
+      }
+      await _mutateQueue(current => { const at = current.findIndex(entry => entry.id === q.id); if (at >= 0) current.splice(at, 1); });
+      item.status = 'done';
     } catch(e) {
-      offlineQueue.push(item.item); item.status = 'failed';
+      if (e.outboxBlocked) q.state = 'blocked';
+      q.error = String(e.message || e);
+      q.attempts = (q.attempts || 0) + 1;
+      _writeError = q.error;
+      await _mutateQueue(current => { const saved = current.find(entry => entry.id === q.id); if (saved) Object.assign(saved, {state: q.state, error: q.error, attempts: q.attempts}); });
+      failedResources.add(q.url);
+      item.status = 'failed';
+      item.label += ' — ' + q.error;
+      try { amuxTrack('outbox_retry_failed', {id: q.id, status: q.state || 'pending', error: q.error}); } catch (_) {}
     }
+    });
     renderBanner();
   }
+  if (!offlineQueue.length && !drafts.length) _writeError = '';
 
-  if (offlineQueue.length) saveQueue();
   const doneCount = items.filter(i => i.status === 'done').length;
   const failCount = items.filter(i => i.status === 'failed').length;
   titleEl.textContent = doneCount + ' synced' + (failCount ? ', ' + failCount + ' failed' : '') + (skipped ? ', ' + skipped + ' skipped' : '');
@@ -2254,6 +2322,39 @@ async function runSyncBanner() {
   if (!failCount) setTimeout(() => banner.classList.remove('active'), 4000);
 }
 
+async function _syncOneDraft(draft) {
+  draft.syncing = true; saveDrafts(); render();
+  const root = API + '/api/sessions/' + encodeURIComponent(draft.name);
+  if (!draft.synced_create) {
+    const created = await _boundedMutationFetch(API + '/api/sessions', {
+      method:'POST', headers:_authHeaders({'Content-Type':'application/json'}),
+      body:JSON.stringify({name:draft.name, dir:draft.dir}),
+    });
+    if (!created.ok) throw new Error('Create worker: ' + await _apiErrText(created));
+    draft.synced_create = true; saveDrafts();
+    await _applyYoloDefault(draft.name);
+  }
+  if (!draft.synced_start) {
+    const started = await _boundedMutationFetch(root + '/start', {method:'POST', headers:_authHeaders()});
+    if (!started.ok) throw new Error('Start worker: ' + await _apiErrText(started));
+    draft.synced_start = true; saveDrafts();
+  }
+  if (draft.prompt) {
+    if (!draft.msg_id) { draft.msg_id = crypto.randomUUID(); saveDrafts(); }
+    const sent = await _boundedMutationFetch(root + '/send', {
+      method:'POST', headers:_authHeaders({'Content-Type':'application/json'}),
+      body:JSON.stringify({text:draft.prompt, msg_id:draft.msg_id}),
+    });
+    if (!sent.ok) throw new Error('Send prompt: ' + await _apiErrText(sent));
+  }
+}
+
+async function _removeQueuedOperation(id) {
+  await _mutateQueue(current => { const at = current.findIndex(q => q.id === id); if (at >= 0) current.splice(at, 1); });
+  if (!offlineQueue.length && !drafts.length) _writeError = '';
+  updateConnectionStatus(); showQueueModal();
+}
+
 // Queue modal
 function showQueueModal() {
   const el = document.getElementById('queue-list');
@@ -2264,6 +2365,8 @@ function showQueueModal() {
       '<div class="queue-item">' +
         esc(describeOp(item)) +
         '<br><span class="queue-time">' + new Date(item.timestamp).toLocaleTimeString() + '</span>' +
+        (item.error ? '<div class="queue-error">' + esc(item.error) + '</div>' : '') +
+        '<button class="btn" onclick="_removeQueuedOperation(\'' + escJs(item.id) + '\')">Discard this queued change</button>' +
       '</div>'
     ).join('');
   }
@@ -2272,9 +2375,9 @@ function showQueueModal() {
 function closeQueueModal() {
   document.getElementById('queue-overlay').classList.remove('active');
 }
-function clearQueue() {
-  offlineQueue = [];
-  saveQueue();
+async function clearQueue() {
+  await _mutateQueue(current => { current.length = 0; });
+  _writeError = '';
   updateConnectionStatus();
   closeQueueModal();
   showToast('Queue cleared');
@@ -2282,6 +2385,7 @@ function clearQueue() {
 async function forceRetry() {
   closeQueueModal();
   if (!offlineQueue.length && !drafts.length) return;
+  await _mutateQueue(current => current.forEach(q => { q.state = 'pending'; q.reviewed_at = Date.now(); }));
   if (online) { runSyncBanner(); } else { setOnline(true); }
 }
 
@@ -2355,7 +2459,7 @@ function _warnIgnoredFields(r, url, options) {
 
 async function apiCall(url, options) {
   if (!online) {
-    _queueOp(url, options);
+    await _queueOp(url, options);
     return null;
   }
   try {
@@ -2387,7 +2491,8 @@ async function apiCall(url, options) {
     // The GET paths (fetchSessions, the status poll) reset unconditionally and
     // correctly: the outbox only intercepts POST/PATCH/PUT/DELETE, so a
     // successful GET really did reach the server.
-    if (!_isLocallyQueued(r)) consecutiveFailures = 0;
+    if (_isLocallyQueued(r)) return null;
+    consecutiveFailures = 0;
     // No _warnIgnoredFields call here: apiCall goes through fetch, which the
     // watch at the top of this file already wraps. Calling it here too would
     // toast twice for every apiCall mutation.
@@ -2398,11 +2503,11 @@ async function apiCall(url, options) {
     consecutiveFailures++;
     if (consecutiveFailures >= 2) setOnline(false);
     amuxTrack('api_unreachable', { url: url.split('?')[0], err: String(e).slice(0, 200) });
-    _queueOp(url, options);
+    await _queueOp(url, options);
     return null;
   }
 }
-function _queueOp(url, options) {
+async function _queueOp(url, options) {
   // THE SINGLE ENFORCEMENT POINT for what may enter the outbox.
   //
   // There are two independent queuing paths — apiCall's `!online` branch and
@@ -2431,11 +2536,6 @@ function _queueOp(url, options) {
     } catch (e) {}
     return false;
   }
-  // Cap the outbox so localStorage can't overflow — oldest ops drop first
-  if (offlineQueue.length >= 200) {
-    offlineQueue.shift();
-    showToast('Offline queue full — oldest operation dropped');
-  }
   let body = options.body;
   // Sends/steers dedup server-side on msg_id — make sure every queued one has
   // it, so a replay after a lost response can't deliver the message twice.
@@ -2448,22 +2548,30 @@ function _queueOp(url, options) {
       }
     } catch (e) {}
   }
-  offlineQueue.push({ url, options: { method: options.method, headers: options.headers, body }, timestamp: Date.now() });
-  saveQueue();
+  const entry = { id: options._outboxId || crypto.randomUUID(), url, options: { method: options.method, headers: options.headers, body }, timestamp: Date.now(), state: 'pending' };
+  try {
+    await _mutateQueue(current => {
+      if (current.some(q => q.id === entry.id)) return;
+      if (current.length >= 200) throw new Error('Queue full — this change was not queued; keep the draft');
+      current.push(entry);
+    });
+  } catch (e) {
+    _writeError = e.name === 'QuotaExceededError'
+      ? 'Device storage full — change is not safely queued; keep the draft' : e.message;
+    showToast(_writeError); updateConnectionStatus();
+    try { amuxTrack('outbox_storage_failed', {error: _writeError}); } catch (_) {}
+    return false;
+  }
+  _scheduleSyncRetry();
   updateConnectionStatus();
-  showToast('Queued (' + offlineQueue.length + ' pending)');
+  if (!options._outboxId) showToast('Queued (' + offlineQueue.length + ' pending)');
   return true;
 }
 
 // ═══════ GLOBAL OFFLINE OUTBOX — fetch interceptor ═══════
-// Dozens of call sites issue raw fetch() mutations; offline they used to just
-// throw and the command was LOST. This wrapper implements the outbox pattern
-// at the fetch boundary so every API command flows through offline sync
-// without touching call sites. PASSIVE by design: while online it delegates
-// straight to the native fetch (zero behavioral change); only a request that
-// would otherwise fail (offline, or the network throws) gets captured into
-// the queue, and the caller receives a synthetic 202 {queued:true} so UI
-// code treats it as accepted rather than crashed.
+// Board edits persist before transmission. Transient failures keep the same
+// intent for retry; only a real acknowledgement removes it. A marked local
+// 202 means queued, and callers must not present it as saved or delivered.
 const _origFetch = window.fetch.bind(window);
 // Never queue interactive/ephemeral endpoints: telemetry, speed tests, live
 // terminal keystrokes, uploads (bodies too big for localStorage), login and
@@ -2513,14 +2621,80 @@ function _isLocallyQueued(r) {
   try { return !!(r && r.status === 202 && r.headers && r.headers.get('X-Amux-Outbox') === 'queued'); }
   catch (e) { return false; }
 }
-window.fetch = function(input, init) {
+function _outboxRequestOptions(url, init) {
+  // Assign the server's deduplication key before the FIRST attempt. Creating
+  // it only after a lost response makes the retry a second message.
+  if (typeof init?.body !== 'string' || !/\/(send|steer)$/.test(url.split('?')[0])) return init;
+  try {
+    const body = JSON.parse(init.body);
+    if (body.msg_id) return init;
+    return { ...init, body: JSON.stringify({ ...body, msg_id: crypto.randomUUID() }) };
+  } catch (_) { return init; }
+}
+function _validateBoardAcknowledgement(card, url) {
+  if (card?.id !== decodeURIComponent(url.split('/').pop())) throw Object.assign(new Error('Server did not acknowledge the exact card'), {outboxBlocked:true});
+  if (card.ignored_fields?.length) throw Object.assign(new Error('Not saved: server ignored ' + card.ignored_fields.join(', ')), {outboxBlocked:true});
+}
+function _outboxBoardAcknowledged(card) {
+  const draft = _boardDrafts[card.id];
+  if (draft && !_bdDraftHasActiveEdits(draft, card) && (!draft.status || draft.status === card.status)) {
+    delete _boardDrafts[card.id];
+    _boardDraftsPersist();
+  }
+}
+async function _boundedMutationFetch(input, init) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  const signal = init && init.signal
+    ? AbortSignal.any([init.signal, controller.signal]) : controller.signal;
+  try {
+    const response = await _origFetch(input, { ...init, signal });
+    const bytes = await response.arrayBuffer();
+    return new Response([204, 205, 304].includes(response.status) ? null : bytes, {status: response.status, statusText: response.statusText, headers: response.headers});
+  } finally { clearTimeout(timer); }
+}
+window.fetch = async function(input, init) {
   const url = typeof input === 'string' ? input : (input && input.url) || '';
   if (!_outboxQueueable(url, init)) return _origFetch(input, init);
+  init = _outboxRequestOptions(url, init);
   if (!online) {
-    _queueOp(url, init || {});
-    return Promise.resolve(_outboxAccepted());
+    return Promise.resolve(await _queueOp(url, init || {}) ? _outboxAccepted() : new Response('Queue unavailable', {status: 507}));
   }
-  return _origFetch(input, init).catch(e => {
+  const durableId = /\/api\/board\/[^/?]+$/.test(url) && (init?.method || '').toUpperCase() === 'PATCH' ? crypto.randomUUID() : null;
+  const deliver = async () => {
+  if (durableId) {
+    init = { ...init, _outboxId: durableId };
+    if (!await _queueOp(url, init)) return Promise.resolve(new Response('Queue unavailable', {status: 507}));
+    _outboxActive.add(durableId);
+  }
+  return _boundedMutationFetch(input, init).then(async r => {
+    if (r.status >= 500 || [401, 408, 429].includes(r.status)) {
+      _writeError = 'Server did not save the change (' + r.status + ')';
+      if (await _queueOp(url, init || {})) return _outboxAccepted();
+    }
+    if (durableId) {
+      const q = offlineQueue.find(q => q.id === durableId);
+      if (r.ok) {
+        const acknowledged = await r.clone().json();
+        _validateBoardAcknowledgement(acknowledged, url);
+        await _mutateQueue(current => { const at = current.findIndex(q => q.id === durableId); if (at >= 0) current.splice(at, 1); });
+        if (!offlineQueue.length && !drafts.length) _writeError = '';
+      } else if (q) {
+        q.state = 'blocked'; q.error = 'Not saved (' + r.status + ') — review this change before retry';
+        _writeError = q.error;
+        await _mutateQueue(current => { const saved = current.find(q => q.id === durableId); if (saved) Object.assign(saved, {state: q.state, error: q.error}); });
+      }
+      updateConnectionStatus();
+    }
+    return r;
+  }).catch(async e => {
+    if (durableId && e.outboxBlocked) {
+      _writeError = e.message;
+      await _mutateQueue(current => { const q = current.find(q => q.id === durableId); if (q) Object.assign(q, {state:'blocked', error:e.message}); });
+      updateConnectionStatus();
+      try { amuxTrack('outbox_acknowledgement_refused', {id:durableId, error:e.message}); } catch (_) {}
+      return new Response(e.message, {status:409});
+    }
     consecutiveFailures++;
     if (consecutiveFailures >= 2) setOnline(false);
     // BEACON — this path queues the op and returns a synthetic 202, so the
@@ -2538,9 +2712,11 @@ window.fetch = function(input, init) {
         err: String(e).slice(0, 200),
       });
     } catch (_) {}
-    _queueOp(url, init || {});
-    return _outboxAccepted();
-  });
+    _writeError = 'Server unreachable; changes are pending';
+    return await _queueOp(url, init || {}) ? _outboxAccepted() : new Response('Queue unavailable', {status: 507});
+  }).finally(() => { if (durableId) _outboxActive.delete(durableId); });
+  };
+  return durableId ? _outboxLock('amux-outbox-delivery:' + durableId, deliver) : deliver();
 };
 
 // Reconcile queue: remove contradictory/stale operations before replay
@@ -2922,7 +3098,10 @@ function _checkSessionTransitions(newData) {
     const statusChanged = s.status !== prev.status;
     const stoppedNow = prev.running && !s.running;
     if (statusChanged) {
-      if (s.status === 'waiting') {
+      if (s.status === 'blocked') {
+        _fireSessionNotif(s.name, s.name + ' blocked on permission', s.task_name || 'Waiting on a permission dialog');
+        amuxTrack('session_blocked', { session: s.name, task: s.task_name || '' });
+      } else if (s.status === 'waiting') {
         _fireSessionNotif(s.name, s.name + ' needs input', s.task_name || 'Waiting for a response');
         amuxTrack('session_waiting', { session: s.name, task: s.task_name || '', auto_continue: !!s.auto_continue });
       } else if (s.status === 'active' && prev.status !== 'active') {
@@ -2943,7 +3122,8 @@ function _checkSessionTransitions(newData) {
 // on every API call and can never heal on its own — the fresh token lives in
 // the fresh shell. Nudge the SW and reload ONCE per session (rate-limited like
 // the version-mismatch reload; a broken SW must not cause a storm).
-function _staleShellRecover() {
+let _authRecoveryAttempted = false;
+async function _staleShellRecover() {
   // AF-639: a reload heals only the case this function was written for, a
   // SW-cached shell carrying a rotated-away token, where the fresh shell does
   // bring a fresh one. When the server withheld the bearer deliberately the
@@ -2952,17 +3132,109 @@ function _staleShellRecover() {
   // 2026-09-09: one laptop sat in this state for 22.5 hours and 28,355 401s,
   // showing a dashboard that looked fine because it was rendering its cache.
   if (_authWithheld) { _amuxAuthWithheldBanner(); return; }
+  if (_authRecoveryAttempted) return;
+  _authRecoveryAttempted = true;
+  // A SW update alone reuses the cached anonymous shell within the same app
+  // version. Ask the server for its actual bootstrap, under the existing owner
+  // or member cookie rules. Never evaluate returned HTML or mint credentials.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
   try {
-    const last = parseInt(sessionStorage.getItem('amux_401_reload') || '0');
-    if (Date.now() - last < 600000) return;
+    const r = await fetch('/?_fresh=auth', { cache: 'no-store', signal: controller.signal });
+    if (!r.ok) return;
+    const html = await r.text();
+    const block = html.match(/<!-- AMUX-BOOTSTRAP-BEGIN[\s\S]*?<!-- AMUX-BOOTSTRAP-END -->/);
+    const match = block && block[0].match(/window\._AMUX_AUTH_TOKEN=("(?:\\.|[^"\\])*")/);
+    const token = match ? JSON.parse(match[1]) : '';
+    // Reload only if the server supplied a DIFFERENT owner credential. A
+    // missing/revoked login cannot be repaired by repeated cache clears.
+    if (!token || token === _authToken) return;
+    const last = Number(sessionStorage.getItem('amux_401_reload') || '0');
+    if (Date.now() - last < 60000) return;
     sessionStorage.setItem('amux_401_reload', String(Date.now()));
-    console.warn('amux: API 401 with this shell’s token — refreshing the shell');
-    const upd = (navigator.serviceWorker && navigator.serviceWorker.getRegistration)
-      ? navigator.serviceWorker.getRegistration().then(r => r && r.update()).catch(() => {})
-      : Promise.resolve();
-    upd.finally ? upd.finally(() => setTimeout(() => location.reload(), 1500))
-                : setTimeout(() => location.reload(), 1500);
-  } catch (e) {}
+    // Reload the full bootstrap so its UI guard rotates with the bearer.
+    // _fresh bypasses the SW's canonical '/' cache; preserve the user's view.
+    location.replace('/?_fresh=auth' + location.hash);
+  } catch (_) {
+    // The original 401 remains visible. Failure to fetch recovery HTML is not
+    // evidence that the access problem was repaired.
+  } finally { clearTimeout(timeout); }
+}
+
+function _sessionReadFailed(status, reason) {
+  const allowed = ['missing_credential', 'invalid_bearer', 'unverified_member_cookie',
+    'invalid_owner_session', 'owner_session_requires_bootstrap', 'unauthorized',
+    'http_error', 'invalid_json', 'invalid_payload', 'network_error'];
+  reason = allowed.includes(reason) ? reason : (status === 401 ? 'unauthorized' : 'http_error');
+  const changed = !_sessionLoadError || _sessionLoadError.status !== status || _sessionLoadError.reason !== reason;
+  _sessionLoadError = { status, reason };
+  if (changed) {
+    // No URL query, token, response body, or user content. Keep the latest
+    // failure across a bootstrap reload and deliver it after access recovers.
+    const incident = { kind: 'session-load-failure', measured: true, n_considered: 1,
+      status, reason, app_ver: APP_VER, had_data: !!lastSessionsJSON,
+      bearer_present: !!_authToken, ts: Date.now() };
+    console.warn('amux: session read failed', incident);
+    try { sessionStorage.setItem('amux_session_load_failure', JSON.stringify(incident)); } catch (_) {}
+  }
+  // A transient server overload used to leave this banner pinned forever.
+  // HTTP failures do not trip fetch's catch branch, and an otherwise-healthy
+  // SSE stream may never emit another sessions invalidation, so the only
+  // recovery path was the human clicking Retry even after the server was
+  // healthy again. Auth failures require a new credential; every other read
+  // failure retries automatically with bounded backoff.
+  if (status !== 401) _scheduleSessionReadRetry();
+  // Arm recovery before entering the large renderer. Even if an unrelated
+  // view-specific render path throws after painting the banner, the transport
+  // still gets a chance to heal itself.
+  updateConnectionStatus();
+  render();
+}
+
+function _sessionReadRecovered() {
+  const changed = !!_sessionLoadError;
+  _sessionLoadError = null;
+  _sessionRetryAttempt = 0;
+  clearTimeout(_sessionRetryTimer);
+  _sessionRetryTimer = null;
+  updateConnectionStatus();
+  if (changed) render();
+  // A 401 also rejects client-debug, so do not hammer it while unauthorized.
+  // The server records each refusal; this delayed beacon adds browser context.
+  try {
+    const saved = sessionStorage.getItem('amux_session_load_failure');
+    if (saved) {
+      sessionStorage.removeItem('amux_session_load_failure');
+      const d = JSON.parse(saved);
+      fetch('/api/client-debug', { method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ ...d, recovered_at: Date.now() }) }).then(r => {
+          if (!r.ok) sessionStorage.setItem('amux_session_load_failure', saved);
+        }).catch(() => { try { sessionStorage.setItem('amux_session_load_failure', saved); } catch (_) {} });
+    }
+  } catch (_) {}
+}
+
+function _retrySessionRead() {
+  _authRecoveryAttempted = false;
+  _sessionRetryAttempt = 0;
+  clearTimeout(_sessionRetryTimer);
+  _sessionRetryTimer = null;
+  fetchSessions();
+}
+
+function _sessionReadNotice() {
+  if (!_sessionLoadError) return '';
+  const auth = _sessionLoadError.status === 401;
+  return '<div class="session-read-notice" role="alert"><strong>'
+    + (auth ? 'Access to this workspace needs to be renewed' : 'Worker updates are unavailable')
+    + '</strong><p>' + (auth
+      ? 'Open your owner access link, or ask the workspace owner for a new invite.'
+      : 'The worker list could not be loaded. Please retry in a moment.')
+    + (sessions.length ? ' The workers shown below are the last saved copy.' : '')
+    + '</p><button type="button" class="btn" onclick="_retrySessionRead()">Retry connection</button>'
+    + '<details><summary>Connection details</summary><code>GET /api/sessions · '
+    + (_sessionLoadError.status ? 'HTTP ' + _sessionLoadError.status : 'Network error')
+    + ' · ' + esc(_sessionLoadError.reason) + '</code></details></div>';
 }
 
 // AF-639. The honest end state for a browser the server will not bootstrap:
@@ -3014,7 +3286,28 @@ function _amuxAuthWithheldBanner() {
 }
 
 let _sessEtag = null;
-async function fetchSessions() {
+let _sessionFetchInFlight = null;
+let _sessionRetryTimer = null;
+let _sessionRetryAttempt = 0;
+function _scheduleSessionReadRetry() {
+  if (_sessionRetryTimer) return;
+  const delay = Math.min(1000 * Math.pow(2, _sessionRetryAttempt++), 10000);
+  _sessionRetryTimer = setTimeout(() => {
+    _sessionRetryTimer = null;
+    fetchSessions();
+  }, delay);
+}
+function fetchSessions() {
+  // Focus, SSE invalidation, reconnect and the fallback poll can all ask for
+  // the same list at once. One browser tab should never contribute its own
+  // request stampede during the exact recovery window it is trying to heal.
+  if (_sessionFetchInFlight) return _sessionFetchInFlight;
+  _sessionFetchInFlight = _fetchSessionsOnce().finally(() => {
+    _sessionFetchInFlight = null;
+  });
+  return _sessionFetchInFlight;
+}
+async function _fetchSessionsOnce() {
   const snapshotEpoch = _sessionsSnapshotEpoch;
   try {
     // AMUX-3504: conditional fetch — the server hashes the (now byte-stable)
@@ -3025,24 +3318,35 @@ async function fetchSessions() {
       consecutiveFailures = 0;
       _lastDataTime = Date.now();
       if (!online) setOnline(true);
+      _sessionReadRecovered();
       return;
     }
-    _sessEtag = r.headers.get('ETag') || null;
-    const data = await r.json();
+    if (!r.ok) {
+      const error = await r.json().catch(() => ({}));
+      _sessionReadFailed(r.status, error?.reason || (r.status === 401 ? 'unauthorized' : 'http_error'));
+      if (r.status === 401) _staleShellRecover();
+      return;
+    }
+    let data;
+    try { data = await r.json(); }
+    catch (_) { _sessionReadFailed(r.status, 'invalid_json'); return; }
     // Same guard as fetchBoard (live crash 2026-08-09): a 401 error object
     // must not become `sessions` — every card render maps over it.
     if (!Array.isArray(data)) {
-      if (r.status === 401) _staleShellRecover();
-      console.warn('sessions fetch returned non-array (status ' + r.status + ') — keeping previous set');
+      _sessionReadFailed(r.status, 'invalid_payload');
       return;
     }
     if (snapshotEpoch !== _sessionsSnapshotEpoch) {
       console.info('sessions poll completed behind a newer stream snapshot; discarded');
       return;
     }
+    _sessEtag = r.headers.get('ETag') || null;
     consecutiveFailures = 0;
     _lastDataTime = Date.now();
-    if (_initialLoad) { _initialLoad = false; }
+    const firstLoad = _initialLoad;
+    _initialLoad = false;
+    _sessionReadRecovered();
+    if (firstLoad) render();
     if (!online) setOnline(true);
     const j = JSON.stringify(data);
     if (j !== lastSessionsJSON) {
@@ -3066,7 +3370,7 @@ async function fetchSessions() {
       if (!window._peekEmbed) _fetchGitBranches(sessions);
     }
   } catch(e) {
-    console.error('fetch workers:', e);
+    _sessionReadFailed(0, 'network_error');
     consecutiveFailures++;
     if (consecutiveFailures >= 2 || navigator.onLine === false) {
       setOnline(false);
@@ -3226,6 +3530,7 @@ function updatePeekStatus() {
     : '<span class="status-badge active">working</span>' + _agentsChip(s)
       + (runtimeBoard.cardless ? _runtimeBoardCardlessBadge() : '');
   else if (s.status === 'unattributed') badge = _runtimeBoardSplitBadge(s);
+  else if (s.status === 'blocked') badge = '<span class="status-badge blocked" title="Agent is waiting on a permission decision. Do not send automated messages.">blocked</span>';
   else if (s.status === 'waiting') badge = '<span class="status-badge waiting"' + _waitingTitle(s) + '>' + _waitingLabel(s) + '</span>';
   else if (s.status === 'rate_limited') badge = '<span class="status-badge rate-limited">rate limited</span>';
   else if (s.status === 'api_error') badge = `<span class="status-badge rate-limited" title="API Error ${esc(s.api_error_code || '5xx')} — server-side and retryable. Send &quot;continue&quot;.">API ${esc(s.api_error_code || '5xx')}</span>`;
@@ -3424,8 +3729,11 @@ function _runtimeBoardSplitBadge(s) {
   const observed = truth.observed_card_id ? ' Observed ' + esc(truth.observed_card_id) + '.' : '';
   const isRunning = truth.runtime_status === 'active';
   if (verdict === 'active-conflicting-claims') {
-    return '<span class="status-badge rate-limited" title="This running worker has more than one live task claim, so AMUX will not guess.'
-      + observed + ' Diagnostic: ' + esc(verdict) + '.">card conflict</span>';
+    // Competing claims are harness bookkeeping, not a human decision. The
+    // board driver gives the full set back to the model to reconcile; keep the
+    // operator-facing state about execution instead of inventing a red status.
+    return '<span class="status-badge active" title="Working while AMUX automatically reconciles multiple live task claims.'
+      + observed + ' Diagnostic: ' + esc(verdict) + '.">working</span>';
   }
   if (isRunning) {
     return '<span class="status-badge active" title="Running. Board link: ' + esc(verdict) + '.'
@@ -3737,7 +4045,9 @@ function render() {
   if (stripEl && stripEl.innerHTML) { stripEl.innerHTML = ''; stripEl._want = ''; }
   const _nonArchivedCount = sessions.filter(s => !s.archived).length;
   if (!_nonArchivedCount && !drafts.length) {
-    if (_initialLoad) {
+    if (_sessionLoadError) {
+      el.innerHTML = ''; // The actionable failure is in #session-read-notice.
+    } else if (_initialLoad) {
       // A SPINNER THAT NEVER RESOLVES IS A LIE (amux-cloud, AC-275, 2026-08-06).
       // _initialLoad clears on ANY successful /api/sessions fetch, empty list
       // included — so a spinner still showing means the fetch never COMPLETED,
@@ -3867,6 +4177,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
               rate_limited_until is set it is the true state and it supersedes
               the status badge outright (AMUX-2566). */ ''}          ${s.rate_limited_until ? '' : `${s.status === 'rate_limited' ? '<span class="status-badge rate-limited" title="Hit a usage limit (on credits or waiting for reset)">rate limited</span>' : ''}${s.status === 'active' ? (runtimeBoard.syncing ? _runtimeBoardSyncBadge() : '<span class="status-badge active">working</span>' + _agentsChip(s) + (runtimeBoard.cardless ? _runtimeBoardCardlessBadge() : '')) : ''}
           ${s.status === 'unattributed' ? _runtimeBoardSplitBadge(s) : ''}
+          ${s.status === 'blocked' ? '<span class="status-badge blocked" title="Agent is waiting on a permission decision. Do not send automated messages.">blocked</span>' : ''}
           ${s.status === 'waiting' ? `<span class="status-badge waiting"${_waitingTitle(s)}>${_waitingLabel(s)}</span>${_stalledFor(s)}` : ''}
           ${s.status === 'idle' ? '<span class="status-badge idle">idle</span>' : ''}`}
           ${s.rate_limited_until ? `<span class="status-badge rate-limited" title="${s.rate_limit_weekly ? 'Weekly limit' : 'Rate-limited'} — auto-resume at ${_fmtResetTime(s.rate_limited_until)}">${s.rate_limit_weekly ? 'Weekly limit until' : 'Rate-limited until'} ${_fmtResetTime(s.rate_limited_until)}</span>` : ''}
@@ -6509,6 +6820,7 @@ async function doSend(name, text) {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: sendBody
     });
+    if (_isLocallyQueued(r)) return 'queued';
     if (r.ok) return 'sent';
     if (r.status === 409) {
       const d = await r.json().catch(() => ({}));
@@ -6534,11 +6846,11 @@ async function doSend(name, text) {
   } catch(e) {
     // Offline — queue it (same body, same msg_id → server-side dedup if the
     // original request actually landed before the connection died)
-    _queueOp(API + '/api/sessions/' + encodeURIComponent(name) + '/send', {
+    const queued = await _queueOp(API + '/api/sessions/' + encodeURIComponent(name) + '/send', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: sendBody
     });
-    return 'queued';
+    return queued ? 'queued' : 'failed';
   }
 }
 
@@ -9244,7 +9556,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.844';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.854';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -9507,6 +9819,7 @@ function openPeek(name, opts) {
   _peekMsgIndex = -1;
   lastPeekHTML = '';
   _lastPeekRaw = '';
+  _peekRenderCache.clear();
   _peekEtag = null; _peekLiveEtag = null;   // new session → drop the old session's ETags
   _peekLastFullMs = 0; _peekPrevStatus = '';   // force a fresh history cycle for this session
   _peekHistoryRaw = ''; _peekHistoryHTML = '';   // and its transcript history
@@ -9702,6 +10015,7 @@ function copyPeekContent() {
 }
 
 function closePeek() {
+  _closePeekFilters();
   _peekLeaseStop();   // AMUX-2634: stop holding the worker's pane at our width
   // Reset peek notes
   // Fold the fullscreen composer (if open) back into the input, and close menus,
@@ -10289,7 +10603,7 @@ function stripAnsi(text) {
     .replace(/^─{10,}\n?/gm, '');
 }
 
-function ansiToHtml(text) {
+function ansiToHtml(text, state) {
   // Convert ANSI SGR color codes to HTML spans. Also HTML-escapes and linkifies text.
   const C16 = ['#1c1c1c','#cc0000','#4e9a06','#c4a000','#3465a4','#75507b','#06989a','#d3d7cf',
                '#888a85','#ef2929','#8ae234','#fce94f','#729fcf','#ad7fa8','#34e2e2','#eeeeec'];
@@ -10312,6 +10626,12 @@ function ansiToHtml(text) {
   // are the right carrier because they pass through eh() untouched (they are
   // not & < >) and cannot occur in real terminal output.
   const _osc8 = [];
+  if (state) {
+    const active = state.osc8Url || '';
+    for (const match of text.matchAll(/\x1b\]8;[^;\x07\x1b]*;([^\x07\x1b]*)(?:\x07|\x1b\\)/g)) state.osc8Url = match[1];
+    if (active) text = '\x1b]8;;' + active + '\x07' + text;
+    if (state.osc8Url) text += '\x1b]8;;\x07';
+  }
   const _osc8Text = text
     // Open: params may be empty; the URL must be NON-empty, which is what
     // distinguishes an open from the `ESC]8;;ST` close below.
@@ -10331,7 +10651,8 @@ function ansiToHtml(text) {
   // border" peek bug). wrapBoxBlocks() now wraps each contiguous box block in a
   // horizontal-scroll container, so alignment is preserved and a wide rule scrolls
   // instead of wrapping into empty lines.
-  let bold=false,dim=false,italic=false,uline=false,fg=null,bg=null,spanOpen=false;
+  let {bold=false, dim=false, italic=false, uline=false, fg=null, bg=null} = state || {};
+  let spanOpen=false;
   const closeSpan=()=>{ if(!spanOpen)return ''; spanOpen=false; return '</span>'; };
   const openSpan=()=>{
     const s=[];
@@ -10362,7 +10683,7 @@ function ansiToHtml(text) {
     return rewriteLocalhostUrls(out);
   };
   const parts=t.split(/(\x1b\[[0-9;]*m)/);
-  let out='';
+  let out=openSpan();
   for(let i=0;i<parts.length;i++){
     const p=parts[i];
     if(p.startsWith('\x1b[')&&p.endsWith('m')){
@@ -10397,6 +10718,7 @@ function ansiToHtml(text) {
         (index ? closeSpan() + '\n' + openSpan() : '') + linkChunk(line)).join('');
     }
   }
+  if (state) Object.assign(state, {bold, dim, italic, uline, fg, bg});
   return _osc8Resolve(out+closeSpan(), _osc8);
 }
 
@@ -10575,9 +10897,133 @@ function _linkifyPaths(safeHtml) {
 // ONE peek render pipeline. The four call sites each spelled the chain out, so
 // adding a stage meant finding all of them — which is how the path linkifier
 // would have been half-wired.
-function _peekHtml(raw) {
-  return wrapBoxBlocks(_fitRules(highlightPrompts(_linkifyPaths(ansiToHtml(raw)))));
+function _peekHtml(raw, state) {
+  return wrapBoxBlocks(_fitRules(highlightPrompts(_peekCodeRows(_linkifyPaths(ansiToHtml(raw, state))))));
 }
+
+// Slice visible text while retaining the balanced, trusted markup produced by
+// ansiToHtml/linkify. In particular, a gutter must not inherit the code's wrap.
+function _peekHtmlSlice(html, start, end) {
+  const tags = [], out = [];
+  let pos = 0, opened = false;
+  for (const token of html.match(/<[^>]*>|&(?:#\d+|#x[\da-f]+|\w+);|[^<&]+|[<&]/gi) || []) {
+    if (token[0] === '<') {
+      if (token.startsWith('</')) { if (opened) out.push(token); tags.pop(); }
+      else { tags.push(token); if (opened) out.push(token); }
+      continue;
+    }
+    const size = token[0] === '&' && token.endsWith(';') ? 1 : token.length;
+    if (pos + size > start && pos < end) {
+      if (!opened) { out.push(...tags); opened = true; }
+      out.push(size === 1 ? token : token.slice(Math.max(0, start - pos), end - pos));
+    }
+    pos += size;
+    if (pos >= end) break;
+  }
+  if (opened) out.push(...tags.reverse().map(tag => '</' + tag.match(/^<([\w-]+)/)[1] + '>'));
+  return out.join('');
+}
+function _peekCodeRows(html) {
+  const lines = html.split('\n');
+  const plain = lines.map(line => line.replace(/<[^>]*>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&'));
+  const numbered = line => /^(\s{0,8})(\d{1,7})([ +\-│|])(?:\s|[+\-])/.test(line);
+  const cell = (line, text) => {
+    const match = text.match(/^(\s*)(\d{1,7})([ +\-│|]?)/);
+    if (!match) return '<span class="peek-code-cell"><span class="peek-code-text">' + line + '</span></span>';
+    const mark = match[3] === '+' ? 'add' : match[3] === '-' ? 'del' : 'context';
+    return '<span class="peek-code-cell peek-code-' + mark + '"><span class="peek-code-number">'
+      + esc(match[2] + (mark === 'context' ? '' : match[3])) + '</span><span class="peek-code-text">'
+      + _peekHtmlSlice(line, match[0].length, text.length) + '</span></span>';
+  };
+  return lines.map((line, i) => {
+    const text = plain[i];
+    if (!numbered(text) || !(/^[ \t]*\d{1,7}[+-]\s/.test(text) || numbered(plain[i-1] || '') || numbered(plain[i+1] || ''))) return line;
+    // A structural column divider followed by another numbered source row.
+    // Never split on arbitrary spaces within source strings or indentation.
+    let split = /[│┃]\s*\d{1,7}[ +\-│|](?:\s|[+\-])/.exec(text);
+    let rightOffset = split ? split.index+1 : 0;
+    if (!split) {
+      const gap = / {4,}(?=\d{1,7}[+-]\s)/.exec(text);
+      // Space-only split layouts have a fixed right gutter across adjacent
+      // rows. A number inside an arbitrary source string is not a divider.
+      const right = gap ? gap.index+gap[0].length : 0;
+      if (right && [plain[i-1] || '', plain[i+1] || ''].some(row => {
+        const other = / {4,}(?=\d{1,7}[+-]\s)/.exec(row);
+        return other && other.index+other[0].length === right;
+      })) { split = gap; rightOffset = right; }
+    }
+    if (split) {
+      const at = split.index;
+      return '<span class="peek-code-row peek-code-split">' + cell(_peekHtmlSlice(line, 0, at), text.slice(0, at))
+        + cell(_peekHtmlSlice(line, rightOffset, text.length), text.slice(rightOffset)) + '</span>';
+    }
+    return '<span class="peek-code-row">' + cell(line, text) + '</span>';
+  }).join('\n');
+}
+
+// Stable chunks bound parsing and DOM replacement to the changed suffix.
+// A snapshot comparison still reads incoming bytes, but unchanged blocks never
+// pass through ANSI/link/prompt parsing or HTML insertion again.
+const _peekRenderCache = new Map();
+const _peekRenderWork = {parsed_chars:0, parsed_chunks:0, dom_chunks:0, paints:0, coalesced:0};
+function _peekRenderChunks(key, raw) {
+  const previous = _peekRenderCache.get(key) || [];
+  if (previous.raw === raw) return previous;
+  const chunks = [];
+  let start = 0, index = 0, state = {}, prompt = false, lines = 0;
+  if (previous.raw && raw.startsWith(previous.raw)) {
+    // The final block may gain rows; all preceding blocks are immutable.
+    chunks.push(...previous.slice(0, -1));
+    index = chunks.length;
+    start = previous.raw.length - previous[previous.length-1].raw.length;
+    if (index) state = {...chunks[index-1].state};
+  }
+  const flush = end => {
+    const text = raw.slice(start, end), old = previous[index];
+    const before = JSON.stringify(state);
+    let chunk;
+    if (old && old.raw === text && old.before === before) chunk = old;
+    else {
+      const next = {...state};
+      chunk = {raw:text, before, html:_peekHtml(text, next), state:next};
+      _peekRenderWork.parsed_chars += text.length;
+      _peekRenderWork.parsed_chunks++;
+    }
+    chunks.push(chunk); state = {...chunk.state}; start = end; index++; lines = 0;
+  };
+  for (let at = start; at < raw.length;) {
+    const nl = raw.indexOf('\n', at), end = nl < 0 ? raw.length : nl+1;
+    const line = raw.slice(at, end).replace(/\x1b\[[0-9;]*m/g, '');
+    const begins = /^[ \t]{0,2}[❯›](?:[ \t]+|$)/.test(line);
+    const continues = prompt && (/^[ \t]{2,}\S/.test(line) || !line.trim());
+    // Preserve prompt blocks across chunk boundaries. Numbered rows/table rows
+    // are independently balanced; a huge prompt remains one semantic message.
+    if (lines >= 64 && !continues) flush(at);
+    prompt = begins || continues;
+    lines++; at = end;
+  }
+  if (start < raw.length) flush(raw.length);
+  chunks.raw = raw;
+  _peekRenderCache.set(key, chunks);
+  return chunks;
+}
+function _peekChunkHTML(chunks) {
+  if (chunks.html == null) chunks.html = chunks.map(c => '<div class="peek-render-chunk">' + c.html + '</div>').join('');
+  return chunks.html;
+}
+function _peekPatchChunks(root, chunks) {
+  for (let i = 0; i < chunks.length; i++) {
+    let node = root.children[i];
+    if (!node) { node = document.createElement('div'); node.className = 'peek-render-chunk'; root.appendChild(node); }
+    if (node._peekChunk !== chunks[i]) {
+      node.innerHTML = chunks[i].html; node._peekChunk = chunks[i];
+      node._peekPrompts = [...node.querySelectorAll('.peek-prompt')];
+      _peekRenderWork.dom_chunks++;
+    }
+  }
+  while (root.children.length > chunks.length) root.lastElementChild.remove();
+}
+
 
 // The MARKERS amux stamps on everything it injects into a pane. Structural, not
 // heuristic: each one is a literal prefix the server writes, so matching it is
@@ -10698,6 +11144,7 @@ function wrapBoxBlocks(html) {
   const stripTags = s => s.replace(/<[^>]*>/g, '');
   const isBoxLine = raw => {
     const t = stripTags(raw);
+    if (raw.includes('class="peek-code-row')) return false;
     if (!BOX.test(t)) return false;
     if (HRULE.test(t)) return true;                 // a border/rule line
     return (t.match(VERT) || []).length >= 2;       // a content row: │ a │ b │
@@ -10730,20 +11177,24 @@ function _isScrolledToBottom(el, threshold) {
   return el.scrollHeight - el.scrollTop - el.clientHeight < (threshold || 40);
 }
 
+function _scrollLockContainer(scrollEl) {
+  return scrollEl.id === 'peek-body' ? scrollEl.parentElement.querySelector('.peek-output-controls') || scrollEl : scrollEl;
+}
 function _showScrollLockBadge(scrollEl, onClickResume) {
-  let badge = scrollEl.querySelector('.scroll-lock-badge');
+  const container = _scrollLockContainer(scrollEl);
+  let badge = container.querySelector('.scroll-lock-badge');
   if (!badge) {
-    badge = document.createElement('div');
+    badge = document.createElement(container === scrollEl ? 'div' : 'button');
     badge.className = 'scroll-lock-badge';
-    badge.textContent = 'Scrolled up \u2014 click to resume';
-    badge.onclick = (e) => { e.stopPropagation(); onClickResume(); };
-    scrollEl.appendChild(badge);
+    badge.textContent = container === scrollEl ? 'Scrolled up — click to resume' : 'Resume output';
+    badge.title = 'New output is buffered while you read earlier lines';
+    container.prepend(badge);
   }
+  badge.onclick = e => { e.stopPropagation(); onClickResume(); };
   badge.style.display = '';
 }
-
 function _hideScrollLockBadge(scrollEl) {
-  const badge = scrollEl.querySelector('.scroll-lock-badge');
+  const badge = _scrollLockContainer(scrollEl).querySelector('.scroll-lock-badge');
   if (badge) badge.style.display = 'none';
 }
 
@@ -11009,80 +11460,7 @@ async function refreshPeek(liveOnly, bypassTrim) {
       _peekIdentityDiscard('live-peek', identity, data.name || '');
       return;
     }
-    // Alt-screen peeks return history + live SEPARATELY so a poll can re-render just
-    // the live frame. A live=1 poll carries no history (keep what we already have);
-    // non-alt/legacy shapes send one `output` blob — treat that as the live part.
-    const output = (data.live != null) ? data.live : (data.output || '(no output)');
-    const histRaw = (data.history != null) ? data.history : null;   // null ⇒ live-only poll
-    // Skip re-render when nothing we'd paint changed — saves ansiToHtml work on every
-    // poll tick. This also applies with an active search: the highlights are already in
-    // the DOM, so re-running applyPeekSearch would needlessly scroll the view back to
-    // the current match every tick (the "force-scroll back to result" bug on idle sessions).
-    if (output === _lastPeekRaw && (histRaw === null || histRaw === _peekHistoryRaw) && lastPeekHTML) {
-      if (performance.now() > _peekGeoHold) statusEl.textContent = 'Updated ' + new Date().toLocaleTimeString() + ' · v' + APP_VER;
-      return;
-    }
-    _lastPeekRaw = output;
-    _peekLastChangeMs = performance.now();   // real content change → drives fast adaptive polling
-    let histChanged = false;
-    if (histRaw !== null && histRaw !== _peekHistoryRaw) {   // full fetch → (re)render history once
-      _peekHistoryRaw = histRaw;
-      _peekHistoryHTML = histRaw ? _peekHtml(histRaw) : '';
-      histChanged = true;
-    }
-    const atBottom = _isScrolledToBottom(body);
-    if (atBottom && !body.querySelector('.peek-msg-current, .peek-highlight.current')) _peekScrollLocked = false;
-    const newHTML = _peekHtml(output);
-    if (peekSelecting || (window.getSelection()?.toString().length > 0)) return;
-    if (_sendingSnapshot && newHTML !== _sendingSnapshot) clearSendingIndicator();
-    // Claude runs on the terminal's ALT SCREEN: tmux holds only the viewport,
-    // so the top of the capture is a hard cutoff mid-conversation. Compose a
-    // "load earlier output" bar (or the loaded log tail) above the live view
-    // so scrollback exists in peek the way it does in a real terminal.
-    _lastLiveHTML = newHTML;
-    lastPeekHTML = _peekEarlierHTML() + _peekHistoryHTML + _lastLiveHTML;
-    const hasSearch = peekSearchQuery.trim().length > 0;
-    // When user has scrolled up, skip DOM update to avoid fidgeting the view.
-    // Buffer in lastPeekHTML and flush when they resume.
-    if (hasSearch && (!_peekScrollLocked || _peekPendingFindScroll)) {
-      // A selected search result stays pinned while output is buffered, just
-      // like message navigation. Only an unlocked search or pending Locate
-      // should replace its nodes. Re-highlight matches in the new
-      // DOM but DON'T scroll to the current match — preserve wherever the user
-      // scrolled. Auto-scroll only happens on explicit search actions (typing /
-      // next / prev). Restoring scrollTop keeps position across the innerHTML swap.
-      const savedTop = body.scrollTop;
-      applyPeekSearch(true, false);
-      body.scrollTop = savedTop;
-      // …EXCEPT the one-shot locate jump: a peek opened via ⌖ Locate arms this
-      // flag, and the first render whose DOM actually contains the match scrolls
-      // to it (the match is in history, which lands after the instant live paint).
-      if (_peekPendingFindScroll && _peekMatches.length) {
-        _peekPendingFindScroll = false;
-        _peekScrollTo(peekSearchIndex, true, true);
-      }
-    } else if (!_peekScrollLocked) {
-      const _liveEl = document.getElementById('pk-live');
-      if (!histChanged && _liveEl) { _liveEl.innerHTML = _lastLiveHTML; _peekReclassifyPrompts(); }   // live tick → swap the small region only
-      else applyPeekSearch(false);
-    }
-    if (!_peekScrollLocked && atBottom && !hasSearch) {
-      body.scrollTop = body.scrollHeight;
-      _hideScrollLockBadge(body);
-    } else if (_peekScrollLocked) {
-      _showScrollLockBadge(body, () => {
-        _peekScrollLocked = false;
-        applyPeekSearch(false, false);
-        body.scrollTop = body.scrollHeight;
-        _hideScrollLockBadge(body);
-      });
-    }
-    if (performance.now() > _peekGeoHold) statusEl.textContent = (data.saved ? 'Saved log' : 'Updated') + ' ' + new Date().toLocaleTimeString() + ' · v' + APP_VER;
-    // Cache peek output for offline browsing
-    // Cache BOTH slices — since the live-split, `output` alone is just the tiny
-    // live frame (sometimes ''), which painted an EMPTY black peek from cache
-    // (social, 2026-07-16). Never write an entry with no content.
-    if (_peekHistoryRaw || _lastPeekRaw) _idb.set('peek_' + name, { output: _lastPeekRaw, history: _peekHistoryRaw, liveHTML: _lastLiveHTML, histHTML: _peekHistoryHTML, time: Date.now() });
+    await _queuePeekFrame(identity, data);
   } catch(e) {
     if (!_peekIdentityCurrent(identity)) return;
     console.error('peek:', e);
@@ -11102,16 +11480,151 @@ async function refreshPeek(liveOnly, bypassTrim) {
   }
 }
 
+// Transport bursts share one animation-frame paint. A late live-only response
+// keeps the newest pending history; an older worker identity can never paint.
+let _peekFramePending = null;
+function _queuePeekFrame(identity, data) {
+  return new Promise((resolve, reject) => {
+    if (!_peekIdentityCurrent(identity)) { resolve(); return; }
+    if (_peekFramePending) {
+      _peekRenderWork.coalesced++;
+      if (_peekFramePending.identity.name === identity.name && _peekFramePending.identity.generation === identity.generation && data.history == null)
+        data = {...data, history:_peekFramePending.data.history};
+      _peekFramePending.identity = identity;
+      _peekFramePending.data = data;
+      _peekFramePending.waiters.push({resolve, reject});
+      return;
+    }
+    _peekFramePending = {identity, data, waiters:[{resolve, reject}]};
+    requestAnimationFrame(() => {
+      const pending = _peekFramePending; _peekFramePending = null;
+      try {
+        if (_peekIdentityCurrent(pending.identity)) _peekAcceptFrame(pending.data);
+        for (const waiter of pending.waiters) waiter.resolve();
+      } catch (error) {
+        for (const waiter of pending.waiters) waiter.reject(error);
+        fetch(API + '/api/client-debug', {method:'POST', headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({kind:'peek-render', verdict:'render-failed', measured:true,
+            n_considered:1, session:pending.identity.name, error:String(error), ver:APP_VER})}).catch(() => {});
+      }
+    });
+  });
+}
+function _peekAcceptFrame(data) {
+  if (peekSelecting || (window.getSelection()?.toString().length > 0)) return;
+  const name = peekSession;
+  const body = document.getElementById('peek-body');
+  const statusEl = document.getElementById('peek-status');
+  const started = performance.now(), before = {..._peekRenderWork};
+  // Alt-screen peeks return history + live SEPARATELY so a poll can re-render just
+  // the live frame. A live=1 poll carries no history (keep what we already have);
+  // non-alt/legacy shapes send one `output` blob — treat that as the live part.
+  const output = (data.live != null) ? data.live : (data.output || '(no output)');
+  const histRaw = (data.history != null) ? data.history : null;   // null ⇒ live-only poll
+  // Skip re-render when nothing we'd paint changed — saves ansiToHtml work on every
+  // poll tick. This also applies with an active search: the highlights are already in
+  // the DOM, so re-running applyPeekSearch would needlessly scroll the view back to
+  // the current match every tick (the "force-scroll back to result" bug on idle sessions).
+  if (output === _lastPeekRaw && (histRaw === null || histRaw === _peekHistoryRaw) && lastPeekHTML) {
+    if (performance.now() > _peekGeoHold) statusEl.textContent = 'Updated ' + new Date().toLocaleTimeString() + ' · v' + APP_VER;
+    return;
+  }
+  if (typeof output !== 'string' || (histRaw !== null && typeof histRaw !== 'string')) throw new Error('Malformed terminal frame');
+  _lastPeekRaw = output;
+  _peekLastChangeMs = performance.now();   // real content change → drives fast adaptive polling
+  if (histRaw !== null && histRaw !== _peekHistoryRaw) {   // full fetch → (re)render history once
+    _peekHistoryRaw = histRaw;
+    _peekHistoryHTML = _peekChunkHTML(_peekRenderChunks('history', histRaw));
+  }
+  const atBottom = _isScrolledToBottom(body);
+  if (atBottom && !body.querySelector('.peek-msg-current, .peek-highlight.current')) _peekScrollLocked = false;
+  const newHTML = _peekChunkHTML(_peekRenderChunks('live', output));
+  if (_sendingSnapshot && newHTML !== _sendingSnapshot) clearSendingIndicator();
+  // Claude runs on the terminal's ALT SCREEN: tmux holds only the viewport,
+  // so the top of the capture is a hard cutoff mid-conversation. Compose a
+  // "load earlier output" bar (or the loaded log tail) above the live view
+  // so scrollback exists in peek the way it does in a real terminal.
+  _lastLiveHTML = newHTML;
+  lastPeekHTML = _peekEarlierHTML() + _peekHistoryHTML + _lastLiveHTML;
+  const hasSearch = peekSearchQuery.trim().length > 0;
+  // When user has scrolled up, skip DOM update to avoid fidgeting the view.
+  // Buffer in lastPeekHTML and flush when they resume.
+  if (hasSearch && _peekPendingFindScroll) {
+    // A selected search result stays pinned while output is buffered, just
+    // like message navigation. Only an unlocked search or pending Locate
+    // should replace its nodes. Re-highlight matches in the new
+    // DOM but DON'T scroll to the current match — preserve wherever the user
+    // scrolled. Auto-scroll only happens on explicit search actions (typing /
+    // next / prev). Restoring scrollTop keeps position across the innerHTML swap.
+    const savedTop = body.scrollTop;
+    applyPeekSearch(true, false);
+    body.scrollTop = savedTop;
+    // …EXCEPT the one-shot locate jump: a peek opened via ⌖ Locate arms this
+    // flag, and the first render whose DOM actually contains the match scrolls
+    // to it (the match is in history, which lands after the instant live paint).
+    if (_peekPendingFindScroll && _peekMatches.length) {
+      _peekPendingFindScroll = false;
+      _peekScrollTo(peekSearchIndex, true, true);
+    }
+  } else if (!_peekScrollLocked && !hasSearch) {
+    _paintPeekRegions(body);
+  }
+  if (!_peekScrollLocked && atBottom && !hasSearch) {
+    body.scrollTop = body.scrollHeight;
+    _hideScrollLockBadge(body);
+  } else if (_peekScrollLocked || hasSearch) {
+    _showScrollLockBadge(body, () => {
+      _peekScrollLocked = false;
+      applyPeekSearch(false, false);
+      body.scrollTop = body.scrollHeight;
+      _hideScrollLockBadge(body);
+    });
+  }
+  if (performance.now() > _peekGeoHold) statusEl.textContent = (data.saved ? 'Saved log' : 'Updated') + ' ' + new Date().toLocaleTimeString() + ' · v' + APP_VER;
+  // Cache peek output for offline browsing
+  // Cache BOTH slices — since the live-split, `output` alone is just the tiny
+  // live frame (sometimes ''), which painted an EMPTY black peek from cache
+  // (social, 2026-07-16). Never write an entry with no content.
+  if ((_peekHistoryRaw || _lastPeekRaw) && (performance.now() - (_peekAcceptFrame.cachedAt || 0) > 10000 || _peekAcceptFrame.cachedName !== name)) {
+    _peekAcceptFrame.cachedAt = performance.now(); _peekAcceptFrame.cachedName = name;
+    _idb.set('peek_' + name, { output: _lastPeekRaw, history: _peekHistoryRaw, liveHTML: _lastLiveHTML, histHTML: _peekHistoryHTML, time: Date.now() });
+  }
+  _peekRenderWork.paints++;
+  const duration = performance.now() - started;
+  // Aggregate bounded work counters in the existing client-debug stream. A
+  // slow update self-announces; do not emit terminal contents or every tick.
+  if (duration > 50 && performance.now() - (_peekAcceptFrame.lastBeacon || 0) > 30000) {
+    _peekAcceptFrame.lastBeacon = performance.now();
+    fetch(API + '/api/client-debug', {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({kind:'peek-render', verdict:'slow-update', session:name, measured:true,
+        n_considered:output.length + (histRaw || '').length, duration_ms:Math.round(duration),
+        parsed_chars:_peekRenderWork.parsed_chars-before.parsed_chars,
+        dom_chunks:_peekRenderWork.dom_chunks-before.dom_chunks, ver:APP_VER})}).catch(() => {});
+  }
+}
+
+
 // Split DOM: history lives in a stable container and the live frame in its own,
 // so a live tick swaps ONLY #pk-live (a few hundred bytes) instead of
 // re-innerHTML'ing the whole ~100K-char scrollback every 900ms — that wholesale
 // reflow was the visible "janky" churn when watching an active session.
 function _paintPeekRegions(body) {
   const hist = _peekEarlierHTML() + _peekHistoryHTML;
-  if (!hist && !_lastLiveHTML && lastPeekHTML) { body.innerHTML = lastPeekHTML; _peekReclassifyPrompts(); return; }  // IDB cached open paint
-  body.innerHTML = '<div id="pk-hist">' + hist + '</div><div id="pk-live">' + _lastLiveHTML + '</div>';
-  _peekReclassifyPrompts();
+  if (!hist && !_lastLiveHTML && lastPeekHTML) { body.innerHTML = lastPeekHTML; _peekReclassifyPrompts(); return; }
+  if (!body.querySelector('#pk-live') || !body.querySelector('#pk-hist'))
+    body.innerHTML = '<div id="pk-earlier"></div><div id="pk-hist"></div><div id="pk-live"></div>';
+  const earlier = body.querySelector('#pk-earlier');
+  if (earlier && earlier._peekHTML !== _peekEarlierHTML()) {
+    earlier._peekHTML = _peekEarlierHTML(); earlier.innerHTML = earlier._peekHTML;
+  }
+  for (const [key, id, html] of [['history','pk-hist',_peekHistoryHTML], ['live','pk-live',_lastLiveHTML]]) {
+    const root = body.querySelector('#' + id), chunks = _peekRenderCache.get(key);
+    if (chunks && _peekChunkHTML(chunks) === html) _peekPatchChunks(root, chunks);
+    else if (root._peekHTML !== html) { root.innerHTML = html; root._peekHTML = html; }
+  }
+  _peekMsgCount(_peekMsgPrompts());
 }
+
 function applyPeekSearch(keepIndex, doScroll) {
   const body = document.getElementById('peek-body');
   const countEl = document.getElementById('peek-search-count');
@@ -11128,8 +11641,8 @@ function applyPeekSearch(keepIndex, doScroll) {
   // spans must not turn one visible phrase into missing or duplicate matches.
   body.innerHTML = lastPeekHTML;
   _peekReclassifyPrompts();
-  const roots = _peekMsgNavKind === 'all' ? [body]
-    : [...body.querySelectorAll('.peek-prompt')].filter(el => el.dataset.msgKind === _peekMsgNavKind);
+  const roots = !_peekFiltersActive() ? [body]
+    : [...body.querySelectorAll('.peek-prompt')].filter(el => _peekPromptMatchesFilters(el));
   _peekMatches = [];
   for (const root of roots) {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
@@ -11199,6 +11712,7 @@ function peekSearchPrev() {
 // ── Peek more-menu ──
 let _peekMoreDismissTimer = 0;
 function togglePeekMoreMenu() {
+  _closePeekFilters();
   const dd = document.getElementById('peek-more-dropdown');
   if (!dd) return;
   const s = (sessions || []).find(row => row.name === peekSession);
@@ -11234,6 +11748,90 @@ function _closePeekMore() {
 // ── Peek message navigation ──
 let _peekMsgIndex = -1;
 let _peekMsgNavKind = 'all';
+let _peekMsgNavContent = 'any';
+const _PEEK_SOURCE_LABELS = {all:'Everyone', human:'Human', session:'Workers', schedule:'Scheduled', amux:'Harness', unstamped:'Unstamped', unknown:'Unclassified'};
+const _PEEK_CONTENT_LABELS = {any:'Any message', board:'Board references', files:'Files', links:'Links'};
+function _peekFiltersActive() { return _peekMsgNavKind !== 'all' || _peekMsgNavContent !== 'any'; }
+function _peekFilterSummary() {
+  const source = _peekMsgNavKind === 'all' ? '' : _PEEK_SOURCE_LABELS[_peekMsgNavKind];
+  const content = _peekMsgNavContent === 'any' ? '' : _PEEK_CONTENT_LABELS[_peekMsgNavContent];
+  return [source, content].filter(Boolean).join(' · ') || 'All messages';
+}
+// Both navigation and Find select message blocks with the same predicate.
+// Content filters inspect actual references, never guesses about task intent.
+function _peekPromptMatchesFilters(el) {
+  if (!el || (_peekMsgNavKind !== 'all' && el.dataset.msgKind !== _peekMsgNavKind)) return false;
+  if (_peekMsgNavContent === 'board') return /\b[A-Z]{2,8}-\d{1,6}\b/.test(el.textContent);
+  if (_peekMsgNavContent === 'files') return !!el.querySelector('.file-link, .md-link');
+  if (_peekMsgNavContent === 'links') return !!el.querySelector('a[href^="https://"], a[href^="http://"]');
+  return true;
+}
+function _peekFilterSync() {
+  const button = document.getElementById('peek-filter-btn');
+  const summary = document.getElementById('peek-filter-summary');
+  if (!button || !summary) return;
+  const label = _peekFilterSummary();
+  summary.textContent = label;
+  button.title = 'Filter messages: ' + label;
+  button.classList.toggle('active', _peekFiltersActive());
+  for (const input of document.querySelectorAll('[name="peek-filter-source"]')) input.checked = input.value === _peekMsgNavKind;
+  for (const input of document.querySelectorAll('[name="peek-filter-content"]')) input.checked = input.value === _peekMsgNavContent;
+  document.getElementById('peek-filter-reset').disabled = !_peekFiltersActive();
+}
+function togglePeekFilters() {
+  const panel = document.getElementById('peek-filter-panel');
+  if (!panel) return;
+  if (!panel.hidden) { _closePeekFilters(true); return; }
+  _closePeekMore();
+  _peekFilterSync();
+  panel.hidden = false;
+  document.getElementById('peek-filter-btn').setAttribute('aria-expanded', 'true');
+  panel.querySelector('input:checked')?.focus({preventScroll:true});
+  document.addEventListener('pointerdown', _peekFiltersOutside);
+  document.addEventListener('focusin', _peekFiltersOutside);
+  document.addEventListener('keydown', _peekFiltersKey, true);
+}
+function _peekFiltersOutside(event) {
+  if (!event.target.closest('.peek-msg-filter')) _closePeekFilters();
+}
+function _peekFiltersKey(event) {
+  if (event.key !== 'Escape') return;
+  event.preventDefault(); event.stopPropagation();
+  _closePeekFilters(true);
+}
+function _closePeekFilters(returnFocus = false) {
+  const panel = document.getElementById('peek-filter-panel');
+  if (!panel) return;
+  panel.hidden = true;
+  const button = document.getElementById('peek-filter-btn');
+  button?.setAttribute('aria-expanded', 'false');
+  document.removeEventListener('pointerdown', _peekFiltersOutside);
+  document.removeEventListener('focusin', _peekFiltersOutside);
+  document.removeEventListener('keydown', _peekFiltersKey, true);
+  if (returnFocus) button?.focus({preventScroll:true});
+}
+function _peekFilterContentSelect(content) {
+  if (!Object.hasOwn(_PEEK_CONTENT_LABELS, content)) return;
+  _peekMsgNavContent = content;
+  _peekFiltersChanged();
+}
+function _peekFiltersReset() {
+  _peekMsgNavKind = 'all'; _peekMsgNavContent = 'any';
+  _peekFiltersChanged();
+}
+function _peekFiltersChanged() {
+  _peekMsgIndex = -1;
+  document.querySelectorAll('#peek-body .peek-msg-current').forEach(p => p.classList.remove('peek-msg-current'));
+  if (peekSearchQuery.trim()) applyPeekSearch(false, true);
+  else _peekReclassifyPrompts();
+  const loaded = [...document.querySelectorAll('#peek-body .peek-prompt')];
+  const matched = loaded.filter(el => _peekPromptMatchesFilters(el)).length;
+  fetch(API + '/api/client-debug', {method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({kind:'peek-message-filter',verdict:matched ? 'matches' : 'no-matches',
+      session:peekSession,measured:true,n_considered:loaded.length,matched_messages:matched,
+      source_filter:_peekMsgNavKind,content_filter:_peekMsgNavContent,
+      searching:!!peekSearchQuery.trim(),search_matches:_peekMatches.length,ver:APP_VER})}).catch(() => {});
+}
 let _peekMsgNavGesture = null;
 function _peekMsgNavArm(e) {
   const body = document.getElementById('peek-body');
@@ -11263,12 +11861,18 @@ function _peekMsgPrompts() {
   const body = document.getElementById('peek-body');
   if (!body) return [];
   if (peekSearchQuery.trim()) return _peekMatches.filter(el => el.isConnected);
-  return Array.from(body.querySelectorAll('.peek-prompt')).filter(el =>
-    _peekMsgNavKind === 'all' || el.dataset.msgKind === _peekMsgNavKind);
+  const regions = [body.querySelector('#pk-hist'), body.querySelector('#pk-live')];
+  if (regions.every(Boolean)) {
+    const prompts = [...(body.querySelector('#pk-earlier')?.querySelectorAll('.peek-prompt') || [])];
+    for (const root of regions) for (const child of root.children)
+      prompts.push(...(child._peekPrompts || (child.matches('.peek-prompt') ? [child] : child.querySelectorAll('.peek-prompt'))));
+    return prompts.filter(el => _peekPromptMatchesFilters(el));
+  }
+  return Array.from(body.querySelectorAll('.peek-prompt')).filter(el => _peekPromptMatchesFilters(el));
 }
 function _peekMsgCount(prompts) {
   const searching = !!peekSearchQuery.trim();
-  const selectedKind = _peekMsgNavKind === 'all' ? 'All' : (_MSG_KIND[_peekMsgNavKind] || _MSG_KIND.unknown).label;
+  const selectedKind = _peekFilterSummary();
   const label = searching ? selectedKind + ' matches' : selectedKind;
   const count = document.getElementById('peek-msg-count');
   if (count) {
@@ -11277,9 +11881,7 @@ function _peekMsgCount(prompts) {
     if (count.textContent !== value) count.textContent = value;
     count.setAttribute('aria-label', label + ': ' + value + ' in loaded output');
   }
-  const select = document.getElementById('peek-msg-kind');
-  if (select) { select.value = _peekMsgNavKind; select.disabled = false; }
-  document.getElementById('peek-nav-label').textContent = searching ? 'Find' : 'Messages';
+  _peekFilterSync();
   for (const btn of document.querySelectorAll('#peek-msg-nav .peek-nav-btn')) {
     // Zero loaded matches still permits loading earlier output. It is not a
     // disabled action; explain that fallback instead of drawing a dead arrow.
@@ -11297,7 +11899,8 @@ function _peekToolbarCheck() {
     _peekToolbarFrame = 0;
     const toolbar = document.querySelector('.peek-toolbar');
     if (!toolbar || !toolbar.getClientRects().length) return;
-    const controls = [...toolbar.querySelectorAll('button,select')];
+    const controls = [...toolbar.querySelectorAll('button,select')].filter(el =>
+      el.getClientRects().length && !el.closest('.peek-filter-panel, .peek-more-dropdown'));
     const rect = toolbar.getBoundingClientRect();
     // Layout sizes are independent of the user's deliberate UI zoom. Comparing
     // scaled screen rectangles to CSS sizes falsely flagged every 80% control.
@@ -11359,12 +11962,11 @@ function _peekNavBeacon(verdict, prompts, target) {
   const body = document.getElementById('peek-body');
   const geometry = target && _peekJumpGeometry(target);
   const searching = !!peekSearchQuery.trim();
-  if (searching && target && _peekMsgNavKind !== 'all'
-      && target.closest('.peek-prompt')?.dataset.msgKind !== _peekMsgNavKind) verdict = 'filter-mismatch';
+  if (target && _peekFiltersActive() && !_peekPromptMatchesFilters(target.closest('.peek-prompt'))) verdict = 'filter-mismatch';
   try {
     fetch(API + '/api/client-debug', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ kind: 'peek-message-nav', verdict, session: peekSession, ver: APP_VER,
-        measured: true, n_considered: prompts.length, filter: _peekMsgNavKind,
+        measured: true, n_considered: prompts.length, filter: _peekMsgNavKind, content_filter: _peekMsgNavContent,
         mode: searching ? 'search' : 'messages',
         index: searching ? peekSearchIndex : _peekMsgIndex, target_kind: target?.closest('.peek-prompt')?.dataset.msgKind || null,
         target_visible: !!geometry && geometry.visible,
@@ -11428,12 +12030,9 @@ async function _peekMsgMove(direction, event) {
 function peekMsgNext(event) { _peekMsgMove(1, event); }
 function peekMsgPrev(event) { _peekMsgMove(-1, event); }
 function _peekMsgNavSelect(kind) {
-  if (!['all', 'human', 'session', 'schedule', 'amux', 'unstamped', 'unknown'].includes(kind)) return;
+  if (!Object.hasOwn(_PEEK_SOURCE_LABELS, kind)) return;
   _peekMsgNavKind = kind;
-  _peekMsgIndex = -1;
-  document.querySelectorAll('#peek-body .peek-msg-current').forEach(p => p.classList.remove('peek-msg-current'));
-  if (peekSearchQuery.trim()) applyPeekSearch(false, true);
-  else _peekReclassifyPrompts();
+  _peekFiltersChanged();
 }
 
 // ── Peek command bar ──
@@ -14965,10 +15564,10 @@ function _pendingSendsFor(session) {
   });
   return out;
 }
-function _pendingCancel(idx) {
+async function _pendingCancel(idx) {
   if (idx < 0 || idx >= offlineQueue.length) return;
-  offlineQueue.splice(idx, 1);
-  saveQueue();
+  const id = offlineQueue[idx].id;
+  await _mutateQueue(current => { const at = current.findIndex(q => q.id === id); if (at >= 0) current.splice(at, 1); });
   updateConnectionStatus();
   _peekMessagesRender();
   showToast('Removed from queue');
@@ -16049,13 +16648,13 @@ function closeFiltersModal() {
 const _PROVIDER_LABELS = { claude: 'Claude', codex: 'Codex', gemini: 'Gemini', iterm2: 'iTerm2' };
 const _MODEL_LABELS = { opus: 'Opus', sonnet: 'Sonnet', haiku: 'Haiku', fable: 'Fable', gpt: 'GPT', gemini: 'Gemini', 'o-series': 'o-series' };
 function _mLabel(x){ return _MODEL_LABELS[x] || (x.charAt(0).toUpperCase()+x.slice(1)); }
-const _STATUS_LABELS = { working: 'Working', waiting: 'Needs input', rate_limited: 'Rate limited', api_error: 'API error', idle: 'Idle', stopped: 'Stopped' };
+const _STATUS_LABELS = { working: 'Working', blocked: 'Blocked', waiting: 'Needs input', rate_limited: 'Rate limited', api_error: 'API error', idle: 'Idle', stopped: 'Stopped' };
 function renderFilterOptions() {
   const live = sessions.filter(s => !s.archived);
   // Status chips — fixed order, only states that exist (or are selected)
   const sEl = document.getElementById('filter-statuses');
   if (sEl) {
-    const opts = ['working', 'waiting', 'rate_limited', 'api_error', 'idle', 'stopped']
+    const opts = ['working', 'blocked', 'waiting', 'rate_limited', 'api_error', 'idle', 'stopped']
       .filter(k => filterStatuses.has(k) || live.some(x => _sessStatusKey(x) === k));
     sEl.innerHTML = opts.length ? opts.map(k => {
       const on = filterStatuses.has(k);
@@ -22112,6 +22711,9 @@ let _boardDragId = null;
 let boardViewMode = localStorage.getItem('amux_board_view') || 'status';
 if (boardViewMode === 'session') boardViewMode = 'worker';
 let boardOwnerFilter = localStorage.getItem('amux_board_owner') || 'human';
+// Smart Board: derived display-status data, fetched from /api/board/derived.
+let _smartBoardData = null;
+let _smartBoardFetching = false;
 let _sessionGroupCollapsed = JSON.parse(localStorage.getItem('amux_board_collapsed') || '{}');
 let _boardWorkerDensityBeaconSent = false;
 let _tagGroupCollapsed = JSON.parse(localStorage.getItem('amux_status_collapsed') || '{}');
@@ -22169,6 +22771,38 @@ const _CUSTOM_STATUS_PALETTE_LIGHT = [
   {bg:'rgba(5,80,174,0.1)',color:'#0550ae',border:'rgba(5,80,174,0.3)',dot:'#0550ae'},
   {bg:'rgba(180,30,120,0.1)',color:'#99286e',border:'rgba(180,30,120,0.3)',dot:'#99286e'},
 ];
+// Derived display-status styles (Smart Board view). These augment the
+// built-in statuses for the computed categories the /api/board/derived
+// endpoint produces.
+const _DERIVED_STATUS_STYLE = {
+  'aged-needsyou':      {bg:'rgba(248,81,73,0.18)',color:'var(--red)',border:'rgba(248,81,73,0.5)',dot:'var(--red)'},
+  'stalled':            {bg:'rgba(210,153,34,0.22)',color:'var(--yellow)',border:'rgba(210,153,34,0.55)',dot:'var(--yellow)'},
+  'stale':              {bg:'rgba(139,148,158,0.15)',color:'rgba(139,148,158,0.7)',border:'rgba(139,148,158,0.35)',dot:'rgba(139,148,158,0.5)'},
+  'verified-candidate': {bg:'rgba(45,212,191,0.12)',color:'#2dd4bf',border:'rgba(45,212,191,0.35)',dot:'#2dd4bf'},
+  'unblocked':          {bg:'rgba(88,166,255,0.18)',color:'var(--accent)',border:'rgba(88,166,255,0.45)',dot:'var(--accent)'},
+};
+const _DERIVED_STATUS_STYLE_LIGHT = {
+  'aged-needsyou':      {bg:'rgba(207,34,46,0.12)',color:'#cf222e',border:'rgba(207,34,46,0.4)',dot:'#cf222e'},
+  'stalled':            {bg:'rgba(154,103,0,0.15)',color:'#7d4e00',border:'rgba(154,103,0,0.4)',dot:'#7d4e00'},
+  'stale':              {bg:'rgba(101,109,118,0.12)',color:'#57606a',border:'rgba(101,109,118,0.3)',dot:'#57606a'},
+  'verified-candidate': {bg:'rgba(13,148,136,0.12)',color:'#0d9488',border:'rgba(13,148,136,0.35)',dot:'#0d9488'},
+  'unblocked':          {bg:'rgba(9,105,218,0.12)',color:'#0550ae',border:'rgba(9,105,218,0.35)',dot:'#0550ae'},
+};
+const _DERIVED_STATUS_LABELS = {
+  'aged-needsyou': 'Aged Needs-You (>14d)',
+  'stalled': 'Stalled (session idle)',
+  'stale': 'Stale (auto, no activity >72h)',
+  'verified-candidate': 'Verified Candidate (has evidence)',
+  'unblocked': 'Unblocked (deps resolved)',
+};
+
+function derivedStatusStyle(id) {
+  const light = document.body.classList.contains('light');
+  const derived = light ? _DERIVED_STATUS_STYLE_LIGHT[id] : _DERIVED_STATUS_STYLE[id];
+  if (derived) return derived;
+  return statusStyle(id);
+}
+
 function statusStyle(id) {
   const light = document.body.classList.contains('light');
   const builtIn = light ? _BUILT_IN_STATUS_STYLE_LIGHT[id] : _BUILT_IN_STATUS_STYLE[id];
@@ -24685,7 +25319,13 @@ async function fetchBoard() {
       fetch(API + '/api/board/statuses'),
       fetch(API + '/api/board/session-gates'),
     ]);
+    for (const response of [r, rs, rsg]) {
+      if (!response.ok && response.status !== 304) throw new Error(await _apiErrText(response));
+    }
     const statusData = await rs.json();
+    if (!Array.isArray(statusData)) throw new Error('Board statuses response is invalid');
+    _boardReadError = '';
+    updateConnectionStatus();
     // r.ok FIRST: a 404 body {"error":"not found"} IS an object, so the typeof
     // guard below happily assigned it and sessionGates became {error:"not found"} —
     // not merely empty, POISONED with a bogus scope key, while this endpoint 404'd
@@ -24721,8 +25361,7 @@ async function fetchBoard() {
     // the SHELL (and its injected token) is stale, so refresh it once.
     if (!Array.isArray(data)) {
       if (r.status === 401) _staleShellRecover();
-      console.warn('board fetch returned non-array (status ' + r.status + ') — keeping previous set');
-      return;
+      throw new Error('Board response is invalid');
     }
     if (snapshotEpoch !== _boardSnapshotEpoch) {
       console.info('board poll completed behind a newer stream snapshot; discarded');
@@ -24761,7 +25400,14 @@ async function fetchBoard() {
       renderBoard();
       _nudgeWorkersOnBoardChange();
     }
+    // Seed CDC cursor so subsequent invalidations can use granular updates
+    try {
+      const cr = await fetch(API + '/api/board/changes?since_seq=0&limit=1');
+      if (cr.ok) { const cd = await cr.json(); if (cd.cursor) _cdcSeq = cd.cursor; }
+    } catch (e2) {}
   } catch(e) {
+    _boardReadError = String(e.message || e);
+    updateConnectionStatus();
     console.error('fetch board:', e);
     consecutiveFailures++;
     if (consecutiveFailures >= 2 || navigator.onLine === false) {
@@ -26285,7 +26931,85 @@ let _prevCardRects = {};
 function setBoardView(mode) {
   boardViewMode = mode;
   localStorage.setItem('amux_board_view', mode);
+  if (mode === 'smart') _smartBoardData = null;
   renderBoard();
+}
+
+async function _fetchSmartBoard() {
+  try {
+    const resp = await fetch('/api/board/derived');
+    if (!resp.ok) throw new Error('derived endpoint returned ' + resp.status);
+    const data = await resp.json();
+    _smartBoardData = data;
+  } catch (e) {
+    console.error('Smart board fetch failed:', e);
+    _smartBoardData = null;
+  }
+}
+
+function _renderSmartBoard(container, visibleStored) {
+  if (!_smartBoardData || !_smartBoardData.items) {
+    container.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">No derived data available.</div>';
+    return;
+  }
+  const visibleIds = new Set(visibleStored.map(i => i.id));
+  const items = _smartBoardData.items.filter(i => visibleIds.has(i.id));
+
+  // Derived status groups in priority display order: attention-needing first
+  const derivedOrder = [
+    'aged-needsyou', 'stalled', 'stale', 'unblocked', 'verified-candidate',
+    'doing', 'review', 'needsyou', 'todo', 'backlog', 'done', 'verified', 'discarded'
+  ];
+  const groups = {};
+  items.forEach(i => {
+    const ds = i.display_status || i.status || 'todo';
+    (groups[ds] = groups[ds] || []).push(i);
+  });
+
+  let html = '';
+  // Show derived-only statuses with a highlight header
+  const derivedSpecial = new Set(['aged-needsyou', 'stalled', 'stale', 'verified-candidate', 'unblocked']);
+  derivedOrder.concat(Object.keys(groups).filter(k => !derivedOrder.includes(k))).forEach(ds => {
+    const g = groups[ds];
+    if (!g || !g.length) return;
+    const isSpecial = derivedSpecial.has(ds);
+    const sty = derivedStatusStyle(ds);
+    const label = _DERIVED_STATUS_LABELS[ds] || ds;
+    const headStyle = isSpecial
+      ? 'display:flex;align-items:center;gap:8px;padding:10px 6px 4px;font-size:0.76rem;font-weight:700;color:' + sty.color + ';text-transform:uppercase;letter-spacing:0.05em;border-left:3px solid ' + sty.dot + ';padding-left:10px;margin-top:6px;'
+      : 'display:flex;align-items:center;gap:8px;padding:10px 6px 4px;font-size:0.74rem;font-weight:600;color:' + sty.color + ';text-transform:uppercase;letter-spacing:0.05em;';
+    html += '<div class="board-list-group-head" style="' + headStyle + '">'
+      + '<span class="board-status-dot" style="background:' + sty.dot + '"></span>' + esc(label)
+      + '<span style="color:var(--dim);font-weight:400;">' + g.length + '</span></div>';
+    html += g.map(i => {
+      let row = _issueRowHTML(i, { showOwner: true });
+      if (isSpecial && i.display_status !== i.status) {
+        const badge = '<span style="font-size:0.65rem;padding:1px 5px;border-radius:3px;background:' + sty.bg + ';color:' + sty.color + ';border:1px solid ' + sty.border + ';margin-left:6px;vertical-align:middle;font-weight:600;">' + esc(i.display_status) + '</span>';
+        row = row.replace('</div>', badge + '</div>');
+      }
+      return row;
+    }).join('');
+  });
+  container.dataset.component = 'board-smart';
+  container.innerHTML = html || '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">Nothing to show.</div>';
+}
+
+function _smartBoardStatsHTML() {
+  if (!_smartBoardData || !_smartBoardData.counts) return '';
+  const c = _smartBoardData.counts;
+  const special = ['aged-needsyou', 'stalled', 'stale', 'verified-candidate', 'unblocked'];
+  let pills = '';
+  for (const key of special) {
+    const n = c[key] || 0;
+    if (n === 0) continue;
+    const sty = derivedStatusStyle(key);
+    const label = _DERIVED_STATUS_LABELS[key] || key;
+    pills += '<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:4px;background:' + sty.bg + ';color:' + sty.color + ';border:1px solid ' + sty.border + ';font-size:0.72rem;font-weight:600;">'
+      + '<span class="board-status-dot" style="background:' + sty.dot + ';width:6px;height:6px;"></span>'
+      + esc(label) + ' <b>' + n + '</b></span>';
+  }
+  if (!pills) return '<div style="padding:6px 8px;font-size:0.75rem;color:var(--dim);">All cards are in their expected status.</div>';
+  return '<div style="display:flex;flex-wrap:wrap;gap:6px;padding:8px 8px 4px;">' + pills + '</div>';
 }
 
 function setBoardOwner(type) {
@@ -26965,9 +27689,11 @@ function renderBoard() {
   var bvS = document.getElementById('bv-session');
   var bvC = document.getElementById('bv-status');
   var bvL = document.getElementById('bv-list');
+  var bvSm = document.getElementById('bv-smart');
   if (bvS) bvS.classList.toggle('active', boardViewMode === 'worker');
   if (bvC) bvC.classList.toggle('active', boardViewMode === 'status');
   if (bvL) bvL.classList.toggle('active', boardViewMode === 'list');
+  if (bvSm) bvSm.classList.toggle('active', boardViewMode === 'smart');
   var boH = document.getElementById('bo-human');
   var boA = document.getElementById('bo-agent');
   if (boH) boH.classList.toggle('active', boardOwnerFilter === 'human');
@@ -27021,6 +27747,26 @@ function renderBoard() {
     container.innerHTML = html || '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">Nothing matches.</div>';
     return;
   }
+
+  if (boardViewMode === 'smart') {
+    container.classList.remove('board-columns');
+    container.classList.add('board-list-mode');
+    if (!_smartBoardData && !_smartBoardFetching) {
+      _smartBoardFetching = true;
+      container.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">Loading derived statuses...</div>';
+      _fetchSmartBoard().then(() => { _smartBoardFetching = false; renderBoard(); }).catch(() => { _smartBoardFetching = false; });
+      return;
+    }
+    if (!_smartBoardData) {
+      container.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">Loading derived statuses...</div>';
+      return;
+    }
+    _renderSmartBoard(container, visible);
+    const _sElSm = document.getElementById('board-stats-mount');
+    if (_sElSm) _sElSm.innerHTML = _smartBoardStatsHTML();
+    return;
+  }
+
   // Mount the progress strip above the columns, over the SAME `visible` set the
   // columns are about to render (AMUX-2506). Fed from `visible` and not from
   // boardItems so it can never describe a different population than the board.
@@ -27562,6 +28308,7 @@ document.addEventListener('change', e => {
 // The SAVE path refuses to write a desc while this is false and the card is
 // known to have one — see the guard in the save handler (AMUX-2840).
 let _bdHydrated = false;
+let _bdLoadedIdentity = null;
 
 function _bdConfigureGo(item) {
   const goBtn = document.getElementById('bd-goto-session');
@@ -27815,13 +28562,16 @@ function _bdRenderMeta(item) {
 /// saving would BLANK the description. This makes the modal read from the one
 /// place that always has it.
 async function _bdHydrate(id) {
+  const generation = _boardDetailOpenGeneration;
+  // Compare controls with the snapshot used when hydration began. A board
+  // poll may update the cache during this GET without changing the editor.
+  const cached = { ...(boardItems.find(item => item.id === id) || {}) };
   try {
     const r = await apiCall(API + '/api/board/' + id);
     if (!r || !r.ok) return false;
     const full = await r.json();
-    if (!full || full.id !== id || boardDetailId !== id) return false;  // modal moved on
+    if (!full || full.id !== id || boardDetailId !== id || generation !== _boardDetailOpenGeneration) return false;  // modal moved on
     const idx = boardItems.findIndex(i => i.id === id);
-    const cached = idx >= 0 ? { ...boardItems[idx] } : {};
     if (idx >= 0) boardItems[idx] = Object.assign({}, boardItems[idx], full);
     const merged = idx >= 0 ? boardItems[idx] : full;
     let draft = _boardDrafts[id];
@@ -27883,6 +28633,7 @@ async function _bdHydrate(id) {
       _tagState['bd'] = [...(full.tags || [])]; _beTagRenderChips('bd'); _beTagInputUpdate('bd');
     }
     _bdHydrated = true;
+    _bdLoadedIdentity = { id, generation, rev: keepLocalDraft ? (draft?.expect_rev ?? cached.rev) : full.rev };
     return true;
   } catch (e) { /* leave unhydrated; the save guard covers it */ return false; }
 }
@@ -27890,6 +28641,8 @@ async function _bdHydrate(id) {
 async function openBoardDetail(id) {
   const detailGeneration = ++_boardDetailOpenGeneration;
   const detailIdentityCurrent = () => detailGeneration === _boardDetailOpenGeneration;
+  _bdHydrated = false;
+  _bdLoadedIdentity = null;
   let item = boardItems.find(i => i.id === id);
   if (!item) {
     // Message history, lineage, and deep links can point at an older terminal
@@ -27927,7 +28680,7 @@ async function openBoardDetail(id) {
   const draft = _boardDrafts[id];
   _bdActiveDirty = false;
   boardDetailStatus = draft ? draft.status : (item.status || 'todo');
-  _bdHydrated = (item.desc !== undefined);
+  _bdHydrated = false;
   _bdHydrate(id);
   const titleEl = document.getElementById('bd-title');
   titleEl.value = _bdDraftField(draft, 'title', item.title);
@@ -27952,9 +28705,9 @@ async function openBoardDetail(id) {
   const dueTimeEl = document.getElementById('bd-due-time');
   if (dueTimeEl) dueTimeEl.value = _bdDraftField(draft, 'due_time', item.due_time || '') || '';
   const gateEl = document.getElementById('bd-gate');
-  if (gateEl) gateEl.value = (Array.isArray(item.gate) ? item.gate : []).join('\n');
+  if (gateEl) gateEl.value = _bdDraftField(draft, 'gate', item.gate || []).join('\n');
   boardDetailTab('preview');
-  _tagState['bd'] = [...(item.tags || [])];
+  _tagState['bd'] = [..._bdDraftField(draft, 'tags', item.tags || [])];
   _beTagRenderChips('bd');
   _beTagInputUpdate('bd');
   _bdRenderMeta(item);
@@ -28120,7 +28873,7 @@ function boardDetailSetStatus(st) {
 
 function closeBoardDetail() {
   // Save unsaved edits as draft
-  if (boardDetailId) {
+  if (boardDetailId && _bdLoadedIdentity?.generation === _boardDetailOpenGeneration) {
     const item = boardItems.find(i => i.id === boardDetailId);
     if (item) {
       const t = (document.getElementById('bd-title').value || '').trim();
@@ -28133,8 +28886,8 @@ function closeBoardDetail() {
       const dueTimeEl2 = document.getElementById('bd-due-time');
       const due_time = dueTimeEl2 ? dueTimeEl2.value : (item.due_time || '');
       // Only save draft if something actually differs from saved state
-      if (t !== (item.title || '') || d !== (item.desc || '') || s !== (item.session || '') || st !== (item.status || 'todo') || due !== (item.due || '') || due_time !== (item.due_time || '')) {
-        _boardDrafts[boardDetailId] = { title: t, desc: d, worker: s, status: st, due, due_time };
+      if (t !== (item.title || '') || d !== (item.desc || '') || s !== (item.session || '') || st !== (item.status || 'todo') || due !== (item.due || '') || due_time !== (item.due_time || '') || _bdActiveDirty) {
+        _boardDrafts[boardDetailId] = { title: t, desc: d, worker: s, status: st, due, due_time, tags: [..._tagState['bd']], gate: (document.getElementById('bd-gate')?.value || '').split('\n').map(v => v.trim()).filter(Boolean), expect_rev: _bdLoadedIdentity.rev };
         _boardDraftsPersist();
       } else {
         delete _boardDrafts[boardDetailId];
@@ -28183,74 +28936,61 @@ function closeBoardDetail() {
   }, {passive: true});
 })();
 
+const _bdSaveRequests = new Set();
 async function boardDetailSave() {
-  if (!boardDetailId) return;
-  const title = document.getElementById('bd-title').value.trim();
-  if (!title) return;
-  const desc = document.getElementById('bd-desc').value.trim();
-
-  // NEVER WRITE AN EMPTY DESC OVER A CARD THAT HAS ONE (AMUX-2840).
-  //
-  // The modal used to fill this textarea from the LIST item. Once the poll
-  // moves to `slim=1` the list carries no desc, so the box would open empty and
-  // this save would blank the card — silently, irreversibly, and it would look
-  // like the board eating people's notes. _bdHydrate normally beats the user to
-  // it, but a slow or failed fetch must not turn into data loss.
-  //
-  // BOTH TERMS BELOW ARE LOAD-BEARING, one per mode, and neither alone is
-  // enough. Measured 2026-08-11: `desc_len` is served ONLY under slim=1, and
-  // `desc` only WITHOUT it — this comment previously claimed desc_len was in
-  // both, which would invite someone to simplify the test down to desc_len and
-  // silently disarm it in full mode, today's default. The failure that follows
-  // is not a crash, it is a blanked description.
-  //
-  // If either says the card has a description and we are about to send an empty
-  // one without having hydrated, refuse and retry the fetch.
-  {
-    const cur = boardItems.find(i => i.id === boardDetailId);
-    const hadDesc = cur && ((cur.desc_len || 0) > 0 || (cur.desc || '').length > 0);
-    if (!_bdHydrated && !desc && hadDesc) {
-      showToast && showToast('Still loading this card — not saving yet');
-      _bdHydrate(boardDetailId);
-      return;
-    }
+  const id = boardDetailId;
+  const generation = _boardDetailOpenGeneration;
+  const identity = _bdLoadedIdentity;
+  if (!id || !_bdHydrated || !identity || identity.id !== id || identity.generation !== generation || !Number.isInteger(identity.rev)) {
+    try { _bdAudit('card-save-refused', {id, generation, loaded_id:identity?.id, loaded_generation:identity?.generation, hydrated:_bdHydrated, verdict:'card_identity_unloaded', measured:true, n_considered:1}); } catch (_) {}
+    showToast('Still loading this card — not saving yet');
+    return false;
   }
-  const sel = document.getElementById('bd-session');
-  const worker = sel ? sel.value : undefined;
-  const gateEl = document.getElementById('bd-gate');
-  const gate = gateEl ? gateEl.value.split('\n').map(s => s.trim()).filter(Boolean) : [];
-  const _cur = boardItems.find(i => i.id === boardDetailId);
-  // Gate: if the status changed to a different status with an effective gate
-  // (using the possibly-just-edited override), confirm before saving.
-  let _gateAck = null;
-  if (_cur && boardDetailStatus !== (_cur.status || 'todo')) {
-    const ok = await _gateConfirm({ ..._cur, gate }, boardDetailStatus);
-    if (!ok) { const el = document.getElementById('bd-save-status'); if (el) el.textContent = ''; return; }
-    _gateAck = ok;
+  const value = key => (document.getElementById(key)?.value || '').trim();
+  const title = value('bd-title');
+  if (!title) return false;
+  if (_bdSaveRequests.has(id)) { showToast('Save already in progress'); return false; }
+  const readForm = () => ({ title: value('bd-title'), desc: value('bd-desc'), status: boardDetailStatus,
+    due: value('bd-due'), due_time: value('bd-due-time'), session: value('bd-session'),
+    tags: [..._tagState['bd']], gate: value('bd-gate').split('\n').map(v => v.trim()).filter(Boolean),
+    expect_rev: identity.rev });
+  const changes = readForm();
+  const submittedForm = JSON.stringify(changes);
+  const submittedDraft = { ...changes };
+  _boardDrafts[id] = submittedDraft;
+  _boardDraftsPersist();
+  _bdSaveRequests.add(id);
+  try {
+  const current = boardItems.find(i => i.id === id);
+  if (current && changes.status !== current.status) {
+    const ack = await _gateConfirm({ ...current, gate: changes.gate }, changes.status);
+    if (!ack) return false;
+    changes.gate_ack = true;
+    if (Array.isArray(ack)) changes.gate_checked = ack;
+  }
+  if (id !== boardDetailId || generation !== _boardDetailOpenGeneration) {
+    _boardDetailIdentityDiscard(id, generation, boardDetailId);
+    return false;
   }
   document.getElementById('bd-save-status').textContent = 'Saving...';
-  const dueInput = document.getElementById('bd-due');
-  const dueTimeInput = document.getElementById('bd-due-time');
-  const changes = { title, desc, status: boardDetailStatus, due: dueInput ? dueInput.value : '', due_time: dueTimeInput ? dueTimeInput.value : '', tags: [..._tagState['bd']], gate };
-  if (worker !== undefined) changes.session = worker;
-  // The server enforces status gates: forward acknowledgement from _gateConfirm.
-  if (_gateAck) { changes.gate_ack = true; if (Array.isArray(_gateAck)) changes.gate_checked = _gateAck; }
-  await updateBoardItem(boardDetailId, changes);
-  delete _boardDrafts[boardDetailId];
-  document.getElementById('bd-save-status').textContent = 'Saved';
-  setTimeout(() => {
-    const el = document.getElementById('bd-save-status');
-    if (el) el.textContent = '';
-  }, 1500);
-  const item = boardItems.find(i => i.id === boardDetailId);
-  if (item) {
-    const meta = document.getElementById('bd-meta');
-    const parts = [];
-    if (item.creator) parts.push('From ' + esc(item.creator));
-    if (item.created) parts.push('Created ' + timeAgo(item.created));
-    if (item.updated && item.updated !== item.created) parts.push('Updated ' + timeAgo(item.updated));
-    if (meta) meta.innerHTML = parts.map(p => '<div class="board-detail-meta-row">' + p + '</div>').join('');
+  const saved = await updateBoardItem(id, changes);
+  if (saved && _boardDrafts[id] === submittedDraft) { delete _boardDrafts[id]; _boardDraftsPersist(); }
+  if (id !== boardDetailId || generation !== _boardDetailOpenGeneration) return saved;
+  const laterForm = readForm();
+  const newerEdits = JSON.stringify(laterForm) !== submittedForm;
+  document.getElementById('bd-save-status').textContent = saved
+    ? (newerEdits ? 'Earlier edit saved — newer changes not saved' : 'Saved')
+    : 'Not saved — draft retained; check Sync';
+  if (saved) {
+    _bdActiveDirty = newerEdits;
+    _bdLoadedIdentity = { id, generation, rev: saved.rev };
   }
+  if (newerEdits) {
+    _boardDrafts[id] = { ...laterForm, expect_rev: saved ? saved.rev : identity.rev };
+    _boardDraftsPersist();
+  }
+  return saved;
+  } finally { _bdSaveRequests.delete(id); }
 }
 
 async function boardDetailDelete() {
@@ -28301,16 +29041,19 @@ async function updateBoardItem(id, changes) {
   if (idx >= 0) { boardItems[idx] = { ...boardItems[idx], ...changes, updated: Math.floor(Date.now() / 1000) }; }
   saveBoardCache();
   renderBoard();
+  if (prev && changes.expect_rev === undefined) changes = { ...changes, expect_rev: prev.rev };
   const r = await apiCall(API + '/api/board/' + id, {
     method: 'PATCH', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(changes)
   });
-  if (r) {
+  if (r && !_isLocallyQueued(r)) {
     const updated = await r.json();
+    if (!updated || updated.id !== id) { _writeError = 'Server returned the wrong card'; updateConnectionStatus(); return false; }
     const idx2 = boardItems.findIndex(i => i.id === id);
     if (idx2 >= 0) boardItems[idx2] = updated;
     saveBoardCache();
     renderBoard();
+    return updated;
   } else if (prev) {
     // Refused (apiCall has already shown the server's own words). Undo the
     // optimistic paint NOW rather than leaving a lie on screen until the next
@@ -28320,6 +29063,7 @@ async function updateBoardItem(id, changes) {
     saveBoardCache();
     renderBoard();
   }
+  return false;
 }
 
 async function deleteBoardItem(id) {
@@ -30259,8 +31003,10 @@ async function _runDeltaSync() {
   try {
     const since = (await _idb.get('last_sync_ts')) || 0;
     const r = await fetch(API + '/api/sync?since=' + since);
-    if (!r.ok) return;
+    if (!r.ok) throw new Error(await _apiErrText(r));
     const data = await r.json();
+    _syncReadError = '';
+    updateConnectionStatus();
     if (data.issues && data.issues.length) {
       // Apply delta to in-memory boardItems
       data.issues.forEach(item => {
@@ -30290,6 +31036,8 @@ async function _runDeltaSync() {
     else if (activeView === 'calendar') renderCalendar();
     _dbgLog('Delta sync: +' + (data.issues || []).length + ' issue changes');
   } catch(e) {
+    _syncReadError = String(e.message || e);
+    updateConnectionStatus();
     _dbgLog('Delta sync failed: ' + e.message);
   }
 }
@@ -30307,6 +31055,51 @@ let _pollTimer = null;
 let _invBoardTimer = null;
 let _invSessTimer = null;
 let _invMessagesTimer = null;
+let _cdcSeq = 0;
+async function _cdcBoardUpdate() {
+  if (!_cdcSeq) { fetchBoard(); return; }
+  try {
+    const r = await fetch(API + '/api/board/changes?since_seq=' + _cdcSeq + '&limit=500');
+    if (!r.ok) { fetchBoard(); return; }
+    const data = await r.json();
+    const changes = data.changes || [];
+    if (data.cursor) _cdcSeq = data.cursor;
+    if (!changes.length) return;
+    // For each changed row_id, refetch that single card and patch boardItems
+    const ids = [...new Set(changes.map(c => c.row_id))];
+    let needsFullFetch = false;
+    for (const id of ids) {
+      const op = changes.filter(c => c.row_id === id).pop();
+      if (op && op.operation === 'DELETE') {
+        boardItems = boardItems.filter(item => item.id !== id);
+        _boardSnapshotEpoch++;
+        continue;
+      }
+      try {
+        const cr = await fetch(API + '/api/board/' + encodeURIComponent(id));
+        if (cr.status === 404) {
+          boardItems = boardItems.filter(item => item.id !== id);
+          _boardSnapshotEpoch++;
+          continue;
+        }
+        if (!cr.ok) { needsFullFetch = true; continue; }
+        const card = await cr.json();
+        if (!card || !card.id) { needsFullFetch = true; continue; }
+        const idx = boardItems.findIndex(item => item.id === card.id);
+        if (idx >= 0) { boardItems[idx] = card; }
+        else { boardItems.push(card); }
+        _boardSnapshotEpoch++;
+      } catch (e) { needsFullFetch = true; }
+    }
+    if (needsFullFetch) { fetchBoard(); return; }
+    lastBoardJSON = JSON.stringify(boardItems);
+    _cacheBoardJSON(lastBoardJSON);
+    if (activeView === 'board') renderBoard();
+    else if (activeView === 'calendar') renderCalendar();
+    _nudgeWorkersOnBoardChange();
+  } catch (e) { fetchBoard(); }
+}
+
 function connectSSE() {
   if (_sseFallback || _sse) return;
   _sse = new EventSource(_authUrl(API + '/api/events'));
@@ -30417,7 +31210,7 @@ function connectSSE() {
           // Coalesced per key so an event burst is one fetch.
           if (key === 'board') {
             clearTimeout(_invBoardTimer);
-            _invBoardTimer = setTimeout(fetchBoard, 400);
+            _invBoardTimer = setTimeout(_cdcBoardUpdate, 400);
           }
           if (key === 'sessions') {
             clearTimeout(_invSessTimer);
@@ -30501,6 +31294,10 @@ function enablePollingFallback() {
 //      if we look stale, otherwise just kick a fetch.
 const _SSE_STALE_MS = 18000;     // declared zombie if no data this long
 const _SSE_REFRESH_MS = 4000;    // visibility-resume refresh threshold
+// Nothing at all from the server for this long means offline, however healthy
+// every other signal looks. Above _SSE_STALE_MS plus a reconnect and a poll
+// cycle, so only real silence reaches it.
+const _NO_CONTACT_MS = 35000;
 
 function _sseLooksStale() {
   // Fall back to page load when nothing has arrived yet (AC-275). Without this the
@@ -30582,6 +31379,32 @@ setInterval(() => {
   if (_sseFallback) return;
   if (window._peekEmbed) return;
   if (_sseLooksStale()) _forceSseReconnect('watchdog stale ' + Math.round((Date.now() - _lastDataTime)/1000) + 's');
+  // A HANG MUST EVENTUALLY COUNT AS A FAILURE.
+  //
+  // `consecutiveFailures` only moves when a fetch RETURNS a failure, and the
+  // offline latch needs 2 of them. A dead tunnel returns nothing at all: the
+  // request is accepted by the local stack and never answered, `navigator
+  // .onLine` stays true because the DEVICE still has a network, and the SSE
+  // reconnect above quietly fails the same way. So every input that could say
+  // "stale" reads healthy, and the badge sits on `Polling` — claiming a
+  // fallback that is fetching — while the last render stays on screen.
+  //
+  // Reported by Ethan 2026-09-08 over Tailscale: the client "just stores
+  // everything that's been cached and presents it as if it's new". Measured in
+  // e2e/tunnel-blackhole.spec.ts: with every /api/ request accepted and never
+  // answered and the open stream severed, the indicator read `Polling` for the
+  // full 48s window and never changed.
+  //
+  // Silence is the only evidence a hang produces, so latch on silence. This is
+  // deliberately generous — well past the 18s zombie threshold and a poll cycle
+  // behind it — so an ordinary slow response can never trip it.
+  if (online && (Date.now() - (_lastDataTime || _pageLoadTime)) > _NO_CONTACT_MS) {
+    setOnline(false);
+  }
+  // Repaint every tick. updateConnectionStatus ran on events, and a hung tunnel
+  // produces none of them, so a badge could go stale and keep saying whatever
+  // it last said.
+  updateConnectionStatus();
 }, 5000);
 
 if (window._peekEmbed) {
@@ -30772,9 +31595,8 @@ if ('serviceWorker' in navigator) {
 // Dual-write drafts and queue to both localStorage and IndexedDB
 function persistOfflineData() {
   localStorage.setItem('amux_drafts', JSON.stringify(drafts));
-  saveQueue();
   _idb.set('drafts', drafts);
-  _idb.set('offline_queue', offlineQueue);
+  _idb.set('offline_queue', _readQueue());
 }
 
 // On startup, restore from IndexedDB if localStorage is empty (iOS purge recovery)
@@ -30794,10 +31616,11 @@ _peekIndexLoad().then(() => {
 setInterval(() => { try { _offlinePrefetch(false); } catch(e) {} }, 10 * 60 * 1000);
 window.addEventListener('online', () => setTimeout(() => { try { _offlinePrefetch(false); } catch(e) {} }, 4000));
 
-_idb.get('offline_queue').then(val => {
-  if (val && !offlineQueue.length && val.length) {
-    offlineQueue = val;
-    saveQueue();
+_idb.get('offline_queue').then(async val => {
+  if (val && localStorage.getItem('amux_offline_queue') === null && val.length) {
+    await _mutateQueue(current => {
+      if (localStorage.getItem('amux_offline_queue') === null) current.push(...val);
+    });
     updateConnectionStatus();
   }
   // Auto-retry queued ops on startup if online (single replayer: page-side only)
@@ -31665,6 +32488,17 @@ function toggleSettings() {
     }
     // Render connections
     _renderInstanceSwitcher();
+    // Owner access link — only shown to the owner (who has _authToken)
+    const ownerLinkWrap = document.getElementById('settings-owner-link');
+    if (ownerLinkWrap) {
+      if (_authToken) {
+        ownerLinkWrap.style.display = '';
+        const inp = document.getElementById('settings-owner-link-url');
+        if (inp) inp.value = location.origin + '/?_token=' + _authToken;
+      } else {
+        ownerLinkWrap.style.display = 'none';
+      }
+    }
     // Populate the notes-folder row
     loadCommitGuard();
     loadTaskGuard();
@@ -32270,10 +33104,40 @@ async function saveTaskGuard(enabled) {
 }
 
 // ── Team / Org / Invites ──────────────────────────────────────────────────────
+let _workspaceTeams = [];
+
+function _workspaceTeamScope(team) {
+  if (!team || team.scope_level === 'global') return 'Global · all workers';
+  return (team.scope_level === 'group' ? 'Group · ' : 'Worker · ') + (team.scope_name || 'not set');
+}
+
+function _workspaceTeamOptions(selected) {
+  return _workspaceTeams.map(team => `<option value="${esc(team.id)}"${team.id === selected ? ' selected' : ''}>${esc(team.name)} — ${esc(_workspaceTeamScope(team))}</option>`).join('');
+}
+
 async function loadTeamSection() {
   try {
     const list = document.getElementById('settings-members-list');
-    if (!list) return;
+    const teamsList = document.getElementById('settings-teams-list');
+    if (!list || !teamsList) return;
+
+    const inviteButton = document.getElementById('settings-team-invite');
+    const createButton = document.getElementById('settings-team-create');
+    const orgWrap = document.getElementById('settings-org-name-wrap');
+    if (_localMemberEmail) {
+      if (inviteButton) inviteButton.style.display = 'none';
+      if (createButton) createButton.style.display = 'none';
+      if (orgWrap) orgWrap.style.display = 'none';
+      const scope = _localMemberScope || {level:'global', name:''};
+      const access = scope.level === 'global' ? 'Global workspace access' :
+        (scope.level === 'group' ? 'Group: ' : 'Worker: ') + (scope.name || '—');
+      teamsList.innerHTML = `<div style="padding:5px 7px;border:1px solid var(--border);border-radius:7px;"><div style="color:var(--text);font-weight:600;">${esc(_localMemberTeam?.name || 'Legacy access')}</div><div style="font-size:0.68rem;color:var(--dim);">${esc(access)}</div></div>`;
+      list.innerHTML = `<div style="padding:4px 0;"><div style="color:var(--text);">${esc(_localMemberEmail)}</div><div style="font-size:0.72rem;color:var(--dim);margin-top:3px;">Membership is managed by the server owner</div></div>`;
+      return;
+    }
+    if (inviteButton) inviteButton.style.display = '';
+    if (createButton) createButton.style.display = '';
+    if (orgWrap) orgWrap.style.display = '';
 
     if (_cloudEmail) {
       // Cloud mode: use gateway-level members
@@ -32303,30 +33167,41 @@ async function loadTeamSection() {
             <button onclick="deleteInvite('${esc(inv.token)}')" style="background:none;border:none;color:var(--dim);cursor:pointer;font-size:0.65rem;">revoke</button>
           </div>`).join('');
       }
+      teamsList.innerHTML = '<span>Cloud workspace roles are managed by the gateway.</span>';
       list.innerHTML = html || '<span style="color:var(--dim);font-size:0.75rem;">No members yet — invite someone!</span>';
     } else {
       // Local mode: use container-level org
-      const [orgRes, membersRes, invitesRes] = await Promise.all([
-        fetch('/api/org'), fetch('/api/org/members'), fetch('/api/org/invites')
+      const [orgRes, teamsRes, membersRes, invitesRes] = await Promise.all([
+        fetch('/api/org'), fetch('/api/org/teams'), fetch('/api/org/members'), fetch('/api/org/invites')
       ]);
       const org = await orgRes.json();
+      _workspaceTeams = teamsRes.ok ? await teamsRes.json() : [];
       const members = await membersRes.json();
       const invites = invitesRes.ok ? await invitesRes.json() : [];
       const nameEl = document.getElementById('settings-org-name');
       if (nameEl && nameEl !== document.activeElement) nameEl.value = org.name || '';
+      teamsList.innerHTML = _workspaceTeams.length ? _workspaceTeams.map(team => `
+        <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;padding:5px 7px;border:1px solid var(--border);border-radius:7px;">
+          <div style="min-width:0;"><div style="color:var(--text);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(team.name)}</div>
+            <div style="font-size:0.67rem;color:var(--dim);">${esc(_workspaceTeamScope(team))} · ${Number(team.member_count || 0)} member${Number(team.member_count || 0) === 1 ? '' : 's'}</div></div>
+          ${team.id === 'team_global' ? '' : `<button class="btn" data-team-edit="${esc(team.id)}" onclick="openTeamEditor(this.dataset.teamEdit)" style="font-size:0.65rem;padding:2px 7px;">Edit</button>`}
+        </div>`).join('') : '<span>No teams configured.</span>';
       let html = '';
       if (members.length) {
         html += members.map(m => `
           <div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;border-bottom:1px solid var(--border);">
             <span>${esc(m.name || m.email)}</span>
-            <span style="color:var(--dim);font-size:0.7rem;">${m.role}</span>
+            <span style="display:flex;align-items:center;gap:7px;color:var(--dim);font-size:0.7rem;">
+              ${esc(m.team_name || 'Legacy access')}
+              <button class="btn" data-member-scope="${esc(m.id)}" data-email="${esc(m.email || '')}" data-team="${esc(m.team_id || '')}" onclick="openMemberScope(this.dataset.memberScope,this.dataset.email,this.dataset.team)" style="font-size:0.64rem;padding:1px 6px;">change</button>
+            </span>
           </div>`).join('');
       }
       if (invites.length) {
         html += '<div style="margin-top:4px;font-size:0.68rem;color:var(--dim);">Pending invites:</div>';
         html += invites.map(inv => `
           <div style="display:flex;justify-content:space-between;align-items:center;padding:2px 0;">
-            <span style="font-size:0.72rem;color:var(--dim);">${esc(inv.email || 'Anyone with link')} · expires ${new Date(inv.expires_at*1000).toLocaleDateString()}</span>
+            <span style="font-size:0.72rem;color:var(--dim);">${esc(inv.email || 'Anyone with link')} → ${esc(inv.team_name || 'Legacy access')} · expires ${new Date(inv.expires_at*1000).toLocaleDateString()}</span>
             <button onclick="deleteInvite('${esc(inv.token)}')" style="background:none;border:none;color:var(--dim);cursor:pointer;font-size:0.65rem;">revoke</button>
           </div>`).join('');
       }
@@ -32350,41 +33225,194 @@ async function saveOrgName(val) {
   await fetch('/api/org', {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name: val})});
 }
 
+function _copyOwnerLink() {
+  const inp = document.getElementById('settings-owner-link-url');
+  if (!inp) return;
+  navigator.clipboard.writeText(inp.value).then(
+    () => showToast('Owner link copied'),
+    () => { inp.select(); showToast('Select and copy manually'); }
+  );
+}
+
 async function openTeamInvite() {
   closeSettings();
-  const email = await showPrompt('Invite by email (optional)', 'person@example.com');
-  if (email === null) return;
-  let res;
-  try {
-    res = await fetch('/api/org/invites', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email})});
-  } catch (e) {
-    showAlert('Failed to create invite: network error');
+  if (!_workspaceTeams.length) {
+    const response = await fetch('/api/org/teams').catch(() => null);
+    _workspaceTeams = response?.ok ? await response.json().catch(() => []) : [];
+  }
+  if (!_workspaceTeams.length) {
+    showToast('Teams are still unavailable — reopen Workspace access and try again');
     return;
   }
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) { showAlert('Failed to create invite: ' + (data.error || 'HTTP ' + res.status)); return; }
-  if (!data.url) { showAlert('Failed to create invite: ' + (data.error || 'unknown error')); return; }
-  // Show modal with copyable link
+  const modal = _workspaceAccessModal(`<h3 style="margin:0 0 8px;font-size:1rem;">Invite to workspace</h3>
+    <p style="color:var(--dim);font-size:0.78rem;margin:0 0 14px;">The invite joins one team. That team’s scope controls access.</p>
+    <label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Email (optional)</label>
+    <input id="team-invite-email" type="email" placeholder="person@example.com" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;margin-bottom:13px;">
+    <label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Team</label>
+    <select id="invite-team-id" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;">${_workspaceTeamOptions('team_global')}</select>
+    <div id="team-scope-error" style="color:var(--red,#f66);font-size:0.75rem;margin-top:10px;"></div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:18px;"><button class="btn" data-modal-cancel>Cancel</button><button id="team-scope-submit" class="btn primary">Create invite</button></div>`);
+  const submit = modal.querySelector('#team-scope-submit');
+  submit.addEventListener('click', async () => {
+    const email = (modal.querySelector('#team-invite-email')?.value || '').trim();
+    const team_id = modal.querySelector('#invite-team-id').value;
+    submit.disabled = true;
+    submit.textContent = 'Creating…';
+    let res;
+    try {
+      res = await fetch('/api/org/invites', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email, team_id})});
+    } catch (e) {
+      _teamScopeError(modal, 'Network error');
+      submit.disabled = false;
+      submit.textContent = 'Create invite';
+      return;
+    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.url) {
+      _teamScopeError(modal, data.error || 'HTTP ' + res.status);
+      submit.disabled = false;
+      submit.textContent = 'Create invite';
+      return;
+    }
+    _renderInviteLink(modal, data);
+  });
+}
+
+function _workspaceAccessModal(html) {
   const modal = document.createElement('div');
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;z-index:9999;padding:12px;';
+  modal.innerHTML = `<div style="background:var(--bg2,#1a1a1a);border:1px solid var(--border,#333);border-radius:12px;padding:24px;max-width:500px;width:100%;box-sizing:border-box;max-height:calc(100dvh - 24px);overflow:auto;">${html}</div>`;
+  document.body.appendChild(modal);
+  modal.addEventListener('click', event => { if (event.target === modal) modal.remove(); });
+  modal.querySelector('[data-modal-cancel]')?.addEventListener('click', () => modal.remove());
+  return modal;
+}
+
+function openTeamEditor(teamId) {
+  closeSettings();
+  const team = _workspaceTeams.find(value => value.id === teamId) || null;
+  const modal = _teamScopeDialog(team ? 'Edit team' : 'Create team', '', team ? team.scope_level : 'global', team ? team.scope_name : '', 'Save team', true);
+  const heading = modal.querySelector('h3');
+  if (heading) heading.insertAdjacentHTML('afterend', `<label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Team name</label><input id="team-name" value="${esc(team ? team.name : '')}" placeholder="e.g. TubeScience" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;margin-bottom:13px;">`);
+  if (team) {
+    const actions = modal.querySelector('#team-scope-submit').parentElement;
+    actions.insertAdjacentHTML('afterbegin', '<button id="team-delete" class="btn" style="margin-right:auto;color:var(--red,#f66);">Delete</button>');
+    modal.querySelector('#team-delete').onclick = async () => {
+      const response = await fetch('/api/org/teams/' + encodeURIComponent(team.id), {method:'DELETE'}).catch(() => null);
+      const data = response ? await response.json().catch(() => ({})) : {};
+      if (!response || !response.ok) { _teamScopeError(modal, data.error || 'Could not delete team'); return; }
+      modal.remove(); showToast('Team deleted'); toggleSettings(); loadTeamSection();
+    };
+  }
+  modal.querySelector('#team-scope-submit').onclick = async () => {
+    const scope_level = modal.querySelector('#team-scope-level').value;
+    const scope_name = scope_level === 'global' ? '' : modal.querySelector('#team-scope-name').value;
+    const name = modal.querySelector('#team-name').value.trim();
+    const response = await fetch(team ? '/api/org/teams/' + encodeURIComponent(team.id) : '/api/org/teams', {
+      method:team ? 'PATCH' : 'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name,scope_level,scope_name})
+    }).catch(() => null);
+    const data = response ? await response.json().catch(() => ({})) : {};
+    if (!response || !response.ok) { _teamScopeError(modal, data.error || 'Could not save team'); return; }
+    modal.remove(); showToast(team ? 'Team updated' : 'Team created'); toggleSettings(); loadTeamSection();
+  };
+}
+
+function _teamScopeTargets(level, current) {
+  if (level === 'global') return [];
+  const fleet = (typeof sessions !== 'undefined' && Array.isArray(sessions)) ? sessions : [];
+  let values = level === 'worker'
+    ? fleet.map(s => s.name).filter(Boolean)
+    : fleet.flatMap(s => Array.isArray(s.tags) ? s.tags : []).filter(Boolean);
+  values = [...new Set(values)].sort((a,b) => a.localeCompare(b));
+  if (current && !values.includes(current)) values.unshift(current);
+  return values;
+}
+
+function _teamScopeDialog(title, email, level, name, submitLabel, hideEmail) {
+  const modal = document.createElement('div');
+  modal.id = 'team-scope-modal';
   modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;z-index:9999;';
   modal.innerHTML = `<div style="background:var(--bg2,#1a1a1a);border:1px solid var(--border,#333);border-radius:12px;padding:28px;max-width:480px;width:90%;box-sizing:border-box;max-height:min(90dvh,calc(100dvh - 24px));overflow-y:auto;overscroll-behavior:contain;">
-    <h3 style="margin:0 0 8px;font-size:1rem;">Invite to workspace</h3>
-    <p style="color:var(--dim);font-size:0.82rem;margin:0 0 14px;">Share this link. It expires in 7 days.</p>
-    <div style="display:flex;gap:8px;">
-      <input id="invite-link-input" type="text" value="${esc(data.url)}" readonly
-        style="flex:1;padding:8px 10px;border-radius:6px;border:1px solid var(--border,#333);background:var(--bg,#111);color:inherit;font-size:0.8rem;min-width:0;">
-      <button onclick="(function(){var el=document.getElementById('invite-link-input');el.select();navigator.clipboard.writeText(el.value).then(()=>{this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500)})}).call(this)"
-        style="padding:8px 14px;border-radius:6px;background:var(--accent,#a78bfa);color:#000;border:none;cursor:pointer;font-weight:600;white-space:nowrap;">Copy</button>
-    </div>
-    <div style="margin-top:16px;text-align:right;">
-      <button onclick="this.closest('div[style*=fixed]').remove()"
-        style="padding:6px 18px;border-radius:6px;background:var(--bg3,#222);border:1px solid var(--border,#333);color:#ddd;cursor:pointer;">Done</button>
+    <h3 style="margin:0 0 8px;font-size:1rem;">${esc(title)}</h3>
+    ${hideEmail ? '' : email ? `<p style="color:var(--dim);font-size:0.82rem;margin:0 0 14px;">${esc(email)}</p>` : `<label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Email (optional)</label><input id="team-invite-email" type="email" placeholder="person@example.com" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;margin-bottom:13px;">`}
+    <label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Access level</label>
+    <select id="team-scope-level" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;">
+      <option value="global">Global — every worker and card</option><option value="group">Group — workers tagged in one group</option><option value="worker">Worker — one worker only</option>
+    </select>
+    <div id="team-scope-target-wrap" style="margin-top:13px;display:none;"><label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Target</label><select id="team-scope-name" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;"></select></div>
+    <div id="team-scope-error" style="color:var(--red,#f66);font-size:0.75rem;margin-top:10px;"></div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:18px;">
+      <button id="team-scope-cancel" class="btn">Cancel</button>
+      <button id="team-scope-submit" class="btn primary">${esc(submitLabel)}</button>
     </div>
   </div>`;
   document.body.appendChild(modal);
   modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
+  modal.querySelector('#team-scope-cancel').addEventListener('click', () => modal.remove());
+  const levelEl = modal.querySelector('#team-scope-level');
+  const targetWrap = modal.querySelector('#team-scope-target-wrap');
+  const targetEl = modal.querySelector('#team-scope-name');
+  const refresh = () => {
+    const values = _teamScopeTargets(levelEl.value, name);
+    targetWrap.style.display = levelEl.value === 'global' ? 'none' : '';
+    targetEl.innerHTML = values.map(value => `<option value="${esc(value)}">${esc(value)}</option>`).join('');
+    if (name && values.includes(name)) targetEl.value = name;
+    const submit = modal.querySelector('#team-scope-submit');
+    submit.disabled = levelEl.value !== 'global' && values.length === 0;
+    _teamScopeError(modal, values.length || levelEl.value === 'global' ? '' : 'Create or tag a worker before granting this scope.');
+  };
+  levelEl.value = level || 'global';
+  levelEl.addEventListener('change', () => { name = ''; refresh(); });
+  refresh();
+  setTimeout(() => modal.querySelector('#team-invite-email, #team-scope-level')?.focus(), 0);
+  return modal;
+}
+
+function _teamScopeError(modal, message) {
+  const el = modal.querySelector('#team-scope-error');
+  if (el) el.textContent = message || '';
+}
+
+function _renderInviteLink(modal, data) {
+  modal.firstElementChild.innerHTML = `<h3 style="margin:0 0 8px;font-size:1rem;">Invite ready</h3>
+    <p style="color:var(--dim);font-size:0.82rem;margin:0 0 14px;">${esc(data.team_name || 'Team')} · ${esc(_workspaceTeamScope(data))} · expires in 7 days.</p>
+    <div style="display:flex;gap:8px;"><input id="invite-link-input" type="text" value="${esc(data.url)}" readonly style="flex:1;padding:8px 10px;border-radius:6px;border:1px solid var(--border,#333);background:var(--bg,#111);color:inherit;font-size:0.8rem;min-width:0;"><button id="invite-copy-button" class="btn primary">Copy</button></div>
+    <div style="margin-top:16px;text-align:right;"><button id="invite-done-button" class="btn">Done</button></div>`;
+  modal.querySelector('#invite-copy-button').addEventListener('click', async e => {
+    const input = modal.querySelector('#invite-link-input');
+    input.select();
+    await navigator.clipboard.writeText(input.value).catch(() => {});
+    e.currentTarget.textContent = 'Copied!';
+  });
+  modal.querySelector('#invite-done-button').addEventListener('click', () => modal.remove());
   // Auto-copy
   setTimeout(() => { try { navigator.clipboard.writeText(data.url); } catch(e) {} }, 100);
+}
+
+async function openMemberScope(id, email, teamId) {
+  const modal = _workspaceAccessModal(`<h3 style="margin:0 0 8px;font-size:1rem;">Change member team</h3>
+    <p style="color:var(--dim);font-size:0.82rem;margin:0 0 14px;">${esc(email)}</p>
+    <label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Team</label>
+    <select id="member-team-id" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;">${_workspaceTeamOptions(teamId)}</select>
+    <div id="team-scope-error" style="color:var(--red,#f66);font-size:0.75rem;margin-top:10px;"></div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:18px;"><button class="btn" data-modal-cancel>Cancel</button><button id="team-scope-submit" class="btn primary">Save team</button></div>`);
+  const submit = modal.querySelector('#team-scope-submit');
+  submit.addEventListener('click', async () => {
+    const team_id = modal.querySelector('#member-team-id').value;
+    submit.disabled = true;
+    const response = await fetch('/api/org/members/' + encodeURIComponent(id), {
+      method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({team_id})
+    }).catch(() => null);
+    const data = response ? await response.json().catch(() => ({})) : {};
+    if (!response || !response.ok) {
+      _teamScopeError(modal, data.error || 'Failed to save access');
+      submit.disabled = false;
+      return;
+    }
+    modal.remove();
+    showToast('Member access updated');
+    loadTeamSection();
+  });
 }
 
 // ── Billing ─────────────────────────────────────────────────────────────────
@@ -37615,6 +38643,87 @@ async function _bwNewProfile() {
     const sel = document.getElementById('bw-profile');
     if (sel) sel.value = d.profile;
   } catch(e) { showToast('Could not create profile'); }
+}
+
+async function _bwImportProfile() {
+  _bwStatus('Scanning for browsers...');
+  let sources;
+  try {
+    const r = await fetch('/api/browser/import/discover');
+    const d = await r.json();
+    sources = d.sources || [];
+  } catch(e) { _bwStatus('Import scan failed: ' + e); return; }
+
+  if (!sources.length) {
+    showToast('No browsers with importable profiles found on this machine');
+    _bwStatus('');
+    return;
+  }
+  _bwStatus('');
+
+  // Build the dialog HTML
+  var html = '<div style="max-height:340px;overflow-y:auto;margin-bottom:12px;">';
+  html += '<div style="font-size:0.78rem;color:var(--dim);margin-bottom:10px;">Select a browser profile to import cookies from.</div>';
+
+  // Radio list: one selection
+  var idx = 0;
+  for (var i = 0; i < sources.length; i++) {
+    var src = sources[i];
+    html += '<div style="margin-bottom:8px;"><div style="font-weight:600;font-size:0.85rem;margin-bottom:4px;">' + esc(src.name);
+    if (src.cookie_support === 'partial') html += ' <span style="color:var(--warn);font-size:0.72rem;">(partial support)</span>';
+    html += '</div>';
+    for (var j = 0; j < src.profiles.length; j++) {
+      var p = src.profiles[j];
+      var rid = 'bwi-radio-' + idx;
+      html += '<label for="' + rid + '" style="display:flex;align-items:center;gap:6px;padding:3px 8px;font-size:0.82rem;cursor:pointer;border-radius:4px;" onmouseover="this.style.background=\'rgba(255,255,255,0.06)\'" onmouseout="this.style.background=\'\'">';
+      html += '<input type="radio" name="bwi-source" id="' + rid + '" value="' + esc(src.id) + '|' + esc(p.name) + '"' + (p.default && idx < 2 ? ' checked' : '') + '>';
+      html += '<span>' + esc(p.display_name);
+      if (p.display_name !== p.name) html += ' <span style="color:var(--dim);font-size:0.72rem;">(' + esc(p.name) + ')</span>';
+      html += '</span></label>';
+      idx++;
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+  html += '<div style="margin-top:4px;"><label style="font-size:0.82rem;font-weight:500;">Destination profile name</label>';
+  html += '<input id="bwi-dest" class="bw-in" style="width:100%;box-sizing:border-box;margin-top:4px;" placeholder="e.g. chrome-default" value="imported-chrome"></div>';
+
+  var ok = await showFormModal('Import browser profile', html, 'Import');
+  if (!ok) return;
+
+  var sel = document.querySelector('input[name="bwi-source"]:checked');
+  if (!sel) { showToast('No source profile selected'); return; }
+  var parts = sel.value.split('|');
+  var browserId = parts[0];
+  var profileName = parts[1];
+  var dest = (document.getElementById('bwi-dest') || {}).value || '';
+  dest = dest.trim();
+  if (!dest) { showToast('Destination name is required'); return; }
+
+  _bwStatus('Importing cookies...');
+  try {
+    var r = await fetch('/api/browser/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ browser_id: browserId, profile_name: profileName, destination: dest })
+    });
+    var d = await r.json();
+    if (d.error) {
+      showToast('Import failed: ' + d.error, 'error');
+      _bwStatus('Import failed');
+      return;
+    }
+    var msg = 'Imported ' + d.imported_cookies + ' cookies into profile "' + esc(d.profile) + '"';
+    if (d.skipped_cookies) msg += ' (' + d.skipped_cookies + ' skipped)';
+    showToast(msg);
+    _bwStatus(msg);
+    await _bwLoadProfiles();
+    var profileSel = document.getElementById('bw-profile');
+    if (profileSel) profileSel.value = d.profile;
+  } catch(e) {
+    showToast('Import failed: ' + e.message, 'error');
+    _bwStatus('Import failed');
+  }
 }
 
 async function _bwSaveProfile() {

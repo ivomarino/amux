@@ -48,15 +48,21 @@ use super::AppState;
 const REC: char = '\u{1e}';
 const UNIT: char = '\u{1f}';
 
-/// Cap on commits parsed per repo. A repo with thousands of matching commits is
-/// a signal to narrow the query, not something to spend minutes on — and the cap
-/// is REPORTED (`truncated`) rather than silently applied, because a silent
-/// truncation reads as "covered everything" when it did not.
-const MAX_COMMITS: usize = 400;
-
-/// `git log --grep` takes one alternation; a very long one is slow and can blow
-/// the arg limit. Ids are chunked and the chunks unioned.
-const IDS_PER_QUERY: usize = 120;
+/// Bound the history WALK, not merely the number of matches returned.
+///
+/// `git log --grep ... --max-count=400` still traverses the entire reachable
+/// history when there are fewer than 400 matches. On the live AMUX checkout a
+/// 120-id alternation ran for minutes after every server restart and competed
+/// with the cold worker-list scrape. Reading a bounded recent window once and
+/// matching in Rust makes the amount of repository work finite.
+const MAX_SCANNED_COMMITS: usize = 5_000;
+const MAX_MATCHED_COMMITS: usize = 400;
+const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const OVERALL_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_REPO_CANDIDATE_DIRS: usize = 32;
+const GIT_CONCURRENCY: usize = 4;
+type CommitHit = (String, String, BTreeSet<String>);
+type RepoScan = (String, Vec<CommitHit>, bool);
 
 #[derive(Deserialize, Default)]
 pub struct Params {
@@ -93,23 +99,30 @@ fn open_cards(
 /// `git rev-parse --show-toplevel`, so several sessions sharing one checkout
 /// collapse to a single scan.
 async fn git_toplevel(dir: &str) -> Option<String> {
-    let out = tokio::process::Command::new("git")
-        .args(["-C", dir, "rev-parse", "--show-toplevel"])
-        .output()
-        .await
-        .ok()?;
+    let out = git_output(dir, &["rev-parse", "--show-toplevel"]).await?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
+async fn git_output(repo: &str, args: &[&str]) -> Option<std::process::Output> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(repo)
+        .args(args)
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    tokio::time::timeout(GIT_TIMEOUT, cmd.output()).await.ok()?.ok()
+}
+
 /// Word-boundary match for a card id inside a commit message.
 ///
 /// Without the boundary, `AMUX-26` matches `AMUX-2674` and the report names
 /// cards no commit mentions — a filter that matches too much returns a
-/// confident wrong answer rather than silence (ethos rule 7). `git log --grep`
-/// does the cheap narrowing; this does the exact matching.
+/// confident wrong answer rather than silence (ethos rule 7). The bounded log
+/// supplies recent messages; this function does the exact matching in Rust.
 fn ids_in_text(text: &str, known: &BTreeSet<&str>) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
     let bytes = text.as_bytes();
@@ -131,65 +144,48 @@ fn ids_in_text(text: &str, known: &BTreeSet<&str>) -> BTreeSet<String> {
     found
 }
 
-/// One `git log` per repo per id-chunk. Returns (sha, subject, ids).
+/// One bounded `git log` per repo. Returns (sha, subject, ids).
 async fn scan_repo(
     repo: &str,
     ids: &BTreeSet<&str>,
-) -> (Vec<(String, String, BTreeSet<String>)>, bool) {
-    let all: Vec<&str> = ids.iter().copied().collect();
-    let mut hits: Vec<(String, String, BTreeSet<String>)> = Vec::new();
-    let mut truncated = false;
-
-    for chunk in all.chunks(IDS_PER_QUERY) {
-        // Reachable from HEAD, which is the point: a commit on someone's
-        // unmerged branch has not fixed anything from this checkout's view.
-        let pattern = chunk.join("|");
-        let fmt = format!("--format=%H{UNIT}%s{UNIT}%B{REC}");
-        let out = tokio::process::Command::new("git")
-            .args([
-                "-C",
-                repo,
-                "log",
-                "-E",
-                "--no-merges",
-                &format!("--grep={pattern}"),
-                &format!("--max-count={MAX_COMMITS}"),
-                &fmt,
-            ])
-            .output()
-            .await;
-        let Ok(out) = out else { continue };
-        if !out.status.success() {
+) -> (Vec<CommitHit>, bool) {
+    let mut hits: Vec<CommitHit> = Vec::new();
+    let fmt = format!("--format=%H{UNIT}%s{UNIT}%B{REC}");
+    let max = format!("--max-count={MAX_SCANNED_COMMITS}");
+    let Some(out) = git_output(repo, &["log", "--no-merges", &max, &fmt]).await else {
+        return (hits, true);
+    };
+    if !out.status.success() {
+        return (hits, true);
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut scanned = 0usize;
+    for rec in text.split(REC) {
+        let rec = rec.trim_start_matches('\n');
+        if rec.trim().is_empty() {
             continue;
         }
-        let text = String::from_utf8_lossy(&out.stdout);
-        let mut n = 0;
-        for rec in text.split(REC) {
-            let rec = rec.trim_start_matches('\n');
-            if rec.trim().is_empty() {
-                continue;
+        scanned += 1;
+        let mut parts = rec.splitn(3, UNIT);
+        let (Some(sha), Some(subject), Some(body)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let found = ids_in_text(&format!("{subject}\n{body}"), ids);
+        if !found.is_empty() {
+            hits.push((
+                sha.trim().chars().take(12).collect(),
+                subject.trim().to_string(),
+                found,
+            ));
+            if hits.len() >= MAX_MATCHED_COMMITS {
+                break;
             }
-            n += 1;
-            let mut parts = rec.splitn(3, UNIT);
-            let (Some(sha), Some(subject), Some(body)) =
-                (parts.next(), parts.next(), parts.next())
-            else {
-                continue;
-            };
-            let found = ids_in_text(&format!("{subject}\n{body}"), ids);
-            if !found.is_empty() {
-                hits.push((
-                    sha.trim().chars().take(12).collect(),
-                    subject.trim().to_string(),
-                    found,
-                ));
-            }
-        }
-        if n >= MAX_COMMITS {
-            truncated = true;
         }
     }
-    (hits, truncated)
+    let matched_cap = hits.len() >= MAX_MATCHED_COMMITS;
+    (hits, scanned >= MAX_SCANNED_COMMITS || matched_cap)
 }
 
 /// The HTTP shell. The body is [`mentions_payload`] so a JOB can ask the same
@@ -250,52 +246,81 @@ async fn mentions_payload_with(state: &AppState, p: Params) -> (StatusCode, Valu
 
     // Distinct repos behind the sessions that own these cards. Several sessions
     // routinely share one checkout, so resolve to toplevel and dedupe.
-    let dirs: BTreeSet<String> = {
-        let conn = match state.store.read() {
-            Ok(c) => c,
-            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR,
-                json!({ "error": "store unreadable" })),
-        };
-        match super::sessions_legacy::build_array(&conn) {
-            Ok(arr) => arr
-                .iter()
-                .filter_map(|v| {
-                    let name = v["name"].as_str()?;
-                    let dir = v["dir"].as_str().unwrap_or("");
-                    // Only sessions that own one of these cards.
-                    cards
-                        .values()
-                        .any(|c| c["session"].as_str() == Some(name))
-                        .then(|| dir.to_string())
-                })
-                .filter(|d| !d.is_empty())
-                .collect(),
-            Err(_) => BTreeSet::new(),
+    let sessions = match super::sessions_legacy::legacy_sessions_values(state.store.clone()).await {
+        Ok(arr) => arr,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({ "error": format!("session list unavailable: {e}") }),
+            )
         }
     };
-
-    let mut repos: BTreeSet<String> = BTreeSet::new();
-    for d in &dirs {
-        if let Some(top) = git_toplevel(d).await {
-            repos.insert(top);
-        }
-    }
+    let dirs: BTreeSet<String> = sessions
+        .iter()
+        .filter_map(|v| {
+            let name = v["name"].as_str()?;
+            let dir = v["dir"].as_str().unwrap_or("");
+            // Only sessions that own one of these cards.
+            cards
+                .values()
+                .any(|c| c["session"].as_str() == Some(name))
+                .then(|| dir.to_string())
+        })
+        .filter(|d| !d.is_empty())
+        .collect();
 
     let known: BTreeSet<&str> = cards.keys().map(|s| s.as_str()).collect();
-    let mut by_card: BTreeMap<String, Vec<Value>> = BTreeMap::new();
-    let mut truncated_any = false;
+    let scan = async {
+        use futures::stream::{self, StreamExt};
 
-    for repo in &repos {
-        let (hits, truncated) = scan_repo(repo, &known).await;
-        truncated_any |= truncated;
-        for (sha, subject, ids) in hits {
-            for id in ids {
-                by_card.entry(id).or_default().push(json!({
-                    "sha": sha, "subject": subject, "repo": repo,
-                }));
+        let dirs_truncated = dirs.len() > MAX_REPO_CANDIDATE_DIRS;
+        let tops: Vec<Option<String>> = stream::iter(
+            dirs.into_iter()
+                .take(MAX_REPO_CANDIDATE_DIRS)
+                .map(|dir| async move { git_toplevel(&dir).await }),
+        )
+        .buffer_unordered(GIT_CONCURRENCY)
+        .collect()
+        .await;
+        let resolution_failed = tops.iter().any(Option::is_none);
+        let repos: BTreeSet<String> = tops.into_iter().flatten().collect();
+
+        let scans: Vec<RepoScan> =
+            stream::iter(repos.iter().cloned().map(|repo| {
+                let known = &known;
+                async move {
+                    let (hits, truncated) = scan_repo(&repo, known).await;
+                    (repo, hits, truncated)
+                }
+            }))
+            .buffer_unordered(GIT_CONCURRENCY)
+            .collect()
+            .await;
+
+        let mut by_card: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+        let mut truncated_any = dirs_truncated || resolution_failed;
+        for (repo, hits, truncated) in scans {
+            truncated_any |= truncated;
+            for (sha, subject, ids) in hits {
+                for id in ids {
+                    by_card.entry(id).or_default().push(json!({
+                        "sha": sha, "subject": subject, "repo": repo,
+                    }));
+                }
             }
         }
-    }
+        (repos, by_card, truncated_any)
+    };
+    let (repos, by_card, truncated_any) =
+        match tokio::time::timeout(OVERALL_SCAN_TIMEOUT, scan).await {
+            Ok(result) => result,
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    json!({ "error": "commit mention scan exceeded its 30s total deadline" }),
+                )
+            }
+        };
 
     let candidates: Vec<Value> = by_card
         .into_iter()
@@ -390,6 +415,21 @@ mod tests {
         assert!(
             ids_in_text("AC-3231 is different", &k).is_empty(),
             "a longer id must not register as AC-323"
+        );
+    }
+
+    #[test]
+    fn history_work_is_bounded_per_process_and_across_repositories() {
+        let src = include_str!("commit_mentions.rs");
+        let unbounded_match_filter = ["--", "grep="].concat();
+        assert!(src.contains("--max-count={MAX_SCANNED_COMMITS}"));
+        assert!(src.contains("kill_on_drop(true)"));
+        assert!(src.contains("timeout(GIT_TIMEOUT, cmd.output())"));
+        assert!(src.contains("timeout(OVERALL_SCAN_TIMEOUT, scan)"));
+        assert!(src.contains("buffer_unordered(GIT_CONCURRENCY)"));
+        assert!(
+            !src.contains(&unbounded_match_filter),
+            "max-count limits matches, not history walked, when combined with git log --grep"
         );
     }
 }

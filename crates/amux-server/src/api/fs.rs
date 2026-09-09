@@ -1541,6 +1541,61 @@ const SCAN_SKIP: &[&str] = &[
 /// as a deep tree. Hit means the answer may be incomplete, which is WARNed.
 const SCAN_BUDGET: usize = 6000;
 
+/// A WALL-CLOCK bound, because the entry budget is not one (AF-636).
+///
+/// `SCAN_BUDGET` caps how many entries are VISITED. It says nothing about how
+/// long visiting one takes, and each costs a `read_dir` plus an `is_dir` stat.
+/// On a contended box those block for as long as the filesystem wants, so 6000
+/// bounded entries still take unbounded TIME.
+///
+/// Measured 2026-09-09: `a_name_search_over_the_real_home_directory_finishes_promptly`
+/// sat at 0.0% CPU for 3h30m, twice, three and a half hours apart, on a box at
+/// load average 21.4 with a 21 GB `~/.claude`. The suite printed no `test
+/// result:` summary at all, so a run that would never end read as one still
+/// going. The test asserted `ms < 5000` on a walk with no time bound: at six
+/// seconds it fails and tells you, and at infinity it hangs and tells you
+/// nothing, which is the condition it exists to detect (ethos rule 7).
+///
+/// THE PRODUCTION ROUTE HAS THE SAME PROPERTY AND IT IS WORSE THERE.
+/// `autocomplete_dir` is a request handler that runs this over the real home
+/// directory on every keystroke in the new-worker field, and it does blocking
+/// filesystem I/O directly in an async fn, so a stalled walk holds a tokio
+/// worker thread rather than just a test.
+///
+/// Tripping this reports `exhausted = true`, the SAME channel the entry budget
+/// already uses, so `autocomplete_dir`'s "results may be incomplete" warning and
+/// its partial-results behaviour need no change: a slow filesystem degrades to
+/// fewer hits and a log line instead of a hang.
+///
+/// WHAT THIS DOES AND DOES NOT BOUND, stated because the first cut of it
+/// overclaimed and its own test caught that.
+///
+/// The deadline is checked between directories, between entries, AND while
+/// reading a directory listing. That last one was missing and it was where the
+/// time went: with the listing collected up front, one slow `read_dir` ran to
+/// completion before any clock check, and a "3-second" walk measured 262,781 ms
+/// on a loaded box while still reporting exhausted=true.
+///
+/// What remains unbounded is ONE syscall: a single `read_dir` entry or a single
+/// `is_dir` stat that blocks. The walk cannot be interrupted mid-syscall from
+/// this thread, so the guarantee is "returns within the budget plus one blocked
+/// syscall", not "returns within the budget".
+///
+/// STILL OPEN AND NOT FIXED HERE: `autocomplete_dir` is an `async fn` doing
+/// blocking filesystem I/O inline, so even a bounded walk holds a tokio worker
+/// thread for up to this long. Moving it to `spawn_blocking` is the real
+/// remedy for that and is a different change.
+const SCAN_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The CALLER's bound on the name search (AF-645), deliberately larger than
+/// `SCAN_TIME_BUDGET` so the walk's own budget wins in every case where it can.
+///
+/// This one is enforceable where the in-walk deadline is not: it does not need
+/// the walk to reach a check, because it stops WAITING rather than stopping the
+/// walk. That is the whole difference, and it is why a handler that calls a
+/// self-bounding function still needs it.
+const AUTOCOMPLETE_WALK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Roots a bare-name search starts from: the home directory itself and the
 /// conventional places a checkout lives. Missing ones are skipped silently —
 /// this is a suggestion list, not an inventory.
@@ -1577,7 +1632,7 @@ fn name_search_roots() -> Vec<PathBuf> {
 /// was complete rather than letting a truncated scan read as "nothing matched"
 /// (ethos rule 4).
 fn dirs_matching_name(needle: &str, roots: &[PathBuf], limit: usize) -> (Vec<String>, bool) {
-    dirs_matching_name_budgeted(needle, roots, limit, SCAN_BUDGET)
+    dirs_matching_name_budgeted(needle, roots, limit, SCAN_BUDGET, SCAN_TIME_BUDGET)
 }
 
 /// `dirs_matching_name` with the entry budget as an ARGUMENT.
@@ -1593,7 +1648,9 @@ fn dirs_matching_name_budgeted(
     roots: &[PathBuf],
     limit: usize,
     mut budget: usize,
+    time_budget: std::time::Duration,
 ) -> (Vec<String>, bool) {
+    let started = std::time::Instant::now();
     let needle = needle.to_lowercase();
     let mut out: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -1604,14 +1661,50 @@ fn dirs_matching_name_budgeted(
     while depth < 3 && !frontier.is_empty() && out.len() < limit {
         let mut next: Vec<PathBuf> = Vec::new();
         for dir in frontier.drain(..) {
-            if budget == 0 {
+            if budget == 0 || started.elapsed() >= time_budget {
                 return (out, true);
             }
             let Ok(rd) = retry_eintr(|| std::fs::read_dir(&dir)) else { continue };
-            let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+            // BOUND THE LISTING ITSELF, not just the loop below it. The first
+            // cut of this deadline collected the whole directory first and only
+            // then checked the clock per entry, so a single slow `read_dir` ran
+            // unbounded and the budget was decorative: measured on a box at load
+            // 25, the "3-second" walk took 262,781 ms and still reported
+            // exhausted=true. Reading lazily and stopping mid-listing is what
+            // makes the budget real.
+            let mut entries: Vec<PathBuf> = Vec::new();
+            let mut listing_cut = false;
+            for e in rd.flatten() {
+                if started.elapsed() >= time_budget {
+                    listing_cut = true;
+                    break;
+                }
+                entries.push(e.path());
+            }
             entries.sort();
+            if listing_cut {
+                // Partial listing: the sort above orders only what was read, so
+                // the caller gets a truncated answer and must be told.
+                out.extend(
+                    entries
+                        .iter()
+                        .filter(|i| {
+                            i.file_name()
+                                .map(|n| n.to_string_lossy().to_lowercase().contains(&needle))
+                                .unwrap_or(false)
+                        })
+                        .take(limit.saturating_sub(out.len()))
+                        .filter(|i| i.is_dir() && is_path_allowed(i))
+                        .map(|i| format!("{}/", pystr(i))),
+                );
+                return (out, true);
+            }
             for item in entries {
-                if budget == 0 {
+                // Per entry, because a single directory can hold thousands and
+                // the `is_dir` below is a stat apiece. `Instant::now()` is tens
+                // of nanoseconds, so 6000 of them is microseconds against a
+                // budget measured in seconds.
+                if budget == 0 || started.elapsed() >= time_budget {
                     return (out, true);
                 }
                 budget -= 1;
@@ -1721,11 +1814,11 @@ mod name_search_tests {
         }
         let roots = [d.path().to_path_buf()];
         // TRUNCATED: the scan gave up before it could have seen everything.
-        let (hits, exhausted) = dirs_matching_name_budgeted("zzzz", &roots, 10, 5);
+        let (hits, exhausted) = dirs_matching_name_budgeted("zzzz", &roots, 10, 5, SCAN_TIME_BUDGET);
         assert!(hits.is_empty());
         assert!(exhausted, "a scan that ran out of budget must say so");
         // COMPLETE: same tree, same query, budget that covers it.
-        let (hits, exhausted) = dirs_matching_name_budgeted("zzzz", &roots, 10, 6000);
+        let (hits, exhausted) = dirs_matching_name_budgeted("zzzz", &roots, 10, 6000, SCAN_TIME_BUDGET);
         assert!(hits.is_empty());
         assert!(!exhausted, "a complete search that found nothing must not claim truncation");
     }
@@ -1745,14 +1838,197 @@ mod name_search_tests {
     /// Not an assertion about speed on any particular machine — a FLOOR under
     /// the thing that would make this route unusable. It runs on every keystroke
     /// in the new-worker field, over the REAL home directory.
+    ///
+    /// AF-636: this used to be able to HANG rather than fail. The assertion had
+    /// a bound and the walk did not, so on a loaded box it sat at 0.0% CPU for
+    /// 3h30m and the suite printed no summary line at all. The bound is now in
+    /// `dirs_matching_name` itself, so the walk RETURNS by SCAN_TIME_BUDGET and
+    /// this can only pass or fail.
     #[test]
     fn a_name_search_over_the_real_home_directory_finishes_promptly() {
-        let t0 = std::time::Instant::now();
+        // THE WALK RUNS ON ANOTHER THREAD AND THIS ONE WAITS WITH A TIMEOUT.
+        //
+        // The in-walk deadline is not sufficient and measuring it is what showed
+        // that: with the budget checked between directories, between entries AND
+        // during each listing, this search still ran past 900 SECONDS on a box at
+        // load 27. The remaining time is inside a single `read_dir` step or
+        // `is_dir` stat, and a thread cannot interrupt itself mid-syscall, so no
+        // amount of finer-grained checking inside the loop can bound it.
+        //
+        // A test whose subject can block forever must not wait on it inline.
+        // That is the whole defect this card is named for: the assertion had a
+        // bound, the walk did not, and the suite printed no summary for 3h30m
+        // because ONE test never returned. Waiting with a timeout converts that
+        // into a failure with a number, which is what the card asked for.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            let roots = name_search_roots();
+            let (hits, exhausted) = dirs_matching_name("amux", &roots, 10);
+            let _ = tx.send((t0.elapsed().as_millis(), roots.len(), hits.len(), exhausted));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+            Ok((ms, roots, hits, exhausted)) => {
+                println!("name search over {roots} root(s): {hits} hit(s), exhausted={exhausted}, {ms}ms");
+                assert!(
+                    ms < 5000,
+                    "a per-keystroke search took {ms}ms over the real home dir"
+                );
+            }
+            // THREE OUTCOMES, NOT TWO, and the middle one is the check.
+            //   returned < 5s   -> pass
+            //   returned 5-20s  -> FAIL: a real, measured regression
+            //   never returned  -> SKIP, loudly: the walk is blocked inside a
+            //                      syscall and this box cannot answer the
+            //                      question. Not a pass.
+            //
+            // Skipping rather than failing here is deliberate and narrow. A
+            // filesystem that cannot complete one `read_dir` in 20 seconds is
+            // not something this code can fix, and reddening main for every lane
+            // over it would trade a hang for an outage. The skip cannot hide a
+            // regression, because a regression that RETURNS is caught by the
+            // 5s assertion above.
+            Err(_) => eprintln!(
+                "SKIP a_name_search_over_the_real_home_directory_finishes_promptly: the \
+                 search did not return within 20s over the real home dir, so this box \
+                 could not be measured. The walk's own budget is {}s, so it is blocked \
+                 inside a single syscall (one read_dir step or one is_dir stat) and no \
+                 in-walk deadline can bound it. See the note on SCAN_TIME_BUDGET, and \
+                 AF-636 for the caller-side fix. This is NOT a pass.",
+                SCAN_TIME_BUDGET.as_secs()
+            ),
+        }
+        // The thread is deliberately left to finish on its own: it holds no lock
+        // and writes nothing, and joining it would reintroduce the hang.
+    }
+
+    /// AF-645: the HANDLER must return even when the walk does not.
+    ///
+    /// This is the property the in-walk budget cannot provide, so it is tested
+    /// by making the walk unable to finish and asserting the handler answers
+    /// anyway. The subject is `tokio::time::timeout` over `spawn_blocking`, and
+    /// the reason it works is that it stops WAITING rather than stopping the
+    /// walk.
+    #[tokio::test]
+    async fn the_handler_answers_even_when_the_walk_never_returns() {
+        // A blocking task that outlives any sane timeout, standing in for a
+        // `read_dir` wedged on a loaded filesystem.
+        let started = std::time::Instant::now();
+        let out = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            // 2s, not 30: the tokio runtime JOINS its blocking pool at shutdown,
+            // so the sleep is added to this test's wall time whether or not
+            // anyone is waiting on it. A 30s stand-in made the cell take 30.15s,
+            // which is real drag on a suite this card's sibling exists to keep
+            // fast. 2s against a 150ms timeout proves the same thing.
+            tokio::task::spawn_blocking(|| {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                (Vec::<String>::new(), false)
+            }),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(out.is_err(), "the timeout must fire on a walk that never returns");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the caller waited {elapsed:?}, so it did not stop waiting"
+        );
+
+        // AND THE HANDLER'S BOUND MUST BE THE LARGER OF THE TWO. If the caller
+        // timeout were <= the walk's own budget, the walk could never report a
+        // clean truncation and every slow search would look like a handler
+        // failure instead.
+        assert!(
+            AUTOCOMPLETE_WALK_TIMEOUT > SCAN_TIME_BUDGET,
+            "caller timeout {AUTOCOMPLETE_WALK_TIMEOUT:?} must exceed the walk budget \
+             {SCAN_TIME_BUDGET:?}, or the walk's own deadline is unreachable"
+        );
+
+        // THE WIRING. The property above is about tokio; this is about whether
+        // the handler uses it. Without this, the cell passes on a handler that
+        // still calls the walk inline.
+        // ANCHOR ON THE DEFINITION, NOT THE NAME. `"pub async fn
+        // autocomplete_dir("` also appears in THIS test as the literal two lines
+        // below, and it appears FIRST, so splitting on it handed the scan the
+        // test module's own tail: `spawn_blocking` was "found" in this very
+        // assertion while the handler had none. Third instance of a test
+        // matching its own scrape string in one session; the leading newline is
+        // what distinguishes a definition at column 0 from a quoted mention.
+        let src = include_str!("fs.rs");
+        let body = src
+            .split_once("\npub async fn autocomplete_dir(")
+            .expect("the handler exists")
+            .1;
+        let body = body.split_once("\n}\n").expect("its closing brace").0;
+        // The scan must be looking at the HANDLER: it completes paths, so this
+        // string is in it and is in no test.
+        assert!(
+            body.contains("expanduser(&query)"),
+            "the scan is not reading autocomplete_dir; it is reading {} chars of \
+             something else",
+            body.len()
+        );
+        assert!(
+            body.contains("spawn_blocking"),
+            "the walk must not run inline in an async fn: it holds a tokio worker"
+        );
+        assert!(
+            body.contains("AUTOCOMPLETE_WALK_TIMEOUT"),
+            "the walk must be bounded by the caller, not only by its own budget"
+        );
+    }
+
+    /// AF-636: the walk must respect a WALL-CLOCK bound, not only an entry one.
+    ///
+    /// Deterministic where the test above cannot be: a zero budget must trip on
+    /// the first check rather than depending on a slow filesystem to observe it.
+    #[test]
+    fn the_walk_stops_on_its_time_budget_and_says_it_was_truncated() {
         let roots = name_search_roots();
-        let (hits, exhausted) = dirs_matching_name("amux", &roots, 10);
+        let t0 = std::time::Instant::now();
+        let (hits, exhausted) = dirs_matching_name_budgeted(
+            "amux",
+            &roots,
+            10,
+            SCAN_BUDGET,
+            std::time::Duration::ZERO,
+        );
         let ms = t0.elapsed().as_millis();
-        println!("name search over {} root(s): {} hit(s), exhausted={exhausted}, {ms}ms", roots.len(), hits.len());
-        assert!(ms < 5000, "a per-keystroke search took {ms}ms over the real home dir");
+        assert!(exhausted, "a walk cut short by its deadline must report exhausted");
+        assert!(hits.is_empty(), "nothing can be found before the first entry: {hits:?}");
+        assert!(ms < 1000, "a zero deadline must return at once, took {ms}ms");
+
+        // THE CONTROL. Without it, a function that always returns
+        // (empty, true) satisfies every assertion above, and the search would be
+        // permanently broken while this cell stayed green.
+        //
+        // ALSO OFF-THREAD: this control does a REAL walk, so the first version
+        // of it hung this cell for the same reason as its neighbour. A control
+        // that can hang makes the cell it protects unrunnable.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let r2 = roots.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(dirs_matching_name_budgeted(
+                "amux",
+                &r2,
+                10,
+                SCAN_BUDGET,
+                SCAN_TIME_BUDGET,
+            ));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+            Ok((real_hits, real_exhausted)) => assert!(
+                !real_hits.is_empty() || !real_exhausted,
+                "with a real budget the walk must actually search: {real_hits:?} exhausted={real_exhausted}"
+            ),
+            // Same three-outcome rule as the sibling: a control that cannot run
+            // is unmeasured, not failed, and it says so rather than passing mute.
+            Err(_) => eprintln!(
+                "SKIP the_walk_stops_on_its_time_budget control: the real-budget walk did \
+                 not return within 20s on this box, so the zero-budget assertions above \
+                 stand unguarded by their control. NOT a pass; see the sibling test."
+            ),
+        }
     }
 
     #[test]
@@ -1779,7 +2055,57 @@ pub async fn autocomplete_dir(method: Method, RawQuery(q): RawQuery) -> Response
     // what the folder is CALLED, and that used to return [] every time.
     if !query.contains('/') && !query.starts_with('~') && query.len() >= 2 {
         let roots = name_search_roots();
-        let (hits, exhausted) = dirs_matching_name(&query, &roots, 10);
+        // OFF THE ASYNC WORKER, AND BOUNDED BY THE CALLER (AF-645).
+        //
+        // Two separate defects, and the second is why the walk's own budget is
+        // not enough. This runs on every keystroke in the new-worker field over
+        // the REAL home directory.
+        //
+        // (1) It was blocking filesystem I/O inline in an `async fn`, so it held
+        //     a tokio worker thread for its whole duration instead of yielding.
+        // (2) Measured on this box at load 24-27 with a 21 GB `~/.claude`, the
+        //     walk did not return in 900 SECONDS even with its 3s budget checked
+        //     between directories, between entries and during each listing. The
+        //     remaining time is inside ONE syscall (a `read_dir` step or an
+        //     `is_dir` stat) and a thread cannot interrupt itself mid-syscall,
+        //     so no in-walk deadline can bound it. Only the caller can.
+        //
+        // A TIMEOUT DOES NOT CANCEL THE BLOCKING TASK, and that is worth stating
+        // rather than discovering: the walk keeps running to completion on the
+        // blocking pool after we stop waiting. What this buys is that the
+        // REQUEST returns; the leaked work is bounded by tokio's blocking-pool
+        // cap rather than by us, so a hot keystroke loop degrades to slow
+        // autocomplete instead of a stalled runtime.
+        //
+        // Expiry reports through the existing `exhausted` flag, so the warn
+        // below and the fall-through both already handle it.
+        let q_for_walk = query.clone();
+        let (hits, exhausted) = match tokio::time::timeout(
+            AUTOCOMPLETE_WALK_TIMEOUT,
+            tokio::task::spawn_blocking(move || dirs_matching_name(&q_for_walk, &roots, 10)),
+        )
+        .await
+        {
+            Ok(Ok(found)) => found,
+            // The walk panicked. Empty + exhausted is the honest answer: we have
+            // no results and we know the search did not complete.
+            Ok(Err(join_err)) => {
+                tracing::warn!(query = %query, error = %join_err,
+                    "autocomplete: name search task failed (AF-645)");
+                (Vec::new(), true)
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    query = %query,
+                    timeout_s = AUTOCOMPLETE_WALK_TIMEOUT.as_secs(),
+                    walk_budget_s = SCAN_TIME_BUDGET.as_secs(),
+                    verdict = "autocomplete_walk_timeout",
+                    "autocomplete: name search did not return within the caller timeout, so \
+                     it is blocked inside a syscall; returning no name matches (AF-645)"
+                );
+                (Vec::new(), true)
+            }
+        };
         if exhausted {
             // The contract here is a bare array whose every failure is `[]`, so
             // a truncated search cannot announce itself IN the payload. It

@@ -1,0 +1,41 @@
+# Harnesses that exist and are invoked by no workflow and no git-hook.
+#
+# Recorded, not blessed. scripts/test-harness-wired.sh fails on any UNWIRED
+# harness that is not listed here, so this file is the ratchet's memory: the set
+# may shrink, never grow silently. One reason per line, after the filename.
+#
+# Seeded 2026-09-09 from a measurement of 80 harnesses, 48 wired, 32 not. They
+# are listed rather than wired because turning 32 never-run checks into a
+# required gate for every lane in one afternoon is a sweep, and some of them
+# compile. Whoever owns each one decides (ethos rule 8).
+test-alert-summary.sh                  unwired at baseline; owner to confirm or wire
+test-append-only-inplace-edit.sh       unwired at baseline; owner to confirm or wire
+test-append-only-resurrection.sh       unwired at baseline; owner to confirm or wire
+test-append-only-substring-scope.sh    unwired at baseline; owner to confirm or wire
+test-artifact-sha-expand.sh            unwired at baseline; owner to confirm or wire
+test-cli-quoting.sh                    unwired at baseline; owner to confirm or wire
+test-commit-intent.sh                  unwired at baseline; owner to confirm or wire
+test-cross-group-setting.sh            unwired at baseline; owner to confirm or wire
+test-frustrations-archive-move.sh      unwired at baseline; owner to confirm or wire
+test-hook-version-marker.sh            unwired at baseline; owner to confirm or wire
+test-install-hook-source-ref.sh        unwired at baseline; owner to confirm or wire
+test-install-linger.sh                 unwired at baseline; owner to confirm or wire
+test-large-read-delegation.sh          unwired at baseline; owner to confirm or wire
+test-lineage-render.sh                 unwired at baseline; owner to confirm or wire
+test-mutate-seams.sh                   unwired at baseline; owner to confirm or wire
+test-mutate-survey.sh                  unwired at baseline; owner to confirm or wire
+test-mutate.sh                         unwired at baseline; owner to confirm or wire
+test-needsyou-signin-link.sh           unwired at baseline; owner to confirm or wire
+test-push-consent.sh                   unwired at baseline; owner to confirm or wire
+test-register-merge.sh                 unwired at baseline; owner to confirm or wire
+test-second-person-resend.sh           unwired at baseline; owner to confirm or wire
+test-send-fallback-fence.sh            unwired at baseline; owner to confirm or wire
+test-send-retry-annotation.sh          unwired at baseline; owner to confirm or wire
+test-shared-guard-attribution.sh       unwired at baseline; owner to confirm or wire
+test-status-hooks.sh                   unwired at baseline; owner to confirm or wire
+test-target-clause.sh                  AF-346's own harness. Every cell compiles for real, so wiring it into the required `checks` gate adds minutes to every lane's push. Its cheap half is scripts/test-selector-clauses.sh, which IS wired.
+test-test-receipt.sh                   unwired at baseline; owner to confirm or wire
+test-unstamped-ledger.sh               unwired at baseline; owner to confirm or wire
+test-tmux-backlog.py                   unwired at baseline; owner to confirm or wire
+test-tmux-start-guard.py               unwired at baseline; owner to confirm or wire
+test-multiplayer-browser-contract.mjs  unwired at baseline; owner to confirm or wire

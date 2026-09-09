@@ -21,6 +21,7 @@
 
 use super::AppState;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::stream::Stream;
@@ -83,9 +84,12 @@ pub fn conn_stats() -> (i64, u64) {
 
 pub async fn events(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let mut rx = state.store.subscribe();
     let current = state.store.current_rev().map(|r| r.0).unwrap_or(0);
+    let scoped_member = super::org::local_member_scope(&headers)
+        .is_some_and(|scope| !scope.is_global());
 
     let stream = async_stream(current, move |yielder: tokio::sync::mpsc::Sender<Event>| async move {
         // No initial snapshot (AMUX-3503): `hello` above carries the rev, and
@@ -95,16 +99,22 @@ pub async fn events(
         loop {
             match rx.recv().await {
                 Ok(ev) => {
-                    let payload = serde_json::json!({
-                        "type": "state",
-                        "payload": ev,
-                    });
-                    if yielder
-                        .send(Event::default().data(payload.to_string()))
-                        .await
-                        .is_err()
-                    {
-                        break; // client went away
+                    // Revision payloads may contain a full entity snapshot. A
+                    // scoped human needs the wake-up, not a copy of a card or
+                    // worker outside their grant; their subsequent list fetch
+                    // is filtered at the authoritative read boundary.
+                    if !scoped_member {
+                        let payload = serde_json::json!({
+                            "type": "state",
+                            "payload": ev,
+                        });
+                        if yielder
+                            .send(Event::default().data(payload.to_string()))
+                            .await
+                            .is_err()
+                        {
+                            break; // client went away
+                        }
                     }
                     // Coalesce this event plus everything already queued:
                     // a burst of N writes = one invalidate signal.

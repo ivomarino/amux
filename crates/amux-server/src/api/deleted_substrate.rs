@@ -72,6 +72,10 @@ use super::AppState;
 /// Cap on shas resolved per repo, REPORTED rather than silently applied. A
 /// silent truncation reads as "covered everything" when it did not (AF-131).
 const MAX_SHAS: usize = 4000;
+const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const OVERALL_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_REPO_CANDIDATE_DIRS: usize = 32;
+const GIT_CONCURRENCY: usize = 4;
 
 #[derive(Deserialize, Default)]
 pub struct Params {
@@ -155,34 +159,51 @@ fn closed_cards(
 }
 
 async fn git_toplevel(dir: &str) -> Option<String> {
-    let out = tokio::process::Command::new("git")
-        .args(["-C", dir, "rev-parse", "--show-toplevel"])
-        .output()
-        .await
-        .ok()?;
+    let out = git_output(dir, &["rev-parse", "--show-toplevel"]).await?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
+async fn git_output(repo: &str, args: &[&str]) -> Option<std::process::Output> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(repo)
+        .args(args)
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    tokio::time::timeout(GIT_TIMEOUT, cmd.output()).await.ok()?.ok()
+}
+
 /// Feed `stdin` to a git subcommand and return stdout. One process for N shas.
 async fn git_stdin(repo: &str, args: &[&str], stdin: String) -> Option<String> {
     use tokio::io::AsyncWriteExt;
-    let mut child = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    if let Some(mut si) = child.stdin.take() {
-        let _ = si.write_all(stdin.as_bytes()).await;
-        let _ = si.shutdown().await;
-    }
-    let out = child.wait_with_output().await.ok()?;
+    let run = async move {
+        let mut child = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut pipe = child.stdin.take();
+        let writer = async move {
+            if let Some(si) = pipe.as_mut() {
+                let _ = si.write_all(stdin.as_bytes()).await;
+                let _ = si.shutdown().await;
+            }
+        };
+        // Drain stdout while writing stdin. Doing these serially can deadlock
+        // once either OS pipe fills on a large batch.
+        let (_, output) = tokio::join!(writer, child.wait_with_output());
+        output.ok()
+    };
+    let out = tokio::time::timeout(GIT_TIMEOUT, run).await.ok().flatten()?;
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
@@ -241,11 +262,9 @@ async fn paths_of(repo: &str, fulls: &BTreeSet<String>) -> BTreeMap<String, Vec<
 /// Every path that exists at HEAD. One `ls-tree`, then set membership, instead
 /// of a `cat-file -e` per path.
 async fn live_paths(repo: &str) -> BTreeSet<String> {
-    let out = tokio::process::Command::new("git")
-        .args(["-C", repo, "ls-tree", "-r", "HEAD", "--name-only"])
-        .output()
-        .await;
-    let Ok(out) = out else { return BTreeSet::new() };
+    let Some(out) = git_output(repo, &["ls-tree", "-r", "HEAD", "--name-only"]).await else {
+        return BTreeSet::new();
+    };
     String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect()
 }
 
@@ -289,69 +308,102 @@ async fn payload(state: &AppState, p: Params) -> (StatusCode, Value) {
         );
     }
 
-    let dirs: BTreeSet<String> = {
-        let conn = match state.store.read() {
-            Ok(c) => c,
-            Err(_) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": "store unreadable" }))
-            }
-        };
-        match super::sessions_legacy::build_array(&conn) {
-            Ok(arr) => arr
-                .iter()
-                .filter_map(|v| {
-                    let name = v["name"].as_str()?;
-                    let dir = v["dir"].as_str().unwrap_or("");
-                    cards
-                        .values()
-                        .any(|(c, _)| c["session"].as_str() == Some(name))
-                        .then(|| dir.to_string())
-                })
-                .filter(|d| !d.is_empty())
-                .collect(),
-            Err(_) => BTreeSet::new(),
+    let sessions = match super::sessions_legacy::legacy_sessions_values(state.store.clone()).await {
+        Ok(arr) => arr,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({ "error": format!("session list unavailable: {e}") }),
+            )
         }
     };
-    let mut repos: BTreeSet<String> = BTreeSet::new();
-    for d in &dirs {
-        if let Some(top) = git_toplevel(d).await {
-            repos.insert(top);
-        }
-    }
-
+    let dirs: BTreeSet<String> = sessions
+        .iter()
+        .filter_map(|v| {
+            let name = v["name"].as_str()?;
+            let dir = v["dir"].as_str().unwrap_or("");
+            cards
+                .values()
+                .any(|(c, _)| c["session"].as_str() == Some(name))
+                .then(|| dir.to_string())
+        })
+        .filter(|d| !d.is_empty())
+        .collect();
     let all_shas: BTreeSet<String> =
         cards.values().flat_map(|(_, s)| s.iter().cloned()).collect();
-    let truncated = all_shas.len() > MAX_SHAS;
+    let scan = async {
+        use futures::stream::{self, StreamExt};
 
-    // sha (as written in the log) -> (repo, verdict, deleted paths, live paths)
-    let mut verdict: BTreeMap<String, Value> = BTreeMap::new();
-    for repo in &repos {
-        let resolved = resolve_shas(repo, &all_shas).await;
-        if resolved.is_empty() {
-            continue;
-        }
-        let fulls: BTreeSet<String> = resolved.values().cloned().collect();
-        let paths = paths_of(repo, &fulls).await;
-        let live = live_paths(repo).await;
-        for (abbrev, full) in &resolved {
-            // First repo that HAS the sha wins; a sha resolving in two repos is
-            // not a case this fleet produces (shas are content-addressed).
-            if verdict.contains_key(abbrev) {
-                continue;
+        let dirs_truncated = dirs.len() > MAX_REPO_CANDIDATE_DIRS;
+        let tops: Vec<Option<String>> = stream::iter(
+            dirs.into_iter()
+                .take(MAX_REPO_CANDIDATE_DIRS)
+                .map(|dir| async move { git_toplevel(&dir).await }),
+        )
+        .buffer_unordered(GIT_CONCURRENCY)
+        .collect()
+        .await;
+        let resolution_failed = tops.iter().any(Option::is_none);
+        let repos: BTreeSet<String> = tops.into_iter().flatten().collect();
+
+        let repo_verdicts: Vec<BTreeMap<String, Value>> = stream::iter(
+            repos.iter().cloned().map(|repo| {
+                let all_shas = &all_shas;
+                async move {
+                    let resolved = resolve_shas(&repo, all_shas).await;
+                    if resolved.is_empty() {
+                        return BTreeMap::new();
+                    }
+                    let fulls: BTreeSet<String> = resolved.values().cloned().collect();
+                    let paths = paths_of(&repo, &fulls).await;
+                    let live = live_paths(&repo).await;
+                    resolved
+                        .iter()
+                        .map(|(abbrev, full)| {
+                            let touched = paths.get(full).cloned().unwrap_or_default();
+                            let (gone, alive): (Vec<String>, Vec<String>) =
+                                touched.into_iter().partition(|p| !live.contains(p));
+                            (
+                                abbrev.clone(),
+                                json!({
+                                    "sha": abbrev, "repo": repo,
+                                    "verdict": if gone.is_empty() { "ALIVE" } else { "DELETED" },
+                                    "deleted_paths": gone, "live_paths": alive,
+                                }),
+                            )
+                        })
+                        .collect()
+                }
+            }),
+        )
+        // Preserve BTreeSet repo order while allowing four repos to make
+        // progress concurrently, so "first repo wins" remains deterministic.
+        .buffered(GIT_CONCURRENCY)
+        .collect()
+        .await;
+
+        // sha (as written in the log) -> (repo, verdict, deleted/live paths).
+        let mut verdict: BTreeMap<String, Value> = BTreeMap::new();
+        for repo_verdict in repo_verdicts {
+            for (sha, value) in repo_verdict {
+                // First repo that HAS the sha wins; a sha resolving in two
+                // repos is not a case this fleet produces (content-addressed).
+                verdict.entry(sha).or_insert(value);
             }
-            let touched = paths.get(full).cloned().unwrap_or_default();
-            let (gone, alive): (Vec<String>, Vec<String>) =
-                touched.into_iter().partition(|p| !live.contains(p));
-            verdict.insert(
-                abbrev.clone(),
-                json!({
-                    "sha": abbrev, "repo": repo,
-                    "verdict": if gone.is_empty() { "ALIVE" } else { "DELETED" },
-                    "deleted_paths": gone, "live_paths": alive,
-                }),
-            );
         }
-    }
+        (repos, verdict, dirs_truncated || resolution_failed)
+    };
+    let (repos, verdict, scan_truncated) =
+        match tokio::time::timeout(OVERALL_SCAN_TIMEOUT, scan).await {
+            Ok(result) => result,
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    json!({ "error": "deleted substrate scan exceeded its 30s total deadline" }),
+                )
+            }
+        };
+    let truncated = all_shas.len() > MAX_SHAS || scan_truncated;
 
     let mut out: Vec<Value> = Vec::new();
     let mut cards_with_deletions = 0usize;
@@ -521,5 +573,16 @@ mod tests {
         }
         assert_eq!(map[&a], vec!["src/one.rs", "src/two.rs"]);
         assert_eq!(map[&b], vec!["README.md"]);
+    }
+
+    #[test]
+    fn git_work_is_bounded_and_children_die_with_the_scan() {
+        let src = include_str!("deleted_substrate.rs");
+        assert!(src.matches("kill_on_drop(true)").count() >= 2);
+        assert!(src.contains("timeout(GIT_TIMEOUT, run)"));
+        assert!(src.contains("timeout(OVERALL_SCAN_TIMEOUT, scan)"));
+        assert!(src.contains("take(MAX_REPO_CANDIDATE_DIRS)"));
+        assert!(src.contains("buffer_unordered(GIT_CONCURRENCY)"));
+        assert!(src.contains("buffered(GIT_CONCURRENCY)"));
     }
 }

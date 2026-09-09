@@ -33,6 +33,7 @@ test('local invitee joins, shares work, uses worker APIs, appears in logs, and c
   browser,
   request,
 }) => {
+  test.setTimeout(120_000);
   await owner.goto('/');
   await settle(owner);
   const ownerToken = await owner.evaluate(() => (window as any)._AMUX_AUTH_TOKEN as string);
@@ -46,15 +47,15 @@ test('local invitee joins, shares work, uses worker APIs, appears in logs, and c
 
   await openTeam(owner);
   await owner.locator('#settings-team-section button', { hasText: '+ Invite' }).click();
-  await expect(owner.locator('#modal-prompt-input')).toBeVisible();
-  await owner.locator('#modal-prompt-input').fill('guest@example.com');
+  await expect(owner.locator('#team-invite-email')).toBeVisible();
+  await owner.locator('#team-invite-email').fill('guest@example.com');
   const [inviteResponse] = await Promise.all([
     owner.waitForResponse(
       (response) =>
         response.url().endsWith('/api/org/invites') &&
         response.request().method() === 'POST',
     ),
-    owner.locator('#modal-btns button', { hasText: 'OK' }).click(),
+    owner.locator('#team-scope-submit').click(),
   ]);
   expect(inviteResponse.status()).toBe(201);
   const inviteUrl = await owner.locator('#invite-link-input').inputValue();
@@ -67,6 +68,8 @@ test('local invitee joins, shares work, uses worker APIs, appears in logs, and c
     serviceWorkers: 'block',
   });
   const guest = await guestContext.newPage();
+  const createdWorkers: string[] = [];
+  const createdCards: string[] = [];
   let memberWorker: string | undefined;
   try {
     await guest.goto(inviteUrl);
@@ -88,16 +91,19 @@ test('local invitee joins, shares work, uses worker APIs, appears in logs, and c
       email: 'guest@example.com',
       is_local_member: true,
       is_cloud: false,
+      access_scope: { level: 'global', name: '' },
     });
     expect(
       await guest.evaluate(() => (window as any)._AMUX_AUTH_TOKEN),
       'member shell must use its cookie, never the owner bearer',
     ).toBe('');
 
-    // Both users see the same membership state through their own sessions.
+    // A member sees their own grant, but membership administration remains an
+    // owner capability even for a global member.
     await openTeam(guest);
-    await expect(guest.locator('#settings-members-list')).toContainText('Guest User');
-    await owner.locator('#invite-link-input').locator('xpath=ancestor::div[contains(@style,"fixed")]//button[normalize-space()="Done"]').click();
+    await expect(guest.locator('#settings-members-list')).toContainText('Global workspace access');
+    await expect(guest.locator('#settings-team-invite')).toBeHidden();
+    await owner.locator('#invite-done-button').click();
     await openTeam(owner);
     await owner.evaluate(() => (window as any).loadTeamSection());
     await expect(owner.locator('#settings-members-list')).toContainText('Guest User');
@@ -108,36 +114,104 @@ test('local invitee joins, shares work, uses worker APIs, appears in logs, and c
     // same shape against a disposable Codex worker; this hermetic case pins the
     // member-auth contract without auto-waking a model in CI.
     memberWorker = `e2e-member-worker-${Date.now()}`;
+    const groupPeer = `e2e-group-peer-${Date.now()}`;
+    const outsider = `e2e-outsider-${Date.now()}`;
     const workerAccess = await guest.evaluate(async (workerName) => {
       const create = await fetch('/api/sessions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          // Ordinary attribution headers are caller-controlled. The server
+          // must still persist the authenticated member as the author.
+          'X-Amux-Worker': 'spoofed-worker-author',
+        },
         body: JSON.stringify({
           name: workerName,
           dir: '/tmp',
           provider: 'codex',
-          creator: 'guest@example.com',
+          creator: 'spoofed-owner',
           tags: ['e2e-multiplayer'],
         }),
       });
+      const createBody = await create.json();
       const fleet = await fetch('/api/sessions');
       const rows = await fleet.json();
+      const fleetRow = rows.find((row: any) => row.name === workerName);
       const info = await fetch(`/api/sessions/${encodeURIComponent(workerName)}/info`);
+      const infoBody = await info.json();
+      const stoppedSend = await fetch(`/api/sessions/${encodeURIComponent(workerName)}/send`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Amux-Session': 'another-spoofed-worker',
+        },
+        body: JSON.stringify({ text: 'member worker-use probe', record_history: true }),
+      });
       return {
         createStatus: create.status,
+        createBody,
         fleetStatus: fleet.status,
-        listed: rows.some((row: any) => row.name === workerName),
+        listed: Boolean(fleetRow),
+        fleetCreator: fleetRow?.creator,
         infoStatus: info.status,
-        infoBody: await info.json(),
+        infoBody,
+        sendStatus: stoppedSend.status,
+        sendBody: await stoppedSend.json(),
       };
     }, memberWorker);
     expect(workerAccess).toMatchObject({
       createStatus: 201,
+      createBody: { creator: 'member:guest@example.com' },
       fleetStatus: 200,
       listed: true,
+      fleetCreator: 'member:guest@example.com',
       infoStatus: 200,
       infoBody: { name: memberWorker },
+      sendStatus: 200,
+      sendBody: { ok: true, authored_by: 'member:guest@example.com' },
     });
+    createdWorkers.push(memberWorker);
+    for (const [name, tags] of [
+      [groupPeer, ['e2e-multiplayer']],
+      [outsider, ['e2e-outsider']],
+    ] as Array<[string, string[]]>) {
+      const status = await guest.evaluate(async ({ name, tags }) => (
+        await fetch('/api/sessions', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, dir: '/tmp', provider: 'codex', tags }),
+        })
+      ).status, { name, tags });
+      expect(status).toBe(201);
+      createdWorkers.push(name);
+    }
+
+    // The owner can grant a non-global scope at invite creation, not only
+    // rescope an existing member later. Exercise the actual Team dialog and
+    // verify the persisted API response before revoking this unused link.
+    await owner.evaluate(() => (window as any).fetchSessions());
+    await openTeam(owner);
+    await owner.locator('#settings-team-invite').click();
+    await owner.locator('#team-invite-email').fill('group-invite@example.com');
+    await owner.locator('#team-scope-level').selectOption('group');
+    await owner.locator('#team-scope-name').selectOption('e2e-multiplayer');
+    const [scopedInviteResponse] = await Promise.all([
+      owner.waitForResponse(
+        (response) =>
+          response.url().endsWith('/api/org/invites') &&
+          response.request().method() === 'POST',
+      ),
+      owner.locator('#team-scope-submit').click(),
+    ]);
+    expect(scopedInviteResponse.status()).toBe(201);
+    const scopedInvite = await scopedInviteResponse.json();
+    expect(scopedInvite).toMatchObject({
+      scope_level: 'group',
+      scope_name: 'e2e-multiplayer',
+    });
+    await request.delete(`/api/org/invites/${encodeURIComponent(scopedInvite.token)}`, {
+      headers: ownerHeaders,
+    });
+    await owner.locator('#invite-done-button').click();
 
     // The invitee performs real work with cookie auth. The owner's browser
     // observes the same card after the normal board refresh.
@@ -145,18 +219,44 @@ test('local invitee joins, shares work, uses worker APIs, appears in logs, and c
     const created = await guest.evaluate(async (cardTitle) => {
       const response = await fetch('/api/board', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Amux-Worker': 'spoofed-card-author',
+        },
         body: JSON.stringify({
           title: cardTitle,
           type: 'chore',
           status: 'todo',
-          creator: 'guest@example.com',
+          creator: 'spoofed-owner',
         }),
       });
       return { status: response.status, body: await response.json() };
     }, title);
     expect(created.status).toBe(201);
+    expect(created.body.creator).toBe('member:guest@example.com');
     const cardId = created.body.id as string;
+    createdCards.push(cardId);
+    const authoredEdit = await guest.evaluate(async (id) => {
+      const response = await fetch(`/api/board/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Amux-Session': 'spoofed-edit-author',
+        },
+        body: JSON.stringify({ desc_append: 'member-authored note' }),
+      });
+      return { status: response.status, body: await response.json() };
+    }, cardId);
+    expect(authoredEdit.status).toBe(200);
+    expect(authoredEdit.body.log).toContain('member:guest@example.com: desc +20 chars');
+    const ownerCard = await request.get(`/api/board/${encodeURIComponent(cardId)}`, {
+      headers: ownerHeaders,
+    });
+    expect(ownerCard.status()).toBe(200);
+    expect(await ownerCard.json()).toMatchObject({
+      creator: 'member:guest@example.com',
+      log: expect.stringContaining('member:guest@example.com: desc +20 chars'),
+    });
     await owner.evaluate(() => {
       document.getElementById('settings-menu')?.classList.remove('open');
       (window as any).switchView('board');
@@ -208,12 +308,102 @@ test('local invitee joins, shares work, uses worker APIs, appears in logs, and c
     });
     expect(memberLogView).toEqual({ status: 200, sawOwnMutation: true });
 
-    await request.delete(`/api/board/${encodeURIComponent(cardId)}`, { headers: ownerHeaders });
     const members = await (
       await request.get('/api/org/members', { headers: ownerHeaders })
     ).json();
     const member = members.find((entry: any) => entry.email === 'guest@example.com');
     expect(member).toBeTruthy();
+
+    // Rescoping is live: the existing HttpOnly cookie immediately changes from
+    // global -> group -> worker without a new invite or login.
+    const groupRescope = await request.patch(
+      `/api/org/members/${encodeURIComponent(member.id)}`,
+      {
+        headers: ownerHeaders,
+        data: { scope_level: 'group', scope_name: 'e2e-multiplayer' },
+      },
+    );
+    expect(groupRescope.status()).toBe(200);
+    const groupView = await guest.evaluate(async ({ groupPeer, outsider }) => {
+      const identity = await (await fetch('/api/identity')).json();
+      const fleetResponse = await fetch('/api/sessions');
+      const fleet = await fleetResponse.json();
+      const peer = await fetch(`/api/sessions/${encodeURIComponent(groupPeer)}/info`);
+      const other = await fetch(`/api/sessions/${encodeURIComponent(outsider)}/info`);
+      const board = await (await fetch('/api/board?all=1')).json();
+      return {
+        identity,
+        names: fleet.map((row: any) => row.name),
+        peerStatus: peer.status,
+        outsiderStatus: other.status,
+        boardTitles: board.map((row: any) => row.title),
+      };
+    }, { groupPeer, outsider });
+    expect(groupView.identity.access_scope).toEqual({ level: 'group', name: 'e2e-multiplayer' });
+    expect(groupView.names).toEqual(expect.arrayContaining([memberWorker, groupPeer]));
+    expect(groupView.names).not.toContain(outsider);
+    expect(groupView.peerStatus).toBe(200);
+    expect(groupView.outsiderStatus).toBe(403);
+    expect(groupView.boardTitles).not.toContain(title); // global/unassigned card is outside the group
+
+    const workerRescope = await request.patch(
+      `/api/org/members/${encodeURIComponent(member.id)}`,
+      {
+        headers: ownerHeaders,
+        data: { scope_level: 'worker', scope_name: memberWorker },
+      },
+    );
+    expect(workerRescope.status()).toBe(200);
+    const outsideCardResponse = await request.post('/api/board', {
+      headers: ownerHeaders,
+      data: {
+        title: `owner-card-outside-worker-scope-${Date.now()}`,
+        type: 'chore', status: 'todo', session: groupPeer,
+      },
+    });
+    expect(outsideCardResponse.status()).toBe(201);
+    const outsideCardId = (await outsideCardResponse.json()).id as string;
+    createdCards.push(outsideCardId);
+    const workerView = await guest.evaluate(async ({ memberWorker, groupPeer, outsideCardId }) => {
+      const identity = await (await fetch('/api/identity')).json();
+      const fleet = await (await fetch('/api/sessions')).json();
+      const deniedWorker = await fetch(`/api/sessions/${encodeURIComponent(groupPeer)}/info`);
+      const deniedExistingCard = await fetch(`/api/board/${encodeURIComponent(outsideCardId)}`);
+      const allowedCard = await fetch('/api/board', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: `worker-scoped-${Date.now()}`,
+          type: 'chore', status: 'todo', session: memberWorker,
+        }),
+      });
+      const allowedBody = await allowedCard.json();
+      const deniedCard = await fetch('/api/board', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: `outside-worker-scope-${Date.now()}`,
+          type: 'chore', status: 'todo', session: groupPeer,
+        }),
+      });
+      return {
+        identity,
+        names: fleet.map((row: any) => row.name),
+        deniedWorkerStatus: deniedWorker.status,
+        deniedExistingCardStatus: deniedExistingCard.status,
+        allowedCardStatus: allowedCard.status,
+        allowedCardId: allowedBody.id,
+        deniedCardStatus: deniedCard.status,
+      };
+    }, { memberWorker, groupPeer, outsideCardId });
+    expect(workerView.identity.access_scope).toEqual({ level: 'worker', name: memberWorker });
+    expect(workerView.names).toEqual([memberWorker]);
+    expect(workerView.deniedWorkerStatus).toBe(403);
+    expect(workerView.deniedExistingCardStatus).toBe(403);
+    expect(workerView.allowedCardStatus).toBe(201);
+    expect(workerView.deniedCardStatus).toBe(403);
+    createdCards.push(workerView.allowedCardId);
+
+    await request.delete(`/api/board/${encodeURIComponent(cardId)}`, { headers: ownerHeaders });
+    createdCards.splice(createdCards.indexOf(cardId), 1);
     const revoked = await request.delete(`/api/org/members/${encodeURIComponent(member.id)}`, {
       headers: ownerHeaders,
     });
@@ -243,8 +433,11 @@ test('local invitee joins, shares work, uses worker APIs, appears in logs, and c
     const afterReload = await guest.evaluate(async () => (await fetch('/api/org/members')).status);
     expect(afterReload).toBe(401);
   } finally {
-    if (memberWorker) {
-      await request.delete(`/api/sessions/${encodeURIComponent(memberWorker)}`, {
+    for (const card of createdCards) {
+      await request.delete(`/api/board/${encodeURIComponent(card)}`, { headers: ownerHeaders });
+    }
+    for (const worker of createdWorkers) {
+      await request.delete(`/api/sessions/${encodeURIComponent(worker)}`, {
         headers: { ...ownerHeaders, 'X-Amux-UI-Token': ownerUiToken },
       });
     }

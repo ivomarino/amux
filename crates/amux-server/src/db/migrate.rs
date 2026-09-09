@@ -342,6 +342,32 @@ const MIGRATIONS: &[Migration] = &[
         name: "0058_harness_enforcement",
         sql: include_str!("../../migrations/0058_harness_enforcement.sql"),
     },
+    // Renumbered 0057 -> 0058 -> 0059 across two successive merges of
+    // origin/main into feat/local-member-scopes. Both branches independently
+    // claim the next free slot each time, which is correct on each branch
+    // alone and a duplicate together; main's side had already shipped and may
+    // be recorded in live `_amux_migrations` rows, so THIS side moved. It will
+    // keep moving on every refresh until this branch lands.
+    Migration {
+        version: 59,
+        name: "0059_local_member_scope",
+        sql: include_str!("../../migrations/0059_local_member_scope.sql"),
+    },
+    Migration {
+        version: 60,
+        name: "0060_org_teams",
+        sql: include_str!("../../migrations/0060_org_teams.sql"),
+    },
+    Migration {
+        version: 61,
+        name: "0061_board_cdc",
+        sql: include_str!("../../migrations/0061_board_cdc.sql"),
+    },
+    Migration {
+        version: 62,
+        name: "0062_self_driving_control_plane",
+        sql: include_str!("../../migrations/0062_self_driving_control_plane.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.
@@ -1197,6 +1223,60 @@ mod tests {
         apply_one(&conn, sql).unwrap(); // second run: column exists, skipped
         assert!(column_exists(&conn, "t", "b").unwrap());
     }
+
+    #[test]
+    fn team_migration_preserves_every_legacy_scope_without_widening_access() {
+        let conn = Connection::open_in_memory().unwrap();
+        for migration in MIGRATIONS.iter().filter(|migration| migration.version <= 59) {
+            apply_one(&conn, migration.sql).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO org_members (id,email,role,joined_at,scope_level,scope_name) \
+             VALUES ('member-group','g@example.com','member',1,'group','research'), \
+                    ('member-worker','w@example.com','member',2,'worker','tubescience'), \
+                    ('member-global','a@example.com','member',3,'global','')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO org_invites (token,created_at,expires_at,scope_level,scope_name) \
+             VALUES ('legacy-group',1,9999999999,'group','research')",
+            [],
+        )
+        .unwrap();
+
+        let migration = MIGRATIONS.iter().find(|migration| migration.version == 60).unwrap();
+        apply_one(&conn, migration.sql).unwrap();
+
+        let rows: Vec<(String, String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT m.id,t.scope_level,t.scope_name FROM org_members m \
+                     JOIN org_teams t ON t.id=m.team_id ORDER BY m.id",
+                )
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            rows,
+            vec![
+                ("member-global".into(), "global".into(), "".into()),
+                ("member-group".into(), "group".into(), "research".into()),
+                ("member-worker".into(), "worker".into(), "tubescience".into()),
+            ]
+        );
+        let invite_scope: (String, String) = conn
+            .query_row(
+                "SELECT t.scope_level,t.scope_name FROM org_invites i JOIN org_teams t ON t.id=i.team_id WHERE i.token='legacy-group'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(invite_scope, ("group".into(), "research".into()));
+    }
 }
 
 #[cfg(test)]
@@ -1484,6 +1564,83 @@ mod cost_tests {
         s.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
+    /// Indexes created after a DML statement that actually READS their table
+    /// through their leading column. The statement's WRITE table is excluded:
+    /// building that index after the backfill is deliberate and avoids paying
+    /// index maintenance on every changed row.
+    fn late_read_side_indexes(name: &str, sql: &str) -> Vec<String> {
+        fn identifiers(s: &str) -> Vec<String> {
+            s.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .filter(|t| !t.is_empty())
+                .map(str::to_uppercase)
+                .collect()
+        }
+        fn indexed_table_and_leading_column(stmt_upper: &str) -> Option<(String, String)> {
+            let on = stmt_upper.find(" ON ")? + 4;
+            let rest = stmt_upper[on..].trim_start();
+            let open = rest.find('(')?;
+            let table = rest[..open].trim().trim_matches('"').to_string();
+            let columns = &rest[open + 1..];
+            let leading = columns
+                .split([',', ')'])
+                .next()?
+                .split_whitespace()
+                .next()?
+                .trim_matches('"')
+                .to_string();
+            (!table.is_empty() && !leading.is_empty()).then_some((table, leading))
+        }
+        fn written_table(stmt_upper: &str) -> Option<String> {
+            let rest = stmt_upper.strip_prefix("UPDATE ")?;
+            let end = rest.find([' ', '\n']).unwrap_or(rest.len());
+            Some(rest[..end].trim().trim_matches('"').to_string())
+        }
+        fn reads_table(stmt_upper: &str, table: &str) -> bool {
+            let ids = identifiers(stmt_upper);
+            ids.windows(2).any(|w| {
+                matches!(w[0].as_str(), "FROM" | "JOIN") && w[1].as_str() == table
+            })
+        }
+        fn mentions_column(stmt_upper: &str, column: &str) -> bool {
+            identifiers(stmt_upper).iter().any(|t| t == column)
+        }
+
+        let body: String = sql
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // (offset, table written, complete statement) for each DML seen so far.
+        let mut dml_seen: Vec<(usize, Option<String>, String)> = Vec::new();
+        let mut offset = 0usize;
+        let mut bad = Vec::new();
+        for raw in body.split(';') {
+            let t = raw.trim().to_uppercase();
+            if t.starts_with("UPDATE ") || t.starts_with("DELETE ") || t.starts_with("WITH ") {
+                dml_seen.push((offset, written_table(&t), t.clone()));
+            }
+            if t.starts_with("CREATE INDEX") || t.starts_with("CREATE UNIQUE INDEX") {
+                if let Some((idx_table, leading_column)) =
+                    indexed_table_and_leading_column(&t)
+                {
+                    for (d_off, written, dml) in &dml_seen {
+                        if offset > *d_off
+                            && written.as_deref() != Some(idx_table.as_str())
+                            && reads_table(dml, &idx_table)
+                            && mentions_column(dml, &leading_column)
+                        {
+                            bad.push(format!(
+                                "{name}: CREATE INDEX on {idx_table}({leading_column}, ...) appears AFTER a statement that reads it through that column — same final schema, same outage"
+                            ));
+                        }
+                    }
+                }
+            }
+            offset += raw.len() + 1;
+        }
+        bad
+    }
+
     /// Every migration, applied in order, with each one's DML plan-checked
     /// against the schema THAT MIGRATION LEAVES BEHIND — previous migrations
     /// plus its own DDL, and nothing from later ones.
@@ -1575,51 +1732,40 @@ mod cost_tests {
     /// the one that turns into a scan per outer row.
     #[test]
     fn a_migration_creates_its_read_side_indexes_before_the_dml_that_needs_them() {
-        fn indexed_table(stmt_upper: &str) -> Option<String> {
-            let on = stmt_upper.find(" ON ")? + 4;
-            let rest = stmt_upper[on..].trim_start();
-            let end = rest.find(['(', ' ', '\n']).unwrap_or(rest.len());
-            Some(rest[..end].trim().trim_matches('"').to_string())
-        }
-        fn written_table(stmt_upper: &str) -> Option<String> {
-            let rest = stmt_upper.strip_prefix("UPDATE ")?;
-            let end = rest.find([' ', '\n']).unwrap_or(rest.len());
-            Some(rest[..end].trim().trim_matches('"').to_string())
-        }
-
         let mut bad = Vec::new();
         for m in MIGRATIONS {
-            let body: String = m
-                .sql
-                .lines()
-                .filter(|l| !l.trim_start().starts_with("--"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            // (offset, table written) for each DML seen so far.
-            let mut dml_seen: Vec<(usize, Option<String>)> = Vec::new();
-            let mut offset = 0usize;
-            for raw in body.split(';') {
-                let t = raw.trim().to_uppercase();
-                if t.starts_with("UPDATE ") || t.starts_with("DELETE ") || t.starts_with("WITH ") {
-                    dml_seen.push((offset, written_table(&t)));
-                }
-                if t.starts_with("CREATE INDEX") || t.starts_with("CREATE UNIQUE INDEX") {
-                    if let Some(idx_table) = indexed_table(&t) {
-                        for (d_off, written) in &dml_seen {
-                            if offset > *d_off && written.as_deref() != Some(idx_table.as_str()) {
-                                bad.push(format!(
-                                    "{}: CREATE INDEX on {} appears AFTER a statement that reads \
-                                     it — same final schema, same outage",
-                                    m.name, idx_table
-                                ));
-                            }
-                        }
-                    }
-                }
-                offset += raw.len() + 1;
-            }
+            bad.extend(late_read_side_indexes(m.name, m.sql));
         }
         assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    /// The ordering check used to equate "another DML appeared earlier" with
+    /// "that DML read this index's table". 0060 alternates writes to
+    /// org_members and org_invites, then correctly builds each WRITE-side
+    /// team_id index after the backfill; the old heuristic called each sibling
+    /// UPDATE a read of the other table and failed four times. Preserve both
+    /// directions: sibling writes stay quiet and the actual 0031 shape fires.
+    #[test]
+    fn read_side_index_ordering_distinguishes_a_read_from_a_sibling_write() {
+        let siblings = "
+            UPDATE org_members SET team_id='x' WHERE team_id IS NULL;
+            UPDATE org_invites SET team_id='x' WHERE team_id IS NULL;
+            CREATE INDEX idx_members_team ON org_members(team_id);
+            CREATE INDEX idx_invites_team ON org_invites(team_id);";
+        assert!(
+            late_read_side_indexes("siblings", siblings).is_empty(),
+            "an UPDATE of one table is not a read of its sibling"
+        );
+
+        let incident = "
+            UPDATE issues SET closed_at=(
+                SELECT MAX(at) FROM _amux_state_events e
+                WHERE e.entity_type='task' AND e.entity_id=issues.id);
+            CREATE INDEX idx_events_entity
+                ON _amux_state_events(entity_type, entity_id);";
+        let bad = late_read_side_indexes("0031-planted", incident);
+        assert_eq!(bad.len(), 1, "the real late read-side index must still fail: {bad:?}");
+        assert!(bad[0].contains("_AMUX_STATE_EVENTS(ENTITY_TYPE"), "{bad:?}");
     }
 
     /// NEGATIVE CONTROL, built from the incident rather than from a convenient

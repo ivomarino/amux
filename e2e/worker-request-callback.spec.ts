@@ -1,222 +1,126 @@
-// Cross-worker work is a board lifecycle, not an ephemeral chat message. This
-// drives the real Rust API and then verifies the real card UI: verified
-// requester, source Messages link, durable terminal callback, and idempotency.
+// Worker board ownership is an authorization boundary. Peer collaboration is
+// represented by reviewer/shepherd/task-dependency links, never by placing a
+// newly created card directly on another worker's board.
 import { test, expect } from './fixtures';
 
-test('worker request stays on one card and returns one terminal callback', async ({ page, request }, testInfo) => {
+test('a worker creates only on its own board and links peers explicitly', async ({ page, request }, testInfo) => {
   await page.goto('/');
   const token = await page.evaluate(() => (window as any)._AMUX_AUTH_TOKEN as string);
   expect(token, 'served bootstrap must provide the API token').toBeTruthy();
   const auth = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
   const suffix = `${testInfo.project.name}-${Date.now()}`;
-  const requester = `callback-a-${suffix}`;
-  const worker = `callback-b-${suffix}`;
-  let card = '';
-  let parent = '';
-  let independent = '';
+  const owner = `board-owner-${suffix}`;
+  const reviewer = `board-reviewer-${suffix}`;
+  const shepherd = `board-shepherd-${suffix}`;
+  let dependency = '';
+  let owned = '';
 
   try {
-    // Different groups are deliberate: fresh installs are open for peer
-    // discovery/message delivery, while an explicit worker opt-out remains a
-    // supported configuration. No approval banner should be involved.
-    for (const [name, group] of [[requester, 'requesters'], [worker, 'workers']]) {
+    for (const name of [owner, reviewer, shepherd]) {
       const made = await request.post('/api/sessions', {
         headers: auth,
-        data: { name, dir: '/tmp', tags: [`e2e-${group}`] },
+        data: { name, dir: '/tmp', tags: ['e2e-board-ownership'] },
       });
       expect(made.status(), `create ${name}`).toBe(201);
     }
 
-    const parentMade = await request.post('/api/board', {
-      headers: { ...auth, 'X-Amux-Worker': requester },
-      data: {
-        title: 'Assemble the callback acceptance result',
-        desc: 'Use the delegated artifact, then finish the requester workflow.',
-        status: 'doing', session: requester, type: 'chore',
-      },
-    });
-    expect(parentMade.status()).toBe(201);
-    parent = (await parentMade.json()).id;
-    const independentMade = await request.post('/api/board', {
-      headers: { ...auth, 'X-Amux-Worker': requester },
-      data: {
-        title: 'Independent callback acceptance work',
-        desc: 'This remains ready while the delegated result is open.',
-        status: 'todo', session: requester, type: 'chore',
-      },
-    });
-    expect(independentMade.status()).toBe(201);
-    independent = (await independentMade.json()).id;
-    for (const [id, next_action] of [
-      [parent, 'Integrate the returned dependency into the requester result.'],
-      [independent, 'Run the independent callback verification.'],
-    ]) {
-      const progressed = await request.patch(`/api/board/${encodeURIComponent(id)}`, {
-        headers: { ...auth, 'X-Amux-Worker': requester }, data: { next_action },
-      });
-      expect(progressed.ok(), `record continuation for ${id}`).toBeTruthy();
-    }
-
-    const made = await request.post('/api/board', {
-      headers: { ...auth, 'X-Amux-Worker': requester },
-      data: {
-        title: 'Produce the callback acceptance result',
-        desc: 'Create /tmp/amux-callback-e2e/result.md and record it on this card.',
-        status: 'todo',
-        session: worker,
-        type: 'chore',
-        request_parent: parent,
-        callback: { prompt: 'Continue the requester workflow from the recorded result.' },
-      },
-    });
-    expect(made.status()).toBe(201);
-    const initial = await made.json();
-    card = initial.id;
-    expect(initial.requested_by).toBe(requester);
-    expect(initial.callback).toMatchObject({ session: requester, state: 'armed' });
-    expect(initial.request_dependency).toEqual({
-      verdict: 'parent_requeued', linked: true, parent, child: card,
-      parent_status: 'todo', prior_parent_status: 'doing',
-    });
-
-    const parentWaiting = await request.get(`/api/board/${encodeURIComponent(parent)}`, { headers: auth });
-    expect(parentWaiting.ok()).toBeTruthy();
-    expect(await parentWaiting.json()).toMatchObject({ status: 'todo', depends_on: [card] });
-    const waitingFrontier = await request.get(`/api/board/ready?session=${encodeURIComponent(requester)}`, {
+    // Administrative setup creates a real task on the reviewer's board. The
+    // worker may depend on it, but may not create another card in that lane.
+    const dependencyMade = await request.post('/api/board', {
       headers: auth,
-    });
-    expect(waitingFrontier.ok()).toBeTruthy();
-    const waitingState = await waitingFrontier.json();
-    expect(waitingState.wip).toMatchObject({ doing: 0, holding: [] });
-    expect(waitingState.ready.map((row: any) => row.id)).toContain(independent);
-    expect(waitingState.ready.map((row: any) => row.id)).not.toContain(parent);
-
-    const finished = await request.patch(`/api/board/${encodeURIComponent(card)}`, {
-      headers: { ...auth, 'X-Amux-Worker': worker },
       data: {
-        status: 'done',
-        force: true,
-        reason: 'The callback transport is the subject; unrelated task-type gates are outside this fixture.',
-        evidence: '/tmp/amux-callback-e2e/result.md',
-        last_result: 'Wrote /tmp/amux-callback-e2e/result.md and validated the callback path.',
+        title: 'Peer-owned prerequisite', status: 'backlog', session: reviewer, type: 'chore',
       },
     });
-    expect(finished.ok()).toBeTruthy();
-    const terminal = await finished.json();
-    expect(terminal.callback_dispatch).toEqual({ attempted: 1, queued: 1, refused: 0 });
-    expect(terminal.callback).toMatchObject({
-      session: requester,
-      state: 'queued',
-      message_id: `task-callback-${card}`,
-    });
+    expect(dependencyMade.status()).toBe(201);
+    dependency = (await dependencyMade.json()).id;
 
-    const resumedFrontier = await request.get(`/api/board/ready?session=${encodeURIComponent(requester)}`, {
-      headers: auth,
-    });
-    expect(resumedFrontier.ok()).toBeTruthy();
-    expect((await resumedFrontier.json()).ready.map((row: any) => row.id)).toContain(parent);
-
-    // Retrying the terminal update is a chaos/replay cell. The stable outbox id
-    // must keep both the steering queue and Messages ledger at one callback.
-    const replay = await request.patch(`/api/board/${encodeURIComponent(card)}`, {
-      headers: { ...auth, 'X-Amux-Worker': worker },
-      data: {
-        status: 'done', force: true,
-        reason: 'Replay the already-terminal mutation to verify callback idempotency.',
-      },
-    });
-    expect(replay.ok()).toBeTruthy();
-
-    const history = await request.get(`/api/history?q=${encodeURIComponent(card)}&limit=20`, {
-      headers: auth,
-    });
-    expect(history.ok()).toBeTruthy();
-    const linked = await history.json();
-    expect(linked.filter((m: any) => m.card_id === card && m.delivery === 'board')).toHaveLength(1);
-    // Completion resumes the original requester task. The callback text keeps
-    // the child id, while the hard card edge deliberately points at `parent`.
-    expect(linked.filter((m: any) =>
-      m.type === 'task-callback'
-      && m.card_id === parent
-      && String(m.text || '').includes(`[task callback ${card}:`),
-    )).toHaveLength(1);
-
-    // The compact card UI must expose the same facts and clickable source link;
-    // this is the operator-facing acceptance, not only an API assertion.
-    await page.goto(`/#issue=${encodeURIComponent(card)}`);
-    await expect(page.locator('#board-detail-overlay')).toHaveClass(/active/, { timeout: 30_000 });
-    const meta = page.locator('#bd-meta');
-    await expect(meta).toContainText('Source message');
-    await expect(meta).toContainText('Worker request');
-    await expect(meta).toContainText(requester);
-    await expect(meta).toContainText('queued');
-    await expect(meta).toContainText('/tmp/amux-callback-e2e/result.md');
-    const sourceMessages = meta.locator('button', { hasText: /^MSG-/ });
-    await expect(sourceMessages).toHaveCount(1);
-
-    // Card -> exact source message -> same card is a two-way relation. The
-    // reverse edge used to be a click-handled span, which looked like inert
-    // prose and was absent from the keyboard accessibility tree.
-    const sourceMessage = (await sourceMessages.first().textContent()) || '';
-    await sourceMessages.first().click();
-    await expect(page.locator('#msgs-search')).toHaveValue(sourceMessage);
-    const backToCard = page.locator(`#msgs-list button.msg-card-chip`, { hasText: card }).first();
-    await expect(backToCard).toBeVisible({ timeout: 15_000 });
-    await expect(backToCard).toHaveAttribute('type', 'button');
-    await backToCard.click();
-    await expect(page.locator('#board-detail-overlay')).toHaveClass(/active/, { timeout: 15_000 });
-    await expect(page.locator('#bd-key')).toHaveText(card);
-  } finally {
-    if (card) await request.delete(`/api/board/${encodeURIComponent(card)}`, { headers: auth }).catch(() => {});
-    if (parent) await request.delete(`/api/board/${encodeURIComponent(parent)}`, { headers: auth }).catch(() => {});
-    if (independent) await request.delete(`/api/board/${encodeURIComponent(independent)}`, { headers: auth }).catch(() => {});
-    await request.delete(`/api/sessions/${requester}`, { headers: auth }).catch(() => {});
-    await request.delete(`/api/sessions/${worker}`, { headers: auth }).catch(() => {});
-  }
-});
-
-test('a worker cannot redirect its callback to a third worker', async ({ page, request }, testInfo) => {
-  await page.goto('/');
-  const token = await page.evaluate(() => (window as any)._AMUX_AUTH_TOKEN as string);
-  const auth = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
-  const suffix = `${testInfo.project.name}-${Date.now()}`;
-  const requester = `callback-owner-${suffix}`;
-  const worker = `callback-target-${suffix}`;
-  const third = `callback-third-${suffix}`;
-  let validCard = '';
-
-  try {
-    for (const name of [requester, worker, third]) {
-      expect((await request.post('/api/sessions', {
-        headers: auth, data: { name, dir: '/tmp', tags: ['e2e-callback-security'] },
-      })).status()).toBe(201);
-    }
     const refused = await request.post('/api/board', {
-      headers: { ...auth, 'X-Amux-Worker': requester },
+      headers: { ...auth, 'X-Amux-Worker': owner },
       data: {
-        title: 'Attempt callback redirect', status: 'todo', session: worker,
-        callback: { session: third },
+        title: 'Cross-board placement must fail', status: 'backlog', session: reviewer,
       },
     });
     expect(refused.status()).toBe(403);
-    expect((await refused.json()).error).toContain('verified requester');
+    expect(await refused.json()).toMatchObject({
+      code: 'cross_board_create_forbidden', caller: owner, requested_owner: reviewer,
+    });
 
-    const valid = await request.post('/api/board', {
-      headers: { ...auth, 'X-Amux-Worker': requester },
-      data: { title: 'Keep requester-owned callback', status: 'todo', session: worker, callback: true },
+    const made = await request.post('/api/board', {
+      headers: { ...auth, 'X-Amux-Worker': owner },
+      data: {
+        title: 'Owner-controlled work with peer links',
+        desc: 'Ownership stays local while peer review and dependency edges remain explicit.',
+        status: 'backlog',
+        session: owner,
+        type: 'chore',
+        reviewer,
+        shepherd,
+        depends_on: [dependency],
+      },
     });
-    expect(valid.status()).toBe(201);
-    validCard = (await valid.json()).id;
-    const hijack = await request.patch(`/api/board/${encodeURIComponent(validCard)}`, {
-      headers: { ...auth, 'X-Amux-Worker': worker },
-      data: { callback: false },
+    expect(made.status()).toBe(201);
+    const card = await made.json();
+    owned = card.id;
+    expect(card).toMatchObject({
+      session: owner,
+      reviewer,
+      shepherd,
+      depends_on: [dependency],
     });
-    expect(hijack.status()).toBe(403);
-    expect((await hijack.json()).error).toContain('only the verified requester');
+
+    const reassignRefused = await request.patch(`/api/board/${encodeURIComponent(owned)}`, {
+      headers: { ...auth, 'X-Amux-Worker': owner },
+      data: { session: reviewer },
+    });
+    expect(reassignRefused.status()).toBe(403);
+    expect(await reassignRefused.json()).toMatchObject({
+      code: 'cross_board_reassignment_forbidden', caller: owner, requested_owner: reviewer,
+    });
+    const stillOwned = await request.get(`/api/board/${encodeURIComponent(owned)}`, { headers: auth });
+    expect(stillOwned.ok()).toBeTruthy();
+    expect(await stillOwned.json()).toMatchObject({ session: owner, reviewer, shepherd });
+
+    const all = await request.get('/api/board?all=1', { headers: auth });
+    expect(all.ok()).toBeTruthy();
+    expect((await all.json()).filter((row: any) =>
+      row.title === 'Cross-board placement must fail' && row.session === reviewer,
+    )).toHaveLength(0);
+
+    // Operator-facing proof: the shipped detail view resolves the same card
+    // and exposes its peer reviewer without changing the owner lane.
+    await page.goto(`/#issue=${encodeURIComponent(owned)}`);
+    await expect(page.locator('#board-detail-overlay')).toHaveClass(/active/, { timeout: 30_000 });
+    await expect(page.locator('#bd-key')).toHaveText(owned);
+    await expect(page.locator('#bd-meta')).toContainText(reviewer);
   } finally {
-    if (validCard) await request.delete(`/api/board/${encodeURIComponent(validCard)}`, { headers: auth }).catch(() => {});
-    for (const name of [requester, worker, third]) {
+    if (owned) await request.delete(`/api/board/${encodeURIComponent(owned)}`, { headers: auth }).catch(() => {});
+    if (dependency) await request.delete(`/api/board/${encodeURIComponent(dependency)}`, { headers: auth }).catch(() => {});
+    for (const name of [owner, reviewer, shepherd]) {
       await request.delete(`/api/sessions/${name}`, { headers: auth }).catch(() => {});
     }
+  }
+});
+
+test('a worker cannot create an unassigned card to escape board ownership', async ({ page, request }, testInfo) => {
+  await page.goto('/');
+  const token = await page.evaluate(() => (window as any)._AMUX_AUTH_TOKEN as string);
+  const auth = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+  const owner = `board-owner-null-${testInfo.project.name}-${Date.now()}`;
+
+  try {
+    expect((await request.post('/api/sessions', {
+      headers: auth, data: { name: owner, dir: '/tmp', tags: ['e2e-board-ownership'] },
+    })).status()).toBe(201);
+    const refused = await request.post('/api/board', {
+      headers: { ...auth, 'X-Amux-Worker': owner },
+      data: { title: 'Unassigned escape must fail', session: null, status: 'backlog' },
+    });
+    expect(refused.status()).toBe(403);
+    expect(await refused.json()).toMatchObject({
+      code: 'cross_board_create_forbidden', caller: owner, requested_owner: null,
+    });
+  } finally {
+    await request.delete(`/api/sessions/${owner}`, { headers: auth }).catch(() => {});
   }
 });

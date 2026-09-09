@@ -27,9 +27,23 @@ n=$(printf '%s' "$o" | grep -oE 'subset — [0-9]+ integration' | grep -oE '[0-9
 real=$(find "$SRC/crates/amux-server/tests" -maxdepth 1 -name '*.rs' | wc -l | tr -d ' ')
 ok "the count matches the tree, not a constant" "$n" "$real"
 
-echo "cell 2: THE CONTROL — a full-suite or --test run stays silent"
+# CELL 2'S CONTRACT CHANGED, deliberately. It used to assert that `--test <name>`
+# stayed SILENT, on the reading that naming a target is not the narrowing this
+# clause is about. AF-346's own closing sentence says the opposite -- "`--lib` is
+# not the only such flag" -- and `--test` is the sharper case: it skips the LIB
+# ENTIRELY, which is the larger half of this crate, while printing the smallest
+# number of any selector. A caveat that fires for the flag that skips the smaller
+# half and stays quiet for the flag that skips the larger one is the wrong way
+# round. The runner now announces it, so this cell asserts the announcement.
+#
+# The full-suite control moved rather than disappeared: it is cell 3 of
+# scripts/test-selector-clauses.sh, which stubs cargo and can therefore afford a
+# no-selector run. Every cell here compiles for real, which is why this file has
+# never had one.
+echo "cell 2: --test skips the LIB, and now says so"
 o2=$("$RUNNER" -p amux-server --test browser_errors_carry_cause 2>&1)
-ok "silent when a target IS selected" "$(printf '%s' "$o2" | grep -c '^targets:')" "0"
+ok "announces the skipped lib" "$(printf '%s' "$o2" | grep -c '^targets:')" "4"
+ok "and names which half"      "$(printf '%s' "$o2" | grep -c 'THE LIB WAS NOT RUN')" "1"
 
 echo "cell 3: the count is derived from the repo, not from the running script"
 # The runner re-execs from a temp snapshot, so a BASH_SOURCE-relative path

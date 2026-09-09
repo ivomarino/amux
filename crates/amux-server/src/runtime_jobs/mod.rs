@@ -49,7 +49,9 @@
 
 pub mod autofix;
 pub mod board_drive;
+pub mod board_hygiene;
 pub mod browser_reaper;
+pub mod cdc_poller;
 pub mod commit_mention_notes;
 pub mod commit_nudge;
 pub mod context_health;
@@ -370,6 +372,7 @@ mod tests {
             ("heartbeat.rs", include_str!("heartbeat.rs")),
             ("status_history.rs", include_str!("status_history.rs")),
             ("commit_nudge.rs", include_str!("commit_nudge.rs")),
+            ("board_hygiene.rs", include_str!("board_hygiene.rs")),
         ];
         // The control first: this cell is worthless unless the literal it looks
         // for is one these files COULD contain, so prove the deriver produces

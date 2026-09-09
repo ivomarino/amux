@@ -18,6 +18,8 @@ pub mod advance;
 pub mod artifact_store;
 pub mod board_store;
 pub mod task_graph_store;
+pub mod trace_store;
+pub mod throughput_store;
 pub mod commands;
 pub mod harness_store;
 pub mod memories;
@@ -36,6 +38,22 @@ use std::sync::mpsc;
 use std::sync::Arc;
 
 pub type ReadPool = r2d2::Pool<SqliteConnectionManager>;
+
+pub(crate) enum ProjectionRead {
+    Dedicated(Connection),
+    Pooled(r2d2::PooledConnection<SqliteConnectionManager>),
+}
+
+impl std::ops::Deref for ProjectionRead {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Dedicated(conn) => conn,
+            Self::Pooled(conn) => conn,
+        }
+    }
+}
 
 /// What a write closure reports back: did it change anything, and what
 /// StateEvents should be published if it did. `applied: false` writes do NOT
@@ -86,6 +104,7 @@ pub struct WriteReply {
 pub struct Store {
     write_tx: mpsc::Sender<WriteRequest>,
     read_pool: ReadPool,
+    db_path: Arc<std::path::PathBuf>,
     pub(crate) health_probe: Arc<tokio::sync::Semaphore>,
     /// Broadcast of committed StateEvents for SSE fan-out.
     events_tx: tokio::sync::broadcast::Sender<StateEvent>,
@@ -125,11 +144,35 @@ impl Store {
         });
         let read_pool = r2d2::Pool::builder()
             .max_size(std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(4))
+            // FAIL FAST, because a blocked acquire pins a tokio worker (AF-640).
+            //
+            // r2d2's default is 30 SECONDS and it was never set, which is why
+            // the 2026-09-08 outage produced rows at exactly 30032, 30100 and
+            // 30104 ms: sixteen 500s in 22 minutes, every one a caller that
+            // waited half a minute to be told no.
+            //
+            // WHY WAITING IS WORSE THAN FAILING HERE. `read()` is synchronous
+            // and there is no `read_async` to match `write_async`, whose own
+            // doc says it exists so a handler "can await a write without
+            // pinning a runtime worker". So every one of the ~440 `read()` call
+            // sites blocks its thread for the whole acquire. The pool's
+            // max_size is `available_parallelism`, which is ALSO tokio's default
+            // worker count, so a saturated pool can pin every worker at once
+            // and each one holds for 30s. That is self-sustaining, which is why
+            // it lasted 22 minutes and recurred five more times that day.
+            //
+            // A healthy acquire is microseconds. Anything approaching seconds
+            // means the pool is already saturated, and a caller that waits
+            // longer does not make a connection appear; it just holds a worker
+            // that could be shedding load. Five seconds keeps a generous margin
+            // over any legitimate contention while cutting the pin by 6x.
+            .connection_timeout(std::time::Duration::from_secs(5))
             .build(manager)?;
 
         Ok(Store {
             write_tx,
             read_pool,
+            db_path: Arc::new(db_path.to_path_buf()),
             health_probe: Arc::new(tokio::sync::Semaphore::new(1)),
             events_tx,
         })
@@ -161,14 +204,87 @@ impl Store {
         tokio::task::spawn_blocking(move || this.write(f)).await?
     }
 
+    /// A read acquire this slow means the pool is already saturated. Well under
+    /// `connection_timeout` so the warning arrives BEFORE the failures do, which
+    /// is the difference between a signal and a post-mortem.
+    const SLOW_ACQUIRE: std::time::Duration = std::time::Duration::from_millis(250);
+
     /// Borrow a read-only connection from the pool.
+    ///
+    /// SAYS WHEN IT IS SLOW, because the only signal the 2026-09-08 exhaustion
+    /// left was a 30-second 500 with `timed out waiting for connection` and no
+    /// pool state beside it (AF-640). "How many connections were out, and how
+    /// many were idle" is the first question anyone asks and nothing recorded
+    /// it, so the cause had to be reconstructed from the source afterwards.
+    ///
+    /// Silent on the happy path: a healthy acquire is microseconds, so the
+    /// threshold below is never reached in normal operation and this stays off
+    /// a hot path rather than logging 200k times a day.
     pub fn read(&self) -> anyhow::Result<r2d2::PooledConnection<SqliteConnectionManager>> {
-        Ok(self.read_pool.get()?)
+        let t0 = std::time::Instant::now();
+        let got = self.read_pool.get();
+        let waited = t0.elapsed();
+        match got {
+            Ok(conn) => {
+                if waited >= Self::SLOW_ACQUIRE {
+                    let st = self.read_pool.state();
+                    tracing::warn!(
+                        verdict = "read_pool_slow_acquire",
+                        waited_ms = waited.as_millis() as u64,
+                        connections = st.connections,
+                        idle = st.idle_connections,
+                        max_size = self.read_pool.max_size(),
+                        "read pool acquire was slow; the pool is saturated and every waiter                          is pinning a thread (AF-640)"
+                    );
+                }
+                Ok(conn)
+            }
+            Err(e) => {
+                let st = self.read_pool.state();
+                tracing::warn!(
+                    verdict = "read_pool_exhausted",
+                    waited_ms = waited.as_millis() as u64,
+                    connections = st.connections,
+                    idle = st.idle_connections,
+                    max_size = self.read_pool.max_size(),
+                    error = %e,
+                    "read pool acquire FAILED; callers are getting 500s (AF-640)"
+                );
+                Err(e.into())
+            }
+        }
     }
 
     /// Health must report pool exhaustion without waiting behind fleet probes.
     pub fn try_read(&self) -> Option<r2d2::PooledConnection<SqliteConnectionManager>> {
         self.read_pool.try_get()
+    }
+
+    /// Open a read-only connection outside the request pool for a bounded,
+    /// heavyweight projection.
+    ///
+    /// The sessions projection deliberately shells out while it assembles its
+    /// answer. Even with one build in flight, lending that work one of the
+    /// request pool's connections makes unrelated, cheap API reads wait behind
+    /// tmux/git. A dedicated reader keeps the pool available while preserving
+    /// SQLite's WAL snapshot semantics; callers must still single-flight and
+    /// bound their external work.
+    pub(crate) fn dedicated_read(&self) -> anyhow::Result<ProjectionRead> {
+        // SQLite gives each `:memory:` connection an independent database, so
+        // a new connection would silently see an empty store. Preserve the
+        // previous pooled behavior for that test/development configuration.
+        if self.db_path.as_path() == Path::new(":memory:") {
+            return Ok(ProjectionRead::Pooled(self.read()?));
+        }
+        let conn = Connection::open_with_flags(
+            self.db_path.as_ref(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "query_only", "ON")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        Ok(ProjectionRead::Dedicated(conn))
     }
 
     /// Current global revision.
@@ -350,3 +466,93 @@ fn apply_write(
 
 /// Shared handle used by API state.
 pub type SharedStore = Arc<Store>;
+
+#[cfg(test)]
+mod af640_read_pool_tests {
+    use super::*;
+
+    /// The DIAGNOSTIC half, which the timeout test does not cover: mutating the
+    /// warn away leaves that cell green, because a pool can fail fast and say
+    /// nothing about why.
+    ///
+    /// `read_pool_exhausted` is the string the health payload already reports
+    /// and the one a log sweep greps for, so it is the name that has to survive
+    /// a rename, not just the presence of some warning.
+    #[test]
+    fn a_saturated_pool_reports_its_state_under_greppable_verdicts() {
+        let src = include_str!("mod.rs");
+        let body = src
+            .split_once("\n    pub fn read(&self)")
+            .expect("Store::read exists")
+            .1;
+        let body = body.split_once("\n    }\n").expect("its closing brace").0;
+
+        // LANDMARK FIRST: prove the scan is reading `read`, not some other
+        // region. Anchoring on a name that also appears quoted elsewhere has
+        // silently read the wrong block three times today.
+        assert!(
+            body.contains("self.read_pool.get()"),
+            "the scan is not reading Store::read; it has {} chars of something else",
+            body.len()
+        );
+
+        for verdict in ["read_pool_exhausted", "read_pool_slow_acquire"] {
+            assert!(
+                body.contains(&format!("verdict = \"{verdict}\"")),
+                "a saturated pool must report under `{verdict}`, which is what the health \
+                 payload uses and what a sweep greps for"
+            );
+        }
+        // The state is what makes it diagnosable. A verdict with no numbers is
+        // the 30-second 500 again, wearing a better name.
+        for field in ["connections", "idle", "max_size", "waited_ms"] {
+            assert!(
+                body.contains(&format!("{field} =")),
+                "the warn must carry `{field}`; without it nobody can tell a saturated \
+                 pool from a slow query"
+            );
+        }
+    }
+
+    /// AF-640. The pool must FAIL rather than pin a thread for half a minute,
+    /// and the bound must be the one we set rather than r2d2's default.
+    ///
+    /// EXHAUSTS THE POOL FOR REAL. Asserting the builder was called with a
+    /// duration would pass on a value that never reaches the pool; this holds
+    /// every connection and measures what a caller actually experiences.
+    #[test]
+    fn an_exhausted_read_pool_fails_fast_instead_of_pinning_a_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("pool.db")).unwrap();
+        let max = store.read_pool.max_size() as usize;
+        assert!(max >= 1, "a pool with no connections cannot be exhausted");
+
+        // Hold every connection, so the next acquire has nowhere to go.
+        let held: Vec<_> = (0..max).map(|_| store.read().expect("initial fill")).collect();
+        assert_eq!(store.read_pool.state().idle_connections, 0, "the pool must be empty");
+
+        let t0 = std::time::Instant::now();
+        let denied = store.read();
+        let waited = t0.elapsed();
+
+        assert!(denied.is_err(), "an exhausted pool must refuse, not hand out a 29th connection");
+        // THE POINT: it fails in ~5s, not r2d2's default 30s. The upper bound is
+        // what this card is about; the lower bound catches a timeout set so
+        // small that ordinary contention would start failing.
+        assert!(
+            waited < std::time::Duration::from_secs(12),
+            "waited {waited:?}: that is r2d2's 30s default, not our timeout, and every \
+             one of those seconds pins a tokio worker"
+        );
+        assert!(
+            waited >= std::time::Duration::from_secs(2),
+            "waited only {waited:?}: the timeout is so short that normal contention \
+             would 500 rather than queue"
+        );
+        drop(held);
+
+        // CONTROL: after releasing, a read must succeed again. Without this the
+        // assertions above are satisfied by a pool that is simply broken.
+        assert!(store.read().is_ok(), "the pool must recover once connections are returned");
+    }
+}

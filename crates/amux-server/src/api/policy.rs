@@ -64,6 +64,7 @@ pub(crate) fn authorize_dispatch(
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e))))?;
     let ctx = ActionContext {
         actor: worker.to_string(),
+        role: crate::db::harness_store::planning_role_for_actor(conn, worker.as_str())?,
         action: ActionClass::ExecuteTask,
         resource: task.to_string(),
         trust: TrustLevel::Trusted,
@@ -100,11 +101,13 @@ pub(crate) fn authorize_dispatch(
     }
     conn.execute(
         "INSERT INTO _amux_policy_receipts
-         (id,actor,action,resource,trust,reversible,effect,rule_id,rationale,cost_microusd,created_at)
-         VALUES(?1,?2,?3,?4,'trusted',1,?5,?6,?7,0,?8)",
+         (id,actor,role,action,resource,trust,reversible,effect,rule_id,rationale,cost_microusd,created_at)
+         VALUES(?1,?2,?3,?4,?5,'trusted',1,?6,?7,?8,0,?9)",
         rusqlite::params![
             format!("pol_{}", ulid::Ulid::new().to_string().to_lowercase()),
             ctx.actor,
+            ctx.role.and_then(|role| serde_json::to_value(role).ok())
+                .and_then(|value| value.as_str().map(str::to_owned)),
             ctx.action.as_str(),
             ctx.resource,
             effect_token(decision.effect),
@@ -133,13 +136,18 @@ fn classify(method: &Method, path: &str) -> (ActionClass, bool) {
         return (ActionClass::Delete, false);
     }
     let lower = path.to_ascii_lowercase();
-    if lower.starts_with("/api/policy")
+    if reconciliation_requires_approval(method, &lower) {
+        (ActionClass::Deploy, false)
+    } else if lower.starts_with("/api/policy")
         || lower.starts_with("/api/criteria")
         || lower.contains("/permissions")
         || lower.starts_with("/api/harness/guides")
         || lower.starts_with("/api/harness/sensors")
         || lower.starts_with("/api/harness/budgets")
         || lower.starts_with("/api/harness/ratchet")
+        || lower.starts_with("/api/harness/goals")
+        || lower.starts_with("/api/harness/planning-nodes")
+        || lower.starts_with("/api/harness/handoffs")
     {
         (ActionClass::CapabilityChange, true)
     } else if lower.contains("deploy") {
@@ -181,6 +189,39 @@ fn effect_token(effect: CapabilityEffect) -> &'static str {
     }
 }
 
+fn reconciliation_requires_approval(method: &Method, path: &str) -> bool {
+    if *method != Method::POST {
+        return false;
+    }
+    if path == "/api/harness/reconciliations" {
+        return true;
+    }
+    let Some(suffix) = path.strip_prefix("/api/harness/reconciliations/") else {
+        return false;
+    };
+    let mut segments = suffix.split('/');
+    matches!(
+        (segments.next(), segments.next(), segments.next()),
+        (Some(id), Some("promote"), None) if !id.is_empty()
+    )
+}
+
+fn require_reconciliation_approval(
+    method: &Method,
+    path: &str,
+    decision: &mut CapabilityDecision,
+) {
+    if reconciliation_requires_approval(method, path)
+        && decision.effect == CapabilityEffect::Allow
+    {
+        decision.effect = CapabilityEffect::Ask;
+        decision.rule_id = Some("builtin-reconciliation-exact-approval".into());
+        decision.rationale =
+            "running repository code or promoting a green ref requires single-use human approval bound to the exact request"
+                .into();
+    }
+}
+
 async fn record_receipt(
     state: &AppState,
     ctx: &ActionContext,
@@ -189,6 +230,10 @@ async fn record_receipt(
     let id = format!("pol_{}", ulid::Ulid::new().to_string().to_lowercase());
     let row_id = id.clone();
     let actor = ctx.actor.clone();
+    let role = ctx
+        .role
+        .and_then(|role| serde_json::to_value(role).ok())
+        .and_then(|value| value.as_str().map(str::to_owned));
     let action = ctx.action.as_str().to_string();
     let resource = ctx.resource.clone();
     let trust = match ctx.trust {
@@ -206,11 +251,12 @@ async fn record_receipt(
         .write_async(move |conn| {
             conn.execute(
                 "INSERT INTO _amux_policy_receipts
-                 (id,actor,action,resource,trust,reversible,effect,rule_id,rationale,cost_microusd,created_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                 (id,actor,role,action,resource,trust,reversible,effect,rule_id,rationale,cost_microusd,created_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                 rusqlite::params![
                     row_id,
                     actor,
+                    role,
                     action,
                     resource,
                     trust,
@@ -281,14 +327,14 @@ fn request_trust(state: &AppState, headers: &HeaderMap) -> Result<TrustLevel, St
         return Ok(TrustLevel::Trusted);
     }
     let conn = state.store.read().map_err(|e| e.to_string())?;
-    let Some(worker) = crate::db::queries::get_worker(&conn, &actor_name)
-        .map_err(|e| e.to_string())?
+    let Some(worker) =
+        crate::db::queries::get_worker(&conn, &actor_name).map_err(|e| e.to_string())?
     else {
         return Ok(TrustLevel::Trusted);
     };
     let worker_id = amux_core::ids::WorkerId::parse(&worker.id).map_err(|e| e.to_string())?;
-    let Some(command) = crate::db::commands::in_flight(&conn, &worker_id)
-        .map_err(|e| e.to_string())?
+    let Some(command) =
+        crate::db::commands::in_flight(&conn, &worker_id).map_err(|e| e.to_string())?
     else {
         return Ok(TrustLevel::Trusted);
     };
@@ -368,8 +414,16 @@ pub async fn enforce(State(state): State<AppState>, mut req: Request, next: Next
                 .into_response()
         }
     };
+    let actor_name = actor(req.headers());
+    let role = state
+        .store
+        .read()
+        .ok()
+        .and_then(|conn| crate::db::harness_store::planning_role_for_actor(&conn, &actor_name).ok())
+        .flatten();
     let mut ctx = ActionContext {
-        actor: actor(req.headers()),
+        actor: actor_name,
+        role,
         action,
         resource: req
             .uri()
@@ -392,7 +446,9 @@ pub async fn enforce(State(state): State<AppState>, mut req: Request, next: Next
                 .into_response()
         }
     };
+    let request_path = req.uri().path().to_string();
     let mut decision = policy.decide(&ctx);
+    require_reconciliation_approval(req.method(), &request_path, &mut decision);
     if decision.effect == CapabilityEffect::Ask {
         let body = std::mem::replace(req.body_mut(), Body::empty());
         let bytes = match axum::body::to_bytes(body, APPROVAL_BODY_LIMIT).await {
@@ -410,6 +466,7 @@ pub async fn enforce(State(state): State<AppState>, mut req: Request, next: Next
         ctx.resource = exact_resource(req.uri(), &bytes);
         *req.body_mut() = Body::from(bytes);
         decision = policy.decide(&ctx);
+        require_reconciliation_approval(req.method(), &request_path, &mut decision);
     }
     match rate_limited(&state, &decision) {
         Ok(true) => {
@@ -696,10 +753,39 @@ mod tests {
 
     #[test]
     fn exact_approval_resource_binds_query_and_body() {
-        let a = exact_resource(&"/api/email/send?account=a".parse().unwrap(), br#"{"to":"a"}"#);
-        let b = exact_resource(&"/api/email/send?account=a".parse().unwrap(), br#"{"to":"b"}"#);
-        let c = exact_resource(&"/api/email/send?account=b".parse().unwrap(), br#"{"to":"a"}"#);
+        let a = exact_resource(
+            &"/api/email/send?account=a".parse().unwrap(),
+            br#"{"to":"a"}"#,
+        );
+        let b = exact_resource(
+            &"/api/email/send?account=a".parse().unwrap(),
+            br#"{"to":"b"}"#,
+        );
+        let c = exact_resource(
+            &"/api/email/send?account=b".parse().unwrap(),
+            br#"{"to":"a"}"#,
+        );
         assert_ne!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn reconciliation_approval_applies_only_to_real_mutating_routes() {
+        assert!(reconciliation_requires_approval(
+            &Method::POST,
+            "/api/harness/reconciliations"
+        ));
+        assert!(reconciliation_requires_approval(
+            &Method::POST,
+            "/api/harness/reconciliations/recon_1/promote"
+        ));
+        for (method, path) in [
+            (Method::DELETE, "/api/harness/reconciliations"),
+            (Method::POST, "/api/harness/reconciliations/recon_1"),
+            (Method::PUT, "/api/harness/reconciliations/recon_1/promote"),
+            (Method::POST, "/api/harness/reconciliations/recon_1/extra/promote"),
+        ] {
+            assert!(!reconciliation_requires_approval(&method, path), "{method} {path}");
+        }
     }
 }

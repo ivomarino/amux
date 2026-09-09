@@ -103,6 +103,13 @@ pub struct LogRow {
 /// definition rather than the test restating the order — the two drifting is
 /// exactly how the log came to disagree with the handlers in the first place.
 pub(crate) fn caller_from_headers(h: &axum::http::HeaderMap) -> String {
+    // An invited human is authenticated by the member cookie. Ordinary
+    // X-Amux-Worker / X-Amux-Session values remain client-controlled, so the
+    // internal member actor must win or multiplayer request history is
+    // trivially spoofable.
+    if let Some(actor) = super::org::local_member_actor(h) {
+        return actor.to_string();
+    }
     for k in ["x-amux-worker", "x-amux-session"] {
         if let Some(v) = h.get(k).and_then(|v| v.to_str().ok()) {
             let v = v.trim();
@@ -721,6 +728,14 @@ const RECOGNISED_LOG_PARAMS: &[&str] = &[
     "min_status",
     "max_status",
     "answered_by",
+    // `ip`, because the sweep's step 4 is "group by client IP" and without a
+    // filter it can only be answered by paging unfiltered rows. Found by the
+    // 2026-09-09 sweep: `?ip=100.66.26.84` came back `ignored_params: ["ip"]`
+    // with `total_matched` 222,564 — the WHOLE log under one address's name,
+    // which is the AF-521 shape the `session=` note below is about. The
+    // question it blocked was "has this client recovered", which needs that
+    // one client's history and nothing else.
+    "ip",
 ];
 
 /// Keys the caller sent that `GET /api/logs` neither consumed nor treats as a
@@ -810,6 +825,18 @@ async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String,
     if let Some(f) = q.get("family").filter(|s| !s.is_empty()) {
         clauses.push("family = ?".into());
         params.push(f.clone().into());
+    }
+    // EXACT match, not a prefix or LIKE. An IP is an identifier, and a prefix
+    // match on one silently widens 100.66.26.8 into 100.66.26.84's rows.
+    //
+    // THE COLUMN IS `client_ip`; `ip` is only its name in the RESPONSE JSON.
+    // The first cut of this filter wrote `ip = ?` and every call 500'd with
+    // `no such column: ip`, while its test passed: the test scraped the source
+    // for the clause STRING, which was present and wrong. A filter's column
+    // name cannot be checked against the handler, only against the schema.
+    if let Some(ip) = q.get("ip").filter(|s| !s.is_empty()) {
+        clauses.push("client_ip = ?".into());
+        params.push(ip.clone().into());
     }
     if let Some(ts) = q.get("since").and_then(|v| v.parse::<f64>().ok()) {
         clauses.push("ts > ?".into());
@@ -1216,6 +1243,8 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/board/statuses/{sid}", methods: &["PATCH", "DELETE"] },
     RouteEntry { path: "/api/board/session-gates", methods: &["GET", "PATCH"] },
     RouteEntry { path: "/api/board/nudges", methods: &["GET", "PATCH"] },
+    RouteEntry { path: "/api/board/changes", methods: &["GET"] },
+    RouteEntry { path: "/api/board/derived", methods: &["GET"] },
     RouteEntry { path: "/api/board/clear-done", methods: &["POST"] },
     RouteEntry { path: "/api/board/overlap", methods: &["POST"] },
     RouteEntry { path: "/api/board/overlap/deployment-permit", methods: &["GET"] },
@@ -1294,6 +1323,17 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/harness/guides", methods: &["GET", "PUT"] },
     RouteEntry { path: "/api/harness/compile", methods: &["POST"] },
     RouteEntry { path: "/api/harness/ratchet", methods: &["POST"] },
+    RouteEntry { path: "/api/harness/traces/{turn_id}", methods: &["GET"] },
+    RouteEntry { path: "/api/harness/work-metrics", methods: &["POST"] },
+    RouteEntry { path: "/api/harness/adaptive-wip", methods: &["GET", "PUT"] },
+    RouteEntry { path: "/api/harness/goals", methods: &["POST"] },
+    RouteEntry { path: "/api/harness/goals/{id}", methods: &["GET", "PUT"] },
+    RouteEntry { path: "/api/harness/goals/{id}/nodes", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/harness/planning-nodes/{id}", methods: &["GET"] },
+    RouteEntry { path: "/api/harness/planning-nodes/{id}/plan", methods: &["GET", "PUT"] },
+    RouteEntry { path: "/api/harness/reconciliations", methods: &["POST"] },
+    RouteEntry { path: "/api/harness/reconciliations/{id}", methods: &["GET"] },
+    RouteEntry { path: "/api/harness/reconciliations/{id}/promote", methods: &["POST"] },
     RouteEntry { path: "/api/harness/health", methods: &["GET"] },
     RouteEntry { path: "/api/prefs", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/criteria/{id}", methods: &["GET", "PUT"] },
@@ -1380,6 +1420,8 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/browser/pw-profiles", methods: &["GET"] },
     RouteEntry { path: "/api/browser/save-profile", methods: &["POST"] },
     RouteEntry { path: "/api/browser/agent", methods: &["POST"] },
+    RouteEntry { path: "/api/browser/import/discover", methods: &["GET"] },
+    RouteEntry { path: "/api/browser/import", methods: &["POST"] },
     // -- file viewer / files / fs
     RouteEntry { path: "/api/file", methods: ANY },
     RouteEntry { path: "/api/file/raw", methods: ANY },
@@ -1445,7 +1487,9 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // completeness test learned to follow .nest() (AMUX-2917); it previously
     // scanned only api/mod.rs's own .route() calls.
     RouteEntry { path: "/api/board/contract", methods: &["GET"] },
+    RouteEntry { path: "/api/board/derived", methods: &["GET"] },
     RouteEntry { path: "/api/board/ready", methods: &["GET"] },
+    RouteEntry { path: "/api/board/changes", methods: &["GET"] },
     RouteEntry { path: "/api/board/bulk-migrate", methods: &["POST"] },
     RouteEntry { path: "/api/board/{id}/decompose", methods: &["POST"] },
     RouteEntry { path: "/api/board/needsyou", methods: &["GET"] },
@@ -1609,7 +1653,9 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/torrents/{gid}/{action}", methods: &["POST"] },
     RouteEntry { path: "/api/org", methods: &["GET", "PATCH"] },
     RouteEntry { path: "/api/org/members", methods: &["GET"] },
-    RouteEntry { path: "/api/org/members/{id}", methods: &["DELETE"] },
+    RouteEntry { path: "/api/org/members/{id}", methods: &["PATCH", "DELETE"] },
+    RouteEntry { path: "/api/org/teams", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/org/teams/{id}", methods: &["PATCH", "DELETE"] },
     RouteEntry { path: "/api/org/invites", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/org/invites/{token}", methods: &["DELETE"] },
     RouteEntry { path: "/api/gmail/accounts", methods: &["GET"] },
@@ -4884,6 +4930,77 @@ mod tests {
         // every polled response and train the reader to ignore the field.
         let busted = get(format!("/api/logs?since={since}&_=12345&cb=x&limit=100")).await;
         assert_eq!(busted["ignored_params"], json!([]), "cache-busters are benign: {busted}");
+    }
+
+    /// `ip` is a REAL filter, in both directions.
+    ///
+    /// The declaration and the SQL are separate edits, and getting only one is
+    /// silent in a different way each time: declared-but-unread means the
+    /// caller is told the filter ran when it did not (the AF-521 shape, which
+    /// returns the whole log under one address's name); read-but-undeclared
+    /// means a working filter is reported as ignored. The sibling test covers
+    /// read-but-undeclared by scraping the handler; this covers the other side
+    /// and the actual clause.
+    #[test]
+    fn ip_is_both_declared_and_actually_filtered() {
+        assert!(
+            RECOGNISED_LOG_PARAMS.contains(&"ip"),
+            "declared: without this `?ip=` reports ignored_params and the caller \
+             holds a superset, not an answer"
+        );
+        assert!(
+            ignored_log_params([String::from("ip")].iter()).is_empty(),
+            "a caller passing ip must not be told it was dropped"
+        );
+        // The SQL half. Scraped from the shipped handler, because a declaration
+        // with no clause is exactly the failure this pair exists to prevent and
+        // it cannot be seen from the constant.
+        let src = include_str!("request_log.rs");
+        let body = src
+            .split("async fn get_logs(")
+            .nth(1)
+            .expect("get_logs is in this file")
+            .split("\n/// One DB row")
+            .next()
+            .expect("get_logs ends before row_to_event");
+        assert!(
+            body.contains(r#"q.get("ip")"#),
+            "declared but never read: the filter would be silently inert"
+        );
+        assert!(
+            body.contains(r#"clauses.push("client_ip = ?""#),
+            "read but no WHERE clause, so every ip returns the whole window"
+        );
+        // EXACT, not prefix: a LIKE would fold 100.66.26.8 into 100.66.26.84.
+        assert!(
+            !body.contains(r#"clauses.push("client_ip LIKE"#),
+            "an ip filter must be exact; a prefix match silently widens it"
+        );
+
+        // AND THE COLUMN MUST EXIST. This is the half the first cut lacked and
+        // the reason it shipped broken: the scrape above passed on `ip = ?`,
+        // which is a perfectly well-formed clause naming a column that is not
+        // in the table, so every call 500'd with `no such column: ip`. A source
+        // scrape can only say the clause is THERE; only the schema says it is
+        // RIGHT. `ip` is the response-JSON name, `client_ip` is the column.
+        let mut conn = rusqlite::Connection::open_in_memory().expect("memdb");
+        crate::db::migrate::apply_all(&mut conn).expect("schema");
+        for col in ["client_ip", "amux_session", "family", "status", "ts"] {
+            let n: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM _amux_request_log WHERE {col} IS NOT NULL"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|e| panic!("filter column `{col}` is not queryable: {e}"));
+            let _ = n;
+        }
+        assert!(
+            conn.query_row("SELECT COUNT(*) FROM _amux_request_log WHERE ip IS NOT NULL", [], |r| r
+                .get::<_, i64>(0))
+                .is_err(),
+            "if a bare `ip` column ever exists, this test's whole premise is stale"
+        );
     }
 
     /// AF-521 — every key the handler reads must be in `RECOGNISED_LOG_PARAMS`.

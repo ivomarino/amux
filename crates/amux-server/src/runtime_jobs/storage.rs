@@ -691,6 +691,10 @@ fn dir_size_fast(root: &Path) -> u64 {
 /// `AMUX_ROTATED_LOG_RETAIN_DAYS` (default 3). The .log.1 is the previous
 /// generation; anything in it that mattered has been acted on. 35 of them
 /// accumulated to 1.2 GB with zero retention (2026-09-09 disk audit).
+///
+/// `server-rs.log.1` is excluded: rotate_server_log owns that file. A merge on
+/// 2026-09-09 collided two implementations of this function, and only the one
+/// deleted there carried the exclusion.
 pub fn prune_rotated_logs(logs_dir: &Path) -> (usize, u64) {
     let days = env_u64("AMUX_ROTATED_LOG_RETAIN_DAYS", 3);
     if days == 0 {
@@ -707,6 +711,13 @@ pub fn prune_rotated_logs(logs_dir: &Path) -> (usize, u64) {
         }
         let name = e.file_name();
         let name = name.to_string_lossy();
+        // server-rs.log.1 is rotate_server_log's to manage. The narrower
+        // duplicate of this function carried that exclusion and this one did
+        // not; the merge that collided them would have silently handed the
+        // broader sweep the server's own rotation (E0428, 2026-09-09).
+        if name == "server-rs.log.1" {
+            continue;
+        }
         let dominated = name.ends_with(".log.1")
             || name.ends_with(".log.2")
             || name.ends_with(".sample.txt")
@@ -1003,6 +1014,8 @@ pub struct StorageReport {
     pub dirs_removed: usize,
     pub dir_bytes_freed: u64,
     pub vacuumed: bool,
+    pub rotated_logs_removed: usize,
+    pub rotated_logs_freed: u64,
     pub free_bytes: Option<u64>,
     pub took_ms: f64,
 }
@@ -1067,6 +1080,9 @@ pub async fn storage_tick(state: &AppState, home: &Path) -> StorageReport {
 
     let logs = home.join("logs");
     rep.rotated_bytes = rotate_server_log(&logs).unwrap_or(0);
+    let (rl_n, rl_b) = prune_rotated_logs(&logs);
+    rep.rotated_logs_removed = rl_n;
+    rep.rotated_logs_freed = rl_b;
 
     // Session log capping: each of ~50 sessions writes a .log that grows
     // without bound. At 20 MB default cap this keeps the logs/ dir under ~1 GB
@@ -1172,7 +1188,8 @@ pub fn spawn(state: AppState) -> Option<super::PeriodicTask> {
                 || r.files_removed > 0
                 || r.kept_card_referenced > 0
                 || r.dirs_removed > 0
-                || r.vacuumed;
+                || r.vacuumed
+                || r.rotated_logs_removed > 0;
             if any_work {
                 tracing::info!(
                     rotated_bytes = r.rotated_bytes,
@@ -1184,6 +1201,8 @@ pub fn spawn(state: AppState) -> Option<super::PeriodicTask> {
                     dirs_removed = r.dirs_removed,
                     dir_bytes_freed = r.dir_bytes_freed,
                     vacuumed = r.vacuumed,
+                    rotated_logs_removed = r.rotated_logs_removed,
+                    rotated_logs_freed = r.rotated_logs_freed,
                     "storage sweep tick"
                 );
             }
@@ -1209,6 +1228,7 @@ pub async fn debug_storage() -> axum::Json<Value> {
         })).collect::<Vec<_>>(),
         "server_log_max_mb": server_log_max_bytes() / 1024 / 1024,
         "session_log_max_mb": env_u64("AMUX_SESSION_LOG_MAX_MB", 20),
+        "rotated_log_retain_days": env_u64("AMUX_ROTATED_LOG_RETAIN_DAYS", 3),
         "sweep_secs": env_u64("AMUX_STORAGE_SWEEP_SECS", STORAGE_TICK_SECS),
         "dir_pruning": AGE_PRUNED_SUBDIRS.iter().map(|(name, env, default)| json!({
             "dir": name, "env": env, "retain_days": env_u64(env, *default),
@@ -1221,6 +1241,8 @@ pub async fn debug_storage() -> axum::Json<Value> {
             "kept_card_referenced": r.kept_card_referenced,
             "dirs_removed": r.dirs_removed, "dir_bytes_freed": r.dir_bytes_freed,
             "vacuumed": r.vacuumed,
+            "rotated_logs_removed": r.rotated_logs_removed,
+            "rotated_logs_freed": r.rotated_logs_freed,
             "took_ms": r.took_ms,
         })),
     });
@@ -1539,6 +1561,45 @@ mod tests {
         fd.write_all(b"after\n").unwrap();
         assert!(std::fs::read_to_string(&log).unwrap().contains("after"));
         std::env::remove_var("AMUX_SERVER_LOG_MAX_MB");
+    }
+
+    #[test]
+    fn prune_rotated_logs_skips_fresh_and_server_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path();
+        // Fresh .log.1 should survive
+        std::fs::write(logs.join("session-a.log.1"), b"recent").unwrap();
+        // server-rs.log.1 should always survive (owned by rotate_server_log)
+        std::fs::write(logs.join("server-rs.log.1"), b"server").unwrap();
+        // Non-.log.1 files should survive
+        std::fs::write(logs.join("session-b.log"), b"active").unwrap();
+
+        std::env::set_var("AMUX_ROTATED_LOG_RETAIN_DAYS", "3");
+        let (n, _) = prune_rotated_logs(logs);
+        assert_eq!(n, 0, "nothing is old enough to prune");
+        assert!(logs.join("session-a.log.1").exists());
+        assert!(logs.join("server-rs.log.1").exists());
+        assert!(logs.join("session-b.log").exists());
+
+        // AGE EVERYTHING PAST THE CUTOFF. Without this the assertions above
+        // pass because nothing was eligible, so they prove the age check and
+        // say NOTHING about the server-log exclusion — the one rule this test
+        // is named for. Retain 0 disables the sweep entirely, so drive it with
+        // a real cutoff and backdated mtimes instead.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+        for f in ["session-a.log.1", "server-rs.log.1", "session-b.log"] {
+            let h = std::fs::File::options().write(true).open(logs.join(f)).unwrap();
+            h.set_modified(old).unwrap();
+        }
+        let (n, _) = prune_rotated_logs(logs);
+        assert_eq!(n, 1, "only the aged session rotation is eligible");
+        assert!(!logs.join("session-a.log.1").exists(), "an aged rotation is pruned");
+        assert!(
+            logs.join("server-rs.log.1").exists(),
+            "server-rs.log.1 belongs to rotate_server_log and must survive at any age"
+        );
+        assert!(logs.join("session-b.log").exists(), "a live .log is never a rotation");
+        std::env::remove_var("AMUX_ROTATED_LOG_RETAIN_DAYS");
     }
 
     #[test]

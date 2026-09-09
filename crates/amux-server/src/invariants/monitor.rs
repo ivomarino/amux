@@ -470,8 +470,61 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     }
     tm.mark(&out, "N. nonterminal disposition");
 
+    // -- 12. does an f64 read back from JSON as the f64 that was written? (AF-595)
+    out.extend(checks::f64_survives_json_roundtrip(&f64_roundtrip_probes()));
+    tm.mark(&out, "12. f64 JSON round trip");
+
     tm.finish();
     out
+}
+
+/// Probe values for [`checks::f64_survives_json_roundtrip`] (AF-595): the two
+/// epoch f64s CI actually failed on, plus two built from THIS process's clock
+/// so the check measures the running server rather than two constants a future
+/// parser could happen to get right.
+///
+/// The round trip is done HERE and the comparison in `checks`, so the
+/// comparator stays pure and its negative control can inject the drift.
+fn f64_roundtrip_probes() -> Vec<(f64, f64)> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    [1788887412.4197621_f64, 1788859526.4033027_f64, now, now - 10.0]
+        .into_iter()
+        .map(|wrote| {
+            // A round trip that ERRORS is a failed round trip, not a skip:
+            // NAN compares unequal, so it reaches the check as a drift.
+            let read = serde_json::to_string(&wrote)
+                .ok()
+                .and_then(|t| serde_json::from_str::<f64>(&t).ok())
+                .unwrap_or(f64::NAN);
+            (wrote, read)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod f64_roundtrip_wiring_tests {
+    /// AF-595's check is REGISTERED, not merely written. Deleting its call
+    /// site in `evaluate_all` reddens nothing else: the section/mark counter
+    /// in `section_timing_tests` stays balanced because the section comment
+    /// goes with it, and `checks`'s own unit tests keep passing on a function
+    /// nobody calls. An unregistered invariant is silence that reads as health.
+    #[test]
+    fn the_f64_roundtrip_check_is_actually_called_by_evaluate_all() {
+        let src = include_str!("monitor.rs");
+        let body = src
+            .split_once("pub async fn evaluate_all(")
+            .expect("evaluate_all exists")
+            .1;
+        let body = body.split_once("\n}\n").expect("its closing brace").0;
+        assert!(
+            body.contains("checks::f64_survives_json_roundtrip("),
+            "serde.f64_survives_json_roundtrip is defined but not evaluated, so a \
+             dropped float_roundtrip feature would announce nothing at runtime"
+        );
+    }
 }
 
 fn decomposition_detail_check(state: &AppState) -> Vec<InvariantResult> {

@@ -534,7 +534,7 @@
   .btn.danger { border-color: var(--red); color: var(--red); }
   .provider-btn { flex:1; font-size:0.82rem; padding:7px 10px; transition: all 0.15s; }
   .provider-btn.selected { background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600; }
-  .chips { display: flex; gap: 6px; flex-wrap: nowrap; margin-bottom: 10px; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; touch-action: pan-x; overscroll-behavior-x: contain; }
+  .chips { display: flex; gap: 6px; flex-wrap: nowrap; margin-bottom: 10px; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; touch-action: pan-x pan-y; overscroll-behavior-x: contain; }
   .chips::-webkit-scrollbar { display: none; }
   .chip {
     font-size: 0.78rem; padding: 6px 12px; border-radius: 16px;
@@ -783,10 +783,13 @@
     margin-bottom: 8px; flex-shrink: 0;
   }
   .overlay-header h2 { font-size: 1.1rem; }
-  /* Reserve the control strip so output does not start underneath it. Scoped
-     to #peek-body: .overlay-body is shared with overlays that have no such
-     controls, and padding them would be a gap with nothing in it. */
-  #peek-body { padding-top: 40px; }
+  .peek-output-wrap { display:flex; flex-direction:column; flex:1; min-height:0; min-width:0; }
+  .peek-output-controls { display:flex; align-items:center; justify-content:flex-end; gap:8px;
+    flex-shrink:0; padding:4px 6px; background:#0d1117; border-radius:8px 8px 0 0; }
+  .peek-output-controls .scroll-lock-badge { position:static; flex:1; min-width:0; margin-right:auto;
+    padding:4px; background:none; border:1px solid var(--border); border-radius:6px;
+    font:inherit; font-size:0.75rem; color:var(--accent); cursor:pointer; white-space:normal; }
+  #peek-body { touch-action:pan-x pan-y pinch-zoom; min-width:0; width:100%; box-sizing:border-box; border-radius:0 0 8px 8px; }
   .overlay-body {
     flex: 1; min-height: 0; overflow-x: hidden; overflow-y: auto;
     background: #010409; border-radius: 8px;
@@ -797,55 +800,24 @@
     -webkit-touch-callout: default; cursor: text;
     touch-action: pan-y;
   }
-  /* DO NOT give #peek-body `white-space: pre`. It was added once (5c7cd9f) and
-     reverted here on Ethan's "make sure peek mode wraps"; the note is what stops
-     it being re-added a third time, because the reasoning for it reads as sound.
-
-     Peek does not need a global `pre`, because wrapping is already decided PER
-     BLOCK by the render pipeline, and only the pipeline can tell prose from a
-     table:
-       - wrapBoxBlocks() wraps each contiguous run of box-drawing lines in
-         `.peek-box` (white-space:pre; overflow-x:auto; max-width:100%) — so
-         tables, framed boxes and diffs keep monospace alignment and get their
-         OWN horizontal scroller.
-       - _fitRules() replaces full-pane `──── name ──` rules with a width-fitted
-         `.peek-rule`, so a 220-col rule never forces a scroller at all.
-     Everything left over is prose, and prose is what `.overlay-body`'s
-     pre-wrap/break-word is for. A `pre` on the container defeats both: the body
-     itself becomes 4196px wide, `.peek-box { max-width:100% }` resolves against
-     that instead of the viewport, and the targeted scroller stops being targeted.
-
-     The evidence that motivated the `pre` was misread, so re-check the pane
-     before trusting it again. The complaint was "a diff wrapped into a ~710px
-     column with two thirds of a 2000px view empty". That is not wrapping — it is
-     AR-110: a browser peek resizes the worker's tmux window to the VIEWER's width
-     and tmux pins window-size manual, so one narrow peek leaves the pane narrow
-     for every later viewer. The session that filed it was sitting at 94 cols;
-     94ch x 7.49px/char = 704px, i.e. the "~710px column" measured the pane, not
-     the CSS. Widening the box cannot fill a view with content that was never
-     emitted that wide, and `pre` traded away prose wrapping for nothing.
-
-     Measured cost of the `pre` build, #peek-body scrollWidth vs clientWidth on a
-     220-col lane: 4196 vs 1416 at 1440px desktop (2780px unreachable without
-     panning) and 4196 vs 366 at 390px phone — ~9% of each line visible on the
-     platform amux optimises for first. */
-  /* THE CONTROL STRIP MUST NOT BLEED (AMUX-4050). Ethan's phone screenshot:
-     `crates/amux-` of a panicked-at path was unreadable because these controls
-     float over #peek-body (position:absolute; inset:0) at 0.85 alpha, so the
-     terminal text showed THROUGH them and neither the text nor the button was
-     legible. Two changes, and both are needed:
-
-       1. Opaque. At 0.85 the text behind is still visible and the result is
-          mush. A sticky control that hides what is under it is honest; one
-          that half-hides it is not readable either way.
-       2. #peek-body reserves the strip (padding-top below), so at rest the
-          first line of output starts BELOW the buttons rather than under them.
-
-     The pane auto-scrolls to the bottom, so the occluded zone is the top,
-     which is exactly where someone scrolled up to read old output is looking.
-     That is the case in the screenshot. */
+  /* Prose wraps. Numbered source rows retain their gutter; structural tables
+     own a horizontal scroller. Controls are outside that scroller at every width. */
+  .peek-render-chunk { min-width:0; content-visibility:auto; contain-intrinsic-size:auto 1100px; }
+  .peek-code-row { display:block; white-space:normal; }
+  .peek-code-cell { display:grid; grid-template-columns:minmax(3ch, max-content) minmax(0, 1fr); gap:1ch; min-width:0; }
+  .peek-code-number { white-space:pre; text-align:right; color:#9da7b3; user-select:none; }
+  .peek-code-text { white-space:pre-wrap; overflow-wrap:anywhere; min-width:0; }
+  .peek-code-add { background:rgba(63,185,80,0.10); }
+  .peek-code-del { background:rgba(248,81,73,0.10); }
+  .peek-code-split { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:12px; }
+  @media (max-width:600px) {
+    .peek-code-split { grid-template-columns:minmax(0,1fr); gap:0; }
+    .peek-output-controls button { min-width:44px; min-height:44px; }
+    .peek-split-wrap.split-active { flex-direction:column; }
+    .peek-split-wrap.split-active > .peek-split-files { border-left:0; border-top:1px solid var(--border); }
+  }
   .peek-copy-btn {
-    position: absolute; top: 6px; right: 6px; z-index: 10;
+    position: static;
     height: 28px; border-radius: 6px; padding: 0 8px;
     border: 1px solid rgba(255,255,255,0.15); background: #0d1117;
     color: var(--dim); font-size: 0.75rem; cursor: pointer;
@@ -855,7 +827,7 @@
   }
   .peek-copy-btn:active { background: var(--accent); color: #fff; }
   .peek-agent-nav {
-    position: absolute; top: 6px; right: 84px; z-index: 10;
+    position: static;
     display: flex; gap: 4px;
   }
   .peek-agent-nav button {
@@ -1953,12 +1925,26 @@
   .peek-msg-nav { display: flex; flex: 1; min-width: 0; align-items: center; border: 1px solid var(--border); border-radius: 8px; }
   .peek-msg-nav .peek-nav-btn { position: static; flex: 0 0 44px; width: 44px; height: 44px; border-left: 1px solid var(--border); font-size: 1rem; color: var(--text); }
   .peek-msg-filter { position: relative; flex: 1; min-width: 0; height: 44px; }
-  .peek-msg-filter select { width: 100%; min-width: 0; height: 44px; border: 0; border-radius: 7px 0 0 7px; padding: 13px 2px 0 7px; background: transparent; color: var(--text); font-size: 0.75rem; cursor: pointer; }
-  .peek-msg-filter select:disabled { opacity: 1; -webkit-text-fill-color: var(--text); cursor: default; }
-  .peek-msg-label, .peek-msg-count { position: absolute; top: 4px; font-size: 0.6rem; line-height: 1; color: var(--dim); pointer-events: none; white-space: nowrap; }
-  .peek-msg-label { left: 7px; }
-  .peek-msg-count { right: 7px; }
-  .peek-toolbar :is(button,select):focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .peek-filter-btn { display:flex; align-items:center; gap:7px; width:100%; height:44px; padding:0 9px; border:0; border-radius:7px 0 0 7px; background:transparent; color:var(--text); cursor:pointer; text-align:left; }
+  .peek-filter-btn > svg { flex-shrink:0; }
+  .peek-filter-btn.active { color:var(--accent); background:var(--accent-bg,rgba(88,166,255,0.10)); }
+  .peek-filter-caption { display:flex; flex-direction:column; gap:2px; flex:1; min-width:0; font:600 0.75rem/1.15 system-ui,sans-serif; }
+  #peek-filter-summary { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--dim); font-size:0.62rem; font-weight:400; }
+  .peek-msg-count { flex-shrink:0; color:var(--dim); font:500 0.65rem/1 system-ui,sans-serif; }
+  .peek-filter-panel { position:absolute; top:calc(100% + 7px); left:0; width:min(320px,calc(100vw - 24px)); box-sizing:border-box; padding:12px; border:1px solid var(--border); border-radius:12px; background:var(--card); color:var(--text); box-shadow:0 10px 30px rgba(0,0,0,0.25); z-index:65; max-height:calc(100dvh - 180px); overflow-y:auto; }
+  .peek-filter-panel[hidden] { display:none; }
+  .peek-filter-heading, .peek-filter-footer { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  .peek-filter-heading strong { font-size:0.85rem; }
+  .peek-filter-panel .btn { min-height:44px; min-width:44px; padding:4px 10px; }
+  .peek-filter-panel fieldset { border:0; padding:0; margin:8px 0 12px; min-width:0; }
+  .peek-filter-panel legend { font-size:0.7rem; color:var(--dim); padding:0 0 6px; }
+  .peek-filter-options { display:grid; grid-template-columns:1fr 1fr; gap:5px; }
+  .peek-filter-option { display:flex; align-items:center; gap:7px; padding:5px 8px; min-height:44px; box-sizing:border-box; border:1px solid var(--border); border-radius:7px; font-size:0.72rem; cursor:pointer; }
+  .peek-filter-option:has(input:checked) { color:var(--accent); background:var(--accent-bg,rgba(88,166,255,0.10)); border-color:var(--accent); }
+  .peek-filter-option input { margin:0; accent-color:var(--accent); flex-shrink:0; }
+  .peek-filter-footer { border-top:1px solid var(--border); padding-top:7px; }
+  .peek-filter-footer > span { color:var(--dim); font-size:0.65rem; line-height:1.5; max-width:185px; }
+  .peek-toolbar :is(button,input):focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
   .peek-prompt.peek-msg-current { outline: 2px solid var(--accent); outline-offset: 1px; border-radius: 3px; }
   .peek-more-wrap { position: relative; }
   .peek-more-dropdown { display: none; position: absolute; top: calc(100% + 4px); right: 0; background: var(--card); border: 1px solid var(--border); border-radius: 8px; min-width: 260px; max-width:min(340px,calc(100vw - 16px)); max-height:min(500px,calc(100dvh - 120px)); overflow-x:hidden; overflow-y:auto; z-index: 60; box-shadow: 0 6px 20px rgba(0,0,0,0.3); }
@@ -2317,7 +2303,7 @@
   .peek-dir-branch.on-main { color: var(--yellow); }
   .peek-dir-branch.on-branch { color: var(--green); }
   .peek-dir-branch.conflict { color: var(--red); }
-  .peek-terminal-panel { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+  .peek-terminal-panel { min-width:0; display: flex; flex-direction: column; flex: 1; min-height: 0; }
   /* Mobile: reclaim peek chrome for the terminal logs. The task label is already
      on the session card and the header carries the name/status, so the task row
      is dropped; the directory row is KEPT (Ethan, 2026-07-18 — wanted it visible
@@ -2508,6 +2494,7 @@
     letter-spacing: 0.3px;
   }
   .status-badge.active { background: rgba(63,185,80,0.2); color: var(--green); }
+  .status-badge.blocked { background: rgba(227,134,37,0.22); color: #e38625; }
   .status-badge.waiting { background: rgba(210,153,34,0.2); color: var(--yellow); }
   .status-badge.idle { background: rgba(139,148,158,0.15); color: var(--dim); }
   .status-badge.steering { background: rgba(137,87,229,0.2); color: var(--purple,#8957e5); }
@@ -6083,3 +6070,11 @@ input.mdai-edge-path-input:focus { border-color: var(--accent); box-shadow: 0 0 
   .mail-actions button { min-height: 44px; min-width: 44px; }
   .mail-row:hover .mail-when { display: block; }
 }
+
+/* A failed worker read must resolve the loading screen (AMUX-4246). */
+.session-read-notice { margin:16px 0; padding:18px; border:1px solid var(--border); border-radius:12px; background:var(--bg2); font-size:0.9rem; }
+.session-read-notice p { margin:8px 0 14px; color:var(--dim); line-height:1.5; }
+.session-read-notice button { min-height:44px; }
+.session-read-notice details { margin-top:14px; color:var(--dim); font-size:0.78rem; }
+.session-read-notice summary { cursor:pointer; }
+.session-read-notice code { display:block; margin-top:8px; overflow-wrap:anywhere; }

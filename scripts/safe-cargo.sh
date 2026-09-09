@@ -58,6 +58,76 @@ set -euo pipefail
 #
 # `_TC_RECEIPT` is set by test-contended.sh, which writes its own receipt at the
 # end of its run. Two identical receipts would be harmless and confusing.
+
+# --- CONCURRENCY THROTTLE (AMUX-4288, 2026-09-09) ---------------------------
+# Confirmed live: enough lanes invoking this wrapper AT ONCE (each a full
+# workspace check/clippy/test) pinned every core on this 4-thread box and ran
+# it into swap -- load average hit 60-67. That was not just a slow build: it
+# starved the LIVE production amux-server's DB read pool (every store.read()
+# has to actually get scheduled on a CPU), turning a local build storm into
+# `read_pool_exhausted` on the real running service. CLAUDE.md already tells
+# every lane to run local cargo through this wrapper instead of bare cargo;
+# this is the enforcement point, not a new rule anyone has to remember.
+#
+# mkdir-based lock, not `flock` -- this box (macOS) does not ship the flock(1)
+# binary, and there is no portable way to hold a flock'd fd across the `exec`
+# this script used to do unconditionally (bash 3.2 here has no `exec {fd}>`
+# dynamic allocation either). So this wrapper no longer execs at all: it runs
+# the guarded command as a child and releases the slot in a trap after it
+# exits. One extra bash frame in the process tree is a smaller cost than the
+# thing it prevents.
+#
+# STALE-SLOT RECLAIM: an mkdir lock does not release itself if its holder is
+# SIGKILLed (an OOM kill is exactly the failure mode the rest of this script
+# exists to contain) -- unlike flock, the kernel does not clean it up. Each
+# slot records its holder's pid; a blocked acquirer that finds a dead pid
+# reclaims the slot instead of queuing behind a lock nobody will ever release.
+_throttle_max="${AMUX_CARGO_MAX_CONCURRENT:-2}"
+_throttle_dir="$HOME/.amux/cargo-throttle"
+mkdir -p "$_throttle_dir" 2>/dev/null || true
+_throttle_slot=""
+_throttle_announced=0
+while [ -z "$_throttle_slot" ]; do
+  _n=1
+  while [ "$_n" -le "$_throttle_max" ]; do
+    _cand="$_throttle_dir/slot-$_n"
+    _pidfile="$_cand.pid"
+    if mkdir "$_cand" 2>/dev/null; then
+      _throttle_slot="$_cand"
+      break
+    elif [ -f "$_pidfile" ]; then
+      _holder="$(cat "$_pidfile" 2>/dev/null || echo)"
+      if [ -n "$_holder" ] && ! kill -0 "$_holder" 2>/dev/null; then
+        rmdir "$_cand" 2>/dev/null || true
+        rm -f "$_pidfile" 2>/dev/null || true
+        if mkdir "$_cand" 2>/dev/null; then
+          _throttle_slot="$_cand"
+          break
+        fi
+      fi
+    fi
+    _n=$((_n + 1))
+  done
+  if [ -z "$_throttle_slot" ]; then
+    if [ "$_throttle_announced" -eq 0 ]; then
+      echo "safe-cargo.sh: $_throttle_max concurrent local cargo build(s) already running" \
+           "through this wrapper -- waiting for a slot (AMUX-4288: unthrottled concurrent" \
+           "builds drove this box's load average past 60 and starved the production DB" \
+           "pool). Set AMUX_CARGO_MAX_CONCURRENT to change the cap." >&2
+      _throttle_announced=1
+    fi
+    sleep 2
+  fi
+done
+# The pid marker is a SIBLING file, not inside the slot dir: `rmdir` only
+# removes EMPTY directories, so a pid file living inside it would make every
+# release (and every stale-slot reclaim, which runs the identical rmdir) a
+# silent no-op forever -- confirmed live in testing before this shipped, the
+# exact bug this comment is here to stop someone re-introducing.
+echo $$ > "$_throttle_slot.pid" 2>/dev/null || true
+_throttle_release() { rmdir "$_throttle_slot" 2>/dev/null || true; rm -f "$_throttle_slot.pid" 2>/dev/null || true; }
+trap '_throttle_release' EXIT
+
 _receipt=""
 if [ "${1:-}" = "test" ] && [ -z "${_TC_RECEIPT:-}" ]; then
   _receipt="$(cd "$(dirname "$0")" && pwd)/write-test-receipt.sh"
@@ -95,11 +165,12 @@ else
   CMD=("${_guard_cmd[@]}" -- cargo "$@")
 fi
 
-if [ -z "$_receipt" ]; then
-  exec "${CMD[@]}"
-fi
-
+# No more `exec` here (see the throttle comment above) -- the EXIT trap that
+# releases this invocation's concurrency slot has to actually run, and `exec`
+# would replace this process before it could.
 rc=0
 "${CMD[@]}" || rc=$?
-"$_receipt" "$rc" "$@"
+if [ -n "$_receipt" ]; then
+  "$_receipt" "$rc" "$@"
+fi
 exit "$rc"

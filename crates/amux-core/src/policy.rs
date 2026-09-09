@@ -8,6 +8,26 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Durable responsibility attached to an actor by the planning plane.
+///
+/// Roles are authorization inputs, not prompt labels.  In particular, a
+/// planner cannot accidentally acquire coding authority just because a policy
+/// file contains a broad allow rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRole {
+    RootPlanner,
+    Subplanner,
+    Worker,
+    Verifier,
+}
+
+impl AgentRole {
+    pub fn is_planner(self) -> bool {
+        matches!(self, Self::RootPlanner | Self::Subplanner)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrustLevel {
@@ -82,6 +102,9 @@ pub struct CapabilityRule {
     /// Exact actor names. Empty means every actor.
     #[serde(default)]
     pub actors: Vec<String>,
+    /// Planning roles. Empty means every role (including actors without one).
+    #[serde(default)]
+    pub roles: Vec<AgentRole>,
     /// Resource prefixes (paths, API routes, domains, account ids).
     #[serde(default)]
     pub resource_prefixes: Vec<String>,
@@ -103,6 +126,10 @@ impl CapabilityRule {
     pub fn matches(&self, ctx: &ActionContext) -> bool {
         (self.actions.is_empty() || self.actions.contains(&ctx.action))
             && (self.actors.is_empty() || self.actors.iter().any(|a| a == &ctx.actor))
+            && (self.roles.is_empty()
+                || ctx
+                    .role
+                    .is_some_and(|role| self.roles.contains(&role)))
             && (self.resource_prefixes.is_empty()
                 || self
                     .resource_prefixes
@@ -140,6 +167,8 @@ impl Default for CapabilityPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionContext {
     pub actor: String,
+    #[serde(default)]
+    pub role: Option<AgentRole>,
     pub action: ActionClass,
     pub resource: String,
     pub trust: TrustLevel,
@@ -200,6 +229,27 @@ impl CapabilityPolicy {
     }
 
     pub fn decide(&self, ctx: &ActionContext) -> CapabilityDecision {
+        // Planner/worker separation is a hard system boundary, not a prompt
+        // reminder and not something a permissive installation policy may
+        // weaken. Planners can read and mutate the planning control plane;
+        // workers and verifiers retain the ordinary policy-driven behavior.
+        let planner_control_plane = ctx.resource.starts_with("/api/harness/goals")
+            || ctx.resource.starts_with("/api/harness/planning-nodes")
+            || ctx.resource.starts_with("/api/harness/handoffs");
+        if ctx.role.is_some_and(AgentRole::is_planner)
+            && (!matches!(ctx.action, ActionClass::Read | ActionClass::CapabilityChange)
+                || (ctx.action == ActionClass::CapabilityChange && !planner_control_plane))
+        {
+            return CapabilityDecision {
+                effect: CapabilityEffect::Deny,
+                policy_version: self.version.clone(),
+                rule_id: Some("builtin-planner-no-execution".into()),
+                rationale: "planning roles may plan and delegate but cannot execute work or mutate delivery surfaces"
+                    .into(),
+                rate_limit: None,
+            };
+        }
+
         // Content never grants authority. This guard is deliberately before
         // configured rules: a rule may allow an action, but an untrusted
         // document cannot turn itself into a policy administrator.
@@ -291,6 +341,7 @@ mod tests {
     fn ctx(action: ActionClass) -> ActionContext {
         ActionContext {
             actor: "worker-a".into(),
+            role: None,
             action,
             resource: "/repo/main".into(),
             trust: TrustLevel::Trusted,
@@ -310,6 +361,7 @@ mod tests {
                 effect: CapabilityEffect::Allow,
                 actions: vec![ActionClass::FileWrite],
                 actors: vec!["worker-a".into()],
+                roles: vec![],
                 resource_prefixes: vec!["/repo".into()],
                 trust: Some(TrustLevel::Trusted),
                 reversible: Some(true),
@@ -335,6 +387,7 @@ mod tests {
                 effect: CapabilityEffect::Allow,
                 actions: vec![],
                 actors: vec![],
+                roles: vec![],
                 resource_prefixes: vec![],
                 trust: None,
                 reversible: None,
@@ -373,6 +426,7 @@ mod tests {
                 effect: CapabilityEffect::Allow,
                 actions: vec![],
                 actors: vec![],
+                roles: vec![],
                 resource_prefixes: vec![],
                 trust: None,
                 reversible: None,
@@ -395,6 +449,7 @@ mod tests {
                 effect: CapabilityEffect::Allow,
                 actions: vec![ActionClass::ToolUse],
                 actors: vec![],
+                roles: vec![],
                 resource_prefixes: vec![],
                 trust: None,
                 reversible: None,
@@ -417,6 +472,7 @@ mod tests {
             effect: CapabilityEffect::Allow,
             actions: vec![],
             actors: vec![],
+            roles: vec![],
             resource_prefixes: vec![],
             trust: None,
             reversible: None,
@@ -426,5 +482,17 @@ mod tests {
             rationale: "invalid fixture".into(),
         });
         assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn planner_execution_is_denied_even_by_a_permissive_policy() {
+        let mut c = ctx(ActionClass::ExecuteTask);
+        c.role = Some(AgentRole::Subplanner);
+        let decision = CapabilityPolicy::default().decide(&c);
+        assert_eq!(decision.effect, CapabilityEffect::Deny);
+        assert_eq!(
+            decision.rule_id.as_deref(),
+            Some("builtin-planner-no-execution")
+        );
     }
 }
