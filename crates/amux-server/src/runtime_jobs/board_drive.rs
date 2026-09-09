@@ -127,7 +127,8 @@ pub(crate) fn pickup_fresh_cut(now: f64) -> i64 {
 /// no-stall guarantee (Invariant 10). Five minutes prevents an immediate hot
 /// loop without turning one model lifecycle decision into a lane-wide stall.
 /// A lane that truly cannot do a card moves it
-/// to backlog/review (the honest exits the pickup prompt names), so it never
+/// to backlog-with-a-trigger or review (the honest exits the pickup prompt
+/// names; a BARE backlog is not one on a drain-enabled lane, AF-579), so it never
 /// re-enters this loop; only a card left in `todo` gets another turn.
 fn reclaim_cooldown_s() -> f64 {
     std::env::var("AMUX_RECLAIM_COOLDOWN_S")
@@ -4132,6 +4133,45 @@ pub(crate) const PICKUP_ANCHOR: &str = "[amux auto-pickup] Claimed ";
 /// (`[a -> b] ...`), and injected bare, such a quote reads as a live unstamped
 /// inter-session message — the 2026-07-23 phantom, where a replayed desc got
 /// attributed to a session as a fresh send.
+/// The exit for "I genuinely cannot do this, and it is neither another lane's
+/// work nor an Ethan decision" (AF-579).
+///
+/// The pickup prompt named three exits and this was not among them, so a lane in
+/// exactly that state had no sentence to follow. The obvious move, a bare
+/// `backlog`, is the BACKLOG DRAIN'S INPUT on a lane that opted into draining:
+/// `oldest_drainable_backlog` promotes the oldest backlog card the lane could
+/// work, so the card returns and the remedy is the loop. Measured on backend:
+/// six cards round-robinned indefinitely, all six plain backlog cards whose
+/// triggers had aged out past AF-514's 24h ceiling.
+///
+/// The exits that actually survive the drain are the ones its own predicate
+/// excludes: a fresh `--trigger`, and `blocked_on` via `amux board block`
+/// (AF-516). Naming those is ethos rule 6 — walk the documented escape with the
+/// sanctioned tooling and check that it comes out the other side.
+fn decline_exit(session: &str) -> &'static str {
+    decline_exit_text(dispatch_backlog_when_idle(session))
+}
+
+/// PURE, so the sentence is testable without the ambient switch.
+///
+/// The first cut read `dispatch_backlog_when_idle` inside the branch and its test
+/// set the env var to get one lane each way. That does not work: the switch
+/// resolves worker > group > global and read `true` for BOTH lanes here, so the
+/// test fell through to a shape assertion common to both arms and proved nothing
+/// about the choice. Splitting the decision from the lookup is the same
+/// pure-comparator shape `invariants::checks` uses, for the same reason.
+fn decline_exit_text(drains: bool) -> &'static str {
+    if drains {
+        " If you genuinely cannot do it and it is neither of those, park it with the \
+         condition that would make it ready: `amux board backlog <ID> --trigger \
+         \"<condition>\"`. A BARE `backlog` is not an exit on this lane, which drains \
+         untriggered backlog cards straight back into pickup."
+    } else {
+        " If you genuinely cannot do it and it is neither of those, `amux board backlog \
+         <ID>` parks it, and `--trigger \"<condition>\"` records what would make it ready."
+    }
+}
+
 fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String {
     // TELL THE LANE HOW DEEP THE QUEUE IS (py:14669, AMUX-2533). Pickup
     // described ONE card and never the queue, so a lane taking card 1 of 90
@@ -4174,11 +4214,27 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
             // triaged its whole queue into undispatchability in two hours
             // while reading as busy. The instruction and the failure were the
             // same action — the AMUX-2140 class.)
-            qnote.push_str(
+            // AF-579: "move not-ready cards to backlog" is the DRAIN'S INPUT on
+            // a lane that opted into draining, so the remedy and the loop are
+            // the same action. Measured on backend: six cards round-robinned
+            // indefinitely, every one a plain backlog card whose trigger had
+            // aged out, falling straight back into the drainable set.
+            //
+            // The sentence now shares the predicate of the mechanism it
+            // describes (ethos rule 1) rather than giving one lane's exit to a
+            // lane it does not work on.
+            qnote.push_str(if dispatch_backlog_when_idle(session) {
+                " Triage first: park not-ready cards with the condition that would make \
+                 them ready, `amux board backlog <ID> --trigger \"<condition>\"`, and send \
+                 owner-blocked ones to review. A BARE `backlog` is not an exit on this \
+                 lane: it drains untriggered backlog cards, so the card comes straight \
+                 back. Do not bounce ready cards to todo (brief re-claim cooldown). Work \
+                 this card or move it where it honestly belongs."
+            } else {
                 " Triage first: move not-ready cards to `backlog`, owner-blocked to review. \
-                 Do not bounce ready cards to todo (brief re-claim cooldown). Work this card or move it \
-                 where it honestly belongs.",
-            );
+                 Do not bounce ready cards to todo (brief re-claim cooldown). Work this \
+                 card or move it where it honestly belongs."
+            });
         }
     }
     // The delivery boundary parses the card id back out of this template to void
@@ -4200,8 +4256,9 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
          `amux board assign <ID> <lane> && amux board todo <ID>` — it dispatches to THEM, \
          not back to you. If it needs a decision only Ethan can make, `amux board needsyou \
          <ID>` with the question. Do NOT move it to review to park it: the review gate asks \
-         you to attest work you have not done, and will refuse.\n{}{}",
+         you to attest work you have not done, and will refuse.{}\n{}{}",
         row.id,
+        decline_exit(session),
         quoted_card_text(&row.title, &row.id),
         qnote
     );
@@ -12078,4 +12135,77 @@ mod tests {
         assert_cli_verbs_exist("amux board show X, amux board done X, amux board reviewer X y");
     }
 
+}
+
+#[cfg(test)]
+mod af579_decline_exit_tests {
+    use super::*;
+
+    /// AF-579. The pickup prompt named three exits: hand it to another lane, ask
+    /// Ethan, and NOT review. A lane that can do none of those had no sentence to
+    /// follow, and the obvious move is the backlog drain's own input.
+    ///
+    /// PINS BOTH ARMS. Testing only the drain arm would pass on a function that
+    /// ignores its argument and always warns, which would tell a lane with no
+    /// drain that its working exit does not work.
+    #[test]
+    fn the_decline_exit_names_a_trigger_only_where_a_bare_backlog_would_come_back() {
+        let drained = decline_exit_text(true);
+        assert!(
+            drained.contains("--trigger"),
+            "a drain-enabled lane must get the exit that survives the drain: {drained}"
+        );
+        assert!(
+            drained.contains("BARE `backlog` is not an exit"),
+            "and be told WHY the obvious move fails, or it reads as style: {drained}"
+        );
+
+        let plain = decline_exit_text(false);
+        assert!(
+            plain.contains("amux board backlog"),
+            "a lane with no drain still needs an exit named: {plain}"
+        );
+        assert!(
+            !plain.contains("not an exit on this lane"),
+            "and must NOT be told a bare backlog fails where it does not: {plain}"
+        );
+
+        // THE ARMS MUST DIFFER. Without this, one constant satisfies every
+        // assertion above that the two arms happen to share.
+        assert_ne!(drained, plain, "both lanes were given the same sentence");
+    }
+
+    /// NO RUN OF SPACES inside either arm. Rust line-continuations in a string
+    /// literal need a trailing backslash; without it the source still compiles
+    /// and the PROMPT renders "the          condition". I shipped exactly that
+    /// in the first cut of this change, and the compiler cannot see it.
+    #[test]
+    fn neither_arm_renders_a_run_of_spaces() {
+        for text in [decline_exit_text(true), decline_exit_text(false)] {
+            assert!(
+                !text.contains("   "),
+                "a dropped line-continuation leaves a gap in the rendered prompt: {text}"
+            );
+        }
+    }
+
+    /// The live wiring: a sentence no prompt includes is a sentence nobody
+    /// reads, which is the defect one layer up.
+    #[test]
+    fn the_pickup_prompt_carries_the_decline_exit() {
+        let src = include_str!("board_drive.rs");
+        // BOUND IT TO THE FUNCTION. Splitting only on the opening line leaves
+        // `body` as the whole rest of the file, which contains THIS assertion's
+        // own literal, so unwiring the call site left the cell green. A test
+        // matching its own text is the self-referential trap ethos rule 7 names.
+        let body = src
+            .split_once("fn pickup_prompt(")
+            .expect("pickup_prompt exists")
+            .1;
+        let body = body.split_once("\n}\n").expect("its closing brace").0;
+        assert!(
+            body.contains("decline_exit(session)"),
+            "pickup_prompt must call decline_exit, or the exit reaches no lane"
+        );
+    }
 }
