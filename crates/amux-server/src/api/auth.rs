@@ -114,17 +114,39 @@ pub async fn require_bearer(
     if req.method() == Method::GET && !path.starts_with("/api/") && !path.starts_with("/proxy/") {
         return next.run(req).await;
     }
-    match provided_owner_token(req.headers(), req.uri()) {
-        Some(t) if constant_time_eq(t.as_bytes(), expected.as_bytes()) => next.run(req).await,
-        // Python's exact 401: JSON body, not bare text (the SPA and CLI both
-        // parse the body; a text/plain 401 reads as a broken server).
-        _ => (
-            StatusCode::UNAUTHORIZED,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            "{\"error\": \"unauthorized\"}",
-        )
-            .into_response(),
+    let owner_session = super::static_files::owner_session_status(&state, req.headers());
+    let bearer_present = provided_owner_token(req.headers(), req.uri()).is_some();
+    let member_cookie = super::org::has_local_member_cookie(req.headers());
+    let reason = if owner_session == "valid" {
+        "owner_session_requires_bootstrap"
+    } else if bearer_present {
+        "invalid_bearer"
+    } else if member_cookie {
+        "unverified_member_cookie"
+    } else if owner_session == "invalid" {
+        "invalid_owner_session"
+    } else {
+        "missing_credential"
+    };
+    // The request log keeps this JSON reason for /api/logs/analyze, including
+    // when the client's own /api/client-debug beacon is denied. A sweep no
+    // longer needs a working browser beacon to explain a bootstrap 401.
+    if matches!(path, "/api/workers" | "/api/sessions" | "/api/client-debug") {
+        tracing::warn!(
+            target: "amux::auth", verdict = "dashboard_auth_rejected",
+            reason, owner_session, bearer_present, member_cookie,
+            path, method = %req.method(),
+            "dashboard request requires authentication"
+        );
     }
+    (
+        StatusCode::UNAUTHORIZED,
+        axum::Json(serde_json::json!({
+            "error": "unauthorized",
+            "reason": reason,
+            "recovery": if owner_session == "valid" { "refresh_bootstrap" } else { "open_owner_or_invite_link" }
+        })),
+    ).into_response()
 }
 
 /// Whether this request explicitly presented the configured owner bearer.
@@ -296,7 +318,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_token_disables_auth_and_401_body_is_pythons_json() {
+    async fn no_token_disables_auth_and_401_names_missing_credential() {
         let open = guarded_app(None);
         assert_eq!(hit(&open, "POST", "/api/thing", None, None).await, StatusCode::OK);
 
@@ -313,6 +335,37 @@ mod tests {
         );
         let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v, serde_json::json!({ "error": "unauthorized" }));
+        assert_eq!(v, serde_json::json!({
+            "error": "unauthorized", "reason": "missing_credential",
+            "recovery": "open_owner_or_invite_link"
+        }));
+    }
+
+    #[tokio::test]
+    async fn rejected_credentials_name_the_recovery_without_leaking_or_granting_access() {
+        use sha2::Digest;
+        let cookie = format!("__Host-amux_owner={}", hex::encode(
+            sha2::Sha256::digest(b"amux-owner-session:tok123")
+        ));
+        let app = guarded_app(Some("tok123"));
+        for (bearer, cookies, reason, recovery) in [
+            (Some("old-secret"), "", "invalid_bearer", "open_owner_or_invite_link"),
+            (None, "amux_member=revoked-secret", "unverified_member_cookie", "open_owner_or_invite_link"),
+            (None, "__Host-amux_owner=old-secret", "invalid_owner_session", "open_owner_or_invite_link"),
+            (None, cookie.as_str(), "owner_session_requires_bootstrap", "refresh_bootstrap"),
+            (Some("old-secret"), cookie.as_str(), "owner_session_requires_bootstrap", "refresh_bootstrap"),
+        ] {
+            let mut req = HttpRequest::builder().uri("/api/thing").header("cookie", cookies);
+            if let Some(bearer) = bearer { req = req.header("authorization", format!("Bearer {bearer}")); }
+            let response = app.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{reason}");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body, serde_json::json!({"error":"unauthorized", "reason":reason, "recovery":recovery}));
+            let rendered = String::from_utf8(bytes.to_vec()).unwrap();
+            for secret in ["tok123", "old-secret", "revoked-secret", cookie.as_str()] {
+                assert!(!rendered.contains(secret));
+            }
+        }
     }
 }

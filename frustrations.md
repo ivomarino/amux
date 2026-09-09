@@ -4279,3 +4279,14 @@ global → group → worker and proves both permitted work and cross-scope 403s.
 Member-authored cards, edits, worker creation, sends, and request-log rows derive
 their author from that verified cookie, so client-supplied creator or worker
 headers cannot rewrite multiplayer history.
+
+## Dashboard calls repeated authorization refusals Connecting and loses its own diagnostics
+AREA: browser
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-08
+SESSION: amux
+CARD: AMUX-4246
+SYMPTOM: Owner screenshot shows Connecting/Polling with no workers. The last-hour request log has 777 worker-list 401s and 38 rejected client-debug reports from a remote client. The old error body cannot distinguish missing credentials from an invalid bearer or member cookie; exact screenshot origin remains unconfirmed.
+COST: A blank owner dashboard and roughly 30 minutes tracing a responding server before finding the client ignored authorization error objects.
+FIX: AMUX-4246 adds an explicit access/failure state, a bounded fresh-bootstrap recovery under existing auth rules, structured refusal reasons in request logs, and a deferred browser diagnostic after access recovers. Historical credential presence cannot be reconstructed.

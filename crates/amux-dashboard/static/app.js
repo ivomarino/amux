@@ -592,6 +592,7 @@ let sessions = [];
 let _sessionsSnapshotEpoch = 0;
 let archivedExpanded = false;
 let gitInfo = {};  // {sessionName: {branch, repo, _conflict}}
+let _sessionLoadError = null; // Last failed worker read; a response is not necessarily data.
 let _initialLoad = true;   // true until first data arrives from server
 let _lastDataTime = null;  // timestamp of last successful data
 // AC-275: when NO data has ever arrived, _lastDataTime stays null and every
@@ -977,7 +978,7 @@ function _connEpisodes() {
       // the first as the second is what would let an old sleep keep posing as
       // an outage with a confident new label on it.
       if (!cur) cur = { start: e.ts, worst: e.to, hid: ('hid' in e) ? !!e.hid : null };
-      else if (e.to === 'offline') cur.worst = 'offline';
+      else if (['offline', 'auth', 'error'].includes(e.to)) cur.worst = e.to;
     } else if (cur) {
       cur.end = e.ts; eps.push(cur); cur = null;
     }
@@ -1000,7 +1001,7 @@ const _CONN_BLIP_MS = 5000;
 function _connEpisodeKind(ep, now) {
   const dur = (ep.end || now) - ep.start;
   if (ep.worst === 'offline' && ep.hid === true) return 'sleep';
-  if (ep.worst !== 'offline' && ep.end && dur < _CONN_BLIP_MS) return 'blip';
+  if (ep.worst === 'polling' && ep.end && dur < _CONN_BLIP_MS) return 'blip';
   return 'outage';
 }
 // _fmtDur lives once, further down. A second copy was declared here; the last
@@ -1074,8 +1075,8 @@ async function _runPing(n) {
 
 function showConnHistory() {
   const eps = _connEpisodes();
-  const stateLabel = { live: '● Live', polling: '● Polling', offline: '● Offline' }[_connState] || '● —';
-  const stateColor = { live: '#3fb950', polling: '#facc15', offline: '#f85149' }[_connState] || 'var(--dim)';
+  const stateLabel = { live: '● Live', polling: '● Polling', offline: '● Offline', auth: '● Access required', error: '● Sync error' }[_connState] || '● —';
+  const stateColor = { live: '#3fb950', polling: '#facc15', offline: '#f85149', auth: '#f85149', error: '#f85149' }[_connState] || 'var(--dim)';
   const _now = Date.now();
   const kinds = eps.map(ep => _connEpisodeKind(ep, _now));
   const blips = eps.filter((_, i) => kinds[i] === 'blip');
@@ -1093,7 +1094,9 @@ function showConnHistory() {
       const isOff = ep.worst === 'offline';
       const sleep = kind === 'sleep';
       const ico = sleep ? '🌙' : isOff ? '🔴' : '🟡';
-      const label = sleep ? 'Device asleep or app backgrounded'
+      const label = ep.worst === 'auth' ? 'Workspace access required'
+                  : ep.worst === 'error' ? 'Worker updates unavailable'
+                  : sleep ? 'Device asleep or app backgrounded'
                   : isOff ? 'Disconnected (offline)'
                   : 'Degraded to polling';
       const when = _fmtClock(ep.start) + ' → ' + (ongoing ? '<span style="color:' + (isOff ? '#f85149' : '#facc15') + '">ongoing</span>' : _fmtClock(ep.end));
@@ -1152,9 +1155,9 @@ async function _initIdentity() {
   try {
     const r = await fetch('/api/identity');
     if (r.status === 401) {
-      // 401 means we're behind the cloud gateway (local server never returns 401 here).
-      // Redirect to login — but not on self-hosted Tailscale/LAN hosts where 401 could
-      // be a transient network issue.
+      // A 401 is an authentication refusal, including on self-hosted remote
+      // browsers. The worker read owns the local access/recovery message; cloud
+      // gateways retain their existing login redirect.
       if (location.hostname.endsWith('.amux.io')) {
         window.location.replace('/api/cloud-logout');
       }
@@ -1923,10 +1926,14 @@ function describeOp(item) {
 // Connection status
 function updateConnectionStatus() {
   // Log the state transition (for the click-to-view disconnection history).
-  _recordConnState(!online ? 'offline' : (_liveSSE ? 'live' : 'polling'));
+  const readState = _sessionLoadError ? (_sessionLoadError.status === 401 ? 'auth' : 'error') : null;
+  _recordConnState(readState || (!online ? 'offline' : (_liveSSE ? 'live' : 'polling')));
   // Update all connection status indicators (main + peek)
   document.querySelectorAll('#conn-status').forEach(el => {
-    if (!online) {
+    if (readState) {
+      el.className = 'conn-status offline';
+      el.textContent = readState === 'auth' ? 'Access required' : 'Sync error';
+    } else if (!online) {
       el.className = 'conn-status offline';
       const total = offlineQueue.length + drafts.length;
       el.textContent = total ? total + ' pending' : 'Offline';
@@ -1938,6 +1945,12 @@ function updateConnectionStatus() {
       el.textContent = 'Polling';
     }
   });
+  const notice = document.getElementById('session-read-notice');
+  const noticeHTML = _sessionReadNotice();
+  if (notice && notice._noticeHTML !== noticeHTML) {
+    notice.innerHTML = noticeHTML;
+    notice._noticeHTML = noticeHTML;
+  }
   // Update offline banner
   const banner = document.getElementById('offline-banner');
   const ops = document.getElementById('offline-ops');
@@ -2947,18 +2960,95 @@ function _checkSessionTransitions(newData) {
 // on every API call and can never heal on its own — the fresh token lives in
 // the fresh shell. Nudge the SW and reload ONCE per session (rate-limited like
 // the version-mismatch reload; a broken SW must not cause a storm).
-function _staleShellRecover() {
+let _authRecoveryAttempted = false;
+async function _staleShellRecover() {
+  if (_authRecoveryAttempted) return;
+  _authRecoveryAttempted = true;
+  // A SW update alone reuses the cached anonymous shell within the same app
+  // version. Ask the server for its actual bootstrap, under the existing owner
+  // or member cookie rules. Never evaluate returned HTML or mint credentials.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
   try {
-    const last = parseInt(sessionStorage.getItem('amux_401_reload') || '0');
-    if (Date.now() - last < 600000) return;
+    const r = await fetch('/?_fresh=auth', { cache: 'no-store', signal: controller.signal });
+    if (!r.ok) return;
+    const html = await r.text();
+    const block = html.match(/<!-- AMUX-BOOTSTRAP-BEGIN[\s\S]*?<!-- AMUX-BOOTSTRAP-END -->/);
+    const match = block && block[0].match(/window\._AMUX_AUTH_TOKEN=("(?:\\.|[^"\\])*")/);
+    const token = match ? JSON.parse(match[1]) : '';
+    // Reload only if the server supplied a DIFFERENT owner credential. A
+    // missing/revoked login cannot be repaired by repeated cache clears.
+    if (!token || token === _authToken) return;
+    const last = Number(sessionStorage.getItem('amux_401_reload') || '0');
+    if (Date.now() - last < 60000) return;
     sessionStorage.setItem('amux_401_reload', String(Date.now()));
-    console.warn('amux: API 401 with this shell’s token — refreshing the shell');
-    const upd = (navigator.serviceWorker && navigator.serviceWorker.getRegistration)
-      ? navigator.serviceWorker.getRegistration().then(r => r && r.update()).catch(() => {})
-      : Promise.resolve();
-    upd.finally ? upd.finally(() => setTimeout(() => location.reload(), 1500))
-                : setTimeout(() => location.reload(), 1500);
-  } catch (e) {}
+    // Reload the full bootstrap so its UI guard rotates with the bearer.
+    // _fresh bypasses the SW's canonical '/' cache; preserve the user's view.
+    location.replace('/?_fresh=auth' + location.hash);
+  } catch (_) {
+    // The original 401 remains visible. Failure to fetch recovery HTML is not
+    // evidence that the access problem was repaired.
+  } finally { clearTimeout(timeout); }
+}
+
+function _sessionReadFailed(status, reason) {
+  const allowed = ['missing_credential', 'invalid_bearer', 'unverified_member_cookie',
+    'invalid_owner_session', 'owner_session_requires_bootstrap', 'unauthorized',
+    'http_error', 'invalid_json', 'invalid_payload', 'network_error'];
+  reason = allowed.includes(reason) ? reason : (status === 401 ? 'unauthorized' : 'http_error');
+  const changed = !_sessionLoadError || _sessionLoadError.status !== status || _sessionLoadError.reason !== reason;
+  _sessionLoadError = { status, reason };
+  if (changed) {
+    // No URL query, token, response body, or user content. Keep the latest
+    // failure across a bootstrap reload and deliver it after access recovers.
+    const incident = { kind: 'session-load-failure', measured: true, n_considered: 1,
+      status, reason, app_ver: APP_VER, had_data: !!lastSessionsJSON,
+      bearer_present: !!_authToken, ts: Date.now() };
+    console.warn('amux: session read failed', incident);
+    try { sessionStorage.setItem('amux_session_load_failure', JSON.stringify(incident)); } catch (_) {}
+  }
+  updateConnectionStatus();
+  render();
+}
+
+function _sessionReadRecovered() {
+  const changed = !!_sessionLoadError;
+  _sessionLoadError = null;
+  updateConnectionStatus();
+  if (changed) render();
+  // A 401 also rejects client-debug, so do not hammer it while unauthorized.
+  // The server records each refusal; this delayed beacon adds browser context.
+  try {
+    const saved = sessionStorage.getItem('amux_session_load_failure');
+    if (saved) {
+      sessionStorage.removeItem('amux_session_load_failure');
+      const d = JSON.parse(saved);
+      fetch('/api/client-debug', { method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ ...d, recovered_at: Date.now() }) }).then(r => {
+          if (!r.ok) sessionStorage.setItem('amux_session_load_failure', saved);
+        }).catch(() => { try { sessionStorage.setItem('amux_session_load_failure', saved); } catch (_) {} });
+    }
+  } catch (_) {}
+}
+
+function _retrySessionRead() {
+  _authRecoveryAttempted = false;
+  fetchSessions();
+}
+
+function _sessionReadNotice() {
+  if (!_sessionLoadError) return '';
+  const auth = _sessionLoadError.status === 401;
+  return '<div class="session-read-notice" role="alert"><strong>'
+    + (auth ? 'Access to this workspace needs to be renewed' : 'Worker updates are unavailable')
+    + '</strong><p>' + (auth
+      ? 'Open your owner access link, or ask the workspace owner for a new invite.'
+      : 'The worker list could not be loaded. Please retry in a moment.')
+    + (sessions.length ? ' The workers shown below are the last saved copy.' : '')
+    + '</p><button type="button" class="btn" onclick="_retrySessionRead()">Retry connection</button>'
+    + '<details><summary>Connection details</summary><code>GET /api/sessions · '
+    + (_sessionLoadError.status ? 'HTTP ' + _sessionLoadError.status : 'Network error')
+    + ' · ' + esc(_sessionLoadError.reason) + '</code></details></div>';
 }
 
 let _sessEtag = null;
@@ -2973,24 +3063,35 @@ async function fetchSessions() {
       consecutiveFailures = 0;
       _lastDataTime = Date.now();
       if (!online) setOnline(true);
+      _sessionReadRecovered();
       return;
     }
-    _sessEtag = r.headers.get('ETag') || null;
-    const data = await r.json();
+    if (!r.ok) {
+      const error = await r.json().catch(() => ({}));
+      _sessionReadFailed(r.status, error?.reason || (r.status === 401 ? 'unauthorized' : 'http_error'));
+      if (r.status === 401) _staleShellRecover();
+      return;
+    }
+    let data;
+    try { data = await r.json(); }
+    catch (_) { _sessionReadFailed(r.status, 'invalid_json'); return; }
     // Same guard as fetchBoard (live crash 2026-08-09): a 401 error object
     // must not become `sessions` — every card render maps over it.
     if (!Array.isArray(data)) {
-      if (r.status === 401) _staleShellRecover();
-      console.warn('sessions fetch returned non-array (status ' + r.status + ') — keeping previous set');
+      _sessionReadFailed(r.status, 'invalid_payload');
       return;
     }
     if (snapshotEpoch !== _sessionsSnapshotEpoch) {
       console.info('sessions poll completed behind a newer stream snapshot; discarded');
       return;
     }
+    _sessEtag = r.headers.get('ETag') || null;
     consecutiveFailures = 0;
     _lastDataTime = Date.now();
-    if (_initialLoad) { _initialLoad = false; }
+    const firstLoad = _initialLoad;
+    _initialLoad = false;
+    _sessionReadRecovered();
+    if (firstLoad) render();
     if (!online) setOnline(true);
     const j = JSON.stringify(data);
     if (j !== lastSessionsJSON) {
@@ -3014,7 +3115,7 @@ async function fetchSessions() {
       if (!window._peekEmbed) _fetchGitBranches(sessions);
     }
   } catch(e) {
-    console.error('fetch workers:', e);
+    _sessionReadFailed(0, 'network_error');
     consecutiveFailures++;
     if (consecutiveFailures >= 2 || navigator.onLine === false) {
       setOnline(false);
@@ -3685,7 +3786,9 @@ function render() {
   if (stripEl && stripEl.innerHTML) { stripEl.innerHTML = ''; stripEl._want = ''; }
   const _nonArchivedCount = sessions.filter(s => !s.archived).length;
   if (!_nonArchivedCount && !drafts.length) {
-    if (_initialLoad) {
+    if (_sessionLoadError) {
+      el.innerHTML = ''; // The actionable failure is in #session-read-notice.
+    } else if (_initialLoad) {
       // A SPINNER THAT NEVER RESOLVES IS A LIE (amux-cloud, AC-275, 2026-08-06).
       // _initialLoad clears on ANY successful /api/sessions fetch, empty list
       // included — so a spinner still showing means the fetch never COMPLETED,
@@ -9192,7 +9295,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.847';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.848';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.

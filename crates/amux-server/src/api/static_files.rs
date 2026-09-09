@@ -181,6 +181,18 @@ fn has_owner_session(state: &AppState, headers: &HeaderMap) -> bool {
     }
 }
 
+// A cookie proves access to the bootstrap, not to API mutations. Keep that
+// distinction in diagnostics without recording the cookie or the owner token.
+pub(crate) fn owner_session_status(state: &AppState, headers: &HeaderMap) -> &'static str {
+    if has_owner_session(state, headers) {
+        "valid"
+    } else if cookie_value(headers, OWNER_COOKIE).is_some() {
+        "invalid"
+    } else {
+        "missing"
+    }
+}
+
 fn establish_owner_session(state: &AppState) -> Response {
     let Some(value) = owner_session_value(state) else {
         return Redirect::to("/").into_response();
@@ -297,11 +309,31 @@ fn serve_index(
         return (StatusCode::NOT_FOUND, "dashboard not embedded").into_response();
     };
     let html = String::from_utf8_lossy(&index.data).into_owned();
+    let owner_access = owner_bootstrap_allowed(state, headers, uri, peer);
+    let member_verified = super::org::is_verified_local_member(headers);
+    let owner_session = owner_session_status(state, headers);
+    let verdict = if owner_access || member_verified || state.auth_token.is_none() {
+        "dashboard_bootstrap_authenticated"
+    } else {
+        "dashboard_bootstrap_access_required"
+    };
+    tracing::info!(
+        target: "amux::auth",
+        verdict,
+        owner_access,
+        owner_session,
+        member_verified,
+        member_cookie = super::org::has_local_member_cookie(headers),
+        bearer_present = headers.contains_key(header::AUTHORIZATION),
+        peer_loopback = peer.map(|ip| ip.is_loopback()),
+        // Deliberately no URL/query, cookie, or credential values.
+        "dashboard bootstrap access decision"
+    );
     let injected = inject_bootstrap(
         &html,
         state,
         legacy,
-        owner_bootstrap_allowed(state, headers, uri, peer),
+        owner_access,
     );
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
