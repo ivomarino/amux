@@ -9578,7 +9578,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.860';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.861';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -9904,6 +9904,22 @@ function openPeek(name, opts) {
   updateConnectionStatus();
   const peekOv = document.getElementById('peek-overlay');
   peekOv.classList.add('active');
+  // A translated/scaled terminal changes the visible scroll viewport after its
+  // first paint. Keep this contract observable so a future generic-overlay CSS
+  // change announces the bounce in the normal log sweep as well as browser E2E.
+  requestAnimationFrame(() => {
+    if (!_peekIdentityCurrent(openIdentity)) return;
+    const style = getComputedStyle(peekOv);
+    const transitions = style.transitionProperty.split(',').map(v => v.trim());
+    if (style.transform !== 'none' || transitions.includes('transform') || transitions.includes('all')) {
+      fetch(API + '/api/client-debug', {
+        method: 'POST', headers: {'Content-Type':'application/json'}, keepalive: true,
+        body: JSON.stringify({kind:'peek-motion-contract', verdict:'layout_shift',
+          measured:true, n_considered:1, session:name, transform:style.transform,
+          transition:style.transitionProperty, ver:APP_VER}),
+      }).catch(() => {});
+    }
+  });
   showPeekLoading('Loading latest…');   // now the overlay is active — the "loading latest" cue can attach
   // Freeze the page behind the overlay: otherwise iOS scrolls the session list
   // to reveal the focused input, sliding content around under the fixed overlay
