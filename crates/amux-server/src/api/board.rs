@@ -2362,7 +2362,7 @@ pub(crate) async fn dispatch_pending_callbacks(
             folded_note = if *inferred {
                 format!(
                     "folded this capture into {target} (target inferred from timing, \
-                     not declared — confirm it is about the capture)"
+                     not declared -- confirm it is about the capture)"
                 )
             } else {
                 format!("folded this capture into {target}")

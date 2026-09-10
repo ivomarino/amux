@@ -1548,7 +1548,7 @@ PYEOF
     # when the body fails the list ABORTS, so nothing is typed and nothing is
     # sitting in the pane; when the Enter fails the body is already typed.
     if tmux has-session -t "=$tname" 2>/dev/null; then
-      echo "${RED}FAILED${RESET} to send to $name: the pane is there but tmux rejected the injection. The body may be sitting UNSENT in the pane — look before retrying, or the retry duplicates it." >&2
+      echo "${RED}FAILED${RESET} to send to $name: the pane is there but tmux rejected the injection. The body may be sitting UNSENT in the pane -- look before retrying, or the retry duplicates it." >&2
     else
       echo "${RED}FAILED${RESET} to send to $name: the target pane is gone. NOTHING was delivered." >&2
     fi

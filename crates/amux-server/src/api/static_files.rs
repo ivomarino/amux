@@ -298,7 +298,68 @@ fn owner_bootstrap_allowed(
         return false;
     }
 
-    super::fs::browser_is_on_this_machine(peer, request_authority(headers, uri).as_deref())
+    let authority = request_authority(headers, uri);
+    let local = super::fs::browser_is_on_this_machine(peer, authority.as_deref());
+    if let Some((peer_field, authority_field)) = withheld_bootstrap_record(
+        state.auth_token.is_some(),
+        local,
+        peer,
+        authority.as_deref(),
+    ) {
+        // AF-639: the ONLY server-side record that a browser was handed a
+        // tokenless shell. Withholding is correct and deliberate (see
+        // `inject_bootstrap`), and it is INVISIBLE: the window that receives
+        // it then 401s on every /api call for the life of the tab, and the
+        // request log shows those refusals with nothing naming a cause.
+        // Measured 2026-09-09 on this fleet: 28,355 401s in 24h from one
+        // laptop over Tailscale, at the SPA's 5s poll cadence, with zero log
+        // lines explaining them.
+        //
+        // The two fields ARE the predicate rather than context around it:
+        // `peer` is who connected and `authority` is the name they addressed,
+        // and the shell is withheld precisely when that name does not resolve
+        // back to that peer. A reader who has both can reproduce the verdict.
+        tracing::warn!(
+            target: "amux::shell_bootstrap",
+            verdict = "remote_bootstrap_withheld",
+            peer = %peer_field,
+            authority = %authority_field,
+            "served a tokenless dashboard shell: the addressed host does not resolve to this peer, so every /api request from that window will 401 until it loads the shell with ?_token="
+        );
+    }
+    local
+}
+
+/// Whether this shell-serve is the withheld case, and the two fields the log
+/// line carries: `(peer, authority)`.
+///
+/// Split out from the `tracing::warn!` above so the decision is testable.
+/// Capturing the emitted line instead is NOT a workable check here: `tracing`
+/// caches interest per callsite for the whole PROCESS, the suite runs tests in
+/// parallel threads of one process, and a sibling test that reaches this code
+/// path with no subscriber installed caches the callsite as disabled for every
+/// later test. Measured 2026-09-09 while writing this: a capture-based version
+/// passed run alone and failed in the suite, with a self-check probe proving
+/// the capture harness itself was working. That is a test whose result depends
+/// on scheduling, which is worse than no test.
+///
+/// What this cannot see is whether the warn is WIRED to it. That is checked
+/// against the running server instead, with the curl repro on AF-639.
+fn withheld_bootstrap_record(
+    auth_configured: bool,
+    local: bool,
+    peer: Option<IpAddr>,
+    authority: Option<&str>,
+) -> Option<(String, String)> {
+    // No token configured means nothing 401s, so there is nothing to report
+    // and a line here would bury the real ones.
+    if local || !auth_configured {
+        return None;
+    }
+    Some((
+        peer.map_or_else(|| "unknown".to_string(), |p| p.to_string()),
+        authority.unwrap_or("").to_string(),
+    ))
 }
 
 fn serve_index(
@@ -391,6 +452,14 @@ fn inject_bootstrap(html: &str, state: &AppState, legacy: Option<u16>, owner_acc
         h.update(format!("amux-ui-guard:{owner_auth}"));
         hex::encode(h.finalize())[..40].to_string()
     };
+    // AF-639: an EMPTY `_AMUX_AUTH_TOKEN` has two causes the SPA must not
+    // confuse. Auth disabled entirely (no token configured) means nothing will
+    // 401 and there is nothing to tell anyone. Withheld from a remote browser
+    // means EVERY /api call will 401 for the life of that window, and no
+    // reload can fix it because the server will withhold again. Only the
+    // second is worth a human's attention, and the client cannot derive which
+    // one it is from the empty string alone.
+    let auth_withheld = !owner_access && !owner_auth.is_empty();
     let home = std::env::var("HOME").unwrap_or_default();
     let jstr = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into());
     let block = format!(
@@ -398,7 +467,8 @@ fn inject_bootstrap(html: &str, state: &AppState, legacy: Option<u16>, owner_acc
          window._AMUX_S3_ICAL_URL={};window._AMUX_AUTH_TOKEN={};window._AMUX_HOME={};\
          window._AMUX_POSTHOG_KEY={};window._AMUX_POSTHOG_HOST={};window._AMUX_USER_EMAIL={};\
          window._AMUX_USER_ID={};window._AMUX_UI_TOKEN={};window._AMUX_DEFAULT_MODEL={};\
-         window._AMUX_LEGACY_PORT={};window._AMUX_CANONICAL_PORT={};</script>\n",
+         window._AMUX_LEGACY_PORT={};window._AMUX_CANONICAL_PORT={};\
+         window._AMUX_AUTH_WITHHELD={};</script>\n",
         jstr(&ical_subscribe_url()),
         jstr(&auth),
         jstr(&home),
@@ -419,6 +489,7 @@ fn inject_bootstrap(html: &str, state: &AppState, legacy: Option<u16>, owner_acc
         )),
         legacy.unwrap_or(0),
         crate::legacy_port::canonical_port(),
+        auth_withheld,
     );
     let with_bootstrap = format!("{}{}{}", &html[..b], block, &html[e..]);
     // Client update adoption is the SSE ping's job, exactly like Python
@@ -517,6 +588,113 @@ mod tests {
         let owner_guard = owner.split("window._AMUX_UI_TOKEN=").nth(1)
             .and_then(|value| value.split(';').next()).unwrap();
         assert!(member.contains(&format!("window._AMUX_UI_TOKEN={owner_guard}")), "{member}");
+    }
+
+    /// AF-639. A remote browser is denied the owner bearer on purpose, and
+    /// until now the server said nothing about it. Measured on this fleet:
+    /// 28,355 401s in 24 hours from one laptop over Tailscale, at the SPA's 5s
+    /// poll cadence, and not one log line naming the cause.
+    #[test]
+    fn the_withheld_bootstrap_record_reports_the_predicate_and_only_the_real_case() {
+        let peer: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+
+        // The case that produced the 28k refusals: auth on, browser remote.
+        let (p, a) = withheld_bootstrap_record(true, false, Some(peer), Some("desktop.example:8824"))
+            .expect("a remote browser denied the bearer must be reported");
+        assert_eq!(p, "203.0.113.5", "the peer is half the predicate");
+        assert_eq!(a, "desktop.example:8824", "the authority is the other half");
+
+        // The three cases that must stay SILENT, each for its own reason.
+        assert!(
+            withheld_bootstrap_record(true, true, Some(peer), Some("h")).is_none(),
+            "a local browser gets the bearer; there is nothing to report"
+        );
+        assert!(
+            withheld_bootstrap_record(false, false, Some(peer), Some("h")).is_none(),
+            "with no token configured NOTHING 401s, so this line would bury the real ones"
+        );
+        assert!(
+            withheld_bootstrap_record(false, true, Some(peer), Some("h")).is_none(),
+            "neither condition holds"
+        );
+
+        // A request with no authority at all is still the withheld case, and
+        // the empty field is the answer rather than a reason to say nothing.
+        let (p2, a2) = withheld_bootstrap_record(true, false, None, None)
+            .expect("an unknown peer is still a withheld shell");
+        assert_eq!(p2, "unknown");
+        assert_eq!(a2, "");
+    }
+
+    /// The predicate the log line describes must be the one the caller acts
+    /// on. Reading `owner_bootstrap_allowed` end to end is what catches the
+    /// two drifting apart, which no test of the pure function alone can see.
+    #[test]
+    fn owner_bootstrap_allowed_and_the_withheld_record_agree_on_a_remote_browser() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "amux.invalid".parse().unwrap());
+        let uri: Uri = "/".parse().unwrap();
+        // TEST-NET-3 (RFC 5737) with a reserved TLD (RFC 2606): even on a host
+        // with a wildcard resolver, `amux.invalid` cannot resolve TO this
+        // peer, so the verdict is the same everywhere this runs.
+        let peer: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+
+        let allowed = owner_bootstrap_allowed(&state(Some("tok123")), &headers, &uri, Some(peer));
+        assert!(!allowed, "a remote browser must not be bootstrapped with the owner bearer");
+        assert!(
+            withheld_bootstrap_record(true, allowed, Some(peer), Some("amux.invalid")).is_some(),
+            "the same inputs that withhold the bearer must also produce the log record"
+        );
+
+        // And the shell built from that decision really is tokenless, so the
+        // record describes a window that will 401 rather than a hypothesis.
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head>";
+        let shell = inject_bootstrap(html, &state(Some("tok123")), None, allowed);
+        assert!(shell.contains("window._AMUX_AUTH_TOKEN=\"\""), "{shell}");
+        assert!(shell.contains("window._AMUX_AUTH_WITHHELD=true;"), "{shell}");
+    }
+
+    /// AF-639, client half. An empty `_AMUX_AUTH_TOKEN` has two causes with
+    /// opposite consequences, and the SPA cannot tell them apart from the
+    /// empty string.
+    #[test]
+    fn the_shell_says_whether_an_empty_token_means_withheld_or_auth_disabled() {
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head>";
+        let owner = inject_bootstrap(html, &state(Some("tok123")), None, true);
+        let withheld = inject_bootstrap(html, &state(Some("tok123")), None, false);
+        let no_auth = inject_bootstrap(html, &state(None), None, false);
+
+        assert!(owner.contains("window._AMUX_AUTH_WITHHELD=false;"), "{owner}");
+        assert!(withheld.contains("window._AMUX_AUTH_WITHHELD=true;"), "{withheld}");
+
+        // Auth disabled: the token is empty here too and NOTHING will 401.
+        // Reporting "withheld" would put a permanent banner in front of every
+        // user of a tokenless server.
+        assert!(no_auth.contains("window._AMUX_AUTH_TOKEN=\"\""), "{no_auth}");
+        assert!(no_auth.contains("window._AMUX_AUTH_WITHHELD=false;"), "{no_auth}");
+    }
+
+    /// The bootstrap block is one Rust string literal held together by
+    /// backslash line continuations, and dropping one does not fail to
+    /// compile: it renders as a run of spaces inside the emitted JavaScript.
+    /// This lane shipped that exact bug twice (AF-621, AF-634), so the guard
+    /// covers the whole script rather than the line just added to it.
+    #[test]
+    fn the_injected_script_carries_no_run_of_spaces_from_a_dropped_continuation() {
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head>";
+        let out = inject_bootstrap(html, &state(Some("tok123")), None, true);
+        let script = out
+            .split("<script>")
+            .nth(1)
+            .and_then(|s| s.split("</script>").next())
+            .expect("the injected block has a script element");
+        assert!(
+            !script.contains("  "),
+            "a dropped line continuation renders as a run of spaces: {script:?}"
+        );
+        // The guard is worth nothing if the block it reads is empty.
+        assert!(script.contains("window._AMUX_AUTH_WITHHELD="), "{script:?}");
+        assert!(script.len() > 200, "script suspiciously short: {script:?}");
     }
 
     #[test]

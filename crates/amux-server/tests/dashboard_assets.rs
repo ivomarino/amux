@@ -620,6 +620,88 @@ fn the_version_parser_reads_real_values_and_rejects_junk() {
 /// CALLED had been checked to exist — which is the one-directional version of
 /// this check, and the direction that was already covered. Every name you call
 /// must exist; every name you define must not already. This is the mirror.
+/// Body of a top-level `function NAME(` in app.js, brace-matched.
+fn fn_body(src: &str, name: &str) -> String {
+    let head = format!("\nfunction {name}(");
+    let i = src.find(&head).unwrap_or_else(|| panic!("no top-level function {name} in app.js"));
+    let open = src[i..].find('{').expect("function has a body") + i;
+    let bytes = src.as_bytes();
+    let (mut depth, mut end) = (0usize, open);
+    for (k, b) in bytes.iter().enumerate().skip(open) {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = k;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(end > open, "unbalanced braces reading {name}");
+    src[open..=end].to_string()
+}
+
+/// AF-639. A browser the server refuses to bootstrap 401s on every request for
+/// the life of the window, and `_staleShellRecover` was written for a
+/// DIFFERENT cause (a service-worker-cached shell holding a rotated-away
+/// token) where reloading genuinely fetches a fresh token. Firing it here
+/// reloads into an identical tokenless shell, once every ten minutes, forever,
+/// with nothing on screen. Measured 2026-09-09: 22.5 hours and 28,355 401s
+/// from one laptop, showing a dashboard that looked fine.
+#[test]
+fn a_shell_the_server_withheld_the_token_from_stops_reloading_and_says_so() {
+    let src = asset("app.js");
+
+    // The client must read the server's reason. Deriving it from an empty
+    // token is exactly what it cannot do: auth-disabled looks identical and
+    // must stay silent.
+    assert!(
+        src.contains("window._AMUX_AUTH_WITHHELD"),
+        "app.js never reads the server's withheld flag, so it cannot tell \
+         'auth is off' from 'this browser was refused'"
+    );
+
+    let body = fn_body(&src, "_staleShellRecover");
+    let guard = body
+        .find("_authWithheld")
+        .expect("_staleShellRecover must special-case the withheld shell");
+    let reload = body.find("location.reload").expect("the reload path is still the other arm");
+    assert!(
+        guard < reload,
+        "the withheld check must come BEFORE the reload, or the futile reload still runs"
+    );
+    assert!(
+        body[..guard].find("sessionStorage").is_none(),
+        "the withheld arm must return before the reload rate-limiter, otherwise it burns the \
+         once-per-10-minutes budget that the real stale-shell case needs"
+    );
+    assert!(
+        body[guard..reload].contains("return"),
+        "the withheld arm must RETURN; falling through reaches the reload it exists to skip"
+    );
+
+    // And it must leave something a human can act on, not just skip the
+    // reload. A page that silently stops trying is the failure this card is
+    // about (ethos rule 6: walk the escape).
+    assert!(body.contains("_amuxAuthWithheldBanner"), "{body}");
+    let banner = fn_body(&src, "_amuxAuthWithheldBanner");
+    assert!(
+        banner.contains("?_token="),
+        "the banner must carry the ONE action that fixes this, not only the diagnosis"
+    );
+    assert!(
+        banner.contains("min-height:44px"),
+        "mobile rule: the sign-in controls are touch targets"
+    );
+    assert!(
+        banner.contains("env(safe-area-inset-top"),
+        "mobile rule: a fixed top bar must clear the iOS notch"
+    );
+}
+
 #[test]
 fn no_two_top_level_functions_in_app_js_share_a_name() {
     let src = asset("app.js");

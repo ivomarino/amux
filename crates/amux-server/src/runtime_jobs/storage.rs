@@ -231,6 +231,16 @@ pub const SPECS: &[SweepSpec] = &[
         env: "AMUX_STATE_EVENTS_RETAIN_DAYS",
         default_days: 14.0,
     },
+    // 19k rows, ~1,930 B/row, ~325 rows/day. Delivery receipts for messages sent
+    // to lanes. 30d x 325 x 1,930B = ~18MB. Discovered at 37MB / 59 days with no
+    // retention at all (2026-09-09 disk audit).
+    SweepSpec {
+        table: "steering_history",
+        ts_col: "queued_at",
+        unit: TsUnit::Secs,
+        env: "AMUX_STEERING_HISTORY_RETAIN_DAYS",
+        default_days: 30.0,
+    },
 ];
 
 /// `<ENV>`: process env wins, then `server.env`, then the spec default — the
@@ -480,60 +490,6 @@ pub fn rotate_server_log(logs_dir: &Path) -> Option<u64> {
     Some(size)
 }
 
-/// Delete `.log.1` rotated session logs older than `AMUX_ROTATED_LOG_RETAIN_DAYS`
-/// (default 3). Each session's pane log rolls to `.1` at 32MB, but nothing ever
-/// cleaned the `.1` files. With ~50 sessions that is ~1.6GB of stale rotations
-/// accumulating indefinitely (disk cleanup 2026-09-09).
-pub fn prune_rotated_logs(logs_dir: &Path) -> (usize, u64) {
-    let retain_secs = env_u64("AMUX_ROTATED_LOG_RETAIN_DAYS", 3) * 86_400;
-    if retain_secs == 0 {
-        return (0, 0);
-    }
-    let now = std::time::SystemTime::now();
-    let cutoff = std::time::Duration::from_secs(retain_secs);
-    let (mut removed, mut freed) = (0usize, 0u64);
-    let entries = match std::fs::read_dir(logs_dir) {
-        Ok(e) => e,
-        Err(_) => return (0, 0),
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if !name_str.ends_with(".log.1") {
-            continue;
-        }
-        // Never touch server-rs.log.1 here; rotate_server_log owns that.
-        if name_str == "server-rs.log.1" {
-            continue;
-        }
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if !meta.is_file() {
-            continue;
-        }
-        let age = now.duration_since(meta.modified().unwrap_or(now)).unwrap_or_default();
-        if age > cutoff {
-            let size = meta.len();
-            if std::fs::remove_file(entry.path()).is_ok() {
-                removed += 1;
-                freed += size;
-            }
-        }
-    }
-    if removed > 0 {
-        tracing::info!(
-            removed,
-            freed_bytes = freed,
-            retain_days = retain_secs / 86_400,
-            knob = "AMUX_ROTATED_LOG_RETAIN_DAYS",
-            "pruned stale .log.1 rotated session logs"
-        );
-    }
-    (removed, freed)
-}
-
 /// Delete files in `dir` whose mtime is older than `max_age_secs`. Returns
 /// (files removed, bytes freed). Non-recursive and never removes directories:
 /// a holding area's SHAPE is somebody's, only its age is ours.
@@ -646,6 +602,386 @@ pub fn prune_dir_by_age(dir: &Path, max_age_secs: u64, label: &str) -> (usize, u
     (n, bytes)
 }
 
+// ---------------------------------------------------------------------------
+// Directory-level pruning (evidence, stale build targets, temp browser dirs)
+// ---------------------------------------------------------------------------
+
+/// Subdirectories under `~/.amux/` whose CONTENTS are pruned by age. Unlike
+/// `AGE_PRUNED_DIRS` (which reaps files), these contain sub-DIRECTORIES that
+/// each represent one task/run. The whole subtree is removed when the
+/// directory's mtime ages past the retention.
+///
+/// (dir name under home, retain-days env var, default days)
+pub const AGE_PRUNED_SUBDIRS: &[(&str, &str, u64)] = &[
+    // 29 GB on 2026-09-09, all from one day of customer evidence captures.
+    // Each subdirectory is a self-contained evidence package (logs, screenshots,
+    // DB snapshots). 7 days is generous: evidence is consumed within hours and
+    // the board card carries the conclusion, not the raw capture.
+    ("evidence", "AMUX_EVIDENCE_RETAIN_DAYS", 7),
+    // 233 MB on 2026-09-09 across 5 audit workspaces. Each is a self-contained
+    // acceptance test workspace (handoff proofs, scroll accuracy, etc.). 30 days
+    // keeps them around for review but prevents indefinite accumulation.
+    ("audits", "AMUX_AUDITS_RETAIN_DAYS", 30),
+];
+
+/// Delete subdirectories of `dir` whose mtime is older than `max_age_secs`.
+/// Returns (dirs removed, bytes freed). Skips files at the top level (those
+/// belong to `prune_dir_by_age`). Each qualifying subdirectory is removed
+/// recursively.
+pub fn prune_subdirs_by_age(dir: &Path, max_age_secs: u64, label: &str) -> (usize, u64) {
+    if max_age_secs == 0 {
+        return (0, 0);
+    }
+    let now = std::time::SystemTime::now();
+    let Ok(rd) = std::fs::read_dir(dir) else { return (0, 0) };
+    let (mut n, mut bytes) = (0usize, 0u64);
+    for e in rd.flatten() {
+        let Ok(md) = e.metadata() else { continue };
+        if !md.is_dir() {
+            continue;
+        }
+        let age = md
+            .modified()
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if age <= max_age_secs {
+            continue;
+        }
+        let size = dir_size_fast(&e.path());
+        if std::fs::remove_dir_all(e.path()).is_ok() {
+            n += 1;
+            bytes += size;
+        }
+    }
+    if n > 0 {
+        tracing::info!(
+            dir = %dir.display(), removed = n, freed_bytes = bytes,
+            max_age_days = max_age_secs / 86_400,
+            knob = label,
+            "storage sweep pruned subdirectories"
+        );
+    }
+    (n, bytes)
+}
+
+/// Quick recursive size estimate. Best-effort: unreadable entries are skipped.
+fn dir_size_fast(root: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            let Ok(md) = e.metadata() else { continue };
+            if md.is_dir() {
+                stack.push(e.path());
+            } else {
+                total += md.len();
+            }
+        }
+    }
+    total
+}
+
+/// Delete rotated session logs (`*.log.1`) older than the retention and any
+/// stale diagnostic files that accumulate in the logs directory. Returns
+/// (files removed, bytes freed).
+///
+/// `AMUX_ROTATED_LOG_RETAIN_DAYS` (default 3). The .log.1 is the previous
+/// generation; anything in it that mattered has been acted on. 35 of them
+/// accumulated to 1.2 GB with zero retention (2026-09-09 disk audit).
+///
+/// `server-rs.log.1` is excluded: rotate_server_log owns that file. A merge on
+/// 2026-09-09 collided two implementations of this function, and only the one
+/// deleted there carried the exclusion.
+pub fn prune_rotated_logs(logs_dir: &Path) -> (usize, u64) {
+    let days = env_u64("AMUX_ROTATED_LOG_RETAIN_DAYS", 3);
+    if days == 0 {
+        return (0, 0);
+    }
+    let max_age = days * 86_400;
+    let now = std::time::SystemTime::now();
+    let Ok(rd) = std::fs::read_dir(logs_dir) else { return (0, 0) };
+    let (mut n, mut bytes) = (0usize, 0u64);
+    for e in rd.flatten() {
+        let Ok(md) = e.metadata() else { continue };
+        if !md.is_file() {
+            continue;
+        }
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        // server-rs.log.1 is rotate_server_log's to manage. The narrower
+        // duplicate of this function carried that exclusion and this one did
+        // not; the merge that collided them would have silently handed the
+        // broader sweep the server's own rotation (E0428, 2026-09-09).
+        if name == "server-rs.log.1" {
+            continue;
+        }
+        let dominated = name.ends_with(".log.1")
+            || name.ends_with(".log.2")
+            || name.ends_with(".sample.txt")
+            || (name.starts_with("tmux-stall-") && name.ends_with(".json"))
+            || (name.starts_with("watchdog-diag-") && name.ends_with(".md"));
+        if !dominated {
+            continue;
+        }
+        let age = md
+            .modified()
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if age <= max_age {
+            continue;
+        }
+        if std::fs::remove_file(e.path()).is_ok() {
+            n += 1;
+            bytes += md.len();
+        }
+    }
+    if n > 0 {
+        tracing::info!(
+            dir = %logs_dir.display(), removed = n, freed_bytes = bytes,
+            retain_days = days,
+            knob = "AMUX_ROTATED_LOG_RETAIN_DAYS",
+            "storage sweep pruned rotated/stale logs"
+        );
+    }
+    (n, bytes)
+}
+
+/// Delete stale build-target directories that are not the canonical shared one.
+/// `rust-build-target-pr199` (615 MB on 2026-09-09) is the kind of sediment
+/// this removes: one-off PR worktree build dirs that outlive their PR.
+///
+/// Retention: `AMUX_STALE_BUILD_TARGET_RETAIN_DAYS` (default 3).
+pub fn prune_stale_build_targets(home: &Path) -> (usize, u64) {
+    let days = env_u64("AMUX_STALE_BUILD_TARGET_RETAIN_DAYS", 3);
+    if days == 0 {
+        return (0, 0);
+    }
+    let max_age = days * 86_400;
+    let canonical = home.join("rust-build-target");
+    let now = std::time::SystemTime::now();
+    let Ok(rd) = std::fs::read_dir(home) else { return (0, 0) };
+    let (mut n, mut bytes) = (0usize, 0u64);
+    for e in rd.flatten() {
+        let Ok(md) = e.metadata() else { continue };
+        if !md.is_dir() {
+            continue;
+        }
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("rust-build-target-") {
+            continue;
+        }
+        if e.path() == canonical {
+            continue;
+        }
+        let age = md
+            .modified()
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if age <= max_age {
+            continue;
+        }
+        let size = dir_size_fast(&e.path());
+        if std::fs::remove_dir_all(e.path()).is_ok() {
+            n += 1;
+            bytes += size;
+            tracing::info!(
+                path = %e.path().display(), freed_bytes = size,
+                knob = "AMUX_STALE_BUILD_TARGET_RETAIN_DAYS",
+                "storage sweep removed stale build target"
+            );
+        }
+    }
+    (n, bytes)
+}
+
+/// Delete temporary browser session directories in `playwright-auth/`.
+/// These are the numbered dirs like `bb-1784387451210` created by one-off
+/// browser runs. They are distinct from PROFILES (which live in `profiles/`)
+/// and the browser_reaper already manages those.
+///
+/// Retention: `AMUX_BROWSER_TEMP_RETAIN_DAYS` (default 7).
+pub fn prune_temp_browser_dirs(home: &Path) -> (usize, u64) {
+    let days = env_u64("AMUX_BROWSER_TEMP_RETAIN_DAYS", 7);
+    if days == 0 {
+        return (0, 0);
+    }
+    let max_age = days * 86_400;
+    let pw_dir = home.join("playwright-auth");
+    let now = std::time::SystemTime::now();
+    let Ok(rd) = std::fs::read_dir(&pw_dir) else { return (0, 0) };
+    let (mut n, mut bytes) = (0usize, 0u64);
+    for e in rd.flatten() {
+        let Ok(md) = e.metadata() else { continue };
+        if !md.is_dir() {
+            continue;
+        }
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        // Skip the persistent directories: `profiles/`, `profile/`, `peek-measure/`
+        if name == "profiles" || name == "profile" || name == "peek-measure" {
+            continue;
+        }
+        // Temp dirs contain a timestamp suffix like `bb-1784387451210`
+        let has_timestamp = name.contains('-')
+            && name.rsplit('-').next().is_some_and(|s| s.len() >= 10 && s.chars().all(|c| c.is_ascii_digit()));
+        if !has_timestamp {
+            continue;
+        }
+        let age = md
+            .modified()
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if age <= max_age {
+            continue;
+        }
+        let size = dir_size_fast(&e.path());
+        if std::fs::remove_dir_all(e.path()).is_ok() {
+            n += 1;
+            bytes += size;
+        }
+    }
+    if n > 0 {
+        tracing::info!(
+            dir = %pw_dir.display(), removed = n, freed_bytes = bytes,
+            retain_days = days,
+            knob = "AMUX_BROWSER_TEMP_RETAIN_DAYS",
+            "storage sweep pruned temp browser dirs"
+        );
+    }
+    (n, bytes)
+}
+
+/// Cap individual session logs by copy-truncate.
+///
+/// Each of the ~50 sessions writes a `<name>.log` in `logs/`. These grow
+/// without bound: 4.5 GB measured on 2026-09-09, with the largest at 56 MB.
+/// The server-rs.log has its own rotation (above), so this skips it.
+///
+/// Copy-truncate is safe here for the same reason it works on server-rs.log:
+/// tmux's pipe-pane opens the file O_APPEND, and truncating in place just
+/// moves the write offset to 0. The race window (bytes between copy and
+/// truncate) is the standard logrotate copytruncate cost.
+///
+/// `AMUX_SESSION_LOG_MAX_MB` (default 20, 0 disables). Returns (files
+/// rotated, total bytes rolled).
+pub fn rotate_session_logs(logs_dir: &Path) -> (usize, u64) {
+    let max_mb = env_u64("AMUX_SESSION_LOG_MAX_MB", 20);
+    if max_mb == 0 {
+        return (0, 0);
+    }
+    let max_bytes = max_mb * 1024 * 1024;
+    let Ok(rd) = std::fs::read_dir(logs_dir) else { return (0, 0) };
+    let (mut n, mut bytes) = (0usize, 0u64);
+    for e in rd.flatten() {
+        let Ok(md) = e.metadata() else { continue };
+        if !md.is_file() {
+            continue;
+        }
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if !name.ends_with(".log") || name == "server-rs.log" {
+            continue;
+        }
+        if md.len() < max_bytes {
+            continue;
+        }
+        let path = e.path();
+        let prev = path.with_extension("log.1");
+        if std::fs::copy(&path, &prev).is_err() {
+            continue;
+        }
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .is_err()
+        {
+            continue;
+        }
+        n += 1;
+        bytes += md.len();
+    }
+    if n > 0 {
+        tracing::info!(
+            dir = %logs_dir.display(), rotated = n, rolled_bytes = bytes,
+            max_mb = max_mb,
+            knob = "AMUX_SESSION_LOG_MAX_MB",
+            "storage sweep rotated oversized session logs"
+        );
+    }
+    (n, bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Periodic VACUUM
+// ---------------------------------------------------------------------------
+
+/// VACUUM at most once per day, when the storage sweep actually deleted rows.
+/// Returns true if a VACUUM ran.
+///
+/// SQLite DELETE frees pages internally but does not shrink the file. Without
+/// VACUUM, the DB file on disk grows monotonically even while the retention
+/// sweep dutifully removes aged rows. Measured 2026-09-09: 2.8 GB on disk,
+/// ~2.1 GB of live data, 82 free pages (essentially zero reclaimable space
+/// because the freelist is continuously reused for new writes). The gap
+/// between the two numbers is what VACUUM recovers.
+///
+/// Full VACUUM rewrites the entire file, so it is expensive. Once per day is a
+/// compromise: frequent enough that a single day's deletions are reclaimed
+/// before the next day's writes fill the freed pages, infrequent enough that
+/// the ~3 GB rewrite cost is negligible.
+async fn maybe_vacuum(store: &crate::db::SharedStore, home: &Path) -> bool {
+    let marker = home.join(".last-vacuum");
+    let min_interval = env_u64("AMUX_VACUUM_INTERVAL_SECS", 86_400);
+    if min_interval == 0 {
+        return false;
+    }
+    if let Ok(md) = std::fs::metadata(&marker) {
+        let age = md
+            .modified()
+            .ok()
+            .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if age < min_interval {
+            return false;
+        }
+    }
+    let t0 = std::time::Instant::now();
+    let res = store
+        .write_async(move |conn| {
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+            conn.execute_batch("VACUUM;")?;
+            Ok(crate::db::WriteOutcome { applied: false, events: vec![] })
+        })
+        .await;
+    let _ = std::fs::write(&marker, format!("{}", unix_now() as i64));
+    match res {
+        Ok(_) => {
+            tracing::info!(
+                took_ms = t0.elapsed().as_millis() as u64,
+                knob = "AMUX_VACUUM_INTERVAL_SECS",
+                "storage sweep: VACUUM completed"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "storage sweep: VACUUM failed");
+            false
+        }
+    }
+}
+
 /// Free bytes on the volume holding `path`.
 pub fn disk_free_bytes(path: &Path) -> Option<u64> {
     let df = ["/bin/df", "/usr/bin/df"].iter().find(|c| Path::new(c).is_file())?;
@@ -667,12 +1003,17 @@ pub struct StorageReport {
     pub at: f64,
     pub tables: Vec<(String, String)>,
     pub rotated_bytes: u64,
+    pub session_logs_rotated: usize,
+    pub session_logs_rolled_bytes: u64,
     pub files_removed: usize,
     pub bytes_freed: u64,
     /// Aged-out uploads NOT deleted because a live card points at them. Reported
     /// beside `files_removed` so "deleted nothing" and "deleted nothing because
     /// everything was still referenced" are different readings (ethos rule 4).
     pub kept_card_referenced: usize,
+    pub dirs_removed: usize,
+    pub dir_bytes_freed: u64,
+    pub vacuumed: bool,
     pub rotated_logs_removed: usize,
     pub rotated_logs_freed: u64,
     pub free_bytes: Option<u64>,
@@ -699,6 +1040,9 @@ pub const AGE_PRUNED_DIRS: &[(&str, &str, u64)] = &[
     ("media-cache", "AMUX_MEDIA_CACHE_RETAIN_DAYS", 30),
     ("uploads", "AMUX_UPLOADS_RETAIN_DAYS", 7),
     ("spin-dumps", "AMUX_SPIN_DUMPS_RETAIN_DAYS", 14),
+    ("browser-screenshots", "AMUX_BROWSER_SCREENSHOTS_RETAIN_DAYS", 14),
+    ("email-attachments", "AMUX_EMAIL_ATTACHMENTS_RETAIN_DAYS", 30),
+    ("transcripts", "AMUX_TRANSCRIPTS_RETAIN_DAYS", 30),
 ];
 
 pub async fn storage_tick(state: &AppState, home: &Path) -> StorageReport {
@@ -740,6 +1084,13 @@ pub async fn storage_tick(state: &AppState, home: &Path) -> StorageReport {
     rep.rotated_logs_removed = rl_n;
     rep.rotated_logs_freed = rl_b;
 
+    // Session log capping: each of ~50 sessions writes a .log that grows
+    // without bound. At 20 MB default cap this keeps the logs/ dir under ~1 GB
+    // steady state instead of the 4.5 GB measured on 2026-09-09.
+    let (slr, slb) = rotate_session_logs(&logs);
+    rep.session_logs_rotated = slr;
+    rep.session_logs_rolled_bytes = slb;
+
     // Age-reaped dirs, driven by the AGE_PRUNED_DIRS authority (above) so the
     // prune and settings::is_ephemeral_path read ONE list. media-cache/uploads
     // prune logic was correct but only fired while GROWING; spin-dumps are
@@ -773,6 +1124,44 @@ pub async fn storage_tick(state: &AppState, home: &Path) -> StorageReport {
     rep.files_removed = files;
     rep.bytes_freed = bytes;
     rep.kept_card_referenced = kept;
+
+    // Rotated session logs and stale diagnostic files in logs/.
+    let (rn, rb) = prune_rotated_logs(&home.join("logs"));
+    rep.files_removed += rn;
+    rep.bytes_freed += rb;
+
+    // Directory-level pruning (evidence captures, etc.).
+    let (mut dirs, mut dir_bytes) = (0usize, 0u64);
+    for (name, env_key, default_days) in AGE_PRUNED_SUBDIRS {
+        let days = env_u64(env_key, *default_days);
+        let (dn, db) = prune_subdirs_by_age(&home.join(name), days * 86_400, env_key);
+        dirs += dn;
+        dir_bytes += db;
+    }
+
+    // Stale one-off build target directories.
+    let (bn, bb) = prune_stale_build_targets(home);
+    dirs += bn;
+    dir_bytes += bb;
+
+    // Temp browser session directories in playwright-auth/.
+    let (pn, pb) = prune_temp_browser_dirs(home);
+    dirs += pn;
+    dir_bytes += pb;
+
+    rep.dirs_removed = dirs;
+    rep.dir_bytes_freed = dir_bytes;
+
+    // VACUUM reclaims disk space that DELETE freed inside SQLite but did not
+    // return to the OS. Only run when something was actually deleted, and at
+    // most once per day (the WAL checkpoint is cheap, full VACUUM is not).
+    let total_deleted: usize = rep.tables.iter()
+        .filter(|(_, v)| v.contains("Deleted { rows:") && !v.contains("rows: 0"))
+        .count();
+    if total_deleted > 0 {
+        rep.vacuumed = maybe_vacuum(&state.store, home).await;
+    }
+
     rep.free_bytes = disk_free_bytes(home);
     rep.took_ms = t0.elapsed().as_secs_f64() * 1000.0;
     *last_report_cell().write().unwrap() = Some(rep.clone());
@@ -794,12 +1183,24 @@ pub fn spawn(state: AppState) -> Option<super::PeriodicTask> {
             // `kept_card_referenced` is in the guard as well as the payload:
             // a tick whose only action was DECLINING to delete a card's
             // attachment is an action, and it was previously silent.
-            if r.rotated_bytes > 0 || r.files_removed > 0 || r.kept_card_referenced > 0 || r.rotated_logs_removed > 0 {
+            let any_work = r.rotated_bytes > 0
+                || r.session_logs_rotated > 0
+                || r.files_removed > 0
+                || r.kept_card_referenced > 0
+                || r.dirs_removed > 0
+                || r.vacuumed
+                || r.rotated_logs_removed > 0;
+            if any_work {
                 tracing::info!(
                     rotated_bytes = r.rotated_bytes,
+                    session_logs_rotated = r.session_logs_rotated,
+                    session_logs_rolled_bytes = r.session_logs_rolled_bytes,
                     files_removed = r.files_removed,
                     bytes_freed = r.bytes_freed,
                     kept_card_referenced = r.kept_card_referenced,
+                    dirs_removed = r.dirs_removed,
+                    dir_bytes_freed = r.dir_bytes_freed,
+                    vacuumed = r.vacuumed,
                     rotated_logs_removed = r.rotated_logs_removed,
                     rotated_logs_freed = r.rotated_logs_freed,
                     "storage sweep tick"
@@ -826,15 +1227,20 @@ pub async fn debug_storage() -> axum::Json<Value> {
             "ts_col": s.ts_col, "unit": format!("{:?}", s.unit),
         })).collect::<Vec<_>>(),
         "server_log_max_mb": server_log_max_bytes() / 1024 / 1024,
+        "session_log_max_mb": env_u64("AMUX_SESSION_LOG_MAX_MB", 20),
         "rotated_log_retain_days": env_u64("AMUX_ROTATED_LOG_RETAIN_DAYS", 3),
         "sweep_secs": env_u64("AMUX_STORAGE_SWEEP_SECS", STORAGE_TICK_SECS),
+        "dir_pruning": AGE_PRUNED_SUBDIRS.iter().map(|(name, env, default)| json!({
+            "dir": name, "env": env, "retain_days": env_u64(env, *default),
+        })).collect::<Vec<_>>(),
         "last": r.map(|r| json!({
             "at": r.at, "tables": r.tables, "rotated_bytes": r.rotated_bytes,
+            "session_logs_rotated": r.session_logs_rotated,
+            "session_logs_rolled_bytes": r.session_logs_rolled_bytes,
             "files_removed": r.files_removed, "bytes_freed": r.bytes_freed,
-            // Beside files_removed, never instead of it: "freed nothing" and
-            // "freed nothing because a live card still points at all of it" are
-            // different answers and the endpoint has to be able to say which.
             "kept_card_referenced": r.kept_card_referenced,
+            "dirs_removed": r.dirs_removed, "dir_bytes_freed": r.dir_bytes_freed,
+            "vacuumed": r.vacuumed,
             "rotated_logs_removed": r.rotated_logs_removed,
             "rotated_logs_freed": r.rotated_logs_freed,
             "took_ms": r.took_ms,
@@ -1174,6 +1580,25 @@ mod tests {
         assert!(logs.join("session-a.log.1").exists());
         assert!(logs.join("server-rs.log.1").exists());
         assert!(logs.join("session-b.log").exists());
+
+        // AGE EVERYTHING PAST THE CUTOFF. Without this the assertions above
+        // pass because nothing was eligible, so they prove the age check and
+        // say NOTHING about the server-log exclusion — the one rule this test
+        // is named for. Retain 0 disables the sweep entirely, so drive it with
+        // a real cutoff and backdated mtimes instead.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+        for f in ["session-a.log.1", "server-rs.log.1", "session-b.log"] {
+            let h = std::fs::File::options().write(true).open(logs.join(f)).unwrap();
+            h.set_modified(old).unwrap();
+        }
+        let (n, _) = prune_rotated_logs(logs);
+        assert_eq!(n, 1, "only the aged session rotation is eligible");
+        assert!(!logs.join("session-a.log.1").exists(), "an aged rotation is pruned");
+        assert!(
+            logs.join("server-rs.log.1").exists(),
+            "server-rs.log.1 belongs to rotate_server_log and must survive at any age"
+        );
+        assert!(logs.join("session-b.log").exists(), "a live .log is never a rotation");
         std::env::remove_var("AMUX_ROTATED_LOG_RETAIN_DAYS");
     }
 
