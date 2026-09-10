@@ -4161,7 +4161,7 @@ function render() {
     // time and one consumer read it for one branch.
     const taskIsDesc = !runtimeBoard.cardless && displayTaskSource === 'desc' && !!displayTaskName;
     return `
-    <div class="card ${isExp ? 'expanded' : ''}" data-session="${esc(s.name)}" data-worker-status="${_sessStatusKey(s)}" onclick="event.stopPropagation();toggle('${s.name}')">
+    <div class="card ${isExp ? 'expanded' : ''}" data-session="${esc(s.name)}" data-worker-status="${_sessStatusKey(s)}" data-pinned="${s.pinned ? '1' : '0'}" onclick="event.stopPropagation();toggle('${s.name}')">
       <div class="card-header" onclick="headerTap('${s.name}', event)" onmousedown="tileMouseDown(event,'${s.name}')">
         <div class="card-header-top">
           <div class="card-drag-handle" title="Drag to reorder"><svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor"><circle cx="3" cy="3" r="1.3"/><circle cx="7" cy="3" r="1.3"/><circle cx="3" cy="8" r="1.3"/><circle cx="7" cy="8" r="1.3"/><circle cx="3" cy="13" r="1.3"/><circle cx="7" cy="13" r="1.3"/></svg></div>
@@ -4313,9 +4313,19 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
 
   // Group mode: group by session status
   if (layoutMode === 'group' && !activeTag && !q) {
-    const STATUS_GROUPS = _WORKER_STATUS_GROUPS;
+    // PINNED IS A GROUP, NOT A TIE-BREAK (Ethan, 2026-09-09: "pinned workers
+    // should be pinned to the top"). Pinning used to sort only WITHIN a status
+    // bucket, so a pinned idle worker still sat below every working one — the
+    // pin moved it a few rows inside a group the reader had to scroll to. The
+    // menu item says "Pin to top", so the pin has to outrank the grouping it
+    // sits in, which means lifting those workers out of their status bucket
+    // into a group of their own at the top.
+    const pinned = filtered.filter(s => s.pinned);
+    const STATUS_GROUPS = pinned.length
+      ? [{ key: '_pinned', label: 'Pinned', defaultOpen: true }, ..._WORKER_STATUS_GROUPS]
+      : _WORKER_STATUS_GROUPS;
     const buckets = Object.fromEntries(STATUS_GROUPS.map(g => [g.key, []]));
-    filtered.forEach(s => buckets[_sessStatusKey(s)].push(s));
+    filtered.forEach(s => buckets[s.pinned && pinned.length ? '_pinned' : _sessStatusKey(s)].push(s));
     // Sort within each bucket: alpha (pinned → name) or pinned → last activity
     for (const key of Object.keys(buckets)) {
       if (sortMode !== 'natural') {
@@ -9643,7 +9653,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.861';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.862';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -9846,6 +9856,8 @@ function _paintCachedPeek(cached) {
   return true;
 }
 function openPeek(name, opts) {
+  _bindPeekScrollAffordance();
+  requestAnimationFrame(_peekScrollAffordance);
   _peekOpenGeneration++;
   const openIdentity = _peekIdentity(name);
   try { _applyPeekTabVisibility(); } catch(e) {}
@@ -11165,20 +11177,57 @@ function _isScrolledToBottom(el, threshold) {
 function _scrollLockContainer(scrollEl) {
   return scrollEl;
 }
-function _showScrollLockBadge(scrollEl, onClickResume) {
+function _showScrollLockBadge(scrollEl, onClickResume, buffered) {
   const container = _scrollLockContainer(scrollEl);
   let badge = container.querySelector('.scroll-lock-badge');
   if (!badge) {
     badge = document.createElement('button');
     badge.type = 'button';
     badge.className = 'scroll-lock-badge';
-    badge.textContent = 'New output \u2193';
-    badge.title = 'New output is buffered while you read earlier lines';
     container.append(badge);
   }
+  // Two different facts, so two different labels. Claiming "New output" when
+  // none arrived would be the control lying about why it is there.
+  const hasNew = buffered !== false;
+  badge.textContent = hasNew ? 'New output \u2193' : 'Jump to bottom \u2193';
+  badge.title = hasNew
+    ? 'New output is buffered while you read earlier lines'
+    : 'You are scrolled up — jump back to the newest output';
   badge.onclick = e => { e.stopPropagation(); onClickResume(); };
   badge.style.display = '';
 }
+
+// SHOW IT WHENEVER THERE IS SOMETHING BELOW, NOT ONLY WHEN OUTPUT ARRIVES
+// (Ethan, 2026-09-09: "make sure that we have the scroll to the bottom thing
+// at the bottom of the terminal when there's stuff to scroll down at").
+// The badge was driven solely by _peekScrollLocked, which is set when a frame
+// lands while the reader is scrolled up. On an IDLE worker no frame ever
+// lands, so scrolling up through history offered no way back down and the
+// control looked deleted. This drives it from scroll position, which is the
+// condition the reader can actually see.
+function _peekScrollAffordance() {
+  const body = document.getElementById('peek-body');
+  if (!body) return;
+  const overlay = document.getElementById('peek-overlay');
+  if (!overlay || !overlay.classList.contains('active')) return;
+  if (_isScrolledToBottom(body)) { _hideScrollLockBadge(body); return; }
+  _showScrollLockBadge(body, () => {
+    _peekScrollLocked = false;
+    body.scrollTop = body.scrollHeight;
+    _hideScrollLockBadge(body);
+  }, _peekScrollLocked);
+}
+// app.js is loaded at the END of body, so DOMContentLoaded may already have
+// fired and a listener registered for it would never run. Bind now when the
+// element exists, and fall back to the event only if it does not.
+function _bindPeekScrollAffordance() {
+  const body = document.getElementById('peek-body');
+  if (!body || body._peekAffordanceBound) return;
+  body._peekAffordanceBound = true;
+  body.addEventListener('scroll', _peekScrollAffordance, { passive: true });
+}
+if (document.getElementById('peek-body')) _bindPeekScrollAffordance();
+else document.addEventListener('DOMContentLoaded', _bindPeekScrollAffordance);
 
 function _hideScrollLockBadge(scrollEl) {
   const badge = _scrollLockContainer(scrollEl).querySelector('.scroll-lock-badge');
@@ -21847,9 +21896,15 @@ function _humanSortSessions(a, b) {
 
 // Status order, then recency within each bucket.
 function _statusSortSessions(a, b) {
+  // PINNED OUTRANKS STATUS (Ethan, 2026-09-09: "pinned workers should be
+  // pinned to the top"). This was the only one of the four sorts that ranked
+  // status FIRST and pinned second, so a pinned idle worker sat below every
+  // working one — and status is the default sort, so it is the ordering most
+  // people actually see. The menu item says "Pin to top"; ranking it below
+  // anything makes that label false.
+  if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
   const ap = _WORKER_STATUS_PRI[_sessStatusKey(a)], bp = _WORKER_STATUS_PRI[_sessStatusKey(b)];
   if (ap !== bp) return ap - bp;
-  if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
   return (b.last_activity || 0) - (a.last_activity || 0)
     || (a.name || '').localeCompare(b.name || '');
 }
@@ -21858,7 +21913,11 @@ function _checkWorkerStatusOrder() {
   if (sortMode !== 'status' || _frozen) return;
   // Read the rendered snapshot, not a newer SSE payload while a menu/input
   // intentionally holds the previous cards on screen.
-  const cards = [...document.querySelectorAll('#cards .card[data-worker-status]')];
+  // Pinned cards are hoisted above the status ordering ON PURPOSE, so they are
+  // not evidence of a violation. Excluding them keeps this probe able to fail
+  // for the reason it exists: a genuine mis-ordering among the rest.
+  const cards = [...document.querySelectorAll('#cards .card[data-worker-status]')]
+    .filter(c => c.dataset.pinned !== '1');
   if (!cards.length) return;
   const keys = cards.map(c => c.dataset.workerStatus);
   const at = keys.findIndex((key, i) => i > 0 && _WORKER_STATUS_PRI[key] < _WORKER_STATUS_PRI[keys[i - 1]]);
