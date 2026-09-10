@@ -9653,7 +9653,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.862';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.863';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -11231,7 +11231,7 @@ function _peekScrollAffordance() {
     _peekScrollLocked = false;
     body.scrollTop = body.scrollHeight;
     _hideScrollLockBadge(body);
-  }, _peekScrollLocked);
+  }, _peekBufferedOutput);
 }
 // app.js is loaded at the END of body, so DOMContentLoaded may already have
 // fired and a listener registered for it would never run. Bind now when the
@@ -21449,8 +21449,9 @@ document.getElementById('peek-body').addEventListener('scroll', function() {
     _hideScrollLockBadge(this);
   } else {
     _peekScrollLocked = true;
-    // Scrolling up is not itself news. The compact resume affordance appears
-    // only when a later frame is actually buffered.
+    // Scrolling up is not itself news. The bottom affordance says "Jump to
+    // bottom" until a later frame is actually buffered, then changes to
+    // "New output". Keep those facts separate so the control never lies.
   }
 }, {passive: true});
 // Force URLs in peek output to open in the system browser (PWA desktop + mobile).
