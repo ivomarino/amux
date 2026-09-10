@@ -1,0 +1,634 @@
+[
+  {
+    "id": "LC-01",
+    "surface": "Fresh install and onboarding",
+    "actions": "Open a fresh home; exercise setup, provider-key entry, walkthrough Next/Back/Skip/reopen, and empty-state Create.",
+    "expected": "No blank or permanently connecting screen; missing prerequisites are actionable; setup persists.",
+    "sources": [
+      "e2e/settings.spec.ts",
+      "e2e/phase0.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-02",
+    "surface": "Navigation and customization",
+    "actions": "Open every top-level tab, overflow menu, hide/show/reorder tabs, reload, use Back/Forward and a direct entity link.",
+    "expected": "Selected view and scope match the URL; hidden tabs remain discoverable; no offscreen controls.",
+    "sources": [
+      "e2e/lifecycle/journey.spec.ts",
+      "e2e/tab-customizer.spec.ts",
+      "e2e/browser-history.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-03",
+    "surface": "Worker creation",
+    "actions": "Create a worker from New worker; exercise name validation, provider/model, cwd autocomplete, template, branch and worktree choices; cancel a second creation.",
+    "expected": "Exactly one durable worker; correct provider/cwd/branch; cancellation creates nothing; no false successful start.",
+    "sources": [
+      "e2e/lifecycle/live-journey.spec.ts",
+      "e2e/control-plane.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-04",
+    "surface": "Worker start/stop/restart",
+    "actions": "Start, send a short task, observe running/working/idle, stop, restart and reopen terminal.",
+    "expected": "Real process and displayed state agree; output resumes once; unrelated workers are untouched.",
+    "sources": [
+      "crates/amux-server/tests/golden_live.rs"
+    ]
+  },
+  {
+    "id": "LC-05",
+    "surface": "Worker menu and identity",
+    "actions": "Exercise every card-menu and peek-menu action, rename, duplicate/clone, pin/unpin, archive/restore and search; verify aliases and copied links.",
+    "expected": "Actions produce the named effect; rename preserves board/history identity; copies do not silently share identity.",
+    "sources": [
+      "e2e/worker-action-parity.spec.ts",
+      "crates/amux-server/tests/rename_covers_every_session_table.rs"
+    ]
+  },
+  {
+    "id": "LC-06",
+    "surface": "Worker configuration changes",
+    "actions": "Edit description, label, cwd, branch, model, provider, effort, permissions, isolation and MCP; reload and restore.",
+    "expected": "Durable values match UI; restart/apply timing is explained; prior task context is retained.",
+    "sources": [
+      "e2e/worker-configurations.spec.ts",
+      "crates/amux-server/tests/golden_remaining.rs"
+    ]
+  },
+  {
+    "id": "LC-07",
+    "surface": "Configuration inheritance",
+    "actions": "At global/group/worker levels edit memory, instructions, environment, rules, connectors, skin and gates; override then Inherit.",
+    "expected": "Source and effective value agree; sibling scope is unaffected; Inherit removes only the override.",
+    "sources": [
+      "e2e/worker-configurations.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-08",
+    "surface": "Isolated worker boundary",
+    "actions": "Create an isolated test worker and compare discovery, incoming peer messaging, harness and automation with a normal worker.",
+    "expected": "Isolation effects are visible and enforced; it cannot auto-pick up normal board work.",
+    "sources": [
+      "e2e/isolated-worker.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-09",
+    "surface": "Worker lists and working indicators",
+    "actions": "Filter/search/group/sort/freeze the worker list; put one worker on one task then let it finish.",
+    "expected": "Exactly the claimed task is Working now; counts, ordering and final idle state agree with authoritative data.",
+    "sources": [
+      "e2e/working-now-accuracy.spec.ts",
+      "e2e/worker-card-counts.spec.ts",
+      "e2e/worker-status-order.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-10",
+    "surface": "Groups lifecycle",
+    "actions": "Create/rename a group, add/remove workers, edit scoped configuration, switch scope, then remove the empty test group.",
+    "expected": "Membership and inherited settings persist; no cross-group data leakage or accidental mass mutation.",
+    "sources": [
+      "crates/amux-server/tests/golden_remaining.rs"
+    ]
+  },
+  {
+    "id": "LC-11",
+    "surface": "Prompt to task decomposition",
+    "actions": "Submit one instruction with at least three distinct deliverables and dependencies through the worker composer.",
+    "expected": "Separate actionable tasks are created and linked to the source message; no untouched capture shell counts as work.",
+    "sources": [
+      "e2e/lifecycle/live-journey.spec.ts",
+      "docs/e2e-acceptance.md"
+    ]
+  },
+  {
+    "id": "LC-12",
+    "surface": "Board create/edit/reload/export",
+    "actions": "Create through the UI with notes, owner, group, due time and gate; reopen, edit, search, filter, switch views and export Markdown/JSON.",
+    "expected": "Exactly one task persists, all fields and export match, empty search has a useful state, cancel preserves old values.",
+    "sources": [
+      "e2e/lifecycle/journey.spec.ts",
+      "e2e/board-search-slim.spec.ts",
+      "e2e/board-slim-consumers.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-13",
+    "surface": "Card detail and navigation",
+    "actions": "Open old/new deep links; inspect status, next action, owner, blockers, history, evidence and outputs; follow worker and file links.",
+    "expected": "The card alone explains work and next action; the exact linked entity opens; details fit every viewport.",
+    "sources": [
+      "e2e/card-details.spec.ts",
+      "e2e/peek-path-links.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-14",
+    "surface": "Column lifecycle and gates",
+    "actions": "Create custom test columns and gates; reorder them; edit a gate; transition a scratch task with a missing condition, then supply real proof.",
+    "expected": "The refusal names the unmet gate; permitted transition records actor/time; custom terminal state is honored.",
+    "sources": [
+      "e2e/worker-configurations.spec.ts",
+      "crates/amux-server/tests/board_api.rs"
+    ]
+  },
+  {
+    "id": "LC-15",
+    "surface": "Backlog autonomous pickup",
+    "actions": "Create backlog work with a clear next action; leave the observer idle for several driver ticks.",
+    "expected": "Work progresses to todo and doing without observer nudges; history attributes the promotion.",
+    "sources": [
+      "docs/e2e-acceptance.md",
+      "crates/amux-server/tests/golden_scenarios.rs"
+    ]
+  },
+  {
+    "id": "LC-16",
+    "surface": "Overdue ordering",
+    "actions": "Create three scratch backlog cards due seven, three and one days ago, with a deterministic tied-due pair.",
+    "expected": "Promotion is oldest due first, then stable ID order; partial promotion explains rate limit or WIP.",
+    "sources": [
+      "docs/e2e-acceptance.md"
+    ]
+  },
+  {
+    "id": "LC-17",
+    "surface": "WIP and ownership",
+    "actions": "Queue work behind a claimed task; attempt a second claim and a competing-worker claim.",
+    "expected": "One owner/lease wins; blocked work explains WIP; after completion the next task starts once.",
+    "sources": [
+      "e2e/queued-behind-wip.spec.ts",
+      "crates/amux-server/tests/task_graph.rs"
+    ]
+  },
+  {
+    "id": "LC-18",
+    "surface": "Dependency chain and cycle",
+    "actions": "Create parent/children and a blocked dependency; attempt a cycle; complete children through real work.",
+    "expected": "Cycles are rejected; parents remain blocked until all prerequisites meet their required terminal conditions.",
+    "sources": [
+      "crates/amux-server/tests/golden_scenarios.rs",
+      "crates/amux-server/tests/task_graph.rs"
+    ]
+  },
+  {
+    "id": "LC-19",
+    "surface": "Review and negative gates",
+    "actions": "Attempt done without an artifact, without evidence, and with a false gate acknowledgment; then supply real results.",
+    "expected": "All invalid closures are refused visibly; legitimate closure preserves command, result and accessible output.",
+    "sources": [
+      "crates/amux-server/tests/board_api.rs",
+      "docs/e2e-acceptance.md"
+    ]
+  },
+  {
+    "id": "LC-20",
+    "surface": "Blocked/needs-you/recovery",
+    "actions": "Create a genuine missing-input or dependency blocker; inspect card and worker; provide the input through normal UI.",
+    "expected": "Blocked state names reason/owner/next action; work resumes without resetting unrelated tasks.",
+    "sources": [
+      "crates/amux-server/tests/golden_scenarios.rs"
+    ]
+  },
+  {
+    "id": "LC-21",
+    "surface": "Code change to finished artifact",
+    "actions": "Run the three-part live journey: implement sum, test it, add non-finite validation, retest, produce HTML and Markdown results.",
+    "expected": "Actual files change, independent tests pass, tasks finish with evidence; generated HTML renders its unique run marker.",
+    "sources": [
+      "e2e/lifecycle/live-journey.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-22",
+    "surface": "Verification and reopen",
+    "actions": "Independently run the artifact tests, inspect its rendered result, verify task, then reopen with a concrete correction and repeat.",
+    "expected": "Verified is backed by fresh checks; reopened work is driven back to a terminal state; history retains both cycles.",
+    "sources": [
+      "crates/amux-server/tests/golden_scenarios.rs",
+      "crates/amux-server/tests/golden_remaining.rs"
+    ]
+  },
+  {
+    "id": "LC-23",
+    "surface": "Board archive/discard/cleanup",
+    "actions": "Archive/restore and discard only test cards; inspect terminal availability; try the column migration dialog then Cancel.",
+    "expected": "No unintended card moves; cancelled migration changes nothing; archived/discarded items remain traceable.",
+    "sources": [
+      "crates/amux-server/tests/board_api.rs"
+    ]
+  },
+  {
+    "id": "LC-24",
+    "surface": "Composer and delivery",
+    "actions": "Type/paste multiline text, expand composer, switch send modes, send once, inspect pending/sent/failed, retry a controlled failure.",
+    "expected": "Exact text and origin reach the right worker once; drafts survive failures and worker switching.",
+    "sources": [
+      "e2e/message-resend.spec.ts",
+      "e2e/suggestion-control-verdict.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-25",
+    "surface": "Message-to-task links",
+    "actions": "Send multipart work and inspect message card chips; open each child task and navigate back.",
+    "expected": "Every durable card link opens the exact child and its state/artifacts; source kind and MSG ID remain truthful.",
+    "sources": [
+      "e2e/terminal-message-navigation.spec.ts",
+      "e2e/msg-id-copy.spec.ts",
+      "e2e/messages-default-kind.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-26",
+    "surface": "Peer requests and callbacks",
+    "actions": "In a test-only group make one worker request work from another, wait for completion/callback, inspect both boards.",
+    "expected": "Own-board boundary enforced; links and callbacks preserve attribution; no duplicate unowned task escape.",
+    "sources": [
+      "e2e/worker-request-callback.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-27",
+    "surface": "Terminal reading and controls",
+    "actions": "Open terminal/transcript; navigate earlier/later messages, source/content filters, Find, copy, path links and focus mode; test long output.",
+    "expected": "Scroll anchors and filter selection survive refresh; no cross-worker output/draft/card mixing; toolbar is reachable.",
+    "sources": [
+      "e2e/terminal-message-navigation.spec.ts",
+      "e2e/terminal-scroll-accuracy.spec.ts",
+      "e2e/peek-default-tab.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-28",
+    "surface": "Read-aloud and media controls",
+    "actions": "Start/pause/resume/seek/close read-aloud, change worker mid-playback, and interrupt playback.",
+    "expected": "Player controls match audio state, stale playback stops appropriately, and no inaccessible overlay remains.",
+    "sources": [
+      "e2e/read-aloud-player.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-29",
+    "surface": "File upload and retry",
+    "actions": "Upload a text file, close peek mid-transfer, cancel another, force failure, retry and download.",
+    "expected": "File bytes match; transfer survives closing; cancel is not an error; failed chip retains its retryable file.",
+    "sources": [
+      "e2e/upload-chip-escape.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-30",
+    "surface": "Files and previews",
+    "actions": "Browse scratch directories, breadcrumb, search, open text/image/PDF/HTML, edit/save/reopen, create/rename/delete scratch files.",
+    "expected": "Correct file and content open; binary/large/missing files explain limitations; previews fit phone screens.",
+    "sources": [
+      "e2e/peek-path-links.spec.ts",
+      "e2e/worker-action-parity.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-31",
+    "surface": "Memories and instructions",
+    "actions": "Create/read/edit/delete worker memory, inspect inherited memory, search and reload; have worker use a unique fact.",
+    "expected": "Version/content and effective scope persist; subsequent worker output uses the saved fact.",
+    "sources": [
+      "crates/amux-server/tests/golden_live.rs"
+    ]
+  },
+  {
+    "id": "LC-32",
+    "surface": "Scheduler lifecycle",
+    "actions": "Create schedule, choose worker/cadence/timezone, edit, disable/enable, run now, wait for natural fire, then delete.",
+    "expected": "One attributed run per trigger; disabled schedule does not fire; history includes edited/deleted jobs.",
+    "sources": [
+      "e2e/scheduler-audit.spec.ts",
+      "crates/amux-server/tests/system_jobs.rs"
+    ]
+  },
+  {
+    "id": "LC-33",
+    "surface": "System jobs and stalled work",
+    "actions": "Open SYSTEM jobs, expand details, compare healthy/stalled/disabled jobs; use Run now only on the dedicated lab.",
+    "expected": "UI agrees with registry/timestamps; stalled job is distinct; automation actually advances eligible tasks.",
+    "sources": [
+      "e2e/system-jobs.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-34",
+    "surface": "Calendar and timezone",
+    "actions": "Create/edit/move/delete a scratch calendar event; inspect all-day/timezone/day boundaries and exported iCal.",
+    "expected": "UI and feed represent the same event and timezone; deletion removes only that event.",
+    "sources": [
+      "docs/rust-rebuild-plan.md"
+    ]
+  },
+  {
+    "id": "LC-35",
+    "surface": "Browser profiles and history",
+    "actions": "Create test profile, start, navigate local artifact, view live screen, screenshot, history Back/Forward, open/close tab and stop.",
+    "expected": "Real browser output updates; active/locked/unavailable states are distinguishable; process ends after Stop.",
+    "sources": [
+      "e2e/browser-history.spec.ts",
+      "e2e/browser-liveview-fail.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-36",
+    "surface": "Email draft and test send",
+    "actions": "Create/edit/discard a draft; with explicit test-recipient authorization send to a controlled sink and inspect Sent.",
+    "expected": "Draft persists; actual test delivery and Sent agree; failure preserves draft and visible error.",
+    "sources": [
+      "docs/rust-rebuild-plan.md"
+    ]
+  },
+  {
+    "id": "LC-37",
+    "surface": "Connectors and authentication",
+    "actions": "Add a test connector, configure scope, connect/disconnect, deny and expire auth, test and retry.",
+    "expected": "Auth health and scoped availability are accurate; credentials are masked; revoked connector cannot act.",
+    "sources": [
+      "e2e/settings.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-38",
+    "surface": "Environment and provider keys",
+    "actions": "Edit a test env variable/key through supported UI, reload, clear override, enter invalid value and test unavailable provider.",
+    "expected": "Saved/effective config agree without stale refresh overwrite; absent/invalid key has a recoverable state.",
+    "sources": [
+      "e2e/settings.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-39",
+    "surface": "Search and cross-entity discovery",
+    "actions": "Create uniquely named worker/task/group/memory/file; search globally and within tabs, filters, zero results and deep links.",
+    "expected": "Every supported entity type is findable and opens correct scope; unsupported search domains are recorded as gaps.",
+    "sources": [
+      "crates/amux-server/tests/search_index.rs",
+      "e2e/board-search-slim.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-40",
+    "surface": "Offline write/reconnect",
+    "actions": "Go offline, create three cards and edit existing work, reload offline, reconnect and wait for replay.",
+    "expected": "Durable queue retains exact intent, server receives each mutation once, UI converges and queue drains.",
+    "sources": [
+      "e2e/golden.spec.ts",
+      "e2e/outbox-connectivity.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-41",
+    "surface": "Concurrent clients and conflicts",
+    "actions": "Open two clients; edit the same task and distinct tasks concurrently; reconnect a stale client.",
+    "expected": "Visible revision conflict protects both drafts; unrelated changes converge with no lost update.",
+    "sources": [
+      "e2e/local-multiplayer.spec.ts",
+      "e2e/golden.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-42",
+    "surface": "Connection failures and recovery",
+    "actions": "Interrupt SSE without a clean close, cut network, restore; provoke bad auth and unavailable API.",
+    "expected": "Status reflects usable data, zombie stream recovers, auth failure differs from retryable outage, no endless silent spinner.",
+    "sources": [
+      "e2e/golden.spec.ts",
+      "e2e/conn-history-classify.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-43",
+    "surface": "Service worker and PWA",
+    "actions": "Install/open PWA, offline launch, cached-version upgrade, failure bar dismissal, save below banner.",
+    "expected": "Upgrade does not lose drafts; failure explains offline limits; Save stays tappable on phone.",
+    "sources": [
+      "e2e/sw-fail-bar.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-44",
+    "surface": "Settings appearance and device",
+    "actions": "Exercise every settings tab and control: theme, zoom, tabs, offline limits, device name, defaults, connections, About, devtools and walkthrough.",
+    "expected": "Persisted controls survive reload; local-only settings remain local; modals close by keyboard and pointer.",
+    "sources": [
+      "e2e/settings.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-45",
+    "surface": "Usage, cost and limits",
+    "actions": "Run real work; inspect token/cost ledger, worker/task attribution, limits, budget exhaustion and recovery.",
+    "expected": "Nonzero real usage appears under correct identity; unknown/unmeasured is not zero; budget stops and recovery are clear.",
+    "sources": [
+      "e2e/settings.spec.ts",
+      "crates/amux-server/tests/golden_remaining.rs"
+    ]
+  },
+  {
+    "id": "LC-46",
+    "surface": "Logs and diagnostics",
+    "actions": "Inspect logs search/filter/details, measured diagnostic endpoints, invariant failures and client action error.",
+    "expected": "Failed actions produce an attributable diagnostic signal; measured/n_considered distinguish empty from unmeasured.",
+    "sources": [
+      "crates/amux-server/tests/diagnostic_contract.rs",
+      "e2e/worker-toolbar-boot.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-47",
+    "surface": "Workspace, map and metrics",
+    "actions": "Open Workspace grid, add/remove panes, resize/focus, switch worker; open map/graph and metrics filters.",
+    "expected": "Pane identity remains correct; graph/metrics reflect scratch tasks and terminal states; no stale cross-worker data.",
+    "sources": [
+      "e2e/lifecycle/journey.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-48",
+    "surface": "Auxiliary tabs and empty capabilities",
+    "actions": "Inspect MDAI, Proxies, Skills, Database, Torrents, journal/habits where enabled; use their creation/edit/cancel controls on test fixtures.",
+    "expected": "Each advertised control works or explains its prerequisite; missing capabilities are recorded, not silently skipped.",
+    "sources": [
+      "e2e/lifecycle/journey.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-49",
+    "surface": "Multiplayer scope and revocation",
+    "actions": "Invite test members/devices, restrict group access, edit concurrently, revoke one member and retest both clients.",
+    "expected": "Authorized client continues; revoked client loses access; no hidden mutation leaks across scope.",
+    "sources": [
+      "e2e/local-multiplayer.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-50",
+    "surface": "Provider/model continuity",
+    "actions": "Repeat core task flow on installed providers; switch model/provider mid-work and inspect continuation, rate-limit recovery and cancellation.",
+    "expected": "Same durable task context and identity survive supported swaps; unavailable providers remain INCOMPLETE.",
+    "sources": [
+      "crates/amux-server/tests/golden_remaining.rs"
+    ]
+  },
+  {
+    "id": "LC-51",
+    "surface": "Restart and persistence",
+    "actions": "Restart only dedicated lab server and worker process during queued and active work; reconnect UI.",
+    "expected": "Tasks/messages/files/gates persist; ownership reconciles; no duplicate execution; build identity brackets evidence.",
+    "sources": [
+      "crates/amux-server/tests/restart_persistence.rs",
+      "crates/amux-server/tests/backend_conformance.rs"
+    ]
+  },
+  {
+    "id": "LC-52",
+    "surface": "Visual and accessibility sweep",
+    "actions": "Inspect each checkpoint and every open dialog/popover across desktop, 375px, iPhone WebKit, light/dark, empty/populated/error/long text.",
+    "expected": "No clipping/overlap or inaccessible action; focus/labels/keyboard/touch work; discovered controls have explicit effect-verification rows.",
+    "sources": [
+      "e2e/lifecycle/journey.spec.ts",
+      "e2e/ux-discovery/crawler.ts"
+    ]
+  },
+  {
+    "id": "LC-54",
+    "surface": "Same-group peer awareness",
+    "actions": "Create author, reviewer and consumer in one test group. Each reads its own and peers\u2019 actual tasks, identifies ownership/status/blockers and names the exact IDs in messages. Repeat discovery and peer task reads with a worker that has no group, in both directions.",
+    "expected": "Roster and board facts are correct without operator-pasted task context; same-group access is a positive control.",
+    "sources": [
+      "e2e/lifecycle/coordination.spec.ts",
+      "e2e/lifecycle/live-coordination.spec.ts",
+      "e2e/worker-request-callback.spec.ts",
+      "e2e/isolated-worker.spec.ts",
+      "e2e/lifecycle/ungrouped.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-55",
+    "surface": "Cross-group awareness and delivery",
+    "actions": "Place author in build and reviewer/consumer in quality. Discover peers, inspect permitted task context, request work and wait for response with normal open defaults.",
+    "expected": "Actual originated peer messages cross groups; request and response identify the right cards and artifacts.",
+    "sources": [
+      "e2e/lifecycle/coordination.spec.ts",
+      "e2e/lifecycle/live-coordination.spec.ts",
+      "e2e/worker-request-callback.spec.ts",
+      "e2e/isolated-worker.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-56",
+    "surface": "Cross-group deny/allow/inherit",
+    "actions": "Set a worker/group deny, attempt a new cross-group request, allow one destination, retry, clear override and inspect effective policy.",
+    "expected": "Denied request is visibly refused with no delivered work; allowed destination succeeds; inheritance restores the documented default, not blanket access by accident.",
+    "sources": [
+      "e2e/lifecycle/coordination.spec.ts",
+      "e2e/lifecycle/live-coordination.spec.ts",
+      "e2e/worker-request-callback.spec.ts",
+      "e2e/isolated-worker.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-57",
+    "surface": "Reply exception and isolation",
+    "actions": "With initiation restricted, test a reply to an actual incoming request, an unsolicited new message, and a message to an isolated worker in the same group.",
+    "expected": "Documented reply path works only with genuine inbound history; unsolicited initiation respects policy; isolation cannot be bypassed by group membership.",
+    "sources": [
+      "e2e/lifecycle/coordination.spec.ts",
+      "e2e/lifecycle/live-coordination.spec.ts",
+      "e2e/worker-request-callback.spec.ts",
+      "e2e/isolated-worker.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-58",
+    "surface": "Peer review requests changes",
+    "actions": "Author supplies a deliberate empty-input defect and requests review. Reviewer discovers the task, independently runs the failing test, owns a review task and sends REVIEW_CHANGES.",
+    "expected": "Reviewer is a different worker, cites actual task/file/failure, and the implementation cannot be treated as approved before repair.",
+    "sources": [
+      "e2e/lifecycle/coordination.spec.ts",
+      "e2e/lifecycle/live-coordination.spec.ts",
+      "e2e/worker-request-callback.spec.ts",
+      "e2e/isolated-worker.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-59",
+    "surface": "Revision and independent re-review",
+    "actions": "Author revises after reviewer feedback, records the changed artifact and tests, asks for re-review. Reviewer reruns tests and sends REVIEW_APPROVED.",
+    "expected": "Durable message timestamps prove rejection precedes approval; approval refers to the revised work and actual successful tests, not the old artifact.",
+    "sources": [
+      "e2e/lifecycle/coordination.spec.ts",
+      "e2e/lifecycle/live-coordination.spec.ts",
+      "e2e/worker-request-callback.spec.ts",
+      "e2e/isolated-worker.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-60",
+    "surface": "Dependent integration and callback",
+    "actions": "Consumer reads author/reviewer tasks, creates its own dependent integration task, waits for approval, tests the artifact, and sends HANDOFF_DONE.",
+    "expected": "Integration finishes after approval; linked task IDs belong to the correct peers; callback wakes requester and all three workers reach evidenced terminal states.",
+    "sources": [
+      "e2e/lifecycle/coordination.spec.ts",
+      "e2e/lifecycle/live-coordination.spec.ts",
+      "e2e/worker-request-callback.spec.ts",
+      "e2e/isolated-worker.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-61",
+    "surface": "No peer ownership hijack or duplicate dispatch",
+    "actions": "Two workers attempt to claim one task; repeat request/callback delivery; ask a peer for work without changing its owned task directly.",
+    "expected": "One claim wins; one callback effect; task ownership and verified message origin stay accurate; duplicate work is not manufactured.",
+    "sources": [
+      "e2e/lifecycle/coordination.spec.ts",
+      "e2e/lifecycle/live-coordination.spec.ts",
+      "e2e/worker-request-callback.spec.ts",
+      "e2e/isolated-worker.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-62",
+    "surface": "Unavailable peer and recovery",
+    "actions": "Stop reviewer before request, resume it later; separately test archived, isolated, error and rate-limited reviewers.",
+    "expected": "Requester shows who/what it awaits, retains its next action, avoids false completion, and resumes when the actual reviewer returns.",
+    "sources": [
+      "e2e/lifecycle/coordination.spec.ts",
+      "e2e/lifecycle/live-coordination.spec.ts",
+      "e2e/worker-request-callback.spec.ts",
+      "e2e/isolated-worker.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-63",
+    "surface": "Group changes during coordination",
+    "actions": "Move reviewer between test groups or change its scope while a review is pending, then refresh both workers and both dashboard clients.",
+    "expected": "Effective policy and peer awareness refresh; pending work remains attributable and either completes through permitted routing or visibly explains the new restriction.",
+    "sources": [
+      "e2e/lifecycle/coordination.spec.ts",
+      "e2e/lifecycle/live-coordination.spec.ts",
+      "e2e/worker-request-callback.spec.ts",
+      "e2e/isolated-worker.spec.ts"
+    ]
+  },
+  {
+    "id": "LC-53",
+    "surface": "Final state and run-owned cleanup",
+    "actions": "Inventory every run-owned entity; inspect all deliverables, verify results, stop/archive test workers and disable/delete test schedules.",
+    "expected": "All requested work is terminal with proof; no active leases, duplicate dispatches or orphan jobs; unresolved work is explicitly failed/incomplete.",
+    "sources": [
+      "e2e/lifecycle/live-journey.spec.ts"
+    ]
+  }
+]

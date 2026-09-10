@@ -801,26 +801,6 @@
     -webkit-touch-callout: default; cursor: text;
     touch-action: pan-y;
   }
-  /* Prose wraps. Numbered source rows retain their gutter; structural tables
-     own a horizontal scroller. Controls are outside that scroller at every width. */
-  /* Terminal chunks need their real height. `content-visibility:auto` with an
-     estimated 1100px intrinsic size made the scroll range expand/contract as
-     off-screen chunks were measured, so a stationary terminal visibly bounced
-     up and down. Incremental DOM patching already bounds render work. */
-  .peek-render-chunk { min-width:0; }
-  .peek-code-row { display:block; white-space:normal; }
-  .peek-code-cell { display:grid; grid-template-columns:minmax(3ch, max-content) minmax(0, 1fr); gap:1ch; min-width:0; }
-  .peek-code-number { white-space:pre; text-align:right; color:#9da7b3; user-select:none; }
-  .peek-code-text { white-space:pre-wrap; overflow-wrap:anywhere; min-width:0; }
-  .peek-code-add { background:rgba(63,185,80,0.10); }
-  .peek-code-del { background:rgba(248,81,73,0.10); }
-  .peek-code-split { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:12px; }
-  @media (max-width:600px) {
-    .peek-code-split { grid-template-columns:minmax(0,1fr); gap:0; }
-    .peek-output-controls button { min-width:44px; min-height:44px; }
-    .peek-split-wrap.split-active { flex-direction:column; }
-    .peek-split-wrap.split-active > .peek-split-files { border-left:0; border-top:1px solid var(--border); }
-  }
   .peek-copy-btn {
     position: static;
     height: 28px; border-radius: 6px; padding: 0 8px;
@@ -852,6 +832,12 @@
     opacity: 0.75; white-space: pre-wrap;
     border-left: 2px solid rgba(255,255,255,0.12); padding-left: 6px;
   }
+  /* The peek text flow is capped to the WORKER's pane width (--peek-cols, set
+     per frame from the peek payload's pane_cols). Without it, prose written for
+     a 154-column terminal re-wraps at ~224 characters on a wide desktop and the
+     author's line breaks and spacing stop making sense. Falls back to 220, the
+     spawn width, when a frame carries no pane_cols. */
+  #pk-earlier, #pk-hist, #pk-live { max-width: calc(var(--peek-cols, 220) * 1ch); }
   .peek-rule {
     display: inline-flex; width: 100%; align-items: center; gap: 6px;
     height: 1.15em; vertical-align: middle;
