@@ -3319,7 +3319,7 @@ FIX: b724cdff retains each write until exact-card acknowledgment, bounds
 ## Numbered terminal output detached its source gutters on phones and reparsed loaded history while streaming
 AREA: browser
 SEVERITY: blocks
-STATUS: fixed
+STATUS: open
 DATE: 2026-09-09
 SESSION: amux-testing-e2e
 CARD: AF-640
@@ -3329,7 +3329,7 @@ SYMPTOM: Ethan's phone terminal squeezed split diff/tool output into unreadable
   replaced its DOM; live ticks also walked all loaded prompt descendants.
 COST: The worker terminal was unusable for reviewing changes at phone widths.
   Large active transcripts added avoidable parsing and scrolling work while typing.
-FIX: 69490b05 uses gutter/code cells, unified split rows below 600px,
+FIX: Initial attempt 69490b05 introduced gutter/code cells, unified split rows below 600px,
   a separate controls row, stable ANSI-aware chunks and animation-frame burst
   coalescing. Render counters and slow-update client-debug expose regressions.
   81/81 browser scenarios and 26/26 Node tests passed; cache and mobile-layout
@@ -3339,6 +3339,51 @@ FIX: 69490b05 uses gutter/code cells, unified split rows below 600px,
   16 chunks, parsed 67,492 characters and preserved typed 01234567 plus focus.
   Screenshots: /private/tmp/af640-live-mobile-diff.png and
   /private/tmp/af640-live-desktop-diff.png. No claim of server pool health.
+  CORRECTION 2026-09-09, originating session amux-testing-e2e: the rendering
+  acceptance above was too narrow. Plain grep context such as 38- background
+  matched the numbered-row heuristic, including its space-only split fallback.
+  A scroll-lock badge in the toolbar flow moved the terminal each time it toggled.
+  The unrelated chips pan-x pan-y change was also reverted. Authoritative amux
+  commits cd8c7bfc and 91091e28 remove those parts and retain the chunk cache,
+  ANSI/OSC-8 carry and frame coalescing. Do not restore the removed renderer from
+  the old fixture proof. Mobile diff presentation remains unvalidated; the
+  performance measurements only support the retained incremental-render path.
+  The Node suite still required the removed helpers (8/8 failed before repair).
+  Corrected coverage preserves literal grep/column text, measures geometry across
+  repeated lock transitions at 390px and 1280px, and tests horizontal chip touch
+  policy. Against the committed pre-revert source, the three text contracts fail
+  for rendered-output mismatches while the five cache/coalescing tests pass.
+  FURTHER CORRECTION 2026-09-09, originating session amux-testing-e2e:
+  c3183a27 supersedes those partial reverts and removes the entire renderer
+  rewrite, including the cache, ANSI/OSC-8 carry and frame coalescing. The amux
+  worker reports a live prompt-highlight wrapper covering 44.2% of a
+  106,680-character pane. Parsing input fragments let document constructs cross
+  parser boundaries; the earlier passing fixtures did not establish structural
+  correctness. All renderer/performance acceptance above is withdrawn, not
+  evidence for re-landing that implementation. The deleted renderer suites stay
+  deleted. e2e1e643 adds worker lifecycle coverage; a future renderer must also
+  prove markup boundaries and visible layout, beyond preserving textContent.
+  The independent 5abadb51 session-read recovery and horizontal chip gesture
+  remain. The original mobile/readability and performance request stays open.
+  Integration then found merges 9461039b/a29882d1 had resurrected the parser,
+  inferred diff markup and deleted suites. Reconcile the authoritative revert
+  with 22d1561f's tab persistence, compact controls, prompt attribution and
+  history/live overlap protection; retain the later menu/path fixes and move
+  314fd8b6's pane-width cap into the restored HTTP refresh path. The
+  existing peek-poll client-debug beacon now reports whether the input chunk
+  parser is present. Product/lifecycle tests assert the removed wrappers stay
+  absent, and product checks deliver updates through refreshPeek's HTTP path.
+  CI's terminal-render.mjs argument goes with the removed suite. Before the
+  merge, Node 22 silently ignored that missing file and both commands passed
+  the 18 surviving outage-recovery tests; that was stale wiring, not a failing
+  gate. Lifecycle fixture failures also exposed a 250ms entrance-animation
+  measurement, column-default rather than exact-card acknowledgements, an
+  artifact refusal masking the acknowledgement checks, and a bare API DELETE
+  that correctly lacked the dashboard UI token. The fixture now waits for the
+  named entrance transition, distinguishes those gates, and confirms deletion
+  through the dashboard. It imports the shared candidate-asset fixture so the
+  installed API binary cannot silently substitute its embedded dashboard.
+  No server code changes or renewed mobile/performance acceptance.
 
 
 ---
@@ -3394,3 +3439,14 @@ FIX: Assert that the message lands near the scroller start and below the actual
   controls included the run was 59/60; its mobile snapshot poll exceeded 5s
   after the config write was logged successful. Exact fresh-home rerun ->
   1 passed (20.9s), no source change. This is not a green full-browser-CI claim.
+
+## An unresolved merge was published as the fleet's Bash CLI
+AREA: cli
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-09
+SESSION: amux-testing-e2e
+CARD: ATE-136
+SYMPTOM: mixpeek-general measured conflict markers in ~/.local/bin/amux at lines 1527/1535/1563; every subcommand failed parsing. The shared checkout was mid-merge. install.sh installed only the Rust binaries, leaving no supported Bash publication path, while the freshness hook prescribed a worktree symlink. The exact manual copier is not established; this lane did not start or change the shared merge.
+COST: Fleet-wide CLI outage requiring a peer to restore the committed origin/main script; the installer recommendation initially pointed at a path that did not exist. Incident evidence is retained on MG-1716.
+FIX: make install-cli and install.sh now use one publisher: snapshot beside the destination, reject unmerged source/conflict markers/invalid Bash, then atomic rename of those validated bytes. Refusals and publication failures preserve the installed client and emit stage/reason to stderr and logs/cli-install.log. The grid helper is included and validated before either file is published, so replacing a symlink preserves that command. Freshness guidance uses the guarded publisher. Sixteen temporary-fixture tests cover ENOSPC, publication failure, open readers, source races, concurrent installs and installed grid dispatch; syntax and in-place-copy mutations fail named tests. This retires the publication mechanism only; resolving the separate shared merge remains its owner's work.

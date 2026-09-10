@@ -72,6 +72,11 @@ surface, and layout breaks live at 375px.
 
 ## e2e (`e2e/`)
 
+For the combined product lifecycle, use `npm run test:lifecycle` and
+[the consolidated acceptance guide](docs/consolidated-lifecycle.md). It retains
+per-stage failures, skipped prerequisites, visual evidence, real task completion
+and peer coordination. `npm run test:lifecycle:browser` is the browser-only scope.
+
 ```bash
 npx playwright test --config=e2e/playwright.config.ts e2e/<spec>.spec.ts
 ```

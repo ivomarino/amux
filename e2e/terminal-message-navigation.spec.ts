@@ -60,14 +60,16 @@ test('header arrows land at the start of a long message and hold through refresh
     const target = body.querySelector('.peek-msg-current')!;
     return { offset: target.getBoundingClientRect().top - body.getBoundingClientRect().top,
       top: body.scrollTop, locked: eval('_peekScrollLocked'), height: target.getBoundingClientRect().height,
+      paddingTop: parseFloat(getComputedStyle(body).paddingTop),
       targetTop: target.getBoundingClientRect().top,
       controlsBottom: document.querySelector('.peek-output-controls')!.getBoundingClientRect().bottom };
   });
   expect(landing.height).toBeGreaterThan(400);
   expect(landing.offset).toBeGreaterThanOrEqual(0);
-  // Controls now occupy a sibling row instead of covering the first 40px.
-  // The message must land near the scroller start and below the real controls.
-  expect(landing.offset).toBeLessThan(20);
+  // The compact controls float inside the terminal, so navigation deliberately
+  // lands at the scroller's padded content start and never underneath them.
+  expect(landing.offset).toBeGreaterThanOrEqual(landing.paddingTop - 2);
+  expect(landing.offset).toBeLessThan(landing.paddingTop + 20);
   expect(landing.targetTop).toBeGreaterThanOrEqual(landing.controlsBottom);
   expect(landing.top).toBeGreaterThan(100);
   expect(landing.locked).toBe(true);

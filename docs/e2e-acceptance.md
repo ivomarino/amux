@@ -1,5 +1,10 @@
 # End-to-end acceptance: does a task actually go all the way round?
 
+The canonical combined run is now [consolidated-lifecycle.md](consolidated-lifecycle.md)
+(`npm run test:lifecycle`). It includes this seven-claim audit, all browser specs,
+live work and same-group/cross-group coordination with independent peer review.
+This document retains the original task-cycle checklist as supporting detail.
+
 `VERIFY.md` says what proves a single change. This file asks a different
 question: does the whole loop work, from a sentence a human typed to a closed
 card carrying its own evidence?

@@ -1,4 +1,4 @@
-.PHONY: install run dev check test clean status restart
+.PHONY: install install-cli run dev check test clean status restart
 
 BIN_DIR   ?= $(HOME)/.local/bin
 PORT      ?= 8824
@@ -7,6 +7,10 @@ LABEL     := com.amux.server-rs
 # First-time or upgrade: build, install, load launchd, wait for /health.
 install:
 	./install.sh
+
+# Publish only syntax-checked Bash CLI bytes; no Cargo build or server restart.
+install-cli:
+	./scripts/install-cli.sh "$(BIN_DIR)"
 
 # Rebuild release + reinstall binary; launchd restarts the server automatically
 # (the server watches its own binary mtime and exits for launchd to relaunch).

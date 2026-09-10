@@ -534,7 +534,7 @@
   .btn.danger { border-color: var(--red); color: var(--red); }
   .provider-btn { flex:1; font-size:0.82rem; padding:7px 10px; transition: all 0.15s; }
   .provider-btn.selected { background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600; }
-  .chips { display: flex; gap: 6px; flex-wrap: nowrap; margin-bottom: 10px; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; touch-action: pan-x pan-y; overscroll-behavior-x: contain; }
+  .chips { display: flex; gap: 6px; flex-wrap: nowrap; margin-bottom: 10px; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; touch-action: pan-x; overscroll-behavior-x: contain; }
   .chips::-webkit-scrollbar { display: none; }
   .chip {
     font-size: 0.78rem; padding: 6px 12px; border-radius: 16px;
@@ -783,13 +783,14 @@
     margin-bottom: 8px; flex-shrink: 0;
   }
   .overlay-header h2 { font-size: 1.1rem; }
-  .peek-output-wrap { display:flex; flex-direction:column; flex:1; min-height:0; min-width:0; }
-  .peek-output-controls { display:flex; align-items:center; justify-content:flex-end; gap:8px;
-    flex-shrink:0; padding:4px 6px; background:#0d1117; border-radius:8px 8px 0 0; }
-  .peek-output-controls .scroll-lock-badge { position:static; flex:1; min-width:0; margin-right:auto;
-    padding:4px; background:none; border:1px solid var(--border); border-radius:6px;
-    font:inherit; font-size:0.75rem; color:var(--accent); cursor:pointer; white-space:normal; }
-  #peek-body { touch-action:pan-x pan-y pinch-zoom; min-width:0; width:100%; box-sizing:border-box; border-radius:0 0 8px 8px; }
+  .peek-output-wrap { position:relative; display:flex; flex-direction:column; flex:1; min-height:0; min-width:0; }
+  .peek-output-controls {
+    position:absolute; z-index:7; top:6px; right:6px; width:max-content;
+    display:flex; align-items:center; justify-content:flex-end; gap:4px;
+    padding:3px; background:rgba(13,17,23,0.94); border:1px solid rgba(255,255,255,0.12);
+    border-radius:8px; box-shadow:0 2px 8px rgba(0,0,0,0.22);
+  }
+  #peek-body { touch-action:pan-x pan-y pinch-zoom; min-width:0; width:100%; box-sizing:border-box; border-radius:8px; padding-top:46px; }
   .overlay-body {
     flex: 1; min-height: 0; overflow-x: hidden; overflow-y: auto;
     background: #010409; border-radius: 8px;
@@ -799,22 +800,6 @@
     -webkit-user-select: text; user-select: text;
     -webkit-touch-callout: default; cursor: text;
     touch-action: pan-y;
-  }
-  /* Prose wraps. Numbered source rows retain their gutter; structural tables
-     own a horizontal scroller. Controls are outside that scroller at every width. */
-  .peek-render-chunk { min-width:0; content-visibility:auto; contain-intrinsic-size:auto 1100px; }
-  .peek-code-row { display:block; white-space:normal; }
-  .peek-code-cell { display:grid; grid-template-columns:minmax(3ch, max-content) minmax(0, 1fr); gap:1ch; min-width:0; }
-  .peek-code-number { white-space:pre; text-align:right; color:#9da7b3; user-select:none; }
-  .peek-code-text { white-space:pre-wrap; overflow-wrap:anywhere; min-width:0; }
-  .peek-code-add { background:rgba(63,185,80,0.10); }
-  .peek-code-del { background:rgba(248,81,73,0.10); }
-  .peek-code-split { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:12px; }
-  @media (max-width:600px) {
-    .peek-code-split { grid-template-columns:minmax(0,1fr); gap:0; }
-    .peek-output-controls button { min-width:44px; min-height:44px; }
-    .peek-split-wrap.split-active { flex-direction:column; }
-    .peek-split-wrap.split-active > .peek-split-files { border-left:0; border-top:1px solid var(--border); }
   }
   .peek-copy-btn {
     position: static;
@@ -847,6 +832,12 @@
     opacity: 0.75; white-space: pre-wrap;
     border-left: 2px solid rgba(255,255,255,0.12); padding-left: 6px;
   }
+  /* The peek text flow is capped to the WORKER's pane width (--peek-cols, set
+     per frame from the peek payload's pane_cols). Without it, prose written for
+     a 154-column terminal re-wraps at ~224 characters on a wide desktop and the
+     author's line breaks and spacing stop making sense. Falls back to 220, the
+     spawn width, when a frame carries no pane_cols. */
+  #pk-earlier, #pk-hist, #pk-live { max-width: calc(var(--peek-cols, 220) * 1ch); }
   .peek-rule {
     display: inline-flex; width: 100%; align-items: center; gap: 6px;
     height: 1.15em; vertical-align: middle;
@@ -911,13 +902,14 @@
   .peek-plan-item .pp-blocked { color: #e0af68; font-size: 0.66rem; flex-shrink: 0; white-space: nowrap; }
   @media (max-width: 600px) { .peek-plan-hdr { min-height: 40px; } }
   .scroll-lock-badge {
-    position: sticky; bottom: 0; left: 0; right: 0;
-    text-align: center; padding: 6px 0;
-    background: linear-gradient(transparent, rgba(0,0,0,0.85) 40%);
-    color: var(--accent); font-size: 0.75rem; cursor: pointer;
-    z-index: 5; pointer-events: auto;
+    position: sticky; bottom: 8px; display: block; width: max-content;
+    max-width: calc(100% - 16px); margin: 8px auto 0; text-align: center;
+    padding: 6px 12px; border: 1px solid rgba(88,166,255,0.45); border-radius: 999px;
+    background: rgba(13,17,23,0.96); box-shadow: 0 2px 10px rgba(0,0,0,0.28);
+    color: var(--accent); font: inherit; font-size: 0.75rem; cursor: pointer;
+    z-index: 8; pointer-events: auto;
   }
-  body.light .scroll-lock-badge { background: linear-gradient(transparent, rgba(255,255,255,0.9) 40%); }
+  body.light .scroll-lock-badge { background: rgba(255,255,255,0.97); }
 
   /* File preview overlay */
   .file-overlay {
@@ -2318,6 +2310,11 @@
     #peek-overlay .peek-tabs { padding: 0 0 0 4px; }   /* right stays 0, see .peek-tabs */
     #peek-overlay .peek-tab { padding: 3px 8px; min-height: 36px; font-size: 0.75rem; }
     #peek-overlay .overlay-body { padding: 6px; }
+    /* The terminal controls float inside the scroller. This selector must be
+       more specific than the generic mobile body rule above or the 46px
+       desktop clearance is collapsed to 6px and the first output row sits
+       underneath the controls. */
+    #peek-overlay #peek-body { padding: 60px 6px 6px; }
     /* Reclaim the "Updated … · vX" status line on mobile — its ~20px is
        better spent on the terminal. (The version/updated info is still
        visible on desktop and via the layout-debug tap on the body.) */
