@@ -2835,6 +2835,10 @@
     background: var(--card); border: 1px solid var(--border); border-radius: 6px;
     min-width: 150px; z-index: 200; padding: 6px 0;
     box-shadow: 0 4px 16px rgba(0,0,0,0.2);
+    /* Scroll instead of overflowing the viewport: adding a nav tab (Secrets,
+       0.9.717) made the list 26px taller than an 800px window and e2e
+       tab-customizer.spec.ts caught it as clipped by BODY. */
+    max-height: calc(100vh - 200px); overflow-y: auto;
   }
   #peek-tab-customizer-menu { position: fixed; z-index: 300; }
   .tab-customizer-item {
