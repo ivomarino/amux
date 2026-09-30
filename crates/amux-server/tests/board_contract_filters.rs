@@ -28,6 +28,7 @@ async fn contract() -> Value {
         store: std::sync::Arc::new(store),
         started: std::time::Instant::now(),
         build_hash: "test".into(),
+        secrets: std::sync::Arc::new(amux_server::secrets::SecretStore::empty()),
         auth_token: None,
     };
     let app = router(state);
@@ -160,6 +161,7 @@ async fn contract_serves_the_enforced_gate_not_just_type_defaults() {
         store: store.clone(),
         started: std::time::Instant::now(),
         build_hash: "test".into(),
+        secrets: std::sync::Arc::new(amux_server::secrets::SecretStore::empty()),
         auth_token: None,
     };
     let app = router(state);

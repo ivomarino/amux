@@ -432,6 +432,7 @@ mod tests {
             store: s.clone(),
             started: std::time::Instant::now(),
             build_hash: "test".into(),
+            secrets: std::sync::Arc::new(crate::secrets::SecretStore::empty()),
             auth_token: None,
         };
         let now = crate::api::reclaim::now_secs();

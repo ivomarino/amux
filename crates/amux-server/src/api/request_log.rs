@@ -1134,6 +1134,12 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/connectors/{id}/credentials", methods: &["POST"] },
     RouteEntry { path: "/api/connectors/{id}/auth", methods: &["POST"] },
     RouteEntry { path: "/api/connectors/{id}/test", methods: &["POST"] },
+    RouteEntry { path: "/api/secrets", methods: &["GET"] },
+    RouteEntry { path: "/api/secrets/inspect", methods: &["GET"] },
+    RouteEntry { path: "/api/secrets/{path}", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/github/status", methods: &["GET"] },
+    RouteEntry { path: "/api/github/auth/start", methods: &["GET"] },
+    RouteEntry { path: "/api/github/auth/callback", methods: &["GET"] },
     RouteEntry { path: "/api/connectors/{id}/token", methods: &["POST"] },
     RouteEntry { path: "/api/connectors/{family}/callback", methods: &["GET"] },
     RouteEntry { path: "/api/pull", methods: &["POST"] },
@@ -2203,6 +2209,7 @@ mod tests {
             store,
             started: std::time::Instant::now(),
             build_hash: "test".into(),
+            secrets: std::sync::Arc::new(crate::secrets::SecretStore::empty()),
             auth_token: None,
         }
     }

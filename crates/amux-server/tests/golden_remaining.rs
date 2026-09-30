@@ -86,6 +86,7 @@ fn rig() -> Rig {
         store: store.clone(),
         started: std::time::Instant::now(),
         build_hash: "golden-remaining-test".into(),
+        secrets: std::sync::Arc::new(amux_server::secrets::SecretStore::empty()),
         auth_token: None,
     };
     Rig {

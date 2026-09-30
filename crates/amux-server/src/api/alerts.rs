@@ -1120,6 +1120,7 @@ mod tests {
             store: Arc::new(store),
             started: std::time::Instant::now(),
             build_hash: "test".into(),
+            secrets: std::sync::Arc::new(crate::secrets::SecretStore::empty()),
             auth_token: None,
         };
         Router::new().nest("/api/alert", routes_with(channels)).with_state(state)
@@ -1455,6 +1456,7 @@ mod tests {
             store: Arc::new(store),
             started: std::time::Instant::now(),
             build_hash: "test".into(),
+            secrets: std::sync::Arc::new(crate::secrets::SecretStore::empty()),
             auth_token: None,
         };
         let out = RealChannels.push(&state, "amux", "drill").await;

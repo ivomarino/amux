@@ -45,6 +45,7 @@ fn app(db_tag: &str) -> (axum::Router, std::sync::Arc<Store>) {
         store: store.clone(),
         started: std::time::Instant::now(),
         build_hash: "test".into(),
+        secrets: std::sync::Arc::new(amux_server::secrets::SecretStore::empty()),
         auth_token: None,
     };
     (router(state), store)

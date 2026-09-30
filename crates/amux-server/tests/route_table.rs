@@ -143,6 +143,7 @@ async fn route_table_matches_the_real_router_both_directions() {
         store: std::sync::Arc::new(store),
         started: std::time::Instant::now(),
         build_hash: "test".into(),
+        secrets: std::sync::Arc::new(amux_server::secrets::SecretStore::empty()),
         auth_token: None,
     });
 

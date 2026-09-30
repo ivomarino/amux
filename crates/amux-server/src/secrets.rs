@@ -12,9 +12,7 @@
 //! let openai_key = secrets.get("external_services.openai.api_key");
 //! ```
 
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -37,6 +35,12 @@ impl SecretStore {
             age_key_path,
             secrets_file,
         }
+    }
+
+    /// A store with nothing loaded and no key/file paths — what tests and
+    /// hookless constructions of `AppState` use.
+    pub fn empty() -> Self {
+        Self::new(PathBuf::new(), PathBuf::new())
     }
 
     /// Load encrypted secrets file and decrypt with age
@@ -85,7 +89,7 @@ impl SecretStore {
         let cache = self.secrets.read().await;
         
         let parts: Vec<&str> = path.split('.').collect();
-        let mut current = &cache;
+        let mut current: &Value = &cache;
 
         for part in parts {
             current = &current[part];
@@ -199,7 +203,7 @@ fn schema_only(value: &Value) -> Value {
         Value::Array(arr) => {
             Value::Array(
                 arr.iter()
-                    .map(|v| schema_only(v))
+                    .map(schema_only)
                     .collect(),
             )
         }

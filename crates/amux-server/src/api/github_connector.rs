@@ -10,7 +10,6 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 use crate::api::AppState;
 
@@ -41,6 +40,18 @@ pub fn routes() -> Router<AppState> {
         .route("/api/github/status", get(github_status))
 }
 
+/// RFC 3986 percent-encoding of a query value (unreserved chars pass through).
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// Start GitHub OAuth flow
 async fn start_auth(State(state): State<AppState>) -> impl IntoResponse {
     match load_github_config(&state).await {
@@ -49,7 +60,7 @@ async fn start_auth(State(state): State<AppState>) -> impl IntoResponse {
                 "https://github.com/login/oauth/authorize?\
                 client_id={}&redirect_uri={}&scope=repo,user",
                 config.client_id, 
-                urlencoding::encode(&config.redirect_uri)
+                percent_encode(&config.redirect_uri)
             );
             
             Json(serde_json::json!({
@@ -123,7 +134,7 @@ async fn load_github_config(state: &AppState) -> Result<GitHubConfig, String> {
 }
 
 /// Exchange authorization code for access token (mock)
-async fn exchange_code_for_token(state: &AppState, code: &str) -> Result<String, String> {
+async fn exchange_code_for_token(_state: &AppState, code: &str) -> Result<String, String> {
     // In production, this would call GitHub's token endpoint
     // For now, return a mock token
     Ok(format!("gho_mock_{}", code))

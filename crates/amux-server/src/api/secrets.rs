@@ -7,7 +7,7 @@ use crate::api::AppState;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -37,7 +37,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/secrets", get(list_secrets))
         .route("/api/secrets/inspect", get(inspect_secrets))
-        .route("/api/secrets/:path", get(get_secret).post(update_secret))
+        .route("/api/secrets/{path}", get(get_secret).post(update_secret))
 }
 
 /// List all secret paths (keys only, no values)
@@ -81,7 +81,7 @@ async fn inspect_secrets(State(state): State<AppState>) -> impl IntoResponse {
 async fn update_secret(
     State(state): State<AppState>,
     Path(path): Path<String>,
-    Json(req): Json<UpdateSecretRequest>,
+    Json(_req): Json<UpdateSecretRequest>,
 ) -> impl IntoResponse {
     // Auth check - in production, verify admin role
     if state.auth_token.is_none() {
