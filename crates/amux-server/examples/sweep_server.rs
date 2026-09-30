@@ -85,6 +85,7 @@ async fn main() {
         started: Instant::now(),
         build_hash: amux_server::build_hash(),
         auth_token: None, // local read-only harness
+        secrets: Arc::new(amux_server::secrets::SecretStore::empty()),
     };
     let app = router(state);
 

@@ -22,6 +22,7 @@ async fn debug_scan_is_mounted_and_returns_200() {
         store: std::sync::Arc::new(store),
         started: std::time::Instant::now(),
         build_hash: "test".into(),
+        secrets: std::sync::Arc::new(amux_server::secrets::SecretStore::empty()),
         // Public route (mounted outside require_bearer), and None disables auth.
         auth_token: None,
     });

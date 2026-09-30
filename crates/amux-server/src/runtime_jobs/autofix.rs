@@ -4732,6 +4732,7 @@ mod tests {
                 store,
                 started: std::time::Instant::now(),
                 build_hash: "test".into(),
+                secrets: std::sync::Arc::new(crate::secrets::SecretStore::empty()),
                 auth_token: None,
             },
             dir,
@@ -4827,6 +4828,7 @@ mod tests {
             store: st.store.clone(),
             started: std::time::Instant::now(),
             build_hash: "test-after-restart".into(),
+            secrets: std::sync::Arc::new(crate::secrets::SecretStore::empty()),
             auth_token: None,
         };
         let r = autofix_tick(&restarted, std::path::Path::new("/nonexistent")).await;
@@ -6035,6 +6037,7 @@ mod tests {
             store: st.store.clone(),
             started: std::time::Instant::now(),
             build_hash: "after-restart".into(),
+            secrets: std::sync::Arc::new(crate::secrets::SecretStore::empty()),
             auth_token: None,
         };
         assert!(

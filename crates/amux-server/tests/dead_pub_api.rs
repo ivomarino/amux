@@ -35,7 +35,12 @@ use std::path::{Path, PathBuf};
 // (SA-124) is genuinely referenced — so the name is now called somewhere and the
 // row is stale by the guard's own rule. If the herdr from_env goes unreferenced
 // again after a rename, it re-earns its row with its reason.
-const ALLOW: &[(&str, &str)] = &[];
+const ALLOW: &[(&str, &str)] = &[(
+    "request_secret",
+    "mcp_secrets.rs REQUEST_SECRET tool entry point: shipped ahead of the MCP transport \
+     that will call it (secrets Phase 6). Delete this row when it is wired; the guard \
+     fails once the name is referenced.",
+)];
 
 fn rs_files(root: &str) -> Vec<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {

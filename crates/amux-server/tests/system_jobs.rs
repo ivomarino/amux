@@ -193,6 +193,7 @@ fn test_app() -> (axum::Router, tempfile::TempDir) {
         store: std::sync::Arc::new(store),
         started: std::time::Instant::now(),
         build_hash: "test".into(),
+        secrets: std::sync::Arc::new(amux_server::secrets::SecretStore::empty()),
         auth_token: None,
     });
     (app, dir)

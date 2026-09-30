@@ -838,6 +838,7 @@ mod tests {
                 store: Arc::new(store),
                 started: std::time::Instant::now(),
                 build_hash: "test".into(),
+                secrets: std::sync::Arc::new(crate::secrets::SecretStore::empty()),
                 auth_token: None,
             },
             dir,
@@ -1105,6 +1106,7 @@ mod tests {
             store: Arc::new(store),
             started: std::time::Instant::now(),
             build_hash: "test".into(),
+            secrets: std::sync::Arc::new(crate::secrets::SecretStore::empty()),
             auth_token: Some("SECRET_BEARER".into()),
         };
         let app = crate::api::router(state);

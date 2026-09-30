@@ -1012,6 +1012,7 @@ mod tests {
             store: std::sync::Arc::new(store),
             started: std::time::Instant::now(),
             build_hash: "test".into(),
+            secrets: std::sync::Arc::new(crate::secrets::SecretStore::empty()),
             auth_token: token,
         };
         (router(state), dir)

@@ -938,6 +938,7 @@ mod tests {
             store: store.clone(),
             started: std::time::Instant::now(),
             build_hash: "test".into(),
+            secrets: std::sync::Arc::new(crate::secrets::SecretStore::empty()),
             auth_token: None,
         };
         (router(state), store, dir)
@@ -1208,6 +1209,7 @@ mod tests {
             store: store.clone(),
             started: std::time::Instant::now(),
             build_hash: "test".into(),
+            secrets: std::sync::Arc::new(crate::secrets::SecretStore::empty()),
             auth_token: None,
         };
         let now_s = Utc::now().timestamp();

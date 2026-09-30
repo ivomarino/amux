@@ -14436,6 +14436,7 @@ mod tests {
                 store: std::sync::Arc::new(store),
                 started: std::time::Instant::now(),
                 build_hash: "test".into(),
+                secrets: std::sync::Arc::new(crate::secrets::SecretStore::empty()),
                 auth_token: None,
             },
             dir,
@@ -16087,6 +16088,7 @@ mod steer_boundary_tests {
                 store: std::sync::Arc::new(store),
                 started: std::time::Instant::now(),
                 build_hash: "test".into(),
+                secrets: std::sync::Arc::new(crate::secrets::SecretStore::empty()),
                 auth_token: None,
             },
             dir,
@@ -16428,6 +16430,7 @@ mod hot_model_switch_tests {
             store: std::sync::Arc::new(store),
             started: std::time::Instant::now(),
             build_hash: "test".into(),
+            secrets: std::sync::Arc::new(crate::secrets::SecretStore::empty()),
             auth_token: None,
         };
         let out = deliver_hot_config(&state, "amux-no-such-session-2617", "/model sonnet", CC_MODEL_ACK).await;

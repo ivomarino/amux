@@ -2005,6 +2005,7 @@ mod tests {
             store: Arc::new(store),
             started: std::time::Instant::now(),
             build_hash: "test".into(),
+            secrets: std::sync::Arc::new(crate::secrets::SecretStore::empty()),
             auth_token: None,
         };
         let router = Router::new()
@@ -2232,6 +2233,7 @@ mod tests {
             store: Arc::new(store),
             started: std::time::Instant::now(),
             build_hash: "test".into(),
+            secrets: std::sync::Arc::new(crate::secrets::SecretStore::empty()),
             auth_token: None,
         };
         let gapp = Router::new()

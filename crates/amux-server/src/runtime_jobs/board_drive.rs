@@ -4269,6 +4269,7 @@ mod tests {
             store: store.clone(),
             started: std::time::Instant::now(),
             build_hash: "test".into(),
+            secrets: std::sync::Arc::new(crate::secrets::SecretStore::empty()),
             auth_token: None,
         };
         let ins = |id: &str, status: &str| {
@@ -4319,6 +4320,7 @@ mod tests {
             store: store.clone(),
             started: std::time::Instant::now(),
             build_hash: "test".into(),
+            secrets: std::sync::Arc::new(crate::secrets::SecretStore::empty()),
             auth_token: None,
         };
         store
@@ -4411,6 +4413,7 @@ mod tests {
             store: store.clone(),
             started: std::time::Instant::now(),
             build_hash: "test".into(),
+            secrets: std::sync::Arc::new(crate::secrets::SecretStore::empty()),
             auth_token: None,
         };
         let ins = |id: &str, owner: &str| {

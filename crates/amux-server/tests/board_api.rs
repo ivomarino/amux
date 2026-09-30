@@ -23,6 +23,7 @@ fn app_with_store() -> (axum::Router, std::sync::Arc<Store>, tempfile::TempDir) 
         store: store.clone(),
         started: std::time::Instant::now(),
         build_hash: "test".into(),
+        secrets: std::sync::Arc::new(amux_server::secrets::SecretStore::empty()),
         auth_token: None,
     };
     (router(state), store, dir)
@@ -39,6 +40,7 @@ fn app() -> (axum::Router, tempfile::TempDir) {
         store: std::sync::Arc::new(store),
         started: std::time::Instant::now(),
         build_hash: "test".into(),
+        secrets: std::sync::Arc::new(amux_server::secrets::SecretStore::empty()),
         auth_token: None,
     };
     (router(state), dir)
@@ -1211,6 +1213,7 @@ async fn board_routes_sit_behind_auth_when_token_configured() {
         store: std::sync::Arc::new(store),
         started: std::time::Instant::now(),
         build_hash: "test".into(),
+        secrets: std::sync::Arc::new(amux_server::secrets::SecretStore::empty()),
         auth_token: Some("sekrit".into()),
     };
     let app = router(state);
