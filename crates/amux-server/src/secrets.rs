@@ -7,9 +7,10 @@
 //! 4. Expose via environment variables and API
 //!
 //! Usage:
-//! ```
-//! let secrets = SecretStore::load().await?;
-//! let openai_key = secrets.get("external_services.openai.api_key");
+//! ```ignore
+//! let store = SecretStore::new(age_key_path, secrets_file);
+//! store.load().await?;
+//! let openai_key = store.get("external_services.openai.api_key").await;
 //! ```
 
 use serde_json::{json, Value};
